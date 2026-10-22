@@ -98,6 +98,9 @@ MORPHEUS_EVERY_TICKS = 12
 #: Read the account's usage meter every N ticks — one minute at the default 5s interval (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)
 USAGE_SAMPLE_EVERY_TICKS = 12
 
+#: Re-offer the steward's queued self-work every N ticks — ten minutes at the default 5s (#1181)
+STEWARD_DRAIN_EVERY_TICKS = 120
+
 #: How often orders that have stopped moving are swept is `fleet_health.sweep_every_ticks`
 
 #: Which work orders' pull requests get asked about (#224)
@@ -646,6 +649,19 @@ class Daemon:
         except Exception:  # noqa: BLE001
             log.exception("steward digest failed")
 
+    def steward_drain(self) -> None:
+        """Queued self-work is deferred, not dropped: re-offer it when there is room (#1181)"""
+        if fleet.load_pause(self.central) is not None:
+            return  # THE BRAKE holds new self-work too
+        try:
+            out = steward.drain(self.catalog, self.central)
+        except Exception:  # noqa: BLE001
+            log.exception("steward drain failed")
+            return
+        if out["dispatched"] or out["expired"] or out["failed"]:
+            log.info("steward queue: %(dispatched)d re-offered, %(expired)d expired, "
+                     "%(failed)d failed, %(waiting)d still waiting", out)
+
     # -- the account's usage meter
 
     def sample_usage_meter(self) -> None:
@@ -849,6 +865,8 @@ class Daemon:
         if self.tick_count % USAGE_SAMPLE_EVERY_TICKS == 1:
             self.sample_usage_meter()
             self.steward_digest()
+        if self.tick_count % STEWARD_DRAIN_EVERY_TICKS == 1:
+            self.steward_drain()
         # The roster is a subprocess, and tracking injected sessions is the only thing left that reads it
         if reconcile and self._tracking_injected_sessions():
             try:

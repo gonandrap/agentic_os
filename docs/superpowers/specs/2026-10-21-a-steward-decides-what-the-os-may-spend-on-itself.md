@@ -138,7 +138,8 @@ Every OS-originated candidate arrives with:
 
 The steward returns one of four outcomes:
 - **`dispatch`:** create the work order now, with a per-order budget the steward sets.
-- **`queue`:** file or keep the issue on the tracker, with no order.
+- **`queue`:** file or keep the issue on the tracker, with no order. *As built (#1181):*
+  queued means deferred, not dropped — see "The queue drains" below.
 - **`drop`:** record the count only.
 - **`ask`:** raise a single inbox item for the user.
 
@@ -166,6 +167,36 @@ already produced an order (`wo_id`, or `applied`): the defect is being worked, s
 second order is dispatched. The higher severity is still written to that row, the
 restatement is recorded with `rule='duplicate-of-dispatched'`, and the order it restates
 gets a `steward_severity_raised` event — the worker on it must see that it got worse.
+When the decision is applied but its order is not linked yet, the raise waits on the
+decision row and `steward.linked` delivers it the moment the order exists (#54). An
+escalated decision carries the severer wording as its subject; the earlier wording is
+kept with the other seats' (#57).
+
+*As amended (decision #55 of 2026-10-22):* the bucket is a FILE, not a defect. Inside
+it, a candidate restates a decision only when their wordings share vocabulary
+(`steward.same_defect`: words of three letters or more, stop words and the file's own
+name removed, shared words over the shorter wording's ≥ 0.4). Two different defects in
+one file are two decisions, so an escalation can no longer rewrite the wrong one. Seats
+that word one mechanism with no word in common now produce two decisions; that costs at
+most one extra filing, where the file-level bucket silently lost a defect.
+
+#### The queue drains (#1181)
+
+A `queue` of a kind the OS can dispatch later on its own — a panel follow-up or a
+worker's improvement order — keeps the whole candidate on its decision row
+(`candidate_json`: subject, severity, evidence, file, parent, the caller's payload, and
+every wording folded onto it) with `queue_state='waiting'`. Every ten minutes the daemon
+runs `steward.drain` (in `enforce`, never while the fleet is paused): severest then
+oldest, each waiting decision is re-decided against today's ledger with the same rules —
+folded wordings count as sightings toward recurrence — and one that now dispatches goes
+through the same path an allowed decision takes (the follow-up is filed, the io is
+created, stamped and budgeted), at most three per pass with the ledger re-read after
+each. It expires instead after 14 days, when its project is gone, when the unit a panel
+finding is about was cancelled or deleted, or when another decision about the same
+defect already dispatched. Other origin kinds re-ask by themselves (a red `main`, an
+investigation, Morpheus) or stay on the tracker (`bug_agent`), so they do not wait;
+`remedy` and `neo_rider` queues are not drained yet.
+`jarvis steward decisions` and the digest say how many are waiting.
 
 #### Decision 1: per item (technical)
 

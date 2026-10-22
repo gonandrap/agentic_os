@@ -2545,7 +2545,8 @@ def follow_up_repo(project_path: Path) -> str:
 
 def _steward_follow_ups(store: ProjectStore, project: ProjectSpec, unit_id: str,
                         pending: Sequence[Mapping[str, Any]],
-                        payload: dict[str, Any]) -> list[Mapping[str, Any]]:
+                        payload: dict[str, Any],
+                        context: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """The panel stops filing on its own say-so (spec 2026-10-21 §3.1, A5)"""
     from . import steward
 
@@ -2561,29 +2562,76 @@ def _steward_follow_ups(store: ProjectStore, project: ProjectSpec, unit_id: str,
                               project.name, str(finding.get("title") or ""),
                               evidence=(str(finding.get("failure") or ""),),
                               parent_wo_id=unit_id,
-                              file=str(finding.get("file") or "")),
+                              file=str(finding.get("file") or ""),
+                              # A held finding is filed LATER from this (`steward.drain`, #1181)
+                              payload={**context, "finding": dict(finding)}),
             catalog=catalog, store=store, self_dispatch=True)
         kept = decided.get(decision.duplicate_of)
         if kept is not None and not decision.allowed:
             # One patch covers every seat's wording, so the brief carries them all (Q2109)
             kept.setdefault("also_worded", []).append(str(finding.get("title") or ""))
-            held.append(finding)
+            held.append((finding, decision))
             continue
         row = dict(finding)
         if not decision.duplicate_of:
             decided[decision.decision_id] = row
-        (allowed if decision.allowed else held).append(row)
+        if decision.allowed:
+            allowed.append(row)
+        else:
+            held.append((row, decision))
     if held:
-        payload["steward_held"] = [{"title": f.get("title"), "level": f.get("level")}
-                                   for f in held]
+        # `queued`: kept whole on the decision and filed once the steward has room (#1181)
+        payload["steward_held"] = [
+            {"title": f.get("title"), "level": f.get("level"),
+             "decision_id": d.duplicate_of or d.decision_id, "outcome": d.outcome,
+             "queued": d.outcome == "queue" and not d.duplicate_of}
+            for f, d in held]
     return allowed
+
+
+def reoffer_panel_follow_up(row: Mapping[str, Any], candidate: Any,
+                            decision: Any) -> str:
+    """File one queued panel finding the steward now has room for (`steward.drain`, #1181)"""
+    from . import steward
+
+    held = candidate.payload or {}
+    finding = dict(held.get("finding") or {})
+    if not finding:
+        raise OpsError(f"steward decision #{row['id']} kept no finding to file")
+    # Every seat's wording that folded onto it while it waited: one patch covers them all
+    also = steward.candidate_wordings(row)
+    if also:
+        finding["also_worded"] = [*(finding.get("also_worded") or ()), *also]
+    # The severer wording an escalation kept is the one filed
+    finding["title"], finding["level"] = candidate.subject, decision.severity
+    catalog = resolve_catalog()
+    spec = project_spec(catalog, candidate.project)
+    store = ProjectStore(spec.path)
+    try:
+        filed = file_validation_follow_ups(
+            store, spec, {"round": int(held.get("round") or 0),
+                          "id": int(held.get("round_id") or 0),
+                          "pr_url": str(held.get("pr_url") or "")},
+            [finding], spec.validation, wo_id=held.get("wo_id") or None,
+            fo_id=held.get("fo_id") or None, steward_decided=True)
+    finally:
+        store.close()
+    if filed["failed"]:
+        # The tracker could not be read or written: still queued, offered again next pass
+        raise OpsError(filed.get("reason") or "the follow-up could not be filed")
+    urls = [i["url"] for i in filed["items"]]
+    # Said on the decision's queue note: where the finding went, when not to a tracker issue
+    return (urls[0] if urls else "kept on the internal record" if filed["withheld"]
+            else "dropped over the follow-up cap" if filed["dropped"]
+            else "already on the tracker")
 
 
 def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
                                round_row: Mapping[str, Any],
                                follow_ups: Sequence[Mapping[str, Any]],
                                cfg: Any, *, wo_id: str | None = None,
-                               fo_id: str | None = None) -> dict[str, Any]:
+                               fo_id: str | None = None,
+                               steward_decided: bool = False) -> dict[str, Any]:
     """Keep this unit's non-blocking findings — on the tracker if they may travel there"""
     from . import issues
 
@@ -2599,7 +2647,12 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     pending = _distinct([f for f in follow_ups if follow_up_admissible(f)])
     if not pending:
         return payload
-    pending = _steward_follow_ups(store, project, unit_id, pending, payload)
+    if not steward_decided:
+        # `steward_decided`: the steward already said yes to these — a re-offered queue
+        pending = _steward_follow_ups(
+            store, project, unit_id, pending, payload,
+            {"round": n, "round_id": round_id, "pr_url": str(round_row.get("pr_url") or ""),
+             "wo_id": wo_id, "fo_id": fo_id})
     if not pending:
         return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
@@ -2702,7 +2755,7 @@ def _record_filing(store: ProjectStore, payload: dict[str, Any], *,
                    wo_id: str | None, fo_id: str | None) -> dict[str, Any]:
     """Write the event, unless the round had nothing at all to say"""
     if (payload["items"] or payload["withheld"] or payload["dropped"]
-            or payload["failed"]):
+            or payload["failed"] or payload.get("steward_held")):
         if wo_id:
             store.add_event(wo_id, FOLLOW_UPS_EVENT, payload)
         else:
@@ -6362,6 +6415,66 @@ def family_prose(kind: str | None) -> tuple[str, str]:
     return _KIND_FAMILY.get(kind or "feature", _KIND_FAMILY["feature"])
 
 
+#: Said to a WORKER whose improvement order the steward did not dispatch (Q2134)
+IO_STEWARD_REFUSED = (
+    "the steward did not dispatch this improvement order ({outcome}): {reason} "
+    "(decision #{decision_id}). Nothing was created and nothing is spending. It is on "
+    "the record: `jarvis steward decisions`"
+)
+#: Said to a WORKER whose improvement order the steward QUEUED: kept, and filed later (#61)
+IO_STEWARD_QUEUED = (
+    "the steward did not dispatch this improvement order yet (queue): {reason} "
+    "(decision #{decision_id}). Nothing is spending now; the observation is kept whole and "
+    "the OS files it by itself once the evolution ledger has room. Do not file it again. "
+    "It is on the record: `jarvis steward decisions`"
+)
+#: Said to a WORKER whose io could not be decided at all: no decision is not a yes (#60)
+IO_STEWARD_UNREADABLE = (
+    "the steward could not read the catalog, so it cannot decide this improvement order "
+    "({error}). Nothing was created. A worker's io waits for a readable catalog; ask the "
+    "user to run `jarvis doctor`, or put the observation in your summary instead"
+)
+#: `decide` said dispatch and the master switch said no (`os.autonomy.self_dispatch`)
+IO_SELF_DISPATCH_OFF = ("`os.autonomy.self_dispatch` is off, so the OS files nothing "
+                        "nobody typed")
+
+
+def _gate_improvement_order(project_name: str, title: str, refs: Sequence[str],
+                            store: ProjectStore, *, description: str = "",
+                            origin: str = "jarvis",
+                            budget_usd: float | None = None) -> Any:
+    """The steward's call on an io a WORKER filed, or None when the user typed it (Q2134)"""
+    from . import steward
+
+    parent_wo_id = os.environ.get("JARVIS_WO_ID") or ""
+    if not parent_wo_id:
+        return None  # spec §3.2 decision 1 rule 1: the user typed it
+    try:
+        catalog = resolve_catalog()
+    except (OpsError, CatalogError, OSError, ValueError) as e:
+        # A FAILURE IS NEVER A VERDICT (kn-40db1828), and work nobody typed needs a yes (#60)
+        log.warning("steward: catalog unreadable; %s io create refused", project_name)
+        raise OpsError(IO_STEWARD_UNREADABLE.format(error=str(e)[:200])) from e
+    decision = steward.gate(
+        steward.Candidate("worker_io", "major", project_name, title,
+                          evidence=tuple(refs), parent_wo_id=parent_wo_id,
+                          refs=len(refs),
+                          # Everything `reoffer_improvement_order` needs to file it later
+                          payload={"title": title, "description": description,
+                                   "refs": list(refs), "origin": origin,
+                                   "budget_usd": budget_usd}),
+        catalog=catalog, store=store)
+    if not decision.allowed and decision.outcome == "queue" and not decision.duplicate_of:
+        raise OpsError(IO_STEWARD_QUEUED.format(reason=decision.reason,
+                                                decision_id=decision.decision_id))
+    if not decision.allowed:
+        raise OpsError(IO_STEWARD_REFUSED.format(
+            outcome=decision.outcome, decision_id=decision.decision_id,
+            reason=(IO_SELF_DISPATCH_OFF if decision.would_dispatch
+                    else decision.reason)))
+    return decision
+
+
 def create_improvement_order(project_name: str, title: str, description: str = "",
                              refs: Sequence[str] = (),
                              budget_usd: float | None = None,
@@ -6386,15 +6499,61 @@ def create_improvement_order(project_name: str, title: str, description: str = "
         )
     store = ProjectStore(paths[project_name])
     try:
-        return store.create_feature_order(
-            title=title, description=description, origin=origin,
-            kind="improvement",
-            metadata={EVIDENCE_REFS_KEY: refs},
-            # The family here is the order plus its analyst
-            budget_usd=(budget_usd if budget_usd is not None
-                        else budget.feature_default_for(_spec_or_none(project_name))))
+        decision = _gate_improvement_order(project_name, title, refs, store,
+                                           description=description, origin=origin,
+                                           budget_usd=budget_usd)
+        return _file_improvement_order(store, project_name, title, description, refs,
+                                       budget_usd, origin, decision)
     finally:
         store.close()
+
+
+def _file_improvement_order(store: ProjectStore, project_name: str, title: str,
+                            description: str, refs: Sequence[str],
+                            budget_usd: float | None, origin: str,
+                            decision: Any) -> dict[str, Any]:
+    """Create the io — now, or when the steward re-offers a queued one (#61)"""
+    from . import steward
+
+    metadata: dict[str, Any] = {EVIDENCE_REFS_KEY: list(refs)}
+    if decision is not None:
+        metadata = steward.stamped(metadata, decision)
+        if decision.budget_usd is not None:
+            budget_usd = decision.budget_usd
+    io = store.create_feature_order(
+        title=title, description=description, origin=origin,
+        kind="improvement",
+        metadata=metadata,
+        # The family here is the order plus its analyst
+        budget_usd=(budget_usd if budget_usd is not None
+                    else budget.feature_default_for(_spec_or_none(project_name))))
+    if decision is not None:
+        steward.linked(decision, io["id"], store=store)
+    return io
+
+
+def reoffer_improvement_order(row: Mapping[str, Any], candidate: Any,
+                              decision: Any) -> str:
+    """File a worker's queued io the steward now has room for (`steward.drain`, #61)"""
+    held = candidate.payload or {}
+    paths = registered_project_paths()
+    if candidate.project not in paths:
+        raise OpsError(f"project {candidate.project!r} is not registered")
+    store = ProjectStore(paths[candidate.project])
+    try:
+        io = _file_improvement_order(
+            store, candidate.project, candidate.subject or str(held.get("title") or ""),
+            str(held.get("description") or ""), list(held.get("refs") or ()),
+            held.get("budget_usd"), str(held.get("origin") or "jarvis"), decision)
+    finally:
+        store.close()
+    # `linked` already ran with the store at hand; `drain` linking again is a no-op
+    return str(io["id"])
+
+
+def steward_dispatchers() -> dict[str, Any]:
+    """How `steward.drain` dispatches a queued decision, per origin kind (#1181)"""
+    return {"panel": reoffer_panel_follow_up, "worker_io": reoffer_improvement_order}
 
 
 def list_improvement_orders(project_name: str | None = None,

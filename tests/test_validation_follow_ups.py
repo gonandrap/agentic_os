@@ -1116,6 +1116,10 @@ def test_enforced_the_panel_files_no_minor_cosmetic_or_lone_medium(fleet, tracke
     assert {h["level"] for h in out["steward_held"]} == {"cosmetic", "minor", "medium"}
 
 
+#: A second seat's wording of "run() returns None where it must raise" (#55: it shares words)
+RESTATED = "run() swallows the error and returns None instead of raising"
+
+
 def test_enforced_one_file_is_one_filing_and_the_brief_carries_the_other_wordings(
         fleet, tracker, monkeypatch):
     """Decisions #23-#25 of 2026-10-22: three seats, one mechanism, one file (Q2109)"""
@@ -1124,15 +1128,101 @@ def test_enforced_one_file_is_one_filing_and_the_brief_carries_the_other_wording
     _enforcing(monkeypatch)
     out = settle_again(fleet, wo["id"],
                        [_rated("run() returns None where it must raise", "critical"),
-                        _rated("the same path swallows the error after a retry",
-                               "critical")])
+                        _rated(RESTATED, "critical")])
     assert titles(tracker) == before + ["run() returns None where it must raise"]
-    assert [h["title"] for h in out["steward_held"]] == [
-        "the same path swallows the error after a retry"]
-    assert "the same path swallows the error after a retry" in filed(tracker)[-1]["body"]
+    assert [h["title"] for h in out["steward_held"]] == [RESTATED]
+    assert RESTATED in filed(tracker)[-1]["body"]
 
 
 def test_a_medium_goes_back_to_the_coder_and_a_cosmetic_does_not():
     note = ops.follow_up_feedback([_rated("A silent empty price list", "medium"),
                                    _rated("Rename the helper", "cosmetic")])
     assert "A silent empty price list" in note and "Rename the helper" not in note
+
+
+# -- the steward's queue drains (#1181)
+
+
+def _queue_rows():
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return [r for r in central.steward_decisions() if r["queue_state"]]
+    finally:
+        central.close()
+
+
+def _drain(**kw):
+    from jarvis import steward
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return steward.drain(ops.resolve_catalog(), central, **kw)
+    finally:
+        central.close()
+
+
+def test_a_queued_follow_up_keeps_the_whole_finding_and_files_once_there_is_room(
+        fleet, tracker, monkeypatch):
+    """Issue #1181: a `queue` dropped the finding's body and was never revisited"""
+    wo = judged(fleet, "passed")
+    before = titles(tracker)
+    _enforcing(monkeypatch)
+    evolution = ops.resolve_catalog().os.evolution
+    evolution.weekly_usd = 0.0  # the ledger is spent: the medium queues on `ledger`
+    out = settle_again(fleet, wo["id"], [_rated("A silent empty price list", "medium"),
+                                         _rated("the price list is silently empty",
+                                                "medium")])
+    assert titles(tracker) == before
+    assert out["steward_held"][0]["queued"] is True
+    # The unit's own timeline says what was held, and the decision keeps all of it
+    assert payload(fleet, wo["id"])["steward_held"]
+    [row] = _queue_rows()
+    assert (row["queue_state"], row["rule"]) == ("waiting", "ledger")
+    held = json.loads(row["candidate_json"])
+    assert held["payload"]["finding"]["failure"] == "returns None instead of raising"
+    assert held["also_worded"] == ["the price list is silently empty"]
+    # No room yet: re-offered, still waiting
+    assert _drain()["waiting"] == 1 and titles(tracker) == before
+    # Room: two seats saw it, which is the recurrence a medium needs at medium_min_refs 2
+    evolution.weekly_usd, evolution.medium_min_refs = 100.0, 2
+    assert _drain()["dispatched"] == 1
+    assert titles(tracker) == before + ["A silent empty price list"]
+    body = filed(tracker)[-1]["body"]
+    assert "returns None instead of raising" in body
+    assert "the price list is silently empty" in body
+    [row] = _queue_rows()
+    assert (row["queue_state"], row["outcome"], row["applied"]) == ("reoffered",
+                                                                    "dispatch", 1)
+    assert "re-offered from the queue (was `ledger`)" in row["reason"]
+    # Once only
+    assert _drain() == {"waiting": 0, "dispatched": 0, "expired": 0, "failed": 0}
+
+
+def test_a_queued_follow_up_on_a_cancelled_order_expires_instead(fleet, tracker,
+                                                                 monkeypatch):
+    wo = judged(fleet, "passed")
+    _enforcing(monkeypatch)
+    ops.resolve_catalog().os.evolution.weekly_usd = 0.0
+    settle_again(fleet, wo["id"], [_rated("A silent empty price list", "medium")])
+    store = fleet.store()
+    try:
+        store.update_work_order(wo["id"], status="cancelled")
+    finally:
+        store.close()
+    assert _drain()["expired"] == 1
+    [row] = _queue_rows()
+    assert row["queue_state"] == "expired" and "cancelled" in row["queue_note"]
+
+
+def test_a_queued_follow_up_expires_after_the_ttl(fleet, tracker, monkeypatch):
+    from jarvis import db, steward
+
+    wo = judged(fleet, "passed")
+    _enforcing(monkeypatch)
+    ops.resolve_catalog().os.evolution.weekly_usd = 0.0
+    settle_again(fleet, wo["id"], [_rated("A silent empty price list", "medium")])
+    assert _drain(now=db.now() + steward.QUEUE_TTL_SECONDS + 60)["expired"] == 1
+    assert "days for room" in _queue_rows()[0]["queue_note"]
