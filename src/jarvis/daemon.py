@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -5214,7 +5215,9 @@ class Daemon:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec... (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.5)
             outcome = CarryOutcome(False, False)
             if not record_only and decision.code == automerge.HELD_SHA_MOVED:
-                outcome = self._carry_catch_up(project, store, wo, pr, decision)
+                outcome = self._carry_catch_up(
+                    project, store, wo, pr, judged=decision.judged_sha,
+                    head=decision.head_sha, round_n=decision.round_n)
             if outcome.carried:
                 round_row = store.latest_validation_round(wo_id=wo_id)
                 decision = automerge.decide(
@@ -5225,6 +5228,21 @@ class Daemon:
                     and decision.code == automerge.HELD_BASE_MOVED:
                 # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2
                 caught = self._catch_up_with_base(project, store, wo, pr)
+                if (caught.outcome == ops.CATCH_UP_DEFERRED
+                        and caught.cause == ops.CATCH_UP_DEFER_HEAD_MOVED):
+                    # #1188: THE OS'S OWN CATCH-UP MOVED THE HEAD, and this hold outranks the...
+                    carry = self._carry_catch_up(
+                        project, store, wo, pr,
+                        judged=store.validated_head(round_row) or "",
+                        head=str(getattr(caught.pr, "head_oid", "") or ""),
+                        round_n=int((round_row or {}).get("round") or 0))
+                    if carry.carried:
+                        round_row = store.latest_validation_round(wo_id=wo_id)
+                        caught = self._catch_up_with_base(project, store, wo, pr)
+                    else:
+                        # A HOLD NOTHING CAN PROVE IS AN ASK: `invariants.carry_unproven_hold`
+                        caught = dataclasses.replace(
+                            caught, cause=ops.CATCH_UP_DEFER_CARRY_UNPROVEN)
                 if caught.outcome == ops.CATCH_UP_NOT_NEEDED:
                     # THE FETCHED READ WINS, AND NOT DECIDING HERE WOULD STALL FOR EVER
                     base_behind = None
@@ -5240,7 +5258,9 @@ class Daemon:
                         base_red=base_red)
                     # #1141: the moved head the base hold was hiding gets the carry too
                     if not decision.armed and decision.code == automerge.HELD_SHA_MOVED:
-                        outcome = self._carry_catch_up(project, store, wo, pr, decision)
+                        outcome = self._carry_catch_up(
+                            project, store, wo, pr, judged=decision.judged_sha,
+                            head=decision.head_sha, round_n=decision.round_n)
                         if outcome.carried:
                             round_row = store.latest_validation_round(wo_id=wo_id)
                             decision = automerge.decide(
@@ -5885,12 +5905,11 @@ class Daemon:
                  "accept" if ruling.accept else "object", ruling.reason)
 
     def _carry_catch_up(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                        pr: Any, decision: Any) -> CarryOutcome:
+                        pr: Any, *, judged: str, head: str,
+                        round_n: int) -> CarryOutcome:
         """Prove this head added no unjudged commit, and carry the verdict onto it (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.4.)"""
         from . import branchproof, ops
 
-        judged = str(getattr(decision, "judged_sha", "") or "")
-        head = str(getattr(decision, "head_sha", "") or "")
         base = str(getattr(pr, "base_ref", "") or "")
         pr_url = str(wo.get("pr_url") or "")
         if not judged or not head or head == judged or not base or not pr_url:
@@ -5901,7 +5920,7 @@ class Daemon:
             if ops.record_carry_refusal(store, wo, judged=judged, head_sha=head,
                                         proof=proof, detail=detail, chain=chain):
                 log.info("[%s] %s: not carrying round %s onto %s — %s", project.name,
-                         wo["id"], getattr(decision, "round_n", 0), head[:10], detail)
+                         wo["id"], round_n, head[:10], detail)
             return CarryOutcome(False, False)
 
         pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
@@ -5919,8 +5938,7 @@ class Daemon:
             # THE REFUSAL IS UNCHANGED, `(head
             refuse(ops.PROOF_PATCH_ID,
                    f"the diff on {head[:10]} is not the diff round "
-                   f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
-                   f"content nobody judged")
+                   f"{round_n} read, so the merge resolved content nobody judged")
             if not ops.rebind_possible(store, wo, head=head, project=project.name,
                                        cfg=project.validation):
                 return CarryOutcome(False, False)
@@ -6005,7 +6023,8 @@ class Daemon:
             log.debug("[%s] %s is in flight — catching up with %s deferred",
                       project.name, wo_id, base)
             return ops.CatchUp(pr, ops.CATCH_UP_DEFERRED,
-                               "the turn, message or validation round in flight")
+                               "the turn, message or validation round in flight",
+                               cause=ops.CATCH_UP_DEFER_IN_FLIGHT)
         pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
         if not branchproof.fetch(project.path, base, pull_ref):
             # logged there, with the refs it asked for
@@ -6042,7 +6061,8 @@ class Daemon:
         if not head_before or head_before != judged:
             return ops.CatchUp(fresh, ops.CATCH_UP_DEFERRED,
                                "the push that moved the head off the judged commit",
-                               base_tip=base_oid)
+                               base_tip=base_oid,
+                               cause=ops.CATCH_UP_DEFER_HEAD_MOVED)
         try:
             ci.update_branch(pr_url, cwd=project.path)
         except github.GitHubError as e:
@@ -6061,9 +6081,15 @@ class Daemon:
         ops.record_base_update(store, wo, base=base, base_sha=base_oid,
                                head_before=head_before, head_after=fresh.head_oid,
                                checks=fresh.failing, cause=ops.BASE_UPDATE_BEHIND)
-        log.info("[%s] %s was behind %s (%s) — caught it up, %s is now %s",
-                 project.name, pr_url, base, base_oid[:10], head_before[:10],
-                 fresh.head_oid[:10])
+        if fresh.head_oid == head_before:
+            # #1188: GitHub builds the merge commit asynchronously, so this read can lag it
+            log.info("[%s] %s was behind %s (%s) — caught it up; GitHub has not "
+                     "published the merge commit yet and %s is still the head",
+                     project.name, pr_url, base, base_oid[:10], head_before[:10])
+        else:
+            log.info("[%s] %s was behind %s (%s) — caught it up, %s is now %s",
+                     project.name, pr_url, base, base_oid[:10], head_before[:10],
+                     fresh.head_oid[:10])
         return ops.CatchUp(fresh, ops.CATCH_UP_DONE, "", base_tip=base_oid)
 
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
