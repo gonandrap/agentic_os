@@ -116,6 +116,8 @@ class Decision:
     round_n: int = 0
     #: `ops.CATCH_UP_*` when a refused catch-up produced this hold — the outcome, not its prose (#1173)
     catch_up: str = ""
+    #: `ops.CATCH_UP_DEFER_*` beside it: which wait a deferral is (#1188)
+    catch_up_cause: str = ""
 
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
@@ -126,7 +128,8 @@ def hold_payload(decision: Decision) -> dict[str, Any]:
     """The `automerge_held` event payload, in ONE place"""
     return {"code": decision.code, "reason": decision.reason,
             "judged_sha": decision.judged_sha, "head_sha": decision.head_sha,
-            "round": decision.round_n, "catch_up": decision.catch_up}
+            "round": decision.round_n, "catch_up": decision.catch_up,
+            "catch_up_cause": decision.catch_up_cause}
 
 
 def hold_is_live(state: dict[str, Any] | None) -> bool:
@@ -144,11 +147,19 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
     moved = f"`{base}` has moved to {oid}" if oid else f"`{base}` has moved"
     caught = (f"caught up with `{base}` at {oid}" if oid
               else f"caught up with `{base}`")
+    cause = str(getattr(catch_up, "cause", "") or "")
+    # #1188: a deferral nothing can prove is an ASK, not a retry the OS owns
+    deferred = (
+        f"{moved}, and the head of this branch is not the commit the panel judged: the "
+        f"OS could not prove it is that commit plus merges of `{base}`, so it will NOT "
+        f"catch this branch up. Merge it by hand, re-judge it "
+        f"(`jarvis validation force`), or `jarvis wo send` the worker"
+        if cause == ops.CATCH_UP_DEFER_CARRY_UNPROVEN else
+        f"{moved}; the branch is being caught up as soon as "
+        f"{catch_up.reason or 'the work in flight'} finishes — the OS retries every "
+        f"tick")
     reason = {
-        ops.CATCH_UP_DEFERRED:
-            f"{moved}; the branch is being caught up as soon as "
-            f"{catch_up.reason or 'the work in flight'} finishes — the OS retries every "
-            f"tick",
+        ops.CATCH_UP_DEFERRED: deferred,
         ops.CATCH_UP_EXHAUSTED:
             f"{moved} and the OS has stopped catching this branch up: "
             f"{catch_up.reason or 'its budget is spent'}. It will NOT try again: merge it "
@@ -161,7 +172,7 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
     }.get(catch_up.outcome, f"{moved} and this branch does not contain it")
     return _held(HELD_BASE_MOVED, reason,
                  head_sha=str(getattr(pr, "head_oid", "") or ""),
-                 catch_up=str(catch_up.outcome or ""))
+                 catch_up=str(catch_up.outcome or ""), catch_up_cause=cause)
 
 
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
