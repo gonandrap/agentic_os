@@ -182,21 +182,42 @@ most one extra filing, where the file-level bucket silently lost a defect.
 
 #### The queue drains (#1181)
 
-A `queue` of a kind the OS can dispatch later on its own — a panel follow-up or a
-worker's improvement order — keeps the whole candidate on its decision row
+A `queue` of a kind the OS can dispatch later on its own — a panel follow-up, a
+worker's improvement order, an alarm-born `file_work_order` remedy or a Neo ledger
+cleanup (`neo_rider`) — keeps the whole candidate on its decision row
 (`candidate_json`: subject, severity, evidence, file, parent, the caller's payload, and
 every wording folded onto it) with `queue_state='waiting'`. Every ten minutes the daemon
 runs `steward.drain` (in `enforce`, never while the fleet is paused): severest then
 oldest, each waiting decision is re-decided against today's ledger with the same rules —
 folded wordings count as sightings toward recurrence — and one that now dispatches goes
 through the same path an allowed decision takes (the follow-up is filed, the io is
-created, stamped and budgeted), at most three per pass with the ledger re-read after
-each. It expires instead after 14 days, when its project is gone, when the unit a panel
-finding is about was cancelled or deleted, or when another decision about the same
-defect already dispatched. Other origin kinds re-ask by themselves (a red `main`, an
-investigation, Morpheus) or stay on the tracker (`bug_agent`), so they do not wait;
-`remedy` and `neo_rider` queues are not drained yet.
-`jarvis steward decisions` and the digest say how many are waiting.
+created, stamped and budgeted; the remedy's handler files the fix and its ship order and
+the alarm is acked; Neo's pre-approved cleanup is filed), at most three per pass with the
+ledger re-read after each. It expires instead after 14 days, when its project is gone,
+when the unit a panel finding is about was cancelled or deleted, when a remedy's alarm
+was answered or removed meanwhile, or when another decision about the same defect
+already dispatched. Other origin kinds re-ask by themselves (a red `main`, an
+investigation, Morpheus) or stay on the tracker (`bug_agent`), so they do not wait.
+
+A remedy and a Neo rider must drain because nothing re-asks them: a remedy's
+`self_heal` grant has one use (`remedies.GRANT_USES`), spent before the steward is
+asked, so the next remedy tick refuses on a spent grant without reaching the steward;
+Neo's cleanup rides one verdict, delivered once. Re-offered, both are re-decided like
+any other: a Neo cleanup is `medium` with one sighting, so under the default
+`medium_min_refs` it keeps waiting on `recurrence` and expires after 14 days unless that
+threshold is lowered. An alarm-born remedy is `major`, so its one sighting meets the
+default `major_min_refs` of 1 at re-offer.
+
+A `queue` recorded in `enforce` for one of these kinds with nothing kept to dispatch it
+from — rows written before 0.12.15 kept no candidate, and remedies and Neo riders kept no
+payload before this subsection — can never move. Each drain pass (and the daemon while
+the fleet is paused) settles such rows as `expired`, noting that they were queued before
+the OS kept what it needs to re-offer them. Shadow rows are left alone: in shadow the
+caller dispatched anyway.
+
+`jarvis steward decisions`, the digest and the dashboard's `/steward` page say how many
+are waiting, re-offered and expired; the page then lists each one, waiting first, with
+its severity, subject, age and last queue note.
 
 #### Decision 1: per item (technical)
 
@@ -239,6 +260,10 @@ a single inbox item. It shows:
 
 A detector whose precision falls below `min_precision` over 4 weeks is
 **auto-throttled**: its `dispatch` outcomes become `queue` until the user re-enables it.
+As built, a sample is a stamped work order or a stamped improvement order, the same units
+the ledger counts. An io is touched when the user engaged with any order in its family
+(its analyst's findings reviewed with `jarvis io review`, a message, a retry, a budget);
+a stamped order inside a stamped io's family is that io's sample, not a second one.
 This is how the OS learns what is fabricated, without a model judging its own output.
 
 #### Decision 3: leaving room for feature work
