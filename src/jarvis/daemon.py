@@ -5274,9 +5274,7 @@ class Daemon:
             finally:
                 neo_store.close()
             return
-        # AT THE CAP THE ATTEMPT CAN ONLY REFUSE, AND IT REFUSED EVERY TICK (#1173): the
-        # grant was given against a `pr.base_oid` that lags the real tip (kn-03089764),
-        # and no catch-up is left to move the branch off it
+        # AT THE CAP THE ATTEMPT CAN ONLY REFUSE (#1173)
         if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
             caught = self._catch_up_with_base(project, store, wo, pr)
             if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
@@ -6117,8 +6115,7 @@ class Daemon:
                                         str(p.get("reason") or ""),
                                         int(p.get("round") or 0))):
             return
-        # THE ASK THE USER OWES IS NOT OVERWRITTEN BY A LESSER READING OF THE SAME HEAD
-        # (#1173): until the head moves, the exhausted cap is the whole truth about it
+        # A LESSER READING OF THE SAME HEAD DOES NOT OVERWRITE THE ASK THE USER OWES (#1173)
         exhausted = invariants_mod.catch_up_exhausted_hold(store, wo_id)
         if (exhausted is not None and decision.code != automerge.HELD_BASE_MOVED
                 and str(exhausted.get("head_sha") or "")
