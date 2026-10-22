@@ -4912,22 +4912,10 @@ class Daemon:
 
     def _adopt_base_red_issue(self, repo: str, run_id: Any) -> str:
         """An OPEN issue THE OS ITSELF filed citing this failing run, or `""` — spec §4"""
-        from . import bugreport, issues
+        from . import bugreport
 
-        if not run_id:
-            return ""
-        login = issues.gh_login()
-        if not login:
-            return ""
-        eligible = [
-            r for r in issues.issues_mentioning(repo, str(run_id))
-            if str(r.get("state") or "").upper() == "OPEN"
-            and str((r.get("author") or {}).get("login") or "") == login
-            and bugreport.FILED_MARKER in str(r.get("body") or "")
-        ]
-        if not eligible:
-            return ""
-        return str(min(eligible, key=lambda r: int(r.get("number") or 0))["url"])
+        # Shared with `jarvis bug report`'s own dedupe, so both sides key a break alike (issue 1212)
+        return bugreport.open_os_filed_issue(repo, run_id)
 
     @staticmethod
     def _base_red_brief(project: ProjectSpec, fact: dict[str, Any]) -> str:
