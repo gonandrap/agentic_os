@@ -1,5 +1,6 @@
 """The supervisor: the agent that answers a cost alarm, and the tick that runs it (docs/superpowers/specs/2026-08-31-the-supervisor.md)"""
 
+# clock-exempt: class 3 — spin-waits on daemon.supervisor_draining, the supervisor tick's own drain flag
 from __future__ import annotations
 
 import ast

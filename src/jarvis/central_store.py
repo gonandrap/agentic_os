@@ -495,6 +495,34 @@ CREATE TABLE IF NOT EXISTS steward_decisions (
     wo_id TEXT NOT NULL DEFAULT '',         -- the order it led to, once one exists
     budget_usd REAL
 );
+-- Morpheus's queue: one shipped PR being validated in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+CREATE TABLE IF NOT EXISTS morpheus_items (
+    id TEXT PRIMARY KEY,                    -- mv-xxxxxxxx
+    project TEXT NOT NULL DEFAULT '',       -- the onboarded project the PR belongs to
+    repo TEXT NOT NULL DEFAULT '',          -- owner/name
+    pr_number INTEGER NOT NULL,
+    pr_url TEXT NOT NULL DEFAULT '',
+    pr_title TEXT NOT NULL DEFAULT '',
+    wo_id TEXT NOT NULL DEFAULT '',         -- the work order the PR title names, if any
+    release_tag TEXT NOT NULL DEFAULT '',
+    hints TEXT NOT NULL DEFAULT '',         -- the PR's validation section, verbatim
+    script TEXT NOT NULL DEFAULT '',
+    script_source TEXT NOT NULL DEFAULT '', -- agent | user
+    state TEXT NOT NULL,                    -- queued | monitoring | validated | failed | timedout
+    created_ts REAL NOT NULL,
+    updated_ts REAL NOT NULL,
+    deadline_ts REAL NOT NULL,
+    last_check_ts REAL,
+    next_check_ts REAL,
+    checks INTEGER NOT NULL DEFAULT 0,
+    last_exit INTEGER,
+    last_output TEXT NOT NULL DEFAULT '',
+    resolution TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',        -- neo:<qid> | investigation:<id> | none:<why>
+    action_ts REAL,
+    UNIQUE (repo, pr_number)
+);
+CREATE INDEX IF NOT EXISTS idx_morpheus_items_state ON morpheus_items(state);
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_ts ON steward_decisions(ts);
 CREATE INDEX IF NOT EXISTS idx_os_config_versions_ts ON os_config_versions(ts);
 CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
@@ -538,6 +566,8 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 
 # Columns added after the first release, exactly as in `neo_store` and `project_store`
 ADDED_COLUMNS = {
+    # A home that ran this table before items were per project
+    "morpheus_items": {"project": "TEXT NOT NULL DEFAULT ''"},
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
         "paired_reason": "TEXT",
@@ -1845,6 +1875,66 @@ class CentralStore:
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         return db.rows_to_dicts(self.conn.execute(
             f"SELECT kind, latency_ms FROM agent_calls {clause}", params).fetchall())
+
+    # -- morpheus: production validation of shipped PRs
+
+    def add_morpheus_item(self, *, project: str, repo: str, pr_number: int, pr_url: str, pr_title: str,
+                          wo_id: str, release_tag: str, hints: str, script: str,
+                          script_source: str, state: str, deadline_ts: float,
+                          resolution: str = "", now: float | None = None
+                          ) -> dict[str, Any] | None:
+        """Queue one PR; None when that PR is already queued (one item per PR, ever)"""
+        ts = db.now() if now is None else now
+        item_id = db.new_id("mv")
+        cur = self.conn.execute(
+            """INSERT OR IGNORE INTO morpheus_items
+               (id, project, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints,
+                script, script_source, state, created_ts, updated_ts, deadline_ts,
+                next_check_ts, resolution)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (item_id, project, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints,
+             script, script_source, state, ts, ts, deadline_ts,
+             ts if state == "monitoring" else None, resolution))
+        return self.morpheus_item(item_id) if cur.rowcount else None
+
+    def morpheus_item(self, item_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM morpheus_items WHERE id=?",
+                                (item_id,)).fetchone()
+        return dict(row) if row else None
+
+    def morpheus_items(self, states: Sequence[str] | None = None,
+                       limit: int = 500) -> list[dict[str, Any]]:
+        """Newest first"""
+        where, params = "", []
+        if states:
+            where = f"WHERE state IN ({','.join('?' * len(states))})"
+            params = list(states)
+        return db.rows_to_dicts(self.conn.execute(
+            f"SELECT * FROM morpheus_items {where} ORDER BY created_ts DESC, pr_number DESC "
+            f"LIMIT ?", (*params, limit)).fetchall())
+
+    def morpheus_counts(self) -> dict[str, int]:
+        return {r["state"]: r["n"] for r in self.conn.execute(
+            "SELECT state, COUNT(*) AS n FROM morpheus_items GROUP BY state").fetchall()}
+
+    def update_morpheus_item(self, item_id: str, **fields: Any) -> None:
+        """Write the named columns, stamping `updated_ts`"""
+        allowed = {"script", "script_source", "state", "deadline_ts", "last_check_ts",
+                   "next_check_ts", "checks", "last_exit", "last_output", "resolution",
+                   "action", "action_ts", "hints"}
+        bad = set(fields) - allowed
+        assert not bad, bad
+        fields["updated_ts"] = db.now()
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(f"UPDATE morpheus_items SET {cols} WHERE id=?",
+                          (*fields.values(), item_id))
+
+    def claim_morpheus_action(self, item_id: str, action: str) -> bool:
+        """Record the action ONCE: False when another pass already took it"""
+        cur = self.conn.execute(
+            "UPDATE morpheus_items SET action=?, action_ts=?, updated_ts=? "
+            "WHERE id=? AND action=''", (action, db.now(), db.now(), item_id))
+        return cur.rowcount == 1
 
     # -- os state
 

@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
-from jarvis import claude_cli, invariants, ops, worker_session
+from jarvis import claude_cli, db, invariants, ops, worker_session
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
@@ -38,7 +37,7 @@ def test_an_expired_refresh_token_is_not_evidence_of_anything(signin):
 def test_a_bare_sign_in_is_later_than_the_turn_it_rescues(signin):
     """The fixture's contract, asserted rather than assumed"""
     for _ in range(200):
-        ended = time.time()
+        ended = db.now()
         signin()
         changed = claude_cli.signin_changed_at()
         assert changed is not None and changed > ended

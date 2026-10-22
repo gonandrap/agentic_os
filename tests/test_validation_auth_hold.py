@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
-from jarvis import claude_cli, ops, seats, validation
+from jarvis import claude_cli, db, ops, seats, validation
 from jarvis.catalog import ValidationConfig
 from jarvis.claude_cli import AuthFailure, AuthFailureError, UsageLimit, UsageLimitError
 from jarvis.daemon import AUTH_HOLD_BACKOFF, Daemon
@@ -31,7 +29,7 @@ def auth_error(message: str = AUTH) -> AuthFailureError:
 
 def refused(in_seconds: float = 3600) -> UsageLimitError:
     return UsageLimitError(UsageLimit(message=REFUSAL,
-                                      reset_at=time.time() + in_seconds))
+                                      reset_at=db.now() + in_seconds))
 
 
 def _rounds(store, wo_id):
@@ -204,7 +202,7 @@ def test_a_four_seat_auth_failure_holds_rather_than_escalating(fleet):
         row = store.validation_rounds(wo_id=wo["id"])[0]
         assert row["hold_cause"] == VALIDATION_AUTH_CAUSE
         assert validation_hold_until(
-            store.events_of_kind(wo["id"], "validation_failed"), 1) > time.time()
+            store.events_of_kind(wo["id"], "validation_failed"), 1) > db.now()
     finally:
         store.close()
 

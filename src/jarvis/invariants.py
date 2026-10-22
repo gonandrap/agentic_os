@@ -768,7 +768,7 @@ def stuck_message(store: ProjectStore, wo: dict[str, Any],
     if not queued:
         return None
     oldest = queued[0]  # `queued_messages` is chronological
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     minutes = int(messaging_config_at(store.project_path).stuck_minutes)
     if now - float(oldest["ts"]) < minutes * SECONDS_PER_MINUTE:
         return None
@@ -1029,7 +1029,7 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     enabled, minutes = _parked_minutes(store)
     if not enabled:
         return None
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     ended = float(turn["ended_at"])
     if now - ended < minutes * SECONDS_PER_MINUTE:
         return None
@@ -1115,7 +1115,7 @@ def validation_hold_note(store: ProjectStore, wo_id: str, round_no: int) -> str:
     """Why this round is not being judged, or "" for a round that is not held (#714)"""
     until, cause = validation_hold(store.events_of_kind(wo_id, "validation_failed"),
                                    round_no)
-    if until <= time.time():
+    if until <= db.now():
         return ""
     if cause == VALIDATION_HELD_CAUSE:
         return usage_hold_note(until)
@@ -1309,7 +1309,7 @@ RETRY_HELD_FRESH_FOR = 2 * RETRY_HELD_RESTATE
 def clock(ts: float) -> str:
     """A moment as the reader's own clock reads it, WITH THE DATE unless it is today"""
     when = time.localtime(ts)
-    if when[:3] == time.localtime(time.time())[:3]:
+    if when[:3] == time.localtime(db.now())[:3]:
         return time.strftime("%H:%M", when)
     return time.strftime("%H:%M on %a %d %b", when)
 
@@ -1334,7 +1334,7 @@ def retry_hold(store: ProjectStore, wo: dict[str, Any], pause: Any,
     payload = db.from_json(row.get("payload"), {}) or {}
     if payload.get("seq") != pause.turn["seq"]:
         return None
-    at = time.time() if now is None else now
+    at = db.now() if now is None else now
     if at - float(row.get("ts") or 0) > RETRY_HELD_FRESH_FOR:
         return None
     return payload
@@ -1646,10 +1646,11 @@ def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
-def check_messages_are_delivered(store: ProjectStore) -> Iterator[Violation]:
+def check_messages_are_delivered(store: ProjectStore, *,
+                                 now: float | None = None) -> Iterator[Violation]:
     """INV-MESSAGE-STUCK — a message queued for a worker must not sit undelivered for ever"""
     readonly = getattr(store, "readonly", False)
-    now = time.time()
+    now = db.now() if now is None else now
     for wo in store.list_work_orders(statuses=MESSAGE_STUCK_STATUSES,
                                      include_hidden=True):
         found = stuck_message(store, wo, now=now)
@@ -2715,7 +2716,7 @@ def check_release_marker(now: float | None = None) -> list[Violation]:
     state = marker.get("state")
     if state not in ("staged", "restarting"):
         return []
-    now = now if now is not None else time.time()
+    now = now if now is not None else db.now()
     reference = float(marker.get("restart_at") or marker.get("staged_at") or 0)
     age = now - reference
     if age <= RELEASE_MARKER_STALE_AFTER:
@@ -3245,6 +3246,42 @@ def _stamp(ts: float | None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
 
 
+#: How long Morpheus may leave an item overdue or an action owed before that is a fault
+MORPHEUS_GRACE_SECONDS = 3600
+
+
+def check_morpheus_moves() -> Iterator[Violation]:
+    """INV-MORPHEUS-OVERDUE — a PR still open past its deadline, or an action never taken"""
+    from . import morpheus
+    from .central_store import CentralStore
+
+    catalog = _live_catalog()
+    cfg = getattr(getattr(catalog, "os", None), "morpheus", None)
+    if cfg is not None and not cfg.enabled:
+        return
+    now = db.now()
+    central = CentralStore()
+    try:
+        items = central.morpheus_items((*morpheus.OPEN_STATES, *morpheus.ACTION_STATES))
+    finally:
+        central.close()
+    for item in items:
+        if (item["state"] in morpheus.OPEN_STATES
+                and now - float(item["deadline_ts"]) > MORPHEUS_GRACE_SECONDS):
+            why = f"is still {item['state']} {(now - float(item['deadline_ts'])) / 3600:.1f}h past its deadline"
+        elif (item["state"] in morpheus.ACTION_STATES and not item["action"]
+              and now - float(item["updated_ts"]) > MORPHEUS_GRACE_SECONDS):
+            why = f"{item['state']} {(now - float(item['updated_ts'])) / 3600:.1f}h ago and no action was taken"
+        else:
+            continue
+        yield Violation(
+            invariant="INV-MORPHEUS-OVERDUE", subject_id=item["id"],
+            detail=(f"Morpheus item {item['id']} (PR #{item['pr_number']}) {why} — the "
+                    f"daemon's Morpheus pass is not running or is failing. `jarvis morpheus "
+                    f"show {item['id']}`; the daemon log names the error."),
+            context={"item": item["id"], "pr": item["pr_number"], "state": item["state"]})
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_ui_wedged,
@@ -3257,6 +3294,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_prefix_stable,
     check_os_identity,
     check_usage_meter_stale,
+    check_morpheus_moves,
 )
 
 

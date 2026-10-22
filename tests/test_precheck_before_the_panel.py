@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-import time
 
-from jarvis import evidence, ops, remedies, rules, validation
+from jarvis import db, evidence, ops, remedies, rules, validation
 from jarvis.central_store import CentralStore
 from jarvis.evidence import EvidencePacket
 from jarvis.invariants import IDLE_NO_FINISH_BLOCKER
@@ -59,11 +58,13 @@ def age_status(fleet, wo_id: str, seconds: float) -> None:
     """Backdate every recorded status span, so the order has been where it is for an hour"""
     store = fleet.store()
     try:
+        # One instant for the back-dating and the read (docs/superpowers/specs/2026-10-15-burn-down-the-clock-hygiene-allowlist.md)
+        now = db.now()
         store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE order_id=?",
-                           (time.time() - seconds, wo_id))
+                           (now - seconds, wo_id))
         store.conn.commit()
         staged = ops.rule_facts(store, store.get_work_order(wo_id),
-                                now=time.time()).values.get("seconds_in_status")
+                                now=now).values.get("seconds_in_status")
         assert staged and staged >= seconds - 60, (
             f"the staged order is not old enough to test the condition: {staged}")
     finally:

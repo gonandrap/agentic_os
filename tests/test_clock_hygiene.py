@@ -1,10 +1,13 @@
-"""No test reads the real clock (docs/superpowers/specs/2026-10-15-no-test-reads-the-real-clock.md)"""
+"""No test reads the real clock; exempt only via ALLOWED or a function-scoped `# clock-exempt` marker (docs/superpowers/specs/2026-10-15-no-test-reads-the-real-clock.md)"""
 
 from __future__ import annotations
 
 import ast
+import io
 import re
 import subprocess
+import tokenize
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -16,41 +19,25 @@ _BOTH = (
     "class 2 — rows back-dated or stamped with time.time(), no now= on the code under "
     "test; also class 3 — spin-waits on real daemon threads and subprocesses"
 )
+# Section 0.8a: the one spelling of class 4 in this repo
+_KERNEL = (
+    "class 4 — the instant compared against is a stamp written by the kernel or by a "
+    "subprocess, which no patched jarvis.db.now reaches"
+)
 
 ALLOWED: dict[str, str] = {
-    "tests/test_alarm_escalation.py": _SPIN,
     "tests/test_bg_transport.py": _SPIN,
-    "tests/test_auth_resume.py": _BACKDATED,
     "tests/test_base_red.py": _BACKDATED,
     "tests/test_budget.py": _SPIN,
-    "tests/test_config_reload.py": _BOTH,
     "tests/test_feature_validation.py": _BOTH,
-    "tests/test_forced_validation.py": _SPIN,
-    "tests/test_health_sweep.py": _SPIN,
     "tests/test_nav_volume.py": _BACKDATED,
-    "tests/test_pr_recorded.py": _SPIN,
-    "tests/test_precheck_before_the_panel.py": _BACKDATED,
-    "tests/test_rejudge_moved_head.py": _SPIN,
     "tests/test_release_red_defer.py": _BACKDATED,
     "tests/test_release_staging.py": _BACKDATED,
-    "tests/test_remedies.py": _SPIN,
-    "tests/test_rules_tick.py": _SPIN,
-    "tests/test_seats.py": _SPIN,
-    "tests/test_supervisor.py": _SPIN,
-    "tests/test_turn_transport.py": _BOTH,
     "tests/test_ui_observability.py": _BOTH,
     "tests/test_ui_wiring.py": _BACKDATED,
     "tests/test_uilog.py": _BACKDATED,
-    "tests/test_uncollected_task_block.py": _BACKDATED,
     "tests/test_usage_window_is_account_wide.py": _SPIN,
-    "tests/test_validation_auth_hold.py": _BACKDATED,
-    "tests/test_validation_ci_hold.py": _BACKDATED,
-    "tests/test_validation_loop.py": _SPIN,
-    "tests/test_validation_release_skip.py": _BACKDATED,
     "tests/test_validation_usage_limit.py": _SPIN,
-    "tests/test_validation_void.py": _BACKDATED,
-    "tests/test_wo_fix.py": _SPIN,
-    "tests/test_worker_session.py": _BOTH,
 }
 
 # The calls that read the real clock, as dotted names after import resolution
@@ -71,7 +58,15 @@ _TIME_OF_DAY = re.compile(
     re.IGNORECASE,
 )
 
-_CLASS_REASON = re.compile(r"^class (2|3) — .+")
+_CLASS_REASON = re.compile(r"^class (2|3|4) — .+")
+
+# Markers are per-function: scope re-derived from the AST, nothing keyed by a line
+_MARKER = re.compile(r"#\s*clock-exempt:\s*(\S.*?)\s*$")
+_WHOLE_FILE = 10**9  # a module-scope marker's end line
+_PLACEMENT = (
+    "put the marker inside the function it exempts, or at the top of the file above the "
+    "first def/class when every read in the file is exempt"
+)
 
 _REMEDY = (
     'state the reset as a duration — reset="in 5h" — never a time of day; '
@@ -82,6 +77,7 @@ _REMEDY = (
 # --------------------------------------------------------------------------- walk
 
 
+# src/jarvis/testing.py is outside this scan — its FAKE_CLAUDE runs in another process, a loophole
 def _tracked_test_files() -> list[str]:
     out = subprocess.run(
         ["git", "ls-files", "-z", "tests"],
@@ -93,6 +89,14 @@ def _tracked_test_files() -> list[str]:
     return sorted(
         name for name in out.split("\0") if name.endswith(".py") and name.strip()
     )
+
+
+def _texts() -> dict[str, str]:
+    """Tracked test files, as source text — comments are not in the AST"""
+    return {
+        rel: (REPO_ROOT / rel).read_text(encoding="utf-8")
+        for rel in _tracked_test_files()
+    }
 
 
 def _sources() -> dict[str, ast.Module]:
@@ -177,6 +181,166 @@ def real_clock_reads(tree: ast.Module) -> list[tuple[int, str]]:
         if resolved is not None and _is_real_clock_read(resolved):
             found.append((node.lineno, resolved))
     return sorted(found)
+
+
+# ------------------------------------------------------------------ the markers
+
+
+@dataclass(frozen=True)
+class Marker:
+    """One `# clock-exempt:` comment, with the scope its position gives it"""
+
+    rel: str
+    line: int
+    reason: str
+    start: int
+    end: int
+    module_scope: bool
+    placed_well: bool
+
+    @property
+    def where(self) -> str:
+        return f"{self.rel}:{self.line}"
+
+
+def _marker_comments(text: str) -> list[tuple[int, str]]:
+    found: list[tuple[int, str]] = []
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, IndentationError):  # pragma: no cover - parse rule fires
+        return found
+    for token in tokens:
+        if token.type != tokenize.COMMENT:
+            continue
+        match = _MARKER.search(token.string)
+        if match:
+            found.append((token.start[0], match.group(1)))
+    return found
+
+
+def _enclosing_function(tree: ast.Module, line: int) -> ast.AST | None:
+    """The innermost def/async def whose body the line falls in"""
+    best: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.lineno <= line <= (node.end_lineno or node.lineno):
+            if best is None or node.lineno > best.lineno:
+                best = node
+    return best
+
+
+def _first_definition_line(tree: ast.Module) -> int | None:
+    lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    return min(lines) if lines else None
+
+
+def markers(rel: str, text: str) -> list[Marker]:
+    """Every marker in one file, scoped from the AST — never from a stored line number"""
+    tree = ast.parse(text, filename=rel)
+    first_def = _first_definition_line(tree)
+    out: list[Marker] = []
+    for line, reason in _marker_comments(text):
+        fn = _enclosing_function(tree, line)
+        if fn is not None:
+            out.append(Marker(rel, line, reason, fn.lineno,
+                              fn.end_lineno or fn.lineno, False, True))
+        else:
+            above_first_def = first_def is None or line < first_def
+            out.append(Marker(rel, line, reason, 1, _WHOLE_FILE, True, above_first_def))
+    return out
+
+
+def marker_scopes(files: dict[str, str]) -> dict[str, list[Marker]]:
+    """Well-placed markers per file; a stranded one exempts nothing"""
+    return {
+        rel: [m for m in markers(rel, text) if m.placed_well]
+        for rel, text in files.items()
+    }
+
+
+def _covered(scoped: list[Marker], line: int) -> bool:
+    return any(m.start <= line <= m.end for m in scoped)
+
+
+def marker_reason_offenders(files: dict[str, str]) -> list[str]:
+    """Markers whose reason names no class"""
+    return [
+        f"{m.where} {m.reason!r} — a reason must match '^class (2|3|4) — .+'"
+        for rel, text in sorted(files.items())
+        for m in markers(rel, text)
+        if not _CLASS_REASON.match(m.reason)
+    ]
+
+
+def marker_class_two_offenders(files: dict[str, str]) -> list[str]:
+    """Back-dating is never an exemption"""
+    return [
+        f"{m.where} claims class 2 — back-dating is never exempt; convert the site to "
+        "db.now() per spec section 0.5"
+        for rel, text in sorted(files.items())
+        for m in markers(rel, text)
+        if m.reason.startswith("class 2")
+    ]
+
+
+def misplaced_marker_offenders(files: dict[str, str]) -> list[str]:
+    """Module-level markers below the first def/class: a whole-file claim, hidden"""
+    return [
+        f"{m.where} sits at module level below the first def/class — {_PLACEMENT}"
+        for rel, text in sorted(files.items())
+        for m in markers(rel, text)
+        if m.module_scope and not m.placed_well
+    ]
+
+
+def uncovered_marker_offenders(files: dict[str, str]) -> list[str]:
+    """Markers over no real-clock read — the marker's own stale-entry rule"""
+    out: list[str] = []
+    for rel, text in sorted(files.items()):
+        reads = [line for line, _ in real_clock_reads(ast.parse(text, filename=rel))]
+        for m in markers(rel, text):
+            if not m.placed_well:  # a stranded marker fails its own rule instead
+                continue
+            if not any(m.start <= line <= m.end for line in reads):
+                out.append(
+                    f"{m.where} {m.reason!r} covers no real-clock read — delete it, "
+                    "markers are shrink-only and cannot go stale"
+                )
+    return out
+
+
+def duplicate_marker_reasons(files: dict[str, str]) -> list[str]:
+    """One unique reason per exempt function: a duplicated reason is a generic one"""
+    seen: dict[str, list[str]] = {}
+    for rel, text in sorted(files.items()):
+        for m in markers(rel, text):
+            seen.setdefault(m.reason, []).append(m.where)
+    return [
+        f"{reason!r} is used at {', '.join(places)} — give each its own reason"
+        for reason, places in sorted(seen.items())
+        if len(places) > 1
+    ]
+
+
+def redundant_allowed_entries(
+    allowed: dict[str, str], files: dict[str, str]
+) -> list[str]:
+    """ALLOWED files whose every read a marker already carries"""
+    out: list[str] = []
+    for rel in sorted(allowed):
+        text = files.get(rel)
+        if text is None:
+            continue
+        reads = real_clock_reads(ast.parse(text, filename=rel))
+        scoped = marker_scopes({rel: text})[rel]
+        if reads and all(_covered(scoped, line) for line, _ in reads):
+            out.append(rel)
+    return out
 
 
 # ------------------------------------------------------------------- assertion A
@@ -278,13 +442,20 @@ def flake_offenders(sources: dict[str, ast.Module]) -> list[str]:
 # ------------------------------------------------------------------- assertion B
 
 
-def clock_offenders(sources: dict[str, ast.Module]) -> list[str]:
-    """One message per unlisted file that reads the real clock"""
+def clock_offenders(
+    sources: dict[str, ast.Module],
+    scopes: dict[str, list[Marker]] | None = None,
+) -> list[str]:
+    """One message per unlisted file that reads the real clock outside every exemption"""
     offenders: list[str] = []
     for rel, tree in sorted(sources.items()):
         if rel in ALLOWED:
             continue
-        reads = real_clock_reads(tree)
+        scoped = (scopes or {}).get(rel, [])
+        reads = [
+            (line, name) for line, name in real_clock_reads(tree)
+            if not _covered(scoped, line)
+        ]
         if reads:
             shown = ", ".join(f"{name} (line {line})" for line, name in reads[:5])
             if len(reads) > 5:
@@ -321,20 +492,20 @@ def test_no_test_pairs_a_faked_clock_with_a_wall_clock_literal() -> None:
 
 
 def test_unlisted_test_files_do_not_read_the_real_clock() -> None:
-    offenders = clock_offenders(_sources())
+    offenders = clock_offenders(_sources(), marker_scopes(_texts()))
     assert not offenders, (
-        f"{len(offenders)} test file(s) read the real clock and are not in ALLOWED:\n  "
+        f"{len(offenders)} test file(s) read the real clock unexempted:\n  "
         + "\n  ".join(offenders)
-        + "\n\nFake the clock instead. If the read is genuinely unavoidable, add the "
-        "file to ALLOWED with a reason naming its class "
-        '("class 2 — …" or "class 3 — …").'
+        + "\n\nFake the clock instead. If the read is genuinely unavoidable, put a "
+        "`# clock-exempt: class 3 — <reason>` (or class 4) comment inside the function "
+        "that holds it."
     )
 
 
 def test_allowed_reasons_name_their_class() -> None:
     bad = {rel: reason for rel, reason in ALLOWED.items() if not _CLASS_REASON.match(reason)}
     assert not bad, (
-        "every ALLOWED reason must match '^class (2|3) — .+' — an entry with no class "
+        "every ALLOWED reason must match '^class (2|3|4) — .+' — an entry with no class "
         f"and no reason is a shrug, not an exemption: {sorted(bad)}"
     )
 
@@ -352,6 +523,53 @@ def test_allowed_has_no_stale_entries() -> None:
     assert not stale, (
         f"{len(stale)} ALLOWED entry/entries no longer read the real clock — delete "
         f"this entry, the list is shrink-only: {stale}"
+    )
+
+
+def test_marker_reasons_name_their_class() -> None:
+    bad = marker_reason_offenders(_texts())
+    assert not bad, (
+        "every clock-exempt marker must match '^class (2|3|4) — .+' — a marker with no "
+        f"class and no reason is a shrug, not an exemption:\n  " + "\n  ".join(bad)
+    )
+
+
+def test_no_marker_claims_class_2() -> None:
+    bad = marker_class_two_offenders(_texts())
+    assert not bad, (
+        f"{len(bad)} marker(s) claim class 2:\n  " + "\n  ".join(bad)
+    )
+
+
+def test_module_level_markers_sit_above_the_first_definition() -> None:
+    bad = misplaced_marker_offenders(_texts())
+    assert not bad, (
+        f"{len(bad)} module-level marker(s) are stranded mid-file:\n  " + "\n  ".join(bad)
+    )
+
+
+def test_every_marker_covers_a_real_clock_read() -> None:
+    bad = uncovered_marker_offenders(_texts())
+    assert not bad, (
+        f"{len(bad)} marker(s) cover no real-clock read — markers are shrink-only and "
+        f"cannot go stale:\n  " + "\n  ".join(bad)
+    )
+
+
+# Unique reasons supersede spec 2.1's `rg | uniq -d` check
+def test_marker_reasons_are_unique() -> None:
+    bad = duplicate_marker_reasons(_texts())
+    assert not bad, (
+        f"{len(bad)} marker reason(s) are used more than once — a duplicated reason is a "
+        f"generic reason; one unique reason per exempt function:\n  " + "\n  ".join(bad)
+    )
+
+
+def test_allowed_has_no_entry_the_markers_carry() -> None:
+    carried = redundant_allowed_entries(ALLOWED, _texts())
+    assert not carried, (
+        f"{len(carried)} ALLOWED entry/entries have every real-clock read covered by a "
+        f"marker — delete this entry, the markers carry it: {carried}"
     )
 
 
@@ -459,6 +677,158 @@ def test_stale_entry_rule_fires_on_a_listed_file_with_no_real_clock_read() -> No
 def test_class_reason_regex_refuses_a_shrug() -> None:
     assert _CLASS_REASON.match("class 2 — rows back-dated with time.time() - N")
     assert _CLASS_REASON.match("class 3 — spin-waits on a real subprocess dying")
+    assert _CLASS_REASON.match("class 4 — a mtime the kernel wrote")
     assert not _CLASS_REASON.match("needed")
     assert not _CLASS_REASON.match("class 1 — the flake itself")
     assert not _CLASS_REASON.match("class 3")
+
+
+# ------------------------------------------------------- the marker rules, armed
+
+_SYNTH_MODULE_TOP = '''# clock-exempt: class 3 — a synthetic module-top marker
+import time
+
+
+def test_x():
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        time.sleep(0.01)
+'''
+
+_SYNTH_FUNCTION_SCOPE = '''import time
+
+
+def test_x():
+    # clock-exempt: class 3 — a synthetic function-scope marker
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_y():
+    return time.time()
+'''
+
+_SYNTH_LATE_MODULE_MARKER = '''import time
+
+
+def test_x():
+    time.sleep(0.01)
+
+
+# clock-exempt: class 3 — a synthetic marker stranded below the first def
+'''
+
+_SYNTH_CLASS_TWO_MARKER = '''import time
+
+
+def test_x():
+    # clock-exempt: class 2 — a synthetic back-dated row
+    return time.time() - 60
+'''
+
+_SYNTH_COVERS_NOTHING = '''def test_x():
+    # clock-exempt: class 3 — a synthetic marker over no read at all
+    assert True
+'''
+
+_SYNTH_SHRUG_MARKER = '''import time
+
+
+def test_x():
+    # clock-exempt: needed
+    time.sleep(0.01)
+'''
+
+_SYNTH_DUPLICATE_A = '''import time
+
+
+def test_x():
+    # clock-exempt: class 3 — a synthetic reason used in two places
+    time.sleep(0.01)
+'''
+
+
+def test_a_module_top_marker_exempts_every_read_in_the_file() -> None:
+    files = {"tests/synth.py": _SYNTH_MODULE_TOP}
+    assert clock_offenders({"tests/synth.py": _parse(_SYNTH_MODULE_TOP)},
+                           marker_scopes(files)) == []
+    assert uncovered_marker_offenders(files) == []
+
+
+def test_a_function_marker_leaves_a_read_in_another_function_caught() -> None:
+    files = {"tests/synth.py": _SYNTH_FUNCTION_SCOPE}
+    offenders = clock_offenders({"tests/synth.py": _parse(_SYNTH_FUNCTION_SCOPE)},
+                                marker_scopes(files))
+    assert len(offenders) == 1, offenders
+    assert "time.time (line 12)" in offenders[0], offenders
+    assert "time.sleep" not in offenders[0], "the marked spin-wait was reported"
+
+
+def test_a_module_marker_below_the_first_definition_is_refused() -> None:
+    offenders = misplaced_marker_offenders({"tests/synth.py": _SYNTH_LATE_MODULE_MARKER})
+    assert len(offenders) == 1, offenders
+    assert "tests/synth.py:8" in offenders[0]
+    assert "inside the function it exempts" in offenders[0]
+
+
+def test_a_class_2_marker_is_refused() -> None:
+    offenders = marker_class_two_offenders({"tests/synth.py": _SYNTH_CLASS_TWO_MARKER})
+    assert len(offenders) == 1, offenders
+    assert "db.now()" in offenders[0]
+    assert marker_class_two_offenders({"tests/synth.py": _SYNTH_MODULE_TOP}) == []
+
+
+def test_a_marker_covering_no_real_clock_read_is_refused() -> None:
+    offenders = uncovered_marker_offenders({"tests/synth.py": _SYNTH_COVERS_NOTHING})
+    assert len(offenders) == 1, offenders
+    assert "delete" in offenders[0]
+
+
+def test_a_marker_reason_that_names_no_class_is_refused() -> None:
+    offenders = marker_reason_offenders({"tests/synth.py": _SYNTH_SHRUG_MARKER})
+    assert len(offenders) == 1, offenders
+    assert "needed" in offenders[0]
+
+
+def test_a_duplicated_marker_reason_is_refused() -> None:
+    files = {"tests/a.py": _SYNTH_DUPLICATE_A, "tests/b.py": _SYNTH_DUPLICATE_A}
+    offenders = duplicate_marker_reasons(files)
+    assert len(offenders) == 1, offenders
+    assert "tests/a.py" in offenders[0] and "tests/b.py" in offenders[0]
+    assert duplicate_marker_reasons({"tests/a.py": _SYNTH_DUPLICATE_A}) == []
+
+
+def test_an_allowed_entry_the_markers_carry_is_refused() -> None:
+    files = {"tests/synth.py": _SYNTH_MODULE_TOP}
+    assert redundant_allowed_entries({"tests/synth.py": _SPIN}, files) == ["tests/synth.py"]
+    assert redundant_allowed_entries(
+        {"tests/synth.py": _SPIN}, {"tests/synth.py": _SYNTH_FUNCTION_SCOPE}) == []
+
+
+_SYNTH_TRIM_TARGET = '''# clock-exempt: class 3 — a synthetic module-top marker whose reason runs well past the hundred characters trim keeps
+# A prose comment directly under it,
+# spread over two lines.
+import time
+
+
+def test_x():
+    # A prose comment directly above,
+    # also two lines.
+    # clock-exempt: class 3 — a synthetic function-scope marker
+    time.sleep(0.01)
+'''
+
+
+def test_the_comment_trimmer_leaves_every_marker_byte_for_byte() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("trim_comments", REPO_ROOT / "scripts/trim_comments.py")
+    trim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(trim)
+    out = trim.trim_source(_SYNTH_TRIM_TARGET, "tests/synth.py")
+    markers = [ln for ln in _SYNTH_TRIM_TARGET.splitlines() if "clock-exempt:" in ln]
+    assert len(markers) == 2
+    for marker in markers:
+        assert marker in out.splitlines(), out
+    assert out != _SYNTH_TRIM_TARGET, "the prose around the markers should still be trimmed"

@@ -1,5 +1,6 @@
 """The remedy: a closed vocabulary, a mandatory gate, and the daemon that applies it (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
 
+# clock-exempt: class 3 — spin-waits on daemon.remedy_applying while a real remedy thread applies the fix
 from __future__ import annotations
 
 import ast

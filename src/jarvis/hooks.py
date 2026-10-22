@@ -170,7 +170,9 @@ def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str,
 
 #: The `##` headings a PR body must carry
 PR_BODY_SECTIONS = ("Summary", "Implementation notes", "Questions asked to Neo",
-                    "Alarms raised", "Learnings", "Test evidence", "Screenshots")
+                    "Alarms raised", "Learnings", "Test evidence",
+                    # `morpheus.SECTION`: production validation is an OS function, for every project
+                    "How to validate in production", "Screenshots")
 
 # GitHub renders neither of these, so neither can mislink or count as content
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)

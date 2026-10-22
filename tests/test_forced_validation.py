@@ -1,5 +1,6 @@
 """`jarvis validation force`: a person opens a round, and no worker is pretended (docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md)"""
 
+# clock-exempt: class 3 — spin-waits on fleet.validating while a forced round runs on a real daemon thread
 from __future__ import annotations
 
 import json

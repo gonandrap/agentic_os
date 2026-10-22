@@ -646,6 +646,52 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--project")
     sp.add_argument("--json", action="store_true")
 
+    # Morpheus: production validation of shipped PRs (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+    mo = sub.add_parser(
+        "morpheus", help="Morpheus: every shipped PR watched in production until validated",
+    ).add_subparsers(dest="morpheus_cmd", required=True)
+    m = mo.add_parser("status", help="counts by state, the session, then every PR")
+    m.add_argument("--all", action="store_true", help="list settled PRs too")
+    m = mo.add_parser("show", help="one PR: its hints, script, last output and action")
+    m.add_argument("item_id")
+    m = mo.add_parser("enqueue-release",
+                      help="queue every PR a release carries (shipit runs this)")
+    m.add_argument("tag", help="the release tag, e.g. jarvis-0.9.3")
+    m.add_argument("--from", dest="from_ref",
+                   help="the previous release's ref (default: the tag before TAG)")
+    m.add_argument("--to", dest="to_ref", help="the shipped commit (default: TAG)")
+    m.add_argument("--repo", help="the git checkout to read (default: production's)")
+    m.add_argument("--project", help="the onboarded project the release is of (default: "
+                                     "the one whose origin is --repo, else the OS)")
+    m = mo.add_parser("add", help="queue one PR by number or URL, outside a release")
+    m.add_argument("pr")
+    m.add_argument("--repo", help="the git checkout whose origin owns a bare PR number")
+    m.add_argument("--release", default="", help="the release to file it under")
+    m.add_argument("--project", help="the onboarded project the PR is of (default: "
+                                     "matched by the PR's repository)")
+    m = mo.add_parser("script", help="(Morpheus's subagents) give a PR its validation "
+                                     "script; a queued PR starts being monitored")
+    m.add_argument("item_id")
+    m.add_argument("--file", required=True, help="the script, or - for stdin")
+    m.add_argument("--source", default="agent", choices=["agent", "user"])
+    m = mo.add_parser("check", help="run a PR's script now, the way the daemon would")
+    m.add_argument("item_id")
+    m = mo.add_parser("waive", help="rule a PR validated yourself")
+    m.add_argument("item_id")
+    m.add_argument("--reason", required=True)
+    m = mo.add_parser("requeue", help="watch a settled PR again with a fresh deadline")
+    m.add_argument("item_id")
+    m = mo.add_parser("pause", help="hold Morpheus's session turns, whatever the fleet does "
+                                    "(checks still run; they spend nothing)")
+    m.add_argument("--reason", required=True)
+    m = mo.add_parser("unpause", help="let Morpheus's session turns run, even through a "
+                                      "fleet `jarvis pause`")
+    m.add_argument("--reason", required=True)
+    mo.add_parser("follow-fleet", help="drop the pause/unpause pin: Morpheus pauses with "
+                                       "the fleet again")
+    for m in mo.choices.values():
+        m.add_argument("--json", action="store_true", help="machine-readable output")
+
     # §7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets- investigated.md
     sp = sub.add_parser(
         "stuck", help="open orders judged on time in status, most overdue first")
@@ -3785,6 +3831,113 @@ def cmd_io(args: argparse.Namespace) -> int:
     return 0
 
 
+MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "failed": "✗",
+                 "timedout": "⌛"}
+
+
+def _morpheus_line(item: dict) -> str:
+    action = f" → {item['action']}" if item.get("action") else ""
+    return (f"{MORPHEUS_ICON.get(item['state'], '•')} {item['id']} "
+            f"[{item.get('project') or '?'}] PR #{item['pr_number']} "
+            f"{item['state']}{action} — {item['pr_title'][:70]}")
+
+
+def cmd_morpheus(args: argparse.Namespace) -> int:
+    """`jarvis morpheus …` — a thin wrapper over `ops.morpheus_*`"""
+    from . import ops
+
+    if args.morpheus_cmd == "status":
+        rep = ops.morpheus_report()
+        if not args.all:
+            rep["items"] = [i for i in rep["items"]
+                            if i["state"] in ("queued", "monitoring") or
+                            (i["state"] in ("failed", "timedout"))]
+        if args.json:
+            _print(rep, True)
+            return 0
+        c = rep["counts"]
+        sess = rep["session"]
+        print(" · ".join(f"{n} {s}" for s, n in c.items()) +
+              (f" · last release {rep['last_release']}" if rep["last_release"] else ""))
+        share = sess.get("context_share")
+        print(f"session: {sess.get('session_id') or 'not started'}"
+              f" · {sess.get('turns') or 0} turn(s)"
+              f" · {sess.get('compactions') or 0} compaction(s)"
+              + (f" · context {share:.0%}" if share is not None else "")
+              + f" · {_morpheus_pause_text(rep['pause'])}"
+              + (f" · last error: {sess['last_error']}" if sess.get("last_error") else ""))
+        for item in rep["items"]:
+            print(_morpheus_line(item))
+        return 0
+    if args.morpheus_cmd == "show":
+        item = ops.morpheus_item(args.item_id)
+        if args.json:
+            _print(item, True)
+            return 0
+        print(_morpheus_line(item))
+        print(f"{item['pr_url']}  release {item['release_tag'] or '—'}"
+              f"  work order {item['wo_id'] or '—'}")
+        print(f"checks {item['checks']} · last exit {item['last_exit']}"
+              f" · deadline {_stamp(item['deadline_ts'])}")
+        if item["resolution"]:
+            print(f"\n{item['resolution']}")
+        print(f"\nhints:\n{item['hints'] or '(none)'}")
+        print(f"\nscript ({item['script_source'] or 'none yet'}):\n{item['script'] or '—'}")
+        if item["last_output"]:
+            print(f"\nlast output:\n{item['last_output']}")
+        return 0
+    if args.morpheus_cmd == "enqueue-release":
+        _print(ops.morpheus_enqueue_release(args.tag, args.from_ref, args.to_ref,
+                                            args.repo, args.project), args.json)
+        return 0
+    if args.morpheus_cmd == "add":
+        item = ops.morpheus_add(args.pr, args.repo, args.release, args.project)
+        _print(item if args.json else {"queued": item["id"], "state": item["state"]},
+               args.json)
+        return 0
+    if args.morpheus_cmd == "script":
+        text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text()
+        item = ops.morpheus_set_script(args.item_id, text, args.source)
+        _print({"id": item["id"], "state": item["state"],
+                "note": "the daemon runs it every check_every_minutes from production"},
+               args.json)
+        return 0
+    if args.morpheus_cmd == "check":
+        item = ops.morpheus_check(args.item_id)
+        _print(item if args.json else {
+            "id": item["id"], "state": item["state"],
+            "exit": item.get("probe_exit", item["last_exit"]),
+            "output": item.get("probe_output", item["last_output"])}, args.json)
+        return 0
+    if args.morpheus_cmd == "waive":
+        item = ops.morpheus_waive(args.item_id, args.reason)
+        _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
+    if args.morpheus_cmd == "requeue":
+        item = ops.morpheus_requeue(args.item_id)
+        _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
+    if args.morpheus_cmd in ("pause", "unpause", "follow-fleet"):
+        mode = {"pause": "paused", "unpause": "running"}.get(args.morpheus_cmd)
+        state = ops.morpheus_pause(mode, getattr(args, "reason", ""))
+        if args.json:
+            _print(state, True)
+        else:
+            print(_morpheus_pause_text(state))
+        return 0
+    return 1
+
+
+def _morpheus_pause_text(pause: dict) -> str:
+    fleet = "fleet paused" if pause["fleet_paused"] else "fleet running"
+    if pause["override"] == "paused":
+        return f"PAUSED by `morpheus pause` ({fleet}): {pause['reason']}"
+    if pause["override"] == "running":
+        return f"RUNNING by `morpheus unpause` ({fleet}): {pause['reason']}"
+    return ("PAUSED with the fleet (no session turns)" if pause["paused"]
+            else "running (follows the fleet pause)")
+
+
 def cmd_investigate(args: argparse.Namespace) -> int:
     """`jarvis investigate …` — A THIN WRAPPER HOLDING NO LOGIC (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     from . import ops, verdicts
@@ -5244,6 +5397,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_io(args)
         if args.cmd == "investigate":
             return cmd_investigate(args)
+        if args.cmd == "morpheus":
+            return cmd_morpheus(args)
         if args.cmd == "gate":
             return cmd_gate(args)
         if args.cmd == "rules":
