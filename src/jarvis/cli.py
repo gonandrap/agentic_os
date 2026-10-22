@@ -3869,6 +3869,7 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
               f" · {sess.get('compactions') or 0} compaction(s)"
               + (f" · context {share:.0%}" if share is not None else "")
               + f" · {_morpheus_pause_text(rep['pause'])}"
+              + f" · {_morpheus_activity_text(rep['activity'])}"
               + (f" · last error: {sess['last_error']}" if sess.get("last_error") else ""))
         for item in rep["items"]:
             print(_morpheus_line(item))
@@ -3939,7 +3940,28 @@ def _morpheus_pause_text(pause: dict) -> str:
     if pause["override"] == "running":
         return f"RUNNING by `morpheus unpause` ({fleet}): {pause['reason']}"
     return ("PAUSED with the fleet (no session turns)" if pause["paused"]
-            else "running (follows the fleet pause)")
+            else "unpaused (follows the fleet)")
+
+
+def _morpheus_activity_text(act: dict) -> str:
+    """The pause mode says what is ALLOWED; this says what the session is doing (issue #1162)"""
+    if act["turn_in_flight"]:
+        return (f"{act['turn_kind'] or 'turn'} in flight since "
+                f"{_stamp(act['turn_started_ts'])}")
+    if act.get("abandoned_turn_ts"):
+        parts = [f"idle (the {act['turn_kind'] or 'turn'} started "
+                 f"{_stamp(act['abandoned_turn_ts'])} never finished)"]
+    else:
+        parts = [f"idle · {act['due']} queued due now" if act["due"] else "idle"]
+    if act.get("usage_hold_until"):
+        parts.append(f"held until {_stamp(act['usage_hold_until'])} (usage limit)")
+    for h in act["held"]:
+        why = {"error": " after a failed turn", "offer": " after an offer"}.get(h["cause"], "")
+        parts.append(f"{h['id']} offered {h['offers']} of {act['max_offers']}: "
+                     + ("no offer left, it will time out"
+                        if h["exhausted"]
+                        else f"held back{why} until {_stamp(h['next_offer_ts'])}"))
+    return " · ".join(parts)
 
 
 def cmd_investigate(args: argparse.Namespace) -> int:

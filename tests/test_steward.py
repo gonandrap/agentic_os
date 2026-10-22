@@ -225,6 +225,87 @@ def test_an_identical_decision_within_the_hour_is_one_row(fleet):
         central.close()
 
 
+# ---------------------------------------------------------------- dedupe (§3.2)
+
+
+#: Decisions #23, #24 and #25 of 2026-10-22, verbatim: one mechanism, three wordings
+PANEL_DUPES = [
+    "uilog._last_success: a recovery that scrolls out of the 64KiB access tail "
+    "re-raises the healed error",
+    "uilog._last_success: a recovery that scrolls out of the 64KiB access tail "
+    "re-lights the error",
+    "uilog.recent_errors: a healed error comes back once its success scrolls out of "
+    "the 64KiB access tail",
+]
+
+
+def test_the_bucket_is_the_origin_unit_and_the_file(fleet):
+    assert steward.dedupe_key(cand(parent_wo_id="wo-1", file="SRC/Jarvis/UiLog.py")) == (
+        "proj_a|bug_agent|wo-1|src/jarvis/uilog.py")
+    # Nothing to collapse by: a candidate that names no code, or none that caused it
+    assert steward.dedupe_key(cand(parent_wo_id="wo-1")) == ""
+    assert steward.dedupe_key(cand(file="src/jarvis/uilog.py")) == ""
+
+
+def test_one_defect_worded_by_three_seats_is_one_queued_decision(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("the order the panel reviewed")
+    out = [steward.gate(cand(origin_kind="panel", severity="medium", subject=subject,
+                             parent_wo_id=parent["id"], file="src/jarvis/uilog.py"),
+                        catalog=cat, store=store)
+           for subject in PANEL_DUPES]
+    assert [(d.outcome, d.rule) for d in out] == [
+        ("queue", "recurrence"), ("drop", "duplicate"), ("drop", "duplicate")]
+    assert {d.duplicate_of for d in out[1:]} == {out[0].decision_id}
+    assert not any(d.allowed for d in out)
+    central = CentralStore()
+    try:
+        rows = central.steward_decisions()
+    finally:
+        central.close()
+    # RECORDED against the one decision they restate, not dropped silently
+    assert len(rows) == 3
+    assert [r["duplicate_of"] for r in rows] == [out[0].decision_id,
+                                                 out[0].decision_id, 0]
+
+
+def test_another_file_under_the_same_order_is_its_own_decision(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("one order, two files")
+    first, second = (steward.gate(
+        cand(origin_kind="panel", severity="medium", subject=f"defect in {path}",
+             parent_wo_id=parent["id"], file=path), catalog=cat, store=store)
+        for path in ("src/jarvis/ops.py", "src/jarvis/uilog.py"))
+    assert (first.rule, second.rule) == ("recurrence", "recurrence")
+    assert second.duplicate_of == 0
+
+
+def test_a_dropped_wording_does_not_swallow_a_severer_one(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("minor first, critical after")
+    where = dict(origin_kind="panel", parent_wo_id=parent["id"],
+                 file="src/jarvis/uilog.py")
+    low = steward.gate(cand(severity="minor", subject="a nit", **where),
+                       catalog=cat, store=store)
+    high = steward.gate(cand(severity="critical", subject="data loss", **where),
+                        catalog=cat, store=store)
+    assert (low.outcome, low.rule) == ("drop", "low-severity")
+    assert (high.outcome, high.rule, high.duplicate_of) == ("dispatch", "urgent", 0)
+
+
+def test_a_candidate_that_names_no_code_is_never_deduped(fleet):
+    """A red `main` keeps its own rule — the hourly repeat check, not the dedupe bucket"""
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("no file named")
+    first = steward.gate(cand(origin_kind="red_main", severity="critical",
+                              parent_wo_id=parent["id"]), catalog=cat, store=store)
+    assert first.duplicate_of == 0 and first.allowed is True
+
+
 # ---------------------------------------------------------------- the weekly digest
 
 

@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 from . import budget, claude_cli, db, worker_session
 # A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here
-from .automerge import HELD_NOT_PASSED, HELD_SHA_MOVED, HELD_SHA_UNRECORDED
+from .automerge import (
+    HELD_BASE_MOVED,
+    HELD_NOT_PASSED,
+    HELD_SHA_MOVED,
+    HELD_SHA_UNRECORDED,
+)
 # Same leaf argument: `autoreview` imports only `navigation`
 from .autoreview import REFUSAL_UNANSWERED_REASON
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
@@ -189,6 +194,12 @@ AUTOMERGE_DENIED_BLOCKER = ("the automatic merge of the commit the panel accepte
                             "— merge it by hand, push a fix and re-judge it "
                             "(`jarvis validation force`), or close it with "
                             "`jarvis wo done`")
+
+#: THE BASE OUTRAN THE CATCH-UP (#1173, kn-d37ef253): the OS has retired the chase and asks
+CATCH_UP_EXHAUSTED_BLOCKER = ("the base moved under the commit the panel accepted and the "
+                              "OS has caught this branch up as often as it may, so "
+                              "nothing will land this pull request by itself — merge it "
+                              "by hand, or `jarvis wo send` the worker to rebase")
 
 #: What a work order says when the validation panel gave up on it: it kept resubmitting and the panel...
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
@@ -458,6 +469,20 @@ def sha_unrecorded_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
     return _parked_on_a_decline(store, wo, rebind=False, code=HELD_SHA_UNRECORDED)
 
 
+def catch_up_exhausted_hold(store: ProjectStore, wo_id: str) -> dict[str, Any] | None:
+    """The newest hold, when it is the OS saying it will NOT chase this moving base again (#1173)"""
+    from . import ops as ops_mod
+
+    held = store.events_of_kind(wo_id, "automerge_held")
+    if not held:
+        return None
+    newest = db.from_json(held[-1]["payload"], {})
+    if (str(newest.get("code") or "") != HELD_BASE_MOVED
+            or str(newest.get("catch_up") or "") != ops_mod.CATCH_UP_EXHAUSTED):
+        return None
+    return newest
+
+
 def sha_unrecorded_rejudge_spent(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """The stall with no commit bound AND NO DECLINE: the OS spent its one round on this very head and..."""
     from . import ops as ops_mod
@@ -698,6 +723,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # ...AND THE SAME STALL THE OS ALREADY SPENT ITS ROUND ON
     if wo["status"] == "waiting_pr_merge" and sha_unrecorded_rejudge_spent(store, wo):
         blockers.append(SHA_UNRECORDED_SPENT_BLOCKER)
+    # THE BASE MOVING FASTER THAN THE OS MAY CHASE IT
+    if (wo["status"] == "waiting_pr_merge"
+            and catch_up_exhausted_hold(store, wo["id"]) is not None):
+        blockers.append(CATCH_UP_EXHAUSTED_BLOCKER)
     # A MERGE THE REVIEWER REFUSED
     if wo["status"] == "waiting_pr_merge" and automerge_denied(store, wo):
         blockers.append(AUTOMERGE_DENIED_BLOCKER)
@@ -1488,6 +1517,33 @@ def neo_question_blocker(question: dict[str, Any]) -> str:
 
 
 # -- invariants
+
+
+def check_a_working_worker_is_not_waiting(store: ProjectStore) -> Iterator[Violation]:
+    """INV-WAIT-WORKING — a worker with a turn in flight is not waiting for you (issue 1166)"""
+    from . import hooks
+
+    readonly = getattr(store, "readonly", False)
+    for wo in store.list_work_orders(statuses=("waiting_input",), include_hidden=True):
+        # The exact literal the hook stamps, never a substring: a permission prompt keeps its flag
+        if (wo.get("attention_reason") or "") != hooks.IDLE_PROMPT:
+            continue
+        turn = worker_session.busy(store, wo["id"])
+        if turn is None:
+            continue
+        if not end_wait_if_nothing_is_out(store, wo["id"]):
+            continue
+        store.clear_attention(wo["id"])
+        yield Violation(
+            invariant="INV-WAIT-WORKING",
+            wo_id=wo["id"],
+            detail=f"parked on you by the idle prompt while turn {turn['seq']} is "
+                   f"still in flight",
+            repaired=not readonly,
+            repair=("would take " if readonly else "took ")
+                   + "the order back to running and clear the flag",
+            context={"turn": turn["seq"]},
+        )
 
 
 def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
@@ -3600,6 +3656,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                     # request is a blocker they would otherwise believe
     check_repaired_work_rejoins_the_merge_queue,  # BEFORE the reason checks: it moves
                                    # the status they derive a reason from
+    check_a_working_worker_is_not_waiting,  # BEFORE the reason checks: it moves the status
+                                   # they derive from, and INV-ATTENTION-MISSING would re-flag what it clears
     check_attention_reason_is_true,
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks

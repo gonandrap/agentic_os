@@ -11,7 +11,7 @@ from jarvis import neo as neo_mod
 from jarvis import ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
-from jarvis.hooks import handle_hook
+from jarvis.hooks import IDLE_PROMPT, IDLE_WHILE_WORKING, handle_hook
 from jarvis.invariants import (
     IDLE_NO_FINISH_BLOCKER,
     awaiting_neo,
@@ -276,6 +276,139 @@ def test_a_real_permission_prompt_still_reaches_the_user(project):
     assert fresh["status"] == "waiting_input"
     assert fresh["needs_attention"] == 1
     assert "permission" in fresh["attention_reason"]
+
+
+# -- 3b. the hook: the idle prompt on a session that is still working (issue 1166)
+
+
+def working(store: ProjectStore, status: str = "running") -> dict:
+    """A work order whose worker has a turn in flight — what `claude agents` calls busy"""
+    wo = store.create_work_order("background-session transport")
+    store.set_status(wo["id"], status)
+    store.create_turn(wo["id"], "dispatch", "go")
+    return store.get_work_order(wo["id"])
+
+
+def test_the_shared_constant_is_the_message_claude_code_sends(project):
+    """Both the hook and INV-WAIT-WORKING match this literal and nothing else"""
+    assert IDLE_PROMPT == IDLE_NOTIFICATION
+
+
+def test_the_idle_prompt_does_not_page_the_user_while_the_worker_works(project):
+    """The bug: the idle timer fires mid-tool-call and the order is still running"""
+    store = ProjectStore(project)
+    wo = working(store)
+
+    handle_hook(
+        {"hook_event_name": "Notification", "session_id": "s1",
+         "cwd": str(project), "message": IDLE_NOTIFICATION},
+        {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)},
+    )
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "running"
+    assert not fresh["needs_attention"]
+    assert store.unrouted_notifications() == []
+    assert ignored_reason(store, wo["id"]) == IDLE_WHILE_WORKING
+
+
+def test_a_permission_prompt_mid_turn_still_reaches_the_user(project):
+    """The guard is on the message, not on the turn: a real prompt also arrives mid-turn"""
+    store = ProjectStore(project)
+    wo = working(store)
+
+    handle_hook(
+        {"hook_event_name": "Notification", "session_id": "s1",
+         "cwd": str(project), "message": "Claude needs your permission to use Bash"},
+        {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)},
+    )
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "waiting_input"
+    assert fresh["needs_attention"] == 1
+    assert "permission" in fresh["attention_reason"]
+
+
+def test_the_idle_prompt_still_parks_a_worker_whose_turn_has_ended(project):
+    """The control: no turn in flight, so the prompt means what it says"""
+    store = ProjectStore(project)
+    wo = working(store)
+    store.finish_turn(store.latest_turn(wo["id"])["id"], "done")
+
+    handle_hook(
+        {"hook_event_name": "Notification", "session_id": "s1",
+         "cwd": str(project), "message": IDLE_NOTIFICATION},
+        {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(project)},
+    )
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "waiting_input"
+    assert fresh["attention_reason"] == IDLE_NOTIFICATION
+
+
+# -- 3c. the state the live bug left heals itself
+
+
+def parked_by_the_idle_prompt(store: ProjectStore) -> dict:
+    """What the hook used to leave: `waiting_input` + the idle flag, turn still running"""
+    wo = working(store, status="waiting_input")
+    store.flag_attention(wo["id"], IDLE_NOTIFICATION)
+    return store.get_work_order(wo["id"])
+
+
+def test_the_invariant_ends_a_wait_the_worker_is_not_in(project):
+    store = ProjectStore(project)
+    wo = parked_by_the_idle_prompt(store)
+
+    violations = check_project(store, repair=True)
+
+    assert [v.invariant for v in violations] == ["INV-WAIT-WORKING"]
+    assert violations[0].repaired
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "running"
+    assert not fresh["needs_attention"]
+    # INV-ATTENTION-MISSING does not put it back on the next pass
+    assert check_project(store, repair=True) == []
+
+
+def test_the_invariant_reports_without_repairing(project):
+    store = ProjectStore(project)
+    wo = parked_by_the_idle_prompt(store)
+
+    violations = check_project(store, repair=False)
+
+    assert [v.invariant for v in violations] == ["INV-WAIT-WORKING"]
+    assert not violations[0].repaired
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "waiting_input"
+    assert fresh["attention_reason"] == IDLE_NOTIFICATION
+
+
+def test_the_invariant_leaves_a_real_permission_prompt_alone(project):
+    """The exact literal, not a substring: the user is the only way out of a prompt"""
+    store = ProjectStore(project)
+    wo = working(store, status="waiting_input")
+    store.flag_attention(wo["id"], "Claude needs your permission to use Bash")
+
+    violations = check_project(store, repair=True)
+
+    assert "INV-WAIT-WORKING" not in [v.invariant for v in violations]
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "waiting_input"
+    assert fresh["needs_attention"] == 1
+
+
+def test_the_invariant_leaves_a_wait_with_something_out_alone(project):
+    """`end_wait_if_nothing_is_out` still owns the predicate: Neo holds this one"""
+    store = ProjectStore(project)
+    wo, _ = park_on_a_question(store)
+    store.create_turn(wo["id"], "dispatch", "go")
+    store.flag_attention(wo["id"], IDLE_NOTIFICATION)
+
+    violations = check_project(store, repair=True)
+
+    assert "INV-WAIT-WORKING" not in [v.invariant for v in violations]
+    assert store.get_work_order(wo["id"])["status"] == "waiting_input"
 
 
 # -- 4. the reconciler: Daemon.settle_work_order
