@@ -1596,6 +1596,9 @@ def uncollected_task_turn_block(store: ProjectStore, wo_id: str,
     from . import background
     from .invariants import TERMINAL_STATUSES
 
+    # A background session outlives its turn and is woken by the task (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+    if env.get(TURN_TRANSPORT_ENV) != TRANSPORT_HEADLESS:
+        return None
     # One continuation, not a loop: a task that is genuinely hung must not make the turn unendable
     if payload.get("stop_hook_active"):
         return None
@@ -2091,13 +2094,19 @@ def compaction_brief(store: ProjectStore, wo: dict[str, Any], project: str) -> s
     if wo.get("description"):
         lines += ["", "## The original ask, verbatim", "", wo["description"]]
 
-    lines += ["", *worker_brief_core(wo_id, wo["title"], project)]
+    lines += ["", *worker_brief_core(wo_id, wo["title"], project,
+                                     transport=wo.get("transport"))]
     return "\n".join(lines)
 
 
-def worker_brief_core(wo_id: str, title: str, project: str) -> list[str]:
+def worker_brief_core(wo_id: str, title: str, project: str,
+                      transport: str | None = None) -> list[str]:
     from .worker_brief import core_contract
-    return core_contract(wo_id, title, project, has_knowledge=True)
+    # The worker's own env is the declaration when the row predates the column
+    return core_contract(
+        wo_id, title, project, has_knowledge=True,
+        transport=transport or os.environ.get(TURN_TRANSPORT_ENV) or TRANSPORT_HEADLESS,
+        require_crew=os.environ.get(REQUIRE_CREW_ENV) == "1")
 
 
 def resume_after_compaction(env: dict[str, str], root: Path, store: ProjectStore,
