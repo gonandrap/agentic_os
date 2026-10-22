@@ -703,3 +703,18 @@ def test_the_dashboard_shows_each_item_s_id_to_copy(central):
     page = TestClient(create_app()).get("/morpheus")
     assert f'title="click to select, then copy">{item["id"]}</td>' in page.text
     assert "jarvis morpheus unpause" in page.text and "validate the release" in page.text
+
+
+def test_the_dashboard_opens_check_and_output_in_a_modal_not_in_the_table(central):
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    item = _failed(central)
+    central.update_morpheus_item(item["id"], last_output="boom <x>")
+    page = TestClient(create_app()).get("/morpheus").text
+    assert "<details>" not in page
+    for kind in ("check", "tail"):
+        assert f'data-peek="{item["id"]}-{kind}"' in page
+        assert f'<dialog id="{item["id"]}-{kind}"' in page
+    assert "boom &lt;x&gt;" in page

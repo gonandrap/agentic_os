@@ -1141,6 +1141,18 @@ def auth_failure(text: str | None) -> AuthFailure | None:
     return AuthFailure(message=_summarise(text))
 
 
+# The CLI's `model_not_found` texts, verbatim from the 2.1.308 bundle
+_MODEL_REJECTED_RE = re.compile(
+    r"There's an issue with the selected model \(([^)]*)\)"
+    r"|The model (\S+) is not available on your")
+
+
+def model_rejected(text: str | None) -> str | None:
+    """The model id a failed turn says claude refused, or None"""
+    m = _MODEL_REJECTED_RE.search(text or "")
+    return (m.group(1) or m.group(2)) if m else None
+
+
 #: Where Claude Code keeps the OAuth session it signs in with and refreshes
 CREDENTIALS_ENV = "JARVIS_CLAUDE_CREDENTIALS"
 
