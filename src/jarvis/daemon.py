@@ -5098,6 +5098,16 @@ class Daemon:
                         validated_head=store.validated_head(round_row),
                         pending_assumptions=pending, plan_assumptions=plan_assumptions,
                         base_red=base_red)
+                    # #1141: the moved head the base hold was hiding gets the carry too
+                    if not decision.armed and decision.code == automerge.HELD_SHA_MOVED:
+                        outcome = self._carry_catch_up(project, store, wo, pr, decision)
+                        if outcome.carried:
+                            round_row = store.latest_validation_round(wo_id=wo_id)
+                            decision = automerge.decide(
+                                round_row, wo, pr, cfg,
+                                validated_head=store.validated_head(round_row),
+                                pending_assumptions=pending,
+                                plan_assumptions=plan_assumptions, base_red=base_red)
                 else:
                     # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a base that has moved
                     moved = bool(caught.base_tip) and ops.catch_up_needed(
@@ -5785,6 +5795,9 @@ class Daemon:
             if not ops.rebind_possible(store, wo, head=head, project=project.name,
                                        cfg=project.validation):
                 return CarryOutcome(False, False)
+            # #1141: merges alone, in ANY topology, earn the rebind
+            if branchproof.merges_only(project.path, judged, head, base):
+                return CarryOutcome(False, True)
             def unreadable(exc: Exception) -> CarryOutcome:
                 log.info("[%s] %s: GitHub would not say what %s merged (%s)",
                          project.name, wo["id"], head[:10], exc)
@@ -5796,17 +5809,24 @@ class Daemon:
             if failed is not None:
                 return failed
             return CarryOutcome(False, bool(chain))
+        def merges_rebind(refused: CarryOutcome) -> CarryOutcome:
+            # #1141: no carry, but merges alone still cost no counted round
+            rebind = (branchproof.merges_only(project.path, judged, head, base)
+                      and ops.rebind_possible(store, wo, head=head, project=project.name,
+                                              cfg=project.validation))
+            return CarryOutcome(False, True) if rebind else refused
+
         chain, failed = self._merge_chain(
             project, wo, pr_url=pr_url, judged=judged, head=head, base=base,
             github_error=lambda exc: refuse(
                 ops.PROOF_READ,
                 f"GitHub would not say what {head[:10]} merged ({exc})"))
         if failed is not None:
-            return failed
+            return merges_rebind(failed)
         if not chain:
-            return refuse(ops.PROOF_CHAIN,
-                          f"{head[:10]} is not {judged[:10]} plus merges of {base} or "
-                          f"of commits {judged[:10]} already contained")
+            return merges_rebind(refuse(
+                ops.PROOF_CHAIN, f"{head[:10]} is not {judged[:10]} plus merges of "
+                f"{base} or of commits {judged[:10]} already contained"))
         # The NEWEST BASE commit walked, and `""` when none was: past Neo question 806 a walked merge may...
         bases = [merged for _sha, merged, is_base in chain if is_base]
         carried = ops.carry_merge_chain(
