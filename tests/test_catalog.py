@@ -428,10 +428,11 @@ def test_validation_settings_round_trip():
 # -- the stakes classifier: three values, not a boolean
 
 
-def test_the_stakes_classifier_ships_on_the_regex():
-    """SS3.4"""
-    assert parse_catalog({"projects": []}).os.validation.stakes_classifier == "regex"
-    assert validation_of({}).stakes_classifier == "regex"
+def test_the_stakes_classifier_ships_on_the_tightened_regex():
+    """io-51469add: the measured winner is the default; `regex` stays selectable"""
+    assert parse_catalog({"projects": []}).os.validation.stakes_classifier == "regex-tightened"
+    assert validation_of({}).stakes_classifier == "regex-tightened"
+    assert validation_of({"stakes_classifier": "regex"}).stakes_classifier == "regex"
 
 
 @pytest.mark.parametrize("mode", ["regex", "shadow", "classifier"])
