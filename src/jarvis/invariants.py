@@ -3246,6 +3246,42 @@ def _stamp(ts: float | None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
 
 
+#: How long Morpheus may leave an item overdue or an action owed before that is a fault
+MORPHEUS_GRACE_SECONDS = 3600
+
+
+def check_morpheus_moves() -> Iterator[Violation]:
+    """INV-MORPHEUS-OVERDUE — a PR still open past its deadline, or an action never taken"""
+    from . import morpheus
+    from .central_store import CentralStore
+
+    catalog = _live_catalog()
+    cfg = getattr(getattr(catalog, "os", None), "morpheus", None)
+    if cfg is not None and not cfg.enabled:
+        return
+    now = db.now()
+    central = CentralStore()
+    try:
+        items = central.morpheus_items((*morpheus.OPEN_STATES, *morpheus.ACTION_STATES))
+    finally:
+        central.close()
+    for item in items:
+        if (item["state"] in morpheus.OPEN_STATES
+                and now - float(item["deadline_ts"]) > MORPHEUS_GRACE_SECONDS):
+            why = f"is still {item['state']} {(now - float(item['deadline_ts'])) / 3600:.1f}h past its deadline"
+        elif (item["state"] in morpheus.ACTION_STATES and not item["action"]
+              and now - float(item["updated_ts"]) > MORPHEUS_GRACE_SECONDS):
+            why = f"{item['state']} {(now - float(item['updated_ts'])) / 3600:.1f}h ago and no action was taken"
+        else:
+            continue
+        yield Violation(
+            invariant="INV-MORPHEUS-OVERDUE", subject_id=item["id"],
+            detail=(f"Morpheus item {item['id']} (PR #{item['pr_number']}) {why} — the "
+                    f"daemon's Morpheus pass is not running or is failing. `jarvis morpheus "
+                    f"show {item['id']}`; the daemon log names the error."),
+            context={"item": item["id"], "pr": item["pr_number"], "state": item["state"]})
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_ui_wedged,
@@ -3258,6 +3294,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_prefix_stable,
     check_os_identity,
     check_usage_meter_stale,
+    check_morpheus_moves,
 )
 
 

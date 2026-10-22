@@ -452,6 +452,16 @@ else
   run "'$CLI_INSTALLER' || say 'NOTE: wrapper install failed — jarvis doctor (INV-PROD-CLI)'"
 fi
 
+# --- 5a3. queue this release's PRs for Morpheus (production validation) ----------
+# BEST-EFFORT: the daemon queues the running release itself at boot if this fails (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+MORPHEUS_FROM=""
+if git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
+  MORPHEUS_FROM="--from '$PREV_TAG'"
+fi
+say "queueing $TAG's pull requests for production validation (Morpheus)"
+run "JARVIS_HOME='$PROD_ROOT/state' '$PROD_DIR/.venv/bin/jarvis' morpheus enqueue-release '$TAG' $MORPHEUS_FROM --to '$SHIP_SHA' --repo '$PROD_DIR' \
+  || say 'NOTE: Morpheus queueing failed — the daemon queues the running release at boot'"
+
 # --- 5b. --stage: stop here and hand the restarts to the daemon ------------------
 #
 # Everything that had to happen has happened: the tag is on origin and production's

@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Morpheus — Jarvis{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md #}
+{% set tone = {"queued": "tone-active", "monitoring": "tone-active", "validated": "tone-ok",
+               "failed": "tone-bad", "timedout": "tone-warn"} %}
+
+<p class="kv" style="margin-top:18px">
+  Every PR that reached production, in every project, watched until its check exits 0.
+  Morpheus only runs the check and reads the exit code; a PR that fails or times out is
+  handed to an investigation or to Neo, once.
+  <span class="counts">({% for s, n in report.counts.items() %}{{ n }} {{ s }}{{ " · " if not loop.last }}{% endfor %})</span>
+</p>
+
+<h2>Session</h2>
+<div class="panel">
+  {% set sess = report.session %}
+  <table>
+    <tr><th>state</th><td class="mono">
+      {% if report.enabled == false %}<span class="tone-warn">disabled (os.morpheus.enabled)</span>
+      {% elif report.paused %}<span class="tone-warn">paused — checks still run, no session turns</span>
+      {% else %}<span class="tone-ok">running</span>{% endif %}</td></tr>
+    <tr><th>session</th><td class="mono">{{ sess.get('session_id') or "not started" }}</td></tr>
+    <tr><th>turns</th><td class="mono">{{ sess.get('turns') or 0 }} · {{ sess.get('compactions') or 0 }} compaction(s)
+      {% if sess.get('compact_due') %}· <span class="tone-warn">compaction due</span>{% endif %}</td></tr>
+    <tr><th>context</th><td class="mono">
+      {% if sess.get('context_share') is not none %}{{ "%.0f"|format(sess.get('context_share') * 100) }}%
+      ({{ fmt_tok(sess.get('context_peak')) }} of {{ fmt_tok(sess.get('context_window')) }}){% else %}—{% endif %}</td></tr>
+    <tr><th>last turn</th><td class="mono">{{ fmt_ts(sess.get('last_turn_ts')) if sess.get('last_turn_ts') else "—" }}
+      {% if sess.get('last_turn_kind') %}· {{ sess.get('last_turn_kind') }}{% endif %}</td></tr>
+    {% if sess.get('last_error') %}<tr><th>last error</th><td class="mono tone-bad">{{ sess.get('last_error') }}</td></tr>{% endif %}
+    <tr><th>last release</th><td class="mono">{{ report.last_release or "—" }}</td></tr>
+  </table>
+</div>
+
+<h2>Pull requests</h2>
+<div class="panel">
+  <table>
+    <tr><th>project</th><th>PR</th><th>state</th><th>check</th><th>runs</th>
+      <th>deadline</th><th>output</th><th>handed to</th></tr>
+    {% for i in report["items"] %}
+    <tr id="{{ i.id }}">
+      <td class="mono">{{ i.project or "—" }}</td>
+      <td class="mono" style="white-space:nowrap"><a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a></td>
+      <td class="mono {{ tone[i.state] }}">{{ i.state }}</td>
+      <td class="mono">{% if i.script %}<details><summary>{{ i.script_source }}</summary><pre>{{ i.script }}</pre></details>{% else %}—{% endif %}</td>
+      <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
+      <td class="mono" style="white-space:nowrap">{{ fmt_ts(i.deadline_ts) }}</td>
+      <td class="mono">{% if i.last_output %}<details><summary>tail</summary><pre>{{ i.last_output }}</pre></details>{% else %}—{% endif %}</td>
+      <td class="mono" style="word-break:break-all">{{ i.action or "—" }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="empty">nothing queued — a release or a merge fills this</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<p class="sub">from a terminal: <span class="mono">jarvis morpheus status</span> ·
+  <span class="mono">jarvis morpheus show &lt;id&gt;</span> ·
+  <span class="mono">jarvis morpheus waive &lt;id&gt; --reason "…"</span> ·
+  <span class="mono">jarvis morpheus requeue &lt;id&gt;</span></p>
+
+{% endblock %}
