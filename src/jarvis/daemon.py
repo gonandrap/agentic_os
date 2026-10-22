@@ -2153,7 +2153,7 @@ class Daemon:
         """The account's window is spent (#235)"""
         from .invariants import usage_hold_note
 
-        reopens = limit.reset_at or (time.time()
+        reopens = limit.reset_at or (db.now()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
         store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
                                      hold_cause=VALIDATION_HELD_CAUSE)
@@ -2604,7 +2604,7 @@ class Daemon:
         from .invariants import usage_hold_note
 
         fo_id = fo["id"]
-        reopens = limit.reset_at or (time.time()
+        reopens = limit.reset_at or (db.now()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
         store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
                                      hold_cause=VALIDATION_HELD_CAUSE)

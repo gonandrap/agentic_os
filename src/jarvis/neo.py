@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
-from . import claude_cli, structured
+from . import claude_cli, db, structured
 from .neo_store import ESCALATION_CAUSES_CHOSEN, NeoStore
 
 log = logging.getLogger("neo")
@@ -280,7 +279,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             # BEFORE the generic outage below (#235)
             from .worker_session import RATE_LIMIT_FALLBACK_DELAY
 
-            reopens = e.limit.reset_at or (time.time() + RATE_LIMIT_FALLBACK_DELAY)
+            reopens = e.limit.reset_at or (db.now() + RATE_LIMIT_FALLBACK_DELAY)
             store.hold_claim(q["id"], e.limit.message, reopens)
             log.info("neo question %s held until the usage window reopens", q["id"])
             results.append({"question": q, "verdict": None, "outcome": "held"})
