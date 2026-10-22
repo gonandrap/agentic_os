@@ -6362,6 +6362,44 @@ def family_prose(kind: str | None) -> tuple[str, str]:
     return _KIND_FAMILY.get(kind or "feature", _KIND_FAMILY["feature"])
 
 
+#: Said to a WORKER whose improvement order the steward did not dispatch (Q2134)
+IO_STEWARD_REFUSED = (
+    "the steward did not dispatch this improvement order ({outcome}): {reason} "
+    "(decision #{decision_id}). Nothing was created and nothing is spending. It is on "
+    "the record: `jarvis steward decisions`"
+)
+#: `decide` said dispatch and the master switch said no (`os.autonomy.self_dispatch`)
+IO_SELF_DISPATCH_OFF = ("`os.autonomy.self_dispatch` is off, so the OS files nothing "
+                        "nobody typed")
+
+
+def _gate_improvement_order(project_name: str, title: str, refs: Sequence[str],
+                            store: ProjectStore) -> Any:
+    """The steward's call on an io a WORKER filed, or None when the user typed it (Q2134)"""
+    from . import steward
+
+    parent_wo_id = os.environ.get("JARVIS_WO_ID") or ""
+    if not parent_wo_id:
+        return None  # spec §3.2 decision 1 rule 1: the user typed it
+    try:
+        catalog = resolve_catalog()
+    except (OpsError, CatalogError, OSError, ValueError):
+        # A FAILURE IS NEVER A VERDICT (kn-40db1828): an unreadable catalog decides nothing
+        log.warning("steward: catalog unreadable; %s io create not decided", project_name)
+        return None
+    decision = steward.gate(
+        steward.Candidate("worker_io", "major", project_name, title,
+                          evidence=tuple(refs), parent_wo_id=parent_wo_id,
+                          refs=len(refs)),
+        catalog=catalog, store=store)
+    if not decision.allowed:
+        raise OpsError(IO_STEWARD_REFUSED.format(
+            outcome=decision.outcome, decision_id=decision.decision_id,
+            reason=(IO_SELF_DISPATCH_OFF if decision.would_dispatch
+                    else decision.reason)))
+    return decision
+
+
 def create_improvement_order(project_name: str, title: str, description: str = "",
                              refs: Sequence[str] = (),
                              budget_usd: float | None = None,
@@ -6384,15 +6422,26 @@ def create_improvement_order(project_name: str, title: str, description: str = "
             f"what you saw — a wo-/fo-/io-/al- id, #<issue>, a URL, or free text: "
             f"`jarvis io create {project_name} \"{title[:40]}\" -d \"...\" --ref <id>`."
         )
+    from . import steward
+
     store = ProjectStore(paths[project_name])
     try:
-        return store.create_feature_order(
+        decision = _gate_improvement_order(project_name, title, refs, store)
+        metadata: dict[str, Any] = {EVIDENCE_REFS_KEY: refs}
+        if decision is not None:
+            metadata = steward.stamped(metadata, decision)
+            if decision.budget_usd is not None:
+                budget_usd = decision.budget_usd
+        io = store.create_feature_order(
             title=title, description=description, origin=origin,
             kind="improvement",
-            metadata={EVIDENCE_REFS_KEY: refs},
+            metadata=metadata,
             # The family here is the order plus its analyst
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.feature_default_for(_spec_or_none(project_name))))
+        if decision is not None:
+            steward.linked(decision, io["id"])
+        return io
     finally:
         store.close()
 

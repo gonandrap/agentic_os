@@ -7,8 +7,9 @@ import json
 
 import pytest
 
-from jarvis import cli, ops, project_store
+from jarvis import cli, ops, project_store, steward
 from jarvis.catalog import load_catalog
+from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 
@@ -147,6 +148,78 @@ def test_an_improvement_order_with_no_evidence_is_refused(started):
     msg = str(e.value)
     assert "request for an opinion" in msg
     assert "--ref" in msg
+
+
+# -- ops: the steward decides a WORKER's io (io-c74f22c3, Q2134)
+
+@pytest.fixture()
+def enforcing(jarvis_home, fake_claude, catalog_file, project, self_dispatch_on):
+    """`started`, with the steward enforcing — `weekly_usd` is the room it has left"""
+    def make(**evolution):
+        data = json.loads(catalog_file.read_text())
+        data["os"]["evolution"] = {"mode": "enforce", **evolution}
+        catalog_file.write_text(json.dumps(data))
+        ops.start_os(str(catalog_file), foreground=True)
+    return make
+
+
+def _decisions():
+    central = CentralStore()
+    try:
+        return central.steward_decisions()
+    finally:
+        central.close()
+
+
+def test_a_worker_filed_improvement_order_over_budget_is_refused(enforcing, monkeypatch,
+                                                                 store):
+    enforcing(weekly_usd=0.0)
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-3b5590a0")
+    with pytest.raises(ops.OpsError) as e:
+        ops.create_improvement_order("proj_a", "slow first turns",
+                                     description=OBSERVATION, refs=REFS)
+    msg = str(e.value)
+    assert "queue" in msg and "the evolution ledger is spent" in msg
+    assert "jarvis steward decisions" in msg
+    assert store.list_feature_orders(kind="improvement", statuses=None) == []
+    [row] = _decisions()
+    assert (row["origin_kind"], row["outcome"], row["applied"]) == ("worker_io",
+                                                                   "queue", 0)
+
+
+def test_a_worker_filed_improvement_order_with_room_is_stamped_and_budgeted(
+        enforcing, monkeypatch, store):
+    enforcing(weekly_usd=30.0, order_budget_usd=25.0)
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-3b5590a0")
+    io = ops.create_improvement_order("proj_a", "slow first turns",
+                                      description=OBSERVATION, refs=REFS)
+    row = store.get_feature_order(io["id"])
+    assert row["budget_usd"] == 25.0
+    stamp = json.loads(row["metadata"])[steward.STAMP_KEY]
+    assert (stamp["origin_kind"], stamp["severity"]) == ("worker_io", "major")
+    # `jarvis steward why <io-id>` answers: the decision names the order it led to
+    [decision] = _decisions()
+    assert (decision["wo_id"], decision["outcome"]) == (io["id"], "dispatch")
+
+
+def test_a_worker_filed_improvement_order_needs_self_dispatch_on(started, monkeypatch):
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-3b5590a0")
+    with pytest.raises(ops.OpsError) as e:
+        ops.create_improvement_order("proj_a", "slow first turns",
+                                     description=OBSERVATION, refs=REFS)
+    assert "`os.autonomy.self_dispatch` is off" in str(e.value)
+    assert _decisions()[0]["origin_kind"] == "worker_io"
+
+
+def test_the_users_own_improvement_order_is_not_decided_by_the_steward(enforcing,
+                                                                      monkeypatch, store):
+    enforcing(weekly_usd=0.0)
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    io = ops.create_improvement_order("proj_a", "slow first turns",
+                                      description=OBSERVATION, refs=REFS)
+    assert steward.STAMP_KEY not in json.loads(
+        store.get_feature_order(io["id"])["metadata"])
+    assert _decisions() == []
 
 
 # -- ops: the listings, the show, the guards
