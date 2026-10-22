@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -210,6 +211,57 @@ def create_issue(title: str, body: str, repo: str, label: str = BUG_LABEL) -> st
     return url
 
 
+#: How the fleet writes a CI run: the run url, and the daemon brief's `run id <n>`
+RUN_REF_RE = re.compile(r"actions/runs/(\d+)|run id (\d+)", re.IGNORECASE)
+
+#: The first line of the comment a deduped report leaves on the issue that already has it
+DUPLICATE_NOTE = ("A second report of this break arrived while this issue was open, so "
+                  "its evidence is here rather than in a new issue.")
+
+
+def run_ids_in(*texts: str) -> list[str]:
+    """The CI runs a report cites, first mention first — what a break is deduped on"""
+    found: list[str] = []
+    for text in texts:
+        for match in RUN_REF_RE.finditer(text or ""):
+            run_id = match.group(1) or match.group(2)
+            if run_id not in found:
+                found.append(run_id)
+    return found
+
+
+def open_os_filed_issue(repo: str, run_id: Any) -> str:
+    """An OPEN issue THE OS ITSELF filed citing this failing run, or `""` (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §4)"""
+    from . import issues
+
+    if not run_id:
+        return ""
+    login = issues.gh_login()
+    if not login:
+        return ""
+    eligible = [
+        r for r in issues.issues_mentioning(repo, str(run_id))
+        if str(r.get("state") or "").upper() == "OPEN"
+        and str((r.get("author") or {}).get("login") or "") == login
+        and FILED_MARKER in str(r.get("body") or "")
+    ]
+    if not eligible:
+        return ""
+    return str(min(eligible, key=lambda r: int(r.get("number") or 0))["url"])
+
+
+def _already_filed(repo: str, body: str, title: str) -> str:
+    """The open OS-filed issue for a run this report cites, or `""` (issue 1212)"""
+    for run_id in run_ids_in(title, body):
+        try:
+            existing = open_os_filed_issue(repo, run_id)
+        except Exception:  # noqa: BLE001 — an unreadable tracker files the report as usual
+            return ""
+        if existing:
+            return existing
+    return ""
+
+
 def _rubric() -> str:
     """`issues.PRIORITY_RUBRIC`, imported late"""
     from .issues import PRIORITY_RUBRIC
@@ -247,7 +299,7 @@ def pickup_note(pickup: dict[str, Any]) -> str:
 
 
 def _notify(project: str, title: str, url: str, version: str, wo_id: str,
-            pickup: dict[str, Any] | None = None) -> None:
+            pickup: dict[str, Any] | None = None, heading: str = "Bug filed") -> None:
     """Put the issue link in front of the user via the normal inbox -> sinks path"""
     from .central_store import CentralStore
     from .daemon import daemon_running
@@ -257,7 +309,7 @@ def _notify(project: str, title: str, url: str, version: str, wo_id: str,
         body += f"\n{pickup_note(pickup)}"
     central = CentralStore()
     try:
-        central.add_inbox(project or "jarvis-os", f"Bug filed: {title}",
+        central.add_inbox(project or "jarvis-os", f"{heading}: {title}",
                           body=body, level="warning")
         if daemon_running() is None:
             from .notify import route_new_inbox
@@ -302,6 +354,21 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
     body = render_body(description=description, expected=expected, actual=actual,
                        version=version, project=project, wo_id=wo_id, steps=steps,
                        priority=priority)
+    existing = _already_filed(repo, body, title)
+    if existing:
+        from .issues import comment
+        try:
+            comment(existing, f"{DUPLICATE_NOTE}\n\n### {title}\n\n{body}", repo)
+        except Exception as e:  # noqa: BLE001 — never file a second issue for this break
+            raise BugReportError(
+                f"this break is already filed as {existing}, and the evidence could "
+                f"not be added there ({e}) — retry the report") from e
+        _notify(project, title, existing, version, wo_id, heading="Bug evidence added")
+        out = {"url": existing, "duplicate_of": existing, "title": title, "repo": repo,
+               "version": version, "project": project, "wo_id": wo_id, "pickup": {}}
+        if note:
+            out["note"] = note
+        return out
     url = create_issue(title, body, repo)
     # Between creating the issue and telling anyone about it (#240)
     pickup = _route(url, title, body, priority, expedite=expedite)
