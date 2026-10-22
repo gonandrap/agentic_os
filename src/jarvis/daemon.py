@@ -3253,11 +3253,11 @@ class Daemon:
         rider = {"question_id": q["id"], "wo_id": str(q["wo_id"]),
                  "title": str(dispatch.get("title") or ""),
                  "description": str(dispatch.get("description") or "")}
-        # A ledger cleanup is `medium`: real
+        # A ledger cleanup is `medium`: real. Neo's verdict is its one sighting (`min_refs_by_kind`)
         decision = steward.gate(
             steward.Candidate("neo_rider", "medium", str(q.get("project") or ""),
                               rider["title"], evidence=(f"neo question {q['id']}",),
-                              parent_wo_id=rider["wo_id"], payload=rider),
+                              parent_wo_id=rider["wo_id"], payload=rider, refs=1),
             catalog=self.catalog, store=pstore,
             self_dispatch=self.self_dispatch)
         if not decision.allowed:

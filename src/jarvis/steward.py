@@ -178,7 +178,8 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
         return ("queue", "ledger",
                 f"the evolution ledger is spent (${ledger.evolution_usd:.2f} of "
                 f"${cfg.weekly_usd:.2f})", severity)
-    threshold = cfg.major_min_refs if severity == "major" else cfg.medium_min_refs
+    threshold = cfg.min_refs_by_kind.get(
+        c.origin_kind, cfg.major_min_refs if severity == "major" else cfg.medium_min_refs)
     if c.refs < threshold:
         return ("queue", "recurrence",
                 f"`{severity}` referenced by {c.refs} order(s); {threshold} needed",

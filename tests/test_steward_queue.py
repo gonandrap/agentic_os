@@ -117,14 +117,27 @@ def _cleanups(store):
     return [w for w in store.list_work_orders() if w["origin"] == "neo"]
 
 
+def test_a_neo_cleanup_files_on_the_first_ask_when_there_is_room(enforcing, store,
+                                                                 central):
+    """The verdict is the evidence: one sighting meets `min_refs_by_kind.neo_rider`"""
+    _queue_a_rider(enforcing(weekly_usd=30.0, order_budget_usd=25.0), store)
+    [row] = central.steward_decisions()
+    assert (row["origin_kind"], row["outcome"], row["mode"]) == ("neo_rider", "dispatch",
+                                                                 "enforce")
+    [cleanup] = _cleanups(store)
+    assert cleanup["title"] == "supersede the stale gate ruling"
+    assert steward.stamp_of(cleanup)["decision_id"] == row["id"]
+
+
 def test_a_queued_neo_cleanup_is_kept_and_filed_once_the_steward_allows_it(
         enforcing, store, central):
-    _queue_a_rider(enforcing(weekly_usd=0.0, medium_min_refs=1), store)
+    _queue_a_rider(enforcing(weekly_usd=0.0), store)
     [row] = central.steward_decisions()
     assert (row["origin_kind"], row["queue_state"]) == ("neo_rider", "waiting")
+    assert row["rule"] == "ledger"
     assert _cleanups(store) == []
 
-    enforcing(weekly_usd=30.0, order_budget_usd=25.0, medium_min_refs=1)
+    enforcing(weekly_usd=30.0, order_budget_usd=25.0)
     assert _drain(central)["dispatched"] == 1
     [cleanup] = _cleanups(store)
     assert cleanup["title"] == "supersede the stale gate ruling"
@@ -135,13 +148,15 @@ def test_a_queued_neo_cleanup_is_kept_and_filed_once_the_steward_allows_it(
     assert central.steward_decision(row["id"])["wo_id"] == cleanup["id"]
 
 
-def test_a_queued_neo_cleanup_still_needs_recurrence_on_re_offer(enforcing, store,
-                                                                 central):
-    """Re-decided, never forced: a lone `medium` is one sighting, short of `medium_min_refs`"""
-    _queue_a_rider(enforcing(weekly_usd=0.0), store)
-    enforcing(weekly_usd=30.0)
-    assert _drain(central)["waiting"] == 1
+def test_a_neo_cleanup_threshold_raised_back_keeps_it_waiting_on_recurrence(
+        enforcing, store, central):
+    """The user's config wins over the shipped default: re-decided, never forced"""
+    raised = {"min_refs_by_kind": {"neo_rider": 3}}
+    _queue_a_rider(enforcing(weekly_usd=30.0, **raised), store)
     [row] = central.steward_decisions()
+    assert (row["rule"], row["queue_state"]) == ("recurrence", "waiting")
+    assert _drain(central)["waiting"] == 1
+    row = central.steward_decision(row["id"])
     assert row["queue_state"] == "waiting" and "(recurrence)" in row["queue_note"]
     assert _cleanups(store) == []
 

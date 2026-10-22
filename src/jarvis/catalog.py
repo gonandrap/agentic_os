@@ -42,7 +42,8 @@ SAFETY_KEYS = (
     # How much of that the steward may spend, and how deep it may go (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
     "os.evolution.weekly_usd", "os.evolution.critical_weekly_usd",
     "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
-    "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_precision",
+    "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_refs_by_kind",
+    "os.evolution.min_refs_by_kind.*", "os.evolution.min_precision",
     "os.evolution.mode",
     # What the OS is permitted to WATCH (docs/superpowers/specs/2026-09-27-self-evolution.md)
     "*.rules.*",
@@ -873,6 +874,8 @@ DEFAULT_EVOLUTION_ORDER_BUDGET_USD = 25.0
 DEFAULT_EVOLUTION_MAX_DEPTH = 1
 DEFAULT_EVOLUTION_MAJOR_MIN_REFS = 1
 DEFAULT_EVOLUTION_MEDIUM_MIN_REFS = 3
+#: Per origin kind, in place of the severity's `*_min_refs`: Neo raises a cleanup once, in one verdict
+DEFAULT_EVOLUTION_MIN_REFS_BY_KIND = {"neo_rider": 1}
 DEFAULT_EVOLUTION_MIN_PRECISION = 0.2
 #: `shadow` decides and records but changes no dispatch; `enforce` applies the decision
 EVOLUTION_MODES = ("shadow", "enforce")
@@ -891,6 +894,8 @@ class EvolutionConfig:
     max_depth: int = DEFAULT_EVOLUTION_MAX_DEPTH
     major_min_refs: int = DEFAULT_EVOLUTION_MAJOR_MIN_REFS
     medium_min_refs: int = DEFAULT_EVOLUTION_MEDIUM_MIN_REFS
+    min_refs_by_kind: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_EVOLUTION_MIN_REFS_BY_KIND))
     min_precision: float = DEFAULT_EVOLUTION_MIN_PRECISION
     mode: str = "shadow"
 
@@ -1738,6 +1743,21 @@ def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
         if value < 0:
             raise _err(f"{where}.{key} must be 0 or more, got {value}")
         counts[key] = value
+    by_kind = raw.get("min_refs_by_kind", {})
+    if not isinstance(by_kind, dict):
+        raise _err(f"{where}.min_refs_by_kind must be an object of origin kind -> count")
+    from .steward import ORIGIN_KINDS
+
+    # Merged over the base: setting one kind does not silently drop the shipped `neo_rider`
+    counts["min_refs_by_kind"] = dict(base.min_refs_by_kind)
+    for kind, raw_value in by_kind.items():
+        if kind not in ORIGIN_KINDS:
+            raise _err(f"{where}.min_refs_by_kind.{kind}: not an origin kind; "
+                       f"one of {list(ORIGIN_KINDS)}")
+        value = int(raw_value)
+        if value < 0:
+            raise _err(f"{where}.min_refs_by_kind.{kind} must be 0 or more, got {value}")
+        counts["min_refs_by_kind"][kind] = value
     min_precision = float(raw.get("min_precision", base.min_precision))
     if not 0 <= min_precision <= 1:
         raise _err(f"{where}.min_precision must be between 0 and 1, got {min_precision}")
