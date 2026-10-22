@@ -373,8 +373,7 @@ ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual"
                 "schedule": "⏰ scheduled"}
 
 
-# Prose out of argv: the harness's worktree guard refuses a quoted argument whose first
-# word names a binary, and the gate recogniser matches content words (issue 1209)
+# Prose out of argv: the worktree guard reads a quoted argument as a command (issue 1209)
 _PROSE_FILE_HELP = ("read this text from a file instead of the command line, or - for "
                     "stdin. A file rather than an argument on purpose: prose whose "
                     "first word names a binary is refused before jarvis runs")
@@ -392,7 +391,7 @@ _PROSE_SLOT_REQUIRED = {"question", "content", "message", "summary"}
 
 
 def fill_prose_from_files(args: argparse.Namespace) -> None:
-    """Resolve every --<slot>-file into its slot, before anything reads the slot."""
+    """Resolve every --<slot>-file into its slot, before anything reads the slot"""
     from .ops import OpsError
     from_stdin = ""
     for opt, slot in _PROSE_FILE_SLOTS.items():

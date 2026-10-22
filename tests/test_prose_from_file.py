@@ -1,10 +1,4 @@
-"""Prose from a file: the worktree guard refuses argv text whose first word is a binary
-
-Issue 1209. `jarvis gate explain "git status"` is refused from a worktree-isolated
-session before jarvis runs, and so is any question or learning whose text STARTS with
-that word; the same word mid-sentence passes. So every prose slot a worker fills has a
-`--<slot>-file PATH` sibling, and the text never enters argv.
-"""
+"""Prose from a file: argv text the worktree guard refuses to carry (issue 1209)"""
 
 from __future__ import annotations
 
