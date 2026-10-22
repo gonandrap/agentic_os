@@ -102,9 +102,9 @@ jobs:
 
   browser:
     runs-on: ubuntu-latest
-    # Covers `playwright install --with-deps`, whose apt step took 4.5m of a 5m budget on
-    # run 39763752424 and cancelled the job before pytest ran; tests stay bounded by --timeout=60
-    timeout-minutes: 12
+    # Two bounded install attempts (180s each) over ~1.5m of checkout, pip and pytest,
+    # measured on run 39842661725 attempt 2; the install is what ate the old 12m (#1193)
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -113,5 +113,13 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
-      - run: playwright install --with-deps chromium
+      - name: Install chromium and its apt deps
+        # A stalled apt mirror must fail THIS step, not eat the job budget (#1193, kn-ffab4362)
+        run: |
+          for attempt in 1 2; do
+            if timeout 180 playwright install --with-deps chromium; then exit 0; fi
+            echo "::warning::playwright install attempt $attempt stalled or failed after 180s; retrying"
+          done
+          echo "::error::playwright install --with-deps chromium failed twice at 180s each — a slow apt mirror is the usual cause, not this commit"
+          exit 1
       - run: pytest tests_browser -q --timeout=60

@@ -4771,6 +4771,8 @@ class Daemon:
             "issue_url": issue_url,
             "fix_wo_id": fix_wo_id,
             "issue_os_filed": issue_os_filed,
+            "ci_reruns": self._rerun_aborted_base_ci(project, store, owner, repo, base,
+                                                     runs, prev.get("ci_reruns") or {}),
             "checked_at": db.now(),
         }
         self.central.set_base_health(project.name, fact)
@@ -4798,6 +4800,53 @@ class Daemon:
             advance_red_episodes(
                 self.central.base_red_episodes(project.name), red, now,
                 project.fleet_health.red_episode_retention_hours * 3600.0))
+
+    def _rerun_aborted_base_ci(self, project: ProjectSpec, store: ProjectStore,
+                               owner: str, repo: str, base: str,
+                               runs: tuple[Any, ...], prev: Any) -> dict[str, str]:
+        """Re-run a default-branch run that JUDGED NOTHING, once each, so the base stays readable (#1193)"""
+        from . import ci, ci_rerun, github
+
+        state = {str(k): str(v) for k, v in prev.items()} if isinstance(prev, dict) else {}
+        # The newest run of a workflow, NOT its newest completed one: an in-flight re-run must not read as a...
+        newest: dict[str, Any] = {}
+        for r in runs:
+            if r.workflow:
+                newest.setdefault(r.workflow, r)
+        for workflow, run in newest.items():
+            if (not run.completed or run.run_id <= 0
+                    or run.conclusion not in ci_rerun.ABORTED_RUN_CONCLUSIONS):
+                continue
+            key = str(run.run_id)
+            if state.get(key) == "stuck":
+                continue
+            if state.get(key) == "rerun":
+                state[key] = "stuck"
+                store.add_notification(
+                    title=f"`{base}` has no CI verdict in {project.name}",
+                    body=(f"workflow `{workflow}` on {run.head_sha[:10] or 'its head'} "
+                          f"ended `{run.conclusion}` again after the OS re-ran it once, "
+                          f"so {ci.run_url(owner, repo, run.run_id)} says nothing about "
+                          f"the code — run `{ci_rerun.rerun_command(run.run_id)}`"),
+                    level="warning", source="base-health",
+                )
+                log.warning("[%s] %s CI on %s was %s again after one re-run (run %s)",
+                            project.name, base, workflow, run.conclusion, run.run_id)
+                continue
+            try:
+                ci_rerun.rerun(run.run_id, cwd=project.path)
+            except github.GitHubError as e:
+                # Unread is not unrecoverable: no attempt is spent, the next tick retries
+                log.info("[%s] could not re-run %s on %s: %s", project.name, run.run_id,
+                         base, e)
+                continue
+            state[key] = "rerun"
+            log.info("[%s] re-ran %s on %s — it ended %s and judged nothing",
+                     project.name, workflow, base, run.conclusion)
+        # Remembered only while the run still has NO verdict: an in-flight re-run counts as none
+        live = {str(r.run_id) for r in runs
+                if not r.completed or r.conclusion in ci_rerun.ABORTED_RUN_CONCLUSIONS}
+        return {k: v for k, v in state.items() if k in live}
 
     def dispatch_base_fix(self, project: ProjectSpec, store: ProjectStore) -> None:
         """A red tracker `main` files-or-adopts an issue and dispatches a work order on it (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §2.)"""
