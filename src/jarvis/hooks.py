@@ -2253,6 +2253,14 @@ def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> boo
     return not bound or not session_id or bound == session_id
 
 
+#: Claude Code's idle-timer `Notification`, verbatim — matched exactly, never as a
+#: substring: a real permission prompt carries its own message and keeps its flag
+IDLE_PROMPT = "Claude is waiting for your input"
+
+#: The `notification_ignored` reason, shared with INV-WAIT-WORKING's repair note
+IDLE_WHILE_WORKING = "idle prompt while the worker's turn is in flight"
+
+
 def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
     """What this work order is parked on instead of the user — "" when nothing is (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
     if store.held_approvals(wo_id):
@@ -2462,6 +2470,15 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
                 })
                 return {"wo_id": wo_id, "event": event, "ignored": True}
             message = payload.get("message") or "Worker needs attention"
+            # The idle timer fires on a session that is still mid-tool-call (issue 1166)
+            from .worker_session import busy
+
+            if message == IDLE_PROMPT and busy(store, wo_id):
+                store.add_event(wo_id, "notification_ignored", {
+                    "message": message,
+                    "reason": IDLE_WHILE_WORKING,
+                })
+                return {"wo_id": wo_id, "event": event, "ignored": True}
             if wo["status"] in ("running", "dispatching"):
                 store.set_status(wo_id, "waiting_input")
             store.flag_attention(wo_id, message)
