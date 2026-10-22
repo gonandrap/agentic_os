@@ -115,6 +115,22 @@ layout — 13 of them passed on the page that wrapped every table row onto three
 `scripts/screenshot_config_console.py` is the shape to copy; playwright and chromium are
 already installed. Write `None — no rendered surface changed.` when none applies.
 
+**How to validate in production** — required in every project the OS runs. Once the PR
+reaches production, Morpheus watches it there until a check says it works. For the OS
+itself that is the release; for every other project it is the merge. Write **hints**:
+
+* what production activity shows the change working;
+* where to look: a command, a log line, a page, or a count that should move.
+
+A Morpheus subagent turns the hints into a read-only check that runs on a schedule. A
+command you write is a hint, and is never run as written. Example: "after the next stuck
+sweep, `jarvis stuck --json` lists budget-capped orders as `excluded`, not stuck."
+
+If production has nothing to show (docs, tests or comments only), write
+`None — <reason>`.
+
+The hook denies a body without the section, or with only the template comment.
+
 ## 3. Link every image by raw URL at the commit SHA
 
 `gh` cannot upload an image, so the PNGs are committed (`docs/screenshots/`) and linked.

@@ -1441,6 +1441,12 @@ def create_app() -> FastAPI:
                       over=[r for r in rows if r["stuck"]],
                       rest=[r for r in rows if not r["stuck"]])
 
+    @app.get("/morpheus", response_class=HTMLResponse)
+    def morpheus_page(request: Request):
+        """Shipped PRs watched in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)"""
+        return render(request, "morpheus.html", active="morpheus",
+                      report=ops.morpheus_report())
+
     @app.get("/evolution", response_class=HTMLResponse)
     def evolution_page(request: Request, days: int = 90):
         """Is the OS getting better at running itself — and where is it still weak? (docs/superpowers/specs/2026-09-27-self-evolution.md)"""

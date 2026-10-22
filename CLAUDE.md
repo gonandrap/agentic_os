@@ -62,6 +62,7 @@ jarvis io review <id> [--accept <key>] [--reject <key>] [--feedback "why"] [--ac
 jarvis io cancel <id>                      # filed orders from accepted findings stay
 jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settles itself; a GAP files an issue, dispatches nothing
 jarvis investigate list / show <inv-id> / cancel <inv-id>
+jarvis morpheus status / show <mv-id> / waive <mv-id> --reason "…" / requeue <mv-id>   # shipped PRs validated in production
 jarvis backlog promote <id> --as feature   # intake -> feature order
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>

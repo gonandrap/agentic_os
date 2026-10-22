@@ -96,6 +96,22 @@
   the `kind='manager'` WO under its feature), `deliver()` (rides `queue_message`, one
   transaction), `Subject`/`ReviewFeedback`/`DeferralRequest`, `DELIVERY_ATTEMPT_CEILING`.
   Turned by `Daemon.deliver_envelopes`; watched by INV-ENVELOPE-STUCK. See `mem:message-bus`.
+- `morpheus.py` — MORPHEUS, production validation of shipped PRs (spec
+  `2026-10-21-morpheus-validates-releases-in-production.md`). Queue = `morpheus_items`
+  in `os.db`, one row per PR with a `project` (`CentralStore.add/update_morpheus_item`,
+  `claim_morpheus_action`), states `queued|monitoring|validated|failed|timedout`.
+  Queued by: `enqueue_release()` for the OS (shipit step 5a3 + `ensure_release_queued`
+  daemon backstop) and `queue_merges()` for every other project (`pr_merged` events,
+  per-project cursor, no backfill). PRs give HINTS only; `wake()` = the ONLY LLM, a
+  long-lived session (`claude_cli.run_session_turn`, state in os_state
+  `morpheus.session`) whose subagents write each check, `/compact` once context ≥
+  `compact_at`. `sweep()` runs checks mechanically in each project's dir (exit 0/1/other).
+  `act()` hands off once per failed/timedout item, facts only (Morpheus never diagnoses):
+  investigation via steward origin `morpheus`, else Neo question kind `validation`
+  (`record_neo_verdict`). Runs on `Daemon.morpheus_pool` (`morpheus_tick`/`_morpheus_pass`).
+  The section is in `hooks.PR_BODY_SECTIONS` for every project; `find_section` also backs
+  `scripts/check_pr_validation.py` (CI `pr-body.yml`). Invariant `INV-MORPHEUS-OVERDUE`.
+  Tests: `tests/test_morpheus.py`.
 - `invariants.py` — the OS's post-conditions, re-evaluated as steady-state predicates on
   every reconcile tick and by `jarvis doctor`. Per-project checks in `INVARIANTS` (take a
   `ProjectStore`, repair what is unambiguous); OS-wide checks in `OS_INVARIANTS` /
