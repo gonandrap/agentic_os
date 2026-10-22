@@ -43,6 +43,12 @@ def seed() -> None:
                                    "usage_hold_until": time.time() + 3600,
                                    "last_error": "You've hit your session limit · resets 6:20am",
                                    "offers": {waiting["id"]: {"n": 1, "ts": time.time()}}})
+    # And a kill hold on top of it: both are session-wide holds and can stand at once
+    store.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.1")  # the hold lifts when this tag moves
+    morpheus._save_session(store, {**morpheus.session_state(store),
+                                   "kills": morpheus.MAX_KILLS,
+                                   "kill_hold_until": time.time() + morpheus.KILL_HOLD_SECONDS,
+                                   "kill_hold_release": "jarvis-0.1.1"})
     store.close()
 
 
