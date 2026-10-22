@@ -102,7 +102,9 @@ jobs:
 
   browser:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Covers `playwright install --with-deps`, whose apt step took 4.5m of a 5m budget on
+    # run 39763752424 and cancelled the job before pytest ran; tests stay bounded by --timeout=60
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
