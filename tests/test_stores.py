@@ -452,6 +452,50 @@ def test_only_db_write_transaction_opens_a_transaction():
         "docstring says what a deferred one costs")
 
 
+def test_a_settling_round_reaches_another_connection_with_its_event(project):
+    """Issue #1203: the invariant sweep read a settled round whose event was not written yet"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+    go, done, ready = threading.Event(), threading.Event(), threading.Event()
+    seen: dict = {}
+
+    def sweeper() -> None:
+        other = ProjectStore(project)   # opened BEFORE the write: construction writes too
+        ready.set()
+        try:
+            assert go.wait(timeout=15)
+            seen["outcome"] = other.latest_validation_round(wo_id=wo["id"])["outcome"]
+            seen["kinds"] = [e["kind"] for e in other.list_events(wo["id"])]
+        finally:
+            other.close()
+            done.set()
+
+    thread = threading.Thread(target=sweeper, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=15)
+
+    def let_the_sweep_read_between_the_two_writes(sql: str) -> None:
+        if sql.strip().upper().startswith("INSERT INTO WO_EVENTS") and not go.is_set():
+            go.set()
+            done.wait(timeout=15)
+
+    store.conn.set_trace_callback(let_the_sweep_read_between_the_two_writes)
+    try:
+        store.settle_validation_round(rnd["id"], "escalated",
+                                      {"round": 1, "round_id": rnd["id"]},
+                                      wo_id=wo["id"], reason="three rounds, no deal")
+    finally:
+        store.conn.set_trace_callback(None)
+        thread.join(timeout=15)
+
+    assert done.is_set(), "the other connection never got its read in"
+    assert (seen["outcome"] == "pending") or ("validation_escalated" in seen["kinds"]), (
+        "a second connection saw the round settled with no event on the timeline")
+    assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "escalated"
+    assert "validation_escalated" in [e["kind"] for e in store.list_events(wo["id"])]
+
+
 def test_approvals_of_kind_is_not_bounded_by_the_generic_listings_window(project):
     """`list_approvals` answers the 200 NEWEST rows of every kind"""
     # Fixture commands stay non-commands: a real `gh pr merge …` literal here trips the privileged-action...

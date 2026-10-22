@@ -1974,10 +1974,11 @@ class Daemon:
                          else self._validator(cfg))
             if validator is None:
                 # Nothing to judge with — the panel is not wired in
-                store.close_validation_round(round_id, "failed", NO_VALIDATOR_REASON)
-                store.add_event(wo_id, "validation_failed",
-                                {"round": n, "cause": "no_validator",
-                                 "reason": NO_VALIDATOR_REASON})
+                store.settle_validation_round(
+                    round_id, "failed",
+                    {"round": n, "cause": "no_validator",
+                     "reason": NO_VALIDATOR_REASON},
+                    wo_id=wo_id, reason=NO_VALIDATOR_REASON)
                 # `panel_cleared`: the round this just closed is `failed`
                 ops.land_when_cleared(store, wo, panel_cleared=True)
                 log.info("[%s] %s: round %d settled unjudged (no validator)",
@@ -2077,11 +2078,11 @@ class Daemon:
             reason = str(verdict.get("reason") or "")
 
             if outcome == "passed":
-                store.close_validation_round(round_id, "passed", reason)
+                store.settle_validation_round(
+                    round_id, "passed", {"round": n, "round_id": round_id},
+                    wo_id=wo_id, reason=reason)
                 self._file_follow_ups(store, project, round_row, follow_ups, cfg,
                                       unit=wo_id, wo_id=wo_id)
-                store.add_event(wo_id, "validation_passed",
-                                {"round": n, "round_id": round_id})
                 # NOT UNDER A LIVE TURN (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
                 if worker_session.busy(store, wo_id) is None:
                     status = ops.land_when_cleared(store, wo)
@@ -2173,7 +2174,6 @@ class Daemon:
         wo_id = wo["id"]
         rework = uncounted_cause == ops.USER_REWORK_CAUSE
         red_ci = uncounted_cause == ops.RED_CI_CAUSE
-        store.close_validation_round(round_id, "rejected", reason)
         used, of = rebind or (0, max_rounds)
         pos = n if budget_round is None else budget_round
         # `of` is the bound this round was actually held by
@@ -2186,7 +2186,8 @@ class Daemon:
         if failing:
             # WHAT IT RETURNED FOR, truncated like the envelope's: GitHub's check list has moved on by the time...
             event["failing"] = list(failing[:6])
-        store.add_event(wo_id, "validation_rejected", event)
+        store.settle_validation_round(round_id, "rejected", event, wo_id=wo_id,
+                                      reason=reason)
         if red_ci:
             text = RED_CI_FEEDBACK.format(reason=reason + note, pr_url=pr_url,
                                           wo_id=wo_id, max_rounds=max_rounds)
@@ -2210,9 +2211,9 @@ class Daemon:
         from . import ops
 
         wo_id = wo["id"]
-        store.close_validation_round(round_id, "void", reason)
-        store.add_event(wo_id, "validation_void",
-                        {"round": n, "round_id": round_id, "reason": reason})
+        store.settle_validation_round(
+            round_id, "void", {"round": n, "round_id": round_id, "reason": reason},
+            wo_id=wo_id, reason=reason)
         ops.land_when_cleared(store, wo, panel_cleared=True)
 
     @staticmethod
@@ -2231,11 +2232,12 @@ class Daemon:
 
         reopens = limit.reset_at or (db.now()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
-        store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
-                                     hold_cause=VALIDATION_HELD_CAUSE)
-        store.add_event(wo["id"], "validation_failed",
-                        {"round": n, "cause": VALIDATION_HELD_CAUSE,
-                         "reopens_at": reopens, "error": limit.message[:500]})
+        store.settle_validation_round(
+            round_id, "failed",
+            {"round": n, "cause": VALIDATION_HELD_CAUSE,
+             "reopens_at": reopens, "error": limit.message[:500]},
+            wo_id=wo["id"], reason=usage_hold_note(reopens),
+            hold_cause=VALIDATION_HELD_CAUSE)
 
     @staticmethod
     def _validation_red_ci(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -2259,14 +2261,14 @@ class Daemon:
         """GitHub has not finished running the checks"""
         reopens = time.time() + CI_HOLD_RECHECK_SECONDS
         names = ", ".join(pending[:6]) + (" …" if len(pending) > 6 else "")
-        store.close_validation_round(
+        store.settle_validation_round(
             round_id, "failed",
-            f"waiting for GitHub to finish the checks on this pull request before "
-            f"judging it: {names}",
+            {"round": n, "cause": VALIDATION_CI_CAUSE,
+             "reopens_at": reopens, "pending": list(pending)},
+            wo_id=wo["id"],
+            reason=f"waiting for GitHub to finish the checks on this pull request "
+                   f"before judging it: {names}",
             hold_cause=VALIDATION_CI_CAUSE)
-        store.add_event(wo["id"], "validation_failed",
-                        {"round": n, "cause": VALIDATION_CI_CAUSE,
-                         "reopens_at": reopens, "pending": list(pending)})
 
     @staticmethod
     def _validation_auth_held(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -2281,12 +2283,12 @@ class Daemon:
             and db.from_json(e["payload"], {}).get("cause") == VALIDATION_AUTH_CAUSE)
         reopens = time.time() + AUTH_HOLD_BACKOFF[min(attempt - 1,
                                                       len(AUTH_HOLD_BACKOFF) - 1)]
-        store.close_validation_round(round_id, "failed", AUTH_HOLD_NOTE,
-                                     hold_cause=VALIDATION_AUTH_CAUSE)
-        store.add_event(wo_id, "validation_failed",
-                        {"round": n, "cause": VALIDATION_AUTH_CAUSE,
-                         "reopens_at": reopens, "attempt": attempt,
-                         "error": auth.message[:500]})
+        store.settle_validation_round(
+            round_id, "failed",
+            {"round": n, "cause": VALIDATION_AUTH_CAUSE,
+             "reopens_at": reopens, "attempt": attempt,
+             "error": auth.message[:500]},
+            wo_id=wo_id, reason=AUTH_HOLD_NOTE, hold_cause=VALIDATION_AUTH_CAUSE)
 
     def _validation_refused(self, store: ProjectStore, project: ProjectSpec, wo: dict,
                             round_id: int, n: int,
@@ -2320,11 +2322,11 @@ class Daemon:
             1 for e in store.events_of_kind(wo_id, "validation_failed")
             if db.from_json(e["payload"], {}).get("round") == n
             and db.from_json(e["payload"], {}).get("cause") == "transport")
-        store.close_validation_round(
-            round_id, "failed", f"the validator could not be reached: {error}")
-        store.add_event(wo_id, "validation_failed",
-                        {"round": n, "cause": "transport", "attempt": outages,
-                         "error": str(error)[:500]})
+        store.settle_validation_round(
+            round_id, "failed",
+            {"round": n, "cause": "transport", "attempt": outages,
+             "error": str(error)[:500]},
+            wo_id=wo_id, reason=f"the validator could not be reached: {error}")
         if outages >= VALIDATION_OUTAGE_LIMIT:
             self._escalate(
                 store, wo, round_id, n,
@@ -2352,14 +2354,14 @@ class Daemon:
             catalog=self.catalog, store=store, self_dispatch=self.self_dispatch)
         inv_id = (self._killed_investigation(store, project, wo_id, round_id, n, killed)
                   if decision.allowed else "")
-        store.close_validation_round(
+        store.settle_validation_round(
             round_id, "failed",
-            f"every validation seat was killed by a signal (rc={killed.rc}) before it "
-            f"could judge this submission")
-        store.add_event(wo_id, "validation_failed",
-                        {"round": n, "cause": VALIDATION_KILLED_CAUSE, "attempt": kills,
-                         "rc": killed.rc, "error": killed.message[:500],
-                         "investigation": inv_id})
+            {"round": n, "cause": VALIDATION_KILLED_CAUSE, "attempt": kills,
+             "rc": killed.rc, "error": killed.message[:500],
+             "investigation": inv_id},
+            wo_id=wo_id,
+            reason=f"every validation seat was killed by a signal (rc={killed.rc}) "
+                   f"before it could judge this submission")
         if kills >= int(cfg.killed_retries):
             # THE INVESTIGATION ID RIDES ON THE SENTENCE: the user reading the attention item needs somewhere to...
             pointer = (f"{inv_id} is investigating what killed them." if inv_id
@@ -2507,10 +2509,11 @@ class Daemon:
                          else self._validator(cfg))
             if validator is None:
                 # Nothing to judge with — the panel is not wired in
-                store.close_validation_round(round_id, "failed", NO_VALIDATOR_REASON)
-                ops.feature_event(store, fo_id, "validation_failed",
-                                  {"round": n, "cause": "no_validator",
-                                   "reason": NO_VALIDATOR_REASON, "feature_order": fo_id})
+                store.settle_validation_round(
+                    round_id, "failed",
+                    {"round": n, "cause": "no_validator",
+                     "reason": NO_VALIDATOR_REASON, "feature_order": fo_id},
+                    fo_id=fo_id, reason=NO_VALIDATOR_REASON)
                 self._complete_feature(store, fo)
                 log.info("[%s] feature %s: round %d settled unjudged (no validator)",
                          project.name, fo_id, n)
@@ -2593,12 +2596,12 @@ class Daemon:
             reason = str(verdict.get("reason") or "")
 
             if outcome == "passed":
-                store.close_validation_round(round_id, "passed", reason)
+                store.settle_validation_round(
+                    round_id, "passed",
+                    {"round": n, "round_id": round_id, "feature_order": fo_id},
+                    fo_id=fo_id, reason=reason)
                 self._file_follow_ups(store, project, round_row, follow_ups, cfg,
                                       unit=fo_id, fo_id=fo_id)
-                ops.feature_event(store, fo_id, "validation_passed",
-                                  {"round": n, "round_id": round_id,
-                                   "feature_order": fo_id})
                 self._complete_feature(store, fo)
                 log.info("[%s] feature %s passed review in round %d",
                          project.name, fo_id, n)
@@ -2628,10 +2631,11 @@ class Daemon:
         from . import ops
 
         fo_id = fo["id"]
-        store.close_validation_round(round_id, "rejected", reason)
-        ops.feature_event(store, fo_id, "validation_rejected",
-                          {"round": n, "round_id": round_id, "of": max_rounds,
-                           "feature_order": fo_id})
+        store.settle_validation_round(
+            round_id, "rejected",
+            {"round": n, "round_id": round_id, "of": max_rounds,
+             "feature_order": fo_id},
+            fo_id=fo_id, reason=reason)
         bus.post(store, subject=bus.Subject(fo_id=fo_id),
                  from_role="reviewer", to_role="manager",
                  payload=bus.ReviewFeedback(
@@ -2648,10 +2652,11 @@ class Daemon:
         from . import ops
 
         fo_id = fo["id"]
-        store.close_validation_round(round_id, "void", reason)
-        ops.feature_event(store, fo_id, "validation_void",
-                          {"round": n, "round_id": round_id, "reason": reason,
-                           "feature_order": fo_id})
+        store.settle_validation_round(
+            round_id, "void",
+            {"round": n, "round_id": round_id, "reason": reason,
+             "feature_order": fo_id},
+            fo_id=fo_id, reason=reason)
         self._complete_feature(store, fo)
 
     @staticmethod
@@ -2662,10 +2667,11 @@ class Daemon:
         from .invariants import VALIDATION_STUCK_BLOCKER
 
         fo_id = fo["id"]
-        store.close_validation_round(round_id, "escalated", reason)
-        ops.feature_event(store, fo_id, "validation_escalated",
-                          {"round": n, "round_id": round_id, "reason": reason,
-                           "feature_order": fo_id})
+        store.settle_validation_round(
+            round_id, "escalated",
+            {"round": n, "round_id": round_id, "reason": reason,
+             "feature_order": fo_id},
+            fo_id=fo_id, reason=reason)
         store.flag_feature_attention(fo_id, VALIDATION_STUCK_BLOCKER)
         store.add_notification(
             title=VALIDATION_ESCALATED_TITLE.format(unit=fo_id, n=n),
@@ -2682,12 +2688,12 @@ class Daemon:
         fo_id = fo["id"]
         reopens = limit.reset_at or (db.now()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
-        store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
-                                     hold_cause=VALIDATION_HELD_CAUSE)
-        ops.feature_event(store, fo_id, "validation_failed",
-                          {"round": n, "cause": VALIDATION_HELD_CAUSE,
-                           "reopens_at": reopens, "error": limit.message[:500],
-                           "feature_order": fo_id})
+        store.settle_validation_round(
+            round_id, "failed",
+            {"round": n, "cause": VALIDATION_HELD_CAUSE, "reopens_at": reopens,
+             "error": limit.message[:500], "feature_order": fo_id},
+            fo_id=fo_id, reason=usage_hold_note(reopens),
+            hold_cause=VALIDATION_HELD_CAUSE)
 
     def _feature_auth_held(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                            auth: claude_cli.AuthFailure) -> None:
@@ -2702,12 +2708,12 @@ class Daemon:
             and db.from_json(e["payload"], {}).get("cause") == VALIDATION_AUTH_CAUSE)
         reopens = time.time() + AUTH_HOLD_BACKOFF[min(attempt - 1,
                                                       len(AUTH_HOLD_BACKOFF) - 1)]
-        store.close_validation_round(round_id, "failed", AUTH_HOLD_NOTE,
-                                     hold_cause=VALIDATION_AUTH_CAUSE)
-        ops.feature_event(store, fo_id, "validation_failed",
-                          {"round": n, "cause": VALIDATION_AUTH_CAUSE,
-                           "reopens_at": reopens, "attempt": attempt,
-                           "error": auth.message[:500], "feature_order": fo_id})
+        store.settle_validation_round(
+            round_id, "failed",
+            {"round": n, "cause": VALIDATION_AUTH_CAUSE, "reopens_at": reopens,
+             "attempt": attempt, "error": auth.message[:500],
+             "feature_order": fo_id},
+            fo_id=fo_id, reason=AUTH_HOLD_NOTE, hold_cause=VALIDATION_AUTH_CAUSE)
 
     def _feature_refused(self, store: ProjectStore, project: ProjectSpec, fo: dict,
                          round_id: int, n: int,
@@ -2750,12 +2756,11 @@ class Daemon:
             1 for e in ops.feature_events_of_kind(store, fo_id, "validation_failed")
             if db.from_json(e["payload"], {}).get("round") == n
             and db.from_json(e["payload"], {}).get("cause") == "transport")
-        store.close_validation_round(
-            round_id, "failed", f"the validator could not be reached: {error}")
-        recorded = ops.feature_event(
-            store, fo_id, "validation_failed",
+        recorded = store.settle_validation_round(
+            round_id, "failed",
             {"round": n, "cause": "transport", "attempt": outages,
-             "error": str(error)[:500], "feature_order": fo_id})
+             "error": str(error)[:500], "feature_order": fo_id},
+            fo_id=fo_id, reason=f"the validator could not be reached: {error}")
         if outages >= VALIDATION_OUTAGE_LIMIT or not recorded:
             self._escalate_feature(
                 store, fo, round_id, n,

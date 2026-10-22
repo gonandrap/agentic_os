@@ -4180,10 +4180,10 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
     from .invariants import VALIDATION_STUCK_BLOCKER
 
     wo_id = wo["id"]
-    store.close_validation_round(round_id, "escalated", reason)
-    store.add_event(wo_id, "validation_escalated",
-                    {"round": n, "round_id": round_id, "reason": reason,
-                     "cause": cause})
+    store.settle_validation_round(
+        round_id, "escalated",
+        {"round": n, "round_id": round_id, "reason": reason, "cause": cause},
+        wo_id=wo_id, reason=reason)
     store.set_status(wo_id, "needs_review")
     store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
     store.add_notification(
@@ -5118,9 +5118,10 @@ def void_round_for_settled_pr(store: ProjectStore, wo: dict[str, Any],
     rnd = store.latest_validation_round(wo_id=wo["id"])
     if not rnd or not store.round_machine_owns(rnd):
         return None
-    store.close_validation_round(rnd["id"], "void", reason)
-    store.add_event(wo["id"], "validation_void",
-                    {"round": rnd["round"], "round_id": rnd["id"], "reason": reason})
+    store.settle_validation_round(
+        rnd["id"], "void",
+        {"round": rnd["round"], "round_id": rnd["id"], "reason": reason},
+        wo_id=wo["id"], reason=reason)
     return int(rnd["round"])
 
 
