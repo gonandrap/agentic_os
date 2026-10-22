@@ -34,7 +34,7 @@ KEEP_COMMENT_REGIONS: dict[str, tuple[str, str]] = {
 
 PRAGMA = re.compile(
     r"#\s*(noqa|type:|pragma|pyright:|pylint:|mypy:|fmt:|isort:|ruff:|nosec|"
-    r"-\*-|vim:|flake8|yapf:|region|endregion)", re.I)
+    r"-\*-|vim:|flake8|yapf:|region|endregion|clock-exempt:)", re.I)
 CODING = re.compile(r"#.*coding[:=]\s*[-\w.]+")
 HEADER = re.compile(r"^#:?\s*([-=─━═_~*#]{2,}|——)")
 DIVIDER = re.compile(r"^[\s\-=─━═_~*#]+$")

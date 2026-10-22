@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from jarvis import db
 from jarvis import budget, ops
 from jarvis.catalog import CatalogError, parse_catalog
 from jarvis.claude_cli import turn_args
@@ -240,7 +241,7 @@ def test_a_cap_is_not_tripped_by_the_session_running_total(started, store, tmp_p
         turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
         out = turn_file(tmp_path, i, own=own, cumulative=cum, cost=cost)
         store.conn.execute("UPDATE wo_turns SET outfile=?, started_at=? WHERE id=?",
-                           (str(out), time.time() - 60, turn["id"]))
+                           (str(out), db.now() - 60, turn["id"]))
         worker_session.poll(store)
         cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
         assert cap is not None and cap.remaining_usd > 0, f"cut short at turn {i}"

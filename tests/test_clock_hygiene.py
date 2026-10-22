@@ -26,28 +26,19 @@ _KERNEL = (
 )
 
 ALLOWED: dict[str, str] = {
-    "tests/test_background_orphan.py": _BACKDATED,
     "tests/test_base_red.py": _BACKDATED,
-    "tests/test_budget.py": _BOTH,
-    "tests/test_budget_blind_spot.py": _BACKDATED,
+    "tests/test_budget.py": _SPIN,
     "tests/test_feature_validation.py": _BOTH,
     "tests/test_fleet_cap.py": _BACKDATED,
     "tests/test_health_sweep.py": _BOTH,
-    "tests/test_invariants.py": _BACKDATED,
-    "tests/test_investigation_orders.py": _BACKDATED,
-    "tests/test_live.py": _BACKDATED,
     "tests/test_nav_volume.py": _BACKDATED,
     "tests/test_parked_retry.py": _BACKDATED,
     "tests/test_precheck_before_the_panel.py": _BACKDATED,
     "tests/test_rate_limit_retry.py": _BACKDATED,
     "tests/test_release_red_defer.py": _BACKDATED,
     "tests/test_release_staging.py": _BACKDATED,
-    "tests/test_repair_resettle.py": _BACKDATED,
-    "tests/test_scheduled_actor.py": _BACKDATED,
     "tests/test_scheduler.py": _BACKDATED,
     "tests/test_transport_resilience.py": _BACKDATED,
-    "tests/test_turn_usage.py": _BACKDATED,
-    "tests/test_ui_cost.py": _BACKDATED,
     "tests/test_ui_fleet_brake.py": _BACKDATED,
     "tests/test_ui_observability.py": _BOTH,
     "tests/test_ui_wiring.py": _BACKDATED,
@@ -824,3 +815,31 @@ def test_an_allowed_entry_the_markers_carry_is_refused() -> None:
     assert redundant_allowed_entries({"tests/synth.py": _SPIN}, files) == ["tests/synth.py"]
     assert redundant_allowed_entries(
         {"tests/synth.py": _SPIN}, {"tests/synth.py": _SYNTH_FUNCTION_SCOPE}) == []
+
+
+_SYNTH_TRIM_TARGET = '''# clock-exempt: class 3 — a synthetic module-top marker whose reason runs well past the hundred characters trim keeps
+# A prose comment directly under it,
+# spread over two lines.
+import time
+
+
+def test_x():
+    # A prose comment directly above,
+    # also two lines.
+    # clock-exempt: class 3 — a synthetic function-scope marker
+    time.sleep(0.01)
+'''
+
+
+def test_the_comment_trimmer_leaves_every_marker_byte_for_byte() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("trim_comments", REPO_ROOT / "scripts/trim_comments.py")
+    trim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(trim)
+    out = trim.trim_source(_SYNTH_TRIM_TARGET, "tests/synth.py")
+    markers = [ln for ln in _SYNTH_TRIM_TARGET.splitlines() if "clock-exempt:" in ln]
+    assert len(markers) == 2
+    for marker in markers:
+        assert marker in out.splitlines(), out
+    assert out != _SYNTH_TRIM_TARGET, "the prose around the markers should still be trimmed"

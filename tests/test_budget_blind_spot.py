@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime, timezone
 
 import pytest
 
+from jarvis import db
 from jarvis import budget, ops, usage, worker_session
 from jarvis.project_store import (
     COST_FROM_ENVELOPE,
@@ -63,7 +63,7 @@ def a_turn_that_ran(store: ProjectStore, wo_id: str) -> dict:
     """An open turn that started a minute ago, with one $25 API call inside it"""
     turn = store.create_turn(wo_id, kind="dispatch", prompt="work")
     store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
-                       (time.time() - 60, turn["id"]))
+                       (db.now() - 60, turn["id"]))
     return store.get_turn(turn["id"])
 
 

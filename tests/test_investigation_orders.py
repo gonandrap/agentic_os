@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +10,7 @@ import pytest
 from test_health_sweep import (HOUR, park_order, stuck_catalog,  # noqa: F401
                                stuck_os)
 
+from jarvis import db
 from jarvis import claude_cli, cli, dispatch, hooks, ops, project_store, verdicts
 from jarvis.catalog import DEFAULT_INVESTIGATION_BUDGET_USD, load_catalog
 from jarvis.daemon import Daemon
@@ -1389,7 +1389,7 @@ def _settle(store, inv_id: str, hours_ago: float) -> None:
     """One investigation settled `hours_ago` — the cooldown's clock (§6b)"""
     store.set_feature_status(inv_id, "completed")
     store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
-                       (time.time() - hours_ago * HOUR, inv_id))
+                       (db.now() - hours_ago * HOUR, inv_id))
     store.conn.commit()
 
 
@@ -1427,13 +1427,13 @@ def test_cooldown_holds_until_the_fingerprint_changes(stuck_os):
     # The situation HAS changed, but the cooldown has not run: "it moved" and "it is better" are not the...
     park_order(store, wo["id"], "needs_review", hours=5)
     store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
-                       (time.time() - HOUR, first))
+                       (db.now() - HOUR, first))
     store.conn.commit()
     daemon.stuck_tick(None)
     assert len(_opened("proj_a")) == 1
 
     store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
-                       (time.time() - 13 * HOUR, first))
+                       (db.now() - 13 * HOUR, first))
     store.conn.commit()
     daemon.stuck_tick(None)
     assert len(_opened("proj_a")) == 2

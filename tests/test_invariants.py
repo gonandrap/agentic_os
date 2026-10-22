@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -619,7 +618,7 @@ def _stranded(store: ProjectStore, *, age: float, outcome: str = "pending",
     if outcome != "pending":
         store.close_validation_round(rnd["id"], outcome)
     store.conn.execute("UPDATE validation_rounds SET ts=? WHERE id=?",
-                       (time.time() - age, rnd["id"]))
+                       (db.now() - age, rnd["id"]))
     return unit["id"], rnd
 
 
@@ -1657,7 +1656,7 @@ def _refused_then_pushed(store: ProjectStore, *, head: str, judged: str,
     store.close_validation_round(round_["id"], "passed", "green")
     store.add_event(wo["id"], "reviewed", {"accepted": False})
     store.set_status(wo["id"], "needs_review", pr_url="https://example/pull/2",
-                     pr_head_oid=head, pr_head_seen_at=time.time())
+                     pr_head_oid=head, pr_head_seen_at=db.now())
     return store.get_work_order(wo["id"])
 
 
@@ -1774,7 +1773,7 @@ def _sweep_run(tmp_path, project, *, projects=None, os_extra=None, **row) -> Pat
         central.set_state("catalog_path", str(path))
         if row:
             central.set_state(Daemon.STUCK_RUN_KEY, db.to_json(
-                {"ts": time.time(), "scanned": 0, "candidates": 0, "opened": 0,
+                {"ts": db.now(), "scanned": 0, "candidates": 0, "opened": 0,
                  "skipped": {}, "excluded": "", "error": "", **row}))
     finally:
         central.close()
@@ -1820,14 +1819,14 @@ def test_sweep_dark_raises_after_the_window(jarvis_home, tmp_path, project, monk
 
     _own_the_os(monkeypatch, project)
     window = catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
-    _sweep_run(tmp_path, project, ts=time.time() - (window + 1) * 60)
+    _sweep_run(tmp_path, project, ts=db.now() - (window + 1) * 60)
     store = ProjectStore(project)
 
     (violation,) = _stuck_dark(store)
     assert violation.context["cause"] == "dark"
     assert window == 180
 
-    _sweep_run(tmp_path, project, ts=time.time() - (window - 1) * 60)
+    _sweep_run(tmp_path, project, ts=db.now() - (window - 1) * 60)
     assert _stuck_dark(store) == []
     store.close()
 
@@ -1837,11 +1836,11 @@ def test_the_fleet_catalog_value_is_what_the_check_judges_by(
     """`sweep_dark_minutes` is a CATALOG setting"""
     _own_the_os(monkeypatch, project)
     silence = 20 * 60  # 20 minutes — well inside the shipped 180
-    _sweep_run(tmp_path, project, ts=time.time() - silence)
+    _sweep_run(tmp_path, project, ts=db.now() - silence)
     store = ProjectStore(project)
     assert _stuck_dark(store) == []
 
-    _sweep_run(tmp_path, project, ts=time.time() - silence,
+    _sweep_run(tmp_path, project, ts=db.now() - silence,
                os_extra={"fleet_health": {"sweep_dark_minutes": 10}})
     (violation,) = _stuck_dark(store)
     assert violation.context["cause"] == "dark"
@@ -2618,8 +2617,8 @@ def test_the_no_actor_line_carries_no_elapsed_time(project, status):
     store = ProjectStore(project)
     wo = _no_actor_row(store, status)
 
-    early = true_blockers(store, wo, now=time.time())
-    late = true_blockers(store, wo, now=time.time() + 40 * 60 * 60)
+    early = true_blockers(store, wo, now=db.now())
+    late = true_blockers(store, wo, now=db.now() + 40 * 60 * 60)
 
     assert early == late != []
 
