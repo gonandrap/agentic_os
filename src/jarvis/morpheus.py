@@ -48,6 +48,10 @@ PAUSE_MODES = ("paused", "running")
 REOFFER_SECONDS = 6 * 3600
 #: How many times an item is offered before Morpheus gives up on it (the deadline then acts)
 MAX_OFFERS = 3
+#: Consecutive killed turns tolerated before the session holds back (one release restart kills once)
+MAX_KILLS = 3
+#: How long that hold lasts when no new release lifts it first
+KILL_HOLD_SECONDS = 6 * 3600
 #: How much of a script's output is kept
 OUTPUT_TAIL = 2000
 
@@ -630,6 +634,17 @@ def context_share(usage: dict[str, Any] | None) -> float | None:
     return (peak / window) if peak and window else None
 
 
+def kill_hold(central: CentralStore, state: dict[str, Any], now: float) -> float:
+    """The live hold after MAX_KILLS kills in a row — 0 once it expires or a new release lands"""
+    until = float(state.get("kill_hold_until") or 0)
+    if not until or now >= until:
+        return 0.0
+    # A release restart is the usual cause of the kills AND the usual fix, so it lifts the hold (#1161)
+    if (central.get_state(RELEASE_KEY) or "") != (state.get("kill_hold_release") or ""):
+        return 0.0
+    return until
+
+
 def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = False,
          dirs: dict[str, Path] | None = None, now: float | None = None,
          call: Callable[..., Any] | None = None) -> str:
@@ -649,6 +664,12 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
         return "usage_held"
     if hold:
         state.pop("usage_hold_until", None)
+    if kill_hold(central, state, now):
+        # Every turn is dying before it answers: retrying each wake only burns resume context
+        return "kill_held"
+    if state.get("kill_hold_until"):
+        state.pop("kill_hold_until", None)
+        state.pop("kill_hold_release", None)
     items = wanting_scripts(central, now=now)
     if not state.get("compact_due") and not items:
         return "idle"
@@ -686,11 +707,23 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
         # BEFORE ClaudeCliError, its base: a kill is not an answer, so it costs no offer (#1161)
         state.pop("turn_started_ts", None)
         state["last_error"] = str(e)[:500]
-        state["kills"] = int(state.get("kills") or 0) + 1
+        state["kills"] = kills = int(state.get("kills") or 0) + 1
         if not resume:
             state.pop("session_id", None)
+        if kills >= MAX_KILLS:
+            state["kill_hold_until"] = now + KILL_HOLD_SECONDS
+            state["kill_hold_release"] = central.get_state(RELEASE_KEY) or ""
+            state["last_error"] = f"held after {kills} killed turns in a row: {str(e)[:400]}"
+            central.add_inbox(
+                project=_os_project(catalog), level="warning",
+                title=f"Morpheus held after {kills} killed turns in a row",
+                body="No session turn answered, so no PR gets a validation script. It retries "
+                     f"when the next release deploys, or in {KILL_HOLD_SECONDS // 3600}h.\n"
+                     "jarvis morpheus status")
+            log.warning("morpheus held after %s killed turns in a row: %s", kills, e)
+        else:
+            log.warning("morpheus turn killed before it answered: %s", e)
         _save_session(central, state)
-        log.warning("morpheus turn killed before it answered: %s", e)
         return "killed"
     except claude_cli.ClaudeCliError as e:
         state.pop("turn_started_ts", None)
@@ -708,6 +741,9 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
                        session_id=session_id, store=central)
     state["turns"] = int(state.get("turns") or 0) + 1
     state["last_error"] = ""
+    state["kills"] = 0
+    state.pop("kill_hold_until", None)
+    state.pop("kill_hold_release", None)
     share = context_share(result.usage)
     if kind == "compact":
         state["compactions"] = int(state.get("compactions") or 0) + 1
@@ -795,6 +831,8 @@ def activity(central: CentralStore, *, timeout: float | None = None,
                          "exhausted": False, "cause": _offer_cause(seen)})
     usage_hold = float(state.get("usage_hold_until") or 0)
     return {"usage_hold_until": usage_hold if now < usage_hold else None,
+            "kill_hold_until": kill_hold(central, state, now) or None,
+            "kills": int(state.get("kills") or 0), "max_kills": MAX_KILLS,
             "turn_in_flight": in_flight, "turn_kind": state.get("last_turn_kind") or "",
             "turn_started_ts": started if in_flight else None,
             "abandoned_turn_ts": started if started and not in_flight else None,
