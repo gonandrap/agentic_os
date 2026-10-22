@@ -681,6 +681,14 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--reason", required=True)
     m = mo.add_parser("requeue", help="watch a settled PR again with a fresh deadline")
     m.add_argument("item_id")
+    m = mo.add_parser("pause", help="hold Morpheus's session turns, whatever the fleet does "
+                                    "(checks still run; they spend nothing)")
+    m.add_argument("--reason", required=True)
+    m = mo.add_parser("unpause", help="let Morpheus's session turns run, even through a "
+                                      "fleet `jarvis pause`")
+    m.add_argument("--reason", required=True)
+    mo.add_parser("follow-fleet", help="drop the pause/unpause pin: Morpheus pauses with "
+                                       "the fleet again")
     for m in mo.choices.values():
         m.add_argument("--json", action="store_true", help="machine-readable output")
 
@@ -3847,7 +3855,7 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
               f" · {sess.get('turns') or 0} turn(s)"
               f" · {sess.get('compactions') or 0} compaction(s)"
               + (f" · context {share:.0%}" if share is not None else "")
-              + (" · PAUSED (no session turns)" if rep["paused"] else "")
+              + f" · {_morpheus_pause_text(rep['pause'])}"
               + (f" · last error: {sess['last_error']}" if sess.get("last_error") else ""))
         for item in rep["items"]:
             print(_morpheus_line(item))
@@ -3900,7 +3908,25 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
         item = ops.morpheus_requeue(args.item_id)
         _print({"id": item["id"], "state": item["state"]}, args.json)
         return 0
+    if args.morpheus_cmd in ("pause", "unpause", "follow-fleet"):
+        mode = {"pause": "paused", "unpause": "running"}.get(args.morpheus_cmd)
+        state = ops.morpheus_pause(mode, getattr(args, "reason", ""))
+        if args.json:
+            _print(state, True)
+        else:
+            print(_morpheus_pause_text(state))
+        return 0
     return 1
+
+
+def _morpheus_pause_text(pause: dict) -> str:
+    fleet = "fleet paused" if pause["fleet_paused"] else "fleet running"
+    if pause["override"] == "paused":
+        return f"PAUSED by `morpheus pause` ({fleet}): {pause['reason']}"
+    if pause["override"] == "running":
+        return f"RUNNING by `morpheus unpause` ({fleet}): {pause['reason']}"
+    return ("PAUSED with the fleet (no session turns)" if pause["paused"]
+            else "running (follows the fleet pause)")
 
 
 def cmd_investigate(args: argparse.Namespace) -> int:

@@ -653,3 +653,53 @@ def test_the_dashboard_shows_a_link_not_the_pr_s_text(central):
         in page.text
     assert "proj_a" in page.text and "failed" in page.text
     assert item["resolution"] not in page.text and "Watch the dashboard" not in page.text
+
+
+def test_morpheus_unpause_runs_its_session_through_a_fleet_pause(central):
+    from jarvis import fleet
+
+    fleet.pause(central, "token burn", now=TEST_EPOCH)
+    assert morpheus.pause_state(central)["paused"] is True
+    state = morpheus.set_pause(central, "running", "validate 0.12.5", now=TEST_EPOCH)
+    assert state["paused"] is False and state["fleet_paused"] is True
+    assert morpheus.report(central)["paused"] is False
+    assert morpheus.set_pause(central, None)["paused"] is True
+
+
+def test_morpheus_pause_holds_it_while_the_fleet_runs(central):
+    state = morpheus.set_pause(central, "paused", "noisy checks", now=TEST_EPOCH)
+    assert state == {"paused": True, "override": "paused", "reason": "noisy checks",
+                     "since": TEST_EPOCH, "fleet_paused": False}
+    assert morpheus.set_pause(central, None)["paused"] is False
+    with pytest.raises(ValueError):
+        morpheus.set_pause(central, "maybe")
+
+
+def test_an_unreadable_morpheus_pause_is_still_a_brake(central):
+    central.set_state(morpheus.PAUSE_KEY, "{not json")
+    assert morpheus.pause_state(central)["paused"] is True
+
+
+def test_the_cli_pins_and_releases_the_morpheus_pause(central, capsys):
+    from jarvis import fleet
+    from jarvis.cli import main
+
+    fleet.pause(central, "token burn", now=TEST_EPOCH)
+    assert main(["morpheus", "unpause", "--reason", "validate the release"]) == 0
+    assert "RUNNING by `morpheus unpause` (fleet paused)" in capsys.readouterr().out
+    assert main(["morpheus", "status"]) == 0
+    assert "RUNNING by `morpheus unpause`" in capsys.readouterr().out
+    assert main(["morpheus", "follow-fleet"]) == 0
+    assert "PAUSED with the fleet" in capsys.readouterr().out
+
+
+def test_the_dashboard_shows_each_item_s_id_to_copy(central):
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    item = _failed(central)
+    morpheus.set_pause(central, "running", "validate the release", now=TEST_EPOCH)
+    page = TestClient(create_app()).get("/morpheus")
+    assert f'title="click to select, then copy">{item["id"]}</td>' in page.text
+    assert "jarvis morpheus unpause" in page.text and "validate the release" in page.text

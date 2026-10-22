@@ -63,6 +63,7 @@ jarvis io cancel <id>                      # filed orders from accepted findings
 jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settles itself; a GAP files an issue, dispatches nothing
 jarvis investigate list / show <inv-id> / cancel <inv-id>
 jarvis morpheus status / show <mv-id> / waive <mv-id> --reason "…" / requeue <mv-id>   # shipped PRs validated in production
+jarvis morpheus pause|unpause --reason "…" / follow-fleet   # Morpheus's own brake; unpause runs it through a fleet pause
 jarvis backlog promote <id> --as feature   # intake -> feature order
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
