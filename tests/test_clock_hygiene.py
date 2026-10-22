@@ -1,12 +1,4 @@
-"""No test reads the real clock (docs/superpowers/specs/2026-10-15-no-test-reads-the-real-clock.md)
-
-An exemption lives either in `ALLOWED` (whole file) or in a `# clock-exempt: class N — reason`
-marker comment, scoped to the function it sits in and re-derived from the AST on every run
-(.jarvis/features/fo-2891ead5/2026-10-15-burn-down-the-clock-hygiene-allowlist.md section 2).
-Every marker reason in tests/ must be unique, which supersedes spec 2.1's `rg | uniq -d` check.
-`src/jarvis/testing.py` is not under tests/ and so is outside this scan — correct, because its
-`FAKE_CLAUDE` string runs in another process, but a loophole.
-"""
+"""No test reads the real clock; exempt only via ALLOWED or a function-scoped `# clock-exempt` marker (docs/superpowers/specs/2026-10-15-no-test-reads-the-real-clock.md)"""
 
 from __future__ import annotations
 
@@ -88,6 +80,7 @@ _TIME_OF_DAY = re.compile(
 
 _CLASS_REASON = re.compile(r"^class (2|3|4) — .+")
 
+# Markers are per-function: scope re-derived from the AST, nothing keyed by a line
 _MARKER = re.compile(r"#\s*clock-exempt:\s*(\S.*?)\s*$")
 _WHOLE_FILE = 10**9  # a module-scope marker's end line
 _PLACEMENT = (
@@ -104,6 +97,7 @@ _REMEDY = (
 # --------------------------------------------------------------------------- walk
 
 
+# src/jarvis/testing.py is outside this scan — its FAKE_CLAUDE runs in another process, a loophole
 def _tracked_test_files() -> list[str]:
     out = subprocess.run(
         ["git", "ls-files", "-z", "tests"],
@@ -582,6 +576,7 @@ def test_every_marker_covers_a_real_clock_read() -> None:
     )
 
 
+# Unique reasons supersede spec 2.1's `rg | uniq -d` check
 def test_marker_reasons_are_unique() -> None:
     bad = duplicate_marker_reasons(_texts())
     assert not bad, (
