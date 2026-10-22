@@ -162,6 +162,16 @@ def reviewable(started, project):
     return daemon, wo
 
 
+@pytest.fixture()
+def wide_net(monkeypatch):
+    """The wide `regex` net, which holds 'migration'; the tightened default does not"""
+    import dataclasses
+
+    real = ops.validation_config
+    monkeypatch.setattr(ops, "validation_config", lambda name: dataclasses.replace(
+        real(name), stakes_classifier="regex"))
+
+
 def _learnings():
     neo = NeoStore()
     try:
@@ -192,7 +202,7 @@ def test_review_without_feedback_still_teaches_the_class_once(reviewable) -> Non
     assert len(_learnings()) == 1
 
 
-def test_a_learning_is_a_rule_about_a_class_not_a_transcript(reviewable) -> None:
+def test_a_learning_is_a_rule_about_a_class_not_a_transcript(reviewable, wide_net) -> None:
     """The class is the high-stakes word the row carries, so it matches the NEXT row like it"""
     _, wo = reviewable
     ops.assume(wo["id"], "ran the database migration on the scratch copy first")
@@ -207,7 +217,7 @@ def test_a_learning_is_a_rule_about_a_class_not_a_transcript(reviewable) -> None
 
 
 def test_a_false_alarm_on_a_held_row_is_recorded_as_a_defect_in_the_net(
-        reviewable, project) -> None:
+        reviewable, project, wide_net) -> None:
     """io-51469add: 'the word migration was a false alarm' must reach the net, like `gate dismiss`"""
     from jarvis import autoreview
 

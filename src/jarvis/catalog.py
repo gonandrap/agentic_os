@@ -293,6 +293,8 @@ DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE = 0.5
 
 #: Which net answers "is this assumption high-stakes?" before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
 STAKES_CLASSIFIER_MODES = ("regex", "shadow", "classifier", "regex-tightened")
+# The measured winner (spec 2026-09-25 §7: precision 0.486 / recall 0.944 vs regex 0.140 / 0.667)
+DEFAULT_STAKES_CLASSIFIER = "regex-tightened"
 
 
 @dataclass
@@ -326,7 +328,7 @@ class ValidationConfig:
     # The cap above, per project
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
     # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
-    stakes_classifier: str = "regex"
+    stakes_classifier: str = DEFAULT_STAKES_CLASSIFIER
     # WHEN FAILING EARLY OBJECTIONS REACH THE INBOX: withdrawn over sent (io-ce566253)
     objection_withdrawal_alarm_rate: float = DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE
 
@@ -1290,7 +1292,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     if assumption_spec_chars < 1:
         raise _err(f"{where}.assumption_spec_chars must be >= 1")
     stakes_classifier = str(
-        raw.get("stakes_classifier", base.stakes_classifier) or "regex")
+        raw.get("stakes_classifier", base.stakes_classifier) or DEFAULT_STAKES_CLASSIFIER)
     if stakes_classifier not in STAKES_CLASSIFIER_MODES:
         # The `roster` precedent: refused loudly rather than shrugged to the default
         raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
