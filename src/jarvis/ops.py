@@ -1108,7 +1108,8 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "msg_id": msg_id, "note": note,
-            "delivery": "jarvisd delivers when the worker is idle"}
+            "delivery": ("delivered at the worker's next tool call if it is mid-turn, "
+                         "otherwise as its next turn")}
 
 
 #: What a message-less `jarvis wo retry` puts on the queue. §3 of... (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)
@@ -3464,6 +3465,29 @@ def objection_response(store: ProjectStore, a: dict[str, Any], *,
 
 #: The shortest verbatim run of an objection's reason that counts as quoting it (io-ce566253)
 OBJECTION_QUOTE_MIN_CHARS = 40
+
+
+def stamp_objection_delivery(store: ProjectStore, msg_id: int) -> None:
+    """An objection that actually went out is DELIVERED, stamped here and nowhere"""
+    envelope = store.envelope_for_message(int(msg_id))
+    if envelope is None:
+        _stamp_late_objection_delivery(store, msg_id)
+        return
+    if envelope["kind"] != "assumption_objection":
+        return
+    a = store.assumption_for_envelope(int(envelope["id"]))
+    if a is not None and a.get("objection_delivered_ts") is None:
+        store.mark_objection_delivered(int(a["id"]))
+
+
+def _stamp_late_objection_delivery(store: ProjectStore, msg_id: int) -> None:
+    """An ordinary message that QUOTES an undelivered objection delivered it, late (io-ce566253)"""
+    msg = store.get_message(int(msg_id))
+    if not msg or msg.get("direction") != "user_to_agent":
+        return
+    for a in store.undelivered_objections(str(msg["wo_id"])):
+        if objection_quoted_in(str(msg.get("content") or ""), a):
+            store.mark_objection_delivered(int(a["id"]), late_msg_id=int(msg_id))
 
 
 def objection_quoted_in(content: str, a: dict[str, Any]) -> bool:

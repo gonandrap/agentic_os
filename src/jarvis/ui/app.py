@@ -357,6 +357,61 @@ class PoolProbe:
             await anyio.sleep(max(1, self.cfg.probe_interval_seconds))
 
 
+def _cost_payloads(picked: dict, project: str, method: str = "TASK") -> dict:
+    """The three /cost payloads for one resolved window (docs/superpowers/specs/2026-10-22-cost-tab-precompute.md)"""
+    report = ops.cost_report(project=project or None, window=picked)
+    # The distribution is a SECTION of this page
+    try:
+        fleet = ops.fleet_cost(project=project or None, resolved=picked)["fleet"]
+    except Exception:                                   # noqa: BLE001
+        fleet = None
+    # The meter is a THIRD payload from the same resolved window
+    try:
+        meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
+    except Exception as e:                              # noqa: BLE001
+        uilog.record_error(method, "cost/meter", e)
+        meter = None
+    return {"report": report, "fleet": fleet, "meter": meter}
+
+
+REFRESH_SECONDS = 60
+
+
+class CostCache:
+    """Default /cost windows, precomputed (docs/superpowers/specs/2026-10-22-cost-tab-precompute.md)"""
+
+    def __init__(self) -> None:
+        self.entries: dict[str, dict] = {}
+
+    def compute(self, name: str) -> dict:
+        picked = ops.cost_window(window=name)
+        return {"window": picked, **_cost_payloads(picked, ""), "computed_at": time.time()}
+
+    def lookup(self, picked: dict) -> dict | None:
+        entry = self.entries.get(picked.get("window") or "")
+        if entry is None or ((entry["window"]["since"], entry["window"]["until"])
+                             != (picked["since"], picked["until"])):
+            return None
+        return entry
+
+    async def refresh(self) -> None:
+        """One round over every named window; a failure keeps the last good entry"""
+        import anyio
+
+        for name in fleetcost.WINDOW_NAMES:
+            try:
+                self.entries[name] = await anyio.to_thread.run_sync(self.compute, name)
+            except Exception as e:                      # noqa: BLE001
+                uilog.record_error("TASK", f"cost/cache/{name}", e)
+
+    async def run(self) -> None:
+        import anyio
+
+        while True:
+            await self.refresh()
+            await anyio.sleep(REFRESH_SECONDS)
+
+
 def _stale_link_hint(name: str, wo_id: str) -> str:
     """Why a work-order deep link went bad, as the visitor should read it"""
     known = sorted(ops.registered_project_paths())
@@ -733,6 +788,7 @@ def wiring_groups(scope: str, *, refresh: bool = False) -> dict[str, object]:
 
 def create_app() -> FastAPI:
     probe = PoolProbe()
+    cost_cache = CostCache()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -741,6 +797,7 @@ def create_app() -> FastAPI:
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
+            tg.start_soon(cost_cache.run)
             try:
                 yield
             finally:
@@ -748,6 +805,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.pool_probe = probe
+    app.state.cost_cache = cost_cache
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
@@ -1222,24 +1280,24 @@ def create_app() -> FastAPI:
                                      offset=_offset_param(offset), tz=tz or None,
                                      since=_in_zone(since, zone) if since else None,
                                      until=_in_zone(until, zone) if until else None)
-            report = ops.cost_report(project=project or None, window=picked)
+            # docs/superpowers/specs/2026-10-22-cost-tab-precompute.md §Matching rule
+            entry = None
+            if (not project and offset in ("", "0") and not since and not until
+                    and (not tz or tz == ops.cost_zone(None, None))):
+                entry = cost_cache.lookup(picked)
+            if entry is not None:
+                picked, payloads = entry["window"], entry
+            else:
+                payloads = _cost_payloads(picked, project, request.method)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
-        # The distribution is a SECTION of this page
-        try:
-            fleet = ops.fleet_cost(project=project or None, resolved=picked)["fleet"]
-        except Exception:                                   # noqa: BLE001
-            fleet = None
-        # The meter is a THIRD payload from the same resolved window
-        try:
-            meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
-        except Exception as e:                              # noqa: BLE001
-            uilog.record_error(request.method, "cost/meter", e)
-            meter = None
+        report, fleet, meter = payloads["report"], payloads["fleet"], payloads["meter"]
+        cached_at = entry["computed_at"] if entry is not None else None
         # Its own variable and never read out of `fleet`: losing the section must not lose the window the...
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
                       project=project, fleet=fleet, meter=meter, window=picked,
+                      cached_at=cached_at, now=time.time(),
                       window_inputs=_window_inputs(picked),
                       projects=sorted(ops.registered_project_paths()))
 
