@@ -668,8 +668,12 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
         # Every turn is dying before it answers: retrying each wake only burns resume context
         return "kill_held"
     if state.get("kill_hold_until"):
+        if (central.get_state(RELEASE_KEY) or "") != (state.get("kill_hold_release") or ""):
+            # A release lifted it: the count starts over, or one restart re-arms the hold (#52)
+            state["kills"] = 0
         state.pop("kill_hold_until", None)
         state.pop("kill_hold_release", None)
+        _save_session(central, state)
     items = wanting_scripts(central, now=now)
     if not state.get("compact_due") and not items:
         return "idle"

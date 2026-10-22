@@ -613,6 +613,26 @@ def test_a_new_release_lifts_the_kill_hold(central, tmp_path):
     assert morpheus.activity(central, now=TEST_EPOCH + 120)["kill_hold_until"] is None
 
 
+def test_a_release_lifted_hold_starts_the_kill_count_again(central, tmp_path):
+    """Decision #52 of 2026-10-22: one restart after the release must not re-arm the hold"""
+    central.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.1")
+    queued(central, 2)
+    kill_until_held(central, tmp_path)
+    central.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.2")
+    # Lifted on a pass with nothing to do: the reset is kept all the same
+    for item in central.conn.execute("SELECT id FROM morpheus_items").fetchall():
+        central.conn.execute("UPDATE morpheus_items SET state='validated' WHERE id=?",
+                             (item["id"],))
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60,
+                         call=FakeTurn()) == "idle"
+    assert morpheus.session_state(central)["kills"] == 0
+    queued(central, 3)
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 120,
+                         call=FakeTurn(error=sigkilled())) == "killed"
+    state = morpheus.session_state(central)
+    assert state["kills"] == 1 and "kill_hold_until" not in state
+
+
 def test_the_status_line_says_the_session_is_held_after_the_kills(central, tmp_path, capsys,
                                                                   clock):
     from jarvis.cli import main
