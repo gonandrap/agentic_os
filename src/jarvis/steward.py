@@ -77,6 +77,8 @@ class Candidate:
     parent_wo_id: str = ""
     #: Distinct orders referencing the subject (`jarvis issues`' count), when it has one
     refs: int = 0
+    #: The file the candidate's defect is in — what it is deduped by (`dedupe_key`)
+    file: str = ""
 
     def __post_init__(self) -> None:
         assert self.origin_kind in ORIGIN_KINDS, self.origin_kind
@@ -102,6 +104,8 @@ class Decision:
     mode: str
     #: Whether the caller may dispatch NOW
     allowed: bool = False
+    #: The decision this one restates, when the candidate is a re-wording of it
+    duplicate_of: int = 0
     budget_usd: float | None = None
     decision_id: int = 0
     stamp: dict[str, Any] = field(default_factory=dict)
@@ -304,7 +308,18 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
                             allowed=allowed, budget_usd=budget_usd)
         decision.stamp = {"origin_kind": c.origin_kind, "generation": generation,
                           "severity": severity, "mode": mode}
-        repeat = _repeat_of(central, c, outcome, now)
+        key = dedupe_key(c)
+        duplicate = _duplicate_of(central, key)
+        if duplicate:
+            # One defect worded by several seats, or re-raised in a later round
+            outcome, rule = "drop", "duplicate"
+            reason = f"the same defect as steward decision #{duplicate}"
+            decision.outcome, decision.rule, decision.reason = outcome, rule, reason
+            decision.duplicate_of = duplicate
+            if mode == "enforce":
+                allowed, budget_usd = False, None
+                decision.allowed, decision.budget_usd = allowed, budget_usd
+        repeat = 0 if duplicate else _repeat_of(central, c, outcome, now)
         if repeat:
             # A site the daemon re-asks every tick (a red `main`
             decision.decision_id = repeat
@@ -315,7 +330,8 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
             "subject": c.subject[:500], "severity": severity, "claimed_severity": claimed,
             "outcome": outcome, "rule": rule, "reason": reason, "mode": mode,
             "applied": int(allowed and outcome == "dispatch"), "generation": generation,
-            "parent_wo_id": c.parent_wo_id, "budget_usd": budget_usd})
+            "parent_wo_id": c.parent_wo_id, "budget_usd": budget_usd,
+            "dedupe_key": key, "duplicate_of": duplicate})
         decision.stamp["decision_id"] = decision.decision_id
         if outcome == "ask" and mode == "enforce" and self_dispatch:
             central.add_inbox(c.project, f"steward: {c.subject[:120]}",
@@ -331,6 +347,27 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
 
 #: How long an identical decision is not recorded again
 REPEAT_SECONDS = 3600
+
+
+def dedupe_key(c: Candidate) -> str:
+    """One defect's bucket: the origin unit and the file, or '' when no code is named
+
+    Per Q2109: the seats of one panel word one mechanism as several findings naming
+    DIFFERENT symbols in one file (decisions #23-#25, #14/#16/#18), so a symbol-level
+    key leaves the leak open. One patch covers the file, so the file is the bucket.
+    """
+    path = c.file.strip().lower()
+    if not path or not c.parent_wo_id:
+        return ""
+    return f"{c.project}|{c.origin_kind}|{c.parent_wo_id}|{path}"
+
+
+def _duplicate_of(central: CentralStore, key: str) -> int:
+    """The decision in `key`'s bucket this candidate restates, or 0 (spec §3.2)"""
+    if not key:
+        return 0
+    rows = central.steward_dedupe_bucket(key)
+    return int(rows[0]["id"]) if rows else 0
 
 
 def _repeat_of(central: CentralStore, c: Candidate, outcome: str,

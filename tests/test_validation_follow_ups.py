@@ -1116,6 +1116,22 @@ def test_enforced_the_panel_files_no_minor_cosmetic_or_lone_medium(fleet, tracke
     assert {h["level"] for h in out["steward_held"]} == {"cosmetic", "minor", "medium"}
 
 
+def test_enforced_one_file_is_one_filing_and_the_brief_carries_the_other_wordings(
+        fleet, tracker, monkeypatch):
+    """Decisions #23-#25 of 2026-10-22: three seats, one mechanism, one file (Q2109)"""
+    wo = judged(fleet, "passed")
+    before = titles(tracker)
+    _enforcing(monkeypatch)
+    out = settle_again(fleet, wo["id"],
+                       [_rated("run() returns None where it must raise", "critical"),
+                        _rated("the same path swallows the error after a retry",
+                               "critical")])
+    assert titles(tracker) == before + ["run() returns None where it must raise"]
+    assert [h["title"] for h in out["steward_held"]] == [
+        "the same path swallows the error after a retry"]
+    assert "the same path swallows the error after a retry" in filed(tracker)[-1]["body"]
+
+
 def test_a_medium_goes_back_to_the_coder_and_a_cosmetic_does_not():
     note = ops.follow_up_feedback([_rated("A silent empty price list", "medium"),
                                    _rated("Rename the helper", "cosmetic")])

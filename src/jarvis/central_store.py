@@ -493,7 +493,11 @@ CREATE TABLE IF NOT EXISTS steward_decisions (
     generation INTEGER NOT NULL DEFAULT 0,
     parent_wo_id TEXT NOT NULL DEFAULT '',
     wo_id TEXT NOT NULL DEFAULT '',         -- the order it led to, once one exists
-    budget_usd REAL
+    budget_usd REAL,
+    -- The mechanical dedupe bucket (`steward.dedupe_key`): origin unit + file, '' for a
+    -- candidate that names no code; `duplicate_of` names the decision this one restates.
+    dedupe_key TEXT NOT NULL DEFAULT '',
+    duplicate_of INTEGER NOT NULL DEFAULT 0
 );
 -- Morpheus's queue: one shipped PR being validated in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
 CREATE TABLE IF NOT EXISTS morpheus_items (
@@ -595,7 +599,19 @@ ADDED_COLUMNS = {
         # How long the call took, in milliseconds (docs/superpowers/specs/2026-10-01-neo-observability.md)
         "latency_ms": "INTEGER",
     },
+    "steward_decisions": {
+        # Dedupe before queue/dispatch (spec §3.2, `steward.dedupe_key`)
+        "dedupe_key": "TEXT NOT NULL DEFAULT ''",
+        "duplicate_of": "INTEGER NOT NULL DEFAULT 0",
+    },
 }
+
+# Indexes over columns ADDED_COLUMNS backfills: on an older home they do not exist yet
+# when SCHEMA runs, so these wait until after the migration.
+POST_MIGRATION_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_steward_decisions_dedupe
+    ON steward_decisions(dedupe_key, duplicate_of);
+"""
 
 
 class CentralStore:
@@ -611,6 +627,7 @@ class CentralStore:
 
     def _migrate(self) -> None:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
+        self.conn.executescript(POST_MIGRATION_SCHEMA)
 
     def _ensure_fts(self) -> bool:
         """Create the search index and backfill it once (docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §4)"""
@@ -675,14 +692,28 @@ class CentralStore:
         """One steward decision (`steward.gate`)"""
         cols = ("project", "origin_kind", "subject", "severity", "claimed_severity",
                 "outcome", "rule", "reason", "mode", "applied", "generation",
-                "parent_wo_id", "wo_id", "budget_usd")
+                "parent_wo_id", "wo_id", "budget_usd", "dedupe_key", "duplicate_of")
+        blank: dict[str, Any] = {"applied": 0, "generation": 0, "budget_usd": None,
+                                 "duplicate_of": 0}
         cur = self.conn.execute(
             f"INSERT INTO steward_decisions (ts, {', '.join(cols)}) "
             f"VALUES (?{', ?' * len(cols)})",
             (row.get("ts") or db.now(),
-             *(row.get(c, {"applied": 0, "generation": 0, "budget_usd": None}.get(c, ""))
-               for c in cols)))
+             *(row.get(c, blank.get(c, "")) for c in cols)))
         return int(cur.lastrowid)
+
+    def steward_dedupe_bucket(self, dedupe_key: str,
+                              limit: int = 1) -> list[dict[str, Any]]:
+        """One dedupe bucket's own decisions, newest first: never a duplicate, never a drop
+
+        A dropped candidate decided nothing to collapse onto, and a severer wording of
+        the same defect must still reach the steward's rules.
+        """
+        rows = self.conn.execute(
+            "SELECT id FROM steward_decisions WHERE dedupe_key=? "
+            "AND duplicate_of=0 AND outcome<>'drop' ORDER BY id DESC LIMIT ?",
+            (dedupe_key, limit))
+        return [dict(r) for r in rows.fetchall()]
 
     def link_steward_decision(self, decision_id: int, wo_id: str) -> None:
         """Name the order a decision led to, once the caller has created it"""

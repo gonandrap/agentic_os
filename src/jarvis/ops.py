@@ -2519,14 +2519,25 @@ def _steward_follow_ups(store: ProjectStore, project: ProjectSpec, unit_id: str,
     except Exception:  # noqa: BLE001 — see the docstring
         return list(pending)
     allowed, held = [], []
+    decided: dict[int, dict[str, Any]] = {}
     for finding in pending:
         decision = steward.gate(
             steward.Candidate("panel", str(finding.get("level") or "medium"),
                               project.name, str(finding.get("title") or ""),
                               evidence=(str(finding.get("failure") or ""),),
-                              parent_wo_id=unit_id),
+                              parent_wo_id=unit_id,
+                              file=str(finding.get("file") or "")),
             catalog=catalog, store=store, self_dispatch=True)
-        (allowed if decision.allowed else held).append(finding)
+        kept = decided.get(decision.duplicate_of)
+        if kept is not None and not decision.allowed:
+            # One patch covers every seat's wording, so the brief carries them all (Q2109)
+            kept.setdefault("also_worded", []).append(str(finding.get("title") or ""))
+            held.append(finding)
+            continue
+        row = dict(finding)
+        if not decision.duplicate_of:
+            decided[decision.decision_id] = row
+        (allowed if decision.allowed else held).append(row)
     if held:
         payload["steward_held"] = [{"title": f.get("title"), "level": f.get("level")}
                                    for f in held]
@@ -2673,6 +2684,8 @@ def _follow_up_body(finding: Mapping[str, Any], *, unit_id: str, round_no: int,
     where = " ".join(x for x in (str(finding.get("file") or "").strip(),
                                  str(finding.get("symbol") or "").strip()) if x)
     failure = str(finding.get("failure") or "").strip()
+    # The wordings the steward collapsed onto this one: one patch covers them all (Q2109)
+    also = [str(t).strip() for t in finding.get("also_worded") or () if str(t).strip()]
     footer = [
         "",
         "---",
@@ -2685,6 +2698,8 @@ def _follow_up_body(finding: Mapping[str, Any], *, unit_id: str, round_no: int,
     return "\n".join([detail or "_The seat recorded no detail._",
                       *([f"\n**Where:** `{where}`"] if where else []),
                       *([f"\n**Failure:** {failure}"] if failure else []),
+                      *(["\n**Other seats worded the same defect as:**",
+                         *(f"- {t}" for t in also)] if also else []),
                       *footer])
 
 
