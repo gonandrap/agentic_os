@@ -3835,11 +3835,23 @@ MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "fail
                  "timedout": "⌛"}
 
 
+def _morpheus_offer_text(item: dict) -> str:
+    """Why a queued item with no script is not being worked on right now (#1161)"""
+    from .morpheus import MAX_OFFERS
+
+    if not item.get("offers"):
+        return ""
+    wait = item.get("offer_wait")
+    when = "gave up" if wait is None else f"next in {_dur(wait)}"
+    return f" · offer {item['offers']}/{MAX_OFFERS}, {when}"
+
+
 def _morpheus_line(item: dict) -> str:
     action = f" → {item['action']}" if item.get("action") else ""
     return (f"{MORPHEUS_ICON.get(item['state'], '•')} {item['id']} "
             f"[{item.get('project') or '?'}] PR #{item['pr_number']} "
-            f"{item['state']}{action} — {item['pr_title'][:70]}")
+            f"{item['state']}{action}{_morpheus_offer_text(item)} "
+            f"— {item['pr_title'][:70]}")
 
 
 def cmd_morpheus(args: argparse.Namespace) -> int:

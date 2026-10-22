@@ -46,7 +46,8 @@
       <td class="mono" style="white-space:nowrap;user-select:all" title="click to select, then copy">{{ i.id }}</td>
       <td class="mono">{{ i.project or "—" }}</td>
       <td class="mono" style="white-space:nowrap"><a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a></td>
-      <td class="mono {{ tone[i.state] }}">{{ i.state }}</td>
+      <td class="mono {{ tone[i.state] }}">{{ i.state }}
+        {% if i.offers %}<br><span class="sub">offer {{ i.offers }}/{{ report.max_offers }}{% if i.offer_wait is none %} · gave up{% endif %}</span>{% endif %}</td>
       <td class="mono">{% if i.script %}<details><summary>{{ i.script_source }}</summary><pre>{{ i.script }}</pre></details>{% else %}—{% endif %}</td>
       <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
       <td class="mono" style="white-space:nowrap">{{ fmt_ts(i.deadline_ts) }}</td>

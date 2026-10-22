@@ -659,6 +659,15 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
                       append_system_prompt=MORPHEUS_PERSONA,
                       permission_mode=catalog.os.default_permission_mode,
                       add_dirs=add_dirs, timeout=cfg.turn_timeout_seconds)
+    except claude_cli.KilledError as e:
+        # BEFORE ClaudeCliError, its base: a kill is not an answer, so it costs no offer (#1161)
+        state["last_error"] = str(e)[:500]
+        state["kills"] = int(state.get("kills") or 0) + 1
+        if not resume:
+            state.pop("session_id", None)
+        _save_session(central, state)
+        log.warning("morpheus turn killed before it answered: %s", e)
+        return "killed"
     except claude_cli.ClaudeCliError as e:
         state["last_error"] = str(e)[:500]
         state["errors"] = int(state.get("errors") or 0) + 1
@@ -727,13 +736,25 @@ def _mark_offered(state: dict[str, Any], items: list[dict], now: float) -> None:
 
 # -- what the surfaces read
 
-def report(central: CentralStore, catalog: Catalog | None = None) -> dict[str, Any]:
+def report(central: CentralStore, catalog: Catalog | None = None, *,
+           now: float | None = None) -> dict[str, Any]:
     """Counts first, then the session, then every item"""
     state = session_state(central)
-    state.pop("offers", None)
+    offers = state.pop("offers", None) or {}
     pause = pause_state(central)
+    items = central.morpheus_items()
+    now = db.now() if now is None else now
+    for item in items:
+        # A queued item silently waiting out its re-offer window has to say so (#1161)
+        seen = offers.get(item["id"]) or {}
+        n = int(seen.get("n") or 0)
+        if item["state"] != "queued" or not n:
+            continue
+        item["offers"] = n
+        item["offer_wait"] = (None if n >= MAX_OFFERS
+                              else max(0.0, float(seen.get("ts") or 0) + REOFFER_SECONDS - now))
     return {"enabled": bool(catalog.os.morpheus.enabled) if catalog else None,
             "counts": {s: central.morpheus_counts().get(s, 0) for s in STATES},
             "session": state, "paused": pause["paused"], "pause": pause,
             "last_release": central.get_state(RELEASE_KEY) or "",
-            "items": central.morpheus_items()}
+            "max_offers": MAX_OFFERS, "items": items}
