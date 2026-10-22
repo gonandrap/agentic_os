@@ -114,6 +114,8 @@ class Decision:
     head_sha: str = ""
     round_id: int = 0
     round_n: int = 0
+    #: `ops.CATCH_UP_*` when a refused catch-up produced this hold — the outcome, not its prose (#1173)
+    catch_up: str = ""
 
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
@@ -124,7 +126,7 @@ def hold_payload(decision: Decision) -> dict[str, Any]:
     """The `automerge_held` event payload, in ONE place"""
     return {"code": decision.code, "reason": decision.reason,
             "judged_sha": decision.judged_sha, "head_sha": decision.head_sha,
-            "round": decision.round_n}
+            "round": decision.round_n, "catch_up": decision.catch_up}
 
 
 def hold_is_live(state: dict[str, Any] | None) -> bool:
@@ -158,7 +160,8 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
             f"{caught}; CI is running on the new head",
     }.get(catch_up.outcome, f"{moved} and this branch does not contain it")
     return _held(HELD_BASE_MOVED, reason,
-                 head_sha=str(getattr(pr, "head_oid", "") or ""))
+                 head_sha=str(getattr(pr, "head_oid", "") or ""),
+                 catch_up=str(catch_up.outcome or ""))
 
 
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
