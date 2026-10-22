@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -87,7 +86,7 @@ class Hold:
 
     def finish(self, now: float | None = None) -> float:
         return self.ended if self.ended is not None else (
-            time.time() if now is None else now)
+            db.now() if now is None else now)
 
     @property
     def phrase(self) -> str:
@@ -107,7 +106,7 @@ class Hold:
 def held(store: ProjectStore, wo_id: str, *,
          now: float | None = None) -> list[Hold]:
     """Every interval the OS's record says this work order was held, oldest first"""
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     spans = _episodes(store.list_events(wo_id, limit=_EVENT_LIMIT))
     spans = _outside(spans, _working(store.list_turns(wo_id), now), now)
     return _merge(spans, now)
@@ -116,7 +115,7 @@ def held(store: ProjectStore, wo_id: str, *,
 def held_family(store: ProjectStore, wo_ids: Sequence[str], *,
                 now: float | None = None) -> list[Hold]:
     """Every interval NO member of this family could run — a feature order's hold (docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md)"""
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     episodes: list[Hold] = []
     turns: list[dict[str, Any]] = []
     for wo_id in wo_ids:

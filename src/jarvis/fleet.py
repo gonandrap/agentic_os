@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
-from . import worker_session
+from . import db, worker_session
 from .invariants import clock
 from .project_store import RETRY_SWEEP_STATUSES, UNGOVERNED_ORIGINS, ProjectStore
 
@@ -82,7 +81,7 @@ def pause(central: Any, reason: str = "", allow: Iterable[str] = (),
     """Stop the fleet"""
     current = load_pause(central)
     since = current.since if current is not None and current.since else (
-        time.time() if now is None else now)
+        db.now() if now is None else now)
     new = FleetPause(since=since, reason=reason or (current.reason if current else ""),
                      allow=frozenset(allow))
     _write_pause(central, new)
@@ -113,7 +112,7 @@ def ramp(central: Any, now: float | None = None) -> Ramp | None:
         return None
     tripped = bool(central.get_state(BREAKER_KEY))
     length = RAMP_SECONDS * (2 if tripped else 1)
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     if now >= reopened + length:
         return None
     return Ramp(since=reopened, until=reopened + length,
@@ -153,7 +152,7 @@ class Fleet:
         self.pause = pause
         self.ramp = ramp
         #: The clock this reading was taken against
-        self.at = time.time() if at is None else at
+        self.at = db.now() if at is None else at
 
     def blocked(self, order_id: str | None = None) -> str:
         """Why nothing may launch, in words for the user — or "" when something may"""

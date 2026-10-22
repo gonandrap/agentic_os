@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import branchproof, claude_cli, evidence, ops, validation
+from jarvis import branchproof, claude_cli, db, evidence, ops, validation
 from jarvis.catalog import load_catalog
 from jarvis.daemon import (FEATURE_HANDOFF_EVENT, FEATURE_MANAGER_SILENT,
                            FEATURE_MANAGER_STALLED,
@@ -1127,7 +1127,7 @@ def test_a_feature_round_met_by_a_usage_window_waits_rather_than_spending_a_retr
     fleet.reconfigure(max_rounds=1)
     validator = Validator(UsageLimitError(UsageLimit(
         message="You've hit your session limit · resets 11:50pm (America/Los_Angeles)",
-        reset_at=time.time() + 3600)))
+        reset_at=db.now() + 3600)))
     fleet.daemon.validator = validator
     store = fleet.store()
     try:
@@ -1163,7 +1163,7 @@ def test_a_feature_round_the_shut_window_skips_records_the_hold(fleet):
         assert store.get_feature_order(fo_id)["status"] == "validating"
 
         state = fleet_mod.Fleet(3, 0, fleet_mod.Outage(
-            project="proj_a", wo_id="wo-1", reopens_at=time.time() + 3600,
+            project="proj_a", wo_id="wo-1", reopens_at=db.now() + 3600,
             message="You've hit your session limit · resets 11:50pm"))
         for _ in range(3):
             fleet.daemon.feature_validation_tick(fleet.spec, store, state)
@@ -1186,7 +1186,7 @@ def test_a_held_feature_round_carries_the_cause_on_the_ROUND(fleet):
 
     fleet.daemon.validator = Validator(UsageLimitError(UsageLimit(
         message="You've hit your session limit · resets 11:50pm (America/Los_Angeles)",
-        reset_at=time.time() + 3600)))
+        reset_at=db.now() + 3600)))
     store = fleet.store()
     try:
         fo_id = fleet.release("CSV export", "one")
@@ -1238,7 +1238,7 @@ def test_a_feature_round_whose_seats_could_not_authenticate_is_held(fleet):
         events = ops.feature_events_of_kind(store, fo_id, "validation_failed")
         until, cause = validation_hold(events, 1)
         assert cause == VALIDATION_AUTH_CAUSE
-        assert until > time.time()
+        assert until > db.now()
 
         # The STREAK is counted from those events
         Daemon._feature_auth_held(fleet.daemon, store, store.get_feature_order(fo_id),
@@ -1415,7 +1415,7 @@ def _pr_merged(store: ProjectStore, child_id: str, sha: str,
                *, minutes_ago: float = 0.0) -> None:
     """What the merge poller records when a child's pull request lands"""
     store.add_event(child_id, "pr_merged", {"merge_commit": sha},
-                    ts=time.time() - minutes_ago * 60)
+                    ts=db.now() - minutes_ago * 60)
 
 
 def _route(fleet, store, fo_id: str) -> bool:
@@ -1619,7 +1619,7 @@ def test_one_defer_event_per_distinct_state(fleet):
 
         store.conn.execute(
             "UPDATE wo_events SET ts=? WHERE wo_id=? AND kind='pr_merged'",
-            (time.time() - (fleet.spec.validation.feature_merge_wait_minutes + 1) * 60,
+            (db.now() - (fleet.spec.validation.feature_merge_wait_minutes + 1) * 60,
              child["id"]))
         store.conn.commit()
 
