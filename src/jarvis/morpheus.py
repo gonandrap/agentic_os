@@ -643,6 +643,12 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
     call = call or claude_cli.run_session_turn
     dirs = dirs or {}
     state = session_state(central)
+    hold = float(state.get("usage_hold_until") or 0)
+    if now < hold:
+        # The account's window is spent: any turn would be refused, so none is attempted (#1171)
+        return "usage_held"
+    if hold:
+        state.pop("usage_hold_until", None)
     items = wanting_scripts(central, now=now)
     if not state.get("compact_due") and not items:
         return "idle"
@@ -653,22 +659,51 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
     else:
         prompt, kind, batch = build_prompt(items, dirs), "scripts", items
     add_dirs = sorted({dirs[i["project"]] for i in batch if i.get("project") in dirs})
-    state.update(session_id=session_id, last_turn_ts=now, last_turn_kind=kind)
+    state.update(session_id=session_id, last_turn_ts=now, last_turn_kind=kind,
+                 turn_started_ts=now)
+    # Persisted before the call: this is what another process reads as "a turn is in flight"
+    _save_session(central, state)
     try:
         result = call(prompt, session_id, resume=resume, cwd=cwd, model=cfg.model,
                       append_system_prompt=MORPHEUS_PERSONA,
                       permission_mode=catalog.os.default_permission_mode,
                       add_dirs=add_dirs, timeout=cfg.turn_timeout_seconds)
+    except claude_cli.UsageLimitError as e:
+        # BEFORE ClaudeCliError, its base: the window refused the call, so it costs no offer (#1171)
+        from .worker_session import RATE_LIMIT_FALLBACK_DELAY
+
+        state.pop("turn_started_ts", None)
+        state["last_error"] = str(e)[:500]
+        state["usage_limits"] = int(state.get("usage_limits") or 0) + 1
+        state["usage_hold_until"] = e.limit.reset_at or now + RATE_LIMIT_FALLBACK_DELAY
+        if not resume:
+            state.pop("session_id", None)
+        _save_session(central, state)
+        log.warning("morpheus turn refused by the usage window, held until %s: %s",
+                    state["usage_hold_until"], e)
+        return "usage_limit"
+    except claude_cli.KilledError as e:
+        # BEFORE ClaudeCliError, its base: a kill is not an answer, so it costs no offer (#1161)
+        state.pop("turn_started_ts", None)
+        state["last_error"] = str(e)[:500]
+        state["kills"] = int(state.get("kills") or 0) + 1
+        if not resume:
+            state.pop("session_id", None)
+        _save_session(central, state)
+        log.warning("morpheus turn killed before it answered: %s", e)
+        return "killed"
     except claude_cli.ClaudeCliError as e:
+        state.pop("turn_started_ts", None)
         state["last_error"] = str(e)[:500]
         state["errors"] = int(state.get("errors") or 0) + 1
         if not resume:
             # The CLI may have half-created the session: the next first turn mints a fresh id
             state.pop("session_id", None)
-        _mark_offered(state, batch, now)
+        _mark_offered(state, batch, now, error=True)
         _save_session(central, state)
         log.warning("morpheus turn failed: %s", e)
         return "error"
+    state.pop("turn_started_ts", None)
     agent_usage.record(agent_usage.MORPHEUS, usage=result, label=kind,
                        session_id=session_id, store=central)
     state["turns"] = int(state.get("turns") or 0) + 1
@@ -718,11 +753,53 @@ def pause_state(central: CentralStore) -> dict[str, Any]:
             "since": pin.get("since"), "fleet_paused": fleet_paused}
 
 
-def _mark_offered(state: dict[str, Any], items: list[dict], now: float) -> None:
+def _mark_offered(state: dict[str, Any], items: list[dict], now: float,
+                  error: bool = False) -> None:
     offers = state.setdefault("offers", {})
     for item in items:
         seen = offers.get(item["id"]) or {}
-        offers[item["id"]] = {"n": int(seen.get("n") or 0) + 1, "ts": now}
+        offers[item["id"]] = {"n": int(seen.get("n") or 0) + 1, "ts": now,
+                              "cause": "error" if error else "offer"}
+
+
+def _offer_cause(seen: dict[str, Any]) -> str | None:
+    """None for an entry written before the cause was recorded — unknown, not "an offer" (#1171)"""
+    if seen.get("cause"):
+        return str(seen["cause"])
+    if "error" in seen:
+        return "error" if seen["error"] else "offer"
+    return None
+
+
+def activity(central: CentralStore, *, timeout: float | None = None,
+             now: float | None = None) -> dict[str, Any]:
+    """What the session is DOING — never its pause mode: in flight, idle, or holding items back"""
+    from .catalog import MorpheusConfig
+
+    now = db.now() if now is None else now
+    state = session_state(central)
+    offers = state.get("offers") or {}
+    limit = float(timeout or MorpheusConfig().turn_timeout_seconds)
+    started = float(state.get("turn_started_ts") or 0)
+    # A marker older than the turn's own timeout is a crashed daemon, not work in flight
+    in_flight = bool(started) and now - started <= limit
+    held = []
+    for item in central.morpheus_items(("queued",)):
+        seen = offers.get(item["id"]) or {}
+        n, ts = int(seen.get("n") or 0), float(seen.get("ts") or 0)
+        if n >= MAX_OFFERS:
+            held.append({"id": item["id"], "offers": n, "next_offer_ts": None,
+                         "exhausted": True, "cause": _offer_cause(seen)})
+        elif now - ts < REOFFER_SECONDS:
+            held.append({"id": item["id"], "offers": n, "next_offer_ts": ts + REOFFER_SECONDS,
+                         "exhausted": False, "cause": _offer_cause(seen)})
+    usage_hold = float(state.get("usage_hold_until") or 0)
+    return {"usage_hold_until": usage_hold if now < usage_hold else None,
+            "turn_in_flight": in_flight, "turn_kind": state.get("last_turn_kind") or "",
+            "turn_started_ts": started if in_flight else None,
+            "abandoned_turn_ts": started if started and not in_flight else None,
+            "due": len(wanting_scripts(central, now=now)),
+            "held": held, "max_offers": MAX_OFFERS}
 
 
 # -- what the surfaces read
@@ -732,8 +809,10 @@ def report(central: CentralStore, catalog: Catalog | None = None) -> dict[str, A
     state = session_state(central)
     state.pop("offers", None)
     pause = pause_state(central)
+    timeout = catalog.os.morpheus.turn_timeout_seconds if catalog else None
     return {"enabled": bool(catalog.os.morpheus.enabled) if catalog else None,
             "counts": {s: central.morpheus_counts().get(s, 0) for s in STATES},
             "session": state, "paused": pause["paused"], "pause": pause,
+            "activity": activity(central, timeout=timeout),
             "last_release": central.get_state(RELEASE_KEY) or "",
             "items": central.morpheus_items()}
