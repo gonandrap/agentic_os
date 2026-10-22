@@ -88,6 +88,17 @@ def test_a_units_uptime_is_read_off_the_same_monotonic_clock(monkeypatch) -> Non
     assert systemd_units.uptime_seconds("jarvis-ui.service") == 12.5
 
 
+@pytest.mark.parametrize("state,transitioning", [
+    ("deactivating", True), ("activating", True), ("reloading", True),
+    ("active", False), ("inactive", False), ("failed", False), ("", False),
+])
+def test_only_a_restarts_own_states_count_as_transitioning(monkeypatch, state,
+                                                           transitioning) -> None:
+    """A restart's stop phase is `deactivating`, and uptime still holds the old start (issue #1194)"""
+    monkeypatch.setattr(systemd_units, "_show", lambda unit, prop: state)
+    assert systemd_units.unit_transitioning("jarvis-ui.service") is transitioning
+
+
 @pytest.mark.parametrize("answer", ["", "0", "not-a-number"])
 def test_an_unknown_uptime_is_none_rather_than_a_guess(monkeypatch, answer) -> None:
     monkeypatch.setattr(systemd_units, "_show", lambda unit, prop: answer)

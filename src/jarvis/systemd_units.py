@@ -133,10 +133,19 @@ def main_pid(unit: str, attempts: int = 20, delay: float = 0.05) -> int | None:
     return None
 
 
+#: States a restart passes through, where the unit serves nothing and is not faulty either
+_TRANSITIONAL = ("activating", "reloading", "deactivating")
+
+
 def unit_active(unit: str) -> bool:
     """Is the unit still running?"""
     state = _show(unit, "ActiveState")
-    return state in ("active", "activating", "reloading", "deactivating")
+    return state in ("active", *_TRANSITIONAL)
+
+
+def unit_transitioning(unit: str) -> bool:
+    """Is the unit mid-restart — stopping or starting? (issue #1194)"""
+    return _show(unit, "ActiveState") in _TRANSITIONAL
 
 
 def uptime_seconds(unit: str) -> float | None:
