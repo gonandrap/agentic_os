@@ -35,8 +35,7 @@ SERENA_READ_TOOLS = (
 SERENA_TOOL_PREFIXES = ("mcp__serena__", "mcp__plugin_serena_serena__")
 
 
-#: The ONE command a release order may run that `auto` mode would otherwise veto — the
-#: release script by its exact path, as the `shipit` skill invokes it, and nothing wider
+#: The ship script by the exact path the `shipit` skill invokes, and nothing wider (#1206)
 RELEASE_ALLOW_RULES = ("Bash(scripts/shipit.sh:*)",)
 
 
@@ -108,10 +107,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         f"Read(//{proj_abs}/**)",
         # Read-only code navigation
         *(serena_allow_rules() if serena else ()),
-        # Release orders only: `auto` mode's classifier denies this one as a "Production
-        # Deploy", a second permission layer that duplicates the OS's own release gate and
-        # that no gate request reaches, so a gate-approved release could never run (#1206).
-        # The PreToolUse gate still mediates it: an approved release gate stays mandatory.
+        # Release orders only: without it `auto` mode vetoes a GATE-APPROVED release (#1206)
         *(RELEASE_ALLOW_RULES if release.is_release_order(wo) else ()),
     ):
         if rule not in allow:

@@ -562,8 +562,10 @@ def test_stage_writes_the_marker_for_real(tmp_path):
                     "--base", _head_sha(repo), dry_run=False)
     assert r.returncode == 0, r.stdout + r.stderr
 
-    marker_file = tmp_path / "jarvis-home" / "run" / "pending_release.json"
+    # The PRODUCTION daemon's home, not this shell's JARVIS_HOME (issue #1206)
+    marker_file = tmp_path / "prod" / "state" / "run" / "pending_release.json"
     assert marker_file.exists()
+    assert not (tmp_path / "jarvis-home" / "run" / "pending_release.json").exists()
     marker = json.loads(marker_file.read_text())
     assert marker == {
         "wo_id": "wo-abc123", "project": "jarvis_os", "version": "0.2.0",
