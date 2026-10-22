@@ -1,5 +1,6 @@
 """§11 of docs/superpowers/specs/2026-09-24-order-observability.md: the user reaching a SHIPPED remedy"""
 
+# clock-exempt: class 3 — spin-waits on daemon.remedy_applying while the wo-fix remedy runs on its own thread
 from __future__ import annotations
 
 import re
