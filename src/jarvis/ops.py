@@ -4192,10 +4192,10 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
     from .invariants import VALIDATION_STUCK_BLOCKER
 
     wo_id = wo["id"]
-    store.close_validation_round(round_id, "escalated", reason)
-    store.add_event(wo_id, "validation_escalated",
-                    {"round": n, "round_id": round_id, "reason": reason,
-                     "cause": cause})
+    store.settle_validation_round(
+        round_id, "escalated",
+        {"round": n, "round_id": round_id, "reason": reason, "cause": cause},
+        wo_id=wo_id, reason=reason)
     store.set_status(wo_id, "needs_review")
     store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
     store.add_notification(
@@ -5135,9 +5135,10 @@ def void_round_for_settled_pr(store: ProjectStore, wo: dict[str, Any],
     rnd = store.latest_validation_round(wo_id=wo["id"])
     if not rnd or not store.round_machine_owns(rnd):
         return None
-    store.close_validation_round(rnd["id"], "void", reason)
-    store.add_event(wo["id"], "validation_void",
-                    {"round": rnd["round"], "round_id": rnd["id"], "reason": reason})
+    store.settle_validation_round(
+        rnd["id"], "void",
+        {"round": rnd["round"], "round_id": rnd["id"], "reason": reason},
+        wo_id=wo["id"], reason=reason)
     return int(rnd["round"])
 
 
@@ -12975,11 +12976,23 @@ REVIEWS_GATE = _Pass(
     "whatever status it was filed under",
     "daemon.reviews_gate", reviews_gate)
 
+#: Shared for REVIEWS_GATE's reason: the panel's sweep filters on `OPEN_STATUSES` (issue #1199)
+JUDGES_ROUND = _Pass(
+    "Daemon.validation_tick",
+    "the panel owns a round on this row, so it judges it — a validation "
+    "hold only DELAYS that turn (`daemon.runnable_round` is the pass's own "
+    "now-or-not test; §2: None means nobody will act, never not yet). "
+    "`Daemon.validation_tick` sweeps `work_orders_awaiting_validation`, which "
+    "filters on `OPEN_STATUSES` and not on `validating`: since issue 212 a round "
+    "runs in PARALLEL with the status the delivery left behind",
+    "daemon.validation_round", validation_round)
+
 #: Keyed in `OPEN_STATUSES` order
 SCHEDULED_ACTORS: dict[str, ActorPasses] = {
     "pending": ActorPasses((
         _Pass("Daemon.dispatch_pending", _pending_why,
               "project_store.claim_sql_selects", claim_sql_selects),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "dispatching": ActorPasses((
@@ -12987,6 +13000,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "the claim is inside its grace or a turn is already on record, so the "
               "settler will move this row",
               "daemon.settles_turn", settles_turn),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "running": ActorPasses((
@@ -13001,6 +13015,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         _Pass("Daemon.deliver_messages",
               "a queued message is deliverable, so it goes out as the next turn",
               "daemon.delivers_message", delivers_message),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "idle": ActorPasses((
@@ -13010,6 +13025,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "including `bus.ChildrenLanded` from `Daemon.settle_features` via "
               "`ops.revive_feature_manager`",
               "ops.manager_awaiting_feature", manager_awaiting_feature),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "waiting_input": ActorPasses((
@@ -13022,14 +13038,11 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         _Pass("Daemon._neo_drain",
               "Neo still holds the question this order is parked on",
               "daemon.answers_question", answers_question),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "validating": ActorPasses((
-        _Pass("Daemon.validation_tick",
-              "the panel owns a round on this row, so it judges it — a validation "
-              "hold only DELAYS that turn (`daemon.runnable_round` is the pass's own "
-              "now-or-not test; §2: None means nobody will act, never not yet)",
-              "daemon.validation_round", validation_round),
+        JUDGES_ROUND,
         _Pass("Daemon.poll_pull_requests",
               "the row carries a routing pull request, so the poll asks GitHub what "
               "became of it",
@@ -13037,7 +13050,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         REVIEWS_GATE,
     )),
     # The USER is the actor: `true_blockers`' four-way triage always yields a line for a governed order
-    "needs_review": ActorPasses((REVIEWS_GATE,), none_because=(
+    "needs_review": ActorPasses((JUDGES_ROUND, REVIEWS_GATE), none_because=(
         "no daemon pass of its own — the user reviews it, and "
         "`invariants.true_blockers` is what puts it in front of them")),
     "waiting_pr_merge": ActorPasses((
@@ -13045,10 +13058,11 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         _Pass("Daemon.poll_pull_requests", _pr_poll_why,
               "daemon.polls_and_can_act_on_pull_request",
               polls_and_can_act_on_pull_request),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     # Deliberately none: `project_store.NOT_RETRIED` excludes it and `Daemon.settle_work_order` returns...
-    "budget_exhausted": ActorPasses((REVIEWS_GATE,), none_because=(
+    "budget_exhausted": ActorPasses((JUDGES_ROUND, REVIEWS_GATE), none_because=(
         "no daemon pass, by design — the actor is the user via "
         "`ops.set_work_order_budget`, because raising the budget resumes the order")),
 }

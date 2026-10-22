@@ -576,6 +576,25 @@ def test_a_validating_work_order_with_a_real_blocker_is_surfaced(project):
     assert fresh["attention_reason"] == "1 assumption pending your review"
 
 
+def test_the_attention_repair_is_dropped_when_the_order_settled_under_the_sweep(project,
+                                                                                monkeypatch):
+    """Issue #1205: the sweep derives from a row read a write earlier"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("quietly stuck mid-review")
+    store.add_assumption(wo["id"], "something needing a decision")
+    store.set_status(wo["id"], "validating")
+    store.open_validation_round(wo_id=wo["id"], fingerprint="abc")
+    store.clear_attention(wo["id"])
+    stale = store.get_work_order(wo["id"])      # the row as the sweep read it
+    # The validation thread settles it while the sweep is deriving
+    store.set_status(wo["id"], "completed")
+    store.clear_attention(wo["id"])
+    monkeypatch.setattr(store, "list_work_orders", lambda *a, **k: [stale])
+
+    assert list(invariants.check_blocked_work_is_surfaced(store)) == []
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
 def test_a_closed_pull_request_outranks_an_escalated_review(project):
     """Both branches live under the same `needs_review` roof"""
     store = ProjectStore(project)

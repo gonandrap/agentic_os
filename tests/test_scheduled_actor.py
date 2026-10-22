@@ -28,6 +28,7 @@ from jarvis.project_store import (
     FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     UNGOVERNED_ORIGINS,
+    VALIDATION_CI_CAUSE,
     VALIDATION_HELD_CAUSE,
     ProjectStore,
 )
@@ -179,11 +180,12 @@ def test_every_predicate_is_an_imported_symbol():
 
 def test_no_fallthrough(jarvis_home, project):
     """STILL A PIN after wo-715db5af: the XOR holds over a status's OWN passes"""
+    shared = (ops.REVIEWS_GATE, ops.JUDGES_ROUND)
     for status, entry in ops.SCHEDULED_ACTORS.items():
-        own = tuple(p for p in entry.passes if p is not ops.REVIEWS_GATE)
+        own = tuple(p for p in entry.passes if p not in shared)
         assert bool(entry.none_because) is not bool(own), (
             f"{status}: `none_because` must be non-empty exactly when there are no "
-            "passes other than the shared gate-sweep constant")
+            "passes other than the shared status-agnostic constants")
     store = ProjectStore(project)
     wo = store.create_work_order("add feature X")
     with pytest.raises(KeyError):
@@ -410,6 +412,60 @@ def test_the_passs_own_hold_gate_is_unchanged(jarvis_home, project):
     row = _held_round(store, wo["id"])
 
     assert runnable_round(store, row) is None
+
+
+# -- issue #1199: the panel's selection is `OPEN_STATUSES`, so every open status carries the pass
+
+def _ci_held_round(store: ProjectStore, wo_id: str) -> dict:
+    """Round one closed `failed` on `VALIDATION_CI_CAUSE`: the panel re-runs it when CI finishes"""
+    rnd = store.open_validation_round(wo_id=wo_id, fingerprint="fp-1")
+    store.close_validation_round(int(rnd["id"]), "failed",
+                                 "waiting for GitHub to finish the checks",
+                                 VALIDATION_CI_CAUSE)
+    store.add_event(wo_id, "validation_failed",
+                    {"round": int(rnd["round"]), "cause": VALIDATION_CI_CAUSE,
+                     "reopens_at": db.now() + 300})
+    return store.get_work_order(wo_id)
+
+
+def _delivered_with_a_confirming_assumption(store: ProjectStore) -> dict:
+    """The production row: delivered, parked in `needs_review`, assumptions the OS is confirming"""
+    wo = store.create_work_order("add feature X", status="needs_review")
+    store.update_work_order(wo["id"], result_summary="done")
+    store.record_provisional(store.add_assumption(wo["id"], "one call I made"),
+                             verdict="accept")
+    return store.get_work_order(wo["id"])
+
+
+@pytest.fixture
+def _os_reviews_assumptions(monkeypatch):
+    """`invariants.true_blockers` reads `ops.auto_review_at`, which needs a live catalog"""
+    monkeypatch.setattr(ops, "auto_review_at", lambda _path: True)
+
+
+def test_a_needs_review_round_held_on_ci_names_the_panel(jarvis_home, project,
+                                                         _os_reviews_assumptions):
+    """#1199: `work_orders_awaiting_validation` filters on `OPEN_STATUSES`, not on `validating`"""
+    store = ProjectStore(project)
+    wo = _delivered_with_a_confirming_assumption(store)
+    assert true_blockers_of(store, wo) == [
+        invariants.NO_ACTOR_BLOCKER.format(status="needs_review")], "the premise"
+
+    row = _ci_held_round(store, wo["id"])
+
+    actor = ops.scheduled_actor(store, row)
+    assert actor is not None and actor.pass_name == "Daemon.validation_tick"
+    assert true_blockers_of(store, row) == []
+
+
+def test_every_open_status_carries_the_panel_pass(jarvis_home, project):
+    """The registration rule of kn-4b2304ef: a pass with no status filter is registered under all of them"""
+    for status in OPEN_STATUSES:
+        assert ops.JUDGES_ROUND in ops.SCHEDULED_ACTORS[status].passes, status
+
+
+def true_blockers_of(store: ProjectStore, wo: dict) -> list[str]:
+    return invariants.true_blockers(store, store.get_work_order(wo["id"]))
 
 
 # -- `running`: a DONE turn names the settler only where the settler WRITES

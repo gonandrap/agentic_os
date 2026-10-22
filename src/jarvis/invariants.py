@@ -1739,7 +1739,9 @@ def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
         blockers = true_blockers(store, wo)
         if not blockers:
             continue
-        store.flag_attention(wo["id"], blockers[0])
+        if not getattr(store, "readonly", False) and not store.flag_attention_while(
+                wo["id"], blockers[0], str(wo["status"] or "")):
+            continue  # it settled under the sweep: the writer that moved it owns the flag
         yield Violation(
             invariant="INV-ATTENTION-MISSING",
             wo_id=wo["id"],
@@ -2208,12 +2210,12 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
             age = int(now - float(latest["ts"] or 0))
             reason = (f"the review was interrupted — round {latest['round']} was left "
                       f"open with nothing running it for {age}s")
-            store.close_validation_round(int(latest["id"]), "failed", reason)
             # The outcome on the timeline too, where `wo show` and Neo read it (INV-RECORD-BEHIND)
-            if id_col == "wo_id":
-                store.add_event(unit_id, "validation_failed",
-                                {"round": latest["round"], "round_id": latest["id"],
-                                 "cause": STRANDED_CAUSE, "reason": reason})
+            store.settle_validation_round(
+                int(latest["id"]), "failed",
+                {"round": latest["round"], "round_id": latest["id"],
+                 "cause": STRANDED_CAUSE, "reason": reason},
+                wo_id=unit_id if id_col == "wo_id" else "", reason=reason)
             yield Violation(
                 invariant="INV-VALIDATION-STRANDED",
                 wo_id=unit_id if id_col == "wo_id" else None,
@@ -3772,13 +3774,14 @@ def check_project(store: ProjectStore, repair: bool = True,
 class _ReadOnly:
     """Store proxy that swallows repairs, so `check_project(repair=False)` is a pure read"""
 
-    _BLOCKED = ("flag_attention", "clear_attention", "add_assumption", "add_event",
+    _BLOCKED = ("flag_attention", "flag_attention_while", "clear_attention",
+                "add_assumption", "add_event",
                 "set_status", "update_work_order", "supersede_approval",
                 # The bus
                 "mark_envelope", "bump_envelope_attempt", "deliver_envelope",
                 "queue_message", "flag_feature_attention",
                 # INV-VALIDATION-STRANDED's repair
-                "close_validation_round",
+                "close_validation_round", "settle_validation_round",
                 # INV-FEATURE-FALSE-FAILURE's
                 "set_feature_status", "clear_feature_attention",
                 # INV-SPEC-POINTER-REAL's
