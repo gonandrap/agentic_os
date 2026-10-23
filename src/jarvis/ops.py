@@ -7165,20 +7165,93 @@ def _ask_findings_review(name: str, fo: dict[str, Any], report: dict[str, Any]
     neo = NeoStore()
     try:
         for f in report["findings"]:
-            if (f.get("status") or "pending") != "pending":
+            if not findings.never_offered(f):
                 continue
             try:
                 q = neo.ask(name, asker, findings.build_finding_question(fo, f),
                             context=context, kind="findings")
             except QuestionTooLargeError as e:
-                # Refused, never trimmed: this one stays the user's
+                # Refused, never trimmed: this one stays the user's, and is never offered again
                 log.warning("[%s] %s/%s: not asked of Neo: %s", name, fo["id"], f["key"], e)
+                f["neo_unasked"] = str(e)[:200]
                 unasked.append(f["key"])
                 continue
             f["neo_question_id"] = q["id"]
     finally:
         neo.close()
     return unasked
+
+
+def offer_unasked_findings(name: str, path: Path) -> list[str]:
+    """Put each waiting report's never-asked findings to Neo, once; the io ids offered"""
+    from . import findings
+    from .neo_store import NeoStore
+
+    if not findings_reviewed_by_neo():
+        return []
+    store = ProjectStore(path)
+    try:
+        waiting = store.list_feature_orders(("plan_review",), kind="improvement")
+    finally:
+        store.close()
+    offered: list[str] = []
+    for fo in waiting:
+        report = db.from_json(fo.get("plan"), None)
+        if not isinstance(report, dict) or not any(
+                isinstance(f, dict) and findings.never_offered(f)
+                for f in report.get("findings") or []):
+            continue
+        _ask_findings_review(name, fo, report)
+        asked = {f["key"]: f for f in report["findings"] if isinstance(f, dict)}
+        moot: list[int] = []
+        store = ProjectStore(path)
+        try:
+            # Re-read: the user may have decided a finding while Neo was being asked
+            fo = store.get_feature_order(fo["id"])
+            current = db.from_json(fo.get("plan"), None)
+            if fo["status"] != "plan_review" or not isinstance(current, dict):
+                moot = [f["neo_question_id"] for f in asked.values()
+                        if f.get("neo_question_id")]
+            else:
+                for f in current.get("findings") or []:
+                    src = asked.get(f.get("key")) if isinstance(f, dict) else None
+                    if src is None:
+                        continue
+                    if findings.never_offered(f):
+                        for field in ("neo_question_id", "neo_unasked"):
+                            if src.get(field):
+                                f[field] = src[field]
+                    elif src.get("neo_question_id") and \
+                            src["neo_question_id"] != f.get("neo_question_id"):
+                        moot.append(src["neo_question_id"])
+                store.update_feature_order(fo["id"], plan=db.to_json(current))
+                owed = [f for f in current.get("findings") or []
+                        if isinstance(f, dict)
+                        and (f.get("status") or "pending") == "pending"
+                        and not findings.with_neo(f)]
+                # The transition, never re-derived on a tick (kn-089de524)
+                if owed:
+                    store.flag_feature_attention(fo["id"], findings.review_headline(fo, current))
+                else:
+                    store.clear_feature_attention(fo["id"])
+                if fo.get("plan_wo_id"):
+                    store.add_event(fo["plan_wo_id"], "findings_offered_to_neo", {
+                        "improvement_order": fo["id"],
+                        "neo_questions": sum(1 for f in current.get("findings") or []
+                                             if isinstance(f, dict) and findings.with_neo(f)),
+                    })
+                offered.append(fo["id"])
+        finally:
+            store.close()
+        if moot:
+            neo = NeoStore()
+            try:
+                for qid in moot:
+                    neo.supersede(qid, f"SUPERSEDED — {fo['id']} was decided while Neo was asked",
+                                  "the user decided this finding first")
+            finally:
+                neo.close()
+    return offered
 
 
 def _supersede_finding_questions(found: Sequence[Any], answer: str, why: str) -> None:

@@ -336,3 +336,103 @@ def test_a_resubmission_closes_the_questions_about_the_report_it_replaces(
     finally:
         neo.close()
     assert len([q for q in neo_questions() if q["status"] == "queued"]) == 2
+
+
+# ---------------------------------------------------------------- reports Neo was never asked about
+
+
+def legacy(store, io, report, monkeypatch):
+    """A report submitted before Neo decided findings: every finding the user's, none asked"""
+    with monkeypatch.context() as m:
+        m.setattr(ops, "findings_reviewed_by_neo", lambda: False)
+        submitted(store, io, report)
+    assert neo_questions() == []
+    assert store.get_feature_order(io["id"])["needs_attention"]
+
+
+def test_a_report_filed_before_neo_decided_findings_goes_to_neo_once(
+        boot, store, improvement_order, monkeypatch):
+    daemon = boot()
+    legacy(store, improvement_order, a_report(), monkeypatch)
+
+    daemon.offer_findings_to_neo(daemon.catalog.projects[0])
+
+    qs = neo_questions()
+    assert len(qs) == 2
+    row = store.get_feature_order(improvement_order["id"])
+    # Every finding is Neo's now, so nothing is owed to the user
+    assert not row["needs_attention"]
+    assert finding(store, improvement_order["id"])["neo_question_id"] in {q["id"] for q in qs}
+    assert "findings_offered_to_neo" in [e["kind"] for e in store.list_events(row["plan_wo_id"])]
+
+    # Once: a second sweep asks nothing
+    assert ops.offer_unasked_findings("proj_a", daemon.catalog.projects[0].path) == []
+    assert len(neo_questions()) == 2
+
+
+def test_neo_decides_a_legacy_finding_like_any_other(boot, store, improvement_order,
+                                                     monkeypatch):
+    daemon = boot()
+    legacy(store, improvement_order, one_finding("FORCE_FINDING_REJECT"), monkeypatch)
+
+    daemon.offer_findings_to_neo(daemon.catalog.projects[0])
+    daemon._neo_drain()
+
+    f = finding(store, improvement_order["id"])
+    assert (f["status"], f["decided_by"]) == ("rejected", "neo")
+    assert store.get_feature_order(improvement_order["id"])["status"] == "completed"
+
+
+def test_a_finding_the_user_already_decided_is_not_offered(boot, store, improvement_order,
+                                                           monkeypatch):
+    daemon = boot()
+    legacy(store, improvement_order, a_report(), monkeypatch)
+    ops.review_findings(improvement_order["id"], accept=["first-turn-reads"])
+
+    daemon.offer_findings_to_neo(daemon.catalog.projects[0])
+
+    [q] = neo_questions()
+    assert "first-turn-reads" not in q["question"]
+    assert not finding(store, improvement_order["id"]).get("neo_question_id")
+
+
+def test_a_finding_too_large_to_ask_stays_the_users_and_is_not_retried(
+        boot, store, improvement_order, monkeypatch):
+    from jarvis.neo_store import QuestionTooLargeError
+
+    daemon = boot()
+    legacy(store, improvement_order, one_finding("ANY"), monkeypatch)
+    calls = []
+
+    def refuse(self, *a, **kw):
+        calls.append(1)
+        raise QuestionTooLargeError("too large", question_chars=90000, context_chars=0, ceiling=60000)
+    monkeypatch.setattr(NeoStore, "ask", refuse)
+
+    daemon.offer_findings_to_neo(daemon.catalog.projects[0])
+    daemon.offer_findings_to_neo(daemon.catalog.projects[0])
+
+    assert len(calls) == 1
+    assert finding(store, improvement_order["id"])["neo_unasked"]
+    assert store.get_feature_order(improvement_order["id"])["needs_attention"]
+
+
+def test_the_brake_holds_the_offer(boot, store, improvement_order, monkeypatch):
+    from jarvis import fleet
+
+    daemon = boot()
+    legacy(store, improvement_order, a_report(), monkeypatch)
+    monkeypatch.setattr(fleet, "load_pause", lambda central: object())
+
+    daemon.offer_findings_to_neo(daemon.catalog.projects[0])
+
+    assert neo_questions() == []
+
+
+def test_switched_off_nothing_is_offered(boot, store, improvement_order):
+    daemon = boot(neo={"review_findings": False})
+    submitted(store, improvement_order, a_report())
+
+    daemon.offer_findings_to_neo(daemon.catalog.projects[0])
+
+    assert neo_questions() == []

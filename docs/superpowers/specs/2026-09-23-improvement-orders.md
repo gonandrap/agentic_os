@@ -573,6 +573,15 @@ about…". The remaining fields follow as labelled paragraphs.
 >   one, so `steward.touched` (detector precision) never counts Neo as the user.
 > * `os.neo.review_findings` (default `true`) switches it off: every finding waits for
 >   the user, as before.
+> * A report Neo was never asked about (submitted before this landed, or while the switch
+>   was off) is offered to Neo by the daemon on its reconcile cadence
+>   (`ops.offer_unasked_findings`, `findings.never_offered`). Each pending finding with no
+>   `neo_question_id`, no `neo_verdict` and no `neo_unasked` is asked once. A question the
+>   store refuses as too large marks the finding `neo_unasked`, so it is never offered
+>   again. The io's attention is cleared when nothing is left for the user and re-raised
+>   with the new headline otherwise. A finding the user decided while Neo was being asked
+>   keeps the user's decision, and its question is superseded. The fleet pause holds the
+>   offer, because a Neo question is spend.
 >
 > The original text follows.
 

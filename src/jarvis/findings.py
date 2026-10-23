@@ -366,6 +366,13 @@ def with_neo(finding: dict[str, Any]) -> bool:
             and bool(finding.get("neo_question_id")) and not finding.get("neo_verdict"))
 
 
+def never_offered(finding: dict[str, Any]) -> bool:
+    """A pending finding Neo was never asked about: reported before Neo decided findings"""
+    return ((finding.get("status") or "pending") == "pending"
+            and not finding.get("neo_question_id") and not finding.get("neo_verdict")
+            and not finding.get("neo_unasked"))
+
+
 def review_headline(io: dict[str, Any], report: dict[str, Any]) -> str:
     """The counts-first line the attention reason uses (§6.2)"""
     findings = report.get("findings") or []
