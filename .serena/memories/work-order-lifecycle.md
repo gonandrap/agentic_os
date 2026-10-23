@@ -71,6 +71,19 @@ enforces the cap (`_bg_over_budget`, every `BG_BUDGET_EVERY`). `jarvis wo respaw
 (the shared `catalog_file` fixture PINS headless; the fake models `--bg` only for `-n`,
 never for the legacy `--name` path).
 
+## Session dispatch: a project's own launcher (spec `docs/superpowers/specs/2026-10-22-session-dispatch.md`)
+
+Catalog `worker.launcher` (path | list | `{command, env}`, parsed by
+`session_dispatch.parse_launcher`) names a LOCAL script that launches the project's
+sessions instead of bare `claude` (e.g. agentic-env behind `claude-ase`).
+`worker_session._launch` builds a `session_dispatch.Launch` per turn and passes
+`launch=` to `spawn_bg_turn` / `resume_bg_turn` / `spawn_turn`; `claude_cli._run` runs
+`launch.argv(args)` + `launch.env()` (`JARVIS_REAL_CLAUDE`, `JARVIS_LAUNCH_*`). Only
+LAUNCHES go through it — `agents`, `stop`, `rm`, `respawn`, Neo stay on the real CLI.
+Contract: exec `$JARVIS_REAL_CLAUDE "$@"`, add nothing on a bg resume (forks a copy),
+no cwd change, no stdout before exec. `INV-LAUNCHER-RUNNABLE` in `check_catalog`.
+Tests: `tests/test_session_dispatch.py`.
+
 ## The headless transport (replaced background sessions 2026-08-01; the fallback since 2026-10-22)
 
 **Read `src/jarvis/worker_session.py`'s module docstring first — it is the layer, and it

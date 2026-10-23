@@ -1,0 +1,9 @@
+# Assumptions — session dispatch layer (2026-10-22)
+
+1. **The mapping lives in the catalog, as `worker.launcher`.** The catalog is already per machine and outside version control, so it satisfies "local to the computer" without a second config file. A separate launcher registry was not added.
+2. **The launcher is argv-transparent.** `claude-ase` and `claude-shining` are session managers that create their own worktree and spawn their own `claude --bg`, so they cannot be called directly as-is. The launcher contract is "receive the exact claude argv, prepare, then `exec "$JARVIS_REAL_CLAUDE" "$@"`". Fully driving those wrappers needs a pass-through mode on their side, which is out of scope here.
+3. **Only launches go through the launcher.** `claude agents`, `stop`, `rm`, `respawn`, Neo and validators stay on the real CLI, because they act on the shared supervisor roster or the OS itself.
+4. **Mapping is per project, not per work-order kind.** Planners, investigators and workers of one project share its launcher. `JARVIS_LAUNCH_WO_KIND` lets a script branch if it needs to.
+5. **The launcher's environment reaches a `--bg` session.** Not verified on the live CLI. If the supervisor does not inherit the invoking process's environment, env-only launchers have no effect on background sessions and the project should use flags on the open turn or the headless transport. `claude respawn` restarts a session without the launcher.
+6. **A missing launcher is a doctor finding, not a catalog error.** Refusing the whole catalog over one deleted script would stop every project.
+7. **The production catalog was not edited.** The running prod instance is on an older tag. A draft launcher was written locally at `~/contribution/prod_agentic_os/config/launchers/agentic-env.sh`, outside the repo. It only exports `ASE_REPO` and `ASE_WRAPPER_NAME` before exec-ing claude.

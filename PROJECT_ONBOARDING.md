@@ -51,6 +51,19 @@ entry per project:
 - `append_system_prompt` — hard constraints every worker must hear
   (e.g. "never touch live credentials").
 
+- `worker.launcher` — the command that launches this project's worker sessions, for a
+  repo that only works behind its own wrapper (e.g. agentic-env behind `claude-ase`).
+  Omit it and workers run plain `claude`. A path, a list (path plus fixed arguments), or
+  `{"command": [...], "env": {...}}`. The script receives the exact `claude` argv and
+  must end with `exec "$JARVIS_REAL_CLAUDE" "$@"`; keep it next to your catalog, outside
+  version control. `jarvis doctor` flags one that is missing or not executable.
+  Contract and environment: `docs/superpowers/specs/2026-10-22-session-dispatch.md`.
+
+  ```json
+  "worker": {"launcher": {"command": "~/.jarvis/launchers/agentic-env.sh",
+                          "env": {"ASE_REPO": "agentic-env"}}}
+  ```
+
 ## 2. What adoption does (idempotent)
 
 | Change | Detail | Undo |

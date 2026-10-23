@@ -72,7 +72,9 @@
       "max_concurrent": 3,
       "worker": {
         "$comment": "inherits os.defaults.permission_mode (auto); override here to restrict a project",
-        "append_system_prompt": "Run the test suite before opening any PR."
+        "append_system_prompt": "Run the test suite before opening any PR.",
+        "$comment_launcher": "OPTIONAL: a local script that launches this project's sessions instead of bare claude. It gets the exact claude argv and must end with exec \"$JARVIS_REAL_CLAUDE\" \"$@\". See docs/superpowers/specs/2026-10-22-session-dispatch.md",
+        "$launcher_example": {"command": "~/.jarvis/launchers/my_webapp.sh", "env": {"MY_WRAPPER_MODE": "worker"}}
       },
       "settings_overrides": {
         "permissions": { "allow": ["Bash(npm run *)"] }

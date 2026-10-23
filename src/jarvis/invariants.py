@@ -2767,6 +2767,33 @@ def check_gate_deny_conflict(spec: Any) -> Iterator[Violation]:
         )
 
 
+INV_LAUNCHER_RUNNABLE = "INV-LAUNCHER-RUNNABLE"
+
+
+def check_launcher_runnable(spec: Any) -> Iterator[Violation]:
+    """INV-LAUNCHER-RUNNABLE — a project's session launcher must exist and be executable (docs/superpowers/specs/2026-10-22-session-dispatch.md)"""
+    import os
+    import shutil
+
+    launcher = getattr(spec.worker, "launcher", None)
+    if launcher is None:
+        return
+    program = launcher.command[0]
+    if os.sep in program:
+        runnable = os.path.isfile(program) and os.access(program, os.X_OK)
+    else:
+        runnable = shutil.which(program) is not None
+    if runnable:
+        return
+    yield Violation(
+        invariant=INV_LAUNCHER_RUNNABLE,
+        detail=(f"project {spec.name!r}: worker.launcher {program!r} is missing or not "
+                f"executable, so every session this project dispatches will fail to "
+                f"start. Fix the path in the catalog or `chmod +x` the script."),
+        context={"project": spec.name, "launcher": program},
+    )
+
+
 def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
     """Config-level post-conditions over the catalog itself"""
     found: list[Violation] = []
@@ -2774,6 +2801,7 @@ def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
         if project and spec.name != project:
             continue
         found.extend(check_gate_deny_conflict(spec))
+        found.extend(check_launcher_runnable(spec))
     return found
 
 
