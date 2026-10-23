@@ -6919,14 +6919,7 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
                     project_name: str | None = None, *,
                     steward_decision: Any = None,
                     file_orders: bool = True) -> dict[str, Any]:
-    """Decide a findings report, finding by finding
-
-    `decided_by` is `user` from the CLI and the dashboard, `neo` or `steward` from
-    `apply_findings_verdict`. Only the user's decision is the user's: it alone teaches Neo
-    and counts as the user touching the analyst. `steward_decision` stamps the orders an
-    OS decision files; `file_orders=False` accepts the diagnosis while the steward holds
-    its orders in its queue.
-    """
+    """Decide a findings report, finding by finding"""
     from . import findings
     from .neo_store import NeoStore
 
@@ -7142,11 +7135,11 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
     return created, error
 
 
-# -- Neo decides findings for the user; the steward decides what they file (spec 2026-09-23 §5.5, as amended)
+# -- Neo decides findings for the user
 
 
 def findings_reviewed_by_neo() -> bool:
-    """Is a findings report Neo's to decide? A catalog the OS cannot read leaves it to the user"""
+    """Is a findings report Neo's to decide?"""
     try:
         cfg = resolve_catalog().os.neo
     except (OpsError, CatalogError, OSError, ValueError) as e:
@@ -7266,12 +7259,7 @@ def _finding_to_user(name: str, path: Path, fo: dict[str, Any], report: dict[str
 
 def apply_findings_verdict(q: Mapping[str, Any], verdict: Mapping[str, Any]
                            ) -> dict[str, Any]:
-    """Neo ruled on one finding: reject it, hand it to the user, or let the steward decide its spend
-
-    Called by `Daemon._deliver_findings_verdict`. Neo judges the diagnosis and rates it;
-    the steward — deterministic code — decides whether the orders it proposes are filed.
-    A model never enforces its own budget.
-    """
+    """Neo ruled on one finding: reject it, hand it to the user, or let the steward decide its spend"""
     from . import steward
 
     located = _finding_for_question(q)

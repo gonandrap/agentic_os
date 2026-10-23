@@ -26,8 +26,7 @@ URGENT = ("critical", "blocker")
 BUG_PRIORITY_SEVERITY = {"low": "minor", "medium": "medium", "high": "major",
                          "critical": "critical", "blocker": "blocker"}
 
-#: Where OS-originated work comes from (§3.4)
-#: `io_finding` is a finding NEO accepted for the user; one the user accepts is theirs and never gated (A8)
+#: Where OS-originated work comes from (§3.4); `io_finding` is a finding Neo, not the user, accepted
 ORIGIN_KINDS = ("bug_agent", "investigation", "neo_rider", "red_main", "release",
                 "remedy", "panel", "morpheus", "worker_io", "io_finding")
 

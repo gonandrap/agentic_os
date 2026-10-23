@@ -196,7 +196,7 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         "stakes": str(data.get("stakes") or "")[:20].strip().lower(),
         # Read exactly as `stakes` is — normalised (docs/superpowers/specs/2026-10-01-neo-observability.md)
         "cause": _escalation_cause(data.get("cause")),
-        # A findings verdict's rating on the steward's scale; the steward normalises it (models rate, code decides)
+        # A findings verdict's rating on the steward's scale
         "severity": str(data.get("severity") or "")[:20].strip().lower(),
     }
 

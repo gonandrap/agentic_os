@@ -1,4 +1,4 @@
-"""Neo decides improvement-order findings for the user; the steward decides what they file (docs/superpowers/specs/2026-09-23-improvement-orders.md §5.5, as amended 2026-10-22)"""
+"""Neo decides improvement-order findings for the user (docs/superpowers/specs/2026-09-23-improvement-orders.md §5.5)"""
 
 from __future__ import annotations
 
