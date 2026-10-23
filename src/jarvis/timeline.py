@@ -326,7 +326,8 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         n = p.get("findings")
         return ("Findings submitted",
                 f"{n} finding(s) on {p.get('improvement_order') or ''}".strip())
-    if kind == "findings_reviewed":
+    # `findings_decided` is Neo or the steward deciding, kept apart so it never counts as the user
+    if kind in ("findings_reviewed", "findings_decided"):
         a, r = len(p.get("accepted") or []), len(p.get("rejected") or [])
         filed = len(p.get("created") or [])
         return (f"Findings reviewed by {p.get('by') or 'the user'}",

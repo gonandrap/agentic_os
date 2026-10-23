@@ -1880,7 +1880,7 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
                 if q["kind"] in ("approval", "plan", "alarm", "triage",
-                                 "assumption", "question")]
+                                 "assumption", "question", "findings")]
         # `triage` is the one kind whose subject is not a row in THIS database (#240)
         mine = (registered_project_paths()
                 if any(q["kind"] == "triage" for q in held) else {})
@@ -1892,7 +1892,8 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
                     "alarm": _stale_alarm_question,
                     "triage": _stale_triage_question,
                     "assumption": _stale_assumption_question,
-                    "question": _stale_worker_question}[q["kind"]](store, q)
+                    "question": _stale_worker_question,
+                    "findings": _stale_findings_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -1946,6 +1947,26 @@ def _stale_plan_question(store: ProjectStore,
         return None
     return (f"SUPERSEDED — {fo['id']} is {fo['status']}",
             f"{fo['id']} left plan review and is now {fo['status']}")
+
+
+def _stale_findings_question(store: ProjectStore,
+                             q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if the finding this question decides was decided some other way"""
+    fo = store.feature_order_for_planner(q["wo_id"])
+    if fo is None or fo.get("kind") != "improvement":
+        return None
+    report = db.from_json(fo.get("plan"), None)
+    findings = report.get("findings") or [] if isinstance(report, dict) else []
+    finding = next((f for f in findings
+                    if isinstance(f, dict) and f.get("neo_question_id") == q["id"]), None)
+    if finding is None:
+        return (f"SUPERSEDED — {fo['id']}'s report was resubmitted",
+                f"{fo['id']}'s report no longer carries the finding this asked about")
+    status = finding.get("status") or "pending"
+    if status != "pending":
+        return (f"SUPERSEDED — finding {finding.get('key')!r} is {status}",
+                f"finding {finding.get('key')!r} of {fo['id']} was already {status}")
+    return None
 
 
 def _stale_alarm_question(store: ProjectStore,

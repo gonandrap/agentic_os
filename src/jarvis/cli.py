@@ -3863,8 +3863,10 @@ def cmd_io(args: argparse.Namespace) -> int:
             d = detail["by_decision"]
             print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
                   f"[{detail['project']}] {detail['title']} ({detail['status_label']})")
+            neo = detail.get("with_neo") or 0
             print(f"\n{detail['findings']} findings: {d['accepted']} accepted, "
-                  f"{d['rejected']} rejected, {d['pending']} awaiting you")
+                  f"{d['rejected']} rejected, {d['pending'] - neo} awaiting you"
+                  + (f", {neo} with Neo" if neo else ""))
             observation = detail["observation"]
             if not (args.full or args.finding):
                 # The brief is the filer's; the findings are what the reader acts on
