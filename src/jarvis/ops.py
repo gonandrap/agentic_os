@@ -4839,7 +4839,9 @@ def collect_feature_evidence(store: ProjectStore, project_path: Path,
     children = []
     for child in store.feature_children(fo["id"], kinds=WORKER_CHILDREN):
         last = store.latest_validation_round(wo_id=child["id"])
-        children.append({**child, "declared": str((last or {}).get("evidence") or "")})
+        # `merge_commit` is what scopes the feature's diff to its own children (issue 985)
+        children.append({**child, "declared": str((last or {}).get("evidence") or ""),
+                         "merge_commit": recorded_merge_commit(store, child)})
     return evidence_mod.collect_feature(project_path, fo, children, declared=declared,
                                         summary=summary, diff_chars=cfg.diff_chars,
                                         side_effects=feature_side_effects(store,
