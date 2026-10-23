@@ -194,6 +194,34 @@ Still not carried: `--agent` (a feature order's lead persona), `--effort`,
 anyway; poll enforces it). A skill both sides ship under the same name (`caveman`) is
 the injected copy.
 
+### One worktree, and the project's CLAUDE.md once
+
+A harness order has exactly one worktree, the harness's: the template carries no
+`--worktree`, so Jarvis never creates `<project>/.claude/worktrees/<wo-id>`. Everything
+that used to assume that location now reads the recorded one:
+
+* `dispatch.worker_tree` is the recorded absolute path, or None while the harness has yet
+  to choose it (the open turn). The worker settings' `Edit`/`Write`/`NotebookEdit` allow
+  rules and `claudeMdExcludes` are built from it, so none name a path that never exists.
+* The worker settings carry `JARVIS_HARNESS_WORKTREE=1`, and `hooks.in_worker_worktree`
+  then accepts a cwd only inside the absolute worktree RECORDED for this order. If none is
+  recorded yet, the check fails closed and the harness's own permissions decide. Any other
+  directory outside the root is never the worker's, which keeps the worktree auto-allow
+  from following a cwd that drifted to `~`. The
+  crew rule, the worktree auto-allow and tool-managed-path marking use that one predicate
+  instead of a `/.claude/worktrees/` substring. The Python-navigation hook resolves the
+  project from `JARVIS_PROJECT_PATH` like every other hook.
+* `dispatch_work_order` records the worktree `start` wrote, not the order id, on the
+  `dispatched` event and in the context ledger.
+
+Claude Code loads every `CLAUDE.md` from the session's cwd up through its ancestors. In
+Jarvis's own layout the worktree sits INSIDE the project root, so both the branch's copy
+and the main checkout's copy would load, possibly at different commits, and
+`claudeMdExcludes` drops the ancestor. `claude-shining` puts its worktrees BESIDE the
+root (`<repo>.worktrees/<name>`), so the root is not an ancestor and its copy never loads:
+the worker reads the branch's CLAUDE.md once. `hooks.claude_md_excludes` already returns
+nothing for a cwd outside the root.
+
 ### The resume race this exposed
 
 After settling a background turn, `poll` stopped the idle session with a bare
