@@ -67,6 +67,7 @@ from .worker_brief import MODEL_ATTRIBUTION_NAMES
 # `ops.IDLE_MANAGER_CAUSE` is an ALIAS: `stuck.IDLE_MANAGER_CAUSE` is the one definition of the cause... (#1008)
 from .stuck import IDLE_MANAGER_CAUSE  # noqa: F401
 from .project_store import (
+    ALARM_REVIEWABLE_STATUSES,
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     COUNTED_VALIDATION_OUTCOMES,
@@ -12387,7 +12388,8 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
         raise OpsError("a correction needs feedback — what should the supervisor "
                        "have decided?")
     name, path, row = _find_alarm(alarm_id, project_name)
-    if row["alarm_status"] not in ("acked", "escalated"):
+    # `failed` is reviewable because nothing re-queues it and it can hold a merge (#1063)
+    if row["alarm_status"] not in ALARM_REVIEWABLE_STATUSES:
         # A REFUSAL THAT DOES NOT SAY WHERE TO GO IS A BUG REPORT
         where = ""
         if row["alarm_status"] == "proposed":
@@ -12396,8 +12398,9 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
                      f"answer it with `jarvis gate approve {gate}` or "
                      f"`jarvis gate deny {gate} --reason \"…\"`")
         raise OpsError(f"alarm {alarm_id} is {row['alarm_status']}, and only an alarm "
-                       f"the supervisor has decided ('acked' or 'escalated') can be "
-                       f"reviewed{where}")
+                       f"the supervisor has decided or could not decide "
+                       f"({', '.join(repr(s) for s in ALARM_REVIEWABLE_STATUSES)}) can "
+                       f"be reviewed{where}")
     review = "approved" if approved else "corrected"
     store = ProjectStore(path)
     try:
