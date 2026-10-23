@@ -6877,7 +6877,7 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
 
     def clear_settled_preconditions(self, project: ProjectSpec,
                                     store: ProjectStore) -> None:
-        """Clear every hold the OS can derive: a settled `bl-` item, and deployed code (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md, docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md)"""
+        """Clear every hold the OS can derive: a settled `bl-` item, deployed code (docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.2)"""
         from . import preconditions
 
         for wo in store.list_work_orders(statuses=("pending",), include_hidden=True):
