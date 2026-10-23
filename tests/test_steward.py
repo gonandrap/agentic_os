@@ -93,6 +93,37 @@ def test_a_medium_needs_recurrence_a_major_needs_less():
     assert outcome(cand(severity="major", refs=0)) == ("queue", "recurrence")
 
 
+def test_a_neo_cleanup_is_one_sighting_enough_a_panel_medium_is_not():
+    """Neo raises a cleanup once, in one verdict: its own threshold, not `medium_min_refs`"""
+    assert CFG.min_refs_by_kind == {"neo_rider": 1}
+    assert outcome(cand(origin_kind="neo_rider", severity="medium")) == ("dispatch",
+                                                                         "medium")
+    assert outcome(cand(origin_kind="neo_rider", severity="medium", refs=0)) == (
+        "queue", "recurrence")
+    assert outcome(cand(origin_kind="panel", severity="medium")) == ("queue", "recurrence")
+
+
+def test_a_per_kind_threshold_keeps_every_rule_before_recurrence():
+    rider = cand(origin_kind="neo_rider", severity="medium")
+    assert outcome(rider, steward.Ledger(evolution_usd=CFG.weekly_usd)) == ("queue",
+                                                                            "ledger")
+    assert outcome(rider, steward.Ledger(fleet_usd=CFG.yield_above_usd + 1)) == (
+        "queue", "yield")
+    assert outcome(rider, throttled=True) == ("queue", "low-precision")
+    assert outcome(rider, generation=2) == ("queue", "max-depth")
+    assert outcome(rider, parent_kind="neo_rider") == ("queue", "self-reference")
+    assert outcome(cand(origin_kind="neo_rider", severity="minor")) == ("drop",
+                                                                        "low-severity")
+
+
+def test_a_per_kind_threshold_overrides_major_and_medium_alike():
+    cfg = EvolutionConfig(min_refs_by_kind={"bug_agent": 4})
+    assert outcome(cand(severity="major", refs=3), cfg=cfg) == ("queue", "recurrence")
+    assert outcome(cand(severity="medium", refs=4), cfg=cfg) == ("dispatch", "medium")
+    assert outcome(cand(origin_kind="panel", severity="major", refs=1), cfg=cfg) == (
+        "dispatch", "major")
+
+
 def test_a_throttled_detector_queues_but_urgent_still_goes():
     assert outcome(cand(), throttled=True) == ("queue", "low-precision")
     assert outcome(cand(severity="critical"), throttled=True) == ("dispatch", "urgent")
@@ -112,8 +143,20 @@ def test_the_config_ships_in_shadow_with_the_spec_defaults():
         "shadow", 150.0, 1, 3)
 
 
+def test_a_per_kind_threshold_merges_over_the_default_and_can_raise_it_back():
+    def parse(raw, projects=()):
+        return parse_catalog({"os": {"evolution": raw}, "projects": list(projects)})
+    assert parse({"min_refs_by_kind": {"panel": 2}}).os.evolution.min_refs_by_kind == {
+        "neo_rider": 1, "panel": 2}
+    assert parse({"min_refs_by_kind": {"neo_rider": 3}}).os.evolution.min_refs_by_kind == {
+        "neo_rider": 3}
+
+
 @pytest.mark.parametrize("bad", [{"mode": "loud"}, {"weekly_usd": -1},
-                                 {"min_precision": 2}])
+                                 {"min_precision": 2},
+                                 {"min_refs_by_kind": []},
+                                 {"min_refs_by_kind": {"nope": 1}},
+                                 {"min_refs_by_kind": {"neo_rider": -1}}])
 def test_a_bad_evolution_setting_is_refused(bad):
     with pytest.raises(CatalogError):
         parse_catalog({"os": {"evolution": bad}, "projects": []})
