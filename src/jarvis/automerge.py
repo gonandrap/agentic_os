@@ -160,10 +160,11 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
         f"tick")
     reason = {
         ops.CATCH_UP_DEFERRED: deferred,
+        # The reason says whether the OS chases again, so the tail must not claim it never will (#1215)
         ops.CATCH_UP_EXHAUSTED:
             f"{moved} and the OS has stopped catching this branch up: "
-            f"{catch_up.reason or 'its budget is spent'}. It will NOT try again: merge it "
-            f"by hand, or `jarvis wo send` the worker to rebase",
+            f"{catch_up.reason or 'its budget is spent'}. Merge it by hand, or "
+            f"`jarvis wo send` the worker to rebase",
         ops.CATCH_UP_FAILED:
             f"{moved} and the update did not run: "
             f"{catch_up.reason or 'the OS could not say why'}. The OS retries next tick",
