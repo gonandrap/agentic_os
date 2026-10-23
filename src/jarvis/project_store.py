@@ -3263,6 +3263,20 @@ class ProjectStore:
                  float(r["ended_at"]) if r["ended_at"] is not None else float("inf"),
                  str(r["cache_ttl"])) for r in rows]
 
+    def turn_arm_rates(self, since: float) -> list[tuple[str, int, str, float,
+                                                          int, int]]:
+        """Each STAMPED turn with recorded usage, and the TTL split it paid (issue 1227)"""
+        rows = self.conn.execute(
+            """SELECT wo_id, seq, cache_ttl, started_at,
+                      COALESCE(json_extract(usage_json, '$.cache_1h'), 0) AS cache_1h,
+                      COALESCE(json_extract(usage_json, '$.cache_5m'), 0) AS cache_5m
+                 FROM wo_turns
+                WHERE cache_ttl != '' AND usage_json IS NOT NULL AND started_at >= ?""",
+            (since,)).fetchall()
+        return [(str(r["wo_id"]), int(r["seq"]), str(r["cache_ttl"]),
+                 float(r["started_at"]), int(r["cache_1h"] or 0),
+                 int(r["cache_5m"] or 0)) for r in rows]
+
     def recent_turns(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """The conversation's most recent turns, newest first"""
         rows = self.conn.execute(

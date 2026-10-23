@@ -417,6 +417,9 @@ DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS = 500_000
 #: The same, for turns JARVIS ITSELF dispatched
 DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS = 50_000
 
+#: Tokens a STAMPED turn paid at the TTL it was NOT armed for (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
+DEFAULT_INSPECT_ALARM_CACHE_ARM_MISSED_TOKENS = 50_000
+
 #: `InspectConfig` fields that are a FRACTION, not a count
 INSPECT_FRACTION_KEYS = ("alarm_rewrite_prefix_share", "alarm_rewrite_ttl_share")
 
@@ -449,6 +452,8 @@ class InspectConfig:
     alarm_cache_1h_tokens: int = DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS
     alarm_cache_1h_dispatched_tokens: int = \
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
+    alarm_cache_arm_missed_tokens: int = \
+        DEFAULT_INSPECT_ALARM_CACHE_ARM_MISSED_TOKENS
 
 
 # -- `ui_health`: the dashboard's own liveness, and the self-heal that answers it
@@ -1466,6 +1471,9 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
         alarm_cache_1h_dispatched_tokens=int(
             raw.get("alarm_cache_1h_dispatched_tokens",
                     base.alarm_cache_1h_dispatched_tokens)),
+        alarm_cache_arm_missed_tokens=int(
+            raw.get("alarm_cache_arm_missed_tokens",
+                    base.alarm_cache_arm_missed_tokens)),
     )
     for name, value in vars(cfg).items():
         if name in INSPECT_FRACTION_KEYS:

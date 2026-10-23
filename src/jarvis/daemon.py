@@ -546,6 +546,8 @@ CACHE_1H_INBOX_TITLE = {
         "Jarvis's OWN turns are buying the one-hour cache write — a transport defect",
     inspection.CACHE_1H_FOREIGN_ALARM:
         "Hand-opened Claude sessions are buying the one-hour cache write",
+    inspection.CACHE_ARM_MISSED_ALARM:
+        "A cache-TTL arm is not reaching the CLI — stamped turns paid the other rate",
 }
 
 
@@ -4437,6 +4439,23 @@ class Daemon:
                 index.setdefault(session_id, []).append((started_at, ended_at, arm))
         return index
 
+    def _arm_rate_rows(self, since: float) -> list[tuple[str, str, int, str, float,
+                                                          int, int]]:
+        """Every project's stamped turns with the TTL split they actually paid (issue 1227)"""
+        rows: list[tuple[str, str, int, str, float, int, int]] = []
+        for project in self.catalog.projects:
+            if not project.path.is_dir():
+                continue
+            try:
+                found = self.store_for(project).turn_arm_rates(since)
+            except Exception:
+                log.exception("[%s] cache-TTL rates unreadable", project.name)
+                continue
+            for wo_id, seq, arm, started_at, cache_1h, cache_5m in found:
+                rows.append((project.name, wo_id, seq, arm, started_at,
+                             cache_1h, cache_5m))
+        return rows
+
     def check_cache_ttl(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Raise the fleet's remaining ONE-HOUR cache writes, split by who bought them (docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md)"""
         from .project_store import NO_TURN
@@ -4446,13 +4465,16 @@ class Daemon:
             return
         days = cfg.alarm_cache_1h_window_days
         since = db.now() - days * 86_400
+        found: list[inspection.HourWrites] = []
         try:
             found = inspection.one_hour_writes(since, arms=self._turn_arms(since))
         except OSError:  # a transcript tree that moved or is unreadable
             log.exception("[%s] the one-hour cache scan could not read transcripts",
                           project.name)
-            return
         raised = inspection.hour_alarms(found, cfg, days=days)
+        # Reads the RECORD, not the transcripts, so it holds when they do not read
+        raised += inspection.arm_miss_alarms(
+            inspection.arm_misses(self._arm_rate_rows(since)), cfg, days=days)
         if not raised:
             return
         carrier = store.latest_settled_order()
