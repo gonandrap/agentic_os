@@ -12,6 +12,10 @@ from jarvis import claude_cli, dispatch
 
 FLAG = "FORCE_PROMPT_CACHING_5M"
 FLAG_1H = "ENABLE_PROMPT_CACHING_1H"
+TTL_MAIN = "CLAUDE_CODE_PROMPT_CACHE_TTL"
+TTL_SUBAGENT = "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL"
+#: What the 1h arm must put in a worker's environment, per key
+ONE_HOUR = {FLAG_1H: "1", TTL_MAIN: "1h", TTL_SUBAGENT: "1h"}
 
 #: The two functions in `claude_cli` allowed to start a `claude` process
 LAUNCHERS = {"_run", "spawn_turn"}
@@ -59,12 +63,19 @@ def test_the_flag_value_is_one_the_cli_actually_parses() -> None:
 def test_the_one_hour_key_and_value_are_the_ones_the_cli_parses() -> None:
     """Same reason as the sibling above: a value the CLI does not parse fails SILENTLY"""
     assert claude_cli.PROMPT_CACHE_1H_ENV_KEY == FLAG_1H
-    assert dispatch.cache_ttl_env("1h") == {FLAG_1H: "1"}
+    assert dispatch.cache_ttl_env("1h") == ONE_HOUR
 
 
-def test_the_decision_owns_both_keys_and_nothing_else() -> None:
+def test_the_one_hour_arm_outranks_a_five_minute_promptcachettl_setting() -> None:
+    """Issue 1187: the user's settings promptCacheTtl beat the 1h flag, so the hour was never sold"""
+    env = dispatch.cache_ttl_env("1h")
+    assert env[TTL_MAIN] == "1h", "settings promptCacheTtl would decide the main thread"
+    assert env[TTL_SUBAGENT] == "1h", "settings subagentPromptCacheTtl would decide subagents"
+
+
+def test_the_decision_owns_every_ttl_key_and_nothing_else() -> None:
     """`CACHE_TTL_KEYS` is what `spawn_turn` STRIPS from the ambient environment"""
-    assert set(claude_cli.CACHE_TTL_KEYS) == {FLAG, FLAG_1H}
+    assert set(claude_cli.CACHE_TTL_KEYS) == {FLAG, FLAG_1H, TTL_MAIN, TTL_SUBAGENT}
 
 
 # -- the three arms
@@ -142,7 +153,7 @@ def test_the_one_hour_arm_reaches_the_child_without_the_five_minute_key(
     """The ambient 5m flag is set DELIBERATELY here: a daemon started from a Jarvis worker carries it"""
     monkeypatch.setenv(FLAG, "1")
     assert _spawn_env(fake_claude, tmp_path,
-                      cache=dispatch.cache_ttl_env("1h")) == {FLAG_1H: "1"}
+                      cache=dispatch.cache_ttl_env("1h")) == ONE_HOUR
 
 
 def test_the_cli_arm_strips_the_ambient_flag_out_of_the_child(
@@ -150,3 +161,12 @@ def test_the_cli_arm_strips_the_ambient_flag_out_of_the_child(
     """Trap 2 in one test: the variable is set in the parent and must be ABSENT from the child"""
     monkeypatch.setenv(FLAG, "1")
     assert _spawn_env(fake_claude, tmp_path, cache=dispatch.cache_ttl_env("cli")) == {}
+
+
+@pytest.mark.parametrize("arm,expected", [("cli", {}), ("5m", {FLAG: "1"})])
+def test_an_ambient_ttl_variable_cannot_leak_into_either_arm(
+        fake_claude, tmp_path, monkeypatch, arm, expected) -> None:
+    """An inherited CLAUDE_CODE_*_PROMPT_CACHE_TTL would silently decide the rate (issue 1187)"""
+    monkeypatch.setenv(TTL_MAIN, "5m")
+    monkeypatch.setenv(TTL_SUBAGENT, "5m")
+    assert _spawn_env(fake_claude, tmp_path, cache=dispatch.cache_ttl_env(arm)) == expected

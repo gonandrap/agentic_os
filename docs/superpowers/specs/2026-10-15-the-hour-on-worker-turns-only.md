@@ -116,6 +116,20 @@ shipped CLI version** and confirms key and accepted value (`Vn` takes exactly
 `1`/`true`/`yes`/`on`, lowercased, trimmed; kn-522c6103). The failure mode of getting it
 wrong is silence.
 
+**AMENDED by issue 1187 (2026-10-22, CLI 2.1.308).** `ENABLE_PROMPT_CACHING_1H` alone did
+not sell the hour: the CLI ranks settings `promptCacheTtl` / `subagentPromptCacheTtl`
+ABOVE it (kn-ccbe6a0d), and the user's own `~/.claude/settings.json` carries `5m` — Trap 1
+case (b), caused by this apparatus rather than the CLI. The `1h` arm therefore also sets
+the env pair that outranks those settings, and `CACHE_TTL_KEYS` owns all four keys so
+neither can be inherited:
+
+```python
+PROMPT_CACHE_TTL_ENV_KEYS = ("CLAUDE_CODE_PROMPT_CACHE_TTL",
+                             "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL")
+```
+
+The `5m` arm needs no change: `FORCE_PROMPT_CACHING_5M` short-circuits the decision first.
+
 ### 3. Both paths the flag reaches a worker
 
 **The settings file.** In `dispatch._write_worker_settings`, `**claude_cli.PROMPT_CACHE_5M_ENV`
