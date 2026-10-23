@@ -851,9 +851,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
             f"\"{stated}\" — and nothing holds it back, so jarvisd would claim and "
             f"dispatch it (wo-314221b5 cost 0.93 USD this way). Wire the hold: "
             f"`--depends-on <wo-id>` when another work order in this project must "
-            f"COMPLETE first, or `--blocked-by <bl-…|kn-…|io-…|#issue|text>` when it "
-            f"waits on something that is not a work order. The brief may keep the "
-            f"sentence either way."
+            f"COMPLETE first, `--blocked-by deployed:<wo-id|sha>` when it needs that "
+            f"work order's code RUNNING in production and not merely merged, or "
+            f"`--blocked-by <bl-…|kn-…|io-…|#issue|text>` when it waits on something "
+            f"that is not a work order. The brief may keep the sentence either way."
         )
     store = ProjectStore(paths[project_name])
     try:
@@ -5965,7 +5966,7 @@ def unblock_work_order(wo_id: str, drop_all: bool = False,
         if not blockers and not rows:
             raise OpsError(f"{wo_id} is not blocked by anything")
         cut = blockers if drop_all else invariants.dead_dependencies(store, wo)
-        live, stranding = _split_preconditions(rows)
+        live, stranding = _split_preconditions(rows, store)
         clearable = stranding + (live if drop_all else [])
         if not cut and not clearable:
             raise OpsError(
@@ -5985,14 +5986,23 @@ def unblock_work_order(wo_id: str, drop_all: bool = False,
             "preconditions_cleared": cleared}
 
 
-def _split_preconditions(rows: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+def _split_preconditions(rows: list[dict[str, Any]],
+                         store: ProjectStore) -> tuple[list[str], list[str]]:
     """(live, stranding) refs — what the daemon can still clear, and what it never can"""
+    from . import preconditions
+
     live: list[str] = []
     stranding: list[str] = []
     central = CentralStore()
     try:
         for row in rows:
             ref = str(row["ref"])
+            target = preconditions.deployed_target(ref)
+            if target:
+                # docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.3
+                (live if _deployed_hold_is_live(store, target)
+                 else stranding).append(ref)
+                continue
             item = central.get_backlog(ref) if ref.startswith("bl-") else None
             # Unsettled, NOT just `open`: a `promoted` item is still one the daemon can clear later
             (live if item is not None
@@ -6001,6 +6011,17 @@ def _split_preconditions(rows: list[dict[str, Any]]) -> tuple[list[str], list[st
     finally:
         central.close()
     return live, stranding
+
+
+def _deployed_hold_is_live(store: ProjectStore, target: str) -> bool:
+    """Can the daemon still resolve this `deployed:` target to a commit it can test?"""
+    if not target.startswith("wo-"):
+        return True
+    try:
+        store.get_work_order(target)
+    except KeyError:
+        return False
+    return True
 
 
 def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
