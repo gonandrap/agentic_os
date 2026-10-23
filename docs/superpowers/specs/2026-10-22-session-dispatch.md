@@ -81,7 +81,7 @@ and this environment:
 | `JARVIS_LAUNCH_TRANSPORT` | `background` or `headless` |
 | *`env` keys* | whatever the catalog entry set |
 
-It must:
+This is the prefix mode (`command`). It must:
 
 1. **End by `exec`-ing `$JARVIS_REAL_CLAUDE "$@"`.** The headless transport tracks the
    turn by pid, and on Linux `process_alive` checks the pid's cmdline names `claude`. A
@@ -96,8 +96,10 @@ It must:
    minted session id off `claude --bg`'s output, and the headless one reads the result
    JSON from it.
 
-Everything else is the launcher's business: exporting variables, sourcing a profile,
-staging skills into the worktree, starting a sandbox.
+Everything else is the launcher's business: sourcing a profile, staging files, starting a
+sandbox. Variables it exports reach a headless turn, which is its child. They do NOT reach
+a background session, which the supervisor spawns with its own environment (see template
+mode below).
 
 A minimal launcher:
 
@@ -109,6 +111,83 @@ export ASE_REPO="${ASE_REPO:-agentic-env}"
 exec "$JARVIS_REAL_CLAUDE" "$@"
 ```
 
+## Template mode: a session manager opens the session
+
+Wrappers such as `claude-jarvis`, `claude-ase` and `claude-shining` are session
+**managers**: `start` builds its own worktree (`<repo>.worktrees/<name>`), stages skills,
+plugins and settings, and runs `claude --bg` there. They are not argv pass-throughs, so
+the prefix contract above cannot drive them. `worker.launcher.open` is an argv template
+that replaces the whole `claude --bg …` call for the session's FIRST turn:
+
+```json
+"worker": {
+  "transport": "background",
+  "launcher": {
+    "open": ["claude-jarvis", "start", "@jarvis", "--model", "{model}",
+             "--compact-pct", "{compact_pct}", "--prompt", "{prompt}", "{wo_name}"]
+  }
+}
+```
+
+| placeholder | value |
+|---|---|
+| `{prompt}` | the turn's prompt; over `BG_PROMPT_ARGV_LIMIT` it is a pointer to the prompt file, as for any background turn |
+| `{wo_name}` | the work-order id with everything but letters and digits removed (`wo-61a28e47` → `wo61a28e47`); `claude-shining` refuses any other name |
+| `{wo_id}`, `{title}`, `{project}`, `{project_path}` | the order and its project |
+| `{model}`, `{effort}`, `{permission_mode}`, `{append_system_prompt}`, `{settings_file}` | the order's briefing |
+| `{autocompact_window}` | the briefing's window in tokens |
+| `{compact_pct}` | that window as a percentage of `context_window` (default 1,000,000), clamped to 1–100; no window is `100` |
+
+An unknown placeholder is a catalog error. The template is only for background sessions:
+a catalog that pairs it with `transport: headless` is refused.
+
+What the OS does with it (`claude_cli.spawn_bg_open`, from `worker_session._launch_bg`):
+
+1. Run the filled template in the project root, with `JARVIS_LAUNCH_*` in its env.
+2. Read the minted short id off its stdout (`backgrounded · <id> · <name>`), then the full
+   session from `claude agents --json --all`.
+3. Record the session AND the roster's `cwd` as the order's `worktree`, as an absolute
+   path. Every reader that joins `<project>/.claude/worktrees/<worktree>` gets that path
+   back unchanged, because joining an absolute path replaces the prefix.
+4. Every later turn is the ordinary bare `claude --bg --resume <sid> -- <msg>` inside that
+   worktree. The manager is never called again.
+
+### What does not reach a template-opened session
+
+Measured live on CLI 2.1.309: **the caller's environment does not reach a `--bg`
+session.** The supervisor spawns it with its own environment. A probe exported a variable
+around `claude-jarvis start`, and the session's `echo` printed it empty. So:
+
+* `launcher.env` and `JARVIS_LAUNCH_*` reach the launcher process only, never the worker.
+* The worker settings file (`--settings`: `JARVIS_WO_ID` and the other worker env, the
+  PreToolUse gates, the Stop and PostToolUse hooks) cannot be passed, because
+  `claude-shining start` takes no `--settings` and pins `--setting-sources project,local`.
+  `{settings_file}` exists so a manager that grows such a flag can be handed the file.
+
+What still works without it, verified live: the order's id reaches the worker in its
+prompt, so `jarvis wo finish <id>` works. The turn settles from the transcript, and the
+Stop hook was only ever a backup there. What does not work is privileged-action gates,
+mid-turn message delivery, and any hook or env-driven worker policy. Closing that gap is a
+change to the session manager: pass `--settings <file>` through to `claude`.
+
+### The resume race this exposed
+
+After settling a background turn, `poll` stopped the idle session with a bare
+`claude stop`. The roster drops the pid about 0.6s before the process exits (fact 8), so a
+resume issued right after saw no live session, resumed, and the CLI forked a copy. The
+live run hit it on its second turn. The daemon can hit it too when a queued message goes
+out in the same tick. The settle now uses `stop_bg`, which waits for the process.
+
+### Verified live (2026-10-22, CLI 2.1.309, haiku)
+
+Project: a detached worktree of agentic_os. Launcher: the template above.
+
+| run | result |
+|---|---|
+| turn 1 | `claude-jarvis` built `agentic_os.worktrees/wo61a28e47` on `gonandrap/wo61a28e47` and wrote `.model`=haiku and `.compact` pct=40. The OS learned the session and the worktree, and the turn settled from the transcript as `PONG-1` |
+| turn 2 | a bare resume in that worktree continued THE SAME session (`PONG-2`), with no fork |
+| prompt over 1 KB | it went by the prompt-file pointer, and the session read the file (`PONG-BIG`) |
+
 ## Health
 
 `INV-LAUNCHER-RUNNABLE` (`invariants.check_launcher_runnable`, part of `check_catalog`)
@@ -116,20 +195,13 @@ flags a launcher that is missing or not executable. Without it the first sign wo
 every turn of the project failing with `could not start`. Those errors now name the
 launcher rather than `claude`.
 
-## What this does not solve
-
-Wrappers such as `claude-ase` and `claude-shining` are session **managers**, not argv
-pass-throughs. `claude-shining start <name> --agentic` creates its own worktree under
-`<repo>.worktrees/<name>`, stages skills, and spawns its own `claude --bg`. The OS
-already owns the worktree and the session, so it cannot call those entry points as-is.
-Driving one of them fully needs a pass-through mode on the wrapper's side, such as
-`claude-shining exec -- <claude argv>`, which prepares the environment for the cwd and
-then execs claude. Until that exists, a project's local launcher reproduces the parts of
-the wrapper it needs.
 
 ## Tests
 
 `tests/test_session_dispatch.py`: parsing, the catalog mapping, argv and environment, each
 primitive through a recording launcher that execs the fake CLI, end-to-end orders on both
 transports, the bare path for a project without a launcher, the error naming a missing
-launcher, and the doctor check.
+launcher, the doctor check, and template mode: parsing, filling, `{wo_name}`,
+`{compact_pct}`, opening through a fake session manager that builds its own worktree, and
+an order whose later turns resume bare inside it. `tests/test_bg_transport.py` holds the
+settle-waits-for-the-process case.

@@ -2778,14 +2778,20 @@ def check_launcher_runnable(spec: Any) -> Iterator[Violation]:
     launcher = getattr(spec.worker, "launcher", None)
     if launcher is None:
         return
-    program = launcher.command[0]
-    if os.sep in program:
-        runnable = os.path.isfile(program) and os.access(program, os.X_OK)
-    else:
-        runnable = shutil.which(program) is not None
-    if runnable:
-        return
-    yield Violation(
+    for argv in (launcher.command, launcher.open):
+        if not argv:
+            continue
+        program = argv[0]
+        if os.sep in program:
+            runnable = os.path.isfile(program) and os.access(program, os.X_OK)
+        else:
+            runnable = shutil.which(program) is not None
+        if not runnable:
+            yield _launcher_violation(spec, program)
+
+
+def _launcher_violation(spec: Any, program: str) -> Violation:
+    return Violation(
         invariant=INV_LAUNCHER_RUNNABLE,
         detail=(f"project {spec.name!r}: worker.launcher {program!r} is missing or not "
                 f"executable, so every session this project dispatches will fail to "

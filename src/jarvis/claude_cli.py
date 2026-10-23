@@ -167,14 +167,15 @@ def _launch_argv(args: list[str], launch: Launch | None) -> list[str]:
 
 def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
          env_extra: dict[str, str] | None = None,
-         stdin_text: str | None = None, launch: Launch | None = None) -> str:
+         stdin_text: str | None = None, launch: Launch | None = None,
+         argv: list[str] | None = None) -> str:
     """One `claude` call, waited for (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)"""
     env = os.environ.copy()
     # `env_extra` is caller intent and must win over the cache default; ambient env loses
     env.update(cache_env(env_extra))
     if launch is not None:
         env.update(launch.env())
-    argv = _launch_argv(args, launch)
+    argv = argv or _launch_argv(args, launch)
     try:
         proc = subprocess.run(
             argv,
@@ -199,7 +200,7 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
             ) from e
         raise ClaudeCliError(f"could not start `{argv[0]}`: {e}") from e
     if proc.returncode != 0:
-        raise _cli_failure(args, proc.returncode, proc.stdout, proc.stderr)
+        raise _cli_failure(args or argv, proc.returncode, proc.stdout, proc.stderr)
     return proc.stdout
 
 
@@ -467,6 +468,21 @@ def spawn_bg_turn(prompt: str, cwd: Path, name: str, worktree: str | None = None
     args += ["--", _bg_prompt(prompt, promptfile)]
     short = _short_id(_run(args, cwd=cwd, timeout=120, launch=launch))
     # `--bg` mints the id (fact 1); the roster is where the full one is read
+    deadline = time.monotonic() + BG_LIST_WAIT_SECONDS
+    while True:
+        for entry in bg_roster().values():
+            if entry.id == short:
+                return entry
+        if time.monotonic() >= deadline:
+            raise ClaudeCliError(f"background session {short} never appeared in "
+                                 f"`claude agents`")
+        time.sleep(0.25)
+
+
+def spawn_bg_open(argv: list[str], cwd: Path, env: dict[str, str] | None = None,
+                  timeout: int = 600) -> BgEntry:
+    """Open a background session through a session manager's own command (docs/superpowers/specs/2026-10-22-session-dispatch.md)"""
+    short = _short_id(_run([], cwd=cwd, timeout=timeout, env_extra=env, argv=argv))
     deadline = time.monotonic() + BG_LIST_WAIT_SECONDS
     while True:
         for entry in bg_roster().values():

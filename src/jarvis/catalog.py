@@ -2238,6 +2238,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             launcher = parse_launcher(w.get("launcher"), f"project {name}: worker.launcher")
         except ValueError as e:
             raise _err(str(e)) from e
+        if launcher is not None and launcher.open and transport != "background":
+            raise _err(f"project {name}: worker.launcher.open opens a background session, "
+                       f"so worker.transport must be background (got {transport!r})")
         require_crew = w.get("require_crew", False)
         if not isinstance(require_crew, bool):
             raise _err(f"project {name}: worker.require_crew must be true or false, "

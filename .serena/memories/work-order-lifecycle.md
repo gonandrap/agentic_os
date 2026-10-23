@@ -84,6 +84,16 @@ Contract: exec `$JARVIS_REAL_CLAUDE "$@"`, add nothing on a bg resume (forks a c
 no cwd change, no stdout before exec. `INV-LAUNCHER-RUNNABLE` in `check_catalog`.
 Tests: `tests/test_session_dispatch.py`.
 
+TEMPLATE mode `launcher.open` (session managers: `claude-jarvis start @jarvis --model {model}
+--compact-pct {compact_pct} --prompt {prompt} {wo_name}`): bg transport only; turn 1 runs
+the filled template (`claude_cli.spawn_bg_open`, id off its `backgrounded · <id>` stdout),
+the roster `cwd` is stored as the order's `worktree` as an ABSOLUTE path (every
+`<project>/.claude/worktrees/<wt>` join collapses to it); later turns resume bare there.
+`{wo_name}` strips non-alnum (claude-shining rule). Measured live 2.1.309: the CALLER'S ENV
+DOES NOT REACH a `--bg` session, so a template session gets no worker settings (no
+JARVIS_WO_ID env, gates, Stop/PostToolUse hooks). Settle now `stop_bg`s (waits for the
+process): a bare `stop_session` let an immediate resume fork a copy (fact 8).
+
 ## The headless transport (replaced background sessions 2026-08-01; the fallback since 2026-10-22)
 
 **Read `src/jarvis/worker_session.py`'s module docstring first — it is the layer, and it

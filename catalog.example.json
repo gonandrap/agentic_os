@@ -73,8 +73,8 @@
       "worker": {
         "$comment": "inherits os.defaults.permission_mode (auto); override here to restrict a project",
         "append_system_prompt": "Run the test suite before opening any PR.",
-        "$comment_launcher": "OPTIONAL: a local script that launches this project's sessions instead of bare claude. It gets the exact claude argv and must end with exec \"$JARVIS_REAL_CLAUDE\" \"$@\". See docs/superpowers/specs/2026-10-22-session-dispatch.md",
-        "$launcher_example": {"command": "~/.jarvis/launchers/my_webapp.sh", "env": {"MY_WRAPPER_MODE": "worker"}}
+        "$comment_launcher": "OPTIONAL: launch this project's sessions through its own wrapper instead of bare claude. `open` is an argv template for a session manager (first turn only; later turns resume bare; needs transport background). `command` is a thin wrapper that gets the exact claude argv and must exec \"$JARVIS_REAL_CLAUDE\" \"$@\". See docs/superpowers/specs/2026-10-22-session-dispatch.md",
+        "$launcher_example": {"open": ["claude-jarvis", "start", "@jarvis", "--model", "{model}", "--compact-pct", "{compact_pct}", "--prompt", "{prompt}", "{wo_name}"]}
       },
       "settings_overrides": {
         "permissions": { "allow": ["Bash(npm run *)"] }

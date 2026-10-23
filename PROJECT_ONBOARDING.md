@@ -51,18 +51,27 @@ entry per project:
 - `append_system_prompt` — hard constraints every worker must hear
   (e.g. "never touch live credentials").
 
-- `worker.launcher` — the command that launches this project's worker sessions, for a
-  repo that only works behind its own wrapper (e.g. agentic-env behind `claude-ase`).
-  Omit it and workers run plain `claude`. A path, a list (path plus fixed arguments), or
-  `{"command": [...], "env": {...}}`. The script receives the exact `claude` argv and
-  must end with `exec "$JARVIS_REAL_CLAUDE" "$@"`; keep it next to your catalog, outside
-  version control. `jarvis doctor` flags one that is missing or not executable.
-  Contract and environment: `docs/superpowers/specs/2026-10-22-session-dispatch.md`.
+- `worker.launcher` — how this project's worker sessions are launched, for a repo that
+  only works behind its own wrapper. Omit it and workers run plain `claude`. Two forms:
+  - **`open`**, for a session manager such as `claude-jarvis`, `claude-ase` or
+    `claude-shining`. An argv template that opens the session itself, used for the first
+    turn only. Later turns resume the same session inside the worktree the manager made.
+    Requires `worker.transport: background`.
 
-  ```json
-  "worker": {"launcher": {"command": "~/.jarvis/launchers/agentic-env.sh",
-                          "env": {"ASE_REPO": "agentic-env"}}}
-  ```
+    ```json
+    "worker": {"launcher": {"open": [
+      "claude-jarvis", "start", "@jarvis", "--model", "{model}",
+      "--compact-pct", "{compact_pct}", "--prompt", "{prompt}", "{wo_name}"]}}
+    ```
+
+  - **`command`**, for a thin wrapper. A path or list that receives the exact `claude`
+    argv on every launch and must end with `exec "$JARVIS_REAL_CLAUDE" "$@"`.
+
+  Keep any script next to your catalog, outside version control. `jarvis doctor` flags a
+  launcher that is missing or not executable. A wrapper must accept the project's
+  worktrees as a working directory. Placeholders, the contract, and what a
+  template-opened session does NOT get (Jarvis's worker settings, gates, and hooks):
+  `docs/superpowers/specs/2026-10-22-session-dispatch.md`.
 
 ## 2. What adoption does (idempotent)
 

@@ -564,6 +564,16 @@ def _launch_bg(store: ProjectStore, wo: dict[str, Any], prompt: str, cwd: Path,
     if wo.get("bg_id"):
         # A session that never wrote a word: retire it rather than leave two
         claude_cli.stop_session(wo["bg_id"])
+    if launch is not None and launch.opens_by_template:
+        entry = claude_cli.spawn_bg_open(
+            launch.open_argv(prompt=claude_cli._bg_prompt(prompt, promptfile),
+                             briefing=briefing),
+            cwd, env=launch.env())
+        # The session manager chose the worktree; every later turn resumes inside it
+        tree = entry.cwd or str(cwd)
+        store.update_work_order(wo["id"], session_id=entry.session_id, bg_id=entry.id,
+                                worktree=tree)
+        return {**wo, "session_id": entry.session_id, "bg_id": entry.id, "worktree": tree}
     entry = claude_cli.spawn_bg_turn(prompt, cwd, _worker_name(wo), worktree=worktree,
                                      promptfile=promptfile, launch=launch, **briefing)
     store.update_work_order(wo["id"], session_id=entry.session_id, bg_id=entry.id)
@@ -904,8 +914,8 @@ def _reap_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
                                        num_turns=(envelope or {}).get("api_calls"),
                                        usage=envelope)
     if entry is not None and entry.alive and budget_cap is None:
-        # Settled and idle: its process holds nothing, and the next prompt restarts it anyway
-        claude_cli.stop_session(entry.id)
+        # Settled and idle; WAIT for the process, or a resume right after forks a copy (fact 8)
+        claude_cli.stop_bg(entry.id)
     return _settle_result(store, turn, result, project_name)
 
 

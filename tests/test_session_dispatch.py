@@ -299,3 +299,157 @@ def test_doctor_accepts_a_runnable_launcher(tmp_path, launcher):
     for raw in (str(launcher.path), "sh"):
         assert [v for v in invariants.check_catalog(_catalog_with(tmp_path, raw))
                 if v.invariant == invariants.INV_LAUNCHER_RUNNABLE] == []
+
+
+# -- template mode: a session manager (claude-jarvis start …) opens the session itself
+
+OPEN = ["claude-jarvis", "start", "@jarvis", "--model", "{model}",
+        "--compact-pct", "{compact_pct}", "--prompt", "{prompt}", "{wo_name}"]
+
+WRAPPER = """#!/usr/bin/env bash
+set -euo pipefail
+python3 - "$@" <<'PY'
+import json, os, sys, time
+with open(os.path.join(os.environ["LAUNCH_LOG_DIR"], f"{time.time_ns()}.json"), "w") as f:
+    json.dump({"argv": sys.argv[1:], "cwd": os.getcwd()}, f)
+PY
+[ "$1" = start ] || { echo "only start" >&2; exit 2; }
+prompt="" model=""
+while [ $# -gt 1 ]; do
+  case "$1" in
+    --prompt) prompt="$2"; shift 2 ;;
+    --model) model="$2"; shift 2 ;;
+    --compact-pct) shift 2 ;;
+    *) shift ;;
+  esac
+done
+name="$1"
+wt="$PWD.worktrees/$name"
+[ -e "$wt" ] && { echo "worktree $wt exists" >&2; exit 1; }
+mkdir -p "$wt"
+cd "$wt"
+echo "preparing env $name" >&2
+echo "HEAD is now at 0000000 init"
+"$JARVIS_REAL_CLAUDE" --bg -n "$name" --model "$model" -- "$prompt"
+"""
+
+
+@pytest.fixture()
+def wrapper(tmp_path, monkeypatch):
+    logdir = tmp_path / "wrapper-log"
+    logdir.mkdir()
+    script = tmp_path / "bin" / "claude-jarvis"
+    script.parent.mkdir()
+    script.write_text(WRAPPER)
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("LAUNCH_LOG_DIR", str(logdir))
+
+    class Handle:
+        path = script
+
+        @property
+        def calls(self) -> list[dict]:
+            return [json.loads(p.read_text()) for p in sorted(logdir.iterdir())]
+
+    return Handle()
+
+
+def test_an_open_template_is_parsed():
+    got = session_dispatch.parse_launcher({"open": OPEN}, "where")
+    assert got.open == tuple(OPEN)
+    assert got.command == ()
+
+
+def test_an_open_template_with_an_unknown_placeholder_is_refused():
+    with pytest.raises(ValueError, match="where.*{bogus}"):
+        session_dispatch.parse_launcher({"open": ["x", "{bogus}"]}, "where")
+
+
+def test_a_launcher_needs_a_command_or_an_open_template():
+    with pytest.raises(ValueError, match="where"):
+        session_dispatch.parse_launcher({"env": {"A": "b"}}, "where")
+
+
+def test_the_template_is_filled_from_the_order_and_its_briefing(tmp_path):
+    lch = session_dispatch.parse_launcher({"open": OPEN}, "where")
+    launch = session_dispatch.Launch(launcher=lch, project="p", project_path=tmp_path,
+                                     wo_id="wo-1", wo_kind="worker", phase="open",
+                                     transport="background")
+    argv = launch.open_argv(prompt="do it", briefing={
+        "model": "claude-opus-5", "autocompact_window": 400_000})
+    assert argv == ["claude-jarvis", "start", "@jarvis", "--model", "claude-opus-5",
+                    "--compact-pct", "40", "--prompt", "do it", "wo1"]
+
+
+def test_wo_name_is_letters_and_digits_only():
+    # claude-shining refuses any other name: `name must match ^[a-zA-Z0-9]+$`
+    assert session_dispatch.wo_name("wo-23b7848c") == "wo23b7848c"
+
+
+@pytest.mark.parametrize("window,pct", [(400_000, "40"), (None, "100"), (1_000, "1"),
+                                        (2_000_000, "100")])
+def test_compact_pct_is_the_window_as_a_share_of_the_model_context(window, pct):
+    assert session_dispatch.compact_pct(window) == pct
+
+
+def test_an_open_template_is_only_for_background_sessions(tmp_path):
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({"projects": [
+        {"name": "p", "path": str(tmp_path),
+         "worker": {"transport": "headless", "launcher": {"open": OPEN}}}]}))
+    with pytest.raises(CatalogError, match="background"):
+        load_catalog(path)
+
+
+def test_an_open_template_opens_the_session_and_learns_its_worktree(
+        fake_claude, wrapper, tmp_path):
+    lch = session_dispatch.parse_launcher(
+        {"open": [str(wrapper.path), *OPEN[1:]]}, "where")
+    launch = session_dispatch.Launch(launcher=lch, project="p", project_path=tmp_path,
+                                     wo_id="wo-tpl1", wo_kind="worker", phase="open",
+                                     transport="background")
+    entry = claude_cli.spawn_bg_open(launch.open_argv(prompt="go", briefing={
+        "model": "claude-fake-1", "autocompact_window": 400_000}), tmp_path,
+        env=launch.env())
+    _wait_idle(entry.session_id)
+    assert entry.cwd == str(Path(f"{tmp_path}.worktrees") / "wotpl1")
+    assert fake_claude.turns[entry.session_id] == ["go"]
+    [call] = wrapper.calls
+    assert call["argv"][:3] == ["start", "@jarvis", "--model"]
+    assert call["cwd"] == str(tmp_path)
+
+
+@pytest.fixture()
+def template_fleet(jarvis_home, fake_claude, catalog_file, project, wrapper, monkeypatch):
+    data = json.loads(catalog_file.read_text())
+    data["os"]["defaults"]["transport"] = "background"
+    data["projects"][0].setdefault("worker", {})["launcher"] = {
+        "open": [str(wrapper.path), *OPEN[1:]]}
+    catalog_file.write_text(json.dumps(data))
+    monkeypatch.setattr(worker_session, "BG_DEAD_GRACE", 0.0)
+    ops.start_os(str(catalog_file), foreground=True)
+    return load_catalog(catalog_file).projects[0], ProjectStore(project)
+
+
+def test_a_templated_order_opens_through_the_wrapper_and_resumes_bare(
+        template_fleet, wrapper, fake_claude, settle_turns):
+    project, store = template_fleet
+    wo = store.get_work_order(ops.create_work_order("proj_a", "task")["id"])
+
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+    fresh = store.get_work_order(wo["id"])
+    tree = Path(f"{project.path}.worktrees") / wo["id"].replace("-", "")
+    assert Path(fresh["worktree"]) == tree
+    assert worker_session.worktree_path(project, fresh) == tree
+
+    worker_session.send(store, project, fresh, "again")
+    assert settle_turns(store)
+
+    assert len(wrapper.calls) == 1
+    sid = fresh["session_id"]
+    assert fake_claude.turns[sid] == ["go", "again"]
+    [resume] = [c for c in fake_claude.calls if "--resume" in c["argv"]]
+    assert resume["argv"] == ["--bg", "--resume", sid, "--", "again"]
+    assert Path(resume["cwd"]).resolve() == tree.resolve()
+    assert store.latest_turn(wo["id"])["result"] == "final: again"
