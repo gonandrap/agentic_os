@@ -1377,23 +1377,27 @@ def create_app() -> FastAPI:
                       blockers=blockers)
 
     @app.get("/knowledge", response_class=HTMLResponse)
-    def knowledge(request: Request):
+    def knowledge(request: Request, topic: str = "", q: str = ""):
         """The base, and what it costs against what it is used for"""
         from ..central_store import PINNED_TAG, has_tag, headline
+        # An empty form field means every topic; "(none)" is how the page names untopicked rows
+        topic_filter = None if not topic else "" if topic == "(none)" else topic
         central = CentralStore()
         try:
-            rows = central.search_knowledge("", limit=200)
+            rows = central.search_knowledge(q.strip(), limit=200, topic=topic_filter)
             topics = central.knowledge_topics()
             hits = central.knowledge_hit_counts()
         finally:
             central.close()
-        rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
+        if not q.strip():  # a word search keeps its rank order
+            rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
         for r in rows:
             r["pinned"] = has_tag(r["tags"], PINNED_TAG)
             r["headline"] = headline(r["content"])
             r["reads"] = hits.get(r["id"], 0)
         return render(request, "knowledge.html", active="knowledge", rows=rows,
-                      topics=topics, usage=ops.knowledge_usage_report(limit=8))
+                      topics=topics, topic=topic, q=q,
+                      usage=ops.knowledge_usage_report(limit=8))
 
     @app.post("/knowledge/pin")
     def knowledge_pin(kn_id: str = Form(...), pinned: str = Form("")):

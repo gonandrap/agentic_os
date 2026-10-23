@@ -886,6 +886,26 @@ def test_knowledge_page(client):
     assert "prefer uv" in r.text and "global" in r.text
 
 
+def test_knowledge_page_filters_by_topic_and_words(client):
+    """Topics were a flat run of text: no link, no way to narrow 800 entries to one topic"""
+    central = CentralStore()
+    central.add_knowledge("prefer uv for python installs", project="", topic="tooling")
+    central.add_knowledge("gates block pr merges", project="", topic="gates")
+    central.add_knowledge("untopicked lesson", project="")
+
+    page = client.get("/knowledge").text
+    assert 'href="/knowledge?topic=tooling"' in page and "<datalist" in page
+
+    page = client.get("/knowledge?topic=tooling").text
+    assert "prefer uv" in page and "gates block" not in page
+    assert "untopicked" in client.get("/knowledge?topic=").text   # empty form field: every topic
+    page = client.get("/knowledge?topic=(none)").text
+    assert "untopicked" in page and "prefer uv" not in page
+
+    page = client.get("/knowledge?q=merges").text
+    assert "gates block" in page and "prefer uv" not in page
+
+
 def test_knowledge_page_reports_what_the_base_costs_and_who_reads_it(client):
     """The page used to answer "what do we know" and nothing about what that is worth: no cost"""
     central = CentralStore()
