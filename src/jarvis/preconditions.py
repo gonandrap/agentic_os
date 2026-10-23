@@ -12,6 +12,9 @@ _MARKERS = "-*•>#\t "
 #: How long a matched sentence may be where it is quoted back
 MAX_SENTENCE = 300
 
+#: A hold on code reaching PRODUCTION, not on it merging (docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md)
+DEPLOYED_PREFIX = "deployed:"
+
 
 class PreconditionError(ValueError):
     """A ref that names nothing"""
@@ -43,11 +46,25 @@ def states_hold(title: str, description: str) -> str | None:
     return None
 
 
+def deployed_target(ref: str) -> str:
+    """What a `deployed:` ref waits for — a `wo-…` id or a commit sha; `""` for any other ref"""
+    if not ref.startswith(DEPLOYED_PREFIX):
+        return ""
+    return ref[len(DEPLOYED_PREFIX):].strip()
+
+
 def checked_ref(raw: str) -> str:
     """The ref, stripped"""
     ref = (raw or "").strip()
     if not ref:
         raise PreconditionError(
             "a precondition needs something to point at — `bl-…`, `kn-…`, `io-…`, "
-            "`#issue`, a URL, or the words for the wait")
+            "`deployed:<wo-id|sha>`, `#issue`, a URL, or the words for the wait")
+    if ref.startswith(DEPLOYED_PREFIX):
+        target = deployed_target(ref)
+        if not target:
+            raise PreconditionError(
+                "`deployed:` needs the work order or commit whose code must reach "
+                "production — `deployed:wo-19e58248` or `deployed:c507208`")
+        return f"{DEPLOYED_PREFIX}{target}"
     return ref
