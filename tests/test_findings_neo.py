@@ -436,3 +436,64 @@ def test_switched_off_nothing_is_offered(boot, store, improvement_order):
     daemon.offer_findings_to_neo(daemon.catalog.projects[0])
 
     assert neo_questions() == []
+
+
+# ---------------------------------------------------------------- `jarvis io ask-neo`
+
+
+def test_ask_neo_puts_a_legacy_report_to_neo_by_hand(boot, store, improvement_order,
+                                                     monkeypatch):
+    boot()
+    legacy(store, improvement_order, a_report(), monkeypatch)
+
+    out = ops.ask_neo_about_findings(improvement_order["id"])
+
+    assert len(out["asked"]) == 2 and out["not_asked"] == []
+    assert len(neo_questions()) == 2
+    row = store.get_feature_order(improvement_order["id"])
+    assert not row["needs_attention"]
+    [ev] = [e for e in store.list_events(row["plan_wo_id"])
+            if e["kind"] == "findings_offered_to_neo"]
+    assert db.from_json(ev["payload"], {})["by"] == "user"
+
+
+def test_ask_neo_re_asks_a_finding_neo_escalated(boot, store, improvement_order):
+    daemon = boot()
+    submitted(store, improvement_order, one_finding("NO_SWITCH"))
+    daemon._neo_drain()
+    first = finding(store, improvement_order["id"])
+    assert first["neo_verdict"]["escalate"] and first["status"] == "pending"
+
+    out = ops.ask_neo_about_findings(improvement_order["id"])
+
+    f = finding(store, improvement_order["id"])
+    assert out["asked"] == ["first-turn-reads"]
+    assert f["neo_question_id"] != first["neo_question_id"] and "neo_verdict" not in f
+    assert findings.with_neo(f)
+    # The new question is the one Neo's ruling lands on
+    daemon._neo_drain()
+    assert finding(store, improvement_order["id"])["neo_verdict"]["question_id"] == \
+        f["neo_question_id"]
+
+
+def test_ask_neo_skips_a_finding_neo_accepted(boot, store, improvement_order):
+    """Its spend waits on the user's yes; asking Neo again changes nothing"""
+    daemon = boot()
+    submitted(store, improvement_order, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
+    daemon._neo_drain()
+    before = len(neo_questions())
+
+    out = ops.ask_neo_about_findings(improvement_order["id"])
+
+    assert out["asked"] == [] and "nothing to ask" in out["note"]
+    assert len(neo_questions()) == before
+
+
+def test_ask_neo_refuses_a_settled_report_and_a_switched_off_neo(boot, store,
+                                                                 improvement_order):
+    boot(neo={"review_findings": False})
+    with pytest.raises(ops.OpsError, match="plan_review"):
+        ops.ask_neo_about_findings(improvement_order["id"])
+    submitted(store, improvement_order, a_report())
+    with pytest.raises(ops.OpsError, match="review_findings"):
+        ops.ask_neo_about_findings(improvement_order["id"])

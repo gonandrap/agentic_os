@@ -582,6 +582,11 @@ about…". The remaining fields follow as labelled paragraphs.
 >   with the new headline otherwise. A finding the user decided while Neo was being asked
 >   keeps the user's decision, and its question is superseded. The fleet pause holds the
 >   offer, because a Neo question is spend.
+> * `jarvis io ask-neo <io-id>` (`ops.ask_neo_about_findings`) does the same by hand, for
+>   one report, and wider (`findings.reaskable`): it also re-asks a finding Neo escalated,
+>   could not be reached for, or was refused as too large. It skips one Neo accepted,
+>   which waits only on the user's yes to the spend. User-typed, so the pause does not
+>   hold it.
 >
 > The original text follows.
 

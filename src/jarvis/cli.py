@@ -1197,6 +1197,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "with --reject")
     i.add_argument("--project")
 
+    i = io.add_parser("ask-neo", help="put the findings awaiting you to Neo: never asked, "
+                                      "escalated, or Neo was unreachable. Skips any Neo "
+                                      "accepted, which wait only on your yes to the spend")
+    i.add_argument("io_id")
+    i.add_argument("--project")
+
     i = io.add_parser("cancel", help="stop an improvement order and its analyst")
     i.add_argument("io_id")
     i.add_argument("--project")
@@ -3912,6 +3918,9 @@ def cmd_io(args: argparse.Namespace) -> int:
                                    feedback=args.feedback,
                                    accept_all=args.accept_all,
                                    project_name=args.project), args.json)
+
+    elif args.io_cmd == "ask-neo":
+        _print(ops.ask_neo_about_findings(args.io_id, args.project), args.json)
 
     elif args.io_cmd == "report":
         path = Path(args.from_file)
