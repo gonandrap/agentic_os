@@ -673,6 +673,20 @@ class Daemon:
         except Exception:  # noqa: BLE001
             log.exception("steward digest failed")
 
+    def offer_findings_to_neo(self, project: ProjectSpec) -> None:
+        """Findings Neo was never asked about go to Neo, once each (spec 2026-09-23 §5.5)"""
+        from . import ops
+        if fleet.load_pause(self.central) is not None:
+            # THE BRAKE: a Neo question is spend
+            return
+        try:
+            offered = ops.offer_unasked_findings(project.name, project.path)
+        except Exception:  # noqa: BLE001
+            log.exception("[%s] offering findings to Neo failed", project.name)
+            return
+        if offered:
+            log.info("[%s] findings offered to Neo: %s", project.name, ", ".join(offered))
+
     def steward_drain(self) -> None:
         """Queued self-work is deferred, not dropped: re-offer it when there is room (#1181)"""
         if fleet.load_pause(self.central) is not None:
@@ -964,6 +978,8 @@ class Daemon:
                     self.clear_answered_investigations(project, store)
                     # Beside it: the investigator's half of a settled investigation
                     self.settle_landed_investigators(project, store)
+                    # A report filed before Neo decided findings still owes Neo its questions
+                    self.offer_findings_to_neo(project)
                     # The agents roster holds ONLY the user's own sessions: workers are headless and never enter it
                     if sessions_by_project is not None:
                         self.track_injected_sessions(project, store, sessions_by_project)
