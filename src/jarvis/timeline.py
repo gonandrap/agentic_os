@@ -183,6 +183,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 " · ".join(x for x in (p.get("investigation"), p.get("filed")) if x))
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
+    # docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §1
+    if kind == "worktree_reclaimed":
+        if not p.get("removed"):
+            return "Checkout was already gone", p.get("why") or ""
+        branch = p.get("branch") or ""
+        return ("Checkout reclaimed",
+                f"the disk is back; `{branch}` still carries its commits" if branch
+                else "the disk is back")
     if kind == TURN_HARVESTED:
         # §5 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md
         if p.get("empty"):
