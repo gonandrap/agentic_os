@@ -2878,7 +2878,8 @@ def check_ui_wedged() -> Iterator[Violation]:
     restarts, cap, cap_spent = _ui_restart_counts()
     yield Violation(
         invariant="INV-UI-WEDGED",
-        detail=(f"the dashboard reported its threadpool wedged "
+        detail=(f"the dashboard reported itself wedged "
+                f"({stamp.get('reason') or 'threadpool wedged'}) "
                 f"{int(age // 60)} minutes ago and dumped every thread's stack to "
                 f"{stamp.get('dump') or uilog.stack_dump_path()} — the OS has "
                 f"self-restarted {release.UI_UNIT} {restarts} time"

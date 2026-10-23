@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -243,6 +244,11 @@ class PoolProbe:
         self.consecutive_failures = 0
         self.wedged_since: float | None = None
         self.stack_dump: str | None = None
+        # Stamped every round, read by `LoopWatchdog` from a plain thread (issue #1221)
+        self.heartbeat = time.monotonic()
+        # The last figures measured ON the loop: a watchdog thread cannot read the limiter
+        self.last_limiter: dict[str, int] = {"borrowed": 0, "available": 0,
+                                             "total": 0, "waiting": 0}
         # Routed requests in flight, keyed by a counter: a monotonic start time and a label
         self._inflight: dict[int, tuple[float, str]] = {}
         self._inflight_seq = 0
@@ -352,11 +358,65 @@ class PoolProbe:
         import anyio
 
         while True:
+            self.heartbeat = time.monotonic()
+            self.last_limiter = self.limiter_figures()
             # Re-resolved every round, so `jarvis config set os.ui_health.…` is in force without restarting the...
             self.cfg = ops.ui_health_config()
             if self.cfg.enabled:
                 await self.step(self.cfg)
             await anyio.sleep(max(1, self.cfg.probe_interval_seconds))
+
+
+#: How often the watchdog thread looks at the heartbeat
+WATCHDOG_TICK_SECONDS = 5
+
+
+class LoopWatchdog:
+    """The dump path that survives a BLOCKED event loop: a plain OS thread (issue #1221)"""
+
+    def __init__(self, probe: PoolProbe) -> None:
+        self.probe = probe
+        self.dumps = 0
+        # One dump per stall, re-armed when the loop starts stamping again
+        self.armed = True
+        self._stop = threading.Event()
+
+    def check(self, now: float) -> bool:
+        """Did this look at the heartbeat dump the stacks?"""
+        # `probe.cfg`, not `ops.ui_health_config()`: this thread must touch nothing the wedge can hold
+        cfg = self.probe.cfg
+        stale = now - self.probe.heartbeat
+        if not cfg.enabled or stale <= max(1, cfg.loop_stall_seconds):
+            self.armed = True
+            return False
+        if not self.armed:
+            return False
+        self.armed = False
+        uilog.record_wedge(limiter=self.probe.last_limiter,
+                           uptime_seconds=time.time() - self.probe.started_at,
+                           version=self.probe.version,
+                           reason=f"event loop stalled {stale:.0f}s — no probe round "
+                                  f"since, so the loop itself is blocked")
+        self.dumps += 1
+        return True
+
+    def run(self) -> None:
+        """The thread body: look, sleep, repeat — never awaits anything"""
+        while not self._stop.is_set():
+            try:
+                self.check(time.monotonic())
+            except Exception:  # noqa: BLE001 — a watchdog that dies is worse than one that misses
+                pass
+            self._stop.wait(WATCHDOG_TICK_SECONDS)
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.run, name="jarvis-ui-watchdog",
+                                  daemon=True)
+        thread.start()
+        return thread
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 def _cost_payloads(picked: dict, project: str, method: str = "TASK") -> dict:
@@ -799,23 +859,27 @@ def wiring_groups(scope: str, *, refresh: bool = False) -> dict[str, object]:
 def create_app() -> FastAPI:
     probe = PoolProbe()
     cost_cache = CostCache()
+    watchdog = LoopWatchdog(probe)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        """Owns the liveness probe task (spec §2)"""
+        """Owns the liveness probe task (spec §2) and the watchdog thread (issue #1221)"""
         import anyio
 
+        watchdog.start()
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
             tg.start_soon(cost_cache.run)
             try:
                 yield
             finally:
+                watchdog.stop()
                 tg.cancel_scope.cancel()
 
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.pool_probe = probe
     app.state.cost_cache = cost_cache
+    app.state.loop_watchdog = watchdog
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:

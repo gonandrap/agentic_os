@@ -474,6 +474,9 @@ DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY = 3
 #: An unreachable dashboard this recently (re)started is still booting, not wedged
 DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS = 60
 
+#: Heartbeat staleness at which the OS-thread watchdog dumps stacks itself (issue #1221)
+DEFAULT_UI_HEALTH_LOOP_STALL_SECONDS = 90
+
 
 @dataclass
 class UiHealthConfig:
@@ -487,6 +490,7 @@ class UiHealthConfig:
     restart_cooldown_seconds: int = DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS
     max_restarts_per_day: int = DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY
     boot_grace_seconds: int = DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS
+    loop_stall_seconds: int = DEFAULT_UI_HEALTH_LOOP_STALL_SECONDS
 
 
 # -- `fleet_health`: when an order that has stopped moving gets investigated. §4 of
@@ -1496,6 +1500,8 @@ def _parse_ui_health(raw: Any, base: UiHealthConfig | None = None,
                                          base.max_restarts_per_day)),
         boot_grace_seconds=int(raw.get("boot_grace_seconds",
                                        base.boot_grace_seconds)),
+        loop_stall_seconds=int(raw.get("loop_stall_seconds",
+                                       base.loop_stall_seconds)),
     )
     for name, value in vars(cfg).items():
         if name != "enabled" and value < 1:
