@@ -99,6 +99,10 @@ def _wedge_evidence(figures: dict[str, Any], dump: str) -> str:
 
     lines = [f"Limiter: {_limiter_line(figures)}",
              f"Stacks: {dump or 'none — no stack dump was written'}"]
+    # A loop stall and a wedged threadpool are different faults; the stamp says which (issue #1221)
+    reason = str((uilog.read_wedge() or {}).get("reason") or "")
+    if reason:
+        lines.append(f"Reason: {reason}")
     stamp = _existing(uilog.wedge_stamp_path())
     if stamp:
         lines.append(f"Stamp: {stamp}")

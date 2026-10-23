@@ -19,7 +19,8 @@ from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
-from jarvis.ui.app import create_app  # noqa: E402
+from jarvis.ui import app as ui_app  # noqa: E402
+from jarvis.ui.app import LoopWatchdog, create_app  # noqa: E402
 
 
 @pytest.fixture()
@@ -492,6 +493,72 @@ def test_a_trip_dumps_every_threads_stack_and_stamps_the_wedge(started, monkeypa
     # kn-57fb4919: `[ERROR]` in ui.log is a parsed contract with three readers
     ui_log = uilog.ui_log_path()
     assert "[ERROR]" not in (ui_log.read_text() if ui_log.exists() else "")
+
+
+# -- a BLOCKED EVENT LOOP: the probe is an asyncio task, the watchdog is not (issue #1221)
+
+
+def test_the_watchdog_dumps_while_the_event_loop_is_blocked(started, monkeypatch):
+    """The assertion this fix exists for: no asyncio task can run here, so only a thread can dump"""
+    _fast_probe(monkeypatch, loop_stall_seconds=1)
+    monkeypatch.setattr(ui_app, "WATCHDOG_TICK_SECONDS", 0.2)
+    app = create_app()
+
+    @app.get("/_loopblock")
+    async def loop_blocker():
+        """Blocks the loop itself — not a threadpool token"""
+        time.sleep(8)
+        return {"ok": True}
+
+    pool = cf.ThreadPoolExecutor(max_workers=2)
+    futs: list = []
+    try:
+        with TestClient(app) as client:
+            futs.append(pool.submit(client.get, "/_loopblock"))
+            assert _wait_until(lambda: uilog.read_wedge() is not None, timeout=20), \
+                "no wedge stamp was written while the event loop was blocked"
+            stamp = uilog.read_wedge()
+            cf.wait(futs, timeout=30)
+    finally:
+        pool.shutdown(wait=False)
+
+    assert str(stamp["reason"]).startswith("event loop stalled")
+    assert stamp["dump"] == str(uilog.stack_dump_path())
+    dump = uilog.stack_dump_path().read_text()
+    assert "event loop stalled" in dump
+    assert "loop_blocker" in dump           # the frame that holds the loop, by name
+
+
+def test_the_watchdog_dumps_once_per_stall_and_re_arms_on_recovery(started, monkeypatch):
+    """A stall lasting hours must not rewrite the dump every tick"""
+    _fast_probe(monkeypatch, loop_stall_seconds=10)
+    probe = create_app().state.pool_probe
+    probe.cfg = ops.ui_health_config()
+    watchdog = LoopWatchdog(probe)
+
+    now = time.monotonic()
+    probe.heartbeat = now                       # fresh
+    assert watchdog.check(now) is False
+    probe.heartbeat = now - 11                   # stale past the threshold
+    assert watchdog.check(now) is True
+    assert watchdog.check(now) is False          # still stalled: one dump, not a stream
+    probe.heartbeat = now                        # the loop came back
+    assert watchdog.check(now) is False
+    probe.heartbeat = now - 11                   # and stalled again
+    assert watchdog.check(now) is True
+    assert watchdog.dumps == 2
+
+
+def test_the_watchdog_is_silent_when_ui_health_is_off(started, monkeypatch):
+    """`ui_health.enabled: false` means the dashboard reports nothing about itself"""
+    _fast_probe(monkeypatch, enabled=False, loop_stall_seconds=1)
+    probe = create_app().state.pool_probe
+    probe.cfg = ops.ui_health_config()
+    watchdog = LoopWatchdog(probe)
+
+    probe.heartbeat = time.monotonic() - 3600
+    assert watchdog.check(time.monotonic()) is False
+    assert uilog.read_wedge() is None
 
 
 # -- the detector is cause-independent (review round 1)

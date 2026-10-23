@@ -253,6 +253,31 @@ traceback that does not exist. So: two **new** files beside the others under
 Writing must never raise into the probe task — same rule as `_append`'s swallow
 (`uilog.py:108`): a failed dump must still leave the 503 answerable.
 
+**Amended by issue #1221: the trip above cannot fire when the EVENT LOOP is what is
+blocked.** The probe of §2 is an asyncio task, so a wedge that blocks the loop — measured
+2026-10-22: four wedges in a day, 0% CPU, every thread in `futex_do_wait`, unread bytes
+queued on accepted sockets — stops the probe too, and no dump was ever written in that
+shape. So the dump has a second trigger that owes nothing to the loop: `LoopWatchdog`
+(`ui/app.py`), a plain daemon `threading.Thread` started by the lifespan. The probe stamps
+`PoolProbe.heartbeat` (`time.monotonic()`) at the top of every round; the thread compares
+that against `ui_health.loop_stall_seconds` every `WATCHDOG_TICK_SECONDS` and calls
+`uilog.record_wedge(reason="event loop stalled …")` itself. Three constraints on that
+thread:
+
+- it reads `probe.cfg`, the settings the probe resolved on the loop, and never calls
+  `ops.ui_health_config()` — a watchdog that reads the catalog could block on whatever the
+  wedge holds;
+- it cannot read the anyio limiter (that needs a running loop in the calling thread), so it
+  reports `PoolProbe.last_limiter`, the figures measured ON the loop in the last round;
+- **one dump per stall**, re-armed only when the heartbeat advances again, or an hours-long
+  wedge rotates its own evidence away.
+
+The stamp carries `reason`, so `INV-UI-WEDGED` and the daemon's inbox item say which fault
+this was rather than claiming the threadpool every time. This covers a wedge that leaves the
+GIL free, which the measured one does; a wedge that HOLDS the GIL would need
+`faulthandler.register(SIGUSR1)` plus a signal from the daemon, deferred as a follow-up
+until one is observed (Neo 2195).
+
 ### 4. Detection and self-heal in the daemon
 
 Where: a new reconcile-tick check on `Daemon`, called from `tick()` **immediately beside
@@ -349,6 +374,7 @@ Keys, defaults and the reasoning for each default:
 | `ui_health.restart_cooldown_seconds` | `300` | one restart per 5 minutes. Longer than the whole measured outage, so the real case needs exactly one restart; short enough that a second genuine wedge the same hour is still healed |
 | `ui_health.max_restarts_per_day` | `3` | a wedge took ~4 hours of uptime to appear, so three in 24h is well above the observed rate and the fourth is evidence of a different, worse fault that wants the user rather than another restart |
 | `ui_health.boot_grace_seconds` | `60` | added by issue #1189. An unreachable `/healthz` within this long of the unit leaving `inactive` is a UI that has not bound the port yet, not a wedge — every release restarts `jarvis-ui.service` and the daemon's next tick probed 70ms later. Read from systemd's own `InactiveExitTimestampMonotonic`, so it holds for a restart by a release, by `shipit` or by hand alike; well above the measured boot and far inside `restart_cooldown_seconds`, so a dashboard that genuinely wedges on boot is still healed one tick later. Amended by issue #1194: the grace covers the START of a restart only, because during its STOP phase `InactiveExitTimestampMonotonic` still holds the PREVIOUS start, so a restart's own silence read as an aged unit and reached the capped CRITICAL. An unreachable `/healthz` while `ActiveState` is `deactivating`, `activating` or `reloading` is that restart, not a wedge, and is checked before the age |
+| `ui_health.loop_stall_seconds` | `90` | added by issue #1221, read by the watchdog thread of §3. A healthy probe round costs at most `probe_interval_seconds` + `probe_timeout_seconds` = 35s, so 90 is past two of them: a loop that has not stamped its heartbeat in 90s is blocked, not busy. Far inside the minutes a real wedge stays unanswered, so the dump still lands long before the daemon's restart |
 
 ## Test strategy
 

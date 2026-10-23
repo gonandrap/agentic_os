@@ -135,17 +135,18 @@ def dump_stacks(note: str = "") -> Path | None:
 
 
 def record_wedge(*, limiter: dict[str, int], uptime_seconds: float,
-                 version: str = "") -> dict[str, object]:
+                 version: str = "", reason: str = "threadpool wedged",
+                 ) -> dict[str, object]:
     """Dump the stacks and (re)write the wedge stamp"""
     stamp: dict[str, object] = {
         "since": time.time(), "at": time.time(), "limiter": dict(limiter),
         "uptime_seconds": round(uptime_seconds, 1), "version": version,
-        "dump": str(stack_dump_path()),
+        "dump": str(stack_dump_path()), "reason": reason,
     }
     previous = read_wedge()
     if previous and previous.get("since"):
         stamp["since"] = previous["since"]
-    note = (f"pool wedged — limiter borrowed={limiter.get('borrowed')} "
+    note = (f"{reason} — limiter borrowed={limiter.get('borrowed')} "
             f"available={limiter.get('available')} total={limiter.get('total')} "
             f"waiting={limiter.get('waiting')} uptime={int(uptime_seconds)}s "
             f"version={version or 'unknown'}")
