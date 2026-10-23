@@ -58,8 +58,7 @@ def cache_ttl_env(cache_ttl: str) -> dict[str, str]:
     if cache_ttl == "cli":
         return {}
     if cache_ttl == "1h":
-        # Settings promptCacheTtl/subagentPromptCacheTtl outrank the 1h flag, so the hour
-        # has to be asked for by the env pair that outranks THEM (kn-ccbe6a0d, issue 1187)
+        # The 1h flag alone loses to the user's settings promptCacheTtl (#1187)
         return {claude_cli.PROMPT_CACHE_1H_ENV_KEY: "1",
                 **{k: "1h" for k in claude_cli.PROMPT_CACHE_TTL_ENV_KEYS}}
     return dict(claude_cli.PROMPT_CACHE_5M_ENV)
