@@ -83,6 +83,32 @@ def serena_allow_rules() -> list[str]:
             for prefix in SERENA_TOOL_PREFIXES for tool in SERENA_READ_TOOLS]
 
 
+#: Routes EVERY MCP call to the hook (#852)
+MCP_MATCHER = "mcp__.*"
+
+
+def widen_mcp_matcher(settings: dict[str, Any]) -> dict[str, Any]:
+    """Hand every MCP call to the hook, for a kind whose no-write rule is an ALLOWLIST (#852, kn-78579bf3)"""
+    from .bootstrap import jarvis_hook_command
+
+    command = jarvis_hook_command()
+    reached = False
+    for entry in (settings.get("hooks") or {}).get("PreToolUse") or []:
+        # A foreign hook entry is not ours to widen, and does not count as reached
+        if not any(h.get("command") == command for h in entry.get("hooks") or []):
+            continue
+        matcher = entry.get("matcher")
+        if matcher and MCP_MATCHER not in matcher.split("|"):
+            entry["matcher"] = f"{matcher}|{MCP_MATCHER}"
+        reached = True  # a matcher-less entry already matches every tool
+    if not reached:
+        # Fail closed: no hook entry means the read-only guarantee has nowhere to run
+        raise RuntimeError(
+            f"no PreToolUse entry runs {command!r}: an investigator cannot be dispatched "
+            "without the hook that refuses its writes (#852)")
+    return settings
+
+
 def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """Merge the project's injected settings with per-work-order env and persist them for --settings"""
     import json as _json
@@ -119,6 +145,10 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     for tool in project.worker.denied_tools:
         if tool not in deny:
             deny.append(tool)
+
+    # The hook refuses every MCP tool but Serena's read-only ones (#852)
+    if wo.get("kind") == "investigator":
+        widen_mcp_matcher(settings)
 
     # THE prefix-stability lever
     settings["includeGitInstructions"] = False
