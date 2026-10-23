@@ -41,6 +41,8 @@ class EvidencePacket:
     children: tuple[dict, ...] = ()
     #: Every assumption the work order ever filed, `{n, content, status}`, review state included (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §4.)
     assumptions: tuple[dict, ...] = ()
+    #: A FEATURE's diff: `"children"`, or `"unscoped"` with no child merge commit (issue #985)
+    diff_scope: str = ""
     #: Where `diff`, `files` and `stat` came from: `"pull_request"` or `"worktree"`
     source: str = "worktree"
     #: The pull request as a human reviewer reads it
@@ -388,13 +390,18 @@ def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[
     """Assemble the packet for one feature order, from the PROJECT ROOT"""
     base = str(fo.get("base_sha") or "")
     head = default_branch_head(project_path) if base else ""
+    # Unscoped, this range carries every SIBLING feature merged into the same base (issue #985)
+    commits = _dedupe(str(c.get("merge_commit") or "") for c in children)
+    paths = _commit_paths(project_path, commits)
     stat = diff = ""
     files: tuple[str, ...] = ()
     if base and head:
         rng = f"{base}...{head}"
-        stat = _git(project_path, *_diff_args(rng, "--stat"))
-        diff = _git(project_path, *_diff_args(rng))
-        files = _dedupe(_git(project_path, *_diff_args(rng, "--name-only")).split("\n"))
+        scope = ("--", *paths) if paths else ()
+        stat = _git(project_path, *_diff_args(rng, "--stat"), *scope)
+        diff = _git(project_path, *_diff_args(rng), *scope)
+        files = _dedupe(
+            _git(project_path, *_diff_args(rng, "--name-only"), *scope).split("\n"))
 
     effects = tuple(dict(e) for e in side_effects)
     kept, truncated, dropped = _truncate(diff, diff_chars, files)
@@ -415,13 +422,15 @@ def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[
         diff_truncated=truncated,
         dropped_files=dropped,
         diff_sha=hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+        diff_scope="children" if paths else "unscoped",
         # `source` stays "worktree": a feature's diff is read from the project root and a feature order has...
         side_effects=effects,
         side_effects_sha=side_effects_digest(effects),
         children=tuple(
             {"id": str(c.get("id") or ""), "title": str(c.get("title") or ""),
              "summary": str(c.get("result_summary") or ""),
-             "declared": str(c.get("declared") or "")}
+             "declared": str(c.get("declared") or ""),
+             "merge_commit": str(c.get("merge_commit") or "")}
             for c in children),
         history=_history(history),
     )
@@ -475,6 +484,16 @@ def _diff_args(rev_range: str | None, *extra: str) -> tuple[str, ...]:
     return ("diff", *extra, rev_range or "HEAD")
 
 
+
+
+def _commit_paths(repo: Path, commits: Iterable[str]) -> tuple[str, ...]:
+    """Every path these commits touched, both names of a rename so a pathspec matches it"""
+    # `<sha>^1` is the default branch before the merge, for a squash commit and a merge commit alike
+    return _dedupe(
+        name
+        for sha in commits
+        for name in _git(repo, "diff", "--name-only", "--no-renames",
+                         f"{sha}^1", sha).split("\n"))
 
 
 def _dedupe(names: Iterable[str]) -> tuple[str, ...]:
