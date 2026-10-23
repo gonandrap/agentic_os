@@ -444,7 +444,7 @@ def test_a_running_turn_past_its_budget_is_stopped(bg_fleet, fake_claude, monkey
 
 def test_settling_waits_for_the_process_so_an_immediate_resume_cannot_fork(
         bg_fleet, fake_claude, settle_turns, monkeypatch):
-    """The roster drops the pid ~0.6s before the process exits (fact 8): a bare stop let the next resume fork"""
+    """The roster drops the pid before the process exits (fact 8): a bare stop let a resume fork"""
     store, project = bg_fleet["store"], bg_fleet["project"]
     waited, bare = [], []
     real_stop_bg = claude_cli.stop_bg

@@ -482,7 +482,7 @@ def spawn_bg_turn(prompt: str, cwd: Path, name: str, worktree: str | None = None
 def spawn_bg_open(argv: list[str], cwd: Path, env: dict[str, str] | None = None,
                   timeout: int = 600) -> BgEntry:
     """Open a background session through a session manager's own command (docs/superpowers/specs/2026-10-22-session-dispatch.md)"""
-    # Only a session that did not exist before the call may bind the order: a manager's output can quote others
+    # Bind only a session that is new: a manager's output may quote other sessions
     before = {e.id for e in bg_roster().values()}
     out = _run([], cwd=cwd, timeout=timeout, env_extra=env, argv=argv)
     fresh = [m.group(1) for m in _BACKGROUNDED_RE.finditer(out or "")
