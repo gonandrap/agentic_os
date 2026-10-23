@@ -114,12 +114,27 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
       - name: Install chromium and its apt deps
-        # A stalled apt mirror must fail THIS step, not eat the job budget (#1193, kn-ffab4362)
+        # A stalled apt mirror must fail THIS step, not eat the job budget (#1193, kn-ffab4362).
+        # timeout signals the group as the runner user, which cannot reach the root-owned
+        # apt-get child, so attempt 2 must clear the dpkg lock itself first (#1219).
         run: |
+          reap_apt() {
+            sudo pkill -TERM -x '(apt-get|apt|dpkg)' 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              pgrep -x '(apt-get|apt|dpkg)' >/dev/null || break
+              sleep 1
+            done
+            sudo pkill -KILL -x '(apt-get|apt|dpkg)' 2>/dev/null || true
+            sleep 2
+            sudo dpkg --configure -a || true
+          }
           for attempt in 1 2; do
             if timeout 180 playwright install --with-deps chromium; then exit 0; fi
-            echo "::warning::playwright install attempt $attempt stalled or failed after 180s; retrying"
+            if [ "$attempt" = 1 ]; then
+              echo "::warning::playwright install attempt 1 stalled or failed after 180s; reaping apt and retrying"
+              reap_apt
+            fi
           done
-          echo "::error::playwright install --with-deps chromium failed twice at 180s each — a slow apt mirror is the usual cause, not this commit"
+          echo "::error::playwright install --with-deps chromium failed twice at 180s each, each attempt against a cleared dpkg lock — a slow apt mirror is the usual cause, not this commit"
           exit 1
       - run: pytest tests_browser -q --timeout=60
