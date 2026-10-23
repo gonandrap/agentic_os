@@ -796,6 +796,12 @@ class WiringConfig:
 #: Tracked files an installed TOOL owns and rewrites
 DEFAULT_TOOL_MANAGED_PATHS = (".serena/project.yml",)
 
+#: How long a settled order's checkout is kept before the daemon reclaims it; 0 = never (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md)
+DEFAULT_WORKTREE_RECLAIM_AFTER_HOURS = 24
+
+#: Free gigabytes under which the daemon raises ONE attention item; 0 = never (same spec, §2)
+DEFAULT_DISK_FREE_WARN_GB = 5.0
+
 
 @dataclass
 class WorktreeConfig:
@@ -803,6 +809,7 @@ class WorktreeConfig:
 
     #: Repo-relative paths
     tool_managed_paths: tuple[str, ...] = DEFAULT_TOOL_MANAGED_PATHS
+    reclaim_after_hours: int = DEFAULT_WORKTREE_RECLAIM_AFTER_HOURS
 
 
 @dataclass
@@ -1117,6 +1124,8 @@ class OsConfig:
     compact_min_context: int | None = DEFAULT_COMPACT_MIN_CONTEXT
     #: Backstop ceiling on one OS-side model call's combined prompt
     max_os_prompt_chars: int = DEFAULT_MAX_OS_PROMPT_CHARS
+    #: The floor the daemon warns under, before SQLite starts failing
+    disk_free_warn_gb: float = DEFAULT_DISK_FREE_WARN_GB
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -1207,6 +1216,15 @@ def _compact_min_context_or_err(os_raw: dict[str, Any]) -> int | None:
                    f"{COMPACT_MIN_CONTEXT_MIN}, where compacting costs more than the "
                    f"re-write it replaces (use null to switch compaction off)")
     return value
+
+
+def _disk_free_warn_gb_or_err(os_raw: dict[str, Any]) -> float:
+    """`os.disk_free_warn_gb`, validated at boot — 0 is the off switch"""
+    value = os_raw.get("disk_free_warn_gb", DEFAULT_DISK_FREE_WARN_GB)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise _err(f"os.disk_free_warn_gb must be a non-negative number of gigabytes "
+                   f"(0 to never warn), got {value!r}")
+    return float(value)
 
 
 def _max_os_prompt_chars_or_err(os_raw: dict[str, Any]) -> int:
@@ -1909,7 +1927,11 @@ def _parse_worktree(raw: Any, base: WorktreeConfig | None = None,
             raise _err(f"{where}.tool_managed_paths entry {path!r} must be repo-relative")
         if ".." in PurePosixPath(path).parts:
             raise _err(f"{where}.tool_managed_paths entry {path!r} must not contain '..'")
-    return WorktreeConfig(tool_managed_paths=paths)
+    hours = raw.get("reclaim_after_hours", base.reclaim_after_hours)
+    if isinstance(hours, bool) or not isinstance(hours, int) or hours < 0:
+        raise _err(f"{where}.reclaim_after_hours must be a non-negative integer "
+                   f"(0 to never reclaim)")
+    return WorktreeConfig(tool_managed_paths=paths, reclaim_after_hours=hours)
 
 
 def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
@@ -2138,6 +2160,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         cache_health_prefix_share=health_prefix,
         compact_min_context=_compact_min_context_or_err(os_raw),
         max_os_prompt_chars=_max_os_prompt_chars_or_err(os_raw),
+        disk_free_warn_gb=_disk_free_warn_gb_or_err(os_raw),
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 8)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 1000)),
