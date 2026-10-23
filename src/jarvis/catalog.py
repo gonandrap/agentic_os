@@ -473,8 +473,7 @@ DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY = 3
 #: An unreachable dashboard this recently (re)started is still booting, not wedged
 DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS = 60
 
-#: Heartbeat staleness at which the OS-thread watchdog dumps stacks itself (issue #1221).
-#: A healthy probe round costs at most probe_interval + probe_timeout = 35s.
+#: Heartbeat staleness at which the OS-thread watchdog dumps stacks itself (issue #1221)
 DEFAULT_UI_HEALTH_LOOP_STALL_SECONDS = 90
 
 

@@ -507,6 +507,7 @@ def test_the_watchdog_dumps_while_the_event_loop_is_blocked(started, monkeypatch
     @app.get("/_loopblock")
     async def loop_blocker():
         """Blocks the loop itself — not a threadpool token"""
+        # clock-exempt: class 3 — a real sleep is what blocks a real event loop
         time.sleep(8)
         return {"ok": True}
 
@@ -536,6 +537,7 @@ def test_the_watchdog_dumps_once_per_stall_and_re_arms_on_recovery(started, monk
     probe.cfg = ops.ui_health_config()
     watchdog = LoopWatchdog(probe)
 
+    # clock-exempt: class 3 — the heartbeat the watchdog reads is a time.monotonic() stamp
     now = time.monotonic()
     probe.heartbeat = now                       # fresh
     assert watchdog.check(now) is False
@@ -556,6 +558,7 @@ def test_the_watchdog_is_silent_when_ui_health_is_off(started, monkeypatch):
     probe.cfg = ops.ui_health_config()
     watchdog = LoopWatchdog(probe)
 
+    # clock-exempt: class 3 — an hour-stale monotonic heartbeat, which no db.now patch reaches
     probe.heartbeat = time.monotonic() - 3600
     assert watchdog.check(time.monotonic()) is False
     assert uilog.read_wedge() is None
