@@ -377,9 +377,17 @@ ALARM_STATUSES = (
     "skipped",    # never offered to the supervisor — backfilled history, or declined
     "failed",     # the review could not be completed; the alarm stays unresolved
 )
+# NOTHING MORE IS COMING FOR THESE: the finding was answered, noted or never offered
+ALARM_SETTLED_STATUSES = ("acked", "informational", "skipped")
+#: raised, reviewing, escalated, proposed, failed — a finding something still owes an answer (#1063)
+ALARM_OPEN_STATUSES = tuple(s for s in ALARM_STATUSES
+                            if s not in ALARM_SETTLED_STATUSES)
+
 # The supervisor reads, reports, and — from §5 — may ASK to act
 ALARM_VERDICTS = ("ack", "escalate", "propose")
 ALARM_REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
+#: What `jarvis alarms review` may answer: a verdict, or the absence of one nothing retries (#1063)
+ALARM_REVIEWABLE_STATUSES = ("acked", "escalated", "failed")
 
 # What an alarm is ABOUT, and what noticed it
 ALARM_SUBJECTS = ("work_order", "feature_order")
