@@ -5409,8 +5409,7 @@ BASE_UPDATE_BASE_RED = "base_red"
 
 #: How many times the OS may catch one pull request up with a MOVING base
 CATCH_UP_MAX = 3
-#: ...WITHIN THIS WINDOW: a RATE, not a lifetime budget (#1215, Neo 2191) — three green
-#: catch-ups on a busy main used to retire the chase for ever on a mergeable branch
+#: ...WITHIN THIS WINDOW: a RATE, not a lifetime budget (#1215, Neo 2191)
 CATCH_UP_WINDOW_SECONDS = 2 * 3600
 
 #: A merge the OS refused because the base moved under the judged commit — spec 2026-09-28 §3.1
