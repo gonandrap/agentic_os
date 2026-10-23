@@ -645,6 +645,16 @@ def _os_is_confirming(a: dict[str, Any]) -> bool:
     return verdict == "object" and bool(a.get("objection_delivered_ts"))
 
 
+def drift_review_failed(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The blocker when a merge is held on a scope-drift finding nothing retries (#1063)"""
+    from . import automerge
+
+    alarm = automerge.open_drift_alarm(store.alarms_of(wo["id"]))
+    if alarm is None or str(alarm["status"] or "") != "failed":
+        return ""
+    return automerge.DRIFT_BLOCKER.format(alarm_id=alarm["id"])
+
+
 def reviewable_assumptions(store: ProjectStore,
                            wo: dict[str, Any]) -> list[dict[str, Any]]:
     """The pending assumptions that are the USER's to review (io-d2a5dd69)"""
@@ -763,6 +773,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if (wo["status"] == "waiting_pr_merge"
             and carry_unproven_hold(store, wo["id"]) is not None):
         blockers.append(CARRY_UNPROVEN_BLOCKER)
+    # A SCOPE-DRIFT FINDING NOTHING WILL SETTLE BUT THE USER (#1063)
+    if wo["status"] == "waiting_pr_merge":
+        if wedged_drift := drift_review_failed(store, wo):
+            blockers.append(wedged_drift)
     # A MERGE THE REVIEWER REFUSED
     if wo["status"] == "waiting_pr_merge" and automerge_denied(store, wo):
         blockers.append(AUTOMERGE_DENIED_BLOCKER)
