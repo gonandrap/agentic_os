@@ -1120,6 +1120,9 @@ REWRITE_TTL_ALARM = "rewrite-tax-ttl"
 CACHE_1H_DISPATCHED_ALARM = "cache-1h-dispatched"
 CACHE_1H_FOREIGN_ALARM = "cache-1h-foreign"
 
+#: THE STAMP AGAINST THE RATE: an arm that never reached the CLI (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
+CACHE_ARM_MISSED_ALARM = "cache-arm-missed"
+
 #: What each kind IS, for a surface listing alarms rather than raising one
 ALARM_KINDS = {
     TURN_ALARM: "a turn still running, still being billed",
@@ -1141,6 +1144,9 @@ ALARM_KINDS = {
                                "breach of the transport's 5-minute guarantee",
     CACHE_1H_FOREIGN_ALARM: "sessions Jarvis never dispatched bought the one-hour cache "
                             "write — reportable, not fixable from inside the OS",
+    CACHE_ARM_MISSED_ALARM: "a turn stamped with a cache-TTL arm paid the OTHER TTL — "
+                            "the arm never reached the CLI, so the stamp records only "
+                            "the intent",
     # The compaction post-conditions, raised by `invariants.check_compactions_hold`
     "compaction-chained": "a compaction run on a conversation the previous turn had "
                           "already compacted — it summarised the summary",
@@ -1437,3 +1443,76 @@ def hour_alarms(found: Sequence[HourWrites], cfg: InspectConfig, *,
             f"{REMEDY_LINE}. {NOT_OURS_TO_FIX} Sessions: "
             f"{_name_sessions(found, 'foreign')}.")))
     return raised
+
+
+# -- the stamp against the RATE (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
+
+#: The arms that CLAIM a rate — `cli` claims none, so it cannot be missed
+CHECKED_ARMS = ("1h", "5m")
+
+#: How many offending turns the reason names before it stops
+NAMED_TURNS = 3
+
+
+@dataclass
+class ArmMiss:
+    """One STAMPED turn whose calls bought the TTL it was not armed for"""
+
+    project: str
+    wo_id: str
+    seq: int
+    arm: str
+    #: Tokens written at the OTHER TTL — what the arm claims was not paid for
+    tokens: int
+    ts: float = 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"project": self.project, "wo_id": self.wo_id, "seq": self.seq,
+                "arm": self.arm, "tokens": self.tokens, "ts": self.ts}
+
+
+def arm_misses(rows: Iterable[tuple[str, str, int, str, float, int, int]],
+               ) -> list[ArmMiss]:
+    """Every stamped turn that paid the OTHER TTL, biggest first — `(project, wo_id, seq, arm, ts, cache_1h, cache_5m)` in"""
+    misses: list[ArmMiss] = []
+    for project, wo_id, seq, arm, ts, cache_1h, cache_5m in rows:
+        if arm not in CHECKED_ARMS:
+            continue
+        paid, other = (cache_1h, cache_5m) if arm == "1h" else (cache_5m, cache_1h)
+        # Only the SPLIT is evidence (kn-dbf6f779): with neither side reported the CLI
+        # said nothing about the rate, and a turn that wrote no cache paid nothing
+        if paid or not other:
+            continue
+        misses.append(ArmMiss(project=project, wo_id=wo_id, seq=seq, arm=arm,
+                              tokens=other, ts=ts))
+    return sorted(misses, key=lambda m: (-m.tokens, m.wo_id, m.seq))
+
+
+def _name_turns(misses: Sequence[ArmMiss]) -> str:
+    """The biggest offenders, named as the record spells them"""
+    return "; ".join(
+        f"{m.wo_id} turn {m.seq} in {m.project} (armed {m.arm}, {m.tokens:,} tokens "
+        f"at the other TTL)" for m in misses[:NAMED_TURNS])
+
+
+def arm_miss_alarms(misses: Sequence[ArmMiss], cfg: InspectConfig, *,
+                    days: int) -> list[Alarm]:
+    """The arm the OS believed it bought against the one the transcript paid"""
+    tokens = sum(m.tokens for m in misses)
+    if not misses or tokens < cfg.alarm_cache_arm_missed_tokens:
+        return []
+    hour = [m for m in misses if m.arm == "1h"]
+    five = [m for m in misses if m.arm == "5m"]
+    return [Alarm(CACHE_ARM_MISSED_ALARM, (
+        f"{tokens:,} cache-write tokens in the last {days} days were bought at a TTL "
+        f"the turn was NOT armed for, over {len(misses)} turns. "
+        f"{len(hour)} were stamped `wo_turns.cache_ttl` = 1h and wrote ephemeral_1h = 0: "
+        f"the arm NEVER REACHED THE CLI, so the stamp records the intent and nothing "
+        f"about the rate. {len(five)} were stamped 5m and wrote ephemeral_5m = 0, which "
+        f"bought the hour nobody asked for — about "
+        f"${_hour_premium_usd(sum(m.tokens for m in five)):,.2f} at Opus list above the "
+        f"five-minute write. EITHER WAY THIS IS A DEFECT IN THE OS, not in anyone's "
+        f"personal configuration: an env variable the OS sets has to OUTRANK every "
+        f"user-owned settings key for the same behaviour, so start at "
+        f"`claude_cli.CACHE_TTL_KEYS`, `dispatch.cache_ttl_env` and what the CLI ranks "
+        f"above them. Turns: {_name_turns(misses)}."))]

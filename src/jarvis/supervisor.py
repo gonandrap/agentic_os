@@ -49,6 +49,12 @@ must never write, so the only honest outcome is a work order asking a PERSON to 
 Never propose a remedy that has the OS edit a user's personal configuration, and never
 answer a `cache-1h-foreign` alarm as though the OS were at fault.
 
+`cache-arm-missed` is fleet-wide in the same way, and it is always the OS's own defect.
+It compares the arm a turn was STAMPED with against the TTL its calls paid: an arm the CLI
+never honoured bought the other rate, so `wo_turns.cache_ttl` records intent only. The
+cure is never the user's settings file — it is the OS setting a variable that OUTRANKS
+every user-owned key for the same behaviour.
+
 READ WHAT A TURN COST BEFORE YOU CALL IT EXPENSIVE. Every turn in the packet carries its
 API call count and the tokens and dollars it actually bought. A turn that made NO API call
 has spent nothing however long its wall clock is: it STALLED, and it is the work never
@@ -132,6 +138,10 @@ writes, the order under them carries only the foreign key, and the second of the
 reports a condition the OS cannot fix — the remedy is a line in a person's own
 `~/.claude/settings.json`, which Jarvis must never write. Never escalate a
 `cache-1h-foreign` alarm as an OS fault, and never propose a remedy that edits that file.
+`cache-arm-missed` is fleet-wide too and is always an OS fault: the arm a turn was STAMPED
+with is not the TTL its calls paid, so the stamp recorded intent only. Its cure is the OS
+setting a variable that OUTRANKS the user-owned key for the same behaviour, never a change
+to that file either.
 
 READ THE PACKET'S "this session is" LINE BEFORE YOU JUDGE THE NUMBERS. The alarm is
 always raised against a work order, but a work order is not always a worker: it may be a

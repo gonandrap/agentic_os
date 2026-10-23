@@ -16,7 +16,7 @@ ID_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 RESERVED_IDS = ("long-turn", "stalled-turn", "slow-model-response",
                 "long-join", "big-rewrite",
                 "rewrite-tax-prefix", "rewrite-tax-ttl",
-                "cache-1h-dispatched", "cache-1h-foreign",
+                "cache-1h-dispatched", "cache-1h-foreign", "cache-arm-missed",
                 "compaction-chained", "compaction-unproven")
 
 
