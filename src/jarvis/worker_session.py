@@ -565,9 +565,11 @@ def _launch_bg(store: ProjectStore, wo: dict[str, Any], prompt: str, cwd: Path,
         # A session that never wrote a word: retire it rather than leave two
         claude_cli.stop_session(wo["bg_id"])
     if launch is not None and launch.opens_by_template:
+        inject = session_dispatch.write_inject_dir(
+            launch.project_path / ".jarvis" / "inject" / wo["id"], briefing)
         entry = claude_cli.spawn_bg_open(
             launch.open_argv(prompt=claude_cli._bg_prompt(prompt, promptfile),
-                             briefing=briefing),
+                             briefing={**briefing, "inject_dir": inject}),
             cwd, env=launch.env())
         # The session manager chose the worktree; every later turn resumes inside it
         tree = entry.cwd or str(cwd)

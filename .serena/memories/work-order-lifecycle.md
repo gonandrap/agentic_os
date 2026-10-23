@@ -90,8 +90,12 @@ the filled template (`claude_cli.spawn_bg_open`, id off its `backgrounded · <id
 the roster `cwd` is stored as the order's `worktree` as an ABSOLUTE path (every
 `<project>/.claude/worktrees/<wt>` join collapses to it); later turns resume bare there.
 `{wo_name}` strips non-alnum (claude-shining rule). Measured live 2.1.309: the CALLER'S ENV
-DOES NOT REACH a `--bg` session, so a template session gets no worker settings (no
-JARVIS_WO_ID env, gates, Stop/PostToolUse hooks). Settle now `stop_bg`s (waits for the
+DOES NOT REACH a `--bg` session; worker settings reach it via `--inject {inject_dir}`:
+`session_dispatch.write_inject_dir` → `.jarvis/inject/<wo>/` (settings-fragment.json =
+worker settings, context.md = append_system_prompt, skills/, agents/), which claude-shining
+layers into the env's settings.local.json (objects merge, lists union, env scalars win;
+agentic-env branch gonzaloraposo-bc/injectSettingsMerge). Verified live: Jarvis env+hooks
+AND harness env+hooks all fire. Not carried: --agent, --effort, --permission-mode. Settle now `stop_bg`s (waits for the
 process): a bare `stop_session` let an immediate resume fork a copy (fact 8).
 
 ## The headless transport (replaced background sessions 2026-08-01; the fallback since 2026-10-22)

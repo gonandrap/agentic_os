@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ DEFAULT_CONTEXT_WINDOW = 1_000_000
 PLACEHOLDERS = frozenset({
     "prompt", "wo_name", "wo_id", "title", "project", "project_path", "model", "effort",
     "permission_mode", "compact_pct", "autocompact_window", "append_system_prompt",
-    "settings_file",
+    "settings_file", "inject_dir",
 })
 
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
@@ -135,6 +136,7 @@ class Launch:
             "autocompact_window": str(window or ""),
             "append_system_prompt": str(briefing.get("append_system_prompt") or ""),
             "settings_file": str(briefing.get("settings_file") or ""),
+            "inject_dir": str(briefing.get("inject_dir") or ""),
         }
         return [_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], part)
                 for part in self.launcher.open]
@@ -152,6 +154,25 @@ class Launch:
             "JARVIS_LAUNCH_PHASE": self.phase,
             "JARVIS_LAUNCH_TRANSPORT": self.transport,
         }
+
+
+def write_inject_dir(dest: Path, briefing: dict[str, Any]) -> Path:
+    """The order's briefing as a claude-shining `--inject` dir"""
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    settings = briefing.get("settings_file")
+    if settings:
+        shutil.copyfile(settings, dest / "settings-fragment.json")
+    prompt = briefing.get("append_system_prompt")
+    if prompt:
+        (dest / "context.md").write_text(prompt, encoding="utf-8")
+    for root in briefing.get("add_dirs") or []:
+        for leaf in ("skills", "agents"):
+            src = Path(root) / ".claude" / leaf
+            if src.is_dir():
+                shutil.copytree(src, dest / leaf, dirs_exist_ok=True)
+    return dest.resolve()
 
 
 def for_work_order(project: Any, wo: dict[str, Any], *, resume: bool,

@@ -473,3 +473,68 @@ def test_a_stale_banner_in_the_managers_output_never_binds_the_order(
 
     assert entry.session_id != old.session_id
     assert entry.cwd.endswith("wonew1")
+
+
+# -- {inject_dir}: Jarvis's own settings layered into the manager's env (claude-shining --inject)
+
+
+def test_inject_dir_is_a_known_placeholder():
+    got = session_dispatch.parse_launcher({"open": [*OPEN, "--inject", "{inject_dir}"]},
+                                          "where")
+    assert got.open[-1] == "{inject_dir}"
+
+
+def test_the_inject_dir_carries_the_workers_settings_prompt_and_assets(tmp_path):
+    settings = tmp_path / "worker-settings.json"
+    settings.write_text(json.dumps({"env": {"JARVIS_WO_ID": "wo-1"},
+                                    "hooks": {"Stop": [{"hooks": []}]}}))
+    skills_root = tmp_path / "agent-skills"
+    (skills_root / ".claude" / "skills" / "jarvis-x").mkdir(parents=True)
+    (skills_root / ".claude" / "skills" / "jarvis-x" / "SKILL.md").write_text("x")
+    crew_root = tmp_path / "agent-crew"
+    (crew_root / ".claude" / "agents").mkdir(parents=True)
+    (crew_root / ".claude" / "agents" / "jarvis-implementer.md").write_text("y")
+
+    out = session_dispatch.write_inject_dir(tmp_path / "inject" / "wo-1", {
+        "settings_file": settings, "append_system_prompt": "Ship through a PR.",
+        "add_dirs": [skills_root, crew_root]})
+
+    assert json.loads((out / "settings-fragment.json").read_text())["env"] == {
+        "JARVIS_WO_ID": "wo-1"}
+    assert (out / "context.md").read_text() == "Ship through a PR."
+    assert (out / "skills" / "jarvis-x" / "SKILL.md").read_text() == "x"
+    assert (out / "agents" / "jarvis-implementer.md").read_text() == "y"
+
+
+def test_a_rewritten_inject_dir_drops_what_the_briefing_no_longer_has(tmp_path):
+    settings = tmp_path / "s.json"
+    settings.write_text("{}")
+    dest = tmp_path / "inject" / "wo-1"
+    session_dispatch.write_inject_dir(dest, {"settings_file": settings,
+                                             "append_system_prompt": "old"})
+    session_dispatch.write_inject_dir(dest, {"settings_file": settings})
+    assert not (dest / "context.md").exists()
+
+
+def test_a_templated_order_hands_its_inject_dir_to_the_manager(
+        jarvis_home, fake_claude, catalog_file, project, wrapper, monkeypatch,
+        settle_turns):
+    data = json.loads(catalog_file.read_text())
+    data["os"]["defaults"]["transport"] = "background"
+    data["projects"][0].setdefault("worker", {})["launcher"] = {
+        "open": [str(wrapper.path), *OPEN[1:-1], "--inject", "{inject_dir}", OPEN[-1]]}
+    catalog_file.write_text(json.dumps(data))
+    monkeypatch.setattr(worker_session, "BG_DEAD_GRACE", 0.0)
+    ops.start_os(str(catalog_file), foreground=True)
+    proj, store = load_catalog(catalog_file).projects[0], ProjectStore(project)
+    wo = store.get_work_order(ops.create_work_order("proj_a", "task")["id"])
+
+    worker_session.start(store, proj, wo, "go")
+    assert settle_turns(store)
+
+    [call] = wrapper.calls
+    inject = Path(call["argv"][call["argv"].index("--inject") + 1])
+    assert inject.is_absolute()
+    fragment = json.loads((inject / "settings-fragment.json").read_text())
+    assert fragment["env"]["JARVIS_WO_ID"] == wo["id"]
+    assert (inject / "context.md").read_text()

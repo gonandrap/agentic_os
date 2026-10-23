@@ -124,7 +124,8 @@ that replaces the whole `claude --bg …` call for the session's FIRST turn:
   "transport": "background",
   "launcher": {
     "open": ["claude-jarvis", "start", "@jarvis", "--model", "{model}",
-             "--compact-pct", "{compact_pct}", "--prompt", "{prompt}", "{wo_name}"]
+             "--compact-pct", "{compact_pct}", "--inject", "{inject_dir}",
+             "--prompt", "{prompt}", "{wo_name}"]
   }
 }
 ```
@@ -135,6 +136,7 @@ that replaces the whole `claude --bg …` call for the session's FIRST turn:
 | `{wo_name}` | the work-order id with everything but letters and digits removed (`wo-61a28e47` → `wo61a28e47`); `claude-shining` refuses any other name |
 | `{wo_id}`, `{title}`, `{project}`, `{project_path}` | the order and its project |
 | `{model}`, `{effort}`, `{permission_mode}`, `{append_system_prompt}`, `{settings_file}` | the order's briefing |
+| `{inject_dir}` | the order's briefing as a claude-shining `--inject` dir (below) |
 | `{autocompact_window}` | the briefing's window in tokens |
 | `{compact_pct}` | that window as a percentage of `context_window` (default 1,000,000), clamped to 1–100; no window is `100` |
 
@@ -152,23 +154,45 @@ What the OS does with it (`claude_cli.spawn_bg_open`, from `worker_session._laun
 4. Every later turn is the ordinary bare `claude --bg --resume <sid> -- <msg>` inside that
    worktree. The manager is never called again.
 
-### What does not reach a template-opened session
+### Jarvis's settings reach the session through `--inject {inject_dir}`
 
 Measured live on CLI 2.1.309: **the caller's environment does not reach a `--bg`
-session.** The supervisor spawns it with its own environment. A probe exported a variable
-around `claude-jarvis start`, and the session's `echo` printed it empty. So:
+session.** The supervisor spawns it with its own environment, so `launcher.env` and
+`JARVIS_LAUNCH_*` reach the launcher process only. `claude-shining start` takes no
+`--settings` either and pins `--setting-sources project,local`. Jarvis's worker settings
+therefore have to be written INTO the env's `.claude/settings.local.json` before the
+session starts, which is what `claude-shining --inject <dir>` does.
 
-* `launcher.env` and `JARVIS_LAUNCH_*` reach the launcher process only, never the worker.
-* The worker settings file (`--settings`: `JARVIS_WO_ID` and the other worker env, the
-  PreToolUse gates, the Stop and PostToolUse hooks) cannot be passed, because
-  `claude-shining start` takes no `--settings` and pins `--setting-sources project,local`.
-  `{settings_file}` exists so a manager that grows such a flag can be handed the file.
+For a template open, `session_dispatch.write_inject_dir` rebuilds
+`<project>/.jarvis/inject/<wo-id>/` from the order's briefing, and `{inject_dir}` is its
+absolute path:
 
-What still works without it, verified live: the order's id reaches the worker in its
-prompt, so `jarvis wo finish <id>` works. The turn settles from the transcript, and the
-Stop hook was only ever a backup there. What does not work is privileged-action gates,
-mid-turn message delivery, and any hook or env-driven worker policy. Closing that gap is a
-change to the session manager: pass `--settings <file>` through to `claude`.
+| file | from | lands as |
+|---|---|---|
+| `settings-fragment.json` | the worker settings file (`env` with `JARVIS_WO_ID`, the PreToolUse/PostToolUse/Stop/SessionStart/... hooks, `permissions`, `includeGitInstructions: false`, `outputStyle`) | layered under the env's `settings.local.json` |
+| `context.md` | `append_system_prompt` (the git briefing and the project's standing instructions) | joined into the env's `--append-system-prompt` |
+| `skills/`, `agents/` | the `--add-dir` roots of `install_agent_assets` | copied into the env's `.claude/` |
+
+The layering rule lives in claude-shining (agentic-env `gonzaloraposo-bc/injectSettingsMerge`):
+objects merge, lists union, so BOTH sides' hooks and permission rules stand, and the env's
+own scalar wins any conflict (`defaultMode`, `autoCompactWindow`). Before that change the
+fragment contributed `permissions.allow` only and no `context.md` existed.
+
+Verified live (haiku, agentic_os worktree, the mapping above plus `--inject {inject_dir}`):
+
+| check, inside the native session | result |
+|---|---|
+| Jarvis env | `JARVIS_WO_ID` and `JARVIS_HOME` set |
+| harness env | `VITEST_MAX_WORKERS=3` kept |
+| harness hook | claude-shining's grep guard blocked a `grep -r` |
+| Jarvis hooks | `hook:SessionStart`, `hook:Stop`, `hook:SessionEnd` recorded on the order's timeline |
+| Jarvis system prompt | the `# Git` briefing present |
+| Jarvis assets | `jarvis-implementer`, `jarvis-spec-writer` agents and the OS skills present |
+
+Still not carried: `--agent` (a feature order's lead persona), `--effort`,
+`--permission-mode` (the env's autonomy decides) and `--max-budget-usd` (print-only
+anyway; poll enforces it). A skill both sides ship under the same name (`caveman`) is
+the injected copy.
 
 ### The resume race this exposed
 
