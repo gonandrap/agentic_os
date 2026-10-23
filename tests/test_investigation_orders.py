@@ -551,17 +551,40 @@ def _pretooluse_matcher(project, kind: str) -> str:
     return ours[0]["matcher"]
 
 
-def test_the_investigators_matcher_routes_every_mcp_call_to_the_hook(project, jarvis_home):
-    """The hook holds the allowlist; the matcher decides whether it ever runs (#852)"""
+def _cli_matches(matcher: str, tool: str) -> bool:
+    """Claude Code's own rule: a matcher of only [A-Za-z0-9_|] is a list of EXACT tool names"""
     import re as _re
 
+    if _re.fullmatch(r"[A-Za-z0-9_|]+", matcher):
+        return tool in matcher.split("|")
+    return _re.search(matcher, tool) is not None
+
+
+def test_the_investigators_matcher_routes_every_mcp_call_to_the_hook(project, jarvis_home):
+    """The hook holds the allowlist; the matcher decides whether it ever runs (#852)"""
     investigator = _pretooluse_matcher(project, "investigator")
     worker = _pretooluse_matcher(project, "worker")
     for tool in MCP_WRITES + MCP_READS:
-        assert _re.search(investigator, tool), tool
+        assert _cli_matches(investigator, tool), tool
     # The negative control: an ordinary worker still pays the hook on NO MCP write
     for tool in MCP_WRITES:
-        assert not _re.search(worker, tool), tool
+        assert not _cli_matches(worker, tool), tool
+
+
+def test_a_bare_mcp_prefix_alternative_would_have_matched_nothing():
+    """Why MCP_MATCHER carries `.*`: round 1 of this order shipped the bare prefix and failed open"""
+    assert not _cli_matches("Bash|Edit|mcp__", "mcp__serena__create_text_file")
+    assert _cli_matches(f"Bash|Edit|{dispatch.MCP_MATCHER}",
+                        "mcp__serena__create_text_file")
+
+
+def test_settings_with_no_jarvis_hook_entry_refuse_to_widen():
+    """A silent no-op here is a read-only guarantee with nowhere to run"""
+    settings = {"hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"command": "/some/other/hook"}]}]}}
+
+    with pytest.raises(RuntimeError, match="investigator cannot be dispatched"):
+        dispatch.widen_mcp_matcher(settings)
 
 
 def test_a_piped_read_still_runs():
