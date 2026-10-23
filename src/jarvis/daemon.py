@@ -113,6 +113,9 @@ RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injec
 
 #: Reconcile stamp an outside reader judges liveness by; spec 2026-10-16 §2a
 RECONCILE_TICK_KEY = "reconcile_tick"
+
+#: Holds the low-disk warning, so it is raised once and re-armed only on recovery (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §2)
+DISK_LOW_KEY = "disk_low_warned"
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s interval
 PR_POLL_EVERY_TICKS = 24
@@ -546,6 +549,8 @@ CACHE_1H_INBOX_TITLE = {
         "Jarvis's OWN turns are buying the one-hour cache write — a transport defect",
     inspection.CACHE_1H_FOREIGN_ALARM:
         "Hand-opened Claude sessions are buying the one-hour cache write",
+    inspection.CACHE_ARM_MISSED_ALARM:
+        "A cache-TTL arm is not reaching the CLI — stamped turns paid the other rate",
 }
 
 
@@ -641,6 +646,8 @@ class Daemon:
         self.validating: set[str] = set()
         # The validator seam (see `_validator`)
         self.validator: Validator | None = None
+        # Orders a reclaim sweep decided to keep: the next sweep spends no git call on them
+        self.worktrees_kept: set[str] = set()
         # Projects already warned that their pull requests cannot be polled (no `gh`
         self.pr_poll_warned: set[str] = set()
         self.issue_sync_warned: set[str] = set()
@@ -1002,6 +1009,8 @@ class Daemon:
                     # Immediately before the check that reads it
                     if sweep_landings:
                         self.refresh_landings(project, store)
+                    # After settlement, so an order completed on this tick starts its grace period here
+                    self.reclaim_worktrees(project, store)
                     # Last: check the state everything above just produced
                     self.check_invariants(project, store, sweep_landings=sweep_landings)
                     # AFTER the invariants, and the position is the whole argument... (docs/superpowers/specs/2026-09-27-self-evolution.md §5.1)
@@ -1040,6 +1049,12 @@ class Daemon:
             self.check_ui_health()
         except Exception:  # noqa: BLE001 — same rule
             log.exception("ui health check failed")
+        # AFTER the reclaim sweeps above, which are what the item would otherwise ask the user to do
+        if reconcile:
+            try:
+                self.check_disk_space()
+            except Exception:  # noqa: BLE001 — same rule
+                log.exception("disk space check failed")
 
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
@@ -1528,6 +1543,59 @@ class Daemon:
             log.exception("could not close backlog item %s", fo["backlog_id"])
 
     # -- 0. the dashboard
+
+    def reclaim_worktrees(self, project: ProjectSpec,
+                          store: ProjectStore) -> list[str]:
+        """Give back the disk the checkouts of settled orders hold (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §1)"""
+        from . import disk
+
+        try:
+            reclaimed, kept = disk.sweep(store, project, skip=self.worktrees_kept)
+        except Exception:  # noqa: BLE001 — housekeeping must never take the tick down
+            log.exception("[%s] worktree reclaim failed", project.name)
+            return []
+        self.worktrees_kept.update(kept)
+        if reclaimed:
+            log.info("[%s] reclaimed %d settled checkout%s: %s", project.name,
+                     len(reclaimed), "s" if len(reclaimed) != 1 else "",
+                     ", ".join(reclaimed))
+        return reclaimed
+
+    def check_disk_space(self) -> str:
+        """One inbox item when a volume holding OS state runs low (same spec, §2)"""
+        from . import disk
+
+        floor = self.catalog.os.disk_free_warn_gb
+        if floor <= 0:
+            return "off"
+        volumes = disk.state_volumes(self.catalog)
+        if not volumes:
+            return "unreadable"
+        worst = volumes[0]
+        warned = bool((self.central.get_state(DISK_LOW_KEY) or "").strip())
+        if worst.free_gb >= floor:
+            # Re-armed on RECOVERY, never on a clock: a standing shortage says nothing further
+            if warned:
+                self.central.set_state(DISK_LOW_KEY, "")
+            return "ok"
+        if warned:
+            return "warned"
+        self.central.set_state(DISK_LOW_KEY, f"{worst.free_bytes}")
+        log.warning("%.1f GB free on %s, under the %.1f GB floor", worst.free_gb,
+                    worst.path, floor)
+        self.central.add_inbox(
+            project="os", level="warning",
+            title=f"{worst.free_gb:.1f} GB free on {worst.path}",
+            body=(f"{worst.free_gb:.1f} GB of {worst.total_gb:.0f} GB left, under the "
+                  f"{floor:.1f} GB floor (`os.disk_free_warn_gb`). When it reaches zero "
+                  f"every SQLite write fails and each invariant reports itself as "
+                  f"`database or disk is full`.\n\n"
+                  f"The OS reclaims the checkout of a settled work order itself "
+                  f"({self.catalog.os.worktree.reclaim_after_hours}h after it settles); "
+                  f"what is left is the checkouts of open and failed orders, the logs "
+                  f"under {logs_dir()} and Claude Code's transcripts."),
+        )
+        return "low"
 
     def check_ui_log(self) -> int:
         """Raise an inbox item for dashboard errors nobody has been told about yet"""
@@ -4437,6 +4505,23 @@ class Daemon:
                 index.setdefault(session_id, []).append((started_at, ended_at, arm))
         return index
 
+    def _arm_rate_rows(self, since: float) -> list[tuple[str, str, int, str, float,
+                                                          int, int]]:
+        """Every project's stamped turns with the TTL split they actually paid (issue 1227)"""
+        rows: list[tuple[str, str, int, str, float, int, int]] = []
+        for project in self.catalog.projects:
+            if not project.path.is_dir():
+                continue
+            try:
+                found = self.store_for(project).turn_arm_rates(since)
+            except Exception:
+                log.exception("[%s] cache-TTL rates unreadable", project.name)
+                continue
+            for wo_id, seq, arm, started_at, cache_1h, cache_5m in found:
+                rows.append((project.name, wo_id, seq, arm, started_at,
+                             cache_1h, cache_5m))
+        return rows
+
     def check_cache_ttl(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Raise the fleet's remaining ONE-HOUR cache writes, split by who bought them (docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md)"""
         from .project_store import NO_TURN
@@ -4446,13 +4531,16 @@ class Daemon:
             return
         days = cfg.alarm_cache_1h_window_days
         since = db.now() - days * 86_400
+        found: list[inspection.HourWrites] = []
         try:
             found = inspection.one_hour_writes(since, arms=self._turn_arms(since))
         except OSError:  # a transcript tree that moved or is unreadable
             log.exception("[%s] the one-hour cache scan could not read transcripts",
                           project.name)
-            return
         raised = inspection.hour_alarms(found, cfg, days=days)
+        # Reads the RECORD, not the transcripts, so it holds when they do not read
+        raised += inspection.arm_miss_alarms(
+            inspection.arm_misses(self._arm_rate_rows(since)), cfg, days=days)
         if not raised:
             return
         carrier = store.latest_settled_order()

@@ -79,6 +79,13 @@ def _both_halves(transcripts, now, *, dispatched: int, foreign: int) -> None:
     ])
 
 
+def _hour_titles(daemon_mod) -> set[str]:
+    """The inbox titles of the 1h PAIR — the dict also carries the arm-miss kind"""
+    return {daemon_mod.CACHE_1H_INBOX_TITLE[k]
+            for k in (inspection.CACHE_1H_DISPATCHED_ALARM,
+                      inspection.CACHE_1H_FOREIGN_ALARM)}
+
+
 def _found(now, *, dispatched=0, foreign=0):
     """An `HourWrites` list without touching a disk — for the prose tests below"""
     return [inspection.HourWrites(session_id="s-mixed", directory="-somewhere",
@@ -193,7 +200,7 @@ def test_the_inbox_says_which_of_the_two_faults_it_is(started, store, transcript
 
     titles = {r["title"] for r in started.central.unacked_inbox()}
 
-    assert set(daemon_mod.CACHE_1H_INBOX_TITLE.values()) <= titles
+    assert _hour_titles(daemon_mod) <= titles
     assert len({t for t in titles if "one-hour cache" in t}) == 2
 
 
@@ -302,7 +309,7 @@ def test_the_real_loop_raises_these_on_the_offset_tick(started, store, transcrip
                                          inspection.CACHE_1H_FOREIGN_ALARM}
     assert all(r["wo_id"] == carrier["id"] for r in rows)
     titles = {r["title"] for r in started.central.unacked_inbox()}
-    assert set(daemon_mod.CACHE_1H_INBOX_TITLE.values()) <= titles
+    assert _hour_titles(daemon_mod) <= titles
 
 
 # -- 3. the arm the turn ran on (spec 2026-10-15-the-hour-on-worker-turns-only.md §5)
@@ -447,7 +454,8 @@ def test_each_alarm_family_owns_its_own_inbox_titles():
     from jarvis import daemon as daemon_mod
 
     assert set(daemon_mod.CACHE_1H_INBOX_TITLE) == {
-        inspection.CACHE_1H_DISPATCHED_ALARM, inspection.CACHE_1H_FOREIGN_ALARM}
+        inspection.CACHE_1H_DISPATCHED_ALARM, inspection.CACHE_1H_FOREIGN_ALARM,
+        inspection.CACHE_ARM_MISSED_ALARM}
     assert not (set(daemon_mod.CACHE_1H_INBOX_TITLE)
                 & set(daemon_mod.REWRITE_INBOX_TITLE))
 
@@ -468,6 +476,143 @@ def test_the_thresholds_are_settings_and_a_zero_is_refused_where_it_was_typed(tm
     assert cfg.alarm_cache_1h_window_days == 7, "the others still fall through"
 
     for key in ("alarm_cache_1h_window_days", "alarm_cache_1h_tokens",
-                "alarm_cache_1h_dispatched_tokens"):
+                "alarm_cache_1h_dispatched_tokens", "alarm_cache_arm_missed_tokens"):
         with pytest.raises(CatalogError, match=key):
             parse_catalog(_catalog(**{key: 0}))
+
+
+# -- 5. the stamp against the RATE (spec 2026-10-22-the-arm-that-did-not-apply.md)
+
+
+def _rows(*turns):
+    """`(project, wo_id, seq, arm, ts, cache_1h, cache_5m)`, the shape the daemon gathers"""
+    return [("proj_a", f"wo-{n}", n, arm, 1_789_000_000.0, hour, five)
+            for n, (arm, hour, five) in enumerate(turns, start=1)]
+
+
+def test_an_arm_that_did_not_apply_is_a_miss_in_both_directions():
+    """The 1h stamp that paid 5m is issue 1187; the mirror is the hour nobody asked for"""
+    misses = inspection.arm_misses(_rows(("1h", 0, 300_000), ("5m", 90_000, 0)))
+
+    assert [(m.arm, m.tokens) for m in misses] == [("1h", 300_000), ("5m", 90_000)]
+
+
+def test_an_arm_that_applied_and_an_arm_that_claims_nothing_are_not_misses():
+    """`cli` asks for no rate, so no rate can be withheld from it"""
+    assert inspection.arm_misses(_rows(
+        ("1h", 300_000, 0),        # the hour was armed and the hour was sold
+        ("5m", 0, 300_000),        # likewise, the control arm
+        ("cli", 0, 300_000), ("cli", 300_000, 0),
+        ("", 0, 300_000),          # a pre-column turn
+    )) == []
+
+
+def test_a_turn_whose_split_was_never_reported_is_not_evidence():
+    """kn-dbf6f779: only the ephemeral split says what was paid — silence says nothing"""
+    assert inspection.arm_misses(_rows(("1h", 0, 0), ("5m", 0, 0))) == []
+
+
+def test_the_missed_tokens_answer_to_their_own_threshold():
+    cfg = InspectConfig(alarm_cache_arm_missed_tokens=100_000)
+    under = inspection.arm_misses(_rows(("1h", 0, 99_999)))
+    over = inspection.arm_misses(_rows(("1h", 0, 60_000), ("5m", 40_000, 0)))
+
+    assert inspection.arm_miss_alarms(under, cfg, days=7) == []
+    assert [a.kind for a in inspection.arm_miss_alarms(over, cfg, days=7)] == \
+        [inspection.CACHE_ARM_MISSED_ALARM]
+
+
+def test_the_reason_names_both_sides_the_premium_and_the_turns():
+    misses = inspection.arm_misses(_rows(("1h", 0, 1_000_000), ("5m", 1_000_000, 0)))
+    (alarm,) = inspection.arm_miss_alarms(misses, InspectConfig(), days=7)
+
+    assert "2,000,000 cache-write tokens" in alarm.reason and "last 7 days" in alarm.reason
+    assert "ephemeral_1h = 0" in alarm.reason and "ephemeral_5m = 0" in alarm.reason
+    assert "$3.75" in alarm.reason, "the premium is charged on the 5m-armed half only"
+    assert "DEFECT IN THE OS" in alarm.reason
+    assert "wo-1 turn 1 in proj_a (armed 1h" in alarm.reason
+    assert "~/.claude/settings.json" not in alarm.reason, "never the user's own file"
+
+
+def _stamped_rate(store, *, arm: str, cache_1h: int, cache_5m: int) -> dict:
+    """A SETTLED turn stamped `arm` whose recorded usage says what it really paid"""
+    wo = store.create_work_order(f"armed {arm}", status="completed", session_id="s-rate")
+    turn = store.create_turn(wo["id"], kind="dispatch", prompt="go", cache_ttl=arm)
+    store.finish_turn(turn["id"], "done",
+                      usage_json=json.dumps({"usage_v": 9, "cache_1h": cache_1h,
+                                             "cache_5m": cache_5m}))
+    return wo
+
+
+def test_the_daemon_raises_it_off_the_record_with_no_transcript_at_all(
+        started, store, transcripts):
+    """THE WHOLE POINT: the 1h-armed session never mentions the 1h key, so only the record sees it"""
+    carrier = _stamped_rate(store, arm="1h", cache_1h=0, cache_5m=900_000)
+    project = started.catalog.projects[0]
+    project.inspect = InspectConfig()
+
+    started.check_cache_ttl(project, store)
+
+    rows = store.alarms_across()
+    assert [r["kind"] for r in rows] == [inspection.CACHE_ARM_MISSED_ALARM]
+    assert rows[0]["wo_id"] == carrier["id"] and rows[0]["seq"] == NO_TURN
+    assert rows[0]["source"] == "cost" and rows[0]["alarm_status"] == "raised"
+
+    from jarvis import daemon as daemon_mod
+
+    titles = {r["title"] for r in started.central.unacked_inbox()}
+    assert daemon_mod.CACHE_1H_INBOX_TITLE[inspection.CACHE_ARM_MISSED_ALARM] in titles
+
+
+def test_an_arm_that_applied_raises_nothing(started, store, transcripts):
+    """What this looks like when the transport is working"""
+    _stamped_rate(store, arm="1h", cache_1h=9_000_000, cache_5m=0)
+    project = started.catalog.projects[0]
+    project.inspect = InspectConfig()
+
+    started.check_cache_ttl(project, store)
+
+    assert store.alarms_across() == []
+
+
+def test_a_turn_outside_the_window_is_not_in_it(started, store, transcripts):
+    """The window is the same cohort the 1h pair uses"""
+    from jarvis import db
+
+    wo = _stamped_rate(store, arm="1h", cache_1h=0, cache_5m=900_000)
+    store.conn.execute("UPDATE wo_turns SET started_at=?", (db.now() - 60 * DAY,))
+    store.conn.commit()
+    project = started.catalog.projects[0]
+    project.inspect = InspectConfig()
+
+    started.check_cache_ttl(project, store)
+    assert store.alarms_across() == []
+
+    store.conn.execute("UPDATE wo_turns SET started_at=?", (db.now() - DAY,))
+    store.conn.commit()
+    started.check_cache_ttl(project, store)
+    assert [r["wo_id"] for r in store.alarms_across()] == [wo["id"]]
+
+
+def test_an_unreadable_transcript_tree_no_longer_hides_the_record_half(
+        started, store, transcripts, monkeypatch):
+    """The two halves have different sources, so one failing must not silence the other"""
+    _stamped_rate(store, arm="5m", cache_1h=900_000, cache_5m=0)
+    project = started.catalog.projects[0]
+    project.inspect = InspectConfig()
+    monkeypatch.setattr(inspection, "one_hour_writes",
+                        lambda *a, **kw: (_ for _ in ()).throw(OSError("gone")))
+
+    started.check_cache_ttl(project, store)
+
+    assert [r["kind"] for r in store.alarms_across()] == \
+        [inspection.CACHE_ARM_MISSED_ALARM]
+
+
+def test_the_supervisor_is_told_this_one_is_always_the_oss_own_defect(started):
+    """The judge must not answer it with a line in the user's settings file"""
+    from jarvis import supervisor
+
+    for prompt_text in (supervisor.SUPERVISOR_PERSONA,
+                        supervisor.ALARM_REVIEWER_PERSONA):
+        assert inspection.CACHE_ARM_MISSED_ALARM in prompt_text

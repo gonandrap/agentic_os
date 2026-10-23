@@ -425,6 +425,12 @@ ALARM_EVENT_KINDS = ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_a
 # HOW A WORK ORDER CAN BE LINKED TO A TRACKER ISSUE, weakest first
 ISSUE_LINK_KINDS = ("cited", "assigned", "raised")
 
+#: One reclaim of a settled order's checkout — also what `settled_worktrees` excludes on (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md)
+WORKTREE_RECLAIMED_EVENT = "worktree_reclaimed"
+
+#: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
+MAX_PER_SWEEP_ROWS = 50
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_orders (
     id TEXT PRIMARY KEY,
@@ -1742,6 +1748,21 @@ class ProjectStore:
             "SELECT * FROM work_orders WHERE session_id=?", (session_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def settled_worktrees(self, statuses: tuple[str, ...], settled_before: float,
+                          limit: int = MAX_PER_SWEEP_ROWS) -> list[dict[str, Any]]:
+        """Settled orders still holding an unreclaimed checkout, oldest settlement first (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md)"""
+        rows = self.conn.execute(
+            f"""SELECT * FROM work_orders
+                 WHERE status IN ({','.join('?' for _ in statuses)})
+                   AND worktree IS NOT NULL AND worktree != ''
+                   AND updated_at < ?
+                   AND NOT EXISTS (SELECT 1 FROM wo_events e
+                                   WHERE e.wo_id = work_orders.id AND e.kind = ?)
+                 ORDER BY updated_at LIMIT ?""",
+            (*statuses, settled_before, WORKTREE_RECLAIMED_EVENT, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
 
     def list_work_orders(
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,
@@ -3262,6 +3283,20 @@ class ProjectStore:
         return [(str(r["session_id"]), float(r["started_at"]),
                  float(r["ended_at"]) if r["ended_at"] is not None else float("inf"),
                  str(r["cache_ttl"])) for r in rows]
+
+    def turn_arm_rates(self, since: float) -> list[tuple[str, int, str, float,
+                                                          int, int]]:
+        """Each STAMPED turn with recorded usage, and the TTL split it paid (issue 1227)"""
+        rows = self.conn.execute(
+            """SELECT wo_id, seq, cache_ttl, started_at,
+                      COALESCE(json_extract(usage_json, '$.cache_1h'), 0) AS cache_1h,
+                      COALESCE(json_extract(usage_json, '$.cache_5m'), 0) AS cache_5m
+                 FROM wo_turns
+                WHERE cache_ttl != '' AND usage_json IS NOT NULL AND started_at >= ?""",
+            (since,)).fetchall()
+        return [(str(r["wo_id"]), int(r["seq"]), str(r["cache_ttl"]),
+                 float(r["started_at"]), int(r["cache_1h"] or 0),
+                 int(r["cache_5m"] or 0)) for r in rows]
 
     def recent_turns(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """The conversation's most recent turns, newest first"""
