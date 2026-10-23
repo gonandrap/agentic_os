@@ -453,3 +453,23 @@ def test_a_templated_order_opens_through_the_wrapper_and_resumes_bare(
     assert resume["argv"] == ["--bg", "--resume", sid, "--", "again"]
     assert Path(resume["cwd"]).resolve() == tree.resolve()
     assert store.latest_turn(wo["id"])["result"] == "final: again"
+
+
+def test_a_stale_banner_in_the_managers_output_never_binds_the_order(
+        fake_claude, wrapper, tmp_path):
+    old = claude_cli.spawn_bg_turn("old", tmp_path, "someone-else")
+    _wait_idle(old.session_id)
+    noisy = tmp_path / "bin" / "noisy"
+    noisy.write_text(f"#!/usr/bin/env bash\necho 'backgrounded · {old.id} · stale'\n"
+                     f"exec {wrapper.path} \"$@\"\n")
+    noisy.chmod(noisy.stat().st_mode | stat.S_IEXEC)
+    lch = session_dispatch.parse_launcher({"open": [str(noisy), *OPEN[1:]]}, "where")
+    launch = session_dispatch.Launch(launcher=lch, project="p", project_path=tmp_path,
+                                     wo_id="wo-new1", wo_kind="worker", phase="open",
+                                     transport="background")
+
+    entry = claude_cli.spawn_bg_open(launch.open_argv(prompt="go", briefing={}),
+                                     tmp_path, env=launch.env())
+
+    assert entry.session_id != old.session_id
+    assert entry.cwd.endswith("wonew1")

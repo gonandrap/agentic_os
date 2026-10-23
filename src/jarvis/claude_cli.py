@@ -482,7 +482,15 @@ def spawn_bg_turn(prompt: str, cwd: Path, name: str, worktree: str | None = None
 def spawn_bg_open(argv: list[str], cwd: Path, env: dict[str, str] | None = None,
                   timeout: int = 600) -> BgEntry:
     """Open a background session through a session manager's own command (docs/superpowers/specs/2026-10-22-session-dispatch.md)"""
-    short = _short_id(_run([], cwd=cwd, timeout=timeout, env_extra=env, argv=argv))
+    # Only a session that did not exist before the call may bind the order: a manager's output can quote others
+    before = {e.id for e in bg_roster().values()}
+    out = _run([], cwd=cwd, timeout=timeout, env_extra=env, argv=argv)
+    fresh = [m.group(1) for m in _BACKGROUNDED_RE.finditer(out or "")
+             if m.group(1) not in before]
+    if not fresh:
+        raise ClaudeCliError(f"`{Path(argv[0]).name}` reported no new background session: "
+                             f"{(out or '')[-300:]}")
+    short = fresh[-1]
     deadline = time.monotonic() + BG_LIST_WAIT_SECONDS
     while True:
         for entry in bg_roster().values():
