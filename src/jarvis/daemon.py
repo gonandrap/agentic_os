@@ -819,7 +819,9 @@ class Daemon:
         moved = config_version.diff(head["resolved"], resolved)
         if not moved:
             return None
-        shown = "; ".join(f"{c['path']} {c['old']!r} → {c['new']!r}" for c in moved[:5])
+        # Changed settings before the defaults this release added (issue 1235)
+        first = sorted(moved, key=lambda c: c.get("kind") == "added")
+        shown = "; ".join(f"{c['path']} {c['old']!r} → {c['new']!r}" for c in first[:5])
         more = f" (and {len(moved) - 5} more)" if len(moved) > 5 else ""
         row = self.central.add_config_version(
             head["document"], resolved, actor="release",

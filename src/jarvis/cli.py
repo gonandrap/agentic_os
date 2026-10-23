@@ -4622,7 +4622,10 @@ def _print_config_versions(rows: list[dict]) -> None:
         head = "●" if row.get("head") else " "
         reason = f" · {row['reason']}" if row["reason"] else ""
         print(f"{head} {row['id']}  {row['actor']} · {_age(row['ts'])} ago{reason}")
-        for change in row["changes"][:4]:
+        # A changed or removed setting before the defaults a release added: the one a
+        # reader must not miss is the one the truncation used to hide (issue 1235)
+        shown = sorted(row["changes"], key=lambda c: c.get("kind") == "added")
+        for change in shown[:4]:
             print(f"      {_cfg_change(change)}")
         if len(row["changes"]) > 4:
             print(f"      … and {len(row['changes']) - 4} more")
