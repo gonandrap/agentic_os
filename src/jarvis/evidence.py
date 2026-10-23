@@ -41,7 +41,7 @@ class EvidencePacket:
     children: tuple[dict, ...] = ()
     #: Every assumption the work order ever filed, `{n, content, status}`, review state included (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §4.)
     assumptions: tuple[dict, ...] = ()
-    #: A FEATURE's diff only: `"children"` when scoped to their paths, `"unscoped"` when no child merge commit is recorded
+    #: A FEATURE's diff: `"children"`, or `"unscoped"` with no child merge commit (issue #985)
     diff_scope: str = ""
     #: Where `diff`, `files` and `stat` came from: `"pull_request"` or `"worktree"`
     source: str = "worktree"
@@ -390,7 +390,7 @@ def collect_feature(project_path: Path, fo: dict[str, Any], children: list[dict[
     """Assemble the packet for one feature order, from the PROJECT ROOT"""
     base = str(fo.get("base_sha") or "")
     head = default_branch_head(project_path) if base else ""
-    # The range ends at the default branch, so unscoped it carries every SIBLING feature merged into the same base (issue 985)
+    # Unscoped, this range carries every SIBLING feature merged into the same base (issue #985)
     commits = _dedupe(str(c.get("merge_commit") or "") for c in children)
     paths = _commit_paths(project_path, commits)
     stat = diff = ""
@@ -487,7 +487,7 @@ def _diff_args(rev_range: str | None, *extra: str) -> tuple[str, ...]:
 
 
 def _commit_paths(repo: Path, commits: Iterable[str]) -> tuple[str, ...]:
-    """Every path these commits touched — both names of a rename, so a pathspec built from this matches the whole rename"""
+    """Every path these commits touched, both names of a rename so a pathspec matches it"""
     # `<sha>^1` is the default branch before the merge, for a squash commit and a merge commit alike
     return _dedupe(
         name
