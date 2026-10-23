@@ -6922,10 +6922,15 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
 
     def clear_settled_preconditions(self, project: ProjectSpec,
                                     store: ProjectStore) -> None:
-        """Clear every `bl-` precondition whose backlog item has settled (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)"""
+        """Clear every hold the OS can derive: a settled `bl-` item, deployed code (docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.2)"""
+        from . import preconditions
+
         for wo in store.list_work_orders(statuses=("pending",), include_hidden=True):
             for row in store.open_preconditions(wo["id"]):
                 ref = str(row["ref"])
+                if preconditions.deployed_target(ref):
+                    self.clear_deployed_precondition(project, store, wo, row)
+                    continue
                 if not ref.startswith("bl-"):
                     continue
                 item = self.central.get_backlog(ref)
@@ -6934,6 +6939,37 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
                 store.clear_precondition(int(row["id"]), by="os")
                 log.info("[%s] %s: precondition %s cleared (%s is %s)", project.name,
                          wo["id"], ref, ref, item["status"])
+
+    def clear_deployed_precondition(self, project: ProjectSpec, store: ProjectStore,
+                                    wo: dict[str, Any], row: dict[str, Any]) -> None:
+        """A `deployed:` hold clears when a release carrying that commit IS what production runs (docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.2)"""
+        from . import preconditions, release
+
+        # `overtaken_by` reads `jarvis-*` tags and the OS's own production checkout, as `_already_live` does
+        if project.name != self._os_project():
+            return
+        ref = str(row["ref"])
+        sha = self.deployed_hold_sha(project, store,
+                                     preconditions.deployed_target(ref))
+        if not sha:
+            return
+        found = release.overtaken_by(project.path, [sha])
+        if found.error or not (found.tag and found.live):
+            return
+        store.clear_precondition(int(row["id"]), by="os")
+        log.info("[%s] %s: precondition %s cleared (%s is in %s and production runs %s)",
+                 project.name, wo["id"], ref, sha[:8], found.tag, found.deployed)
+
+    def deployed_hold_sha(self, project: ProjectSpec, store: ProjectStore,
+                          target: str) -> str:
+        """The commit a `deployed:` hold waits for: a work order's merge commit, else the target"""
+        if not target.startswith("wo-"):
+            return target
+        try:
+            dep = store.get_work_order(target)
+        except KeyError:
+            return ""
+        return self._merge_commit_of(project, store, dep)
 
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red (docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5)"""
