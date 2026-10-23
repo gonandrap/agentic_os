@@ -35,8 +35,13 @@ PROMPT_CACHE_5M_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
 #: Buy the ONE-HOUR write instead, for the `worker.cache_ttl` arm that asks for it (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
 PROMPT_CACHE_1H_ENV_KEY = "ENABLE_PROMPT_CACHING_1H"
 
+#: The main-thread and subagent TTL the CLI reads ABOVE settings `promptCacheTtl`/`subagentPromptCacheTtl` (kn-ccbe6a0d, issue 1187)
+PROMPT_CACHE_TTL_ENV_KEYS = ("CLAUDE_CODE_PROMPT_CACHE_TTL",
+                             "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL")
+
 #: Every variable this decision OWNS
-CACHE_TTL_KEYS = (*PROMPT_CACHE_5M_ENV, PROMPT_CACHE_1H_ENV_KEY)
+CACHE_TTL_KEYS = (*PROMPT_CACHE_5M_ENV, PROMPT_CACHE_1H_ENV_KEY,
+                  *PROMPT_CACHE_TTL_ENV_KEYS)
 
 
 #: WHICH TRANSPORT this session's turns run on, declared rather than assumed (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)
