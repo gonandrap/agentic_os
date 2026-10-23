@@ -17,7 +17,7 @@ log = logging.getLogger("jarvis.disk")
 
 EVENT = WORKTREE_RECLAIMED_EVENT
 
-#: Statuses whose checkout is never resumed. `failed` is absent on purpose: `wo retry` resumes in place
+#: Statuses whose checkout is never resumed — not `failed`, which `wo retry` resumes in place
 RECLAIMABLE_STATUSES = ("completed", "cancelled")
 
 #: Removals one sweep performs for one project — each is a `git worktree remove` subprocess
