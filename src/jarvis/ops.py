@@ -67,6 +67,7 @@ from .worker_brief import MODEL_ATTRIBUTION_NAMES
 # `ops.IDLE_MANAGER_CAUSE` is an ALIAS: `stuck.IDLE_MANAGER_CAUSE` is the one definition of the cause... (#1008)
 from .stuck import IDLE_MANAGER_CAUSE  # noqa: F401
 from .project_store import (
+    ALARM_REVIEWABLE_STATUSES,
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     COUNTED_VALIDATION_OUTCOMES,
@@ -851,9 +852,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
             f"\"{stated}\" — and nothing holds it back, so jarvisd would claim and "
             f"dispatch it (wo-314221b5 cost 0.93 USD this way). Wire the hold: "
             f"`--depends-on <wo-id>` when another work order in this project must "
-            f"COMPLETE first, or `--blocked-by <bl-…|kn-…|io-…|#issue|text>` when it "
-            f"waits on something that is not a work order. The brief may keep the "
-            f"sentence either way."
+            f"COMPLETE first, `--blocked-by deployed:<wo-id|sha>` when it needs that "
+            f"work order's code RUNNING in production and not merely merged, or "
+            f"`--blocked-by <bl-…|kn-…|io-…|#issue|text>` when it waits on something "
+            f"that is not a work order. The brief may keep the sentence either way."
         )
     store = ProjectStore(paths[project_name])
     try:
@@ -4838,7 +4840,9 @@ def collect_feature_evidence(store: ProjectStore, project_path: Path,
     children = []
     for child in store.feature_children(fo["id"], kinds=WORKER_CHILDREN):
         last = store.latest_validation_round(wo_id=child["id"])
-        children.append({**child, "declared": str((last or {}).get("evidence") or "")})
+        # `merge_commit` is what scopes the feature's diff to its own children (issue 985)
+        children.append({**child, "declared": str((last or {}).get("evidence") or ""),
+                         "merge_commit": recorded_merge_commit(store, child)})
     return evidence_mod.collect_feature(project_path, fo, children, declared=declared,
                                         summary=summary, diff_chars=cfg.diff_chars,
                                         side_effects=feature_side_effects(store,
@@ -5965,7 +5969,7 @@ def unblock_work_order(wo_id: str, drop_all: bool = False,
         if not blockers and not rows:
             raise OpsError(f"{wo_id} is not blocked by anything")
         cut = blockers if drop_all else invariants.dead_dependencies(store, wo)
-        live, stranding = _split_preconditions(rows)
+        live, stranding = _split_preconditions(rows, store)
         clearable = stranding + (live if drop_all else [])
         if not cut and not clearable:
             raise OpsError(
@@ -5985,14 +5989,23 @@ def unblock_work_order(wo_id: str, drop_all: bool = False,
             "preconditions_cleared": cleared}
 
 
-def _split_preconditions(rows: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+def _split_preconditions(rows: list[dict[str, Any]],
+                         store: ProjectStore) -> tuple[list[str], list[str]]:
     """(live, stranding) refs — what the daemon can still clear, and what it never can"""
+    from . import preconditions
+
     live: list[str] = []
     stranding: list[str] = []
     central = CentralStore()
     try:
         for row in rows:
             ref = str(row["ref"])
+            target = preconditions.deployed_target(ref)
+            if target:
+                # docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.3
+                (live if _deployed_hold_is_live(store, target)
+                 else stranding).append(ref)
+                continue
             item = central.get_backlog(ref) if ref.startswith("bl-") else None
             # Unsettled, NOT just `open`: a `promoted` item is still one the daemon can clear later
             (live if item is not None
@@ -6001,6 +6014,17 @@ def _split_preconditions(rows: list[dict[str, Any]]) -> tuple[list[str], list[st
     finally:
         central.close()
     return live, stranding
+
+
+def _deployed_hold_is_live(store: ProjectStore, target: str) -> bool:
+    """Can the daemon still resolve this `deployed:` target to a commit it can test?"""
+    if not target.startswith("wo-"):
+        return True
+    try:
+        store.get_work_order(target)
+    except KeyError:
+        return False
+    return True
 
 
 def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -12364,7 +12388,8 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
         raise OpsError("a correction needs feedback — what should the supervisor "
                        "have decided?")
     name, path, row = _find_alarm(alarm_id, project_name)
-    if row["alarm_status"] not in ("acked", "escalated"):
+    # `failed` is reviewable because nothing re-queues it and it can hold a merge (#1063)
+    if row["alarm_status"] not in ALARM_REVIEWABLE_STATUSES:
         # A REFUSAL THAT DOES NOT SAY WHERE TO GO IS A BUG REPORT
         where = ""
         if row["alarm_status"] == "proposed":
@@ -12373,8 +12398,9 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
                      f"answer it with `jarvis gate approve {gate}` or "
                      f"`jarvis gate deny {gate} --reason \"…\"`")
         raise OpsError(f"alarm {alarm_id} is {row['alarm_status']}, and only an alarm "
-                       f"the supervisor has decided ('acked' or 'escalated') can be "
-                       f"reviewed{where}")
+                       f"the supervisor has decided or could not decide "
+                       f"({', '.join(repr(s) for s in ALARM_REVIEWABLE_STATUSES)}) can "
+                       f"be reviewed{where}")
     review = "approved" if approved else "corrected"
     store = ProjectStore(path)
     try:

@@ -795,12 +795,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "one is dispatched (same project only)")
     # §2.3 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md
     c.add_argument("--blocked-by", action="append", default=None, metavar="REF",
-                   help="something that is NOT a work order and must clear before this "
-                        "one is dispatched (`bl-…`, `kn-…`, `io-…`, `#123`, a URL, or "
-                        "the words for the wait). Repeatable. It becomes a row the claim "
-                        "SQL evaluates, so the order stays `pending` and costs no worker "
-                        "turn; the OS clears a `bl-` ref itself once the backlog item "
-                        "settles, and `jarvis wo unblock` clears the rest")
+                   help="something that is NOT a work order COMPLETING and must clear "
+                        "before this one is dispatched (`deployed:<wo-id|sha>`, `bl-…`, "
+                        "`kn-…`, `io-…`, `#123`, a URL, or the words for the wait). "
+                        "Repeatable. It becomes a row the claim SQL evaluates, so the "
+                        "order stays `pending` and costs no worker turn. The OS clears "
+                        "two kinds itself: a `bl-` ref once the backlog item settles, "
+                        "and a `deployed:` ref once a release carrying that commit is "
+                        "what production RUNS — which `--depends-on` can never say, "
+                        "since a dependency completes at merge. `jarvis wo unblock` "
+                        "clears the rest")
     c.add_argument("--parent", default="",
                    help="file it UNDER this feature order: it becomes one of the "
                         "feature's children, so the feature waits for it and shows it "

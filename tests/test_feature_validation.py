@@ -377,6 +377,55 @@ def test_the_base_is_recorded_at_release_and_bounds_the_diff(fleet):
         store.close()
 
 
+def test_the_diff_is_scoped_to_the_childrens_own_merge_commits(fleet):
+    """A sibling feature merged into the same base is not this feature's work (issue 985)"""
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one", "two")
+        children = store.feature_children(fo_id, kinds=("worker",))
+        mine = fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        store.add_event(children[0]["id"], "pr_merged", {"merge_commit": mine})
+        fleet.merge("fleetcost.py", "def fleetcost():\n    return 0\n")
+        fleet.land_children(fo_id, store)
+
+        packet = ops.collect_feature_evidence(
+            store, fleet.project, store.get_feature_order(fo_id),
+            declared="", summary="", cfg=fleet.daemon.catalog.os.validation)
+
+        assert packet.diff_scope == "children"
+        assert "exporter.py" in packet.files
+        assert "fleetcost.py" not in packet.files, "a sibling feature is in the packet"
+        assert "fleetcost" not in packet.diff
+        assert "def export" in packet.diff
+        assert "exporter.py" in packet.stat and "fleetcost.py" not in packet.stat
+        prompt = validation.build_packet_prompt(packet)
+        assert "SCOPED TO THIS FEATURE'S OWN CHILDREN" in prompt
+        assert mine in prompt, "the prompt does not say what scoped the diff"
+    finally:
+        store.close()
+
+
+def test_a_feature_with_no_recorded_merge_commit_declares_its_diff_unscoped(fleet):
+    """The fallback is today's range, said out loud rather than passed off as the feature"""
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.merge("fleetcost.py", "def fleetcost():\n    return 0\n")
+        fleet.land_children(fo_id, store)
+
+        packet = ops.collect_feature_evidence(
+            store, fleet.project, store.get_feature_order(fo_id),
+            declared="", summary="", cfg=fleet.daemon.catalog.os.validation)
+
+        assert packet.diff_scope == "unscoped"
+        assert {"exporter.py", "fleetcost.py"} <= set(packet.files)
+        assert "THE DIFF IS NOT SCOPED TO THIS FEATURE" in \
+            validation.build_packet_prompt(packet)
+    finally:
+        store.close()
+
+
 def test_a_feature_with_no_base_escalates_without_calling_the_panel(fleet):
     """A guessed base produces a confidently wrong diff"""
     validator = Validator(passed())

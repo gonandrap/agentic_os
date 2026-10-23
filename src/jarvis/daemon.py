@@ -5317,11 +5317,13 @@ class Daemon:
         # Spec 2026-09-28 §3.2
         base_behind = (automerge.BaseBehind(base=pr.base_ref, base_oid=pr.base_oid)
                        if ops.catch_up_needed(pr, repo=project.path) else None)
+        # #1063
+        drift = self._drift_hold(store, wo)
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
-            base_red=base_red, base_behind=base_behind)
+            drift=drift, base_red=base_red, base_behind=base_behind)
         if not decision.armed:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec... (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.5)
             outcome = CarryOutcome(False, False)
@@ -5334,7 +5336,8 @@ class Daemon:
                 decision = automerge.decide(
                     round_row, wo, pr, cfg,
                     validated_head=store.validated_head(round_row),
-                    pending_assumptions=pending, plan_assumptions=plan_assumptions)
+                    pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                    drift=drift)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
                 # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2
@@ -5366,7 +5369,7 @@ class Daemon:
                         round_row, wo, pr, cfg,
                         validated_head=store.validated_head(round_row),
                         pending_assumptions=pending, plan_assumptions=plan_assumptions,
-                        base_red=base_red)
+                        drift=drift, base_red=base_red)
                     # #1141: the moved head the base hold was hiding gets the carry too
                     if not decision.armed and decision.code == automerge.HELD_SHA_MOVED:
                         outcome = self._carry_catch_up(
@@ -5378,7 +5381,8 @@ class Daemon:
                                 round_row, wo, pr, cfg,
                                 validated_head=store.validated_head(round_row),
                                 pending_assumptions=pending,
-                                plan_assumptions=plan_assumptions, base_red=base_red)
+                                plan_assumptions=plan_assumptions, drift=drift,
+                                base_red=base_red)
                 else:
                     # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a base that has moved
                     moved = bool(caught.base_tip) and ops.catch_up_needed(
@@ -6283,6 +6287,25 @@ class Daemon:
             finally:
                 neo_store.close()
 
+    def _drift_hold(self, store: ProjectStore, wo: dict) -> Any:
+        """The open scope-drift finding this merge must not land over, or None (#1063)"""
+        from . import automerge
+        from .neo_store import NeoStore
+
+        alarm = automerge.open_drift_alarm(store.alarms_of(wo["id"]))
+        if alarm is None:
+            return None
+        question = None
+        # Only `escalated` has a question in flight; every other status reads off the row
+        if alarm["status"] == "escalated" and alarm["neo_question_id"]:
+            neo = NeoStore()
+            try:
+                question = neo.get(int(alarm["neo_question_id"]))
+            finally:
+                neo.close()
+        # A wedged one raises the flag through `invariants.true_blockers`, not from here
+        return automerge.drift_hold(alarm, question)
+
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:
         """Record ONCE, per (commit, reason), that the OS declined to merge (#263)"""
@@ -6877,10 +6900,15 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
 
     def clear_settled_preconditions(self, project: ProjectSpec,
                                     store: ProjectStore) -> None:
-        """Clear every `bl-` precondition whose backlog item has settled (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)"""
+        """Clear every hold the OS can derive: a settled `bl-` item, deployed code (docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.2)"""
+        from . import preconditions
+
         for wo in store.list_work_orders(statuses=("pending",), include_hidden=True):
             for row in store.open_preconditions(wo["id"]):
                 ref = str(row["ref"])
+                if preconditions.deployed_target(ref):
+                    self.clear_deployed_precondition(project, store, wo, row)
+                    continue
                 if not ref.startswith("bl-"):
                     continue
                 item = self.central.get_backlog(ref)
@@ -6889,6 +6917,37 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
                 store.clear_precondition(int(row["id"]), by="os")
                 log.info("[%s] %s: precondition %s cleared (%s is %s)", project.name,
                          wo["id"], ref, ref, item["status"])
+
+    def clear_deployed_precondition(self, project: ProjectSpec, store: ProjectStore,
+                                    wo: dict[str, Any], row: dict[str, Any]) -> None:
+        """A `deployed:` hold clears when a release carrying that commit IS what production runs (docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.2)"""
+        from . import preconditions, release
+
+        # `overtaken_by` reads `jarvis-*` tags and the OS's own production checkout, as `_already_live` does
+        if project.name != self._os_project():
+            return
+        ref = str(row["ref"])
+        sha = self.deployed_hold_sha(project, store,
+                                     preconditions.deployed_target(ref))
+        if not sha:
+            return
+        found = release.overtaken_by(project.path, [sha])
+        if found.error or not (found.tag and found.live):
+            return
+        store.clear_precondition(int(row["id"]), by="os")
+        log.info("[%s] %s: precondition %s cleared (%s is in %s and production runs %s)",
+                 project.name, wo["id"], ref, sha[:8], found.tag, found.deployed)
+
+    def deployed_hold_sha(self, project: ProjectSpec, store: ProjectStore,
+                          target: str) -> str:
+        """The commit a `deployed:` hold waits for: a work order's merge commit, else the target"""
+        if not target.startswith("wo-"):
+            return target
+        try:
+            dep = store.get_work_order(target)
+        except KeyError:
+            return ""
+        return self._merge_commit_of(project, store, dep)
 
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red (docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5)"""
