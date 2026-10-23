@@ -1765,8 +1765,7 @@ class CentralStore:
         salted = build if actor == "release" else None
         vid = config_version.version_id(document, build=salted)
         head = self.head_config_version()
-        # An edit that changes nothing is not a change — same document under the same
-        # build, already the head. Only THAT is dedup now (issue 1235)
+        # An edit that changes nothing: same document, same build, already head (1235)
         if (head is not None and head["schema_version"] == build
                 and config_version.canonicalise(head["document"])
                 == config_version.canonicalise(document)):
@@ -1774,8 +1773,7 @@ class CentralStore:
         ts = db.now()
         attempt = 0
         while self.get_config_version(vid) is not None:
-            # Repeat of an OLDER document is its own event; head never moves back onto
-            # that version's stale snapshot (issue 1235)
+            # A repeat of an OLDER document is its own event, and head never rewinds (1235)
             attempt += 1
             vid = config_version.version_id(document, build=salted,
                                             salt=f"{ts}#{attempt}")
