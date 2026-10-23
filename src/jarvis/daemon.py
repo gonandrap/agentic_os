@@ -5094,7 +5094,7 @@ class Daemon:
                      fix_wo_id, issue_url)
 
     def _base_red_outlived_grace(self, project: ProjectSpec) -> bool:
-        """Has the open red episode outlived `base_fix_grace_minutes`? Workers' own merge-heal often greens it first"""
+        """Has the open red episode outlived `base_fix_grace_minutes`?"""
         episodes = self.central.base_red_episodes(project.name)
         if not episodes or episodes[-1][1] is not None:
             return False  # no open episode yet: the transition tick records it
