@@ -9,5 +9,6 @@ tags: [concision, house style]
 
 - Worker rules: `jarvis brief concision`; house style: the `caveman` and `ponytail` skills.
 - Reviewers (validation seats, Neo's assumption review): `concision.REVIEW_SCOPE`, ponytail's scope rules.
-- CI: `scripts/trim_comments.py --check` fails on a comment or docstring past one line.
+- CI: `scripts/trim_comments.py --check` fails on a comment or docstring past one line, and also on a trailing period it would strip. It names each file as `OVERLONG <path>`.
+- A worker's `git push` is denied before that CI round when the check fails: `hooks.overlong_comment_decision`.
 - Enforcement: Serena `read_memory concision-enforcement`.

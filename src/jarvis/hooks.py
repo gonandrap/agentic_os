@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -174,6 +175,11 @@ PR_BODY_SECTIONS = ("Summary", "Implementation notes", "Questions asked to Neo",
                     # `morpheus.SECTION`: production validation is an OS function, for every project
                     "How to validate in production", "Screenshots")
 
+#: A repo shipping this checker has the one-line-comment rule in required CI (issue 1231)
+COMMENT_CHECKER = "scripts/trim_comments.py"
+#: Separated-value `git` options, whose value is not the subcommand
+_GIT_FLAGS_WITH_A_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+
 # GitHub renders neither of these, so neither can mislink or count as content
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 _CODE_SPAN = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
@@ -282,6 +288,76 @@ def pr_body_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, 
         + "The template and the rules for filling it are in your "
           "`open-a-pull-request` skill; this repository's copy, if it has one, is "
           "`.github/pull_request_template.md`."
+    )
+
+
+def pushes_a_branch(command: str) -> bool:
+    """Whether this command runs `git push` (issue 1231)"""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    starts_a_command = True
+    for i, word in enumerate(words):
+        if word in ("&&", "||", ";", "|"):
+            starts_a_command = True
+            continue
+        if starts_a_command and (word == "git" or word.endswith("/git")):
+            skip_value = False
+            for arg in words[i + 1:]:
+                if arg in ("&&", "||", ";", "|"):
+                    break
+                if skip_value:
+                    skip_value = False
+                    continue
+                if arg.startswith("-"):
+                    skip_value = arg in _GIT_FLAGS_WITH_A_VALUE
+                    continue
+                if arg == "push":
+                    return True
+                break
+        starts_a_command = False
+    return False
+
+
+def overlong_comments(cwd: str) -> tuple[list[str], int] | None:
+    """The repo's own one-line-comment checker over `cwd`: the files it names and its exit code"""
+    script = Path(cwd) / COMMENT_CHECKER
+    if not cwd or not script.is_file():
+        return None
+    try:
+        done = subprocess.run(
+            [sys.executable, str(script), "--check"],
+            cwd=cwd, capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    named = [line.split(" ", 1)[1] for line in done.stdout.splitlines() if line.startswith("OVERLONG ")]
+    return named, done.returncode
+
+
+def overlong_comment_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """Keep a push from spending a CI round on a rule the repository can check locally (issue 1231)"""
+    if not env.get("JARVIS_WO_ID"):
+        return None
+    command = (payload.get("tool_input") or {}).get("command", "")
+    if not pushes_a_branch(command):
+        return None
+    cwd = payload.get("cwd") or ""
+    result = overlong_comments(cwd)
+    if result is None:
+        return None
+    named, code = result
+    if code == 0:
+        return None
+    return _deny(
+        "This push would be red on CI: a comment or docstring in these files is not in the one-line "
+        "form the checker requires (over one line, or a trailing period it strips).\n"
+        + "".join(f"  - {p}\n" for p in named)
+        + f"Rewrite each one AS ONE LINE yourself, with no trailing period, keeping the pointer it "
+          f"carries. Do NOT run `{COMMENT_CHECKER}` without `--check` to fix it: it truncates the "
+          f"overflow to `...` and the half it deletes is usually the reference the comment existed "
+          f"for. Then `uv run python {COMMENT_CHECKER} --check` must report `0 file(s) would change`."
     )
 
 
@@ -1646,6 +1722,10 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         unreviewable = pr_body_decision(payload, env)
         if unreviewable is not None:
             return unreviewable
+        # Beside the PR gates, which is where the push that triggers CI belongs (issue 1231)
+        red = overlong_comment_decision(payload, env)
+        if red is not None:
+            return red
         # BEFORE the auto-allow below, which would otherwise wave every `jarvis …` through and make the cap...
         overlong = finish_summary_decision(payload, env)
         if overlong is not None:

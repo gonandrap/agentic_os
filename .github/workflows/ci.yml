@@ -88,7 +88,7 @@ jobs:
       - name: Comments and docstrings stay one line
         run: |
           python scripts/trim_comments.py --check || {
-            echo "::error::A comment or docstring runs past one line. Run 'uv run python scripts/trim_comments.py' and push the result."
+            echo "::error::A comment or docstring is not in one-line form — over one line, or a trailing period the checker strips. The 'OVERLONG <path>' lines above name the files; rewrite each comment as one line yourself rather than letting 'scripts/trim_comments.py' truncate it."
             exit 1
           }
       - run: pytest evals -q -n auto --timeout=60
