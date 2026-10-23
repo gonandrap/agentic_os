@@ -17,5 +17,6 @@ from jarvis.testing import (  # noqa: F401
     project,
     settle_turns,
     self_dispatch_on,
+    user_decides_findings,
     signin,
 )

@@ -536,6 +536,46 @@ about…". The remaining fields follow as labelled paragraphs.
 
 ### 5.5 Neo: rejections teach it, and nothing else is built
 
+> **Amended 2026-10-22: Neo now decides findings, and the steward decides their spend.**
+> The user ruled that a report must not wait on them finding by finding. The OS is meant
+> to be as autonomous as possible. The seam described below is now built, with two
+> departures from it. As built:
+>
+> * `ops.submit_findings` asks Neo ONE `kind='findings'` question per pending finding
+>   (`findings.build_finding_question`: that finding's argument, evidence and proposed
+>   orders, each brief clipped to 600 characters; the io's observation as context). It
+>   keeps the question id on the finding as `neo_question_id`. The io gets NO attention
+>   item while every finding is with Neo. `plan_question_id` stays NULL. A question the
+>   store refuses as too large leaves that finding to the user.
+> * Neo answers accept / reject / escalate and RATES the defect on the steward's §3.0
+>   scale (`findings.FINDINGS_REVIEWER_PERSONA`). `ops.apply_findings_verdict` applies it.
+>   - **Reject:** the finding is rejected `decided_by='neo'`. First departure: the seam
+>     said accept-only. A Neo rejection writes NO Neo learning, because Neo learning from
+>     its own ruling is a loop. Only the user's rejection teaches it.
+>   - **Accept with no proposed orders:** accepted outright. Nothing is spent, so nothing
+>     is the steward's to decide.
+>   - **Accept with orders:** second departure, the steward is in the loop. A
+>     Neo-accepted finding is no longer user-originated (steward A8 still holds for
+>     findings the USER accepts). It goes to `steward.gate` as origin kind `io_finding`,
+>     with Neo's severity, the evidence sources as evidence, and the io's evidence-ref
+>     count as recurrence. `allowed` files the orders stamped and budgeted. In `enforce`
+>     with `self_dispatch` on, `queue` accepts the diagnosis and HOLDS its orders
+>     (`orders_held`, drained by `ops.reoffer_io_finding`), and `drop` rejects it
+>     `decided_by='steward'`. Anything else (`ask`, `self_dispatch` off, an unreadable
+>     catalog) leaves the finding pending for the user, with Neo's reading and the
+>     steward's reason on it.
+>   - **Escalate, or Neo unreachable / refused:** the finding is the user's. The
+>     attention item is raised at that transition, and one inbox row goes out.
+> * The user can decide any finding at any time; doing so closes Neo's open question.
+>   `INV-NEO-ESCALATION-STALE` closes an escalated one the user decided since. A
+>   resubmission closes the old report's questions.
+> * The OS deciding writes a `findings_decided` event and the user a `findings_reviewed`
+>   one, so `steward.touched` (detector precision) never counts Neo as the user.
+> * `os.neo.review_findings` (default `true`) switches it off: every finding waits for
+>   the user, as before.
+>
+> The original text follows.
+
 A rejection adds a Neo learning (`NeoStore.add_learning`) carrying the user's feedback and
 the finding's root cause, scoped to the project — the same path
 `jarvis wo review --feedback` uses for a correction.

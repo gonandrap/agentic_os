@@ -1845,8 +1845,12 @@ def test_a_childs_link_carries_its_sections_anchor_and_that_id_exists(released_f
 
 
 @pytest.fixture()
-def improvement(client, project, improvement_order):
-    """An improvement order in `plan_review` with the shared findings report on it"""
+def improvement(client, project, improvement_order, user_decides_findings):
+    """An improvement order in `plan_review` with the shared findings report on it, the user's to decide"""
+    return _reported(client, project, improvement_order)
+
+
+def _reported(client, project, improvement_order):
     from jarvis.testing import a_report
 
     store = ProjectStore(project)
@@ -1904,6 +1908,24 @@ def test_an_accepted_finding_lists_the_orders_it_filed(improvement):
         # The status has to ride on the filed order's OWN row: an accepted finding that says what was...
         row = page[page.index(link):page.index(link) + 400]
         assert order["status"] in row
+
+
+def test_a_finding_with_neo_says_so_and_a_decided_one_shows_neos_reading(
+        client, project, improvement_order):
+    client, io, _ = _reported(client, project, improvement_order)
+
+    page = client.get(f"/io/proj_a/{io['id']}").text
+    assert "2 with Neo" in page and ">with Neo<" in page
+
+    report = io["report"]
+    q = {"id": report["findings"][0]["neo_question_id"], "project": "proj_a",
+         "wo_id": io["plan_wo_id"]}
+    ops.apply_findings_verdict(q, {"escalate": False, "approve": False,
+                                   "severity": "medium",
+                                   "reason": "the evidence shows no mechanism"})
+    page = client.get(f"/io/proj_a/{io['id']}").text
+    assert "rejected by neo" in page
+    assert "the evidence shows no mechanism" in page and "rated medium" in page
 
 
 def test_a_pending_finding_carries_both_decisions_and_a_required_reason(improvement):

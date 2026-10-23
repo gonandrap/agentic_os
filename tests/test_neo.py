@@ -784,7 +784,9 @@ def test_parse_verdict_tolerates_fences():
                  # And an answer that classifies no stakes classifies none
                  "stakes": "",
                  # And an answer that names no escalation cause names none: "" stores as NULL and renders "not...
-                 "cause": ""}
+                 "cause": "",
+                 # And a reply that rates no finding rates none
+                 "severity": ""}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True
 

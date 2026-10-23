@@ -27,8 +27,9 @@ BUG_PRIORITY_SEVERITY = {"low": "minor", "medium": "medium", "high": "major",
                          "critical": "critical", "blocker": "blocker"}
 
 #: Where OS-originated work comes from (§3.4)
+#: `io_finding` is a finding NEO accepted for the user; one the user accepts is theirs and never gated (A8)
 ORIGIN_KINDS = ("bug_agent", "investigation", "neo_rider", "red_main", "release",
-                "remedy", "panel", "morpheus", "worker_io")
+                "remedy", "panel", "morpheus", "worker_io", "io_finding")
 
 OUTCOMES = ("dispatch", "queue", "drop", "ask")
 
@@ -631,7 +632,7 @@ def _store_for(central: CentralStore, project: str) -> ProjectStore | None:
 # ---------------------------------------------------------------- the queue (#1181)
 
 #: Origin kinds whose `queue` the OS dispatches later on its own; the rest re-ask by themselves
-DRAINABLE = ("panel", "worker_io", "remedy", "neo_rider")
+DRAINABLE = ("panel", "worker_io", "remedy", "neo_rider", "io_finding")
 #: Origin kinds whose candidate is about the PARENT unit's code: moot once that is cancelled
 PARENT_BOUND = ("panel",)
 #: A queued decision older than this is not re-offered: the code it named has moved on
@@ -683,6 +684,12 @@ def _stale(central: CentralStore, row: Mapping[str, Any], store: ProjectStore | 
             return f"{parent} was cancelled, so its code never landed"
     held, key = _candidate_of(row), str(row["dedupe_key"] or "")
     alarm_id = str((held.get("payload") or {}).get("alarm_id") or "")
+    io_id = str((held.get("payload") or {}).get("io_id") or "")
+    if row["origin_kind"] == "io_finding" and io_id:
+        try:
+            store.get_feature_order(io_id)
+        except KeyError:
+            return f"{io_id} no longer exists"
     if row["origin_kind"] == "remedy" and alarm_id:
         try:
             status = store.get_alarm(alarm_id)["status"]

@@ -15,6 +15,11 @@ from jarvis.project_store import ProjectStore
 from jarvis.testing import a_finding, a_report, make_git_project
 
 
+@pytest.fixture(autouse=True)
+def _user_decides(user_decides_findings):
+    """This suite pins the USER's review; Neo deciding is tests/test_findings_neo.py"""
+
+
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
     ops.start_os(str(catalog_file), foreground=True)

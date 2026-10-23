@@ -183,8 +183,8 @@ most one extra filing, where the file-level bucket silently lost a defect.
 #### The queue drains (#1181)
 
 A `queue` of a kind the OS can dispatch later on its own — a panel follow-up, a
-worker's improvement order, an alarm-born `file_work_order` remedy or a Neo ledger
-cleanup (`neo_rider`) — keeps the whole candidate on its decision row
+worker's improvement order, an alarm-born `file_work_order` remedy, a Neo ledger
+cleanup (`neo_rider`) or the orders of a finding Neo accepted (`io_finding`) — keeps the whole candidate on its decision row
 (`candidate_json`: subject, severity, evidence, file, parent, the caller's payload, and
 every wording folded onto it) with `queue_state='waiting'`. Every ten minutes the daemon
 runs `steward.drain` (in `enforce`, never while the fleet is paused): severest then
@@ -382,7 +382,10 @@ Mark each ✅ or ❌ with a note.
 - **A7. Release orders count against the evolution ledger.** They are cheap ($124 in the
   window), and keeping them in keeps the accounting honest.
 - **A8. Accepted improvement-order findings are user-originated.** The user decided them
-  in `jarvis io review`, so the steward does not gate them.
+  in `jarvis io review`, so the steward does not gate them. *Amended 2026-10-22:* a
+  finding NEO accepts is not user-originated. Its proposed orders are gated as origin
+  kind `io_finding`, with Neo's severity rating, and a `queue` of one drains like the
+  other drainable kinds (improvement-orders spec §5.5, as amended).
 - **A9. The steward is deterministic code, a sibling of Neo rather than a Neo persona.**
   Severity rating stays with the cheap model at the point of detection (Haiku, per U6).
 - **A10. A precision auto-throttle replaces model judgement of "fabricated".** The signal

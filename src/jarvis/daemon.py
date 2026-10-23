@@ -2980,6 +2980,10 @@ class Daemon:
         """Neo's retries are spent"""
         from . import invariants
 
+        if q.get("kind") == "findings":
+            # The analyst behind it has settled: the finding, on its io, is what the user decides
+            self._findings_question_unanswered(q, f"Neo could not be reached: {detail}")
+            return
         head = q["question"].strip().splitlines()[0][:200]
         central.add_inbox(
             project=q["project"], level="warning",
@@ -3088,6 +3092,9 @@ class Daemon:
                     self._deliver_gate_verdict(central, pstore, q, verdict)
                 elif q.get("kind") == "plan":
                     self._deliver_plan_verdict(central, store, pstore, q, verdict)
+                elif q.get("kind") == "findings":
+                    # Owns its escalation too: the finding, not a worker, is what waits
+                    self._deliver_findings_verdict(q, verdict)
                 elif q.get("kind") == "alarm":
                     # ABOVE the escalate branch, because this kind owns both outcomes
                     self._deliver_alarm_verdict(central, pstore, q, verdict)
@@ -3125,7 +3132,7 @@ class Daemon:
                     invariants.end_wait_if_nothing_is_out(pstore, q["wo_id"])
                 # `alarm` joins the two exclusions for a reason of its own: a cleanup work order dispatched off a...
                 if pstore and q.get("kind") not in ("approval", "plan", "alarm",
-                                                    "assumption"):
+                                                    "assumption", "findings"):
                     self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
                 if pstore:
@@ -3133,6 +3140,9 @@ class Daemon:
 
         def refused(q: dict, error: claude_cli.PromptTooLargeError) -> None:
             """The OS built a prompt past its own ceiling (spec §4)"""
+            if q.get("kind") == "findings":
+                self._findings_question_unanswered(q, f"its prompt was too large: {error}")
+                return
             ppath = paths.get(q["project"])
             if not (ppath and ppath.is_dir() and q.get("wo_id")):
                 # A `triage` question has no work order behind it, so there is nothing to flag (#240)
@@ -3265,6 +3275,28 @@ class Daemon:
                      q["wo_id"], decision.outcome, decision.reason)
             return
         ops.file_neo_cleanup(pstore, rider, decision)
+
+    def _deliver_findings_verdict(self, q: dict, verdict: dict) -> None:
+        """Apply Neo's ruling on one improvement-order finding; the steward decides its spend"""
+        from . import ops
+
+        try:
+            out = ops.apply_findings_verdict(q, verdict)
+        except ops.OpsError:
+            log.exception("neo's verdict on findings question %s could not be applied",
+                          q["id"])
+            return
+        log.info("findings question %s: %s", q["id"],
+                 out.get("reason") or out.get("status") or "applied")
+
+    def _findings_question_unanswered(self, q: dict, detail: str) -> None:
+        """Neo made no decision on a finding, so the finding is the user's"""
+        from . import ops
+
+        try:
+            ops.findings_question_unanswered(q, detail)
+        except ops.OpsError:
+            log.exception("findings question %s: could not hand it to the user", q["id"])
 
     def _deliver_plan_verdict(self, central: CentralStore, neo_store: Any,
                               pstore: ProjectStore | None, q: dict,

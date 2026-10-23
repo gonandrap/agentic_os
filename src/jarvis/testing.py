@@ -1153,6 +1153,21 @@ elif "-p" in argv and "--resume" not in argv:
             verdict = {"escalate": True, "verdict": "deny", "stakes": "routine",
                        "reason": "test default: assumption reviews escalate unless "
                                  "forced"}
+    elif "Would the user accept it?" in prompt:
+        # One improvement-order finding (`findings.build_finding_question`). Escalates by
+        # default for the plan review's reason; FORCE_FINDING_ACCEPT_<SEVERITY> rates it.
+        rated = next((s for s in ("blocker", "critical", "major", "medium", "minor",
+                                  "cosmetic")
+                      if f"FORCE_FINDING_ACCEPT_{s.upper()}" in prompt), "")
+        if rated:
+            verdict = {"escalate": False, "verdict": "accept", "severity": rated,
+                       "reason": f"test-forced acceptance, rated {rated}"}
+        elif "FORCE_FINDING_REJECT" in prompt:
+            verdict = {"escalate": False, "verdict": "reject", "severity": "medium",
+                       "reason": "test-forced: the evidence does not show the mechanism"}
+        else:
+            verdict = {"escalate": True, "verdict": "", "severity": "medium",
+                       "reason": "test default: findings escalate unless forced"}
     elif "Release this plan?" in prompt:
         # A feature order's plan review — the third question kind, and the third verdict
         # shape. Same defaulting rule as the gate above and for the same reason: a fake
@@ -2946,3 +2961,11 @@ def self_dispatch_on(monkeypatch):
 
     monkeypatch.setattr(catalog_mod, "_parse_autonomy", _autonomy)
     monkeypatch.setattr(catalog_mod, "_parse_fleet_health", _fleet_health)
+
+
+@pytest.fixture()
+def user_decides_findings(monkeypatch):
+    """Leave every findings report to the user, as before Neo decided them (`os.neo.review_findings`)"""
+    from . import ops
+
+    monkeypatch.setattr(ops, "findings_reviewed_by_neo", lambda: False)

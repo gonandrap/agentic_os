@@ -1006,6 +1006,8 @@ class NeoConfig:
     digest_model: str = "haiku"
     #: How much of a question the digest model is shown, clipped and LABELLED (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     digest_max_question_chars: int = DEFAULT_DIGEST_MAX_QUESTION_CHARS
+    #: Neo decides each improvement-order finding for the user; the steward decides what it files
+    review_findings: bool = True
     panel: PanelConfig = field(default_factory=PanelConfig)
 
 
@@ -2065,6 +2067,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         timeout=int(neo_raw.get("timeout", 300)),
         digest_model=str(neo_raw.get("digest_model", "haiku")),
         digest_max_question_chars=_digest_max_question_chars_or_err(neo_raw),
+        review_findings=bool(neo_raw.get("review_findings", True)),
         panel=_parse_panel(neo_raw.get("panel", {})),
     )
 
