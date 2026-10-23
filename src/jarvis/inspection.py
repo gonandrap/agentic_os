@@ -1473,14 +1473,13 @@ class ArmMiss:
 
 def arm_misses(rows: Iterable[tuple[str, str, int, str, float, int, int]],
                ) -> list[ArmMiss]:
-    """Every stamped turn that paid the OTHER TTL, biggest first — `(project, wo_id, seq, arm, ts, cache_1h, cache_5m)` in"""
+    """Every stamped turn that paid the OTHER TTL, biggest first"""
     misses: list[ArmMiss] = []
     for project, wo_id, seq, arm, ts, cache_1h, cache_5m in rows:
         if arm not in CHECKED_ARMS:
             continue
         paid, other = (cache_1h, cache_5m) if arm == "1h" else (cache_5m, cache_1h)
-        # Only the SPLIT is evidence (kn-dbf6f779): with neither side reported the CLI
-        # said nothing about the rate, and a turn that wrote no cache paid nothing
+        # Only the SPLIT is evidence (kn-dbf6f779): neither side reported says nothing
         if paid or not other:
             continue
         misses.append(ArmMiss(project=project, wo_id=wo_id, seq=seq, arm=arm,

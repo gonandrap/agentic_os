@@ -3257,7 +3257,7 @@ class ProjectStore:
 
     def turn_arm_rates(self, since: float) -> list[tuple[str, int, str, float,
                                                           int, int]]:
-        """`(wo_id, seq, cache_ttl, started_at, cache_1h, cache_5m)` per STAMPED turn whose usage is recorded (issue 1227)"""
+        """Each STAMPED turn with recorded usage, and the TTL split it paid (issue 1227)"""
         rows = self.conn.execute(
             """SELECT wo_id, seq, cache_ttl, started_at,
                       COALESCE(json_extract(usage_json, '$.cache_1h'), 0) AS cache_1h,
