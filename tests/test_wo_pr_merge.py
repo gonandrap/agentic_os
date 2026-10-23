@@ -1204,12 +1204,15 @@ def test_a_held_request_starts_blocking_the_moment_the_case_is_made(
 BRANCH = "worktree-wo-pushed"
 
 
+HEAD_SHA = "c" * 40
+
+
 def pr_pending(store, wo_id: str, *, compare_url: str = "",
-               branch: str = BRANCH) -> None:
+               branch: str = BRANCH, head_sha: str = HEAD_SHA) -> None:
     store.add_event(wo_id, "pr_pending",
                     {"branch": branch, "base": "origin/main", "commits": 2,
                      "dirty": [], "pushed": True, "compare_url": compare_url,
-                     "was": "running"})
+                     "head_sha": head_sha, "was": "running"})
     store.set_status(wo_id, "needs_review")
 
 
@@ -1345,7 +1348,8 @@ def test_cli_wo_pr_records_it(started, project, pushed, capsys):
 def test_the_poll_attaches_an_open_pull_request_found_on_the_parked_branch(
         started, project, fake_gh, pushed):
     """§9"""
-    fake_gh.set_open_pr(BRANCH, PR)
+    fake_gh.set_open_pr(BRANCH, {"url": PR, "isCrossRepository": False,
+                                 "headRefOid": HEAD_SHA})
     store = ProjectStore(project)
 
     started.attach_pull_requests(started.catalog.project("proj_a"), store)
@@ -1356,6 +1360,32 @@ def test_the_poll_attaches_an_open_pull_request_found_on_the_parked_branch(
     assert ops.routes_on_pull_request(store, row) is True
     assert json.loads(store.events_of_kind(pushed["id"], "pr_url_recorded")[-1]
                       ["payload"])["source"] == "auto"
+
+
+def test_the_poll_never_attaches_a_fork_pull_request_on_the_same_branch_name(
+        started, project, fake_gh, pushed):
+    fake_gh.set_open_pr(BRANCH, {"url": PR, "isCrossRepository": True,
+                                 "headRefOid": HEAD_SHA})
+    store = ProjectStore(project)
+
+    started.attach_pull_requests(started.catalog.project("proj_a"), store)
+
+    assert not store.get_work_order(pushed["id"])["pr_url"]
+    assert store.pr_pending_open(pushed["id"]) is not None
+
+
+def test_a_park_with_no_recorded_sha_is_never_auto_attached(started, project, fake_gh):
+    wo = ops.create_work_order("proj_a", "add feature X")
+    store = ProjectStore(project)
+    store.add_event(wo["id"], "finished", {"summary": "pushed the branch"})
+    pr_pending(store, wo["id"], head_sha="")
+    fake_gh.set_open_pr(BRANCH, {"url": PR, "isCrossRepository": False,
+                                 "headRefOid": HEAD_SHA})
+
+    started.attach_pull_requests(started.catalog.project("proj_a"), store)
+
+    assert not store.get_work_order(wo["id"])["pr_url"]
+    assert fake_gh.calls == []
 
 
 def test_no_open_pull_request_on_the_branch_changes_nothing(started, project, fake_gh,

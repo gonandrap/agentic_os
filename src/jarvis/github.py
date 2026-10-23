@@ -330,12 +330,14 @@ def ls_remote(cwd: Path | None = None, remote: str = "origin") -> dict[str, str]
     return heads
 
 
-def open_pull_request_for_branch(branch: str, cwd: Path | None = None) -> str:
+def open_pull_request_for_branch(branch: str, cwd: Path | None = None, *,
+                                 head_sha: str = "") -> str:
     """The OPEN pull request on `branch`, or "" when there is none (docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md)"""
     if not BRANCH_RE.match(branch or ""):
         raise GitHubError(f"{branch!r} is not a branch this may ask about",
                           GitHubError.URL_REFUSED)
-    stdout = _run(["pr", "list", "--head", branch, "--state", "open", "--json", "url"],
+    fields = "url,isCrossRepository,headRefOid" if head_sha else "url"
+    stdout = _run(["pr", "list", "--head", branch, "--state", "open", "--json", fields],
                   url=branch, cwd=cwd,
                   missing_hint="so Jarvis cannot confirm a planner's pull request")
     try:
@@ -346,6 +348,13 @@ def open_pull_request_for_branch(branch: str, cwd: Path | None = None) -> str:
     if not isinstance(payload, list):
         raise GitHubError(f"`gh pr list {branch}` returned no array ({payload!r})",
                           GitHubError.UNREADABLE)
+    if head_sha:
+        # `--head` matches a fork's branch of the same name too
+        payload = [row for row in payload if isinstance(row, dict)
+                   and row.get("isCrossRepository") is False
+                   and row.get("headRefOid") == head_sha]
+        if len(payload) != 1:
+            return ""
     if not payload:
         return ""
     first = payload[0] if isinstance(payload[0], dict) else {}

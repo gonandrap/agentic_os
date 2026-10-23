@@ -58,6 +58,8 @@ class Authored:
     pushed: bool = False
     #: Where the user would open the pull request; "" is not a failure
     compare_url: str = ""
+    #: The SHA `origin/<branch>` carried when read; "" unless pushed
+    head_sha: str = ""
 
     @property
     def produced(self) -> bool:
@@ -68,7 +70,7 @@ class Authored:
         """This, as an event payload (#232)"""
         return {"branch": self.branch, "base": self.base, "commits": self.commits,
                 "dirty": list(self.dirty), "pushed": self.pushed,
-                "compare_url": self.compare_url}
+                "compare_url": self.compare_url, "head_sha": self.head_sha}
 
     def describe(self) -> str:
         """One clause naming what exists, for the refusal that quotes it"""
@@ -101,7 +103,8 @@ def authored_in(payload: dict[str, object]) -> Authored | None:
                     commits=count if isinstance(count, int) else 0,
                     dirty=tuple(str(f) for f in dirty) if isinstance(dirty, list) else (),
                     pushed=bool(payload.get("pushed")),
-                    compare_url=str(payload.get("compare_url") or ""))
+                    compare_url=str(payload.get("compare_url") or ""),
+                    head_sha=str(payload.get("head_sha") or ""))
 
 
 def latest_authorship(events: list[tuple[float, dict[str, object]]]) -> Authored | None:
@@ -138,22 +141,25 @@ def authored(worktree: Path | None, artifacts: tuple[str, ...] = ()) -> Authored
     dirty = tuple(line[3:] for line in status.splitlines()
                   if line[3:] and line[3:] not in artifacts)
     branch = branch.strip()
-    pushed = not dirty and _pushed(worktree, branch)
+    head_sha = _pushed(worktree, branch) if not dirty else ""
+    pushed = bool(head_sha)
     return Authored(branch=branch, base=base,
                     commits=int(count.strip()) if count.strip().isdigit() else 0,
                     dirty=dirty, pushed=pushed,
-                    compare_url=_compare_url(worktree, base, branch) if pushed else "")
+                    compare_url=_compare_url(worktree, base, branch) if pushed else "",
+                    head_sha=head_sha)
 
 
-def _pushed(worktree: Path, branch: str) -> bool:
-    """Does the local `origin/<branch>` ref carry every commit HEAD has? Never the network (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §1)"""
+def _pushed(worktree: Path, branch: str) -> str:
+    """The local `origin/<branch>` SHA if it carries every commit HEAD has, else ""; never the network (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §1)"""
     if not branch or branch == "HEAD":
-        return False
+        return ""
     remote = f"refs/remotes/origin/{branch}"
-    if not (_git(worktree, "rev-parse", "--verify", "--quiet", remote) or "").strip():
-        return False
+    sha = (_git(worktree, "rev-parse", "--verify", "--quiet", remote) or "").strip()
+    if not sha:
+        return ""
     ahead = _git(worktree, "rev-list", "--count", f"{remote}..HEAD")
-    return ahead is not None and ahead.strip() == "0"
+    return sha if ahead is not None and ahead.strip() == "0" else ""
 
 
 def _compare_url(worktree: Path, base: str, branch: str) -> str:

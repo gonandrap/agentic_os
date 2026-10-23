@@ -5362,10 +5362,12 @@ class Daemon:
             return
         for wo, park in parked:
             branch = str(park.get("branch") or "")
-            if not branch:
+            head_sha = str(park.get("head_sha") or "")
+            if not branch or not head_sha:
                 continue
             try:
-                url = github.open_pull_request_for_branch(branch, cwd=project.path)
+                url = github.open_pull_request_for_branch(branch, cwd=project.path,
+                                                          head_sha=head_sha)
             except github.GitHubError as e:
                 log.debug("[%s] could not look for %s's pull request: %s", project.name,
                           wo["id"], e)

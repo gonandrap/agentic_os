@@ -151,6 +151,26 @@ def test_a_branch_whose_every_commit_is_on_the_remote_is_pushed(repo):
     assert work.pushed is True
 
 
+def test_a_pushed_branch_records_the_sha_the_remote_carries(repo):
+    """The auto-attach matches a pull request's head against this SHA"""
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+
+    work = landing.authored(wt)
+
+    assert work.head_sha == _git(wt, "rev-parse", f"refs/remotes/origin/worktree-{WO}").strip()
+    assert work.record()["head_sha"] == work.head_sha
+    assert landing.authored_in(work.record()).head_sha == work.head_sha
+
+
+def test_an_unpushed_branch_records_no_sha(repo):
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+
+    assert landing.authored(wt).head_sha == ""
+
+
 def test_a_remote_behind_the_branch_is_not_pushed(repo):
     """One commit made after the push. The remote does NOT carry every commit HEAD has."""
     wt = repo.worktree(WO)

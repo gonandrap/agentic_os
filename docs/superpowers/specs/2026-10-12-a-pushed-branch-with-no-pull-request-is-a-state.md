@@ -364,6 +364,19 @@ Degrades silently: `GhUnavailable` and `GitHubError` are logged and the step ret
 exactly as `poll_pull_requests` treats them. The manual `jarvis wo pr` route is unaffected,
 and a read-only `gh` can still run `pr list`.
 
+#### 9.1 Only our own branch, at the SHA we pushed (added 2026-10-23)
+
+`gh pr list --head <branch>` matches by branch NAME, so a pull request from a fork whose
+branch happens to share the name would match too. Attaching it would put someone else's
+code in the merge queue under this order. The auto-attach therefore:
+
+1. records `head_sha`, the SHA `refs/remotes/origin/<branch>` carried at park time, on the
+   `pr_pending` payload (via `landing.Authored`);
+2. asks `gh` for `url,isCrossRepository,headRefOid` and keeps only rows with
+   `isCrossRepository == false` and `headRefOid == head_sha`;
+3. attaches only when exactly one row survives, and never attaches a park that recorded no
+   `head_sha`. `jarvis wo pr` stays the manual route for those cases.
+
 ### 10. `pr_url` never holds a compare URL
 
 Four readers treat that column as a real pull request: `Daemon.poll_pull_requests`

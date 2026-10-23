@@ -6,3 +6,4 @@
 4. **`plan_submit` stays a non-declaring source.** Main added `pr_url_recorded {source: "plan_submit"}` after the fix. `DECLARING_SOURCES` stays `("user", "auto")`, so planner-recorded URLs keep not routing the merge queue.
 5. **Main's artifact filter on `dirty` is kept.** `landing.authored` now ignores a kind's own artifact files. `pushed` is computed after that filter.
 6. **CLAUDE.md gets one crib-sheet line** for `jarvis wo pr`, not the long block the original commit added, because main's crib sheet is one line per command now.
+7. **The auto-attach is pinned to our own branch and SHA.** An automated security review noted that `gh pr list --head` also matches fork pull requests with the same branch name. The daemon now attaches only a same-repository pull request whose head equals the SHA recorded at park time, and only when exactly one matches. Parks written before this change carry no SHA, so they are never auto-attached; `jarvis wo pr` still works for them.
