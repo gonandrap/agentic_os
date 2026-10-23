@@ -373,6 +373,13 @@ def never_offered(finding: dict[str, Any]) -> bool:
             and not finding.get("neo_unasked"))
 
 
+def reaskable(finding: dict[str, Any]) -> bool:
+    """A pending finding the user may put (back) to Neo: not with Neo, and not one Neo accepted"""
+    verdict = (finding.get("neo_verdict") or {}).get("verdict")
+    return ((finding.get("status") or "pending") == "pending"
+            and not with_neo(finding) and verdict != "accept")
+
+
 def review_headline(io: dict[str, Any], report: dict[str, Any]) -> str:
     """The counts-first line the attention reason uses (§6.2)"""
     findings = report.get("findings") or []

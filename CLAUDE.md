@@ -59,6 +59,7 @@ jarvis fo resume <id> [--fix "what still needs doing"]  # a FAILED feature back 
 jarvis io create <project> "title" -d "<what you saw>" --ref <id|#n|url> ...  # "io" = improvement order: root cause, not a patch
 jarvis io list [project] [--all] / show <id>    # counts first, then each finding
 jarvis io review <id> [--accept <key>] [--reject <key>] [--feedback "why"] [--accept-all]   # only what Neo escalated
+jarvis io ask-neo <id>                     # put findings awaiting you (back) to Neo
 jarvis io cancel <id>                      # filed orders from accepted findings stay
 jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settles itself; a GAP files an issue, dispatches nothing
 jarvis investigate list / show <inv-id> / cancel <inv-id>
