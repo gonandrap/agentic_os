@@ -252,6 +252,9 @@ class PoolProbe:
         # Routed requests in flight, keyed by a counter: a monotonic start time and a label
         self._inflight: dict[int, tuple[float, str]] = {}
         self._inflight_seq = 0
+        # Registered requests that came back: a wedge is nothing being SERVED, not one slow page (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+        self.served = 0
+        self._served_seen = 0
         self.probe_failure_reason = ""
         # Resolved once, here: `jarvis_version` shells out to git on its first call
         try:
@@ -281,8 +284,10 @@ class PoolProbe:
         self._inflight[key] = (time.monotonic(), f"{method} {path}")
         return key
 
-    def end(self, key: int) -> None:
+    def end(self, key: int, served: bool = True) -> None:
         self._inflight.pop(key, None)
+        if served:
+            self.served += 1
 
     def oldest_inflight(self) -> tuple[float, str] | None:
         """Age in seconds and label of the longest-running routed request, or None"""
@@ -330,7 +335,11 @@ class PoolProbe:
         except TimeoutError:
             return self._fail("pool_timeout", cfg)
         oldest = self.oldest_inflight()
-        if oldest is not None and oldest[0] > cfg.probe_timeout_seconds:
+        # A dashboard still serving other routed requests is slow, not wedged (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+        progressed = self.served != self._served_seen
+        self._served_seen = self.served
+        if (oldest is not None and oldest[0] > cfg.probe_timeout_seconds
+                and not progressed):
             return self._fail("inflight_stall", cfg)
         self.last_ok = time.time()
         self.consecutive_failures = 0
@@ -419,7 +428,7 @@ class LoopWatchdog:
         self._stop.set()
 
 
-def _cost_payloads(picked: dict, project: str, method: str = "TASK") -> dict:
+def _cost_payloads(picked: dict, project: str) -> dict:
     """The three /cost payloads for one resolved window (docs/superpowers/specs/2026-10-22-cost-tab-precompute.md)"""
     report = ops.cost_report(project=project or None, window=picked)
     # The distribution is a SECTION of this page
@@ -431,12 +440,19 @@ def _cost_payloads(picked: dict, project: str, method: str = "TASK") -> dict:
     try:
         meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
     except Exception as e:                              # noqa: BLE001
-        uilog.record_error(method, "cost/meter", e)
+        uilog.record_error("TASK", "cost/meter", e)
         meter = None
     return {"report": report, "fleet": fleet, "meter": meter}
 
 
 REFRESH_SECONDS = 60
+
+#: How long a request waits for an on-demand compute before it renders `computing.html`
+WAIT_SECONDS = 5
+
+#: On-demand entries kept, and computes allowed to run at once
+MAX_ON_DEMAND = 8
+MAX_COMPUTING = 4
 
 
 class CostCache:
@@ -444,6 +460,11 @@ class CostCache:
 
     def __init__(self) -> None:
         self.entries: dict[str, dict] = {}
+        # The windows no refresh covers — a scope, an offset, a custom range (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+        self.on_demand: dict[tuple, dict] = {}
+        self.computing: dict[tuple, threading.Event] = {}
+        self.failures: dict[tuple, str] = {}
+        self._lock = threading.Lock()
 
     def compute(self, name: str) -> dict:
         picked = ops.cost_window(window=name)
@@ -454,6 +475,65 @@ class CostCache:
         if entry is None or ((entry["window"]["since"], entry["window"]["until"])
                              != (picked["since"], picked["until"])):
             return None
+        return entry
+
+    @staticmethod
+    def key(picked: dict, project: str) -> tuple:
+        """The bounds and the scope: the only inputs the payloads depend on"""
+        return (project, picked["since"], picked["until"])
+
+    def _compute_on_demand(self, key: tuple, picked: dict, project: str) -> None:
+        try:
+            entry = {"window": picked, **_cost_payloads(picked, project),
+                     "computed_at": time.time()}
+        except Exception as e:                          # noqa: BLE001
+            uilog.record_error("TASK", "cost/on-demand", e)
+            with self._lock:
+                # The last good entry is left where it is (kn-40db1828)
+                self.failures[key] = f"{type(e).__name__}: {e}"
+        else:
+            with self._lock:
+                self.failures.pop(key, None)
+                self.on_demand[key] = entry
+                while len(self.on_demand) > MAX_ON_DEMAND:
+                    self.on_demand.pop(next(iter(self.on_demand)))
+        finally:
+            with self._lock:
+                event = self.computing.pop(key, None)
+            if event is not None:
+                event.set()
+
+    def start(self, key: tuple, picked: dict, project: str) -> threading.Event | None:
+        """The compute for one window, in its own thread; None when too many run already"""
+        with self._lock:
+            running = self.computing.get(key)
+            if running is not None:
+                return running
+            if len(self.computing) >= MAX_COMPUTING:
+                return None
+            event = self.computing[key] = threading.Event()
+        # A plain thread, NOT the anyio pool: it must not borrow the token a page needs
+        threading.Thread(target=self._compute_on_demand, args=(key, picked, project),
+                         name="jarvis-ui-cost", daemon=True).start()
+        return event
+
+    def serve(self, picked: dict, project: str) -> dict | None:
+        """One window's payloads, or None while they are still being computed"""
+        key = self.key(picked, project)
+        entry = self.on_demand.get(key)
+        if entry is not None and time.time() - entry["computed_at"] < REFRESH_SECONDS:
+            return entry
+        event = self.start(key, picked, project)
+        if entry is not None:
+            # Stale, and served as it is: the page already says how old it is
+            return entry
+        if event is not None:
+            event.wait(WAIT_SECONDS)
+        entry = self.on_demand.get(key)
+        if entry is None and self.failures.get(key):
+            raise ops.OpsError(f"the cost report for {picked['label']} could not be "
+                               f"computed — {self.failures[key]}. The traceback is in "
+                               f"{uilog.ui_log_path()}.")
         return entry
 
     async def refresh(self) -> None:
@@ -995,14 +1075,18 @@ def create_app() -> FastAPI:
         # Runs on the event loop, before `call_next` queues a sync handler onto the pool: the one place a...
         key = (probe.begin(request.method, request.url.path)
                if request.url.path != "/healthz" and _routed(request) else None)
+        # A cancellation is a BaseException, so a client that gave up never counts as served (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+        served = False
         try:
             try:
                 response = await call_next(request)
             except Exception:
                 # The handler above renders the page
+                served = True
                 uilog.record_access(request.method, _rel_url(request), 500,
                                     (time.perf_counter() - t0) * 1000)
                 raise
+            served = True
             if response.status_code >= 400 or not _quiet(request.url.path):
                 uilog.record_access(request.method, _rel_url(request),
                                     response.status_code,
@@ -1011,7 +1095,7 @@ def create_app() -> FastAPI:
         finally:
             # A 500 and a cancellation both clean up (spec §1)
             if key is not None:
-                probe.end(key)
+                probe.end(key, served=served)
 
     # -- pages
 
@@ -1389,13 +1473,17 @@ def create_app() -> FastAPI:
                     and (not tz or tz == ops.cost_zone(None, None))):
                 entry = cost_cache.lookup(picked)
             if entry is not None:
-                picked, payloads = entry["window"], entry
+                picked = entry["window"]
             else:
-                payloads = _cost_payloads(picked, project, request.method)
+                # Never on the request path (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+                entry = cost_cache.serve(picked, project)
+                if entry is None:
+                    return render(request, "computing.html", active="cost",
+                                  window=picked)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
-        report, fleet, meter = payloads["report"], payloads["fleet"], payloads["meter"]
-        cached_at = entry["computed_at"] if entry is not None else None
+        report, fleet, meter = entry["report"], entry["fleet"], entry["meter"]
+        cached_at = entry["computed_at"]
         # Its own variable and never read out of `fleet`: losing the section must not lose the window the...
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
