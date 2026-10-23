@@ -197,9 +197,10 @@ AUTOMERGE_DENIED_BLOCKER = ("the automatic merge of the commit the panel accepte
 
 #: THE BASE OUTRAN THE CATCH-UP (#1173, kn-d37ef253): the OS has retired the chase and asks
 CATCH_UP_EXHAUSTED_BLOCKER = ("the base moved under the commit the panel accepted and the "
-                              "OS has caught this branch up as often as it may, so "
-                              "nothing will land this pull request by itself — merge it "
-                              "by hand, or `jarvis wo send` the worker to rebase")
+                              "OS has caught this branch up as often as it may in one "
+                              "window, so nothing will land this pull request until that "
+                              "window clears — merge it by hand, or `jarvis wo send` the "
+                              "worker to rebase")
 
 #: THE HEAD MOVED OFF THE JUDGED COMMIT AND NO CARRY COULD BE PROVEN ONTO IT (#1188)
 CARRY_UNPROVEN_BLOCKER = ("the head of this pull request is not the commit the panel "

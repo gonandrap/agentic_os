@@ -5409,6 +5409,9 @@ BASE_UPDATE_BASE_RED = "base_red"
 
 #: How many times the OS may catch one pull request up with a MOVING base
 CATCH_UP_MAX = 3
+#: ...WITHIN THIS WINDOW: a RATE, not a lifetime budget (#1215, Neo 2191) — three green
+#: catch-ups on a busy main used to retire the chase for ever on a mergeable branch
+CATCH_UP_WINDOW_SECONDS = 2 * 3600
 
 #: A merge the OS refused because the base moved under the judged commit — spec 2026-09-28 §3.1
 MERGE_BASE_STALE_EVENT = "automerge_base_stale"
@@ -5583,14 +5586,15 @@ def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: 
                      "reason": reason, "cause": cause})
 
 
-def catch_up_attempts(store: ProjectStore, wo_id: str) -> int:
-    """How often the OS has already caught this pull request up with a moving base"""
+def catch_up_attempts(store: ProjectStore, wo_id: str, *, now: float = 0.0) -> int:
+    """How often the OS has caught this pull request up within `CATCH_UP_WINDOW_SECONDS`"""
     from . import invariants as invariants_mod
 
+    since = (now or db.now()) - CATCH_UP_WINDOW_SECONDS
     n = 0
     for row in store.events_of_kind(wo_id, invariants_mod.PR_BASE_UPDATED_EVENT):
         payload = db.from_json(row.get("payload"), {}) or {}
-        if payload.get("cause") == BASE_UPDATE_BEHIND:
+        if payload.get("cause") == BASE_UPDATE_BEHIND and float(row["ts"] or 0.0) >= since:
             n += 1
     return n
 

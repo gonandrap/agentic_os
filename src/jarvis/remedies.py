@@ -557,9 +557,10 @@ def _can_update_branch(pstore: Any, subject: dict[str, Any],
     attempts = ops.catch_up_attempts(pstore, wo_id)
     if attempts >= ops.CATCH_UP_MAX:
         return (f"the OS has already caught {wo_id} up with its base "
-                f"{ops.CATCH_UP_MAX} times, which is the bound `ops.CATCH_UP_MAX` sets — "
-                f"a base moving faster than this one is caught up is a person's problem, "
-                f"not another merge")
+                f"{ops.CATCH_UP_MAX} times inside one "
+                f"`ops.CATCH_UP_WINDOW_SECONDS` window, which is the bound "
+                f"`ops.CATCH_UP_MAX` sets — a base moving faster than this one is caught "
+                f"up is a person's problem, not another merge")
     return ""
 
 
@@ -582,9 +583,9 @@ def _apply_update_branch(pstore: Any, central: Any, project: str,
     if attempts >= ops.CATCH_UP_MAX:
         raise RemedyRefused(
             f"the OS has already caught {wo_id} up with its base "
-            f"{ops.CATCH_UP_MAX} times, which is the bound `ops.CATCH_UP_MAX` sets — "
-            f"a base moving faster than this one is caught up is a person's problem, "
-            f"not another merge")
+            f"{ops.CATCH_UP_MAX} times inside one `ops.CATCH_UP_WINDOW_SECONDS` window, "
+            f"which is the bound `ops.CATCH_UP_MAX` sets — a base moving faster than "
+            f"this one is caught up is a person's problem, not another merge")
     path = Path(str(pstore.project_path))
     try:
         fresh = github.pr_view(pr_url, cwd=path)

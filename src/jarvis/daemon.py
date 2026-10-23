@@ -6098,11 +6098,14 @@ class Daemon:
                                f"this branch has already been rebuilt against "
                                f"{base_oid[:10]} once", base_tip=base_oid)
         if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
-            log.debug("[%s] %s has been caught up with %s %d times — leaving it held",
-                      project.name, wo_id, base, ops.CATCH_UP_MAX)
+            hours = ops.CATCH_UP_WINDOW_SECONDS // 3600
+            log.debug("[%s] %s has been caught up with %s %d times in %dh — leaving it "
+                      "held", project.name, wo_id, base, ops.CATCH_UP_MAX, hours)
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
-                               f"it has already been caught up {ops.CATCH_UP_MAX} time(s),"
-                               f" which is the cap ({ops.CATCH_UP_MAX})",
+                               f"it has already been caught up {ops.CATCH_UP_MAX} time(s)"
+                               f" in the last {hours}h, which is the cap "
+                               f"({ops.CATCH_UP_MAX}) — the OS chases it again once that "
+                               f"window clears",
                                base_tip=base_oid)
 
         # GUARD 6, and it is `heal_inherited_failure`'s review-round-1 note: `pr` was read at the top of the...
