@@ -1034,6 +1034,11 @@ def test_the_refusal_templates_render_verbatim():
         assert key in remedies.ATTENTION_TEMPLATES and key in choices
 
 
+def test_the_pushed_branch_blocker_is_not_a_template_key():
+    """§6 of docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is- a-state.md, PINNED rather than remembered"""
+    assert "pr_pending" not in remedies.ATTENTION_TEMPLATES
+
+
 def test_attention_slots_interpolate_validated_ids_only(monkeypatch):
     """V1 DECLARES NO SLOTS — every template above is `slots=()`"""
     from jarvis import invariants

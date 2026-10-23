@@ -36,6 +36,7 @@ from .project_store import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
     OPEN_STATUSES,
+    PR_PENDING_EVENT,
     RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
@@ -972,6 +973,8 @@ class Daemon:
                     # BETWEEN the two, spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §2
                     self.dispatch_base_fix(project, store)
                     self.poll_pull_requests(project, store)
+                    # AFTER the poll: a pushed-branch park has no `pr_url` for it to read (2026-10-12 spec §9)
+                    self.attach_pull_requests(project, store)
                     # AFTER the poll, in the same tick: a merge that just completed a work order is what closes its... (#240)
                     self.sync_issues(project, store)
                     # Beside it, on the same cadence and for the same reason: the tracker is the surface a person scans...
@@ -5340,6 +5343,44 @@ class Daemon:
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
+
+    def attach_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Record the open pull request the user made for a pushed-branch park; routes as `auto` (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §9)"""
+        from . import github, ops
+
+        # One bulk statement per step, `poll_pull_requests`' shape
+        candidates = [wo for wo in store.list_work_orders(statuses=("needs_review",),
+                                                          include_hidden=True)
+                      if not wo.get("pr_url")]
+        if not candidates:
+            return
+        ever = store.work_orders_with_event(PR_PENDING_EVENT,
+                                            [wo["id"] for wo in candidates])
+        parked = [(wo, park) for wo in candidates if wo["id"] in ever
+                  and (park := store.pr_pending_open(wo["id"])) is not None]
+        if not parked:
+            return
+        for wo, park in parked:
+            branch = str(park.get("branch") or "")
+            if not branch:
+                continue
+            try:
+                url = github.open_pull_request_for_branch(branch, cwd=project.path)
+            except github.GitHubError as e:
+                log.debug("[%s] could not look for %s's pull request: %s", project.name,
+                          wo["id"], e)
+                return
+            if not url:
+                continue
+            try:
+                ops.record_pull_request(wo["id"], url, project_name=project.name,
+                                        source="auto")
+            except ops.OpsError:
+                log.exception("[%s] could not attach %s to %s", project.name, url,
+                              wo["id"])
+                continue
+            log.info("[%s] attached %s to %s — found open on %s", project.name, url,
+                     wo["id"], branch)
 
     def refresh_landings(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what became of the pull request each COMPLETED order recorded"""

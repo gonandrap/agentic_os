@@ -54,6 +54,10 @@ class Authored:
     dirty: tuple[str, ...] = ()
     #: Why there is no answer, when there is none
     unreadable: str = ""
+    #: Remote carries every commit HEAD has, nothing uncommitted (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §1)
+    pushed: bool = False
+    #: Where the user would open the pull request; "" is not a failure
+    compare_url: str = ""
 
     @property
     def produced(self) -> bool:
@@ -63,7 +67,8 @@ class Authored:
     def record(self) -> dict[str, object]:
         """This, as an event payload (#232)"""
         return {"branch": self.branch, "base": self.base, "commits": self.commits,
-                "dirty": list(self.dirty)}
+                "dirty": list(self.dirty), "pushed": self.pushed,
+                "compare_url": self.compare_url}
 
     def describe(self) -> str:
         """One clause naming what exists, for the refusal that quotes it"""
@@ -90,10 +95,13 @@ def authored_in(payload: dict[str, object]) -> Authored | None:
         return None
     dirty = payload.get("dirty")
     count = payload.get("commits")
+    # A pre-2026-10-12 payload reads as not pushed: the safe direction
     return Authored(branch=str(payload.get("branch") or ""),
                     base=str(payload.get("base") or ""),
                     commits=count if isinstance(count, int) else 0,
-                    dirty=tuple(str(f) for f in dirty) if isinstance(dirty, list) else ())
+                    dirty=tuple(str(f) for f in dirty) if isinstance(dirty, list) else (),
+                    pushed=bool(payload.get("pushed")),
+                    compare_url=str(payload.get("compare_url") or ""))
 
 
 def latest_authorship(events: list[tuple[float, dict[str, object]]]) -> Authored | None:
@@ -129,9 +137,30 @@ def authored(worktree: Path | None, artifacts: tuple[str, ...] = ()) -> Authored
         return Authored(unreadable="git could not read the worktree")
     dirty = tuple(line[3:] for line in status.splitlines()
                   if line[3:] and line[3:] not in artifacts)
-    return Authored(branch=branch.strip(), base=base,
+    branch = branch.strip()
+    pushed = not dirty and _pushed(worktree, branch)
+    return Authored(branch=branch, base=base,
                     commits=int(count.strip()) if count.strip().isdigit() else 0,
-                    dirty=dirty)
+                    dirty=dirty, pushed=pushed,
+                    compare_url=_compare_url(worktree, base, branch) if pushed else "")
+
+
+def _pushed(worktree: Path, branch: str) -> bool:
+    """Does the local `origin/<branch>` ref carry every commit HEAD has? Never the network (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §1)"""
+    if not branch or branch == "HEAD":
+        return False
+    remote = f"refs/remotes/origin/{branch}"
+    if not (_git(worktree, "rev-parse", "--verify", "--quiet", remote) or "").strip():
+        return False
+    ahead = _git(worktree, "rev-list", "--count", f"{remote}..HEAD")
+    return ahead is not None and ahead.strip() == "0"
+
+
+def _compare_url(worktree: Path, base: str, branch: str) -> str:
+    """Where the user would open the pull request, or ""; lazy import, as `github.blob_url` does"""
+    from .github import compare_url
+
+    return compare_url(worktree, base, branch) or ""
 
 
 def committed_text(project_path: Path, planner_wo: dict[str, Any] | None,

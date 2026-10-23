@@ -44,6 +44,9 @@ def inbox_flag(project_path: Path, wo_id: str) -> Path:
 OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
 OBJECTION_HANDED_BACK_REASON = "the order delivered its result and the decision is yours"
 
+#: Branch pushed, no pull request yet; payload `Authored.record()` plus `was` (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §4)
+PR_PENDING_EVENT = "pr_pending"
+
 #: An OS-built prompt for this work order was past `claude_cli.MAX_OS_PROMPT_CHARS` (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 OS_PROMPT_REFUSED_EVENT = "os_prompt_refused"
 #: What settles one: the next OS call for this order that actually produced something
@@ -2868,6 +2871,18 @@ class ProjectStore:
         since = float(parked[-1]["ts"])
         closed = any(float(e["ts"]) > since
                      for kind in ("finished", "abandoned", "release_completed")
+                     for e in self.events_of_kind(wo_id, kind))
+        return None if closed else db.from_json(parked[-1]["payload"], {})
+
+    def pr_pending_open(self, wo_id: str) -> dict[str, Any] | None:
+        """The open pushed-branch-no-pull-request park's payload, or None (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §4)"""
+        parked = self.events_of_kind(wo_id, PR_PENDING_EVENT)
+        if not parked:
+            return None
+        since = float(parked[-1]["ts"])
+        closed = any(float(e["ts"]) > since
+                     for kind in ("finished", "abandoned", "pr_url_recorded",
+                                  "pr_merged")
                      for e in self.events_of_kind(wo_id, kind))
         return None if closed else db.from_json(parked[-1]["payload"], {})
 
