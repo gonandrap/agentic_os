@@ -534,6 +534,36 @@ def test_an_ordinary_worker_is_untouched_by_the_mcp_rule():
         assert hooks.preflight_decision(payload, _env(kind="worker")) is None, tool
 
 
+def _pretooluse_matcher(project, kind: str) -> str:
+    """The injected hook's own PreToolUse matcher in one work order's settings file"""
+    import re as _re
+
+    from jarvis.bootstrap import jarvis_hook_command
+    from jarvis.catalog import ProjectSpec
+
+    spec = ProjectSpec(name="proj_a", path=project, description="")
+    settings = json.loads(dispatch._write_worker_settings(
+        spec, {"id": f"wo-mcp-{kind}", "title": "t", "kind": kind}).read_text())
+    ours = [e for e in settings["hooks"]["PreToolUse"]
+            if any(h.get("command") == jarvis_hook_command() for h in e["hooks"])]
+    assert len(ours) == 1
+    _re.compile(ours[0]["matcher"])  # a matcher Claude Code cannot compile matches nothing
+    return ours[0]["matcher"]
+
+
+def test_the_investigators_matcher_routes_every_mcp_call_to_the_hook(project, jarvis_home):
+    """The hook holds the allowlist; the matcher decides whether it ever runs (#852)"""
+    import re as _re
+
+    investigator = _pretooluse_matcher(project, "investigator")
+    worker = _pretooluse_matcher(project, "worker")
+    for tool in MCP_WRITES + MCP_READS:
+        assert _re.search(investigator, tool), tool
+    # The negative control: an ordinary worker still pays the hook on NO MCP write
+    for tool in MCP_WRITES:
+        assert not _re.search(worker, tool), tool
+
+
 def test_a_piped_read_still_runs():
     for command in PIPED_READS:
         assert _decision(
