@@ -266,9 +266,12 @@ def test_a_second_identical_deselection_writes_the_same_document(jarvis_home,
     ops.start_os(str(catalog_file), foreground=True)
     first = ops.set_wiring(f"{wiring.LEVER_SKILL}b", False, project="proj_a")
     ops.set_wiring(f"{wiring.LEVER_SKILL}a", False, project="proj_a")
-    ops.set_wiring(f"{wiring.LEVER_SKILL}a", True, project="proj_a")
+    back = ops.set_wiring(f"{wiring.LEVER_SKILL}a", True, project="proj_a")
     assert ops.wiring_config("proj_a").disabled_skills == ("b",)
-    assert ops.current_config_version() == first["version"]["id"]
+    assert back["version"]["document"] == first["version"]["document"]
+    # The same document, but its own row: head never rewinds onto the first (1235)
+    assert ops.current_config_version() == back["version"]["id"]
+    assert back["version"]["id"] != first["version"]["id"]
 
 
 def test_an_unknown_lever_is_an_error_not_a_silent_write(jarvis_home, fake_claude,

@@ -109,9 +109,16 @@ lands, `resolve()` simply yields `os.validation.*` paths and no project ones; af
 it yields both, for free and with no change to the ledger.
 
 **The version id is content-addressed**: `cfg-` + `sha256(canonical document_json)[:16]`,
-the same move as `evidence.fingerprint` (`evidence.py:100`). Consequences that are
-features: an edit that changes nothing writes no row, and re-applying an old
-configuration lands back on its old id.
+the same move as `evidence.fingerprint` (`evidence.py:100`), salted with the build for a
+release rebase. An edit that changes nothing writes no row — and that is only true of an
+edit whose document AND build already ARE the head's.
+
+**Issue 1235 narrowed it to exactly that.** Re-applying a document an older version holds
+used to land back on that version's id: no row, no reason, and the head pointing at a
+snapshot resolved under an older build — which is what `dispatch` stamps on every order,
+what `validation_config_from_resolved` reads, and the baseline the release rebase diffs
+against. So a repeat is its own event: the id is salted until it is unique, the row is
+written, and the head only ever moves forward.
 
 Alongside: `changes_json` (the path/old/new triples the user actually asked for),
 `actor`, `reason`, `ts`, `schema_version` (`bugreport.jarvis_version()`).
@@ -347,7 +354,7 @@ change with no row.
 
 Versions are never rewritten, never garbage-collected. `jarvis config restore cfg-abc`
 does not rewind — it writes a **new** version whose document equals that one's, authored
-by the user with their reason (and, being content-addressed, landing back on the same id).
+by the user with their reason, and carrying a fresh id (issue 1235).
 Same discipline as knowledge retraction (`kn-5f018158`): an audit trail that rewrites
 itself is not one.
 

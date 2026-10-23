@@ -436,7 +436,7 @@ CREATE INDEX IF NOT EXISTS idx_rule_recurrences_detector
 -- ran, not configuration anyone needs to run, so it is rendered and diffed — never fed
 -- back to `parse_catalog` (§6).
 CREATE TABLE IF NOT EXISTS os_config_versions (
-    id             TEXT PRIMARY KEY,        -- cfg-<sha256(document_json)[:16]>
+    id             TEXT PRIMARY KEY,        -- cfg-<sha256(document_json[+build][+salt])[:16]>
     ts             REAL NOT NULL,
     actor          TEXT NOT NULL,           -- user | file | release | <wo-id>
     reason         TEXT NOT NULL DEFAULT '',
@@ -1762,18 +1762,27 @@ class CentralStore:
 
         build = (schema_version if schema_version is not None
                  else bugreport.jarvis_version())
-        vid = config_version.version_id(document,
-                                        build=build if actor == "release" else None)
-        existing = self.get_config_version(vid)
-        if existing is not None:
-            self.set_state(CONFIG_HEAD_KEY, vid)
-            return existing
+        salted = build if actor == "release" else None
+        vid = config_version.version_id(document, build=salted)
+        head = self.head_config_version()
+        # An edit that changes nothing: same document, same build, already head (1235)
+        if (head is not None and head["schema_version"] == build
+                and config_version.canonicalise(head["document"])
+                == config_version.canonicalise(document)):
+            return head
+        ts = db.now()
+        attempt = 0
+        while self.get_config_version(vid) is not None:
+            # A repeat of an OLDER document is its own event, and head never rewinds (1235)
+            attempt += 1
+            vid = config_version.version_id(document, build=salted,
+                                            salt=f"{ts}#{attempt}")
         self.conn.execute(
             """INSERT INTO os_config_versions
                (id, ts, actor, reason, schema_version, document_json, resolved_json,
                 changes_json, source_path)
                VALUES (?,?,?,?,?,?,?,?,?)""",
-            (vid, db.now(), actor, reason, build,
+            (vid, ts, actor, reason, build,
              config_version.canonicalise(document),
              db.to_json(resolved), db.to_json(changes or []), source_path),
         )
