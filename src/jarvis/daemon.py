@@ -5339,11 +5339,13 @@ class Daemon:
         # Spec 2026-09-28 §3.2
         base_behind = (automerge.BaseBehind(base=pr.base_ref, base_oid=pr.base_oid)
                        if ops.catch_up_needed(pr, repo=project.path) else None)
+        # #1063
+        drift = self._drift_hold(store, wo)
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
-            base_red=base_red, base_behind=base_behind)
+            drift=drift, base_red=base_red, base_behind=base_behind)
         if not decision.armed:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec... (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.5)
             outcome = CarryOutcome(False, False)
@@ -5356,7 +5358,8 @@ class Daemon:
                 decision = automerge.decide(
                     round_row, wo, pr, cfg,
                     validated_head=store.validated_head(round_row),
-                    pending_assumptions=pending, plan_assumptions=plan_assumptions)
+                    pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                    drift=drift)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
                 # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2
@@ -5388,7 +5391,7 @@ class Daemon:
                         round_row, wo, pr, cfg,
                         validated_head=store.validated_head(round_row),
                         pending_assumptions=pending, plan_assumptions=plan_assumptions,
-                        base_red=base_red)
+                        drift=drift, base_red=base_red)
                     # #1141: the moved head the base hold was hiding gets the carry too
                     if not decision.armed and decision.code == automerge.HELD_SHA_MOVED:
                         outcome = self._carry_catch_up(
@@ -5400,7 +5403,8 @@ class Daemon:
                                 round_row, wo, pr, cfg,
                                 validated_head=store.validated_head(round_row),
                                 pending_assumptions=pending,
-                                plan_assumptions=plan_assumptions, base_red=base_red)
+                                plan_assumptions=plan_assumptions, drift=drift,
+                                base_red=base_red)
                 else:
                     # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a base that has moved
                     moved = bool(caught.base_tip) and ops.catch_up_needed(
@@ -6304,6 +6308,25 @@ class Daemon:
                                     f"SUPERSEDED — `{base}` moved", reason)
             finally:
                 neo_store.close()
+
+    def _drift_hold(self, store: ProjectStore, wo: dict) -> Any:
+        """The open scope-drift finding this merge must not land over, or None (#1063)"""
+        from . import automerge
+        from .neo_store import NeoStore
+
+        alarm = automerge.open_drift_alarm(store.alarms_of(wo["id"]))
+        if alarm is None:
+            return None
+        question = None
+        # Only `escalated` has a question in flight; every other status reads off the row
+        if alarm["status"] == "escalated" and alarm["neo_question_id"]:
+            neo = NeoStore()
+            try:
+                question = neo.get(int(alarm["neo_question_id"]))
+            finally:
+                neo.close()
+        # A wedged one raises the flag through `invariants.true_blockers`, not from here
+        return automerge.drift_hold(alarm, question)
 
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:

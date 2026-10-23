@@ -12,6 +12,9 @@ SUBJECTS = ("work_order", "feature_order")
 #: A probe id is the alarm's `probe` column and a surface's grouping key, so it is spelled one way only
 ID_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
+#: THE SCOPE-DRIFT PROBE, named because `automerge` holds a merge on an open finding of it (#1063)
+BRIEF_MISMATCH = "brief-mismatch"
+
 #: `inspection`'s alarm kinds, which a probe id may NOT take: the two would read as one thing on...
 RESERVED_IDS = ("long-turn", "stalled-turn", "slow-model-response",
                 "long-join", "big-rewrite",
@@ -105,7 +108,7 @@ DEFAULT_PROBES: tuple[HealthProbe, ...] = (
         subjects=("feature_order",),
     ),
     HealthProbe(
-        id="brief-mismatch",
+        id=BRIEF_MISMATCH,
         title="Drifted from the ask",
         prompt=(
             "What the instrument is doing has drifted from what it was asked to do. "
