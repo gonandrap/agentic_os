@@ -138,8 +138,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         if tool not in deny:
             deny.append(tool)
 
-    # The hook refuses every MCP tool but Serena's read-only ones, and only reaches the ones the
-    # matcher names: without this the investigator's no-write guarantee skips MCP entirely (#852)
+    # The hook refuses every MCP tool but Serena's read-only ones (#852)
     if wo.get("kind") == "investigator":
         widen_mcp_matcher(settings)
 
