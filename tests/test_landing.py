@@ -126,7 +126,7 @@ def test_a_missing_worktree_is_unreadable_not_produced(repo):
 
 
 def _push(repo: Repo, wt: Path, branch: str) -> None:
-    """What the worker does: push the branch, which writes `refs/remotes/origin/…`."""
+    """What the worker does: push the branch, which writes `refs/remotes/origin/…`"""
     _git(wt, "push", "-q", "origin", branch)
 
 
@@ -172,7 +172,7 @@ def test_an_unpushed_branch_records_no_sha(repo):
 
 
 def test_a_remote_behind_the_branch_is_not_pushed(repo):
-    """One commit made after the push. The remote does NOT carry every commit HEAD has."""
+    """A commit made after the push leaves the remote behind HEAD"""
     wt = repo.worktree(WO)
     repo.commit(wt, "src/feature.py", _feature("coder"))
     _push(repo, wt, f"worktree-{WO}")
@@ -221,7 +221,7 @@ def test_the_record_round_trips_both_new_facts(repo):
 
 
 def test_an_event_written_before_this_shipped_reads_as_not_pushed():
-    """§3's backward compatibility, by construction: not-pushed is the safe direction."""
+    """§3's backward compatibility, by construction: not-pushed is the safe direction"""
     legacy = landing.authored_in({"branch": "worktree-wo-abc12345",
                                   "base": "origin/trunk", "commits": 1, "dirty": []})
 

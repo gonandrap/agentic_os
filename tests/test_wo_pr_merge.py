@@ -1218,7 +1218,7 @@ def pr_pending(store, wo_id: str, *, compare_url: str = "",
 
 @pytest.fixture()
 def pushed(started, project):
-    """An order parked on a pushed branch with no pull request."""
+    """An order parked on a pushed branch with no pull request"""
     wo = ops.create_work_order("proj_a", "add feature X")
     store = ProjectStore(project)
     try:
@@ -1266,7 +1266,7 @@ def test_a_gate_recorded_url_still_routes_nothing(started, project):
 @pytest.mark.parametrize("source", ["user", "auto"])
 def test_a_recorded_url_the_user_or_the_os_asserted_is_a_declaration(started, project,
                                                                      source):
-    """§8.2: the auto-attach routes too, and that is decided rather than inherited."""
+    """§8.2: the auto-attach routes too, and that is decided rather than inherited"""
     wo = ops.create_work_order("proj_a", "add feature X")
     store = ProjectStore(project)
     try:
@@ -1288,7 +1288,7 @@ def test_it_refuses_an_order_that_already_declared_one(started, project, pushed)
 
 
 def test_it_refuses_an_order_that_is_not_waiting_on_a_pull_request(started, project):
-    """And says what the order IS waiting on, so the refusal is not a dead end."""
+    """And says what the order IS waiting on, so the refusal is not a dead end"""
     wo = ops.create_work_order("proj_a", "add feature X")
     store = ProjectStore(project)
     try:
@@ -1305,7 +1305,7 @@ def test_it_refuses_an_order_that_is_not_waiting_on_a_pull_request(started, proj
                                  "https://github.com/acme/proj/compare/a...b"])
 def test_it_refuses_a_url_that_is_not_a_pull_request_on_this_project(started, project,
                                                                      pushed, bad):
-    """`github.checked_pr_url` already does exactly this, including the leading-`-`-is- a-flag case and the compare URL §10 must never let into the column"""
+    """`github.checked_pr_url` refuses these, a compare URL included (§10)"""
     with pytest.raises(ops.OpsError):
         ops.record_pull_request(pushed["id"], bad)
 

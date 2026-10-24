@@ -1035,7 +1035,7 @@ def test_the_refusal_templates_render_verbatim():
 
 
 def test_the_pushed_branch_blocker_is_not_a_template_key():
-    """§6 of docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is- a-state.md, PINNED rather than remembered"""
+    """A compare URL is derived state, never a template key (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §6)"""
     assert "pr_pending" not in remedies.ATTENTION_TEMPLATES
 
 

@@ -3901,7 +3901,7 @@ DECLARING_SOURCES = ("user", "auto")
 
 
 def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
-    """The pull request the SUBMITTER declared — the only one that routes the merge queue (#742; `jarvis wo pr` too, docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §8.1)"""
+    """The pull request the SUBMITTER declared (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §8.1)"""
     # Newest first; read order breaks a timestamp tie, the later row winning
     events = [(float(e["ts"]), seq, kind, db.from_json(e["payload"], {}))
               for seq, (kind, e) in enumerate(
@@ -3973,7 +3973,7 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
 
 def park_pr_pending(store: ProjectStore, wo: dict[str, Any],
                     work: landing.Authored) -> str:
-    """Hold an order whose branch is pushed with no pull request, once per episode (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §2, §4)"""
+    """Hold an order whose branch is pushed with no pull request (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §2)"""
     if store.pr_pending_open(wo["id"]):
         store.set_status(wo["id"], "needs_review", trigger="pr_pending_repark")
         return "needs_review"

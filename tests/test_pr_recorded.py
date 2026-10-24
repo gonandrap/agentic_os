@@ -377,7 +377,7 @@ def test_route_a_feature_manager_records_what_it_authored(started, project):
 
 
 def _pushed_order(project: Path, **kw) -> dict:
-    """`_order`, with the branch pushed the way the worker's own `git push` leaves it."""
+    """`_order`, with the branch pushed the way the worker's own `git push` leaves it"""
     wo = _order(project, **kw)
     _git(wo["worktree_path"], "push", "-q", "origin", f"worktree-{wo['id']}")
     return wo
@@ -398,7 +398,7 @@ def test_a_kind_that_does_not_land_code_is_still_refused_over_a_pushed_branch(st
 
 
 def test_finish_no_longer_refuses_a_pushed_branch(started, project):
-    """§2: no refusal, the ordinary path, and `land_finished` parks on `pr_pending`."""
+    """§2: no refusal, the ordinary path, and `land_finished` parks on `pr_pending`"""
     wo = _pushed_order(project, code="launcher")
 
     out = ops.finish(wo["id"], "pushed the branch — the gh account cannot open the PR")
@@ -430,7 +430,7 @@ def test_finish_still_refuses_uncommitted_files(started, project):
 
 
 def test_finish_still_refuses_a_commit_the_remote_does_not_have(started, project):
-    """There is no URL that would show the user the code, so there is nothing better to say than today's refusal"""
+    """No URL would show the user the code, so the refusal stands"""
     wo = _pushed_order(project, code="launcher")
     (wo["worktree_path"] / "second.py").write_text(_feature("second"))
     _git(wo["worktree_path"], "add", "-A")
