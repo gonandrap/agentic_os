@@ -5034,6 +5034,8 @@ class Daemon:
         if fix_wo_id:
             # §2 step 4: one fix work order per break, EVER, whatever became of it
             return
+        if not self._base_red_outlived_grace(project):
+            return
         # The steward's call... (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md §3.2)
         decision = steward.gate(
             steward.Candidate("red_main", "critical", project.name,
@@ -5093,6 +5095,15 @@ class Daemon:
             steward.linked(decision, fix_wo_id)
             log.info("[%s] %s is fixing the red default branch (%s)", project.name,
                      fix_wo_id, issue_url)
+
+    def _base_red_outlived_grace(self, project: ProjectSpec) -> bool:
+        """Has the open red episode outlived `base_fix_grace_minutes`?"""
+        episodes = self.central.base_red_episodes(project.name)
+        if not episodes or episodes[-1][1] is not None:
+            return False  # no open episode yet: the transition tick records it
+        started = float(episodes[-1][0] or 0)
+        grace = project.fleet_health.base_fix_grace_minutes * 60.0
+        return db.now() - started >= grace
 
     @staticmethod
     def _stamp(store: ProjectStore, wo_id: str, decision: Any) -> None:
