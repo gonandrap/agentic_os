@@ -14,3 +14,8 @@
 11. **The live test ran against a throwaway detached worktree of agentic_os,** not the main checkout, whose `.jarvis` queue belongs to the prod daemon. The test used an isolated `JARVIS_HOME`. `claude-jarvis` was restricted to agentic_os mid-session, so the first probe repo was abandoned and removed. All test envs, sessions, branches, plugin records and the probe trust entry were cleaned up.
 12. **The production catalog was not edited.** The earlier env-only draft launcher was deleted, because env cannot reach a background session.
 13. **Experiments ran the patched `claude-shining` through a `PATH` override.** `~/.local/bin/claude-shining` was never replaced. All experiment envs, sessions, worktrees and local plugin records were removed.
+14. **The settled-checkout sweep keeps any absolute recorded worktree.** Main's new reclaim sweep would otherwise `git worktree remove --force` a harness's worktree 24h after its order completes. The harness removes its own env, branch and worktree.
+15. **Main was merged into this branch, not rebased onto it.** The branch is already pushed, and force-pushing is not allowed.
+16. **The end-to-end run merged into a throwaway base, `e2e/session-dispatch-base`, not into `main`.** CI runs on PRs into any base, and auto-merge has no base check, so the full path runs without landing a probe file on `main`.
+17. **The end-to-end run used haiku for the worker, Neo and every panel seat.** That keeps the run cheap.
+18. **The auto-merge wording fix is its own branch, `gonandrap/automergeBase`, and is not merged into this one.** The run used a temporary checkout that combined both branches.
