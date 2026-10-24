@@ -220,6 +220,10 @@ that used to assume that location now reads the recorded one:
   reported cwd fails the check, or that reported none, and stops that session.
 * `dispatch_work_order` records the worktree `start` wrote, not the order id, on the
   `dispatched` event and in the context ledger.
+* The settled-checkout sweep (`disk.sweep`) keeps a recorded absolute worktree. The
+  harness removes its own env, branch and worktree (`claude-jarvis delete <name>`), and a
+  `git worktree remove` behind its back would leave the harness's env record pointing at
+  nothing.
 
 Claude Code loads every `CLAUDE.md` from the session's cwd up through its ancestors. In
 Jarvis's own layout the worktree sits INSIDE the project root, so both the branch's copy

@@ -297,3 +297,29 @@ def test_an_open_that_reports_no_worktree_fails_the_dispatch(monkeypatch, tmp_pa
         assert store.get_work_order("wo-crew01")["worktree"] != str(root)
     finally:
         store.close()
+
+
+# -- the settled-checkout sweep leaves a harness's worktree to the harness
+
+
+def test_the_reclaim_sweep_never_removes_a_harness_worktree(layout):
+    from jarvis import db, disk
+    from jarvis.catalog import OsConfig, ProjectSpec
+    from jarvis.project_store import ProjectStore
+
+    root, sibling = layout
+    (sibling / "CLAUDE.md").unlink()
+    store = ProjectStore(root)
+    try:
+        store.set_status("wo-crew01", "completed")
+        store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
+                           (db.now() - 48 * 3600, "wo-crew01"))
+        store.conn.commit()
+        cfg = OsConfig()
+        cfg.worktree.reclaim_after_hours = 24
+        reclaimed, kept = disk.sweep(store, ProjectSpec(name="proj", path=root,
+                                                        worktree=cfg.worktree))
+        assert sibling.exists()
+        assert reclaimed == [] and kept == ["wo-crew01"]
+    finally:
+        store.close()
