@@ -70,22 +70,54 @@ def checked_pr_url(url: str, cwd: Path | None = None) -> str:
     return url
 
 
-def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
-    """`(owner, repo)` lowercased for this checkout's `origin`, or None if unreadable"""
+def _origin_url(cwd: Path | None) -> str:
+    """This checkout's `origin` remote URL, or "" if unreadable; the one `LOCAL_GIT_READS` site"""
     if cwd is None or not Path(cwd).is_dir():
-        return None
+        return ""
     try:
         proc = subprocess.run(["git", "-C", str(cwd), "remote", "get-url", "origin"],
                               capture_output=True, text=True, timeout=GH_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
-        return None
+        return ""
     if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
+    """`(owner, repo)` lowercased for this checkout's `origin`, or None if unreadable; host discarded"""
+    remote = _origin_url(cwd).removesuffix(".git")
+    if not remote:
         return None
-    remote = (proc.stdout or "").strip().removesuffix(".git")
     parts = remote.replace(":", "/").rstrip("/").split("/")
     if len(parts) < 2 or not parts[-1] or not parts[-2]:
         return None
     return parts[-2].lower(), parts[-1].lower()
+
+
+def origin_host(cwd: Path | None) -> str:
+    """The host `origin` points at, lowercased; "" for a local path remote or none"""
+    remote = _origin_url(cwd)
+    if not remote:
+        return ""
+    authority = remote.split("://", 1)[-1].split("@", 1)[-1]
+    return authority.split("/", 1)[0].split(":", 1)[0].lower()
+
+
+GITHUB_HOST = "github.com"
+
+
+def compare_url(cwd: Path | None, base: str, branch: str) -> str | None:
+    """GitHub compare URL for `base...branch` from local git only, or None (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §3)"""
+    if cwd is None or not base or not branch:
+        return None
+    if origin_host(cwd) != GITHUB_HOST:
+        return None
+    origin = origin_repo(cwd)
+    if origin is None:
+        return None
+    return (f"https://{GITHUB_HOST}/{origin[0]}/{origin[1]}/compare/"
+            f"{base.removeprefix('origin/')}...{branch}?expand=1")
 
 
 def blob_url(cwd: Path | None, repo_path: str) -> str | None:
@@ -298,12 +330,14 @@ def ls_remote(cwd: Path | None = None, remote: str = "origin") -> dict[str, str]
     return heads
 
 
-def open_pull_request_for_branch(branch: str, cwd: Path | None = None) -> str:
+def open_pull_request_for_branch(branch: str, cwd: Path | None = None, *,
+                                 head_sha: str = "") -> str:
     """The OPEN pull request on `branch`, or "" when there is none (docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md)"""
     if not BRANCH_RE.match(branch or ""):
         raise GitHubError(f"{branch!r} is not a branch this may ask about",
                           GitHubError.URL_REFUSED)
-    stdout = _run(["pr", "list", "--head", branch, "--state", "open", "--json", "url"],
+    fields = "url,isCrossRepository,headRefOid" if head_sha else "url"
+    stdout = _run(["pr", "list", "--head", branch, "--state", "open", "--json", fields],
                   url=branch, cwd=cwd,
                   missing_hint="so Jarvis cannot confirm a planner's pull request")
     try:
@@ -314,6 +348,13 @@ def open_pull_request_for_branch(branch: str, cwd: Path | None = None) -> str:
     if not isinstance(payload, list):
         raise GitHubError(f"`gh pr list {branch}` returned no array ({payload!r})",
                           GitHubError.UNREADABLE)
+    if head_sha:
+        # `--head` matches a fork's branch of the same name too
+        payload = [row for row in payload if isinstance(row, dict)
+                   and row.get("isCrossRepository") is False
+                   and row.get("headRefOid") == head_sha]
+        if len(payload) != 1:
+            return ""
     if not payload:
         return ""
     first = payload[0] if isinstance(payload[0], dict) else {}

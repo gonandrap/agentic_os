@@ -462,6 +462,17 @@ def release_base_red_blocker(said: dict[str, Any]) -> str:
         run_url=said.get("run_url") or "")
 
 
+def pr_pending_blocker(wo_id: str, park: dict[str, Any]) -> str:
+    """The pushed-branch-no-pull-request line, from the park payload only (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §5)"""
+    branch = str(park.get("branch") or "its branch")
+    base = str(park.get("base") or "the default branch")
+    url = str(park.get("compare_url") or "")
+    where = (f"open it at {url} (base `{base}`)" if url
+             else f"open one against `{base}`")
+    return (f"branch `{branch}` is pushed and has no pull request — {where}, then "
+            f"`jarvis wo pr {wo_id} <url>`")
+
+
 #: §9: the objection the OS sent about an assumption died on the way to the worker
 OBJECTION_UNDELIVERABLE_BLOCKER = ("the OS objected to an assumption and the objection "
                                    "never reached the worker — decide it yourself")
@@ -787,6 +798,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         # In the body, the pattern `auto_review_at` above already uses: `ops` imports this module
         from .ops import refusal_answered
 
+        # Above the triage and unguarded by `pending`, like PR_CLOSED_BLOCKER (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §5)
+        pr_pending = store.pr_pending_open(wo["id"])
+        if pr_pending is not None:
+            blockers.append(pr_pending_blocker(wo["id"], pr_pending))
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for something different (#224)
         if wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
@@ -807,8 +822,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(REFUSAL_UNANSWERED_DOC_BLOCKER
                             if wo.get("kind") in DOCUMENT_DELIVERY_KINDS
                             else REFUSAL_UNANSWERED_BLOCKER)
-        # 4
-        elif not pending:
+        # 4; a pushed-branch park always follows `finished`
+        elif not pending and pr_pending is None:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43)
     if stuck_message(store, wo, now=now) is not None:

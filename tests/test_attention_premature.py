@@ -113,3 +113,74 @@ def test_a_hook_reason_on_the_same_order_is_left_alone(started, catalog_file):
 
     assert list(invariants.check_assumption_flags_are_owed(store)) == []
     assert store.get_work_order(wo["id"])["needs_attention"]
+
+
+# -- a pushed branch with no pull request, on the attention list (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md)
+
+COMPARE = "https://github.com/acme/proj/compare/trunk...worktree-wo-x?expand=1"
+
+
+def parked_pr_pending(started, *, compare_url: str = COMPARE,
+                      pending: bool = False) -> tuple[ProjectStore, dict]:
+    store, wo = running(started)
+    if pending:
+        ops.assume(wo["id"], ROUTINE)
+    store.add_event(wo["id"], "pr_pending",
+                    {"branch": f"worktree-{wo['id']}", "base": "origin/trunk",
+                     "commits": 2, "dirty": [], "pushed": True,
+                     "compare_url": compare_url, "was": "running"})
+    store.set_status(wo["id"], "needs_review")
+    return store, store.get_work_order(wo["id"])
+
+
+def test_the_pushed_branch_is_named_with_its_compare_url(started):
+    store, wo = parked_pr_pending(started)
+
+    (blocker,) = invariants.true_blockers(store, wo)
+
+    assert blocker == (f"branch `worktree-{wo['id']}` is pushed and has no pull request "
+                       f"— open it at {COMPARE} (base `origin/trunk`), then "
+                       f"`jarvis wo pr {wo['id']} <url>`")
+
+
+def test_it_co_occurs_with_the_assumptions_line_and_ranks_below_it(started):
+    """§5's D, PR_CLOSED_BLOCKER's precedent"""
+    store, wo = parked_pr_pending(started, pending=True)
+
+    blockers = invariants.true_blockers(store, wo)
+
+    assert "assumption" in blockers[0]
+    assert any("is pushed and has no pull request" in b for b in blockers)
+
+
+def test_the_idle_line_is_suppressed_because_the_worker_did_finish(started):
+    """§5"""
+    store, wo = parked_pr_pending(started)
+
+    blockers = invariants.true_blockers(store, wo)
+
+    assert invariants.IDLE_NO_FINISH_BLOCKER not in blockers
+
+
+def test_the_sentence_is_re_derived_byte_identically_with_no_worktree(started):
+    """INV-ATTENTION-REASON rewrites any flag it cannot re-derive"""
+    store, wo = parked_pr_pending(started)
+    reason = invariants.true_blockers(store, wo)[0]
+    store.flag_attention(wo["id"], reason)
+
+    assert list(invariants.check_attention_reason_is_true(store)) == []
+    assert store.get_work_order(wo["id"])["attention_reason"] == reason
+
+
+def test_with_no_compare_url_it_degrades_and_stays_stable_across_ticks(started):
+    """A non-github.com origin, or an event written before this shipped"""
+    store, wo = parked_pr_pending(started, compare_url="")
+    reason = invariants.true_blockers(store, wo)[0]
+    store.flag_attention(wo["id"], reason)
+
+    assert reason == (f"branch `worktree-{wo['id']}` is pushed and has no pull request "
+                      f"— open one against `origin/trunk`, then "
+                      f"`jarvis wo pr {wo['id']} <url>`")
+    for _ in range(3):
+        assert list(invariants.check_attention_reason_is_true(store)) == []
+    assert store.get_work_order(wo["id"])["attention_reason"] == reason
