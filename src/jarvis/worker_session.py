@@ -572,7 +572,12 @@ def _launch_bg(store: ProjectStore, wo: dict[str, Any], prompt: str, cwd: Path,
                              briefing={**briefing, "inject_dir": inject}),
             cwd, env=launch.env())
         # The session manager chose the worktree; every later turn resumes inside it
-        tree = entry.cwd or str(cwd)
+        tree = entry.cwd
+        if not tree or not session_dispatch.harness_worktree_ok(launch.project_path, tree):
+            claude_cli.stop_session(entry.id)
+            raise claude_cli.ClaudeCliError(
+                f"session {entry.id} opened outside a worktree of the project "
+                f"({tree or 'no cwd reported'}); refusing to bind the order to it")
         store.update_work_order(wo["id"], session_id=entry.session_id, bg_id=entry.id,
                                 worktree=tree)
         return {**wo, "session_id": entry.session_id, "bg_id": entry.id, "worktree": tree}

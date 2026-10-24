@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -154,6 +155,33 @@ class Launch:
             "JARVIS_LAUNCH_PHASE": self.phase,
             "JARVIS_LAUNCH_TRANSPORT": self.transport,
         }
+
+
+def _git_dir(path: Path, flag: str) -> Path | None:
+    try:
+        out = subprocess.run(["git", "-C", str(path), "rev-parse", flag], capture_output=True,
+                             text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    found = Path(out.stdout.strip())
+    return (found if found.is_absolute() else path / found).resolve()
+
+
+def harness_worktree_ok(root: Path, path: Path | str) -> bool:
+    """A real linked worktree of the project's repo, and neither the project root nor an ancestor of it"""
+    candidate = Path(path)
+    if not candidate.is_absolute() or not candidate.is_dir():
+        return False
+    here, top = candidate.resolve(), Path(root).resolve()
+    if here == top or top.is_relative_to(here):
+        return False
+    common = _git_dir(here, "--git-common-dir")
+    return (common is not None
+            and _git_dir(here, "--show-toplevel") == here
+            and common == _git_dir(top, "--git-common-dir")
+            and _git_dir(here, "--git-dir") != common)
 
 
 def write_inject_dir(dest: Path, briefing: dict[str, Any]) -> Path:

@@ -211,6 +211,13 @@ that used to assume that location now reads the recorded one:
   crew rule, the worktree auto-allow and tool-managed-path marking use that one predicate
   instead of a `/.claude/worktrees/` substring. The Python-navigation hook resolves the
   project from `JARVIS_PROJECT_PATH` like every other hook.
+* Every reader trusts a recorded worktree only through `session_dispatch.harness_worktree_ok`.
+  The path must be absolute and must not be the project root or an ancestor of it. It
+  must also be a real LINKED git worktree of the project's own repo, sharing the root's
+  `--git-common-dir` but not being the main one. Without that, a manager that reported
+  the root, `~` or a plain directory would have extended the edit auto-allow and the
+  `Edit`/`Write` rules over it. `_launch_bg` refuses to bind an order to a session whose
+  reported cwd fails the check, or that reported none, and stops that session.
 * `dispatch_work_order` records the worktree `start` wrote, not the order id, on the
   `dispatched` event and in the context ledger.
 

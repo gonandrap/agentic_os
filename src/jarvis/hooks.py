@@ -677,7 +677,9 @@ def in_worker_worktree(cwd: str, env: dict[str, str]) -> bool:
             store.close()
     except (KeyError, OSError, sqlite3.Error):
         return False
-    if not Path(recorded).is_absolute():
+    from .session_dispatch import harness_worktree_ok
+
+    if not harness_worktree_ok(Path(root), recorded):
         return False
     try:
         Path(cwd).resolve().relative_to(Path(recorded).resolve())

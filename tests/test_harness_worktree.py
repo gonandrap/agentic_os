@@ -18,11 +18,17 @@ OPEN = ["claude-jarvis", "start", "@jarvis", "--prompt", "{prompt}", "{wo_name}"
 def layout(tmp_path, jarvis_home):
     from jarvis.project_store import ProjectStore
 
-    root = tmp_path / "proj"
-    (root / ".jarvis").mkdir(parents=True)
+    import subprocess
+
+    from jarvis.testing import make_git_project
+
+    root = make_git_project(tmp_path, "proj")
+    (root / ".jarvis").mkdir()
     (root / "CLAUDE.md").write_text("root rules")
     sibling = tmp_path / "proj.worktrees" / "wocrew01"
-    (sibling / "src").mkdir(parents=True)
+    subprocess.run(["git", "worktree", "add", "-q", "--detach", str(sibling)], cwd=root,
+                   check=True)
+    (sibling / "src").mkdir()
     (sibling / "CLAUDE.md").write_text("branch rules")
     store = ProjectStore(root)
     try:
@@ -211,4 +217,83 @@ def test_dispatch_records_the_harness_worktree(jarvis_home, fake_claude, catalog
         assert not (Path(project) / ".claude" / "worktrees" / wo["id"]).exists()
     finally:
         central.close()
+        store.close()
+
+
+# -- a recorded worktree is trusted only if it is a real, non-main worktree of the project
+
+
+def _record(root: Path, worktree: str) -> None:
+    from jarvis.project_store import ProjectStore
+
+    store = ProjectStore(root)
+    try:
+        store.update_work_order("wo-crew01", worktree=worktree)
+    finally:
+        store.close()
+
+
+def test_a_real_sibling_worktree_is_valid(layout):
+    from jarvis import session_dispatch
+
+    root, sibling = layout
+    assert session_dispatch.harness_worktree_ok(root, sibling)
+
+
+@pytest.mark.parametrize("pick", ["root", "ancestor", "plain", "missing", "relative"])
+def test_anything_else_is_not_a_harness_worktree(layout, tmp_path, pick):
+    from jarvis import session_dispatch
+
+    root, _ = layout
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    path = {"root": root, "ancestor": tmp_path, "plain": plain,
+            "missing": tmp_path / "gone", "relative": Path("proj.worktrees/wocrew01")}[pick]
+    assert not session_dispatch.harness_worktree_ok(root, path)
+
+
+def test_a_recorded_project_root_never_auto_allows(layout):
+    root, _ = layout
+    _record(root, str(root))
+    assert not hooks.in_worker_worktree(str(root / "src"), _env(root))
+    assert hooks.preflight_decision(_write(root, "src/app.py"), _env(root)) is None
+
+
+def test_a_recorded_ancestor_never_auto_allows(layout, tmp_path):
+    root, sibling = layout
+    _record(root, str(tmp_path))
+    assert not hooks.in_worker_worktree(str(sibling), _env(root))
+
+
+def test_a_recorded_project_root_gets_no_edit_rules(tmp_path, layout):
+    root, _ = layout
+    project = _project(tmp_path, root, {"open": OPEN})
+    settings = _settings(project, {"id": "wo-crew01", "kind": "worker", "worktree": str(root)})
+    assert not any(r.startswith(("Edit(", "Write(", "NotebookEdit("))
+                   for r in settings["permissions"]["allow"])
+
+
+def test_an_open_that_reports_no_worktree_fails_the_dispatch(monkeypatch, tmp_path, layout):
+    from jarvis import session_dispatch, worker_session
+    from jarvis.project_store import ProjectStore
+
+    root, _ = layout
+    stopped = []
+    monkeypatch.setattr(claude_cli, "spawn_bg_open", lambda argv, cwd, env=None:
+                        claude_cli.BgEntry(id="abcd1234", session_id="abcd1234-x",
+                                           pid=1, status="idle", state="", cwd=""))
+    monkeypatch.setattr(claude_cli, "stop_session", lambda bg_id: stopped.append(bg_id) or True)
+    lch = session_dispatch.parse_launcher({"open": OPEN}, "where")
+    launch = session_dispatch.Launch(launcher=lch, project="proj", project_path=root,
+                                     wo_id="wo-crew01", wo_kind="worker", phase="open",
+                                     transport="background")
+    store = ProjectStore(root)
+    try:
+        wo = store.get_work_order("wo-crew01")
+        with pytest.raises(claude_cli.ClaudeCliError, match="worktree"):
+            worker_session._launch_bg(store, wo, "go", root, False, None,
+                                      tmp_path / "p.prompt", {}, launch)
+        assert stopped == ["abcd1234"]
+        assert store.get_work_order("wo-crew01")["worktree"] != str(root)
+    finally:
         store.close()

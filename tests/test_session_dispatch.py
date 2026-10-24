@@ -326,7 +326,11 @@ done
 name="$1"
 wt="$PWD.worktrees/$name"
 [ -e "$wt" ] && { echo "worktree $wt exists" >&2; exit 1; }
-mkdir -p "$wt"
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  git worktree add -q --detach "$wt" >&2
+else
+  mkdir -p "$wt"
+fi
 cd "$wt"
 echo "preparing env $name" >&2
 echo "HEAD is now at 0000000 init"

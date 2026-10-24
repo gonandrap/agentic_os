@@ -88,9 +88,11 @@ def opened_by_harness(project: ProjectSpec) -> bool:
 
 def worker_tree(project: ProjectSpec, wo: dict[str, Any]) -> Path | None:
     """The worktree this order's worker edits in, or None while a harness has yet to choose it"""
+    from .session_dispatch import harness_worktree_ok
+
     recorded = wo.get("worktree")
     if recorded and Path(str(recorded)).is_absolute():
-        return Path(str(recorded))
+        return Path(str(recorded)) if harness_worktree_ok(project.path, recorded) else None
     if opened_by_harness(project):
         return None
     return project.path / ".claude" / "worktrees" / wo["id"]
