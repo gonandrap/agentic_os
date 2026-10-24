@@ -225,7 +225,9 @@ def _write_call_record(finished=None):
                    "prompt": resolved_prompt(),
                    "started_at": _started, "finished_at": finished,
                    "cache_env": {k: os.environ[k] for k in
-                                 ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H")
+                                 ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H",
+                                  "CLAUDE_CODE_PROMPT_CACHE_TTL",
+                                  "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL")
                                  if k in os.environ}}, f)
     # Renamed into place: `Handle.calls` polls this directory while processes are still
     # running, and a half-written record it cannot parse is a call it silently drops.
@@ -1153,6 +1155,21 @@ elif "-p" in argv and "--resume" not in argv:
             verdict = {"escalate": True, "verdict": "deny", "stakes": "routine",
                        "reason": "test default: assumption reviews escalate unless "
                                  "forced"}
+    elif "Would the user accept it?" in prompt:
+        # One improvement-order finding (`findings.build_finding_question`). Escalates by
+        # default for the plan review's reason; FORCE_FINDING_ACCEPT_<SEVERITY> rates it.
+        rated = next((s for s in ("blocker", "critical", "major", "medium", "minor",
+                                  "cosmetic")
+                      if f"FORCE_FINDING_ACCEPT_{s.upper()}" in prompt), "")
+        if rated:
+            verdict = {"escalate": False, "verdict": "accept", "severity": rated,
+                       "reason": f"test-forced acceptance, rated {rated}"}
+        elif "FORCE_FINDING_REJECT" in prompt:
+            verdict = {"escalate": False, "verdict": "reject", "severity": "medium",
+                       "reason": "test-forced: the evidence does not show the mechanism"}
+        else:
+            verdict = {"escalate": True, "verdict": "", "severity": "medium",
+                       "reason": "test default: findings escalate unless forced"}
     elif "Release this plan?" in prompt:
         # A feature order's plan review — the third question kind, and the third verdict
         # shape. Same defaulting rule as the gate above and for the same reason: a fake
@@ -1392,7 +1409,7 @@ elif argv[:2] == ["pr", "list"]:
     # `ops.submit_plan`'s refusal is built on. Registered by `set_open_pr`.
     branch = argv[argv.index("--head") + 1] if "--head" in argv else ""
     rows = json.loads(os.environ.get("FAKE_GH_OPEN_PRS", "{}")).get(branch, [])
-    print(json.dumps([{"url": u} for u in rows]))
+    print(json.dumps([u if isinstance(u, dict) else {"url": u} for u in rows]))
 elif argv[:2] == ["run", "list"]:
     # The BASE branch's CI history. Keyed by branch, because the whole recogniser turns
     # on "was main red when this check ran", and a fake that answered one list for every
@@ -2009,7 +2026,7 @@ def fake_gh(tmp_path, monkeypatch):
 
         open_prs: dict[str, list[str]] = {}
 
-        def set_open_pr(self, branch: str, *urls: str) -> None:
+        def set_open_pr(self, branch: str, *urls: str | dict) -> None:
             """What `gh pr list --head <branch> --state open` answers"""
             self.open_prs[branch] = list(urls)
             monkeypatch.setenv("FAKE_GH_OPEN_PRS", json.dumps(self.open_prs))
@@ -2946,3 +2963,11 @@ def self_dispatch_on(monkeypatch):
 
     monkeypatch.setattr(catalog_mod, "_parse_autonomy", _autonomy)
     monkeypatch.setattr(catalog_mod, "_parse_fleet_health", _fleet_health)
+
+
+@pytest.fixture()
+def user_decides_findings(monkeypatch):
+    """Leave every findings report to the user, as before Neo decided them (`os.neo.review_findings`)"""
+    from . import ops
+
+    monkeypatch.setattr(ops, "findings_reviewed_by_neo", lambda: False)

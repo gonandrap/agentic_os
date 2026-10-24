@@ -373,6 +373,63 @@ ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual"
                 "schedule": "⏰ scheduled"}
 
 
+# Prose out of argv: the worktree guard reads a quoted argument as a command (issue 1209)
+_PROSE_FILE_HELP = ("read this text from a file instead of the command line, or - for "
+                    "stdin. A file rather than an argument on purpose: prose whose "
+                    "first word names a binary is refused before jarvis runs")
+_PROSE_FILE_SLOTS = {
+    "question_file": "question",
+    "content_file": "content",
+    "message_file": "message",
+    "summary_file": "summary",
+    "feedback_file": "feedback",
+    "why_file": "why",
+    "evidence_file": "evidence",
+}
+# The slots whose argparse requirement this mechanism relaxed; one of the two must arrive
+_PROSE_SLOT_REQUIRED = {"question", "content", "message", "summary"}
+
+
+def fill_prose_from_files(args: argparse.Namespace) -> None:
+    """Resolve every --<slot>-file into its slot, before anything reads the slot"""
+    from .ops import OpsError
+    from_stdin = ""
+    for opt, slot in _PROSE_FILE_SLOTS.items():
+        if not hasattr(args, opt):
+            continue
+        flag = "--" + opt.replace("_", "-")
+        path = getattr(args, opt) or ""
+        if not path:
+            if slot in _PROSE_SLOT_REQUIRED and not getattr(args, slot, None):
+                raise OpsError(f"pass the {slot} as an argument or with {flag} PATH")
+            continue
+        if getattr(args, slot, None):
+            raise OpsError(f"the {slot} was given twice: as an argument and with "
+                               f"{flag}")
+        if path == "-":
+            if from_stdin:
+                raise OpsError(f"only one argument can be read from stdin, and "
+                                   f"{from_stdin} already is")
+            from_stdin = flag
+            text = sys.stdin.read().strip()
+        else:
+            file = Path(path)
+            if not file.is_file():
+                raise OpsError(f"no such {slot} file: {file}")
+            text = file.read_text().strip()
+        if not text:
+            raise OpsError(f"{flag} {path} is empty, so there is no {slot} to record")
+        # The word cap lives in the PreToolUse hook, which sees argv only
+        if slot == "summary" and os.environ.get("JARVIS_WO_ID"):
+            from . import concision
+            cap, words = concision.summary_cap(), concision.word_count(text)
+            if cap and words > cap:
+                raise OpsError(f"this {flag} is {words} words; the cap is {cap}. The "
+                               f"summary is the HEADLINE — the detail belongs in the "
+                               f"final message of your turn")
+        setattr(args, slot, text)
+
+
 class _VersionAction(argparse.Action):
     """`jarvis --version` — resolved lazily so hooks don't pay for dist metadata"""
 
@@ -738,12 +795,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "one is dispatched (same project only)")
     # §2.3 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md
     c.add_argument("--blocked-by", action="append", default=None, metavar="REF",
-                   help="something that is NOT a work order and must clear before this "
-                        "one is dispatched (`bl-…`, `kn-…`, `io-…`, `#123`, a URL, or "
-                        "the words for the wait). Repeatable. It becomes a row the claim "
-                        "SQL evaluates, so the order stays `pending` and costs no worker "
-                        "turn; the OS clears a `bl-` ref itself once the backlog item "
-                        "settles, and `jarvis wo unblock` clears the rest")
+                   help="something that is NOT a work order COMPLETING and must clear "
+                        "before this one is dispatched (`deployed:<wo-id|sha>`, `bl-…`, "
+                        "`kn-…`, `io-…`, `#123`, a URL, or the words for the wait). "
+                        "Repeatable. It becomes a row the claim SQL evaluates, so the "
+                        "order stays `pending` and costs no worker turn. The OS clears "
+                        "two kinds itself: a `bl-` ref once the backlog item settles, "
+                        "and a `deployed:` ref once a release carrying that commit is "
+                        "what production RUNS — which `--depends-on` can never say, "
+                        "since a dependency completes at merge. `jarvis wo unblock` "
+                        "clears the rest")
     c.add_argument("--parent", default="",
                    help="file it UNDER this feature order: it becomes one of the "
                         "feature's children, so the feature waits for it and shows it "
@@ -818,17 +879,23 @@ def build_parser() -> argparse.ArgumentParser:
                                    "on a failed order this also revives the session; "
                                    "`wo retry` is the named form")
     m.add_argument("wo_id")
-    m.add_argument("message")
+    m.add_argument("message", nargs="?")
+    m.add_argument("--message-file", dest="message_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     m.add_argument("--project")
     m.add_argument("--source", default="jarvis", choices=["jarvis", "ui", "direct"])
 
     a = wo.add_parser("assume", help="(workers) record an assumption for user review")
     a.add_argument("wo_id")
-    a.add_argument("content")
+    a.add_argument("content", nargs="?")
+    a.add_argument("--content-file", dest="content_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
 
     q = wo.add_parser("ask", help="(workers) ask a question — Neo answers as the user")
     q.add_argument("wo_id")
-    q.add_argument("question")
+    q.add_argument("question", nargs="?")
+    q.add_argument("--question-file", dest="question_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     q.add_argument("--project")
 
     d = wo.add_parser("defer", help="(workers) hand off work that is not this work "
@@ -846,7 +913,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     f = wo.add_parser("finish", help="(workers) mark a work order finished")
     f.add_argument("wo_id")
-    f.add_argument("--summary", required=True)
+    f.add_argument("--summary", default="")
+    f.add_argument("--summary-file", dest="summary_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     f.add_argument("--pr", default="", metavar="URL",
                    help="the pull request this work order opened — parks it in "
                         "'waiting for PR merge' instead of completing it, so it stays "
@@ -865,6 +934,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--feedback", default="",
                    help="your reasoning — teaches Neo, and on --reject is delivered "
                         "to the worker as guidance")
+    r.add_argument("--feedback-file", dest="feedback_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     r.add_argument("--false-alarm", action="store_true",
                    help="the high-stakes net was WRONG to hold these: record a defect "
                         "in the net that fired (also read from 'false alarm' in "
@@ -877,6 +948,14 @@ def build_parser() -> argparse.ArgumentParser:
                                     "finished; stops the worker if one is still running")
     dn.add_argument("wo_id")
     dn.add_argument("--project")
+
+    # docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §8
+    pr = wo.add_parser("pr", help="record the pull request you opened for a work order "
+                                  "whose branch is pushed — it goes back in the merge "
+                                  "queue and the OS watches it merge")
+    pr.add_argument("wo_id")
+    pr.add_argument("url")
+    pr.add_argument("--project")
 
     ak = wo.add_parser("ack", help="acknowledge a work order's attention flag — it "
                                    "stops asking for you in status and on the dashboard")
@@ -1130,6 +1209,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "with --reject")
     i.add_argument("--project")
 
+    i = io.add_parser("ask-neo", help="put the findings awaiting you to Neo: never asked, "
+                                      "escalated, or Neo was unreachable. Skips any Neo "
+                                      "accepted, which wait only on your yes to the spend")
+    i.add_argument("io_id")
+    i.add_argument("--project")
+
     i = io.add_parser("cancel", help="stop an improvement order and its analyst")
     i.add_argument("io_id")
     i.add_argument("--project")
@@ -1221,6 +1306,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "different question; the block message states yours")
     g.add_argument("--evidence", default="",
                    help="what a reviewer can check — the reviewer sees only this")
+    g.add_argument("--why-file", dest="why_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
+    g.add_argument("--evidence-file", dest="evidence_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     g.add_argument("--project")
     g = ga.add_parser(
         "contest",
@@ -1447,7 +1536,9 @@ def build_parser() -> argparse.ArgumentParser:
     kn = sub.add_parser("learn", help="central knowledge base").add_subparsers(
         dest="kn_cmd", required=True)
     k = kn.add_parser("add")
-    k.add_argument("content")
+    k.add_argument("content", nargs="?")
+    k.add_argument("--content-file", dest="content_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     k.add_argument("--project", default="", help="omit for a global learning")
     k.add_argument("--topic", default="")
     k.add_argument("--tags", default="")
@@ -3457,6 +3548,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.cancel(args.wo_id), args.json)
     elif args.wo_cmd == "done":
         _print(ops.mark_done(args.wo_id, project_name=args.project), args.json)
+    elif args.wo_cmd == "pr":
+        _print(ops.record_pull_request(args.wo_id, args.url,
+                                       project_name=args.project), args.json)
     elif args.wo_cmd == "ack":
         _print(ops.ack_attention(args.wo_id, all_projects=args.all,
                                  project_name=args.project), args.json)
@@ -3790,8 +3884,10 @@ def cmd_io(args: argparse.Namespace) -> int:
             d = detail["by_decision"]
             print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
                   f"[{detail['project']}] {detail['title']} ({detail['status_label']})")
+            neo = detail.get("with_neo") or 0
             print(f"\n{detail['findings']} findings: {d['accepted']} accepted, "
-                  f"{d['rejected']} rejected, {d['pending']} awaiting you")
+                  f"{d['rejected']} rejected, {d['pending'] - neo} awaiting you"
+                  + (f", {neo} with Neo" if neo else ""))
             observation = detail["observation"]
             if not (args.full or args.finding):
                 # The brief is the filer's; the findings are what the reader acts on
@@ -3837,6 +3933,9 @@ def cmd_io(args: argparse.Namespace) -> int:
                                    feedback=args.feedback,
                                    accept_all=args.accept_all,
                                    project_name=args.project), args.json)
+
+    elif args.io_cmd == "ask-neo":
+        _print(ops.ask_neo_about_findings(args.io_id, args.project), args.json)
 
     elif args.io_cmd == "report":
         path = Path(args.from_file)
@@ -4543,7 +4642,9 @@ def _print_config_versions(rows: list[dict]) -> None:
         head = "●" if row.get("head") else " "
         reason = f" · {row['reason']}" if row["reason"] else ""
         print(f"{head} {row['id']}  {row['actor']} · {_age(row['ts'])} ago{reason}")
-        for change in row["changes"][:4]:
+        # Changed and removed first: truncation hid them behind a release's defaults (1235)
+        shown = sorted(row["changes"], key=lambda c: c.get("kind") == "added")
+        for change in shown[:4]:
             print(f"      {_cfg_change(change)}")
         if len(row["changes"]) > 4:
             print(f"      … and {len(row['changes']) - 4} more")
@@ -5415,6 +5516,7 @@ def main(argv: list[str] | None = None) -> int:
     from .neo_store import QuestionTooLargeError
     from .ops import OpsError
     try:
+        fill_prose_from_files(args)
         if args.cmd == "start":
             return cmd_start(args)
         if args.cmd == "stop":

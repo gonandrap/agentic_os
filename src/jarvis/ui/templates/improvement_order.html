@@ -18,6 +18,7 @@
   · <a href="/project/{{ project }}">{{ project }}</a>
   · {{ io.findings }} findings
   · {{ io.by_decision.pending }} pending
+  {% if io.with_neo %}· {{ io.with_neo }} with Neo{% endif %}
   · {{ io.by_decision.accepted }} accepted
   · {{ io.by_decision.rejected }} rejected
   · {{ fmt_age(io.created_at) }}
@@ -52,12 +53,14 @@
    is open, because that is the one asking for a decision. `#finding-<key>` opens one. #}
 {% for f in findings %}
 {% set status = f.status or 'pending' %}
+{# Neo holds a pending finding until it rules; only what it hands back is the user's #}
+{% set with_neo = status == 'pending' and f.neo_question_id and not f.neo_verdict %}
 <details class="turn panel" id="finding-{{ f.key }}" style="margin-bottom: 10px;"
-         {% if status == 'pending' or f.filing_error %}open{% endif %}>
+         {% if (status == 'pending' and not with_neo) or f.filing_error %}open{% endif %}>
   <summary>
   <div class="row">
     <span class="mono">{{ f.key }}</span>
-    <span class="st tone-{{ 'warn' if status == 'pending' else 'ok' if status == 'accepted' else 'muted' }}">{{ status }}</span>
+    <span class="st tone-{{ 'muted' if with_neo else 'warn' if status == 'pending' else 'ok' if status == 'accepted' else 'muted' }}">{{ 'with Neo' if with_neo else status }}{% if f.decided_by and f.decided_by != 'user' and status != 'pending' %} by {{ f.decided_by }}{% endif %}</span>
     <strong class="grow clamp1" title="{{ f.symptom }}">{{ f.symptom }}</strong>
   </div>
   </summary>
@@ -82,6 +85,18 @@
           <strong>{{ o.title }}</strong> — {{ o.description }}</div>
       </details>
       {% endfor %}
+      {% if f.neo_verdict %}
+      <div class="sub"><strong>Neo</strong>
+        ({{ 'escalated' if f.neo_verdict.escalate else f.neo_verdict.verdict }}{% if f.neo_verdict.severity %}, rated {{ f.neo_verdict.severity }}{% endif %}):
+        {{ f.neo_verdict.reason }}</div>
+      {% endif %}
+      {% if f.steward %}
+      <div class="sub"><strong>steward</strong> decision #{{ f.steward.decision_id }}
+        ({{ f.steward.outcome }}, {{ f.steward.rule }}): {{ f.steward.reason }}</div>
+      {% endif %}
+      {% if f.orders_held %}
+      <div class="sub">its orders wait in the steward's queue for room — accepting again files them now, as yours</div>
+      {% endif %}
       {% if f.filing_error %}
       <div class="sub tone-bad">✗ {{ f.filing_error }} — accepting again retries it</div>
       {% endif %}
@@ -100,7 +115,7 @@
       {% endif %}
     </div>
   </div>
-  {% if status == 'pending' or f.filing_error %}
+  {% if status == 'pending' or f.filing_error or f.orders_held %}
   {# The decision is taken where the finding is read. Both forms post to the one review
      route, which holds no logic of its own. #}
   <div class="row">

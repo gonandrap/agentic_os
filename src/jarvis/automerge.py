@@ -7,7 +7,9 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-from .project_store import validation_standing
+from .probes import BRIEF_MISMATCH
+from .project_store import (ALARM_OPEN_STATUSES, ALARM_REVIEWABLE_STATUSES,
+                            validation_standing)
 from .provenance import (
     CONTEXT_LIMIT,
     DESCRIPTION_LIMIT,
@@ -41,6 +43,8 @@ HELD_STATUS = "status"
 HELD_ASSUMPTIONS = "assumptions"
 #: ITS OWN CODE, never folded into `HELD_ASSUMPTIONS`: the dedupe key above would drop the second of... (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.4)
 HELD_PLAN_ASSUMPTIONS = "plan_assumptions"
+#: An open 'drifted from the ask' finding on the delivery this merge would land (#1063)
+HELD_DRIFT_ALARM = "drift_alarm"
 HELD_NOT_PASSED = "not_passed"
 HELD_SHA_UNRECORDED = "sha_unrecorded"
 HELD_SHA_MOVED = "sha_moved"
@@ -99,6 +103,94 @@ class BaseRed:
     fix_wo_id: str = ""
     issue_url: str = ""
     issue_os_filed: bool = False
+
+
+#: WHO can still clear a scope-drift finding — what the hold reason has to say (#1063)
+AWAITING_SUPERVISOR = "supervisor"
+AWAITING_NEO = "neo"
+AWAITING_GATE = "gate"
+AWAITING_USER = "user"
+
+#: Each one's wait, as the hold sentence states it
+AWAITING_WAIT = {
+    AWAITING_SUPERVISOR: "the supervisor has not read it yet, and this hold lifts by "
+                         "itself if the next sweep acks it",
+    AWAITING_NEO: "Neo is reading it as question {question}, and this hold lifts by "
+                  "itself if Neo answers in this order's favour",
+    AWAITING_GATE: "the supervisor has asked permission to act on it and that gate "
+                   "request is not decided",
+    AWAITING_USER: "it is with you",
+}
+
+#: The finding's own words, clipped: the whole of it is `jarvis alarms show`'s job
+DRIFT_REASON_CHARS = 300
+
+#: What `failed` means here: the supervisor review errored, and nothing re-queues it (Neo 2202)
+DRIFT_WEDGED = (" The supervisor review of it FAILED, so no sweep will settle it and "
+                "this hold lifts for nobody but you.")
+
+#: The attention line a wedged drift hold raises: a hold nobody will lift is an ASK (Neo 2202)
+DRIFT_BLOCKER = ("scope-drift alarm {alarm_id} is holding the merge and its supervisor "
+                 "review failed — `jarvis alarms review {alarm_id}`")
+
+
+@dataclass(frozen=True)
+class DriftAlarm:
+    """An open 'drifted from the ask' finding, and who can still clear it"""
+
+    alarm_id: str
+    reason: str
+    awaiting: str
+    status: str = ""
+    question_id: int = 0
+    #: `failed` self-clears for nobody, so the hold is flagged rather than waited out
+    wedged: bool = False
+
+
+def open_drift_alarm(alarms: Any) -> dict[str, Any] | None:
+    """The newest UNSETTLED scope-drift finding among one order's alarms (#1063)"""
+    found = [a for a in alarms
+             if str(a.get("probe") or "") == BRIEF_MISMATCH
+             and str(a.get("status") or "") in ALARM_OPEN_STATUSES
+             and str(a.get("review_status") or "") == "unreviewed"]
+    return found[-1] if found else None
+
+
+def drift_hold(alarm: dict[str, Any],
+               question: dict[str, Any] | None = None) -> DriftAlarm:
+    """`open_drift_alarm`'s row as the hold reads it: who owes the answer (#1063)"""
+    from .neo_store import NEO_HELD_Q_STATUSES
+
+    status = str(alarm.get("status") or "")
+    if status in ("raised", "reviewing"):
+        awaiting = AWAITING_SUPERVISOR
+    elif status == "proposed":
+        awaiting = AWAITING_GATE
+    elif status == "escalated" \
+            and str((question or {}).get("status") or "") in NEO_HELD_Q_STATUSES:
+        awaiting = AWAITING_NEO
+    else:
+        # `escalated` that Neo declined or never asked about, and `failed`
+        awaiting = AWAITING_USER
+    return DriftAlarm(alarm_id=str(alarm.get("id") or ""),
+                      reason=str(alarm.get("reason") or ""),
+                      awaiting=awaiting, status=status,
+                      question_id=int(alarm.get("neo_question_id") or 0),
+                      wedged=status == "failed")
+
+
+def drift_reason(drift: DriftAlarm) -> str:
+    """The hold sentence: which finding, what it says, and who clears it (#1063)"""
+    wait = AWAITING_WAIT[drift.awaiting].format(
+        question=f"#{drift.question_id}" if drift.question_id else "it")
+    # `jarvis alarms review` REFUSES every other status, so the sentence must not name it
+    settle = (f" and settle it with `jarvis alarms review {drift.alarm_id}`"
+              if drift.status in ALARM_REVIEWABLE_STATUSES else "")
+    return (f"the supervisor flagged this delivery as drifted from the ask — alarm "
+            f"{drift.alarm_id}: {drift.reason[:DRIFT_REASON_CHARS]}. Nothing merges "
+            f"over an open scope-drift finding, and {wait}."
+            f"{DRIFT_WEDGED if drift.wedged else ''} Read it with `jarvis alarms show "
+            f"{drift.alarm_id}`{settle}")
 
 
 @dataclass(frozen=True)
@@ -160,10 +252,11 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
         f"tick")
     reason = {
         ops.CATCH_UP_DEFERRED: deferred,
+        # The reason says whether the OS chases again, so the tail must not claim it never will (#1215)
         ops.CATCH_UP_EXHAUSTED:
             f"{moved} and the OS has stopped catching this branch up: "
-            f"{catch_up.reason or 'its budget is spent'}. It will NOT try again: merge it "
-            f"by hand, or `jarvis wo send` the worker to rebase",
+            f"{catch_up.reason or 'its budget is spent'}. Merge it by hand, or "
+            f"`jarvis wo send` the worker to rebase",
         ops.CATCH_UP_FAILED:
             f"{moved} and the update did not run: "
             f"{catch_up.reason or 'the OS could not say why'}. The OS retries next tick",
@@ -179,6 +272,7 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
            *, validated_head: str | None,
            pending_assumptions: bool = False,
            plan_assumptions: str = "",
+           drift: DriftAlarm | None = None,
            base_red: BaseRed | None = None,
            base_behind: BaseBehind | None = None) -> Decision:
     """May the OS merge this pull request right now? (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4)"""
@@ -201,6 +295,9 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"the plan this work order implements is still waiting on you — "
                      f"assumptions on {plan_assumptions}, and the machine does not "
                      f"merge over a decision a person owes")
+    # Beside the two above and before every environmental fact: a finding about THIS artifact (#1063)
+    if drift is not None:
+        return _held(HELD_DRIFT_ALARM, drift_reason(drift))
     # Spec docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4
     on_the_break = str(wo.get("issue_url") or "")
     fixes_the_break = bool(base_red is not None and on_the_break

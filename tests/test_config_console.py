@@ -447,11 +447,14 @@ def test_restore_puts_the_document_back_and_makes_it_the_head(catalog):
     res = ops.restore_config(first, reason="9002 was wrong")
 
     assert document_of(catalog)["os"]["ui"]["port"] == 9001
-    assert res["version"]["id"] == first
-    assert head()["id"] == first
+    assert res["restored"] == first
+    assert res["version"]["id"] != first       # its own event, with its own reason
+    assert res["version"]["reason"] == "9002 was wrong"
+    assert head()["id"] == res["version"]["id"]
     assert ops.config_show()["drift"] is False
     store = CentralStore()
-    assert len(store.config_versions()) == 2  # no third row: restoring is not an edit
+    # A third row: head only moves forward, never back onto an older snapshot (1235)
+    assert len(store.config_versions()) == 3
     store.close()
 
 

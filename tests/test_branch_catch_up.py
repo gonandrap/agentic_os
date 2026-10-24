@@ -246,6 +246,25 @@ def test_the_cap_stops_the_os_chasing_a_fast_moving_base(started, project, fake_
     assert len(updates(store, wo)) == ops.CATCH_UP_MAX
 
 
+def test_catch_ups_older_than_the_window_do_not_hold_a_mergeable_branch(
+        started, project, fake_gh, local_proof):
+    """#1215: the cap is a RATE — three green catch-ups must not retire the chase for ever"""
+    opt_in(started)
+    store, wo = parked(project)
+    stale = db.now() - ops.CATCH_UP_WINDOW_SECONDS - 60
+    for i in range(ops.CATCH_UP_MAX):
+        store.add_event(wo["id"], invariants.PR_BASE_UPDATED_EVENT,
+                        {"base": "main", "base_sha": f"{i}" * 40,
+                         "cause": ops.BASE_UPDATE_BEHIND}, ts=stale)
+    behind_pr(fake_gh, base_oid=BASE_OID2)
+    local_proof["tip"] = BASE_OID2
+
+    poll(started, store)
+
+    assert fake_gh.updates == [PR]
+    assert ops.catch_up_attempts(store, wo["id"]) == 1
+
+
 def test_a_head_that_moved_between_the_re_read_and_the_update_is_not_updated(
         started, project, fake_gh, local_proof, monkeypatch):
     """GUARD 6"""
@@ -426,7 +445,8 @@ def test_an_exhausted_catch_up_names_the_cap_and_proposes_nothing(started, proje
 
     [row] = held(store, wo)
     assert row["code"] == "base_moved"
-    assert f"the cap ({ops.CATCH_UP_MAX})" in row["reason"] and "will NOT" in row["reason"]
+    assert f"the cap ({ops.CATCH_UP_MAX})" in row["reason"]
+    assert "once that window clears" in row["reason"]
     assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []
 
 

@@ -295,8 +295,8 @@ def render_report(report: dict[str, Any],
                   f"{len(report.get('findings') or [])} findings: "
                   f"{report['justification']}", ""]
     for finding in report.get("findings") or []:
-        status = finding.get("status") or "pending"
-        lines.append(f"- [{finding.get('key', '')}] {status}")
+        lines.append(f"- [{finding.get('key', '')}] {status_label(finding)}")
+        lines += [f"  {line}" for line in decision_lines(finding)]
         lines += render_finding(finding,
                                 (filed_orders or {}).get(finding.get("key", "")))
     return lines
@@ -319,8 +319,9 @@ def render_digest(report: dict[str, Any],
         lines += [report["summary"], ""]
     for finding in report.get("findings") or []:
         key = finding.get("key", "")
-        lines.append(f"- [{key}] {finding.get('status') or 'pending'}: "
+        lines.append(f"- [{key}] {status_label(finding)}: "
                      f"{clip(finding.get('root_cause', ''), limit)}")
+        lines += [f"    {clip(line, limit)}" for line in decision_lines(finding)]
         lines.append(f"    do: {clip(finding.get('recommendation', ''), limit)}")
         filed = (filed_orders or {}).get(key) or []
         if filed:
@@ -334,17 +335,158 @@ def render_digest(report: dict[str, Any],
     return lines
 
 
+def status_label(finding: dict[str, Any]) -> str:
+    """`pending` says who it waits on: Neo deciding is not the user being owed a decision"""
+    status = finding.get("status") or "pending"
+    if status == "pending":
+        return "pending, with Neo" if with_neo(finding) else "pending"
+    by = finding.get("decided_by") or ""
+    return f"{status} by {by}" if by and by != "user" else status
+
+
+def decision_lines(finding: dict[str, Any]) -> list[str]:
+    """What Neo read and what the steward held, when either touched this finding"""
+    lines = []
+    neo = finding.get("neo_verdict") or {}
+    if neo:
+        reading = "escalated" if neo.get("escalate") else neo.get("verdict", "?")
+        severity = f", rated {neo['severity']}" if neo.get("severity") else ""
+        lines.append(f"Neo ({reading}{severity}): {neo.get('reason', '')}")
+    held = finding.get("steward") or {}
+    if held:
+        lines.append(f"steward decision #{held.get('decision_id', '?')} "
+                     f"({held.get('outcome', '?')}, {held.get('rule', '?')}): "
+                     f"{held.get('reason', '')}")
+    return lines
+
+
+def with_neo(finding: dict[str, Any]) -> bool:
+    """Is this pending finding Neo's to decide right now, rather than the user's?"""
+    return ((finding.get("status") or "pending") == "pending"
+            and bool(finding.get("neo_question_id")) and not finding.get("neo_verdict"))
+
+
+def never_offered(finding: dict[str, Any]) -> bool:
+    """A pending finding Neo was never asked about: reported before Neo decided findings"""
+    return ((finding.get("status") or "pending") == "pending"
+            and not finding.get("neo_question_id") and not finding.get("neo_verdict")
+            and not finding.get("neo_unasked"))
+
+
+def reaskable(finding: dict[str, Any]) -> bool:
+    """A pending finding the user may put (back) to Neo: not with Neo, and not one Neo accepted"""
+    verdict = (finding.get("neo_verdict") or {}).get("verdict")
+    return ((finding.get("status") or "pending") == "pending"
+            and not with_neo(finding) and verdict != "accept")
+
+
 def review_headline(io: dict[str, Any], report: dict[str, Any]) -> str:
     """The counts-first line the attention reason uses (§6.2)"""
     findings = report.get("findings") or []
     accepted = sum(1 for f in findings if (f.get("status") or "pending") == "accepted")
     rejected = sum(1 for f in findings if (f.get("status") or "pending") == "rejected")
-    pending = len(findings) - accepted - rejected
+    neo = sum(1 for f in findings if with_neo(f))
+    pending = len(findings) - accepted - rejected - neo
     parts = []
     if accepted:
         parts.append(f"{accepted} accepted")
     if rejected:
         parts.append(f"{rejected} rejected")
-    parts.append(f"{pending} awaiting you")
+    if neo:
+        parts.append(f"{neo} with Neo")
+    if pending or not neo:
+        parts.append(f"{pending} awaiting you")
     return (f"{len(findings)} findings on {io.get('id')}: {', '.join(parts)} — "
             f"jarvis io review {io.get('id')}")
+
+
+# -- Neo decides findings for the user (§5.5, as amended 2026-10-22)
+
+FINDINGS_REVIEWER_PERSONA = """You are Neo, deciding ONE FINDING of an improvement order inside
+the Jarvis agentic OS, on the user's behalf.
+
+An analyst read the OS's records about something that went wrong and reported a
+diagnosis: a symptom, its root cause, quoted evidence, why the cheap fix is not enough,
+a recommendation, and the orders it proposes filing. You decide whether the user would
+accept this finding. Accepting it writes the root cause into the knowledge base every
+worker reads, and offers its proposed orders to the steward — the OS's deterministic
+budget keeper, which decides from your severity rating, the weekly cap and recurrence
+whether the orders are filed now, held, or dropped. So you judge the DIAGNOSIS and RATE
+it. What the OS can afford is not yours to decide.
+
+ACCEPT when all of these hold:
+- **The root cause is a mechanism, not a restatement.** It explains WHY the symptom
+  happens in terms of code, configuration or process, and the quoted evidence supports it.
+- **The cheap fix really is insufficient.** The argument against it is concrete, or the
+  finding says plainly why the cheap fix is nevertheless right.
+- **The proposed orders follow from the recommendation.** They fix the cause the finding
+  names and nothing it did not argue for. A finding with no proposed orders is
+  legitimate when "do nothing" is argued.
+
+REJECT when the finding is wrong or not worth the user's money: a root cause the evidence
+does not support, a speculative mechanism, a recommendation that is the cheap patch
+dressed up, proposed work that drifts from the diagnosis, or a defect so small nobody
+would notice it. Your reason is kept on the finding, so say what is wrong.
+
+ESCALATE to the user, rather than deciding, when:
+- A proposed order would delete data, publish, spend money outside the OS, or change
+  production systems or credentials.
+- The finding contradicts a standing learning below, or a learning says the user wants
+  to decide this kind of thing themselves.
+- Accepting it is really choosing between two directions the user has not chosen between.
+
+RATE the defect the finding diagnoses, honestly, on this scale:
+  blocker / critical: an OS function is broken now: work is lost, stuck or wrong
+  major: wrong behaviour a user or operator would notice
+  medium: a real defect, but bounded or unlikely
+  minor: hygiene with no behavioural change
+  cosmetic: naming, typos, style
+An inflated rating is one the steward spends the user's weekly budget on.
+
+Output STRICT JSON, nothing else:
+  {"escalate": false, "verdict": "accept", "severity": "<scale word>", "reason": "<one line>"}
+  or
+  {"escalate": false, "verdict": "reject", "severity": "<scale word>", "reason": "<one line: what is wrong>"}
+  or
+  {"escalate": true, "verdict": "", "severity": "<scale word>", "reason": "<one line why the user must decide>"}
+An escalation may carry one optional label, which is grouped and reported:
+  "cause": "<high-stakes | no-learning-applies | conflicting-authority | ambiguous-intent>\""""
+
+#: How much of one proposed order's brief Neo is shown: enough to see it follows, not the whole brief
+QUESTION_ORDER_CHARS = 600
+
+
+def build_finding_question(io: dict[str, Any], finding: dict[str, Any]) -> str:
+    """ONE finding, atomic: its whole argument and the work it proposes"""
+    lines = [f"Decide finding {finding.get('key', '')!r} of improvement order "
+             f"{io.get('id', '')}. Would the user accept it?", "",
+             f"symptom: {finding.get('symptom', '')}",
+             f"root cause: {finding.get('root_cause', '')}",
+             f"cheap fix, and why it is insufficient: "
+             f"{finding.get('why_insufficient', '')}",
+             f"recommendation: {finding.get('recommendation', '')}"]
+    evidence = finding.get("evidence") or []
+    if evidence:
+        lines.append("evidence:")
+        lines += [f"  - {item.get('quote', '')!r} ({item.get('source', '')})"
+                  for item in evidence]
+    orders = finding.get("proposed_orders") or []
+    if not orders:
+        lines.append("proposed orders: none — the finding argues nothing should be filed")
+    else:
+        lines.append("proposed orders:")
+        for order in orders:
+            project = f" [{order['project']}]" if order.get("project") else ""
+            lines.append(f"  - ({order.get('type', '')}){project} {order.get('title', '')}")
+            lines.append(f"    brief: "
+                         f"{clip(order.get('description', ''), QUESTION_ORDER_CHARS)}")
+    return "\n".join(lines)
+
+
+def build_finding_context(io: dict[str, Any], report: dict[str, Any]) -> str:
+    """What the improvement order was opened about, and the report's one line"""
+    return "\n".join([
+        f"{io.get('id', '')}: {io.get('title', '')}",
+        f"Opened on this observation: {clip(io.get('description', ''), 1500)}",
+        f"The analyst's summary across all findings: {report.get('summary', '')}",
+    ])

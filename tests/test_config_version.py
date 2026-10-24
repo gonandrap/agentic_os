@@ -222,6 +222,26 @@ def test_adding_the_same_document_twice_writes_one_row(store):
     assert len(store.config_versions()) == 1
 
 
+def test_setting_a_value_back_writes_its_own_row_and_head_moves_forward(store):
+    """Issue 1235: A → B → A is three events, and head never rewinds to the first"""
+    a = {"os": {"validation": {"enabled": True}}}
+    b = {"os": {"validation": {"enabled": False}}}
+
+    first = store.add_config_version(a, {"os.validation.enabled": True}, actor="user",
+                                     reason="on")
+    store.add_config_version(b, {"os.validation.enabled": False}, actor="user",
+                             reason="off")
+    again = store.add_config_version(a, {"os.validation.enabled": True}, actor="user",
+                                     reason="on again")
+
+    assert again["id"] != first["id"]
+    assert again["reason"] == "on again"
+    assert again["ts"] >= first["ts"]
+    assert store.head_config_version()["id"] == again["id"]
+    assert len(store.config_versions()) == 3
+    assert again["document"] == a           # the id is salted; the snapshot is not
+
+
 def test_a_version_carries_its_document_verbatim_and_its_evidence_decoded(store):
     """`document_json` is the RAW document"""
     doc = {"//": "a pseudo-comment", "os": {"validation": {"enabled": True}},

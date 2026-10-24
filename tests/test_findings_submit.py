@@ -17,6 +17,11 @@ OBSERVATION = ("Three work orders in a row spent their first turn re-reading the
                "module because nothing told them where the dispatch path lives.")
 
 
+@pytest.fixture(autouse=True)
+def _user_decides(user_decides_findings):
+    """This suite pins the USER's review; Neo deciding is tests/test_findings_neo.py"""
+
+
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
     ops.start_os(str(catalog_file), foreground=True)

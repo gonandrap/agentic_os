@@ -293,7 +293,10 @@ def main() -> int:
         after[top] = after.get(top, 0) + out.count("\n")
         if out != src:
             changed += 1
-            if not args.check:
+            if args.check:
+                # The marker `hooks.overlong_comment_decision` reads back, and the name CI never printed (issue 1231)
+                print(f"OVERLONG {rel}")
+            else:
                 p.write_text(out, encoding="utf-8")
     for d in DIRS:
         print(f"{d:8} {before[d]:7} -> {after[d]:7} lines")

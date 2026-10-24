@@ -886,6 +886,26 @@ def test_knowledge_page(client):
     assert "prefer uv" in r.text and "global" in r.text
 
 
+def test_knowledge_page_filters_by_topic_and_words(client):
+    """Topics were a flat run of text: no link, no way to narrow 800 entries to one topic"""
+    central = CentralStore()
+    central.add_knowledge("prefer uv for python installs", project="", topic="tooling")
+    central.add_knowledge("gates block pr merges", project="", topic="gates")
+    central.add_knowledge("untopicked lesson", project="")
+
+    page = client.get("/knowledge").text
+    assert 'href="/knowledge?topic=tooling"' in page and "<datalist" in page
+
+    page = client.get("/knowledge?topic=tooling").text
+    assert "prefer uv" in page and "gates block" not in page
+    assert "untopicked" in client.get("/knowledge?topic=").text   # empty form field: every topic
+    page = client.get("/knowledge?topic=(none)").text
+    assert "untopicked" in page and "prefer uv" not in page
+
+    page = client.get("/knowledge?q=merges").text
+    assert "gates block" in page and "prefer uv" not in page
+
+
 def test_knowledge_page_reports_what_the_base_costs_and_who_reads_it(client):
     """The page used to answer "what do we know" and nothing about what that is worth: no cost"""
     central = CentralStore()
@@ -1845,8 +1865,12 @@ def test_a_childs_link_carries_its_sections_anchor_and_that_id_exists(released_f
 
 
 @pytest.fixture()
-def improvement(client, project, improvement_order):
-    """An improvement order in `plan_review` with the shared findings report on it"""
+def improvement(client, project, improvement_order, user_decides_findings):
+    """An improvement order in `plan_review` with the shared findings report on it, the user's to decide"""
+    return _reported(client, project, improvement_order)
+
+
+def _reported(client, project, improvement_order):
     from jarvis.testing import a_report
 
     store = ProjectStore(project)
@@ -1904,6 +1928,24 @@ def test_an_accepted_finding_lists_the_orders_it_filed(improvement):
         # The status has to ride on the filed order's OWN row: an accepted finding that says what was...
         row = page[page.index(link):page.index(link) + 400]
         assert order["status"] in row
+
+
+def test_a_finding_with_neo_says_so_and_a_decided_one_shows_neos_reading(
+        client, project, improvement_order):
+    client, io, _ = _reported(client, project, improvement_order)
+
+    page = client.get(f"/io/proj_a/{io['id']}").text
+    assert "2 with Neo" in page and ">with Neo<" in page
+
+    report = io["report"]
+    q = {"id": report["findings"][0]["neo_question_id"], "project": "proj_a",
+         "wo_id": io["plan_wo_id"]}
+    ops.apply_findings_verdict(q, {"escalate": False, "approve": False,
+                                   "severity": "medium",
+                                   "reason": "the evidence shows no mechanism"})
+    page = client.get(f"/io/proj_a/{io['id']}").text
+    assert "rejected by neo" in page
+    assert "the evidence shows no mechanism" in page and "rated medium" in page
 
 
 def test_a_pending_finding_carries_both_decisions_and_a_required_reason(improvement):

@@ -36,6 +36,7 @@ from .project_store import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
     OPEN_STATUSES,
+    PR_PENDING_EVENT,
     RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
@@ -99,6 +100,10 @@ def _wedge_evidence(figures: dict[str, Any], dump: str) -> str:
 
     lines = [f"Limiter: {_limiter_line(figures)}",
              f"Stacks: {dump or 'none — no stack dump was written'}"]
+    # A loop stall and a wedged threadpool are different faults; the stamp says which (issue #1221)
+    reason = str((uilog.read_wedge() or {}).get("reason") or "")
+    if reason:
+        lines.append(f"Reason: {reason}")
     stamp = _existing(uilog.wedge_stamp_path())
     if stamp:
         lines.append(f"Stamp: {stamp}")
@@ -109,6 +114,9 @@ RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injec
 
 #: Reconcile stamp an outside reader judges liveness by; spec 2026-10-16 §2a
 RECONCILE_TICK_KEY = "reconcile_tick"
+
+#: Holds the low-disk warning, so it is raised once and re-armed only on recovery (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §2)
+DISK_LOW_KEY = "disk_low_warned"
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s interval
 PR_POLL_EVERY_TICKS = 24
@@ -542,6 +550,8 @@ CACHE_1H_INBOX_TITLE = {
         "Jarvis's OWN turns are buying the one-hour cache write — a transport defect",
     inspection.CACHE_1H_FOREIGN_ALARM:
         "Hand-opened Claude sessions are buying the one-hour cache write",
+    inspection.CACHE_ARM_MISSED_ALARM:
+        "A cache-TTL arm is not reaching the CLI — stamped turns paid the other rate",
 }
 
 
@@ -637,6 +647,8 @@ class Daemon:
         self.validating: set[str] = set()
         # The validator seam (see `_validator`)
         self.validator: Validator | None = None
+        # Orders a reclaim sweep decided to keep: the next sweep spends no git call on them
+        self.worktrees_kept: set[str] = set()
         # Projects already warned that their pull requests cannot be polled (no `gh`
         self.pr_poll_warned: set[str] = set()
         self.issue_sync_warned: set[str] = set()
@@ -668,6 +680,20 @@ class Daemon:
                 steward.send_digest(self.catalog, self.central)
         except Exception:  # noqa: BLE001
             log.exception("steward digest failed")
+
+    def offer_findings_to_neo(self, project: ProjectSpec) -> None:
+        """Findings Neo was never asked about go to Neo, once each (spec 2026-09-23 §5.5)"""
+        from . import ops
+        if fleet.load_pause(self.central) is not None:
+            # THE BRAKE: a Neo question is spend
+            return
+        try:
+            offered = ops.offer_unasked_findings(project.name, project.path)
+        except Exception:  # noqa: BLE001
+            log.exception("[%s] offering findings to Neo failed", project.name)
+            return
+        if offered:
+            log.info("[%s] findings offered to Neo: %s", project.name, ", ".join(offered))
 
     def steward_drain(self) -> None:
         """Queued self-work is deferred, not dropped: re-offer it when there is room (#1181)"""
@@ -801,7 +827,9 @@ class Daemon:
         moved = config_version.diff(head["resolved"], resolved)
         if not moved:
             return None
-        shown = "; ".join(f"{c['path']} {c['old']!r} → {c['new']!r}" for c in moved[:5])
+        # Changed settings before the defaults this release added (issue 1235)
+        first = sorted(moved, key=lambda c: c.get("kind") == "added")
+        shown = "; ".join(f"{c['path']} {c['old']!r} → {c['new']!r}" for c in first[:5])
         more = f" (and {len(moved) - 5} more)" if len(moved) > 5 else ""
         row = self.central.add_config_version(
             head["document"], resolved, actor="release",
@@ -945,6 +973,8 @@ class Daemon:
                     # BETWEEN the two, spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §2
                     self.dispatch_base_fix(project, store)
                     self.poll_pull_requests(project, store)
+                    # AFTER the poll: a pushed-branch park has no `pr_url` for it to read (2026-10-12 spec §9)
+                    self.attach_pull_requests(project, store)
                     # AFTER the poll, in the same tick: a merge that just completed a work order is what closes its... (#240)
                     self.sync_issues(project, store)
                     # Beside it, on the same cadence and for the same reason: the tracker is the surface a person scans...
@@ -960,6 +990,8 @@ class Daemon:
                     self.clear_answered_investigations(project, store)
                     # Beside it: the investigator's half of a settled investigation
                     self.settle_landed_investigators(project, store)
+                    # A report filed before Neo decided findings still owes Neo its questions
+                    self.offer_findings_to_neo(project)
                     # The agents roster holds ONLY the user's own sessions: workers are headless and never enter it
                     if sessions_by_project is not None:
                         self.track_injected_sessions(project, store, sessions_by_project)
@@ -982,6 +1014,8 @@ class Daemon:
                     # Immediately before the check that reads it
                     if sweep_landings:
                         self.refresh_landings(project, store)
+                    # After settlement, so an order completed on this tick starts its grace period here
+                    self.reclaim_worktrees(project, store)
                     # Last: check the state everything above just produced
                     self.check_invariants(project, store, sweep_landings=sweep_landings)
                     # AFTER the invariants, and the position is the whole argument... (docs/superpowers/specs/2026-09-27-self-evolution.md §5.1)
@@ -1020,6 +1054,12 @@ class Daemon:
             self.check_ui_health()
         except Exception:  # noqa: BLE001 — same rule
             log.exception("ui health check failed")
+        # AFTER the reclaim sweeps above, which are what the item would otherwise ask the user to do
+        if reconcile:
+            try:
+                self.check_disk_space()
+            except Exception:  # noqa: BLE001 — same rule
+                log.exception("disk space check failed")
 
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
@@ -1508,6 +1548,59 @@ class Daemon:
             log.exception("could not close backlog item %s", fo["backlog_id"])
 
     # -- 0. the dashboard
+
+    def reclaim_worktrees(self, project: ProjectSpec,
+                          store: ProjectStore) -> list[str]:
+        """Give back the disk the checkouts of settled orders hold (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §1)"""
+        from . import disk
+
+        try:
+            reclaimed, kept = disk.sweep(store, project, skip=self.worktrees_kept)
+        except Exception:  # noqa: BLE001 — housekeeping must never take the tick down
+            log.exception("[%s] worktree reclaim failed", project.name)
+            return []
+        self.worktrees_kept.update(kept)
+        if reclaimed:
+            log.info("[%s] reclaimed %d settled checkout%s: %s", project.name,
+                     len(reclaimed), "s" if len(reclaimed) != 1 else "",
+                     ", ".join(reclaimed))
+        return reclaimed
+
+    def check_disk_space(self) -> str:
+        """One inbox item when a volume holding OS state runs low (same spec, §2)"""
+        from . import disk
+
+        floor = self.catalog.os.disk_free_warn_gb
+        if floor <= 0:
+            return "off"
+        volumes = disk.state_volumes(self.catalog)
+        if not volumes:
+            return "unreadable"
+        worst = volumes[0]
+        warned = bool((self.central.get_state(DISK_LOW_KEY) or "").strip())
+        if worst.free_gb >= floor:
+            # Re-armed on RECOVERY, never on a clock: a standing shortage says nothing further
+            if warned:
+                self.central.set_state(DISK_LOW_KEY, "")
+            return "ok"
+        if warned:
+            return "warned"
+        self.central.set_state(DISK_LOW_KEY, f"{worst.free_bytes}")
+        log.warning("%.1f GB free on %s, under the %.1f GB floor", worst.free_gb,
+                    worst.path, floor)
+        self.central.add_inbox(
+            project="os", level="warning",
+            title=f"{worst.free_gb:.1f} GB free on {worst.path}",
+            body=(f"{worst.free_gb:.1f} GB of {worst.total_gb:.0f} GB left, under the "
+                  f"{floor:.1f} GB floor (`os.disk_free_warn_gb`). When it reaches zero "
+                  f"every SQLite write fails and each invariant reports itself as "
+                  f"`database or disk is full`.\n\n"
+                  f"The OS reclaims the checkout of a settled work order itself "
+                  f"({self.catalog.os.worktree.reclaim_after_hours}h after it settles); "
+                  f"what is left is the checkouts of open and failed orders, the logs "
+                  f"under {logs_dir()} and Claude Code's transcripts."),
+        )
+        return "low"
 
     def check_ui_log(self) -> int:
         """Raise an inbox item for dashboard errors nobody has been told about yet"""
@@ -2980,6 +3073,10 @@ class Daemon:
         """Neo's retries are spent"""
         from . import invariants
 
+        if q.get("kind") == "findings":
+            # The analyst behind it has settled: the finding, on its io, is what the user decides
+            self._findings_question_unanswered(q, f"Neo could not be reached: {detail}")
+            return
         head = q["question"].strip().splitlines()[0][:200]
         central.add_inbox(
             project=q["project"], level="warning",
@@ -3088,6 +3185,9 @@ class Daemon:
                     self._deliver_gate_verdict(central, pstore, q, verdict)
                 elif q.get("kind") == "plan":
                     self._deliver_plan_verdict(central, store, pstore, q, verdict)
+                elif q.get("kind") == "findings":
+                    # Owns its escalation too: the finding, not a worker, is what waits
+                    self._deliver_findings_verdict(q, verdict)
                 elif q.get("kind") == "alarm":
                     # ABOVE the escalate branch, because this kind owns both outcomes
                     self._deliver_alarm_verdict(central, pstore, q, verdict)
@@ -3125,7 +3225,7 @@ class Daemon:
                     invariants.end_wait_if_nothing_is_out(pstore, q["wo_id"])
                 # `alarm` joins the two exclusions for a reason of its own: a cleanup work order dispatched off a...
                 if pstore and q.get("kind") not in ("approval", "plan", "alarm",
-                                                    "assumption"):
+                                                    "assumption", "findings"):
                     self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
                 if pstore:
@@ -3133,6 +3233,9 @@ class Daemon:
 
         def refused(q: dict, error: claude_cli.PromptTooLargeError) -> None:
             """The OS built a prompt past its own ceiling (spec §4)"""
+            if q.get("kind") == "findings":
+                self._findings_question_unanswered(q, f"its prompt was too large: {error}")
+                return
             ppath = paths.get(q["project"])
             if not (ppath and ppath.is_dir() and q.get("wo_id")):
                 # A `triage` question has no work order behind it, so there is nothing to flag (#240)
@@ -3253,11 +3356,11 @@ class Daemon:
         rider = {"question_id": q["id"], "wo_id": str(q["wo_id"]),
                  "title": str(dispatch.get("title") or ""),
                  "description": str(dispatch.get("description") or "")}
-        # A ledger cleanup is `medium`: real
+        # A ledger cleanup is `medium`; Neo's verdict is its one sighting
         decision = steward.gate(
             steward.Candidate("neo_rider", "medium", str(q.get("project") or ""),
                               rider["title"], evidence=(f"neo question {q['id']}",),
-                              parent_wo_id=rider["wo_id"], payload=rider),
+                              parent_wo_id=rider["wo_id"], payload=rider, refs=1),
             catalog=self.catalog, store=pstore,
             self_dispatch=self.self_dispatch)
         if not decision.allowed:
@@ -3265,6 +3368,28 @@ class Daemon:
                      q["wo_id"], decision.outcome, decision.reason)
             return
         ops.file_neo_cleanup(pstore, rider, decision)
+
+    def _deliver_findings_verdict(self, q: dict, verdict: dict) -> None:
+        """Apply Neo's ruling on one improvement-order finding; the steward decides its spend"""
+        from . import ops
+
+        try:
+            out = ops.apply_findings_verdict(q, verdict)
+        except ops.OpsError:
+            log.exception("neo's verdict on findings question %s could not be applied",
+                          q["id"])
+            return
+        log.info("findings question %s: %s", q["id"],
+                 out.get("reason") or out.get("status") or "applied")
+
+    def _findings_question_unanswered(self, q: dict, detail: str) -> None:
+        """Neo made no decision on a finding, so the finding is the user's"""
+        from . import ops
+
+        try:
+            ops.findings_question_unanswered(q, detail)
+        except ops.OpsError:
+            log.exception("findings question %s: could not hand it to the user", q["id"])
 
     def _deliver_plan_verdict(self, central: CentralStore, neo_store: Any,
                               pstore: ProjectStore | None, q: dict,
@@ -4385,6 +4510,23 @@ class Daemon:
                 index.setdefault(session_id, []).append((started_at, ended_at, arm))
         return index
 
+    def _arm_rate_rows(self, since: float) -> list[tuple[str, str, int, str, float,
+                                                          int, int]]:
+        """Every project's stamped turns with the TTL split they actually paid (issue 1227)"""
+        rows: list[tuple[str, str, int, str, float, int, int]] = []
+        for project in self.catalog.projects:
+            if not project.path.is_dir():
+                continue
+            try:
+                found = self.store_for(project).turn_arm_rates(since)
+            except Exception:
+                log.exception("[%s] cache-TTL rates unreadable", project.name)
+                continue
+            for wo_id, seq, arm, started_at, cache_1h, cache_5m in found:
+                rows.append((project.name, wo_id, seq, arm, started_at,
+                             cache_1h, cache_5m))
+        return rows
+
     def check_cache_ttl(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Raise the fleet's remaining ONE-HOUR cache writes, split by who bought them (docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md)"""
         from .project_store import NO_TURN
@@ -4394,13 +4536,16 @@ class Daemon:
             return
         days = cfg.alarm_cache_1h_window_days
         since = db.now() - days * 86_400
+        found: list[inspection.HourWrites] = []
         try:
             found = inspection.one_hour_writes(since, arms=self._turn_arms(since))
         except OSError:  # a transcript tree that moved or is unreadable
             log.exception("[%s] the one-hour cache scan could not read transcripts",
                           project.name)
-            return
         raised = inspection.hour_alarms(found, cfg, days=days)
+        # Reads the RECORD, not the transcripts, so it holds when they do not read
+        raised += inspection.arm_miss_alarms(
+            inspection.arm_misses(self._arm_rate_rows(since)), cfg, days=days)
         if not raised:
             return
         carrier = store.latest_settled_order()
@@ -4793,6 +4938,8 @@ class Daemon:
             "issue_url": issue_url,
             "fix_wo_id": fix_wo_id,
             "issue_os_filed": issue_os_filed,
+            "ci_reruns": self._rerun_aborted_base_ci(project, store, owner, repo, base,
+                                                     runs, prev.get("ci_reruns") or {}),
             "checked_at": db.now(),
         }
         self.central.set_base_health(project.name, fact)
@@ -4820,6 +4967,53 @@ class Daemon:
             advance_red_episodes(
                 self.central.base_red_episodes(project.name), red, now,
                 project.fleet_health.red_episode_retention_hours * 3600.0))
+
+    def _rerun_aborted_base_ci(self, project: ProjectSpec, store: ProjectStore,
+                               owner: str, repo: str, base: str,
+                               runs: tuple[Any, ...], prev: Any) -> dict[str, str]:
+        """Re-run a default-branch run that JUDGED NOTHING, once each, so the base stays readable (#1193)"""
+        from . import ci, ci_rerun, github
+
+        state = {str(k): str(v) for k, v in prev.items()} if isinstance(prev, dict) else {}
+        # The newest run of a workflow, NOT its newest completed one: an in-flight re-run must not read as a...
+        newest: dict[str, Any] = {}
+        for r in runs:
+            if r.workflow:
+                newest.setdefault(r.workflow, r)
+        for workflow, run in newest.items():
+            if (not run.completed or run.run_id <= 0
+                    or run.conclusion not in ci_rerun.ABORTED_RUN_CONCLUSIONS):
+                continue
+            key = str(run.run_id)
+            if state.get(key) == "stuck":
+                continue
+            if state.get(key) == "rerun":
+                state[key] = "stuck"
+                store.add_notification(
+                    title=f"`{base}` has no CI verdict in {project.name}",
+                    body=(f"workflow `{workflow}` on {run.head_sha[:10] or 'its head'} "
+                          f"ended `{run.conclusion}` again after the OS re-ran it once, "
+                          f"so {ci.run_url(owner, repo, run.run_id)} says nothing about "
+                          f"the code — run `{ci_rerun.rerun_command(run.run_id)}`"),
+                    level="warning", source="base-health",
+                )
+                log.warning("[%s] %s CI on %s was %s again after one re-run (run %s)",
+                            project.name, base, workflow, run.conclusion, run.run_id)
+                continue
+            try:
+                ci_rerun.rerun(run.run_id, cwd=project.path)
+            except github.GitHubError as e:
+                # Unread is not unrecoverable: no attempt is spent, the next tick retries
+                log.info("[%s] could not re-run %s on %s: %s", project.name, run.run_id,
+                         base, e)
+                continue
+            state[key] = "rerun"
+            log.info("[%s] re-ran %s on %s — it ended %s and judged nothing",
+                     project.name, workflow, base, run.conclusion)
+        # Remembered only while the run still has NO verdict: an in-flight re-run counts as none
+        live = {str(r.run_id) for r in runs
+                if not r.completed or r.conclusion in ci_rerun.ABORTED_RUN_CONCLUSIONS}
+        return {k: v for k, v in state.items() if k in live}
 
     def dispatch_base_fix(self, project: ProjectSpec, store: ProjectStore) -> None:
         """A red tracker `main` files-or-adopts an issue and dispatches a work order on it (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §2.)"""
@@ -5150,6 +5344,46 @@ class Daemon:
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
 
+    def attach_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Record the open pull request the user made for a pushed-branch park; routes as `auto` (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §9)"""
+        from . import github, ops
+
+        # One bulk statement per step, `poll_pull_requests`' shape
+        candidates = [wo for wo in store.list_work_orders(statuses=("needs_review",),
+                                                          include_hidden=True)
+                      if not wo.get("pr_url")]
+        if not candidates:
+            return
+        ever = store.work_orders_with_event(PR_PENDING_EVENT,
+                                            [wo["id"] for wo in candidates])
+        parked = [(wo, park) for wo in candidates if wo["id"] in ever
+                  and (park := store.pr_pending_open(wo["id"])) is not None]
+        if not parked:
+            return
+        for wo, park in parked:
+            branch = str(park.get("branch") or "")
+            head_sha = str(park.get("head_sha") or "")
+            if not branch or not head_sha:
+                continue
+            try:
+                url = github.open_pull_request_for_branch(branch, cwd=project.path,
+                                                          head_sha=head_sha)
+            except github.GitHubError as e:
+                log.debug("[%s] could not look for %s's pull request: %s", project.name,
+                          wo["id"], e)
+                return
+            if not url:
+                continue
+            try:
+                ops.record_pull_request(wo["id"], url, project_name=project.name,
+                                        source="auto")
+            except ops.OpsError:
+                log.exception("[%s] could not attach %s to %s", project.name, url,
+                              wo["id"])
+                continue
+            log.info("[%s] attached %s to %s — found open on %s", project.name, url,
+                     wo["id"], branch)
+
     def refresh_landings(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what became of the pull request each COMPLETED order recorded"""
         from . import github, landing
@@ -5216,11 +5450,13 @@ class Daemon:
         # Spec 2026-09-28 §3.2
         base_behind = (automerge.BaseBehind(base=pr.base_ref, base_oid=pr.base_oid)
                        if ops.catch_up_needed(pr, repo=project.path) else None)
+        # #1063
+        drift = self._drift_hold(store, wo)
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
-            base_red=base_red, base_behind=base_behind)
+            drift=drift, base_red=base_red, base_behind=base_behind)
         if not decision.armed:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec... (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.5)
             outcome = CarryOutcome(False, False)
@@ -5233,7 +5469,8 @@ class Daemon:
                 decision = automerge.decide(
                     round_row, wo, pr, cfg,
                     validated_head=store.validated_head(round_row),
-                    pending_assumptions=pending, plan_assumptions=plan_assumptions)
+                    pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                    drift=drift)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
                 # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2
@@ -5265,7 +5502,7 @@ class Daemon:
                         round_row, wo, pr, cfg,
                         validated_head=store.validated_head(round_row),
                         pending_assumptions=pending, plan_assumptions=plan_assumptions,
-                        base_red=base_red)
+                        drift=drift, base_red=base_red)
                     # #1141: the moved head the base hold was hiding gets the carry too
                     if not decision.armed and decision.code == automerge.HELD_SHA_MOVED:
                         outcome = self._carry_catch_up(
@@ -5277,7 +5514,8 @@ class Daemon:
                                 round_row, wo, pr, cfg,
                                 validated_head=store.validated_head(round_row),
                                 pending_assumptions=pending,
-                                plan_assumptions=plan_assumptions, base_red=base_red)
+                                plan_assumptions=plan_assumptions, drift=drift,
+                                base_red=base_red)
                 else:
                     # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a base that has moved
                     moved = bool(caught.base_tip) and ops.catch_up_needed(
@@ -6049,11 +6287,14 @@ class Daemon:
                                f"this branch has already been rebuilt against "
                                f"{base_oid[:10]} once", base_tip=base_oid)
         if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
-            log.debug("[%s] %s has been caught up with %s %d times — leaving it held",
-                      project.name, wo_id, base, ops.CATCH_UP_MAX)
+            hours = ops.CATCH_UP_WINDOW_SECONDS // 3600
+            log.debug("[%s] %s has been caught up with %s %d times in %dh — leaving it "
+                      "held", project.name, wo_id, base, ops.CATCH_UP_MAX, hours)
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
-                               f"it has already been caught up {ops.CATCH_UP_MAX} time(s),"
-                               f" which is the cap ({ops.CATCH_UP_MAX})",
+                               f"it has already been caught up {ops.CATCH_UP_MAX} time(s)"
+                               f" in the last {hours}h, which is the cap "
+                               f"({ops.CATCH_UP_MAX}) — the OS chases it again once that "
+                               f"window clears",
                                base_tip=base_oid)
 
         # GUARD 6, and it is `heal_inherited_failure`'s review-round-1 note: `pr` was read at the top of the...
@@ -6178,6 +6419,25 @@ class Daemon:
                                     f"SUPERSEDED — `{base}` moved", reason)
             finally:
                 neo_store.close()
+
+    def _drift_hold(self, store: ProjectStore, wo: dict) -> Any:
+        """The open scope-drift finding this merge must not land over, or None (#1063)"""
+        from . import automerge
+        from .neo_store import NeoStore
+
+        alarm = automerge.open_drift_alarm(store.alarms_of(wo["id"]))
+        if alarm is None:
+            return None
+        question = None
+        # Only `escalated` has a question in flight; every other status reads off the row
+        if alarm["status"] == "escalated" and alarm["neo_question_id"]:
+            neo = NeoStore()
+            try:
+                question = neo.get(int(alarm["neo_question_id"]))
+            finally:
+                neo.close()
+        # A wedged one raises the flag through `invariants.true_blockers`, not from here
+        return automerge.drift_hold(alarm, question)
 
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:
@@ -6773,10 +7033,15 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
 
     def clear_settled_preconditions(self, project: ProjectSpec,
                                     store: ProjectStore) -> None:
-        """Clear every `bl-` precondition whose backlog item has settled (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)"""
+        """Clear every hold the OS can derive: a settled `bl-` item, deployed code (docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.2)"""
+        from . import preconditions
+
         for wo in store.list_work_orders(statuses=("pending",), include_hidden=True):
             for row in store.open_preconditions(wo["id"]):
                 ref = str(row["ref"])
+                if preconditions.deployed_target(ref):
+                    self.clear_deployed_precondition(project, store, wo, row)
+                    continue
                 if not ref.startswith("bl-"):
                     continue
                 item = self.central.get_backlog(ref)
@@ -6785,6 +7050,37 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
                 store.clear_precondition(int(row["id"]), by="os")
                 log.info("[%s] %s: precondition %s cleared (%s is %s)", project.name,
                          wo["id"], ref, ref, item["status"])
+
+    def clear_deployed_precondition(self, project: ProjectSpec, store: ProjectStore,
+                                    wo: dict[str, Any], row: dict[str, Any]) -> None:
+        """A `deployed:` hold clears when a release carrying that commit IS what production runs (docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.2)"""
+        from . import preconditions, release
+
+        # `overtaken_by` reads `jarvis-*` tags and the OS's own production checkout, as `_already_live` does
+        if project.name != self._os_project():
+            return
+        ref = str(row["ref"])
+        sha = self.deployed_hold_sha(project, store,
+                                     preconditions.deployed_target(ref))
+        if not sha:
+            return
+        found = release.overtaken_by(project.path, [sha])
+        if found.error or not (found.tag and found.live):
+            return
+        store.clear_precondition(int(row["id"]), by="os")
+        log.info("[%s] %s: precondition %s cleared (%s is in %s and production runs %s)",
+                 project.name, wo["id"], ref, sha[:8], found.tag, found.deployed)
+
+    def deployed_hold_sha(self, project: ProjectSpec, store: ProjectStore,
+                          target: str) -> str:
+        """The commit a `deployed:` hold waits for: a work order's merge commit, else the target"""
+        if not target.startswith("wo-"):
+            return target
+        try:
+            dep = store.get_work_order(target)
+        except KeyError:
+            return ""
+        return self._merge_commit_of(project, store, dep)
 
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red (docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5)"""

@@ -183,8 +183,8 @@ most one extra filing, where the file-level bucket silently lost a defect.
 #### The queue drains (#1181)
 
 A `queue` of a kind the OS can dispatch later on its own — a panel follow-up, a
-worker's improvement order, an alarm-born `file_work_order` remedy or a Neo ledger
-cleanup (`neo_rider`) — keeps the whole candidate on its decision row
+worker's improvement order, an alarm-born `file_work_order` remedy, a Neo ledger
+cleanup (`neo_rider`) or the orders of a finding Neo accepted (`io_finding`) — keeps the whole candidate on its decision row
 (`candidate_json`: subject, severity, evidence, file, parent, the caller's payload, and
 every wording folded onto it) with `queue_state='waiting'`. Every ten minutes the daemon
 runs `steward.drain` (in `enforce`, never while the fleet is paused): severest then
@@ -203,10 +203,15 @@ A remedy and a Neo rider must drain because nothing re-asks them: a remedy's
 `self_heal` grant has one use (`remedies.GRANT_USES`), spent before the steward is
 asked, so the next remedy tick refuses on a spent grant without reaching the steward;
 Neo's cleanup rides one verdict, delivered once. Re-offered, both are re-decided like
-any other: a Neo cleanup is `medium` with one sighting, so under the default
-`medium_min_refs` it keeps waiting on `recurrence` and expires after 14 days unless that
-threshold is lowered. An alarm-born remedy is `major`, so its one sighting meets the
-default `major_min_refs` of 1 at re-offer.
+any other. A Neo cleanup is `medium`, and Neo raises it once, so it can never collect the
+three sightings `medium_min_refs` asks of a panel finding. The verdict itself is the
+evidence instead: the cleanup is one sighting from the first ask, and the shipped
+`min_refs_by_kind` sets `neo_rider` to 1. It files on the first ask when the ledger has
+room, or on the first drain pass that finds room, and every earlier rule (depth,
+self-reference, precision, yield, ledger) still applies. Raising
+`min_refs_by_kind.neo_rider` back makes it wait on `recurrence` again. An alarm-born
+remedy is `major`, so its one sighting meets the default `major_min_refs` of 1 at
+re-offer.
 
 A `queue` recorded in `enforce` for one of these kinds with nothing kept to dispatch it
 from — rows written before 0.12.15 kept no candidate, and remedies and Neo riders kept no
@@ -237,6 +242,10 @@ Applied in order. The first matching rule wins.
    least `major_min_refs`. Otherwise → `queue`.
 7. **`medium`** → `dispatch` only if recurrence is at least `medium_min_refs` and the
    ledger has room. Otherwise → `queue`.
+
+An origin kind named in `min_refs_by_kind` uses that count in place of `major_min_refs`
+or `medium_min_refs`, whatever its severity. Only the recurrence threshold changes; rules
+2 to 5, the precision throttle, the yield rule and the ledger apply as before.
 
 `self_dispatch: false` keeps today's meaning: every `dispatch` above becomes `queue`.
 The steward still records what it *would* have done, and that record is what makes shadow
@@ -295,6 +304,7 @@ machinery (`src/jarvis/budget.py`). That bounds the overshoot of any single orde
     "max_depth": 1,                // OS work may dispatch only from user-originated parents
     "major_min_refs": 1,
     "medium_min_refs": 3,
+    "min_refs_by_kind": { "neo_rider": 1 },  // per origin kind, in place of *_min_refs
     "min_precision": 0.2,          // auto-throttle a detector below this over 4 weeks
     "mode": "shadow"               // shadow | enforce
   }
@@ -303,6 +313,9 @@ machinery (`src/jarvis/budget.py`). That bounds the overshoot of any single orde
 
 The ledger is fleet-wide, so the steward reads these keys from `os.evolution` only. A
 project's `evolution` block keeps its existing `min_samples` meaning.
+
+`min_refs_by_kind` is merged over the shipped default, so naming one kind keeps
+`neo_rider: 1`. An unknown origin kind or a negative count is refused at load.
 
 ### 3.4 Provenance
 
@@ -382,7 +395,10 @@ Mark each ✅ or ❌ with a note.
 - **A7. Release orders count against the evolution ledger.** They are cheap ($124 in the
   window), and keeping them in keeps the accounting honest.
 - **A8. Accepted improvement-order findings are user-originated.** The user decided them
-  in `jarvis io review`, so the steward does not gate them.
+  in `jarvis io review`, so the steward does not gate them. *Amended 2026-10-22:* a
+  finding NEO accepts is not user-originated. Its proposed orders are gated as origin
+  kind `io_finding`, with Neo's severity rating, and a `queue` of one drains like the
+  other drainable kinds (improvement-orders spec §5.5, as amended).
 - **A9. The steward is deterministic code, a sibling of Neo rather than a Neo persona.**
   Severity rating stays with the cheap model at the point of detection (Haiku, per U6).
 - **A10. A precision auto-throttle replaces model judgement of "fabricated".** The signal

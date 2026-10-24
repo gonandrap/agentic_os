@@ -59,11 +59,15 @@ n|url> ... an IMPROVEMENT order ("io" = improvement order): when the OS MISBEHAV
 
 ## `jarvis io list [project] [--all] / show <id>`
 
-show leads with the counts — `3 findings: 1 accepted, 1 rejected, 1 awaiting you` — then the observation and each finding
+show leads with the counts — `3 findings: 1 accepted, 1 rejected, 1 with Neo` — then the observation and each finding, with Neo's reading and the steward's decision when either touched it
 
 ## `jarvis io review <id> [--accept <key>] [--reject <key>] [--feedback "why"] [--accept-all]`
 
-decide the findings one by one. ACCEPT writes that finding's root cause to the knowledge base and FILES the orders it proposed, as ordinary independent orders with a back-link. REJECT needs --feedback: the reason teaches Neo. NOTHING is filed until you decide.
+only for what Neo handed back. NEO DECIDES EACH FINDING FIRST, one atomic question per finding: it rejects the ones it cannot defend, rates the rest on the steward's severity scale, and escalates the high-stakes ones. An accepted finding's orders then go to the STEWARD, which files them as OS work under its budget, holds them in its queue until there is room, or drops a minor one. You are asked only when Neo escalates, when Neo could not be reached, or when filing needs your yes (`os.autonomy.self_dispatch` off, or the steward's critical ceiling is spent). `--accept-all` takes everything left for you. ACCEPT writes the root cause to the knowledge base and FILES the proposed orders as your own work (never steward-gated), as ordinary independent orders with a back-link. REJECT needs --feedback: the reason teaches Neo. Neo's own decisions never do. `os.neo.review_findings: false` leaves every finding to you, as before.
+
+## `jarvis io ask-neo <id>`
+
+put the findings awaiting you back to Neo, by hand: a report Neo was never asked about, a finding Neo escalated, or one it could not be reached for. The daemon already offers never-asked reports by itself; this is for the rest and for "do it now". It skips findings Neo ACCEPTED: those wait only on your yes to the spend, and asking again would not change that. Works while the fleet is paused, because you typed it.
 
 ## `jarvis io cancel <id>`
 

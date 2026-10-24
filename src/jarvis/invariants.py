@@ -197,9 +197,10 @@ AUTOMERGE_DENIED_BLOCKER = ("the automatic merge of the commit the panel accepte
 
 #: THE BASE OUTRAN THE CATCH-UP (#1173, kn-d37ef253): the OS has retired the chase and asks
 CATCH_UP_EXHAUSTED_BLOCKER = ("the base moved under the commit the panel accepted and the "
-                              "OS has caught this branch up as often as it may, so "
-                              "nothing will land this pull request by itself — merge it "
-                              "by hand, or `jarvis wo send` the worker to rebase")
+                              "OS has caught this branch up as often as it may in one "
+                              "window, so nothing will land this pull request until that "
+                              "window clears — merge it by hand, or `jarvis wo send` the "
+                              "worker to rebase")
 
 #: THE HEAD MOVED OFF THE JUDGED COMMIT AND NO CARRY COULD BE PROVEN ONTO IT (#1188)
 CARRY_UNPROVEN_BLOCKER = ("the head of this pull request is not the commit the panel "
@@ -461,6 +462,17 @@ def release_base_red_blocker(said: dict[str, Any]) -> str:
         run_url=said.get("run_url") or "")
 
 
+def pr_pending_blocker(wo_id: str, park: dict[str, Any]) -> str:
+    """The pushed-branch-no-pull-request line, from the park payload only (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §5)"""
+    branch = str(park.get("branch") or "its branch")
+    base = str(park.get("base") or "the default branch")
+    url = str(park.get("compare_url") or "")
+    where = (f"open it at {url} (base `{base}`)" if url
+             else f"open one against `{base}`")
+    return (f"branch `{branch}` is pushed and has no pull request — {where}, then "
+            f"`jarvis wo pr {wo_id} <url>`")
+
+
 #: §9: the objection the OS sent about an assumption died on the way to the worker
 OBJECTION_UNDELIVERABLE_BLOCKER = ("the OS objected to an assumption and the objection "
                                    "never reached the worker — decide it yourself")
@@ -644,6 +656,16 @@ def _os_is_confirming(a: dict[str, Any]) -> bool:
     return verdict == "object" and bool(a.get("objection_delivered_ts"))
 
 
+def drift_review_failed(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The blocker when a merge is held on a scope-drift finding nothing retries (#1063)"""
+    from . import automerge
+
+    alarm = automerge.open_drift_alarm(store.alarms_of(wo["id"]))
+    if alarm is None or str(alarm["status"] or "") != "failed":
+        return ""
+    return automerge.DRIFT_BLOCKER.format(alarm_id=alarm["id"])
+
+
 def reviewable_assumptions(store: ProjectStore,
                            wo: dict[str, Any]) -> list[dict[str, Any]]:
     """The pending assumptions that are the USER's to review (io-d2a5dd69)"""
@@ -762,6 +784,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if (wo["status"] == "waiting_pr_merge"
             and carry_unproven_hold(store, wo["id"]) is not None):
         blockers.append(CARRY_UNPROVEN_BLOCKER)
+    # A SCOPE-DRIFT FINDING NOTHING WILL SETTLE BUT THE USER (#1063)
+    if wo["status"] == "waiting_pr_merge":
+        if wedged_drift := drift_review_failed(store, wo):
+            blockers.append(wedged_drift)
     # A MERGE THE REVIEWER REFUSED
     if wo["status"] == "waiting_pr_merge" and automerge_denied(store, wo):
         blockers.append(AUTOMERGE_DENIED_BLOCKER)
@@ -772,6 +798,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         # In the body, the pattern `auto_review_at` above already uses: `ops` imports this module
         from .ops import refusal_answered
 
+        # Above the triage and unguarded by `pending`, like PR_CLOSED_BLOCKER (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §5)
+        pr_pending = store.pr_pending_open(wo["id"])
+        if pr_pending is not None:
+            blockers.append(pr_pending_blocker(wo["id"], pr_pending))
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for something different (#224)
         if wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
@@ -792,8 +822,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(REFUSAL_UNANSWERED_DOC_BLOCKER
                             if wo.get("kind") in DOCUMENT_DELIVERY_KINDS
                             else REFUSAL_UNANSWERED_BLOCKER)
-        # 4
-        elif not pending:
+        # 4; a pushed-branch park always follows `finished`
+        elif not pending and pr_pending is None:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43)
     if stuck_message(store, wo, now=now) is not None:
@@ -1879,7 +1909,7 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
                 if q["kind"] in ("approval", "plan", "alarm", "triage",
-                                 "assumption", "question")]
+                                 "assumption", "question", "findings")]
         # `triage` is the one kind whose subject is not a row in THIS database (#240)
         mine = (registered_project_paths()
                 if any(q["kind"] == "triage" for q in held) else {})
@@ -1891,7 +1921,8 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
                     "alarm": _stale_alarm_question,
                     "triage": _stale_triage_question,
                     "assumption": _stale_assumption_question,
-                    "question": _stale_worker_question}[q["kind"]](store, q)
+                    "question": _stale_worker_question,
+                    "findings": _stale_findings_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -1945,6 +1976,26 @@ def _stale_plan_question(store: ProjectStore,
         return None
     return (f"SUPERSEDED — {fo['id']} is {fo['status']}",
             f"{fo['id']} left plan review and is now {fo['status']}")
+
+
+def _stale_findings_question(store: ProjectStore,
+                             q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if the finding this question decides was decided some other way"""
+    fo = store.feature_order_for_planner(q["wo_id"])
+    if fo is None or fo.get("kind") != "improvement":
+        return None
+    report = db.from_json(fo.get("plan"), None)
+    findings = report.get("findings") or [] if isinstance(report, dict) else []
+    finding = next((f for f in findings
+                    if isinstance(f, dict) and f.get("neo_question_id") == q["id"]), None)
+    if finding is None:
+        return (f"SUPERSEDED — {fo['id']}'s report was resubmitted",
+                f"{fo['id']}'s report no longer carries the finding this asked about")
+    status = finding.get("status") or "pending"
+    if status != "pending":
+        return (f"SUPERSEDED — finding {finding.get('key')!r} is {status}",
+                f"finding {finding.get('key')!r} of {fo['id']} was already {status}")
+    return None
 
 
 def _stale_alarm_question(store: ProjectStore,
@@ -2911,7 +2962,8 @@ def check_ui_wedged() -> Iterator[Violation]:
     restarts, cap, cap_spent = _ui_restart_counts()
     yield Violation(
         invariant="INV-UI-WEDGED",
-        detail=(f"the dashboard reported its threadpool wedged "
+        detail=(f"the dashboard reported itself wedged "
+                f"({stamp.get('reason') or 'threadpool wedged'}) "
                 f"{int(age // 60)} minutes ago and dumped every thread's stack to "
                 f"{stamp.get('dump') or uilog.stack_dump_path()} — the OS has "
                 f"self-restarted {release.UI_UNIT} {restarts} time"

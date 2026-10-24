@@ -213,6 +213,8 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
               else "the worker's worktree")
     parts.append(f"## The change, as collected from {origin}\n"
                  f"`{packet.base or '?'}` → `{packet.head or '?'}`")
+    if packet.diff_scope:
+        parts.append(_scope_section(packet))
     listed = "\n".join(f"- {f}" for f in packet.files) or "(no files changed)"
     parts.append(f"## Every file this change touches ({len(packet.files)}) — "
                  f"this list is NEVER truncated\n{listed}")
@@ -228,6 +230,25 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
             "rather than passing what you did not read.")
     parts.append(f"## The diff\n```diff\n{packet.diff or '(empty)'}\n```")
     return "\n\n".join(parts)
+
+
+def _scope_section(packet: EvidencePacket) -> str:
+    """What the feature's diff was narrowed to, and what it still may carry (issue 985)"""
+    if packet.diff_scope == "children":
+        listed = "\n".join(
+            f"- {c.get('id') or '?'} — `{c.get('merge_commit')}`"
+            for c in packet.children if c.get("merge_commit"))
+        return ("## The diff is SCOPED TO THIS FEATURE'S OWN CHILDREN\n"
+                "The range above ends at the default branch, which also carries other "
+                "features. The diff below is restricted to the paths these children's "
+                f"merge commits touched:\n{listed}\n"
+                "A file one of them touched may still hold a line from another "
+                "feature. Judge this feature's children.")
+    return ("## THE DIFF IS NOT SCOPED TO THIS FEATURE\n"
+            "No merge commit is recorded for any child, so the diff below is every "
+            "change on the default branch since this feature started and may carry "
+            "work belonging to other features. Say that you could not attribute the "
+            "code rather than raising findings about work this feature did not do.")
 
 
 def _history_section(packet: EvidencePacket) -> str:

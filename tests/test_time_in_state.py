@@ -554,6 +554,38 @@ def test_a_store_whose_spans_are_current_pays_two_scalar_reads(tmp_path):
     assert len(sql) == 4      # two counts, two MAXes, and nothing per order
 
 
+def test_two_openers_of_one_store_backfill_a_span_once(tmp_path):
+    """The kn-c23b0ce6 flake: a browser test's store and the UI server's both backfilled the same feature"""
+    import threading
+
+    path = tmp_path / "raced"
+    store = ProjectStore(path)
+    try:
+        fo = store.create_feature_order("Export the cost history")
+        store.conn.execute("DELETE FROM wo_state_spans WHERE order_id=?", (fo["id"],))
+        store.conn.commit()
+    finally:
+        store.close()
+
+    ready = threading.Barrier(2)
+
+    def open_it():
+        ready.wait()
+        ProjectStore(path).close()
+
+    threads = [threading.Thread(target=open_it) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    reopened = ProjectStore(path)
+    try:
+        assert len(reopened.state_spans(fo["id"])) == 1
+    finally:
+        reopened.close()
+
+
 def test_the_reader_reports_the_column_when_the_spans_disagree(store):
     """The belt"""
     wo = store.create_work_order("t")

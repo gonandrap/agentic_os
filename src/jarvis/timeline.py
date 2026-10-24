@@ -183,6 +183,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 " · ".join(x for x in (p.get("investigation"), p.get("filed")) if x))
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
+    # docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §1
+    if kind == "worktree_reclaimed":
+        if not p.get("removed"):
+            return "Checkout was already gone", p.get("why") or ""
+        branch = p.get("branch") or ""
+        return ("Checkout reclaimed",
+                f"the disk is back; `{branch}` still carries its commits" if branch
+                else "the disk is back")
     if kind == TURN_HARVESTED:
         # §5 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md
         if p.get("empty"):
@@ -326,7 +334,8 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         n = p.get("findings")
         return ("Findings submitted",
                 f"{n} finding(s) on {p.get('improvement_order') or ''}".strip())
-    if kind == "findings_reviewed":
+    # `findings_decided` is Neo or the steward deciding, kept apart so it never counts as the user
+    if kind in ("findings_reviewed", "findings_decided"):
         a, r = len(p.get("accepted") or []), len(p.get("rejected") or [])
         filed = len(p.get("created") or [])
         return (f"Findings reviewed by {p.get('by') or 'the user'}",
@@ -745,6 +754,12 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == BACKGROUND_UNRESOLVED:
         return ("Backgrounded it again after being sent back — over to you",
                 f"{p.get('attempts')} attempts")
+    if kind == "pr_pending":
+        # Shown however the attention line ranks (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §7)
+        where = f" — open it at {p['compare_url']}" if p.get("compare_url") else ""
+        return ("Pushed, with no pull request yet",
+                f"`{p.get('branch') or 'its branch'}` against "
+                f"`{p.get('base') or 'the default branch'}`{where}")
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "marked_done":

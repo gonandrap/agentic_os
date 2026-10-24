@@ -26,8 +26,9 @@ USER_HELD_Q_STATUSES = ("escalated", "failed")
 OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 
 # What Neo is being asked for (docs/superpowers/specs/2026-08-31-the-supervisor.md)
-#: `validation` is Morpheus asking about a shipped PR — like `triage`, no work order behind it
-Q_KINDS = ("question", "approval", "plan", "alarm", "triage", "assumption", "validation")
+#: `validation` is Morpheus asking about a shipped PR
+Q_KINDS = ("question", "approval", "plan", "alarm", "triage", "assumption", "validation",
+           "findings")
 
 # The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md
 SEATS = ("premise", "record", "blast", "taste", "chair")

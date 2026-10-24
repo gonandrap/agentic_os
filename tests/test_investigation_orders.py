@@ -534,6 +534,59 @@ def test_an_ordinary_worker_is_untouched_by_the_mcp_rule():
         assert hooks.preflight_decision(payload, _env(kind="worker")) is None, tool
 
 
+def _pretooluse_matcher(project, kind: str) -> str:
+    """The injected hook's own PreToolUse matcher in one work order's settings file"""
+    import re as _re
+
+    from jarvis.bootstrap import jarvis_hook_command
+    from jarvis.catalog import ProjectSpec
+
+    spec = ProjectSpec(name="proj_a", path=project, description="")
+    settings = json.loads(dispatch._write_worker_settings(
+        spec, {"id": f"wo-mcp-{kind}", "title": "t", "kind": kind}).read_text())
+    ours = [e for e in settings["hooks"]["PreToolUse"]
+            if any(h.get("command") == jarvis_hook_command() for h in e["hooks"])]
+    assert len(ours) == 1
+    _re.compile(ours[0]["matcher"])  # a matcher Claude Code cannot compile matches nothing
+    return ours[0]["matcher"]
+
+
+def _cli_matches(matcher: str, tool: str) -> bool:
+    """Claude Code's own rule: a matcher of only [A-Za-z0-9_|] is a list of EXACT tool names"""
+    import re as _re
+
+    if _re.fullmatch(r"[A-Za-z0-9_|]+", matcher):
+        return tool in matcher.split("|")
+    return _re.search(matcher, tool) is not None
+
+
+def test_the_investigators_matcher_routes_every_mcp_call_to_the_hook(project, jarvis_home):
+    """The hook holds the allowlist; the matcher decides whether it ever runs (#852)"""
+    investigator = _pretooluse_matcher(project, "investigator")
+    worker = _pretooluse_matcher(project, "worker")
+    for tool in MCP_WRITES + MCP_READS:
+        assert _cli_matches(investigator, tool), tool
+    # The negative control: an ordinary worker still pays the hook on NO MCP write
+    for tool in MCP_WRITES:
+        assert not _cli_matches(worker, tool), tool
+
+
+def test_a_bare_mcp_prefix_alternative_would_have_matched_nothing():
+    """Why MCP_MATCHER carries `.*`: round 1 of this order shipped the bare prefix and failed open"""
+    assert not _cli_matches("Bash|Edit|mcp__", "mcp__serena__create_text_file")
+    assert _cli_matches(f"Bash|Edit|{dispatch.MCP_MATCHER}",
+                        "mcp__serena__create_text_file")
+
+
+def test_settings_with_no_jarvis_hook_entry_refuse_to_widen():
+    """A silent no-op here is a read-only guarantee with nowhere to run"""
+    settings = {"hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"command": "/some/other/hook"}]}]}}
+
+    with pytest.raises(RuntimeError, match="investigator cannot be dispatched"):
+        dispatch.widen_mcp_matcher(settings)
+
+
 def test_a_piped_read_still_runs():
     for command in PIPED_READS:
         assert _decision(

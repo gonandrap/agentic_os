@@ -102,13 +102,15 @@ def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50
                         learnings_chars: int = LEARNINGS_CHAR_BUDGET) -> str:
     """Persona + learnings"""
     from .autoreview import ASSUMPTION_REVIEWER_PERSONA
+    from .findings import FINDINGS_REVIEWER_PERSONA
     from .gates import REVIEWER_PERSONA
     from .plans import PLAN_REVIEWER_PERSONA
     from .supervisor import ALARM_REVIEWER_PERSONA
 
     persona = {"approval": REVIEWER_PERSONA, "plan": PLAN_REVIEWER_PERSONA,
                "alarm": ALARM_REVIEWER_PERSONA,
-               "assumption": ASSUMPTION_REVIEWER_PERSONA}.get(kind, PERSONA)
+               "assumption": ASSUMPTION_REVIEWER_PERSONA,
+               "findings": FINDINGS_REVIEWER_PERSONA}.get(kind, PERSONA)
     parts = [persona, "", "# Learnings (from the user's reviews of your past answers)"]
     parts += render_learnings(store.learnings(project, limit=learnings_limit),
                               budget=learnings_chars)
@@ -122,7 +124,9 @@ def build_question_prompt(q: dict[str, Any]) -> str:
     ]
     if q.get("context"):
         # A plan question's context IS the subject — the spec being judged (§5)
-        label = "Spec under review" if q.get("kind") == "plan" else "Work order context"
+        label = {"plan": "Spec under review",
+                 "findings": "Improvement order"}.get(q.get("kind") or "",
+                                                      "Work order context")
         parts.append(f"{label}:\n{q['context']}")
     parts += ["", f"Worker question:\n{q['question']}"]
     return "\n".join(parts)
@@ -131,6 +135,8 @@ def build_question_prompt(q: dict[str, Any]) -> str:
 # What Neo may write in `verdict`, and the status it means
 _VERDICT_ALIASES = {
     "approve": "approved", "approved": "approved",
+    # A findings verdict says accept/reject; it means what approve/deny means everywhere else
+    "accept": "approved", "accepted": "approved",
     "deny": "denied", "denied": "denied", "reject": "denied", "rejected": "denied",
     "dismiss": "dismissed", "dismissed": "dismissed",
 }
@@ -190,6 +196,8 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         "stakes": str(data.get("stakes") or "")[:20].strip().lower(),
         # Read exactly as `stakes` is — normalised (docs/superpowers/specs/2026-10-01-neo-observability.md)
         "cause": _escalation_cause(data.get("cause")),
+        # A findings verdict's rating on the steward's scale
+        "severity": str(data.get("severity") or "")[:20].strip().lower(),
     }
 
 
@@ -319,7 +327,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
         else:
             # `text`, not `answer`: `answer` is the injected answerer above
             text = verdict["answer"]
-            if q.get("kind") in ("approval", "plan"):
+            if q.get("kind") in ("approval", "plan", "findings"):
                 # A ruling lives in `verdict`, not in prose
                 text = (verdict.get("verdict") or "denied").upper()
             store.record_answer(q["id"], text, answered_by="neo",

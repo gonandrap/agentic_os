@@ -368,7 +368,7 @@ def test_a_promoted_hold_is_live_not_stranding(started, store, central):
     central.mark_backlog(item["id"], "promoted")
 
     rows = store.open_preconditions(wo["id"])
-    assert ops._split_preconditions(rows) == ([item["id"]], [])
+    assert ops._split_preconditions(rows, store) == ([item["id"]], [])
 
     with pytest.raises(ops.OpsError) as e:
         ops.unblock_work_order(wo["id"])

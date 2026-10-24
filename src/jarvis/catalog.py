@@ -43,7 +43,8 @@ SAFETY_KEYS = (
     # How much of that the steward may spend, and how deep it may go (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
     "os.evolution.weekly_usd", "os.evolution.critical_weekly_usd",
     "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
-    "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_precision",
+    "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_refs_by_kind",
+    "os.evolution.min_precision",
     "os.evolution.mode",
     # What the OS is permitted to WATCH (docs/superpowers/specs/2026-09-27-self-evolution.md)
     "*.rules.*",
@@ -419,6 +420,9 @@ DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS = 500_000
 #: The same, for turns JARVIS ITSELF dispatched
 DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS = 50_000
 
+#: Tokens a STAMPED turn paid at the TTL it was NOT armed for (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
+DEFAULT_INSPECT_ALARM_CACHE_ARM_MISSED_TOKENS = 50_000
+
 #: `InspectConfig` fields that are a FRACTION, not a count
 INSPECT_FRACTION_KEYS = ("alarm_rewrite_prefix_share", "alarm_rewrite_ttl_share")
 
@@ -451,6 +455,8 @@ class InspectConfig:
     alarm_cache_1h_tokens: int = DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS
     alarm_cache_1h_dispatched_tokens: int = \
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
+    alarm_cache_arm_missed_tokens: int = \
+        DEFAULT_INSPECT_ALARM_CACHE_ARM_MISSED_TOKENS
 
 
 # -- `ui_health`: the dashboard's own liveness, and the self-heal that answers it
@@ -476,6 +482,9 @@ DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY = 3
 #: An unreachable dashboard this recently (re)started is still booting, not wedged
 DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS = 60
 
+#: Heartbeat staleness at which the OS-thread watchdog dumps stacks itself (issue #1221)
+DEFAULT_UI_HEALTH_LOOP_STALL_SECONDS = 90
+
 
 @dataclass
 class UiHealthConfig:
@@ -489,6 +498,7 @@ class UiHealthConfig:
     restart_cooldown_seconds: int = DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS
     max_restarts_per_day: int = DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY
     boot_grace_seconds: int = DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS
+    loop_stall_seconds: int = DEFAULT_UI_HEALTH_LOOP_STALL_SECONDS
 
 
 # -- `fleet_health`: when an order that has stopped moving gets investigated. §4 of
@@ -794,6 +804,12 @@ class WiringConfig:
 #: Tracked files an installed TOOL owns and rewrites
 DEFAULT_TOOL_MANAGED_PATHS = (".serena/project.yml",)
 
+#: How long a settled order's checkout is kept before the daemon reclaims it; 0 = never (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md)
+DEFAULT_WORKTREE_RECLAIM_AFTER_HOURS = 24
+
+#: Free gigabytes under which the daemon raises ONE attention item; 0 = never (same spec, §2)
+DEFAULT_DISK_FREE_WARN_GB = 5.0
+
 
 @dataclass
 class WorktreeConfig:
@@ -801,6 +817,7 @@ class WorktreeConfig:
 
     #: Repo-relative paths
     tool_managed_paths: tuple[str, ...] = DEFAULT_TOOL_MANAGED_PATHS
+    reclaim_after_hours: int = DEFAULT_WORKTREE_RECLAIM_AFTER_HOURS
 
 
 @dataclass
@@ -876,6 +893,8 @@ DEFAULT_EVOLUTION_ORDER_BUDGET_USD = 25.0
 DEFAULT_EVOLUTION_MAX_DEPTH = 1
 DEFAULT_EVOLUTION_MAJOR_MIN_REFS = 1
 DEFAULT_EVOLUTION_MEDIUM_MIN_REFS = 3
+#: Per origin kind, in place of the severity's `*_min_refs`: Neo raises a cleanup once, in one verdict
+DEFAULT_EVOLUTION_MIN_REFS_BY_KIND = {"neo_rider": 1}
 DEFAULT_EVOLUTION_MIN_PRECISION = 0.2
 #: `shadow` decides and records but changes no dispatch; `enforce` applies the decision
 EVOLUTION_MODES = ("shadow", "enforce")
@@ -894,6 +913,8 @@ class EvolutionConfig:
     max_depth: int = DEFAULT_EVOLUTION_MAX_DEPTH
     major_min_refs: int = DEFAULT_EVOLUTION_MAJOR_MIN_REFS
     medium_min_refs: int = DEFAULT_EVOLUTION_MEDIUM_MIN_REFS
+    min_refs_by_kind: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_EVOLUTION_MIN_REFS_BY_KIND))
     min_precision: float = DEFAULT_EVOLUTION_MIN_PRECISION
     mode: str = "shadow"
 
@@ -1009,6 +1030,8 @@ class NeoConfig:
     digest_model: str = "haiku"
     #: How much of a question the digest model is shown, clipped and LABELLED (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     digest_max_question_chars: int = DEFAULT_DIGEST_MAX_QUESTION_CHARS
+    #: Neo decides each improvement-order finding for the user; the steward decides what it files
+    review_findings: bool = True
     panel: PanelConfig = field(default_factory=PanelConfig)
 
 
@@ -1109,6 +1132,8 @@ class OsConfig:
     compact_min_context: int | None = DEFAULT_COMPACT_MIN_CONTEXT
     #: Backstop ceiling on one OS-side model call's combined prompt
     max_os_prompt_chars: int = DEFAULT_MAX_OS_PROMPT_CHARS
+    #: The floor the daemon warns under, before SQLite starts failing
+    disk_free_warn_gb: float = DEFAULT_DISK_FREE_WARN_GB
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -1199,6 +1224,15 @@ def _compact_min_context_or_err(os_raw: dict[str, Any]) -> int | None:
                    f"{COMPACT_MIN_CONTEXT_MIN}, where compacting costs more than the "
                    f"re-write it replaces (use null to switch compaction off)")
     return value
+
+
+def _disk_free_warn_gb_or_err(os_raw: dict[str, Any]) -> float:
+    """`os.disk_free_warn_gb`, validated at boot — 0 is the off switch"""
+    value = os_raw.get("disk_free_warn_gb", DEFAULT_DISK_FREE_WARN_GB)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise _err(f"os.disk_free_warn_gb must be a non-negative number of gigabytes "
+                   f"(0 to never warn), got {value!r}")
+    return float(value)
 
 
 def _max_os_prompt_chars_or_err(os_raw: dict[str, Any]) -> int:
@@ -1458,6 +1492,9 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
         alarm_cache_1h_dispatched_tokens=int(
             raw.get("alarm_cache_1h_dispatched_tokens",
                     base.alarm_cache_1h_dispatched_tokens)),
+        alarm_cache_arm_missed_tokens=int(
+            raw.get("alarm_cache_arm_missed_tokens",
+                    base.alarm_cache_arm_missed_tokens)),
     )
     for name, value in vars(cfg).items():
         if name in INSPECT_FRACTION_KEYS:
@@ -1494,6 +1531,8 @@ def _parse_ui_health(raw: Any, base: UiHealthConfig | None = None,
                                          base.max_restarts_per_day)),
         boot_grace_seconds=int(raw.get("boot_grace_seconds",
                                        base.boot_grace_seconds)),
+        loop_stall_seconds=int(raw.get("loop_stall_seconds",
+                                       base.loop_stall_seconds)),
     )
     for name, value in vars(cfg).items():
         if name != "enabled" and value < 1:
@@ -1741,6 +1780,21 @@ def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
         if value < 0:
             raise _err(f"{where}.{key} must be 0 or more, got {value}")
         counts[key] = value
+    by_kind = raw.get("min_refs_by_kind", {})
+    if not isinstance(by_kind, dict):
+        raise _err(f"{where}.min_refs_by_kind must be an object of origin kind -> count")
+    from .steward import ORIGIN_KINDS
+
+    # Merged over the base: setting one kind does not silently drop the shipped `neo_rider`
+    counts["min_refs_by_kind"] = dict(base.min_refs_by_kind)
+    for kind, raw_value in by_kind.items():
+        if kind not in ORIGIN_KINDS:
+            raise _err(f"{where}.min_refs_by_kind.{kind}: not an origin kind; "
+                       f"one of {list(ORIGIN_KINDS)}")
+        value = int(raw_value)
+        if value < 0:
+            raise _err(f"{where}.min_refs_by_kind.{kind} must be 0 or more, got {value}")
+        counts["min_refs_by_kind"][kind] = value
     min_precision = float(raw.get("min_precision", base.min_precision))
     if not 0 <= min_precision <= 1:
         raise _err(f"{where}.min_precision must be between 0 and 1, got {min_precision}")
@@ -1884,7 +1938,11 @@ def _parse_worktree(raw: Any, base: WorktreeConfig | None = None,
             raise _err(f"{where}.tool_managed_paths entry {path!r} must be repo-relative")
         if ".." in PurePosixPath(path).parts:
             raise _err(f"{where}.tool_managed_paths entry {path!r} must not contain '..'")
-    return WorktreeConfig(tool_managed_paths=paths)
+    hours = raw.get("reclaim_after_hours", base.reclaim_after_hours)
+    if isinstance(hours, bool) or not isinstance(hours, int) or hours < 0:
+        raise _err(f"{where}.reclaim_after_hours must be a non-negative integer "
+                   f"(0 to never reclaim)")
+    return WorktreeConfig(tool_managed_paths=paths, reclaim_after_hours=hours)
 
 
 def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
@@ -2068,6 +2126,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         timeout=int(neo_raw.get("timeout", 300)),
         digest_model=str(neo_raw.get("digest_model", "haiku")),
         digest_max_question_chars=_digest_max_question_chars_or_err(neo_raw),
+        review_findings=bool(neo_raw.get("review_findings", True)),
         panel=_parse_panel(neo_raw.get("panel", {})),
     )
 
@@ -2112,6 +2171,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         cache_health_prefix_share=health_prefix,
         compact_min_context=_compact_min_context_or_err(os_raw),
         max_os_prompt_chars=_max_os_prompt_chars_or_err(os_raw),
+        disk_free_warn_gb=_disk_free_warn_gb_or_err(os_raw),
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 8)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 1000)),
