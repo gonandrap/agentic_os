@@ -447,7 +447,7 @@ def protection_fact(protection: Any, base: str) -> str:
     if protection is None:
         return (f"`{base}` carries no branch protection rules: this gate and "
                 f"`--match-head-commit` are the only things standing between this commit "
-                f"and the default branch, so read the evidence above on that footing.")
+                f"and `{base}`, so read the evidence above on that footing.")
     names = protection.required_checks
     if not names:
         return (f"`{base}` is protected, and the protection requires no status check: "
@@ -492,7 +492,7 @@ def _request_question(project: str, wo: dict[str, Any], decision: Decision,
                  text=wo.get("description") or "", limit=DESCRIPTION_LIMIT)))
     parts += [
         "# What it cannot undo\n"
-        "The squash lands on the default branch. No branch is deleted, here or on the "
+        f"The squash lands on `{base}`. No branch is deleted, here or on the "
         "remote. The work order completes."
         + (f"\n{protection}" if protection else ""),
         "Approve it to let the OS merge, or deny it with a reason. Denying leaves the "

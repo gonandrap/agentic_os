@@ -1631,6 +1631,23 @@ def test_with_no_protection_fact_the_request_makes_no_claim_about_protection():
     assert "branch protection" not in text.lower()
 
 
+def test_the_request_names_the_base_the_squash_lands_on():
+    text = automerge._request_question(
+        "proj_a", {"id": "wo-1", "title": "t"},
+        automerge.Decision(armed=True, code="", reason="r", judged_sha=JUDGED,
+                           round_n=2), PR, checks=(), base="release/x")
+
+    assert "The squash lands on `release/x`." in text
+    assert "default branch" not in text
+
+
+def test_an_unprotected_base_names_itself_as_where_the_commit_lands():
+    fact = automerge.protection_fact(None, "release/x")
+
+    assert "default branch" not in fact
+    assert "`release/x`" in fact
+
+
 def test_a_protection_fact_is_rendered_verbatim_and_nowhere_else():
     fact = automerge.protection_fact(None, "main")
     text = automerge._request_question(
