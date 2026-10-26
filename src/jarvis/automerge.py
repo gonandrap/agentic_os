@@ -50,6 +50,7 @@ HELD_SHA_UNRECORDED = "sha_unrecorded"
 HELD_SHA_MOVED = "sha_moved"
 HELD_PR_CLOSED = "pr_closed"
 HELD_NOT_MERGEABLE = "not_mergeable"
+HELD_DRAFT = "draft"
 #: Three worlds `github.PullRequest.checks_green` is false in (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §5)
 HELD_CHECKS_FAILED = "checks_failed"
 HELD_CHECKS_RUNNING = "checks_running"
@@ -359,6 +360,10 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
         return _held(HELD_PR_CLOSED,
                      f"the pull request is {getattr(pr, 'state', '') or 'unreadable'}",
                      **fields)
+    if getattr(pr, "draft", False):
+        return _held(HELD_DRAFT,
+                     "the pull request is a draft, and GitHub refuses to merge a draft "
+                     "until it is marked ready for review", **fields)
     if not pr.mergeable_now:
         return _held(HELD_NOT_MERGEABLE,
                      "GitHub does not (yet) say the branch merges cleanly", **fields)

@@ -1631,6 +1631,23 @@ def test_with_no_protection_fact_the_request_makes_no_claim_about_protection():
     assert "branch protection" not in text.lower()
 
 
+def test_a_draft_pull_request_is_held_before_any_request_is_filed():
+    decision = decide(rnd(), pull=pr(draft=True))
+
+    assert not decision.armed
+    assert decision.code == automerge.HELD_DRAFT
+
+
+def test_the_poll_reads_whether_the_pull_request_is_a_draft(monkeypatch):
+    from jarvis import github
+
+    monkeypatch.setattr(github, "checked_pr_url", lambda url, cwd=None: url)
+    monkeypatch.setattr(github, "_run", lambda args, **kw: (
+        '{"state": "OPEN", "isDraft": true}' if "isDraft" in args[-1] else '{"state": "OPEN"}'))
+
+    assert github.pr_view(PR).draft
+
+
 def test_the_request_names_the_base_the_squash_lands_on():
     text = automerge._request_question(
         "proj_a", {"id": "wo-1", "title": "t"},
