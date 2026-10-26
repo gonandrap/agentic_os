@@ -5537,6 +5537,8 @@ class Daemon:
                     return
             if not decision.armed:
                 self._note_automerge_held(store, wo_id, decision)
+                if not record_only and decision.code == automerge.HELD_DRAFT:
+                    automerge.mark_ready(store, wo, decision.head_sha, cwd=project.path)
                 # TWO CODES, ONE PROPERTY (spec 2026-10-16 §1): a passed round whose commit binding is unusable and a...
                 if (not record_only
                         and decision.code in (automerge.HELD_SHA_MOVED,

@@ -1545,6 +1545,50 @@ def parked(started, project):
     return store
 
 
+def readies(fake_gh) -> list:
+    return [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "ready"]]
+
+
+def test_a_draft_the_panel_passed_is_marked_ready_and_then_proposed(
+        started, project, fake_gh):
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   draft=True)
+
+    poll(started, store)
+
+    assert [c["argv"][2] for c in readies(fake_gh)] == [PR]
+    [event] = store.events_of_kind(wo["id"], automerge.READY_EVENT)
+    assert JUDGED in event["payload"]
+    poll(started, store)
+    assert store.list_approvals(wo["id"])[0]["status"] == "pending"
+    assert len(readies(fake_gh)) == 1
+
+
+def test_a_draft_is_marked_ready_once_per_commit(started, project, fake_gh):
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   draft=True)
+    poll(started, store)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   draft=True)
+
+    poll(started, store)
+
+    assert len(readies(fake_gh)) == 1
+    assert store.list_approvals(wo["id"]) == []
+
+
+def test_a_draft_the_panel_has_not_passed_stays_a_draft(started, project, fake_gh):
+    store, wo = arm(started, project, auto_merge=True, outcome="rejected")
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   draft=True)
+
+    poll(started, store)
+
+    assert readies(fake_gh) == []
+
+
 def test_the_reviewer_is_told_what_each_check_concluded(parked):
     """Three names are equally true of three passing checks and three failing ones"""
     checks = (check("unit (3.13)"), check("evals", conclusion="FAILURE"))
@@ -1629,6 +1673,53 @@ def test_with_no_protection_fact_the_request_makes_no_claim_about_protection():
                            round_n=2), PR, checks=tuple(GREEN), protection="")
 
     assert "branch protection" not in text.lower()
+
+
+def test_a_draft_pull_request_is_held_before_any_request_is_filed():
+    decision = decide(rnd(), pull=pr(draft=True))
+
+    assert not decision.armed
+    assert decision.code == automerge.HELD_DRAFT
+
+
+def test_a_draft_with_red_ci_is_held_on_ci_not_on_being_a_draft():
+    """Only a draft that would otherwise merge is the OS's to mark ready"""
+    decision = decide(rnd(), pull=pr(draft=True, checks=(check("unit", "FAILURE"),)))
+
+    assert decision.code == automerge.HELD_CHECKS_FAILED
+
+
+def test_a_merge_state_of_draft_reads_as_a_draft():
+    decision = decide(rnd(), pull=pr(draft=True, merge_state="DRAFT"))
+
+    assert decision.code == automerge.HELD_DRAFT
+
+
+def test_the_poll_reads_whether_the_pull_request_is_a_draft(monkeypatch):
+    from jarvis import github
+
+    monkeypatch.setattr(github, "checked_pr_url", lambda url, cwd=None: url)
+    monkeypatch.setattr(github, "_run", lambda args, **kw: (
+        '{"state": "OPEN", "isDraft": true}' if "isDraft" in args[-1] else '{"state": "OPEN"}'))
+
+    assert github.pr_view(PR).draft
+
+
+def test_the_request_names_the_base_the_squash_lands_on():
+    text = automerge._request_question(
+        "proj_a", {"id": "wo-1", "title": "t"},
+        automerge.Decision(armed=True, code="", reason="r", judged_sha=JUDGED,
+                           round_n=2), PR, checks=(), base="release/x")
+
+    assert "The squash lands on `release/x`." in text
+    assert "default branch" not in text
+
+
+def test_an_unprotected_base_names_itself_as_where_the_commit_lands():
+    fact = automerge.protection_fact(None, "release/x")
+
+    assert "default branch" not in fact
+    assert "`release/x`" in fact
 
 
 def test_a_protection_fact_is_rendered_verbatim_and_nowhere_else():

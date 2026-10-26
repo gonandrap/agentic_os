@@ -139,7 +139,7 @@ def blob_url(cwd: Path | None, repo_path: str) -> str | None:
 
 #: The fields of one `gh pr view --json …` (#232)
 PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,baseRefOid,"
-             "statusCheckRollup,headRefOid,headRefName,mergeCommit")
+             "statusCheckRollup,headRefOid,headRefName,mergeCommit,isDraft")
 
 #: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green
 RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "ERROR"})
@@ -195,6 +195,8 @@ class PullRequest:
     head_ref: str = ""
     #: `mergeCommit.oid`: the commit THIS PULL REQUEST PUT ON ITS BASE (docs/superpowers/specs/2026-09-26-a-release-order-overtaken-mid-ci-wait-settles-itself.md §2)
     merge_commit_oid: str = ""
+    #: `isDraft`: GitHub refuses to merge a draft even when its merge state reads CLEAN
+    draft: bool = False
 
     @property
     def merged(self) -> bool:
@@ -298,6 +300,7 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         head_ref=str(payload.get("headRefName") or ""),
         # A nested object, so one `or {}` guard — spec §2
         merge_commit_oid=str((payload.get("mergeCommit") or {}).get("oid") or ""),
+        draft=bool(payload.get("isDraft")),
     )
 
 
