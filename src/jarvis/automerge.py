@@ -29,10 +29,13 @@ log = logging.getLogger(__name__)
 GATE_KIND = "auto_merge"
 
 #: EVERY `gh` SUBCOMMAND THIS MODULE MAY RUN
-WRITE_VERBS = (("pr", "merge"),)
+WRITE_VERBS = (("pr", "merge"), ("pr", "ready"))
 
 #: A grant covers ONE merge
 GRANT_USES = 1
+
+#: The OS took its own worker's draft out of draft, for one commit
+READY_EVENT = "automerge_marked_ready"
 
 #: A merge is one API round trip
 MERGE_TIMEOUT = 60
@@ -360,10 +363,6 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
         return _held(HELD_PR_CLOSED,
                      f"the pull request is {getattr(pr, 'state', '') or 'unreadable'}",
                      **fields)
-    if getattr(pr, "draft", False):
-        return _held(HELD_DRAFT,
-                     "the pull request is a draft, and GitHub refuses to merge a draft "
-                     "until it is marked ready for review", **fields)
     if not pr.mergeable_now:
         return _held(HELD_NOT_MERGEABLE,
                      "GitHub does not (yet) say the branch merges cleanly", **fields)
@@ -382,6 +381,12 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"CI was cancelled on this commit, not failed — "
                      f"{checks_evidence(aborted)} — and GitHub blocks the merge until "
                      f"it is re-run", **fields)
+    # LAST BEFORE THE MERGE STATE: a draft held here is one the OS may mark ready itself
+    if getattr(pr, "draft", False) or \
+            str(getattr(pr, "merge_state", "") or "").upper() == "DRAFT":
+        return _held(HELD_DRAFT,
+                     "the pull request is a draft, and GitHub refuses to merge a draft "
+                     "until it is marked ready for review", **fields)
     if str(getattr(pr, "merge_state", "") or "").upper() != "CLEAN":
         return _held(HELD_MERGE_STATE_UNCLEAN,
                      f"GitHub reports the merge state as "
@@ -422,6 +427,30 @@ def sha_of_command(command: str) -> str:
 def decided_sha(payload: dict[str, Any]) -> str:
     """The commit an `automerge_decided` row was bound to — spec 2026-09-24 fix 4a"""
     return str(payload.get("head_sha") or "") or sha_of_command(payload.get("command"))
+
+
+def mark_ready(store: Any, wo: dict[str, Any], head_sha: str, cwd: Any = None) -> bool:
+    """Take the order's own draft out of draft, once per commit; the merge stays gated"""
+    from . import db, github
+    from .github import gh_bin
+
+    if any(str(db.from_json(e["payload"], {}).get("head_sha") or "") == head_sha
+           for e in store.events_of_kind(wo["id"], READY_EVENT)):
+        return False
+    url = github.checked_pr_url(str(wo.get("pr_url") or ""), cwd=cwd)
+    try:
+        proc = subprocess.run([gh_bin(), "pr", "ready", url], capture_output=True,
+                              text=True, timeout=MERGE_TIMEOUT,
+                              cwd=str(cwd) if cwd is not None else None)
+        failure = "" if proc.returncode == 0 else (
+            (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}")
+    except (OSError, subprocess.SubprocessError) as e:
+        failure = str(e)
+    store.add_event(wo["id"], READY_EVENT, {"head_sha": head_sha, "pr_url": url,
+                                            "failure": failure[:500]})
+    log.info("marked %s ready for review at %s%s", url, head_sha[:10],
+             f" — failed: {failure}" if failure else "")
+    return not failure
 
 
 def _merge_args(pr_url: str, sha: str) -> list[str]:

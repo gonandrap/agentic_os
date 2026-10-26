@@ -1582,6 +1582,22 @@ elif argv[:2] == ["pr", "diff"]:
         sys.stderr.write("no pull requests found for this URL\n")
         sys.exit(1)
     sys.stdout.write(pr.get("_diff", ""))
+elif argv[:2] == ["pr", "ready"]:
+    # Takes a draft out of draft, through the same overlay a merge writes
+    prs = roster()
+    url = argv[2] if len(argv) > 2 else ""
+    if url not in prs:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    try:
+        with open(merged_path) as f:
+            landed = json.load(f)
+    except (OSError, ValueError):
+        landed = {}
+    landed[url] = {**landed.get(url, {}), "isDraft": False}
+    with open(merged_path, "w") as f:
+        json.dump(landed, f)
+    print(f"Pull request {url} is marked as ready for review")
 elif argv[:2] == ["pr", "merge"]:
     # THE ONE WRITE THE OS EVER MAKES. It is modelled on the property the whole
     # auto-merge design rests on: `--match-head-commit <sha>` is refused by the SERVER
@@ -1966,7 +1982,7 @@ def fake_gh(tmp_path, monkeypatch):
                    checks: list[dict] | None = None,
                    merge_state: str | None = None, head_oid: str = "",
                    base_oid: str = "", merge_commit: str = "",
-                   head_ref: str = "") -> None:
+                   head_ref: str = "", draft: bool | None = None) -> None:
             """Register what `gh pr view <pr_url>` answers (#232)"""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
@@ -1987,6 +2003,8 @@ def fake_gh(tmp_path, monkeypatch):
             # `mergeCommit.oid`, the commit the merge put on the base
             if merge_commit:
                 row["mergeCommit"] = {"oid": merge_commit}
+            if draft is not None:
+                row["isDraft"] = draft
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
             # "Re-calling re-states it" includes un-doing a merge the fake performed: this is the authoritative...
