@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import plistlib
 import re
 import subprocess
 import time
@@ -45,15 +46,25 @@ def is_release_order(wo: dict[str, Any]) -> bool:
     return isinstance(meta.get(BATCH_KEY), list)
 
 #: Where `scripts/install_prod_service.sh` installs the two units
-UNIT_DIR_ENV = "JARVIS_SYSTEMD_UNIT_DIR"
+UNIT_DIR_ENV = service_manager.UNIT_DIR_ENV
 
 
 def unit_dir() -> Path:
-    return Path(os.environ.get(UNIT_DIR_ENV) or "~/.config/systemd/user").expanduser()
+    default = ("~/Library/LaunchAgents" if service_manager.manager() == service_manager.LAUNCHD
+               else "~/.config/systemd/user")
+    return Path(os.environ.get(UNIT_DIR_ENV) or default).expanduser()
 
 
 def unit_environment(unit: str, name: str) -> str | None:
-    """One `Environment=<name>=…` value from an installed unit, or None"""
+    """One environment value from an installed unit — or its launchd plist — or None"""
+    if service_manager.manager() == service_manager.LAUNCHD:
+        try:
+            with (unit_dir() / f"{service_manager.label(unit)}.plist").open("rb") as f:
+                env = plistlib.load(f).get("EnvironmentVariables") or {}
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            return None
+        value = env.get(name) if isinstance(env, dict) else None
+        return value if isinstance(value, str) else None
     try:
         text = (unit_dir() / unit).read_text(encoding="utf-8")
     except OSError:

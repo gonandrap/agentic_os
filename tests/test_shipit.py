@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -86,8 +87,7 @@ def _dry_run(repo: Path, prod: Path, *args: str) -> subprocess.CompletedProcess[
                            # `gh` must not decide if the release page is planned
     env = {**os.environ,
            "PRODUCTION_CODE": str(prod),
-           # Pinned: the restart assertions below describe the Linux branch and must
-           # hold on a macOS developer machine too, where the default is launchd.
+           # Pinned: the restart assertions below describe the Linux branch, on a Mac too
            "JARVIS_SERVICE_MANAGER": os.environ.get("TEST_SERVICE_MANAGER", "systemd"),
            "PATH": f"{stub_bin}{os.pathsep}{os.environ['PATH']}"}
     return subprocess.run(
@@ -849,7 +849,7 @@ def test_notify_never_echoes_the_bot_token(tmp_path):
     assert "rc=0" in out, out
 
 
-# -- launchd: shipping on a macOS production host --------------------------------
+# -- launchd: shipping on a macOS production host
 
 
 def test_on_launchd_the_services_are_restarted_with_launchctl_not_systemctl(tmp_path):
@@ -858,12 +858,21 @@ def test_on_launchd_the_services_are_restarted_with_launchctl_not_systemctl(tmp_
     assert r.returncode == 0, r.stderr
     out = r.stdout
     assert "systemctl" not in out and "systemd-run" not in out
-    assert "launchctl kickstart -k gui/" in out
+    # A reload, not `kickstart -k`: only a bootstrap reads the plist step 5a re-rendered
+    assert "launchctl bootout gui/" in out and "launchctl bootstrap gui/" in out
+    assert "kickstart" not in out
     assert "com.jarvis.ui" in out and "com.jarvis.daemon" in out
 
 
+def test_no_sed_call_edits_in_place():
+    """BSD sed reads `sed -i -E` as backup suffix `-E` and edits nothing"""
+    code = [ln for ln in SHIPIT.read_text().splitlines() if not ln.lstrip().startswith("#")]
+    assert not [ln for ln in code if re.search(r"\bsed\b[^|;]*\s-i", ln)]
+    assert not [ln for ln in code if "0,/" in ln], "the `0,/re/` address is GNU-only"
+
+
 def test_on_launchd_the_daemon_restart_is_still_detached_and_last(tmp_path):
-    """The 0.5.0 trap does not care which init system kills the script."""
+    """The 0.5.0 trap does not care which init system kills the script"""
     repo = _make_repo(tmp_path)
     r = _dry_run_launchd(repo, _deployed(tmp_path), "0.2.0")
     out = r.stdout

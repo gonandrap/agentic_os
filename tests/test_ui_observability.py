@@ -693,7 +693,7 @@ HEALTHY = {
 
 @pytest.fixture()
 def ui_unit(monkeypatch):
-    """`jarvis-ui.service` as its init system sees it — `active`, uptime unknown, unless a test says otherwise"""
+    """`jarvis-ui.service` as its init system sees it"""
     state = {"active": True, "uptime": None, "transitioning": False}
     monkeypatch.setattr(service_manager, "unit_active", lambda unit: state["active"])
     monkeypatch.setattr(service_manager, "uptime_seconds", lambda unit: state["uptime"])
@@ -878,7 +878,7 @@ def test_a_failed_restart_says_so_once_and_still_spends_the_cooldown(wedged,
     assert "could not be restarted" in items[0]["title"]
     assert "dbus: connection refused" in items[0]["body"]
     assert WEDGED["stack_dump"] in items[0]["body"]
-    # The one instruction the user acts on by hand names the command THIS host has.
+    # The one instruction the user acts on by hand names the command THIS host has
     assert f"systemctl --user restart {release.UI_UNIT}" in items[0]["body"]
 
     # The attempt IS recorded, so the cooldown holds and nothing is said again
@@ -889,8 +889,7 @@ def test_a_failed_restart_says_so_once_and_still_spends_the_cooldown(wedged,
 
 @pytest.fixture()
 def wedged_on_a_mac(started, catalog_file, monkeypatch, fake_launchd):
-    """The same wedge, on the host this defect was reported from — no `systemctl`
-    anywhere, `com.jarvis.ui` answered by the stub."""
+    """The same wedge, on the host this defect was reported from"""
     answers = [HEALTHY]
     monkeypatch.setattr(daemon_mod, "fetch_healthz", lambda url, timeout: answers[0])
     fake_launchd.load("com.jarvis.ui", state="running", pid=73299)
@@ -902,9 +901,7 @@ def wedged_on_a_mac(started, catalog_file, monkeypatch, fake_launchd):
 
 
 def test_under_launchd_a_running_label_plus_a_wedge_is_restarted(wedged_on_a_mac):
-    """THE DEFECT, end to end: `systemd_units.unit_active` swallowed the missing-binary
-    `OSError`, returned "" and made every wedge read `down` — so the whole of the
-    2026-10-08 self-heal spec was dead code on this host."""
+    """THE DEFECT, end to end: `systemd_units.unit_active` swallowed the missing-binary `OSError`"""
     d, runner, _ = wedged_on_a_mac
 
     assert d.check_ui_health(now=1000.0) == "restarted"
@@ -913,8 +910,7 @@ def test_under_launchd_a_running_label_plus_a_wedge_is_restarted(wedged_on_a_mac
 
 def test_under_launchd_an_absent_label_is_down_and_nothing_is_restarted(
         wedged_on_a_mac):
-    """`launchctl bootout gui/$UID/com.jarvis.ui` makes the label unfindable, which is
-    the deliberately-stopped case `down` exists for."""
+    """`launchctl bootout gui/$UID/com.jarvis.ui` makes the label unfindable"""
     d, runner, fake_launchd = wedged_on_a_mac
     fake_launchd.bootout("com.jarvis.ui")
 
@@ -925,7 +921,7 @@ def test_under_launchd_an_absent_label_is_down_and_nothing_is_restarted(
 
 def test_under_launchd_a_failed_restart_names_the_launchctl_command(wedged_on_a_mac,
                                                                     monkeypatch):
-    """`systemctl --user restart jarvis-ui.service` is not a command this host has."""
+    """`systemctl --user restart jarvis-ui.service` is not a command this host has"""
     d, runner, _ = wedged_on_a_mac
     monkeypatch.setattr(runner, "restart_unit",
                         lambda unit: (_ for _ in ()).throw(OSError("no launchctl")))

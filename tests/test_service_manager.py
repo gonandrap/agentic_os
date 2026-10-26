@@ -1,14 +1,4 @@
-"""Which init system owns production's two services, and how launchd is asked.
-
-The defect (docs/superpowers/specs/2026-10-12-service-queries-on-a-mac.md): three Python
-call paths shelled out to `systemctl` unconditionally, so on the macOS production host
-the dashboard self-heal returned `down` for every wedge, a staged release could never
-apply, and the boot check parked every one of them `failed_verification` — all behind one
-`WARNING` nobody reads.
-
-Every launchd assertion here runs through the `fake_launchd` stub. No test invokes the
-real `launchctl`: this suite runs on the machine whose own `com.jarvis.ui` is live.
-"""
+"""Which init system owns production's two services, and how launchd is asked (docs/superpowers/specs/2026-10-12-service-queries-on-a-mac.md)"""
 
 from __future__ import annotations
 
@@ -29,7 +19,7 @@ LAUNCHCTL_PRINT = (
 )
 
 
-# -- which manager -------------------------------------------------------------------
+# -- which manager
 
 
 @pytest.mark.parametrize("value,system,expected", [
@@ -40,9 +30,7 @@ LAUNCHCTL_PRINT = (
 ])
 def test_manager_resolves_the_env_first_then_uname(monkeypatch, value, system,
                                                    expected):
-    """Same precedence and same spelling as `install_prod_service.sh:48-50`: a host where
-    the installer and the daemon disagreed would install launchd agents and then restart
-    systemd units — a release that half-applies."""
+    """Same precedence and spelling as `install_prod_service.sh`, so installer and daemon never disagree"""
     monkeypatch.setenv(service_manager.MANAGER_ENV, value)
     monkeypatch.setattr(service_manager.platform, "system", lambda: system)
 
@@ -51,9 +39,7 @@ def test_manager_resolves_the_env_first_then_uname(monkeypatch, value, system,
 
 @pytest.mark.parametrize("value", ["nonsense", "   ", "systemd launchd"])
 def test_an_unrecognised_manager_reads_as_uname_and_never_raises(monkeypatch, value):
-    """The shell scripts exit 2 on junk and that is right for an install a human is
-    watching. Here it is wrong: this variable must not be able to stop the daemon
-    booting, exactly as `systemd_units.transport()` reads junk as `auto`."""
+    """The shell scripts exit 2 on junk and that is right for an install a human is watching"""
     monkeypatch.setenv(service_manager.MANAGER_ENV, value)
     monkeypatch.setattr(service_manager.platform, "system", lambda: "Linux")
 
@@ -65,9 +51,7 @@ def test_an_unrecognised_manager_reads_as_uname_and_never_raises(monkeypatch, va
 
 @pytest.mark.parametrize("value", ["LaunchD ", "\tLAUNCHD\n"])
 def test_case_and_surrounding_space_are_normalised(monkeypatch, value):
-    """Spec §1: `.strip().lower()` before the match. A value read out of a sourced env
-    file carries a newline, and reading that as junk would silently pick the uname
-    answer on the one host that bothered to set the variable."""
+    """Spec §1: `.strip().lower()` before the match"""
     monkeypatch.setenv(service_manager.MANAGER_ENV, value)
     monkeypatch.setattr(service_manager.platform, "system", lambda: "Linux")
 
@@ -75,8 +59,7 @@ def test_case_and_surrounding_space_are_normalised(monkeypatch, value):
 
 
 def test_the_unit_to_label_map_cannot_drift():
-    """The price of keeping the literals in `service_manager`: it may not import
-    `release` (`release` imports it), so the names are pinned here instead."""
+    """`service_manager` cannot import `release`, so its literal unit names are pinned here"""
     assert set(service_manager.LABELS) == {release.DAEMON_UNIT, release.UI_UNIT}
 
 
@@ -86,12 +69,12 @@ def test_a_unit_with_no_label_raises_naming_it():
 
 
 def test_target_is_the_domain_shell_builds():
-    """`DOMAIN="gui/$UID"` — `install_prod_service.sh:126`, `shipit.sh:107`."""
+    """`DOMAIN="gui/$UID"` — `install_prod_service.sh:126`, `shipit.sh:107`"""
     assert (service_manager.target(release.UI_UNIT)
             == f"gui/{os.getuid()}/com.jarvis.ui")
 
 
-# -- the pure parsers ----------------------------------------------------------------
+# -- the pure parsers
 
 
 def test_parse_print_reads_the_captured_block():
@@ -114,7 +97,7 @@ def test_parse_etime(text, expected):
     assert service_manager._parse_etime(text) == expected
 
 
-# -- unit_active ---------------------------------------------------------------------
+# -- unit_active
 
 
 @pytest.mark.parametrize("state,expected", [
@@ -131,9 +114,7 @@ def test_unit_active_on_launchd(fake_launchd, state, expected):
 
 
 def test_an_absent_label_is_not_active_and_is_not_a_warning(fake_launchd, caplog):
-    """A non-zero `launchctl print` is the NORMAL answer for a booted-out service.
-    Logging it at WARNING would re-create the `could not query ActiveState` line this
-    whole change exists to remove, with a different spelling."""
+    """A non-zero `launchctl print` is the NORMAL answer for a booted-out service"""
     caplog.set_level("DEBUG", logger="jarvisd.service")
 
     assert service_manager.unit_active(release.UI_UNIT) is False
@@ -141,9 +122,7 @@ def test_an_absent_label_is_not_active_and_is_not_a_warning(fake_launchd, caplog
 
 
 def test_unit_active_on_systemd_delegates_byte_identically(monkeypatch):
-    """Not a copy: `systemd_units.unit_active` is the function the Linux production host
-    has been answering with, and a re-implementation here would be a second definition of
-    "active" to keep in step."""
+    """Delegates to `systemd_units.unit_active`, the Linux host's answer, rather than redefining it"""
     monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.SYSTEMD)
     seen: list[str] = []
     monkeypatch.setattr(systemd_units, "unit_active",
@@ -153,13 +132,11 @@ def test_unit_active_on_systemd_delegates_byte_identically(monkeypatch):
     assert seen == [release.UI_UNIT]
 
 
-# -- start_time ----------------------------------------------------------------------
+# -- start_time
 
 
 def test_start_time_reads_a_pid_the_test_owns(fake_launchd):
-    """`ps` is deliberately NOT stubbed: it is read-only, universal, and a second binary
-    knob is a second thing to forget in `gate_environment`. So the test points the stub
-    at a process it spawned itself."""
+    """`ps` is deliberately NOT stubbed: it is read-only"""
     proc = subprocess.Popen(["sleep", "30"])
     try:
         fake_launchd.load("com.jarvis.ui", pid=proc.pid)
@@ -184,25 +161,35 @@ def test_start_time_is_none_when_the_job_is_not_loaded(fake_launchd):
     assert service_manager.start_time(release.UI_UNIT) is None
 
 
-# -- restarts ------------------------------------------------------------------------
+# -- restarts
 
 
-def test_restart_unit_kickstarts_in_place(fake_launchd):
-    """`kickstart -k` is what `install_prod_service.sh:149` and `shipit.sh:529` already
-    use, so the daemon's restart and the human's are one operation."""
+def test_restart_unit_reloads_the_plist_so_a_re_render_takes_effect(fake_launchd):
+    """`kickstart -k` keeps the loaded plist; only bootout + bootstrap reads the new one"""
     fake_launchd.load("com.jarvis.ui", pid=100)
 
     release.LaunchdRunner().restart_unit(release.UI_UNIT)
 
-    assert fake_launchd.calls[-1] == [
-        "kickstart", "-k", f"gui/{os.getuid()}/com.jarvis.ui"]
+    assert fake_launchd.calls[-2:] == [
+        ["bootout", f"gui/{os.getuid()}/com.jarvis.ui"],
+        ["bootstrap", f"gui/{os.getuid()}", service_manager.plist_path(release.UI_UNIT)]]
     assert fake_launchd.jobs["com.jarvis.ui"]["pid"] == 101
 
 
+def test_restart_unit_retries_a_bootstrap_launchd_refuses_while_the_old_job_exits(
+        fake_launchd):
+    """`Bootstrap failed: 5: Input/output error` is transient; the reload waits it out"""
+    fake_launchd.load("com.jarvis.ui", pid=100)
+    (fake_launchd.dir / "bootstrap-failures").write_text("2")
+
+    release.LaunchdRunner().restart_unit(release.UI_UNIT)
+
+    assert [c[0] for c in fake_launchd.calls].count("bootstrap") == 3
+    assert fake_launchd.jobs["com.jarvis.ui"]["state"] == "running"
+
+
 def test_restart_unit_detached_returns_at_once_and_outlives_our_session(fake_launchd):
-    """`start_new_session=True` is load-bearing: launchd takes the job's whole process
-    group down when it kickstarts it, so a child left in our group dies before its sleep
-    ends and the release half-applies."""
+    """`start_new_session=True` is load-bearing: launchd takes the job's process group down with it"""
     fake_launchd.load("com.jarvis.daemon", pid=200)
     sessions: list[int] = []
     real_popen = subprocess.Popen
@@ -223,10 +210,11 @@ def test_restart_unit_detached_returns_at_once_and_outlives_our_session(fake_lau
 
     deadline = time.time() + 20
     while time.time() < deadline and not any(
-            c[:1] == ["kickstart"] for c in fake_launchd.calls):
+            c[:1] == ["bootstrap"] for c in fake_launchd.calls):
         time.sleep(0.2)
-    assert fake_launchd.calls[-1] == [
-        "kickstart", "-k", f"gui/{os.getuid()}/com.jarvis.daemon"]
+    assert fake_launchd.calls[-2:] == [
+        ["bootout", f"gui/{os.getuid()}/com.jarvis.daemon"],
+        ["bootstrap", f"gui/{os.getuid()}", service_manager.plist_path(release.DAEMON_UNIT)]]
 
 
 def test_restart_hint_names_the_command_this_host_has(fake_launchd, monkeypatch):
@@ -238,7 +226,7 @@ def test_restart_hint_names_the_command_this_host_has(fake_launchd, monkeypatch)
             == "systemctl --user restart jarvis-ui.service")
 
 
-# -- the factory, and the systemd path it must leave untouched -----------------------
+# -- the factory, and the systemd path it must leave untouched
 
 
 def test_service_runner_picks_the_manager(monkeypatch, fake_launchd):
@@ -249,9 +237,7 @@ def test_service_runner_picks_the_manager(monkeypatch, fake_launchd):
 
 
 def test_service_runner_resolves_the_class_as_a_module_global(monkeypatch):
-    """`tests/test_validation_release_skip.py:34` and `tests/test_validation_void.py:33`
-    rebind `release.SystemdRunner`, and that keeps working only if the lookup happens at
-    call time rather than in a default argument or a module-level dict."""
+    """Other suites rebind `release.SystemdRunner`, which works only if the lookup is at call time"""
     monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.SYSTEMD)
 
     class Fake:
@@ -262,8 +248,7 @@ def test_service_runner_resolves_the_class_as_a_module_global(monkeypatch):
 
 
 def test_the_systemd_argv_is_unchanged(monkeypatch):
-    """The regression that makes the refactor provable rather than plausible: every
-    systemd command the release path issues, byte for byte."""
+    """Every systemd command the release path issues, byte for byte"""
     monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.SYSTEMD)
     runner = release.SystemdRunner()
     argvs: list[list[str]] = []
@@ -283,3 +268,30 @@ def test_the_systemd_argv_is_unchanged(monkeypatch):
     ]
     assert argvs[2] == ["systemctl", "--user", "show", "jarvis.service",
                         "--property=ExecMainStartTimestampMonotonic", "--value"]
+
+
+# -- INV-SERVICE-PATH reads the plists on a Mac
+
+
+def _plist(path, env):
+    import plistlib
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(plistlib.dumps({"Label": path.stem, "EnvironmentVariables": env}))
+
+
+def test_unit_environment_reads_a_launchd_plist(fake_launchd):
+    _plist(release.unit_dir() / "com.jarvis.daemon.plist", {"PATH": "/a:/b"})
+
+    assert release.unit_environment(release.DAEMON_UNIT, "PATH") == "/a:/b"
+    assert release.unit_environment(release.UI_UNIT, "PATH") is None
+
+
+def test_service_path_drift_is_reported_from_the_plists(fake_launchd):
+    from jarvis import bugreport, invariants
+
+    gh_dir = os.path.dirname(bugreport.gh_bin())
+    _plist(release.unit_dir() / "com.jarvis.daemon.plist", {"PATH": "/usr/bin:/bin"})
+    _plist(release.unit_dir() / "com.jarvis.ui.plist", {"PATH": f"{gh_dir}:/usr/bin"})
+
+    [violation] = list(invariants.check_service_path())
+    assert violation.context["units"] == [release.DAEMON_UNIT]

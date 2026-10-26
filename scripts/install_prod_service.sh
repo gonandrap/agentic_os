@@ -72,7 +72,7 @@ done
 # MIRRORS bugreport.GH_SEARCH_DIRS — keep the two in step. /snap/bin matters because the
 # probe above runs under whatever PATH invoked this script, and when that is a Jarvis
 # worker (which this often is) it has the same hole we are patching.
-for d in /snap/bin "$HOME/.local/bin" /usr/local/bin /usr/bin /bin; do add "$d"; done
+for d in /snap/bin "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin /usr/bin /bin; do add "$d"; done
 
 # UI port from the prod catalog (default 8787).
 UI_PORT=8787
@@ -125,27 +125,30 @@ fi
 if [ "$MANAGER" = launchd ]; then
   DOMAIN="gui/$UID"
   if [ "$DRY_RUN" = 1 ]; then
+    if [ "$NO_RESTART" = 1 ]; then
+      echo "[dry-run] (--no-restart) plists written only — the caller reloads them"
+      exit 0
+    fi
     for label in com.jarvis.daemon com.jarvis.ui; do
       echo "[dry-run] launchctl bootout $DOMAIN/$label (ignored if not loaded)"
       echo "[dry-run] launchctl bootstrap $DOMAIN $UNIT_DIR/$label.plist"
     done
-    if [ "$NO_RESTART" = 1 ]; then
-      echo "[dry-run] (--no-restart) restarts left to the caller"
-    else
-      echo "[dry-run] launchctl kickstart -k $DOMAIN/com.jarvis.ui"
-      echo "[dry-run] launchctl kickstart -k $DOMAIN/com.jarvis.daemon (detached, in ~3s)"
-    fi
+    echo "[dry-run] launchctl kickstart -k $DOMAIN/com.jarvis.ui"
+    echo "[dry-run] launchctl kickstart -k $DOMAIN/com.jarvis.daemon (detached, in ~3s)"
     exit 0
   fi
   mkdir -p "$PROD_ROOT/state/logs"
+  # A bootout STOPS a loaded agent and a bootstrap STARTS it (RunAtLoad), so reloading
+  # here would restart production — or start a stopped one — behind the caller's back.
+  # launchd has no daemon-reload: the caller's own bootout+bootstrap reads these plists.
+  if [ "$NO_RESTART" = 1 ]; then
+    echo "agents re-rendered, not reloaded — the caller reloads them (--no-restart)"
+    exit 0
+  fi
   for label in com.jarvis.daemon com.jarvis.ui; do
     launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
     launchctl bootstrap "$DOMAIN" "$UNIT_DIR/$label.plist"
   done
-  if [ "$NO_RESTART" = 1 ]; then
-    echo "agents re-rendered and loaded — restarts left to the caller (--no-restart)"
-    exit 0
-  fi
   launchctl kickstart -k "$DOMAIN/com.jarvis.ui"
   sleep 2
   launchctl print "$DOMAIN/com.jarvis.ui" 2>/dev/null | grep -E "^\s+(state|pid) =" || true

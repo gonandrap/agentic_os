@@ -34,8 +34,7 @@ def _run(prod_root: Path, tmp_path: Path, *, path: str = BASE_PATH,
     unit_dir = tmp_path / "units"
     env = {"PATH": path, "HOME": str(tmp_path / "home"),
            "PRODUCTION_CODE": str(prod_root), "USER": os.environ.get("USER", "t")}
-    # Pinned, not inherited: the systemd tests below describe the Linux branch and must
-    # say the same thing on a macOS developer machine, where the default is launchd.
+    # Pinned: the systemd tests below describe the Linux branch, on a Mac developer machine too
     if manager is not None:
         env["JARVIS_SERVICE_MANAGER"] = manager
     return subprocess.run(
@@ -244,11 +243,7 @@ def test_the_check_is_doctor_only(units):
     assert invariants.check_service_path not in invariants.INVARIANTS
 
 
-# -- launchd: the same install on macOS ------------------------------------------
-#
-# macOS has no systemd. The units become two launchd agents under ~/Library/LaunchAgents,
-# `systemctl --user` becomes `launchctl`, and everything the PATH work above decided
-# still holds: the plist's PATH is the only PATH the daemon and every worker get.
+# -- launchd: the same install on macOS
 
 
 def _plist_string(tmp_path: Path, plist: str, key: str) -> str:
@@ -271,7 +266,7 @@ def test_launchd_dry_run_renders_two_agents_and_never_calls_systemctl(prod, tmp_
 
 
 def test_launchd_is_the_default_on_darwin(prod, tmp_path):
-    """No knob needed on a Mac: `uname -s` decides, and the env var only overrides it."""
+    """No knob needed on a Mac: `uname -s` decides, and the env var only overrides it"""
     result = _run(prod, tmp_path, manager=None)
 
     assert result.returncode == 0, result.stderr
@@ -317,8 +312,7 @@ def test_launchd_ui_agent_serves_the_catalog_port(prod, tmp_path):
 
 
 def test_launchd_restarts_ui_inline_and_the_daemon_detached_and_last(prod, tmp_path):
-    """Same ordering contract as the systemd branch: kick the UI here, hand the daemon's
-    restart to something outside this script so a shipping worker survives it."""
+    """Same ordering contract as the systemd branch: kick the UI here"""
     result = _run(prod, tmp_path, manager="launchd")
 
     out = result.stdout
@@ -329,13 +323,16 @@ def test_launchd_restarts_ui_inline_and_the_daemon_detached_and_last(prod, tmp_p
     assert ui < daemon
 
 
-def test_launchd_no_restart_loads_but_leaves_the_restarts_to_the_caller(prod, tmp_path):
+def test_launchd_no_restart_writes_the_plists_and_touches_no_agent(prod, tmp_path):
+    """A bootout stops an agent and a bootstrap starts one, so either would restart production"""
     result = _run(prod, tmp_path, manager="launchd", args=["--no-restart"])
 
     assert result.returncode == 0, result.stderr
-    assert "[dry-run] launchctl bootstrap" in result.stdout
+    assert "com.jarvis.daemon.plist" in result.stdout
+    assert "bootout" not in result.stdout
+    assert "bootstrap" not in result.stdout
     assert "kickstart" not in result.stdout
-    assert "left to the caller" in result.stdout
+    assert "the caller reloads them" in result.stdout
 
 
 def test_an_unknown_service_manager_is_refused(prod, tmp_path):

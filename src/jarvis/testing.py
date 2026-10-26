@@ -1874,6 +1874,33 @@ elif argv[:2] == ["kickstart", "-k"] and len(argv) == 3:
     rec["state"] = "running"
     with open(os.path.join(jobs_dir, label + ".json"), "w") as f:
         json.dump(rec, f)
+elif argv[:1] == ["bootout"] and len(argv) == 2:
+    label = argv[1].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    os.rename(os.path.join(jobs_dir, label + ".json"),
+              os.path.join(state_dir, label + ".booted-out.json"))
+elif argv[:1] == ["bootstrap"] and len(argv) == 3:
+    fails = os.path.join(state_dir, "bootstrap-failures")
+    left = int(open(fails).read()) if os.path.exists(fails) else 0
+    if left > 0:
+        with open(fails, "w") as f:
+            f.write(str(left - 1))
+        sys.stderr.write("Bootstrap failed: 5: Input/output error\n"); sys.exit(5)
+    label = os.path.basename(argv[2])[:-len(".plist")]
+    old = os.path.join(state_dir, label + ".booted-out.json")
+    try:
+        with open(old) as f:
+            rec = json.load(f)
+        os.unlink(old)
+    except (OSError, ValueError):
+        rec = {}
+    rec["pid"] = int(rec.get("pid") or 0) + 1
+    rec["state"] = "running"
+    rec["plist"] = argv[2]
+    with open(os.path.join(jobs_dir, label + ".json"), "w") as f:
+        json.dump(rec, f)
 else:
     sys.stderr.write("fake launchctl: unhandled argv %s\n" % argv); sys.exit(2)
 """
@@ -1907,7 +1934,7 @@ def fake_launchd(tmp_path, monkeypatch):
 
         def load(self, label: str, state: str = "running", pid: int | None = 4242,
                  exit_code: int = 0) -> None:
-            """Make `label` a job launchd knows about. Absent = booted out."""
+            """Make `label` a job launchd knows about"""
             (ldir / "jobs" / f"{label}.json").write_text(
                 json.dumps({"state": state, "pid": pid, "exit": exit_code}))
 

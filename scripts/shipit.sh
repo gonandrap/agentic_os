@@ -107,6 +107,12 @@ case "$MANAGER" in
        "JARVIS_SERVICE_MANAGER must be systemd or launchd, not '$MANAGER'" >&2; exit 1 ;;
 esac
 LAUNCHD_DOMAIN="gui/$UID"
+LAUNCHD_PLIST_DIR="$HOME/Library/LaunchAgents"
+# Reload, not `kickstart -k`: only a bootstrap reads the plist 5a just re-rendered. The
+# retry covers `Bootstrap failed: 5: Input/output error` while the old job still exits.
+launchd_reload_cmd() {  # launchd_reload_cmd <label> — a /bin/sh command, free of single quotes
+  printf '%s' "launchctl bootout $LAUNCHD_DOMAIN/$1 2>/dev/null; i=0; until launchctl bootstrap $LAUNCHD_DOMAIN $LAUNCHD_PLIST_DIR/$1.plist; do i=\$((i+1)); [ \$i -ge 10 ] && exit 1; sleep 1; done"
+}
 
 say()  { printf '\033[1;36m▶ %s\033[0m\n' "$*"; }
 run()  { if [ "$DRY_RUN" = 1 ]; then printf '  [dry-run] %s\n' "$*"; else eval "$*"; fi; }
@@ -238,8 +244,10 @@ assert_lock_bump_only() {  # assert_lock_bump_only <worktree> <version>
   expected="$(mktemp)"
   git -C "$wt" show HEAD:uv.lock > "$expected" \
     || { rm -f "$expected"; die "cannot read HEAD:uv.lock in $wt"; }
-  sed -i -E "/^name = \"jarvis-os\"\$/{n;s/^version = \"[^\"]+\"\$/version = \"$version\"/;}" \
-    "$expected" || { rm -f "$expected"; die "cannot apply the version bump to HEAD's lock"; }
+  # No `sed -i`: BSD sed reads `-i -E` as a backup suffix of "-E" and edits nothing
+  sed -E "/^name = \"jarvis-os\"\$/{n;s/^version = \"[^\"]+\"\$/version = \"$version\"/;}" \
+    "$expected" > "$expected.bumped" && mv "$expected.bumped" "$expected" \
+    || { rm -f "$expected" "$expected.bumped"; die "cannot apply the version bump to HEAD's lock"; }
   stray="$(diff -u --label "HEAD:uv.lock, bumped to $version" --label "uv.lock as relocked" \
            "$expected" "$wt/uv.lock")" && rc=0 || rc=$?
   rm -f "$expected"
@@ -288,7 +296,8 @@ cleanup() { [ "$DRY_RUN" != 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ] \
               && git worktree remove --force "$WT" 2>/dev/null || true; }
 trap cleanup EXIT
 run "git worktree add --quiet '$WT' '$REL_BRANCH'"
-run "sed -i -E '0,/^version *= *\"[^\"]+\"/s//version = \"$VERSION\"/' '$WT/pyproject.toml'"
+# awk, not `sed -i -E '0,/re/…'`: both the in-place flag and the `0,` address are GNU-only
+run "awk -v v='$VERSION' '!done && /^version *= *\"[^\"]+\"/ { sub(/\"[^\"]+\"/, \"\\\"\" v \"\\\"\"); done = 1 } { print }' '$WT/pyproject.toml' > '$WT/pyproject.toml.bumped' && mv '$WT/pyproject.toml.bumped' '$WT/pyproject.toml'"
 # uv.lock records the root package's own version, so a tag carrying the bumped
 # pyproject without the relocked lock is internally inconsistent — and every bare `uv`
 # command in production is then licensed to re-resolve and rewrite it (issue 202).
@@ -542,7 +551,7 @@ if unit_installed "$UI_SVC"; then
   any_installed=1
   say "restarting $UI_SVC"
   if [ "$MANAGER" = launchd ]; then
-    run "launchctl kickstart -k '$LAUNCHD_DOMAIN/$UI_SVC'"
+    run "/bin/sh -c '$(launchd_reload_cmd "$UI_SVC")'"
     [ "$DRY_RUN" = 1 ] || sleep 2
     run "launchctl print '$LAUNCHD_DOMAIN/$UI_SVC' | grep -E '^\s+(state|pid) =' || true"
   else
@@ -622,10 +631,9 @@ say "shipped $TAG → $PROD_DIR"
 # this script print its last line and exit cleanly first.
 if unit_installed "$DAEMON_SVC"; then
   if [ "$MANAGER" = launchd ]; then
-    # No transient units on launchd: a nohup'd subshell outlives this script, and
-    # `kickstart -k` is what restarts a loaded agent.
+    # No transient units on launchd: a nohup'd subshell outlives this script
     say "restarting $DAEMON_SVC (detached — this script may descend from its job)"
-    run "nohup /bin/sh -c 'sleep 3; launchctl kickstart -k $LAUNCHD_DOMAIN/$DAEMON_SVC' >/dev/null 2>&1 &"
+    run "nohup /bin/sh -c 'sleep 3; $(launchd_reload_cmd "$DAEMON_SVC")' >/dev/null 2>&1 &"
     say "  queued: $DAEMON_SVC restarts in ~3s — check with: launchctl print $LAUNCHD_DOMAIN/$DAEMON_SVC"
   elif [ "$DRY_RUN" != 1 ] && ! command -v systemd-run >/dev/null 2>&1; then
     say "systemd-run unavailable — restarting $DAEMON_SVC inline (this script may be killed)"

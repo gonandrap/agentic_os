@@ -24,7 +24,8 @@ FILED_MARKER = "<!-- Filed automatically by `jarvis bug report`. -->"
 GH_BIN_ENV = "JARVIS_GH_BIN"
 
 #: Where to look for `gh` when PATH does not have it (#41)
-GH_SEARCH_DIRS = ("/snap/bin", "~/.local/bin", "/usr/local/bin", "/usr/bin", "/bin")
+GH_SEARCH_DIRS = ("/snap/bin", "~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin",
+                  "/bin")
 
 
 def heal_path(environ: MutableMapping[str, str] | None = None) -> list[str]:

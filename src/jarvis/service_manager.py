@@ -20,6 +20,9 @@ SYSTEMD, LAUNCHD = "systemd", "launchd"
 #: Binary override, mirroring `systemd_units.systemctl_bin()` — the seam tests point at a fake
 LAUNCHCTL_BIN_ENV = "JARVIS_LAUNCHCTL_BIN"
 
+#: Where the installed units live; `release.UNIT_DIR_ENV` is this name
+UNIT_DIR_ENV = "JARVIS_SYSTEMD_UNIT_DIR"
+
 #: systemd unit -> launchd label; literals because `release` imports this module
 LABELS = {"jarvis.service": "com.jarvis.daemon", "jarvis-ui.service": "com.jarvis.ui"}
 
@@ -29,6 +32,9 @@ _ETIME_RE = re.compile(r"^(?:(?P<days>\d+)-)?(?:(?P<hours>\d+):)?(?P<mins>\d+):"
 
 #: Seconds the detached restart waits so this daemon can exit cleanly first
 _DETACH_SLEEP = 3
+
+#: Bootstrap attempts before a reload gives up, one second apart
+_BOOTSTRAP_TRIES = 10
 
 #: `launchctl print` states of a loaded job that is between processes, not stopped
 _LAUNCHD_PENDING = ("waiting", "spawn scheduled")
@@ -83,7 +89,7 @@ def _parse_etime(text: str) -> float | None:
 
 
 def _print(unit: str) -> dict[str, str] | None:
-    """`launchctl print <target>`, or `None` when the job is not loaded — the normal answer for a stopped service"""
+    """`launchctl print <target>`, or `None` when the job is not loaded"""
     argv = [launchctl_bin(), "print", target(unit)]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
@@ -98,7 +104,7 @@ def _print(unit: str) -> dict[str, str] | None:
 
 
 def unit_active(unit: str) -> bool:
-    """Is the unit loaded and owned by its manager? A booted-out launchd label is not"""
+    """Is the unit loaded and owned by its manager?"""
     if manager() != LAUNCHD:
         return systemd_units.unit_active(unit)
     info = _print(unit)
@@ -141,18 +147,32 @@ def start_time(unit: str) -> float | None:
     return None if elapsed is None else time.time() - elapsed
 
 
+def plist_path(unit: str) -> str:
+    """The installed agent's plist, where `scripts/install_prod_service.sh` renders it"""
+    base = os.environ.get(UNIT_DIR_ENV) or os.path.expanduser("~/Library/LaunchAgents")
+    return os.path.join(base, f"{label(unit)}.plist")
+
+
+def _reload_script(unit: str) -> str:
+    """bootout + bootstrap, retried through `Bootstrap failed: 5` while the old job exits"""
+    ctl = launchctl_bin()
+    return (f"{ctl} bootout {target(unit)} 2>/dev/null; i=0; "
+            f"until {ctl} bootstrap gui/{os.getuid()} {plist_path(unit)}; do "
+            f"i=$((i+1)); [ $i -ge {_BOOTSTRAP_TRIES} ] && exit 1; sleep 1; done")
+
+
 def restart(unit: str) -> None:
-    """`launchctl kickstart -k`, the same restart the install and ship scripts use"""
-    argv = [launchctl_bin(), "kickstart", "-k", target(unit)]
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    """Reload the agent — unlike `kickstart -k`, a bootstrap rereads a re-rendered plist"""
+    proc = subprocess.run(["/bin/sh", "-c", _reload_script(unit)],
+                          capture_output=True, text=True, timeout=60)
     if proc.returncode != 0:
-        log.warning("%s failed (%s): %s", argv[0], proc.returncode,
+        log.warning("reloading %s failed (%s): %s", label(unit), proc.returncode,
                     (proc.stderr or "").strip())
 
 
 def restart_detached(unit: str, tag: str) -> None:
-    """Restart `unit` from a new session launchd cannot take down with this job's process group"""
-    cmd = f"sleep {_DETACH_SLEEP}; {launchctl_bin()} kickstart -k {target(unit)}"
+    """Reload `unit` from a new session launchd cannot take down with this job's process group"""
+    cmd = f"sleep {_DETACH_SLEEP}; {_reload_script(unit)}"
     log.info("release %s: queued detached restart of %s", tag, label(unit))
     subprocess.Popen(["/bin/sh", "-c", cmd],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

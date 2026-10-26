@@ -192,16 +192,27 @@ and both `install_prod_service.sh` and `shipit.sh` read that one knob.
 | `jarvis.service` | `com.jarvis.daemon` |
 | `jarvis-ui.service` | `com.jarvis.ui` |
 | `systemctl --user status jarvis` | `launchctl print gui/$UID/com.jarvis.daemon` |
-| `systemctl --user restart jarvis` | `launchctl kickstart -k gui/$UID/com.jarvis.daemon` |
+| `systemctl --user restart jarvis` | `launchctl kickstart -k gui/$UID/com.jarvis.daemon` (keeps the loaded plist) |
+| `systemctl --user daemon-reload` + restart | `launchctl bootout gui/$UID/com.jarvis.daemon` then `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.jarvis.daemon.plist` |
 | `systemctl --user stop jarvis` | `launchctl bootout gui/$UID/com.jarvis.daemon` |
 | `journalctl --user -u jarvis -f` | `tail -f $PRODUCTION_CODE/state/logs/jarvisd.launchd.log` |
 | `EnvironmentFile=` | the agent sources `secrets/jarvis.env` itself before `exec` |
-| linger | not needed: agents survive logout, start at login |
+| linger | none: `gui/$UID` agents start at login and stop at logout, so a headless Mac needs auto-login |
+
+launchd has no `daemon-reload`: a loaded agent keeps the plist it was bootstrapped from
+until it is booted out. So `install_prod_service.sh --no-restart` only WRITES the plists —
+a bootout would stop production and a bootstrap would start it (`RunAtLoad`) — and every
+restart a release makes, `shipit.sh`'s and the daemon's own, is a bootout + bootstrap, so a
+re-rendered plist takes effect. The bootstrap is retried through the transient
+`Bootstrap failed: 5: Input/output error` launchd returns while the old job still exits.
 
 The Python half reads the same knob through `src/jarvis/service_manager.py`: the daemon
-restarts `com.jarvis.ui` and `com.jarvis.daemon` with `launchctl kickstart -k`, verifies a
-staged (`--stage`) release from `launchctl print` plus `ps -o etime=`, and tells a wedged
-dashboard from a stopped one.
+reloads `com.jarvis.ui` and `com.jarvis.daemon` that way, verifies a staged (`--stage`)
+release from `launchctl print` plus `ps -o etime=`, tells a wedged dashboard from a stopped
+one, and `jarvis doctor`'s INV-SERVICE-PATH reads the plists' `EnvironmentVariables`.
+
+`scripts/shipit.sh` uses only BSD-compatible tools — no `sed -i`, no GNU `0,/re/` address
+— so it runs on a stock Mac without GNU sed.
 
 Not ported, and only this: the **per-turn transient unit**. Worker turns run on the direct
 `Popen` transport on a Mac (no `systemd-run`), so a daemon restart still takes a running
