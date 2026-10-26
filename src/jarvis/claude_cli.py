@@ -1247,24 +1247,14 @@ def process_alive(pid: int | None) -> bool:
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
-        tokens = _ps_command(pid)  # macOS has no /proc
+        from . import service_manager
+
+        tokens = service_manager.command_line(pid)  # macOS has no /proc
         if tokens is None:
             return True  # it vanished mid-read, or `ps` would not say — trust the signal
         return any(Path(tok).name == want for tok in tokens)
     return any(Path(tok).name == want
                for tok in raw.decode(errors="replace").split("\0") if tok)
-
-
-def _ps_command(pid: int) -> list[str] | None:
-    """The process's command line from `ps`, split on whitespace — `None` when `ps` cannot say"""
-    try:
-        proc = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                              capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.split()
 
 
 def kill_process_group(pid: int | None) -> bool:

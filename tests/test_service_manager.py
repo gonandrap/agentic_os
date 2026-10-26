@@ -137,6 +137,7 @@ def test_unit_active_on_systemd_delegates_byte_identically(monkeypatch):
 
 def test_start_time_reads_a_pid_the_test_owns(fake_launchd):
     """`ps` is deliberately NOT stubbed: it is read-only"""
+    # clock-exempt: class 4 — the instant compared against is the start time the kernel reports via `ps -o etime=`
     proc = subprocess.Popen(["sleep", "30"])
     try:
         fake_launchd.load("com.jarvis.ui", pid=proc.pid)
@@ -190,6 +191,7 @@ def test_restart_unit_retries_a_bootstrap_launchd_refuses_while_the_old_job_exit
 
 def test_restart_unit_detached_returns_at_once_and_outlives_our_session(fake_launchd):
     """`start_new_session=True` is load-bearing: launchd takes the job's process group down with it"""
+    # clock-exempt: class 3 — spin-waits on a real detached subprocess that sleeps before it reloads
     fake_launchd.load("com.jarvis.daemon", pid=200)
     sessions: list[int] = []
     real_popen = subprocess.Popen

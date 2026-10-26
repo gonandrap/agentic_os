@@ -147,6 +147,18 @@ def start_time(unit: str) -> float | None:
     return None if elapsed is None else time.time() - elapsed
 
 
+def command_line(pid: int) -> list[str] | None:
+    """A process's command line from `ps`, split on whitespace — `None` when `ps` cannot say"""
+    try:
+        proc = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.split()
+
+
 def plist_path(unit: str) -> str:
     """The installed agent's plist, where `scripts/install_prod_service.sh` renders it"""
     base = os.environ.get(UNIT_DIR_ENV) or os.path.expanduser("~/Library/LaunchAgents")
