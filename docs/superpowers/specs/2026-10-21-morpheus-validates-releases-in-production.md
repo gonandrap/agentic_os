@@ -99,6 +99,13 @@ nothing.
   no work order behind it, like `triage`. Neo either escalates (a warning in the inbox
   for the user) or answers (recorded on the item, plus an info row in the inbox).
 
+An answer may carry `"action": "requeue"`, and the OS applies it: the item goes back on
+the watch list with a fresh deadline instead of waiting for the user to read an inbox
+row (issue #1254). The cap is one automatic requeue per item, counted in `auto_requeues`
+and claimed atomically, so a verdict can never loop an item through validation. `requeue`
+is the only action a verdict may carry: a waive ends the OS's only production check on a
+change nobody has seen work, so it stays a command the user runs.
+
 ## Surfaces
 
 * `jarvis morpheus status|show|add|enqueue-release|script|check|waive|requeue|pause|unpause|follow-fleet`

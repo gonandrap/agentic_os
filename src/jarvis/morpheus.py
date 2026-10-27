@@ -54,6 +54,10 @@ MAX_KILLS = 3
 KILL_HOLD_SECONDS = 6 * 3600
 #: How much of a script's output is kept
 OUTPUT_TAIL = 2000
+#: What a `validation` verdict may ask the OS to do — a waive stays the user's (issue #1254)
+VERDICT_ACTIONS = ("requeue",)
+#: How many times Neo's own verdict may put one item back on the watch list
+MAX_AUTO_REQUEUES = 1
 
 SECONDS_PER_DAY = 86400
 
@@ -333,14 +337,15 @@ def waive(central: CentralStore, item_id: str, reason: str) -> dict:
     return central.morpheus_item(item_id) or {}
 
 
-def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str) -> dict:
+def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str, *,
+            resolution: str = "") -> dict:
     """Watch it again with a fresh deadline (and a fresh action)"""
     item = _item_or_raise(central, item_id)
     now = db.now()
     central.update_morpheus_item(
         item_id, state="monitoring" if item["script"] else "queued",
         deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY,
-        next_check_ts=now if item["script"] else None, resolution="", action="",
+        next_check_ts=now if item["script"] else None, resolution=resolution, action="",
         action_ts=None)
     _forget_offer(central, item_id)
     return central.morpheus_item(item_id) or {}
@@ -506,19 +511,33 @@ VALIDATION_QUESTION = """MORPHEUS — a shipped change has no passing production
 {why}
 
 Decide whether the user needs to look. If they do, ESCALATE and say what to look at. If
-not, answer in two sentences; the answer is recorded on the item and it stays {state}.
-They can re-watch it with `jarvis morpheus requeue {id}` or rule it fine with
-`jarvis morpheus waive {id} --reason "…"`."""
+not, answer in two sentences; the answer is recorded on the item.
+{actions}"""
+
+#: The item still has its automatic requeue
+REQUEUE_OFFER = """If the failure was transient — production had not exercised the change yet, a network or
+environment hiccup — add `"action": "requeue"` to your JSON and the OS watches it again
+with a fresh deadline. That is available ONCE per item, and this item still has it.
+Ruling the change fine is the USER'S: recommend `jarvis morpheus waive {id} --reason "…"`,
+never a waive of your own."""
+
+#: It has spent it, so saying `requeue` would only look like an action
+REQUEUE_SPENT = """This item has already spent its one automatic requeue, so `"action": "requeue"` is
+refused and it stays {state}. The user re-watches it with `jarvis morpheus requeue {id}`
+or rules it fine with `jarvis morpheus waive {id} --reason "…"`."""
 
 
 def _ask_neo(catalog: Catalog, item: dict[str, Any], note: str = "") -> int:
     from .neo_store import NeoStore
 
     why = _why(item) + (f"\n\nNo investigation was filed: {note}." if note else "")
+    spent = int(item.get("auto_requeues") or 0) >= MAX_AUTO_REQUEUES
+    offer = REQUEUE_SPENT if spent else REQUEUE_OFFER
+    actions = offer.format(id=item["id"], state=item["state"])
     neo = NeoStore()
     try:
         q = neo.ask(item.get("project") or _os_project(catalog), "",
-                    VALIDATION_QUESTION.format(why=why, state=item["state"], id=item["id"]),
+                    VALIDATION_QUESTION.format(why=why, actions=actions),
                     context=json.dumps({"morpheus_item": item["id"]}), kind="validation")
     finally:
         neo.close()
@@ -533,23 +552,39 @@ def item_of_question(q: dict[str, Any]) -> str:
         return ""
 
 
-def record_neo_verdict(central: CentralStore, q: dict[str, Any],
+def verdict_action(verdict: dict[str, Any]) -> str:
+    """What a `validation` verdict asks the OS to do, or '' for anything else it said"""
+    action = str(verdict.get("action") or "").strip().lower()
+    return action if action in VERDICT_ACTIONS else ""
+
+
+def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, Any],
                        verdict: dict[str, Any], question_url: str = "") -> None:
-    """Neo ruled on a `validation` question: record it, and tell the user what it means"""
+    """Neo ruled on a `validation` question: record it, act on it, and tell the user"""
     item_id = item_of_question(q)
     item = central.morpheus_item(item_id) if item_id else None
     if not item:
         log.warning("validation verdict for question %s names no item", q.get("id"))
         return
     reading = (verdict.get("answer") or verdict.get("reason") or "").strip()
-    central.update_morpheus_item(
-        item_id, resolution=f"{item['resolution']} — Neo: {reading[:600]}".strip(" —"))
+    resolution = f"{item['resolution']} — Neo: {reading[:600]}".strip(" —")
     escalated = bool(verdict.get("escalate"))
+    # The state guard catches the user waiving between the question and the verdict
+    requeued = (not escalated and verdict_action(verdict) == "requeue"
+                and item["state"] in ACTION_STATES
+                and central.claim_morpheus_auto_requeue(item_id, MAX_AUTO_REQUEUES))
+    if requeued:
+        requeue(central, cfg, item_id, resolution=f"re-watched by Neo: {resolution}")
+    else:
+        central.update_morpheus_item(item_id, resolution=resolution)
     central.add_inbox(
         project=q.get("project") or "os", level="warning" if escalated else "info",
         title=(f"PR #{item['pr_number']} {item['state']} production validation"
-               + (" — Neo escalated" if escalated else " — Neo's reading")),
+               + (" — Neo escalated" if escalated else
+                  " — Neo is watching it again" if requeued else " — Neo's reading")),
         body=f"{item['pr_url']}\n{reading[:600]}\n"
+             + ("the OS is validating it again — its one automatic requeue is now spent\n"
+                if requeued else "")
              + (f"{question_url}\n" if question_url else "")
              + f"jarvis morpheus show {item_id}")
 

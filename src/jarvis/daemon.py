@@ -3179,7 +3179,8 @@ class Daemon:
                     # Triage's twin: Morpheus asked, and no work order stands behind it
                     from . import morpheus
                     morpheus.record_neo_verdict(
-                        central, q, verdict, notify.neo_question_url(self.catalog, q["id"]))
+                        central, self.catalog.os.morpheus, q, verdict,
+                        notify.neo_question_url(self.catalog, q["id"]))
                     return
                 if q.get("kind") == "approval":
                     self._deliver_gate_verdict(central, pstore, q, verdict)

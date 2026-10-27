@@ -786,9 +786,17 @@ def test_parse_verdict_tolerates_fences():
                  # And an answer that names no escalation cause names none: "" stores as NULL and renders "not...
                  "cause": "",
                  # And a reply that rates no finding rates none
-                 "severity": ""}
+                 "severity": "",
+                 # And a reply that asks for nothing asks for nothing (issue #1254)
+                 "action": ""}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True
+
+
+def test_parse_verdict_carries_a_validation_action():
+    v = neo_mod.parse_verdict('{"escalate": false, "answer": "transient", "reason": "r", '
+                              '"action": "Requeue"}')
+    assert v["action"] == "requeue"
 
 
 def test_parse_verdict_recovers_a_reply_missing_only_its_final_brace():

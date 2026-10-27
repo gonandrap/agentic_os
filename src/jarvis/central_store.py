@@ -531,6 +531,7 @@ CREATE TABLE IF NOT EXISTS morpheus_items (
     resolution TEXT NOT NULL DEFAULT '',
     action TEXT NOT NULL DEFAULT '',        -- neo:<qid> | investigation:<id> | none:<why>
     action_ts REAL,
+    auto_requeues INTEGER NOT NULL DEFAULT 0,  -- requeues Neo's own verdict has spent (capped)
     UNIQUE (repo, pr_number)
 );
 CREATE INDEX IF NOT EXISTS idx_morpheus_items_state ON morpheus_items(state);
@@ -577,8 +578,12 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 
 # Columns added after the first release, exactly as in `neo_store` and `project_store`
 ADDED_COLUMNS = {
-    # A home that ran this table before items were per project
-    "morpheus_items": {"project": "TEXT NOT NULL DEFAULT ''"},
+    "morpheus_items": {
+        # A home that ran this table before items were per project
+        "project": "TEXT NOT NULL DEFAULT ''",
+        # …and before Neo's verdict could act on an item (issue #1254)
+        "auto_requeues": "INTEGER NOT NULL DEFAULT 0",
+    },
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
         "paired_reason": "TEXT",
@@ -2026,6 +2031,13 @@ class CentralStore:
         cur = self.conn.execute(
             "UPDATE morpheus_items SET action=?, action_ts=?, updated_ts=? "
             "WHERE id=? AND action=''", (action, db.now(), db.now(), item_id))
+        return cur.rowcount == 1
+
+    def claim_morpheus_auto_requeue(self, item_id: str, limit: int) -> bool:
+        """Spend one automatic requeue: False once the item has spent `limit` of them"""
+        cur = self.conn.execute(
+            "UPDATE morpheus_items SET auto_requeues=auto_requeues+1, updated_ts=? "
+            "WHERE id=? AND auto_requeues<?", (db.now(), item_id, limit))
         return cur.rowcount == 1
 
     # -- os state

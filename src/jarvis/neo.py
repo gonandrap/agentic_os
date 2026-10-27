@@ -198,6 +198,8 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         "cause": _escalation_cause(data.get("cause")),
         # A findings verdict's rating on the steward's scale
         "severity": str(data.get("severity") or "")[:20].strip().lower(),
+        # What a `validation` verdict asks the OS to do; that kind decides what it may be
+        "action": str(data.get("action") or "")[:20].strip().lower(),
     }
 
 

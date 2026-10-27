@@ -4011,7 +4011,9 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
         print(f"{item['pr_url']}  release {item['release_tag'] or '—'}"
               f"  work order {item['wo_id'] or '—'}")
         print(f"checks {item['checks']} · last exit {item['last_exit']}"
-              f" · deadline {_stamp(item['deadline_ts'])}")
+              f" · deadline {_stamp(item['deadline_ts'])}"
+              + (f" · {item['auto_requeues']} automatic requeue(s)"
+                 if item.get("auto_requeues") else ""))
         if item["resolution"]:
             print(f"\n{item['resolution']}")
         print(f"\nhints:\n{item['hints'] or '(none)'}")
