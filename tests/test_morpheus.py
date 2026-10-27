@@ -386,10 +386,52 @@ def test_timedout_asks_neo_by_default_and_the_route_is_configurable(central):
                         ask_neo=lambda *a: 3) == "investigation:fo-x"
 
 
-def test_no_work_order_means_no_investigation(central):
+def _allowed(monkeypatch, allowed: bool = True) -> list:
+    from jarvis import steward
+
+    seen = []
+
+    def gate(c, **kw):
+        seen.append(c)
+        return steward.Decision(outcome="dispatch" if allowed else "refuse", rule="test",
+                                reason="" if allowed else "no", severity="critical",
+                                claimed_severity="critical", generation=0, mode="test",
+                                allowed=allowed)
+
+    monkeypatch.setattr(steward, "gate", gate)
+    return seen
+
+
+def test_no_work_order_files_an_improvement_order_on_the_pr(central, monkeypatch):
+    from jarvis import ops
+
     item = queued(central, title="untitled")
-    assert morpheus._investigate(catalog(), item) == \
-        ("", "the PR names no work order to investigate")
+    candidates = _allowed(monkeypatch)
+    filed = {}
+
+    def create(project, title, description="", refs=(), origin="jarvis", **kw):
+        filed.update(project=project, title=title, description=description,
+                     refs=list(refs), origin=origin)
+        return {"id": "io-abcd1234"}
+
+    monkeypatch.setattr(ops, "create_improvement_order", create)
+    assert morpheus._investigate(catalog(), item) == ("io-abcd1234", "")
+    assert filed["project"] == "proj_a" and filed["refs"] == [item["pr_url"]]
+    assert filed["origin"] == "morpheus" and "has NOT diagnosed anything" in filed["description"]
+    assert [c.origin_kind for c in candidates] == ["morpheus"]
+
+
+def test_an_improvement_order_the_steward_refuses_asks_neo(central, monkeypatch):
+    item = queued(central, title="untitled")
+    _allowed(monkeypatch, allowed=False)
+    order_id, note = morpheus._investigate(catalog(), item)
+    assert order_id == "" and "the steward did not dispatch it" in note
+
+
+def test_an_improvement_order_is_recorded_as_one_not_as_an_investigation(central):
+    assert morpheus.act(central, catalog(), _failed(central),
+                        investigate=lambda c, i: ("io-abcd1234", ""),
+                        ask_neo=lambda *a: 9) == "improvement:io-abcd1234"
 
 
 def test_the_neo_question_is_a_validation_question_naming_the_item(central):

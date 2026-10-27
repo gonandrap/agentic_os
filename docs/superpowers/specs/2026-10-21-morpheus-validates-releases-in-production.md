@@ -92,9 +92,12 @@ output tail, the hints and the check. It says explicitly that Morpheus has diagn
 nothing.
 
 * `on_failed` (default `investigate`): an investigation order on the PR's work order,
-  parsed from the `[wo-xxxxxxxx]` title prefix. It goes through the steward as origin
-  `morpheus`, which needs `os.autonomy.self_dispatch`. If the PR has no work order or
-  the steward declines, the item goes to Neo instead.
+  parsed from the `[wo-xxxxxxxx]` title prefix. A PR opened by hand names no work order,
+  and an investigation needs an order to investigate, so that one gets an improvement
+  order instead, with the PR URL as its ref (#1253); the item records
+  `improvement:<io-id>` rather than `investigation:<id>`. Either goes through the steward
+  as origin `morpheus`, which needs `os.autonomy.self_dispatch`. If the steward declines
+  or the order cannot be filed, the item goes to Neo instead.
 * `on_timeout` (default `neo`): a Neo question of the new kind `validation`, which has
   no work order behind it, like `triage`. Neo either escalates (a warning in the inbox
   for the user) or answers (recorded on the item, plus an info row in the inbox).
