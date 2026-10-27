@@ -2147,17 +2147,21 @@ class ProjectStore:
         self.update_work_order(wo_id, needs_attention=1, attention_reason=reason)
         self.add_event(wo_id, "attention", {"reason": reason})
 
+    def repair_while(self, order_id: str, status: str, repair: Callable[[], None], *,
+                     kind: str = "wo") -> bool:
+        """Apply an invariant repair only while the row is STILL in the status the checker derived from (#1205)"""
+        table = "work_orders" if kind == "wo" else "feature_orders"
+        with db.write_transaction(self.conn):
+            # An empty status is a derivation nothing can be guarded against
+            if not status or self._status_of(table, order_id) != status:
+                return False
+            repair()
+        return True
+
     def flag_attention_while(self, wo_id: str, reason: str, status: str) -> bool:
         """Flag only while the order is STILL in the status the caller derived from (#1205)"""
-        with db.write_transaction(self.conn):
-            cur = self.conn.execute(
-                "UPDATE work_orders SET needs_attention=1, attention_reason=?, "
-                "updated_at=? WHERE id=? AND status=?",
-                (reason, db.now(), wo_id, status))
-            if not cur.rowcount:
-                return False
-            self.add_event(wo_id, "attention", {"reason": reason})
-        return True
+        return self.repair_while(wo_id, status,
+                                 lambda: self.flag_attention(wo_id, reason))
 
     def clear_attention(self, wo_id: str) -> None:
         # The blocker is gone, so any ack against it is spent: if the same reason comes back later it is a...

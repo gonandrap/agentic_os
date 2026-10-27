@@ -496,6 +496,33 @@ def test_a_settling_round_reaches_another_connection_with_its_event(project):
     assert "validation_escalated" in [e["kind"] for e in store.list_events(wo["id"])]
 
 
+def test_a_repair_is_dropped_when_the_row_left_the_status_it_derived_from(project):
+    """Issue #1205, second half: a repair writes only against the row it derived from"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    store.set_status(wo["id"], "validating")
+    store.flag_attention(wo["id"], "something")
+
+    def retire() -> None:
+        store.set_status(wo["id"], "completed")
+        store.clear_attention(wo["id"])
+
+    assert store.repair_while(wo["id"], "validating", retire)
+    assert store.get_work_order(wo["id"])["status"] == "completed"
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+    assert not store.repair_while(wo["id"], "validating",
+                                  lambda: store.flag_attention(wo["id"], "stale"))
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+    fo = store.create_feature_order("a feature", description="all of it")
+    store.set_feature_status(fo["id"], "failed")
+    assert not store.repair_while(
+        fo["id"], "executing",
+        lambda: store.flag_feature_attention(fo["id"], "stale"), kind="fo")
+    assert not store.get_feature_order(fo["id"])["needs_attention"]
+
+
 def test_approvals_of_kind_is_not_bounded_by_the_generic_listings_window(project):
     """`list_approvals` answers the 200 NEWEST rows of every kind"""
     # Fixture commands stay non-commands: a real `gh pr merge …` literal here trips the privileged-action...
