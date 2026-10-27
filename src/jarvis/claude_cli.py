@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
-from . import systemd_units
+from . import keychain, systemd_units
 
 
 if TYPE_CHECKING:
@@ -1210,14 +1210,52 @@ def credentials_path() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / ".credentials.json"
 
 
-def signin_changed_at() -> float | None:
-    """When Claude Code's stored sign-in last changed, or None if nothing can be said"""
+#: The login-Keychain item Claude Code signs in to on a Mac, in place of `.credentials.json`
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+@dataclass
+class StoredSignin:
+    #: The parsed JSON — `claudeAiOauth` holds the OAuth session
+    data: Any
+    #: When it last changed, or None when its store would not say
+    changed_at: float | None
+    #: Where it was read from, for messages: a path or the Keychain item
+    source: str
+
+
+def stored_signin() -> StoredSignin | None:
+    """The credentials file, else on a Mac the Keychain item; `None` when neither exists"""
     path = credentials_path()
     try:
         changed = path.stat().st_mtime
-        raw = json.loads(path.read_text())
-    except (OSError, ValueError):
+        raw = path.read_text()
+    except FileNotFoundError:
+        if os.environ.get(CREDENTIALS_ENV) or os.environ.get("CLAUDE_CONFIG_DIR"):
+            return None  # an explicit file, or a config dir whose Keychain item is named apart
+        item = keychain.generic_password(KEYCHAIN_SERVICE)
+        if item is None:
+            return None
+        changed, raw, where = item.modified_at, item.secret, f"Keychain item {KEYCHAIN_SERVICE!r}"
+    except OSError:
+        raise ValueError(f"{path} is unreadable") from None
+    else:
+        where = str(path)
+    try:
+        return StoredSignin(data=json.loads(raw), changed_at=changed, source=where)
+    except ValueError:
+        raise ValueError(f"{where} is not JSON") from None
+
+
+def signin_changed_at() -> float | None:
+    """When Claude Code's stored sign-in last changed, or None if nothing can be said"""
+    try:
+        stored = stored_signin()
+    except ValueError:
         return None
+    if stored is None or stored.changed_at is None:
+        return None
+    raw, changed = stored.data, stored.changed_at
     oauth = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
     expires = oauth.get("refreshTokenExpiresAt") if isinstance(oauth, dict) else None
     if isinstance(expires, (int, float)) and not isinstance(expires, bool) and \
