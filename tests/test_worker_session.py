@@ -213,6 +213,18 @@ def test_process_alive_rejects_a_pid_that_is_not_a_claude(fake_claude):
     assert claude_cli.process_alive(os.getpid()) is False
 
 
+def test_process_alive_rejects_a_non_claude_pid_without_proc(fake_claude, monkeypatch):
+    """macOS has no /proc, so the pid-reuse guard asks `ps` instead of trusting the signal"""
+    import os
+
+    real = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda self: (
+        (_ for _ in ()).throw(OSError("no /proc")) if str(self).startswith("/proc/")
+        else real(self)))
+
+    assert claude_cli.process_alive(os.getpid()) is False
+
+
 def test_a_finished_turn_is_not_reported_alive_as_a_zombie(fleet):
     """Nothing waits on a detached turn, so on exit it becomes a **zombie**"""
     import os

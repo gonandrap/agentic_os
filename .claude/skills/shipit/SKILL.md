@@ -68,6 +68,11 @@ established.
    SIGTERMs the script mid-deploy — which is how 0.5.0 shipped half-applied. Nothing
    may be added after this step.
 
+On macOS the services are launchd agents (`com.jarvis.daemon`, `com.jarvis.ui`) and
+steps 6 and 8 use `launchctl kickstart -k` instead; `uname -s` decides, and
+`JARVIS_SERVICE_MANAGER=systemd|launchd` overrides. See `docs/DEPLOYMENT.md`,
+"macOS: launchd instead of systemd".
+
 Production's `origin` is the GitHub remote, so what runs in prod is exactly what is on
 the remote — every release is reproducible from a fresh clone. `main`'s `pyproject`
 version intentionally lags the shipped one: the bump lives only on release branches.

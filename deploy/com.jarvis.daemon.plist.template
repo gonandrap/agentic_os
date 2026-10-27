@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Jarvis OS production fleet daemon, the macOS counterpart of jarvis.service.template.
+     Rendered by scripts/install_prod_service.sh into ~/Library/LaunchAgents. DO NOT EDIT.
+     launchd has no EnvironmentFile=, so the agent sources the secrets file itself before
+     exec-ing the daemon; a missing file is skipped (Telegram just stays off). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jarvis.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>if [ -f "@PROD_ROOT@/secrets/jarvis.env" ]; then set -a; . "@PROD_ROOT@/secrets/jarvis.env"; set +a; fi; exec "@PROD_DIR@/.venv/bin/jarvis" start --catalog "@PROD_CONFIG@" --foreground</string>
+  </array>
+  <key>WorkingDirectory</key><string>@PROD_DIR@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>JARVIS_HOME</key><string>@PROD_ROOT@/state</string>
+    <key>PRODUCTION_CODE</key><string>@PROD_ROOT@</string>
+    <key>JARVIS_ENV</key><string>production</string>
+    <key>HOME</key><string>@HOME@</string>
+    <key>PATH</key><string>@PATH@</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ExitTimeOut</key><integer>30</integer>
+  <key>StandardOutPath</key><string>@PROD_ROOT@/state/logs/jarvisd.launchd.log</string>
+  <key>StandardErrorPath</key><string>@PROD_ROOT@/state/logs/jarvisd.launchd.log</string>
+</dict>
+</plist>

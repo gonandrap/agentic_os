@@ -1243,11 +1243,16 @@ def process_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True  # alive, just not ours to signal
+    want = Path(claude_bin()).name
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
-        return True  # no /proc (or it vanished mid-read) — trust the signal
-    want = Path(claude_bin()).name
+        from . import service_manager
+
+        tokens = service_manager.command_line(pid)  # macOS has no /proc
+        if tokens is None:
+            return True  # it vanished mid-read, or `ps` would not say — trust the signal
+        return any(Path(tok).name == want for tok in tokens)
     return any(Path(tok).name == want
                for tok in raw.decode(errors="replace").split("\0") if tok)
 

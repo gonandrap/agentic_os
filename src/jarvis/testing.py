@@ -16,7 +16,7 @@ from typing import Any, Sequence
 
 import pytest
 
-from . import agent_usage, paths, release, systemd_units, usage
+from . import agent_usage, paths, release, service_manager, systemd_units, usage
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -72,6 +72,8 @@ def gate_environment(root: Path) -> dict[str, str]:
         GH_BIN_ENV: str(_blocked_bin(root, "gh", BLOCKED_GH)),
         # Worker turns stay on the plain-`Popen` transport for the whole suite
         systemd_units.TRANSPORT_ENV: systemd_units.DIRECT,
+        # Production services stay systemd's, so a Mac run never kickstarts the human's own dashboard
+        service_manager.MANAGER_ENV: service_manager.SYSTEMD,
         # The developer's own Claude Code sign-in
         CREDENTIALS_ENV: str(root / "claude-credentials.json"),
         # The developer's own installed `jarvis.service`, which `INV-SERVICE-PATH` reads
@@ -1825,6 +1827,119 @@ def fake_systemd(tmp_path, monkeypatch):
         def fail(self, message: str = "fake systemd-run: refused") -> None:
             """Make every subsequent spawn fail, so the direct fallback is exercised"""
             monkeypatch.setenv("FAKE_SYSTEMD_FAIL", message)
+
+    return Handle()
+
+
+FAKE_LAUNCHCTL = r"""#!/usr/bin/env python3
+# Fake `launchctl print|kickstart -k`, output shapes copied from the live production Mac
+import json, os, sys
+
+state_dir = os.environ["FAKE_LAUNCHD_DIR"]
+jobs_dir = os.path.join(state_dir, "jobs")
+argv = sys.argv[1:]
+with open(os.path.join(state_dir, "ctl-calls.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": argv}) + "\n")
+
+def load(label):
+    try:
+        with open(os.path.join(jobs_dir, label + ".json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+def missing(label):
+    sys.stderr.write(
+        'Could not find service "%s" in domain for user gui: %s\n' % (label, os.getuid()))
+    sys.exit(113)
+
+if argv[:1] == ["print"] and len(argv) == 2:
+    label = argv[1].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    print("%s = {" % label)
+    print("\tstate = %s" % rec.get("state", "running"))
+    if rec.get("pid") is not None:
+        print("\tpid = %s" % rec["pid"])
+    print("\tlast exit code = %s" % rec.get("exit", 0))
+    print("}")
+elif argv[:2] == ["kickstart", "-k"] and len(argv) == 3:
+    label = argv[2].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    # A new pid proves the restart made a new process
+    rec["pid"] = int(rec.get("pid") or 0) + 1
+    rec["state"] = "running"
+    with open(os.path.join(jobs_dir, label + ".json"), "w") as f:
+        json.dump(rec, f)
+elif argv[:1] == ["bootout"] and len(argv) == 2:
+    label = argv[1].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    os.rename(os.path.join(jobs_dir, label + ".json"),
+              os.path.join(state_dir, label + ".booted-out.json"))
+elif argv[:1] == ["bootstrap"] and len(argv) == 3:
+    fails = os.path.join(state_dir, "bootstrap-failures")
+    left = int(open(fails).read()) if os.path.exists(fails) else 0
+    if left > 0:
+        with open(fails, "w") as f:
+            f.write(str(left - 1))
+        sys.stderr.write("Bootstrap failed: 5: Input/output error\n"); sys.exit(5)
+    label = os.path.basename(argv[2])[:-len(".plist")]
+    old = os.path.join(state_dir, label + ".booted-out.json")
+    try:
+        with open(old) as f:
+            rec = json.load(f)
+        os.unlink(old)
+    except (OSError, ValueError):
+        rec = {}
+    rec["pid"] = int(rec.get("pid") or 0) + 1
+    rec["state"] = "running"
+    rec["plist"] = argv[2]
+    with open(os.path.join(jobs_dir, label + ".json"), "w") as f:
+        json.dump(rec, f)
+else:
+    sys.stderr.write("fake launchctl: unhandled argv %s\n" % argv); sys.exit(2)
+"""
+
+
+@pytest.fixture()
+def fake_launchd(tmp_path, monkeypatch):
+    """Put the two production services on the launchd path, against a fake `launchctl`"""
+    ldir = tmp_path / "fake-launchd"
+    (ldir / "jobs").mkdir(parents=True)
+    ctl_bin = ldir / "launchctl"
+    ctl_bin.write_text(FAKE_LAUNCHCTL)
+    ctl_bin.chmod(ctl_bin.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("FAKE_LAUNCHD_DIR", str(ldir))
+    monkeypatch.setenv(service_manager.LAUNCHCTL_BIN_ENV, str(ctl_bin))
+    monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.LAUNCHD)
+
+    class Handle:
+        dir = ldir
+
+        @property
+        def calls(self) -> list[list[str]]:
+            path = ldir / "ctl-calls.jsonl"
+            return ([json.loads(ln)["argv"] for ln in path.read_text().splitlines()]
+                    if path.exists() else [])
+
+        @property
+        def jobs(self) -> dict[str, dict]:
+            return {p.stem: json.loads(p.read_text())
+                    for p in (ldir / "jobs").glob("*.json")}
+
+        def load(self, label: str, state: str = "running", pid: int | None = 4242,
+                 exit_code: int = 0) -> None:
+            """Make `label` a job launchd knows about"""
+            (ldir / "jobs" / f"{label}.json").write_text(
+                json.dumps({"state": state, "pid": pid, "exit": exit_code}))
+
+        def bootout(self, label: str) -> None:
+            (ldir / "jobs" / f"{label}.json").unlink(missing_ok=True)
 
     return Handle()
 
