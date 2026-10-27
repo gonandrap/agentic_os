@@ -441,6 +441,44 @@ def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
         neo.close()
 
 
+_RETRIES_SUFFIX = re.compile(r"\s*\(after \d+ retries — nobody has judged this\)$")
+
+
+def fold_neo_attention(questions: list[dict[str, Any]],
+                       rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per CAUSE, with a count, the biggest pile first: one outage is one thing to fix, not one per question"""
+    from .neo_store import REVIVABLE_KINDS, UNREACHABLE_PREFIX
+
+    groups: dict[tuple[str, ...], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for q, row in zip(questions, rows):
+        reason = q.get("answer_reason") or ""
+        if q["status"] == "failed" and reason.startswith(UNREACHABLE_PREFIX):
+            # Unjudged: the outage is the subject, whatever each question asked
+            key = (q["project"], q.get("kind") or "", "unreachable",
+                   _RETRIES_SUFFIX.sub("", reason))
+        else:
+            # Judged: only the same question asked twice is the same decision
+            key = (q["project"], q.get("kind") or "", q.get("wo_id") or "", q["question"])
+        groups.setdefault(key, []).append((q, row))
+    out = []
+    for key, members in groups.items():
+        q, row = members[-1]
+        ids = [m["id"] for m, _ in members]
+        row = {**row, "count": len(ids), "neo_question_ids": ids}
+        if len(ids) > 1 and key[2] == "unreachable":
+            kind = q.get("kind") or "question"
+            heals = (" — they re-ask themselves once Neo answers again; `jarvis neo list` "
+                     "to read them" if kind in REVIVABLE_KINDS
+                     else " — `jarvis neo list` to read and answer them")
+            row.update(title=f"Neo could not be reached for {len(ids)} {kind} questions",
+                       reason=_RETRIES_SUFFIX.sub("", q.get("answer_reason") or "") + heals,
+                       wo_id=None, decide="jarvis neo list")
+        elif len(ids) > 1:
+            row["title"] = f"{row['title']} (asked {len(ids)}×)"
+        out.append(row)
+    return sorted(out, key=lambda r: -r["count"])
+
+
 def _held_jobs(store: ProjectStore, catalog: Catalog | None = None) -> list[dict[str, Any]]:
     """Scheduled jobs this project is STILL SUPPOSED TO RUN and cannot"""
     cfg = schedule_config_at(store.project_path, catalog)
@@ -675,6 +713,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 store.close()
         inbox = central.unacked_inbox()
         backlog_open = central.list_backlog(status="open")
+        neo_rows = []
         for q in escalated_questions:
             # A `triage` question is the one kind with NO WORKER BEHIND IT (issue #240): nothing is blocked on...
             triage = q.get("kind") == "triage"
@@ -682,7 +721,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             if triage:
                 from . import issues
                 url = (issues.triage_payload(q) or {}).get("issue_url") or ""
-            attention.append({
+            neo_rows.append({
                 "project": q["project"], "wo_id": q["wo_id"],
                 "title": (f"Neo could not confirm a bug's priority: {q['question'][:60]}"
                           if triage else f"Neo escalated: {q['question'][:80]}"),
@@ -696,6 +735,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                            f"jarvis neo show {q['id']}") if triage else
                           f"jarvis neo answer {q['id']} \"…\"",
             })
+        attention.extend(fold_neo_attention(escalated_questions, neo_rows))
         # Gates Neo sent up
         gate_items = []
         # Gate requests that turned out not to be gated actions at all
