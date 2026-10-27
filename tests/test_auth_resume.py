@@ -16,7 +16,7 @@ from jarvis.testing import make_git_project
 
 
 def test_a_sign_in_the_os_cannot_see_is_not_a_sign_in(signin, monkeypatch):
-    """None means DO NOT RESUME, and it is the default: an `ANTHROPIC_API_KEY` sign-in leaves nothing to watch"""
+    """None means DO NOT RESUME, and it is the default: an API-key sign-in has nothing to watch"""
     assert claude_cli.signin_changed_at() is None
 
 
