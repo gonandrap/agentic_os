@@ -194,7 +194,8 @@ and both `install_prod_service.sh` and `shipit.sh` read that one knob.
 | `systemctl --user status jarvis` | `launchctl print gui/$UID/com.jarvis.daemon` |
 | `systemctl --user restart jarvis` | `launchctl kickstart -k gui/$UID/com.jarvis.daemon` (keeps the loaded plist) |
 | `systemctl --user daemon-reload` + restart | `launchctl bootout gui/$UID/com.jarvis.daemon` then `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.jarvis.daemon.plist` |
-| `systemctl --user stop jarvis` | `launchctl bootout gui/$UID/com.jarvis.daemon` |
+| `systemctl --user stop jarvis` | `launchctl bootout gui/$UID/com.jarvis.daemon` (until next login) |
+| `systemctl --user disable --now jarvis` | `launchctl disable gui/$UID/com.jarvis.daemon` + bootout; `enable` + bootstrap undoes it |
 | `journalctl --user -u jarvis -f` | `tail -f $PRODUCTION_CODE/state/logs/jarvisd.launchd.log` |
 | `EnvironmentFile=` | the agent sources `secrets/jarvis.env` itself before `exec` |
 | linger | none: `gui/$UID` agents start at login and stop at logout, so a headless Mac needs auto-login |
@@ -214,9 +215,27 @@ one, and `jarvis doctor`'s INV-SERVICE-PATH reads the plists' `EnvironmentVariab
 `scripts/shipit.sh` uses only BSD-compatible tools — no `sed -i`, no GNU `0,/re/` address
 — so it runs on a stock Mac without GNU sed.
 
-Not ported, and only this: the **per-turn transient unit**. Worker turns run on the direct
-`Popen` transport on a Mac (no `systemd-run`), so a daemon restart still takes a running
-turn with it.
+A bootout lasts until the next login only: every plist in `~/Library/LaunchAgents` is
+loaded again at login, and `RunAtLoad` starts it. To keep production off across logins,
+`launchctl disable` both labels as well; a release's bootstrap then fails loudly until
+they are enabled again.
+
+Other Mac differences the Python half handles:
+
+- **Sign-in.** Claude Code keeps its OAuth session in the login Keychain (item
+  `Claude Code-credentials`), not in `~/.claude/.credentials.json`. The usage meter and
+  the auth-pause resume clock read the file when it exists, else that item through
+  `/usr/bin/security` (`src/jarvis/keychain.py`). An explicit `JARVIS_CLAUDE_CREDENTIALS`
+  or a `CLAUDE_CONFIG_DIR` never falls back to it.
+- **Desktop notifications.** The `desktop` sink uses `notify-send` when present, else
+  `osascript` (`display notification`). macOS may need notifications allowed for Script
+  Editor before the banners appear.
+- **Worker turns survive a daemon restart.** There is no per-turn transient unit, and
+  none is needed: launchd's bootout and `kickstart -k` kill the job's own process group,
+  and a turn on the direct `Popen` transport runs in its own session
+  (`start_new_session`), so the restarted daemon finds it by pid. A turn on the
+  background-session transport belongs to Claude Code's own daemon and never belonged to
+  the job. Both were checked live on a Mac.
 
 ### The unit's PATH is the whole fleet's PATH
 

@@ -16,7 +16,7 @@ from typing import Any, Sequence
 
 import pytest
 
-from . import agent_usage, paths, release, service_manager, systemd_units, usage
+from . import agent_usage, keychain, paths, release, service_manager, systemd_units, usage
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -76,6 +76,8 @@ def gate_environment(root: Path) -> dict[str, str]:
         service_manager.MANAGER_ENV: service_manager.SYSTEMD,
         # The developer's own Claude Code sign-in
         CREDENTIALS_ENV: str(root / "claude-credentials.json"),
+        # ...and its macOS twin, the login Keychain
+        keychain.SECURITY_BIN_ENV: str(root / "no-security"),
         # The developer's own installed `jarvis.service`, which `INV-SERVICE-PATH` reads
         release.UNIT_DIR_ENV: str(root / "systemd-units"),
         # The developer's own production checkout, which `INV-PROD-CLEAN` reads (#202)

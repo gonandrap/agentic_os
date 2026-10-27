@@ -79,13 +79,13 @@ class Sample:
 
 def token() -> str:
     """`claudeAiOauth.accessToken`, read FRESH — a cached token is a 401 waiting (§1)"""
-    path = claude_cli.credentials_path()
     try:
-        raw = json.loads(path.read_text())
-    except FileNotFoundError:
-        raise MeterError("no credentials file to read the usage endpoint with") from None
-    except (OSError, ValueError):
+        stored = claude_cli.stored_signin()
+    except ValueError:
         raise MeterError("the credentials file is unreadable") from None
+    if stored is None:
+        raise MeterError("no credentials file or Keychain item to read the usage endpoint with")
+    raw = stored.data
     oauth = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
     value = oauth.get("accessToken") if isinstance(oauth, dict) else None
     if not isinstance(value, str) or not value:
