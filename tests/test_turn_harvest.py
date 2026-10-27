@@ -291,10 +291,12 @@ def test_refused_checkpoint_commit_records_gits_own_words(fleet, settle_turns):
     assert payload["checkpoint"] == ""
     assert reason.startswith("git refused the checkpoint commit: ")
     assert "\n" not in reason  # the CLI and the HTML page both render it on one line
-    assert len(reason) <= len("git refused the checkpoint commit: ") + harvest.SKIP_CHARS
+    limit = len("git refused the checkpoint commit: ") + harvest.SKIP_CHARS
+    assert len(reason) <= limit
     # what git ACTUALLY says here, verbatim from the run above
     assert "cannot lock ref 'HEAD'" in reason
-    assert "Permission denied" in reason
+    # macOS's long `$TMPDIR` in the lock path can push this past the cut
+    assert "Permission denied" in reason or len(reason) == limit
     assert payload["said"] == "Half of the CSV path is written."
     assert payload["authored"]["commits"] == 1
     assert payload["authored"]["dirty"] == ["halfway.py"]
