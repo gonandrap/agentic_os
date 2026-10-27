@@ -496,6 +496,48 @@ def test_a_settling_round_reaches_another_connection_with_its_event(project):
     assert "validation_escalated" in [e["kind"] for e in store.list_events(wo["id"])]
 
 
+def test_a_status_move_reaches_another_connection_with_its_event(project):
+    """Issue #1205: the sweep read a span whose `status` event was not written yet"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    go, done, ready = threading.Event(), threading.Event(), threading.Event()
+    seen: dict = {}
+
+    def sweeper() -> None:
+        other = ProjectStore(project)   # opened BEFORE the write: construction writes too
+        ready.set()
+        try:
+            assert go.wait(timeout=15)
+            seen["spans"] = [s["to_status"] for s in other.state_spans(wo["id"])]
+            seen["events"] = [(db.from_json(e["payload"], {}) or {}).get("status")
+                              for e in other.events_of_kind(wo["id"], "status")]
+        finally:
+            other.close()
+            done.set()
+
+    thread = threading.Thread(target=sweeper, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=15)
+
+    def let_the_sweep_read_between_the_span_and_its_event(sql: str) -> None:
+        # The callback runs BEFORE its statement: the span is written by now, the event is not
+        if sql.strip().upper().startswith("INSERT INTO WO_EVENTS") and not go.is_set():
+            go.set()
+            done.wait(timeout=15)
+
+    store.conn.set_trace_callback(let_the_sweep_read_between_the_span_and_its_event)
+    try:
+        store.set_status(wo["id"], "needs_review")
+    finally:
+        store.conn.set_trace_callback(None)
+        thread.join(timeout=15)
+
+    assert done.is_set(), "the other connection never got its read in"
+    assert "needs_review" not in seen["spans"] or "needs_review" in seen["events"], (
+        "a second connection saw a span with no `status` event beside it")
+    assert "needs_review" in [s["to_status"] for s in store.state_spans(wo["id"])]
+
+
 def test_a_repair_is_dropped_when_the_row_left_the_status_it_derived_from(project):
     """Issue #1205, second half: a repair writes only against the row it derived from"""
     store = ProjectStore(project)
