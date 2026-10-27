@@ -595,6 +595,25 @@ def test_the_attention_repair_is_dropped_when_the_order_settled_under_the_sweep(
     assert not store.get_work_order(wo["id"])["needs_attention"]
 
 
+def test_the_phantom_clear_is_dropped_when_the_order_moved_under_the_sweep(project,
+                                                                           monkeypatch):
+    """Issue #1205: a clear derived from a settled row must not land on a retried one"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("retried after it settled")
+    store.set_status(wo["id"], "completed")
+    store.flag_attention(wo["id"], "a flag with nothing behind it")
+    stale = store.get_work_order(wo["id"])      # the row as the sweep read it
+    # `jarvis wo retry` moves it while the sweep is deriving
+    store.set_status(wo["id"], "running")
+    store.flag_attention(wo["id"], "the retry's own blocker")
+    monkeypatch.setattr(store, "list_work_orders", lambda *a, **k: [stale])
+
+    assert list(invariants.check_no_phantom_attention(store)) == []
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"] == 1
+    assert fresh["attention_reason"] == "the retry's own blocker"
+
+
 def test_a_closed_pull_request_outranks_an_escalated_review(project):
     """Both branches live under the same `needs_review` roof"""
     store = ProjectStore(project)

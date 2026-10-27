@@ -24,7 +24,11 @@ def connect(path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """One all-or-nothing unit of work"""
+    """One all-or-nothing unit of work, reentrant: the outermost one owns the commit"""
+    if conn.in_transaction:
+        # The connection is in autocommit (`connect`), so this is an explicit BEGIN of ours
+        yield conn
+        return
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
