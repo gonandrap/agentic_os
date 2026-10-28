@@ -1009,6 +1009,8 @@ def create_app() -> FastAPI:
         assumption_decider=ops.assumption_decider,
         # And the OS's RULING on one, same reason one authority along: the page and `jarvis wo show` must not... (#712)
         assumption_ruling_line=ops.assumption_ruling_line,
+        # And WHY a pending one with no ruling is with the user at all (issue #1265)
+        assumption_routing_line=ops.assumption_routing_line,
         # The early pass's three facts, same reason again (§8 of the early-review spec): Neo's provisional...
         provisional_line=ops.provisional_line,
         objection_line=ops.objection_line,

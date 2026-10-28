@@ -3528,7 +3528,14 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
     # Children of this plan that have already landed, for the rows that are still the user's
     over = (_overtaken(store, wo_id)
             if any(str(a.get("status") or "") == "pending" for a in rows) else None)
-    return [{**a, "overtaken": over if str(a.get("status") or "") == "pending" else None}
+    # WHY a pending row with no ruling is with the user — the catalog is read only if one is
+    off = (autoreview_off_because(store.project_path)
+           if any(str(a.get("status") or "") == "pending" and not a.get("os_ruling")
+                  for a in rows) else "")
+    replies = store.agent_replies(wo_id) if rows else []
+    return [{**a, "overtaken": over if str(a.get("status") or "") == "pending" else None,
+             "autoreview_off": off,
+             "source_ref": assumption_source_ref(a, replies)}
             for a in rows]
 
 
@@ -3680,6 +3687,32 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
     return ""
 
 
+def assumption_routing_line(a: dict[str, Any]) -> str:
+    """WHY a pending assumption is with the user when nothing judged it first (issue #1265)"""
+    # A row with a ruling already says who looked, through `assumption_ruling_line`
+    if str(a.get("status") or "") != "pending" or a.get("os_ruling"):
+        return ""
+    # ABSENT, not empty: a row `assumptions_with_rulings` never enriched carries no answer
+    off = a.get("autoreview_off")
+    if off is None:
+        return ""
+    if off:
+        return f"With you because {off} for this project, so nobody judged it before you"
+    return "With you because the automatic review has not reached it yet"
+
+
+def assumption_source_ref(a: dict[str, Any],
+                          replies: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The worker turn this assumption was recorded during, as a `timeline` ref, or None"""
+    # `jarvis wo assume` always runs BEFORE the reply that ends its turn (#1265)
+    ts = float(a.get("ts") or 0.0)
+    for m in replies:
+        if float(m.get("ts") or 0.0) >= ts:
+            return {"kind": "message", "id": int(m["id"]),
+                    "label": "the turn that raised it"}
+    return None
+
+
 def overtaken_line(a: dict[str, Any]) -> str:
     """CHILDREN OF THIS PLAN THAT ALREADY MERGED, in one line, or `''`"""
     over = a.get("overtaken") or {}
@@ -3735,9 +3768,9 @@ def assumption_line(a: dict[str, Any]) -> str:
     n, status = a.get("n"), str(a.get("status") or "")
     content = str(a.get("content") or "")
     if status == "pending":
-        parts = [p for p in (assumption_ruling_line(a), provisional_line(a),
-                             objection_line(a), objection_response_line(a),
-                             overtaken_line(a)) if p]
+        parts = [p for p in (assumption_ruling_line(a), assumption_routing_line(a),
+                             provisional_line(a), objection_line(a),
+                             objection_response_line(a), overtaken_line(a)) if p]
         return (f"#{n} pending your review: {content}"
                 f"{' — ' + '; '.join(parts) if parts else ''}")
     reason = str(a.get("decided_reason") or "").strip()
@@ -12006,21 +12039,30 @@ def inspect_config_at(project_path: Path) -> Any:
         return InspectConfig()
 
 
-def auto_review_at(project_path: Path) -> bool:
-    """Will the OS decide this project's assumptions ITSELF, rather than the user?"""
+def autoreview_off_because(project_path: Path) -> str:
+    """WHICH setting leaves this project's assumptions with the user, or `''` when the OS judges them"""
     try:
         catalog = resolve_catalog()
         if not catalog.os.neo.enabled:
-            return False
+            return "`os.neo.enabled` is off"
         target = Path(project_path).resolve()
         cfg = catalog.os.validation
         for spec in catalog.projects:
             if Path(spec.path).resolve() == target:
                 cfg = spec.validation
                 break
-        return bool(cfg.enabled and cfg.auto_review)
+        if not cfg.enabled:
+            return "`validation.enabled` is off"
+        if not cfg.auto_review:
+            return "`validation.auto_review` is off"
+        return ""
     except (OpsError, CatalogError, OSError, ValueError):
-        return False
+        return "the catalog could not be read"
+
+
+def auto_review_at(project_path: Path) -> bool:
+    """Will the OS decide this project's assumptions ITSELF, rather than the user?"""
+    return not autoreview_off_because(project_path)
 
 
 def schedule_config_at(project_path: Path, catalog: Catalog | None = None) -> Any:

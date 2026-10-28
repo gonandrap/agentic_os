@@ -94,7 +94,10 @@ def test_a_row_written_before_the_columns_renders_exactly_as_before(client, proj
     row = row_of(store, wo["id"], aid)
     line = ops.assumption_line(row)
 
-    assert line == "#1 pending your review: reused the existing exporter"
+    # The dropped columns add nothing; the routing line is a fact about the PROJECT (#1265)
+    assert line == (
+        "#1 pending your review: reused the existing exporter — With you because "
+        "`validation.enabled` is off for this project, so nobody judged it before you")
     assert ops.provisional_line(row) == ""
     assert ops.objection_line(row) == ""
     assert ops.objection_response_line(row) == ""
@@ -104,15 +107,18 @@ def test_a_row_written_before_the_columns_renders_exactly_as_before(client, proj
         assert absent not in page
 
 
-def test_an_assumption_in_an_auto_review_off_project_grows_no_lines(client, project):
-    """Most of the fleet"""
+def test_an_assumption_in_an_auto_review_off_project_grows_only_its_routing_line(
+        client, project):
+    """Most of the fleet: no early-pass line, but it still says who it waits on (#1265)"""
     wo = ops.create_work_order("proj_a", "task with a judgement call")
     store = ProjectStore(project)
     aid = store.add_assumption(wo["id"], "kept the default timeout")
     store.set_status(wo["id"], "needs_review")
 
     row = row_of(store, wo["id"], aid)
-    assert ops.assumption_line(row) == "#1 pending your review: kept the default timeout"
+    assert ops.assumption_line(row) == (
+        "#1 pending your review: kept the default timeout — With you because "
+        "`validation.enabled` is off for this project, so nobody judged it before you")
     assert row["objection_undeliverable"] is False
     assert row["objection_response"] is None
     page = page_of(client, wo["id"])

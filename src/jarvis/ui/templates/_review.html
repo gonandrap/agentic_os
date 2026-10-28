@@ -21,8 +21,12 @@
 <div class="row">
   <form method="post" action="/wo/{{ project }}/{{ wo.id }}/review"
         style="flex:1; display:flex; gap:8px; align-items:center">
+    {# "recorded as a rule for Neo", never "teaches Neo": `ops.review_work_order` writes
+       the rule on every project, auto-review on or not, so the old wording read as "Neo
+       already ruled here" on a project where nothing had looked at the assumption at all
+       (issue #1265). The card above says who looked; this says where the reason goes. #}
     <input type="text" name="feedback" style="flex:1"
-           placeholder="Why? (optional — teaches Neo, and on reject goes to the worker as guidance)">
+           placeholder="Why? (optional — recorded as a rule for Neo, and on reject goes to the worker as guidance)">
     <button name="decision" value="accept" class="accept"
             title="{{ review.accept }}">{{ 'Accept all' if review.pending
                                            else 'Accept as is' }}</button>
