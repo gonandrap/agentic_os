@@ -138,26 +138,61 @@ section 7's job, by not calling you.
 
 An unknown name returns all-zero counts and raises nothing, so a second purge is safe.
 
-**Derive the table list from the live schema, do not hard-code it.** Introspect which tables
-carry a `project` column (`PRAGMA table_info`, or the equivalent over
-`sqlite_master`) and delete from each. A hand-written list silently misses a table added
-after this spec, and that is the exact leak section 6's invariant exists to catch — making
-the purge self-maintaining is the fix the OS's own rule asks for (`kn-7698ad89`). Pin the
-derived set with a test asserting it equals the eleven tables that carry one today, so a
-new table is a visible test failure rather than a silent widening:
+**A `project` column does not mean the row belongs to the project.** Two tables document
+theirs as provenance — `gate_rules` (`central_store.py:274`, `-- provenance, never scope`)
+and `detectors` (`central_store.py:310`, `-- provenance AND optional scope; '' = fleet-wide`).
+Their rows are fleet-wide gate rules and detectors that merely *originated* in some project.
+Deleting them because a sandbox is being purged would silently remove gates that guard every
+other project, and the only trace would be a rowcount. **Never delete from either table.**
+Both also carry the schema's append-mostly discipline in as many words: *"Rows here are NEVER
+deleted and never rewritten in place except the counters, the timestamps and the arm/retract
+fields"* — what the OS believed and when is evidence.
 
-`inbox`, `backlog`, `knowledge`, `knowledge_reads`, `agent_calls`, `gate_rules`,
-`detectors`, `rule_fires`, `rule_recurrences`, `steward_decisions`, `morpheus_items`.
+So there are two sets, and the distinction is the whole of this section.
 
-`knowledge_read_hits` carries no `project` column and hangs off `knowledge_reads`, so it
-cascades by parent — check whether the foreign key does that for you or the delete has to.
-In `neo.db` it is `questions`, `learnings`, and the `panel_opinions` rows belonging to those
-questions.
+**Scope — deleted.** Nine tables in `os.db`: `inbox`, `backlog`, `knowledge`,
+`knowledge_reads`, `agent_calls`, `rule_fires`, `rule_recurrences`, `steward_decisions`,
+`morpheus_items`. `rule_fires.project` is `NOT NULL` with no default, beside `order_id` and
+`order_kind` (`central_store.py:372`): one fire against one order in one project, so it is
+scope and it goes. `knowledge_read_hits` carries no `project` column and hangs off
+`knowledge_reads`, so it cascades by parent — check whether the foreign key does that for you
+or the delete has to. In `neo.db`: `questions`, `learnings`, and the `panel_opinions` rows
+belonging to those questions.
 
-A `project` column documented `-- provenance, never scope` (`gate_rules`,
-`central_store.py:274`; `detectors`, `central_store.py:310`) means a row that merely *came
-from* this project. Purge it anyway — a purge promises nothing remains — and report those
-counts separately so the operator can see what provenance was lost.
+**Provenance — never deleted.** Two tables, and they need *different* treatment, because the
+columns are named alike and do not mean the same thing:
+
+- `gate_rules.project` is provenance only. Clear it: set it to `''`. The column is
+  `NOT NULL DEFAULT ''`, so NULL is not available and `''` is the schema's own value for
+  "no provenance". The rule keeps guarding the fleet, and `reason` still holds the reviewer's
+  words verbatim, so why the OS believes it survives the purge.
+- `detectors.project` is provenance **and optional scope**, where `''` means fleet-wide and a
+  name means that one project. Blanking one would *widen* a project-scoped detector to the
+  whole fleet — the opposite error, and worse than leaving it. So: rows already at `''` are
+  fleet-wide and are **not touched at all**; rows naming the purged project can never fire
+  again and are **retracted** through the table's own documented mechanism,
+  `CentralStore.retract_detector(detector_id, reason)` (`central_store.py:1518`), which
+  retires the detector and every live remedy rule under it. Pass a reason naming the purge.
+
+Report both sets in the returned dict, under keys that say which happened — a count of rows
+deleted and a count of rows whose provenance was cleared or retracted are different facts and
+must not be added together.
+
+**Derive the scope list from the live schema, do not hard-code it**, and exclude the
+provenance tables by an explicit named constant (`PROVENANCE_TABLES = ("gate_rules",
+"detectors")`) rather than by omission. Introspect which tables carry a `project` column
+(`PRAGMA table_info`, or the equivalent over `sqlite_master`) and delete from each one that
+is not in that constant. A hand-written delete list silently misses a table added after this
+spec, which is the exact leak section 6's invariant exists to catch, and making the purge
+self-maintaining is what the OS's own rule asks for (`kn-7698ad89`). But the same
+self-maintaining rule is a hazard in the other direction: a provenance-only table added
+later would be picked up and deleted automatically. The named exclusion is what makes the
+derivation safe, so the constant is not a tidiness preference.
+
+The pinning test names **both** lists — the nine scope tables and the two provenance tables —
+and asserts their union equals the eleven tables carrying a `project` column today. A new
+table then fails the test with a message saying it must be classified as scope or provenance
+before purge may touch it. Classifying it is a decision, not a default.
 
 The `knowledge_fts` index has `AFTER DELETE` and `AFTER UPDATE` triggers
 (`central_store.py:555-567`), so a plain `DELETE FROM knowledge` keeps search consistent by
@@ -365,6 +400,14 @@ rows, open `backlog` rows. The detail names the project, the table and the row c
 tells the user which way out they have. It is the same enumeration 6.2 needs, which is why it
 lives here and not in a separate order.
 
+Two exclusions, from the provenance distinction section 3 draws, and getting either wrong
+makes this check cry wolf on every clean fleet. A `detectors` row at `project=''` is
+fleet-wide, names no project and is never a violation. A `gate_rules` row is never a
+violation at all, whatever its `project` holds: provenance is a record of where a rule came
+from, not activity the OS would still take. Only an **armed** detector whose `project` names
+the offboarded project counts — which is also why section 3 retracts exactly those rather
+than blanking them, so an archive shows the violation and a purge does not.
+
 Finally, `ops.start_os` must not `bootstrap_project` or `upsert_project` an offboarded
 project. With section 7 removing the catalog entry this should already hold by construction —
 prove it with a test rather than assuming, because "a removed project is not re-bootstrapped
@@ -484,8 +527,13 @@ the restatement below is the criterion and the obvious phrasing is not.
   returns a hit whose `id` is that work order, whose `project` is the archived project, and
   whose `url` still resolves. ("`jarvis search` still finds it" is a CLI process and not a
   unit assertion.)
-- Purging removes the `projects` row and every project-scoped row in `os.db` and `neo.db`,
+- Purging removes the `projects` row and every project-**scoped** row in `os.db` and `neo.db`,
   removes `<project>/.jarvis/`, and afterwards `search.search(<those same words>)` is empty.
+- Purging deletes **no** `gate_rules` or `detectors` row, and a gate rule recorded with the
+  purged project's provenance **still blocks the same command for another project** after
+  `purge_project` — the rule's `project` is now `''` and it is still in force. A detector at
+  `project=''` is untouched and still fires; one naming the purged project is retracted with
+  a reason, not blanked, so it has not silently become fleet-wide.
 - Either mode with an open work order raises `OpsError` whose message carries the order's
   **id**, its status and the string `--force`, and nothing has moved — status still active,
   the project still in the catalog file, `.claude/settings.json` still present. With
