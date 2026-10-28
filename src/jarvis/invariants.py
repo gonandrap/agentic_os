@@ -1980,12 +1980,13 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
                 if q["kind"] in ("approval", "plan", "alarm", "triage",
-                                 "assumption", "question", "findings")]
-        # `triage` is the one kind whose subject is not a row in THIS database (#240)
+                                 "assumption", "question", "findings", "validation")]
+        # `triage` and `validation` are the kinds whose subject is not a row in THIS database (#240)
+        elsewhere = ("triage", "validation")
         mine = (registered_project_paths()
-                if any(q["kind"] == "triage" for q in held) else {})
+                if any(q["kind"] in elsewhere for q in held) else {})
         for q in held:
-            if q["kind"] == "triage" and mine.get(q["project"]) != store.project_path:
+            if q["kind"] in elsewhere and mine.get(q["project"]) != store.project_path:
                 continue
             moot = {"approval": _stale_approval_question,
                     "plan": _stale_plan_question,
@@ -1993,7 +1994,8 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
                     "triage": _stale_triage_question,
                     "assumption": _stale_assumption_question,
                     "question": _stale_worker_question,
-                    "findings": _stale_findings_question}[q["kind"]](store, q)
+                    "findings": _stale_findings_question,
+                    "validation": _stale_validation_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -2067,6 +2069,20 @@ def _stale_findings_question(store: ProjectStore,
         return (f"SUPERSEDED — finding {finding.get('key')!r} is {status}",
                 f"finding {finding.get('key')!r} of {fo['id']} was already {status}")
     return None
+
+
+def _stale_validation_question(store: ProjectStore,
+                               q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if the user already waived or requeued the PR this asks about"""
+    from . import morpheus
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(morpheus.item_of_question(q) or "")
+    finally:
+        central.close()
+    return morpheus.stale_question(item, q)
 
 
 def _stale_alarm_question(store: ProjectStore,

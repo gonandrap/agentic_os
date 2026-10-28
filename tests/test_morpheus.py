@@ -559,6 +559,82 @@ def test_a_validation_question_cannot_be_answered_like_a_worker_question(central
         ops.neo_answer_escalated(qid, "looks fine")
 
 
+def _escalated(central) -> tuple[dict, int]:
+    """A failed item whose Neo question came back to the user"""
+    from jarvis.neo_store import NeoStore
+
+    item = _failed(central)
+    qid = morpheus._ask_neo(catalog(), item, "")
+    central.claim_morpheus_action(item["id"], f"neo:{qid}")
+    neo = NeoStore()
+    try:
+        neo.mark(qid, "escalated", reason="needs you")
+    finally:
+        neo.close()
+    return central.morpheus_item(item["id"]), qid
+
+
+def _status(qid: int) -> str:
+    from jarvis.neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        return neo.get(qid)["status"]
+    finally:
+        neo.close()
+
+
+@pytest.mark.parametrize("decide", ["waive", "requeue"])
+def test_deciding_the_item_closes_its_question(central, decide):
+    from jarvis import ops
+
+    item, qid = _escalated(central)
+    if decide == "waive":
+        ops.morpheus_waive(item["id"], "the meter reads fine")
+    else:
+        ops.morpheus_requeue(item["id"])
+    assert _status(qid) == "answered"
+
+
+def test_a_question_whose_item_was_already_decided_is_swept(central, tmp_path, monkeypatch):
+    from jarvis import invariants, ops
+    from jarvis.project_store import ProjectStore
+
+    item, qid = _escalated(central)
+    store = ProjectStore(tmp_path / "proj_a")
+    monkeypatch.setattr(ops, "registered_project_paths", lambda: {"proj_a": store.project_path})
+    try:
+        assert list(invariants.check_neo_escalations_are_live(store)) == []
+        morpheus.requeue(central, MorpheusConfig(), item["id"])  # decided without ops
+        [v] = list(invariants.check_neo_escalations_are_live(store))
+    finally:
+        store.close()
+    assert (v.invariant, v.context["question_id"]) == ("INV-NEO-ESCALATION-STALE", qid)
+    assert _status(qid) == "answered"
+
+
+def test_the_neo_tab_decides_a_validation_question_on_its_item(central):
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    item, qid = _escalated(central)
+    client = TestClient(create_app())
+    page = client.get("/neo")
+    assert f'action="/morpheus/{item["id"]}/waive"' in page.text
+    assert f'action="/morpheus/{item["id"]}/requeue"' in page.text
+    assert "Send answer to worker" not in page.text
+
+    r = client.post(f"/morpheus/{item['id']}/waive", follow_redirects=False,
+                    data={"reason": " ", "next": "/neo#tab-escalated"})
+    assert "error=" in r.headers["location"] and _status(qid) == "escalated"
+    r = client.post(f"/morpheus/{item['id']}/waive", follow_redirects=False,
+                    data={"reason": "works", "next": "/neo#tab-escalated"})
+    assert r.headers["location"] == "/neo#tab-escalated"
+    assert central.morpheus_item(item["id"])["state"] == "validated"
+    assert _status(qid) == "answered"
+
+
 # -- 6. the only LLM: Morpheus's session turns hints into scripts
 
 

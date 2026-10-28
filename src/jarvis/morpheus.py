@@ -589,6 +589,21 @@ def verdict_action(verdict: dict[str, Any]) -> str:
     return action if action in VERDICT_ACTIONS else ""
 
 
+def stale_question(item: dict[str, Any] | None,
+                   q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if the item this `validation` question asks about was decided elsewhere"""
+    item_id = item_of_question(q)
+    if not item_id:
+        return None
+    if item is None:
+        return ("SUPERSEDED — the Morpheus item is gone", f"{item_id} no longer exists")
+    # A requeue clears `action`, and a later failure asks a NEW question: either way not this one
+    if item["state"] not in ACTION_STATES or item.get("action") != f"neo:{q['id']}":
+        return (f"SUPERSEDED — {item_id} is {item['state']}",
+                f"{item_id} was already decided: it is {item['state']}")
+    return None
+
+
 def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, Any],
                        verdict: dict[str, Any], question_url: str = "") -> None:
     """Neo ruled on a `validation` question: record it, act on it, and tell the user"""

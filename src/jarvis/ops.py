@@ -9149,10 +9149,12 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
             from . import morpheus
 
             item = morpheus.item_of_question(q) or "<mv-id>"
-            raise OpsError(f"neo question {question_id} is about a shipped PR's production "
-                           f"validation, and no work order is waiting on it — decide it "
-                           f"on the item: jarvis morpheus waive {item} --reason \"...\" "
-                           f"or jarvis morpheus requeue {item}")
+            raise OpsError(
+                f"neo question {question_id} asks you to rule on a shipped PR's production "
+                f"check ({item}), and no worker is waiting for a reply. If it works in "
+                f"production: jarvis morpheus waive {item} --reason \"...\". To run the "
+                f"check again (after fixing what made it fail): "
+                f"jarvis morpheus requeue {item}. Either closes this question.")
         neo.record_answer(question_id, answer, answered_by="user")
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:
@@ -13907,16 +13909,33 @@ def morpheus_check(item_id: str) -> dict[str, Any]:
         central.close()
 
 
+def _close_validation_questions(item_id: str, answer: str, why: str) -> list[int]:
+    """Supersede every open Neo question about this item: the user decided it on the item"""
+    from . import morpheus
+    from .neo_store import OPEN_Q_STATUSES, NeoStore
+
+    neo = NeoStore()
+    try:
+        return [q["id"] for q in neo.list_questions(statuses=OPEN_Q_STATUSES)
+                if q["kind"] == "validation" and morpheus.item_of_question(q) == item_id
+                and neo.supersede(q["id"], answer, why)]
+    finally:
+        neo.close()
+
+
 def morpheus_waive(item_id: str, reason: str) -> dict[str, Any]:
     from . import morpheus
 
     central = CentralStore()
     try:
-        return morpheus.waive(central, item_id, reason)
+        item = morpheus.waive(central, item_id, reason)
     except (KeyError, ValueError) as e:
         raise OpsError(str(e).strip("'\"")) from e
     finally:
         central.close()
+    _close_validation_questions(item_id, f"The user waived {item_id}: {reason.strip()}",
+                                f"decided by the user on {item_id} itself")
+    return item
 
 
 def morpheus_pause(mode: str | None, reason: str = "") -> dict[str, Any]:
@@ -13935,8 +13954,11 @@ def morpheus_requeue(item_id: str) -> dict[str, Any]:
 
     central = CentralStore()
     try:
-        return morpheus.requeue(central, _morpheus_catalog().os.morpheus, item_id)
+        item = morpheus.requeue(central, _morpheus_catalog().os.morpheus, item_id)
     except KeyError as e:
         raise OpsError(str(e).strip("'\"")) from e
     finally:
         central.close()
+    _close_validation_questions(item_id, f"The user put {item_id} back on the watch list",
+                                f"decided by the user on {item_id} itself")
+    return item
