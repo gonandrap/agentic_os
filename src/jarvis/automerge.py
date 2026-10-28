@@ -29,10 +29,13 @@ log = logging.getLogger(__name__)
 GATE_KIND = "auto_merge"
 
 #: EVERY `gh` SUBCOMMAND THIS MODULE MAY RUN
-WRITE_VERBS = (("pr", "merge"),)
+WRITE_VERBS = (("pr", "merge"), ("pr", "ready"))
 
 #: A grant covers ONE merge
 GRANT_USES = 1
+
+#: The OS took its own worker's draft out of draft, for one commit
+READY_EVENT = "automerge_marked_ready"
 
 #: A merge is one API round trip
 MERGE_TIMEOUT = 60
@@ -50,6 +53,7 @@ HELD_SHA_UNRECORDED = "sha_unrecorded"
 HELD_SHA_MOVED = "sha_moved"
 HELD_PR_CLOSED = "pr_closed"
 HELD_NOT_MERGEABLE = "not_mergeable"
+HELD_DRAFT = "draft"
 #: Three worlds `github.PullRequest.checks_green` is false in (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §5)
 HELD_CHECKS_FAILED = "checks_failed"
 HELD_CHECKS_RUNNING = "checks_running"
@@ -377,6 +381,12 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"CI was cancelled on this commit, not failed — "
                      f"{checks_evidence(aborted)} — and GitHub blocks the merge until "
                      f"it is re-run", **fields)
+    # LAST BEFORE THE MERGE STATE: a draft held here is one the OS may mark ready itself
+    if getattr(pr, "draft", False) or \
+            str(getattr(pr, "merge_state", "") or "").upper() == "DRAFT":
+        return _held(HELD_DRAFT,
+                     "the pull request is a draft, and GitHub refuses to merge a draft "
+                     "until it is marked ready for review", **fields)
     if str(getattr(pr, "merge_state", "") or "").upper() != "CLEAN":
         return _held(HELD_MERGE_STATE_UNCLEAN,
                      f"GitHub reports the merge state as "
@@ -419,6 +429,30 @@ def decided_sha(payload: dict[str, Any]) -> str:
     return str(payload.get("head_sha") or "") or sha_of_command(payload.get("command"))
 
 
+def mark_ready(store: Any, wo: dict[str, Any], head_sha: str, cwd: Any = None) -> bool:
+    """Take the order's own draft out of draft, once per commit; the merge stays gated"""
+    from . import db, github
+    from .github import gh_bin
+
+    if any(str(db.from_json(e["payload"], {}).get("head_sha") or "") == head_sha
+           for e in store.events_of_kind(wo["id"], READY_EVENT)):
+        return False
+    url = github.checked_pr_url(str(wo.get("pr_url") or ""), cwd=cwd)
+    try:
+        proc = subprocess.run([gh_bin(), "pr", "ready", url], capture_output=True,
+                              text=True, timeout=MERGE_TIMEOUT,
+                              cwd=str(cwd) if cwd is not None else None)
+        failure = "" if proc.returncode == 0 else (
+            (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}")
+    except (OSError, subprocess.SubprocessError) as e:
+        failure = str(e)
+    store.add_event(wo["id"], READY_EVENT, {"head_sha": head_sha, "pr_url": url,
+                                            "failure": failure[:500]})
+    log.info("marked %s ready for review at %s%s", url, head_sha[:10],
+             f" — failed: {failure}" if failure else "")
+    return not failure
+
+
 def _merge_args(pr_url: str, sha: str) -> list[str]:
     """`gh`'s arguments for one merge, without the binary (#253)"""
     return ["pr", "merge", pr_url, "--squash", "--match-head-commit", sha]
@@ -447,7 +481,7 @@ def protection_fact(protection: Any, base: str) -> str:
     if protection is None:
         return (f"`{base}` carries no branch protection rules: this gate and "
                 f"`--match-head-commit` are the only things standing between this commit "
-                f"and the default branch, so read the evidence above on that footing.")
+                f"and `{base}`, so read the evidence above on that footing.")
     names = protection.required_checks
     if not names:
         return (f"`{base}` is protected, and the protection requires no status check: "
@@ -492,7 +526,7 @@ def _request_question(project: str, wo: dict[str, Any], decision: Decision,
                  text=wo.get("description") or "", limit=DESCRIPTION_LIMIT)))
     parts += [
         "# What it cannot undo\n"
-        "The squash lands on the default branch. No branch is deleted, here or on the "
+        f"The squash lands on `{base}`. No branch is deleted, here or on the "
         "remote. The work order completes."
         + (f"\n{protection}" if protection else ""),
         "Approve it to let the OS merge, or deny it with a reason. Denying leaves the "

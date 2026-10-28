@@ -72,6 +72,7 @@ jarvis wo budget <id> [<usd>] [--clear]    # dollar ceiling on one order; raisin
 jarvis fo budget <id> [<usd>] [--clear]    # family budget for a whole feature
 jarvis wo ack <id> / --all                 # "seen it" — refuses on pending assumptions
 jarvis wo done <id>                        # user closes it; PR-parked orders close themselves on merge
+jarvis wo pr <id> <url>                    # record a PR the user opened by hand for a pushed branch
 jarvis wo hide <id> / unhide <id>          # declutter, record kept
 jarvis wo delete <id> --yes                # irreversible
 jarvis wo resume-auto <id>                 # what is it ACTUALLY waiting on?

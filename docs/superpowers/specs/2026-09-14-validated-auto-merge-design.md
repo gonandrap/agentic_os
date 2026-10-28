@@ -384,6 +384,20 @@ selling point over option 2:
 
 ---
 
+### 6.1 A draft pull request (2026-10-26)
+
+GitHub reports a draft into an unprotected base as `mergeStateStatus: CLEAN` and then
+refuses `gh pr merge` with "Pull Request is still a draft". `decide` therefore reads
+`isDraft` (or a `DRAFT` merge state) and holds with code `draft`, placed after every
+other fact, just before the merge-state check. A `draft` hold thus means "this would
+merge if it were not a draft".
+
+On that hold the poll runs `gh pr ready <url>` once per head commit
+(`automerge.mark_ready`, event `automerge_marked_ready`). The next poll files the merge
+request as usual, so the merge itself still rides the `auto_merge` gate. Marking ready
+is not gated: it is reversible, it touches only the order's own pull request, and only
+after the panel passed the commit at the head and CI is green.
+
 ## 7. Failure directions — every one of them ends in "nothing merged"
 
 | what breaks | what happens |

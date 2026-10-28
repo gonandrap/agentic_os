@@ -163,6 +163,37 @@ def test_a_branch_with_no_open_pull_request_answers_empty_rather_than_raising(fa
     assert github.open_pull_request_for_branch("plan/wo-2") == ""
 
 
+SHA = "a" * 40
+
+
+def _row(url=PR, *, fork=False, sha=SHA):
+    return {"url": url, "isCrossRepository": fork, "headRefOid": sha}
+
+
+def test_a_pinned_head_attaches_the_same_repository_pull_request_at_that_sha(fake_gh):
+    fake_gh.set_open_pr("worktree-wo-1", _row())
+
+    assert github.open_pull_request_for_branch("worktree-wo-1", head_sha=SHA) == PR
+
+    argv = fake_gh.calls[-1]["argv"]
+    assert set(argv[argv.index("--json") + 1].split(",")) >= {
+        "url", "isCrossRepository", "headRefOid"}
+
+
+@pytest.mark.parametrize("row", [_row(fork=True), _row(sha="b" * 40), {"url": PR}],
+                         ids=["fork", "other-sha", "no-fields"])
+def test_a_pinned_head_never_attaches_a_fork_or_another_commit(row, fake_gh):
+    fake_gh.set_open_pr("worktree-wo-1", row)
+
+    assert github.open_pull_request_for_branch("worktree-wo-1", head_sha=SHA) == ""
+
+
+def test_a_pinned_head_matched_by_two_pull_requests_attaches_neither(fake_gh):
+    fake_gh.set_open_pr("worktree-wo-1", _row(), _row("https://github.com/acme/proj/pull/8"))
+
+    assert github.open_pull_request_for_branch("worktree-wo-1", head_sha=SHA) == ""
+
+
 @pytest.mark.parametrize("bad", ["--state", "-X", "", " main", "x y", "a;b"])
 def test_open_pull_request_for_branch_refuses_a_branch_it_may_not_ask_about(bad, fake_gh):
     """`BRANCH_RE`, the guard `branch_protection` already applies: no leading `-`"""

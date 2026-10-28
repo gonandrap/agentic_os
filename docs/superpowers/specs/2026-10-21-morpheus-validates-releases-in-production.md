@@ -42,9 +42,11 @@ Each item has a state:
    * Each `monitoring` item's check runs every `check_every_minutes` (default 15), with
      a timeout. It runs from its project's production directory: the deployed checkout
      for the OS, and the catalog path for every other project.
-   * **Exit 0 = validated, exit 1 = failed, anything else = not yet.** "Not yet" is the
-     normal answer for a change whose code path production has not exercised; the
-     deadline is what turns it into `timedout`.
+   * **Exit 0 = validated, two exit 1 in a row = failed, anything else = not yet.**
+     "Not yet" is the normal answer for a change whose code path production has not
+     exercised; the deadline is what turns it into `timedout`. A script exits 1 only on
+     the PR's own failure signature and 75 when the environment is what it cannot read,
+     and one exit 1 that the next check does not repeat is a blip, not a verdict (#1255).
 3. **Morpheus's session writes the checks (the only LLM).**
    * PRs give hints, never scripts. One long-lived Claude session, resumed turn after
      turn, is woken by the daemon only when items are `queued`.
@@ -92,12 +94,22 @@ output tail, the hints and the check. It says explicitly that Morpheus has diagn
 nothing.
 
 * `on_failed` (default `investigate`): an investigation order on the PR's work order,
-  parsed from the `[wo-xxxxxxxx]` title prefix. It goes through the steward as origin
-  `morpheus`, which needs `os.autonomy.self_dispatch`. If the PR has no work order or
-  the steward declines, the item goes to Neo instead.
+  parsed from the `[wo-xxxxxxxx]` title prefix. A PR opened by hand names no work order,
+  and an investigation needs an order to investigate, so that one gets an improvement
+  order instead, with the PR URL as its ref (#1253); the item records
+  `improvement:<io-id>` rather than `investigation:<id>`. Either goes through the steward
+  as origin `morpheus`, which needs `os.autonomy.self_dispatch`. If the steward declines
+  or the order cannot be filed, the item goes to Neo instead.
 * `on_timeout` (default `neo`): a Neo question of the new kind `validation`, which has
   no work order behind it, like `triage`. Neo either escalates (a warning in the inbox
   for the user) or answers (recorded on the item, plus an info row in the inbox).
+
+An answer may carry `"action": "requeue"`, and the OS applies it: the item goes back on
+the watch list with a fresh deadline instead of waiting for the user to read an inbox
+row (issue #1254). The cap is one automatic requeue per item, counted in `auto_requeues`
+and claimed atomically, so a verdict can never loop an item through validation. `requeue`
+is the only action a verdict may carry: a waive ends the OS's only production check on a
+change nobody has seen work, so it stays a command the user runs.
 
 ## Surfaces
 

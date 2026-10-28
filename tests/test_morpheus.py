@@ -279,7 +279,7 @@ def _run(exit_code, seen=None):
 
 
 @pytest.mark.parametrize("code,state,resolution", [
-    (0, "validated", "script exited 0"), (1, "failed", "script exited 1"),
+    (0, "validated", "script exited 0"), (1, "monitoring", ""),
     (75, "monitoring", ""), (None, "monitoring", "")])
 def test_the_exit_code_is_the_verdict(central, cfg, tmp_path, code, state, resolution):
     item = monitoring(central)
@@ -289,6 +289,32 @@ def test_the_exit_code_is_the_verdict(central, cfg, tmp_path, code, state, resol
     assert after["checks"] == 1 and after["last_output"] == f"said {code}"
     if state == "monitoring":
         assert after["next_check_ts"] == TEST_EPOCH + cfg.check_every_minutes * 60
+
+
+def test_failed_needs_two_exit_1_in_a_row(central, cfg, tmp_path):
+    item = monitoring(central)
+    later = TEST_EPOCH + cfg.check_every_minutes * 60
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH, run=_run(1))
+    morpheus.sweep(central, cfg, tmp_path, now=later, run=_run(1))
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["resolution"]) == ("failed", "script exited 1 twice in a row")
+    assert after["checks"] == 2
+
+
+def test_an_exit_1_the_next_check_does_not_repeat_is_not_a_failure(central, cfg, tmp_path):
+    item = monitoring(central)
+    for n, code in enumerate((1, 75, 1)):
+        morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + n * cfg.check_every_minutes * 60,
+                       run=_run(code))
+    assert central.morpheus_item(item["id"])["state"] == "monitoring"
+
+
+def test_an_unconfirmed_exit_1_times_out_saying_so(central, cfg, tmp_path):
+    item = monitoring(central)
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 3 * DAY + 1, run=_run(1))
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["resolution"]) == \
+        ("timedout", "one exit 1 within 3 day(s), never confirmed by a second")
 
 
 def test_each_script_runs_in_its_own_project(central, cfg, tmp_path):
@@ -386,10 +412,52 @@ def test_timedout_asks_neo_by_default_and_the_route_is_configurable(central):
                         ask_neo=lambda *a: 3) == "investigation:fo-x"
 
 
-def test_no_work_order_means_no_investigation(central):
+def _allowed(monkeypatch, allowed: bool = True) -> list:
+    from jarvis import steward
+
+    seen = []
+
+    def gate(c, **kw):
+        seen.append(c)
+        return steward.Decision(outcome="dispatch" if allowed else "refuse", rule="test",
+                                reason="" if allowed else "no", severity="critical",
+                                claimed_severity="critical", generation=0, mode="test",
+                                allowed=allowed)
+
+    monkeypatch.setattr(steward, "gate", gate)
+    return seen
+
+
+def test_no_work_order_files_an_improvement_order_on_the_pr(central, monkeypatch):
+    from jarvis import ops
+
     item = queued(central, title="untitled")
-    assert morpheus._investigate(catalog(), item) == \
-        ("", "the PR names no work order to investigate")
+    candidates = _allowed(monkeypatch)
+    filed = {}
+
+    def create(project, title, description="", refs=(), origin="jarvis", **kw):
+        filed.update(project=project, title=title, description=description,
+                     refs=list(refs), origin=origin)
+        return {"id": "io-abcd1234"}
+
+    monkeypatch.setattr(ops, "create_improvement_order", create)
+    assert morpheus._investigate(catalog(), item) == ("io-abcd1234", "")
+    assert filed["project"] == "proj_a" and filed["refs"] == [item["pr_url"]]
+    assert filed["origin"] == "morpheus" and "has NOT diagnosed anything" in filed["description"]
+    assert [c.origin_kind for c in candidates] == ["morpheus"]
+
+
+def test_an_improvement_order_the_steward_refuses_asks_neo(central, monkeypatch):
+    item = queued(central, title="untitled")
+    _allowed(monkeypatch, allowed=False)
+    order_id, note = morpheus._investigate(catalog(), item)
+    assert order_id == "" and "the steward did not dispatch it" in note
+
+
+def test_an_improvement_order_is_recorded_as_one_not_as_an_investigation(central):
+    assert morpheus.act(central, catalog(), _failed(central),
+                        investigate=lambda c, i: ("io-abcd1234", ""),
+                        ask_neo=lambda *a: 9) == "improvement:io-abcd1234"
 
 
 def test_the_neo_question_is_a_validation_question_naming_the_item(central):
@@ -405,20 +473,81 @@ def test_the_neo_question_is_a_validation_question_naming_the_item(central):
         neo.close()
     assert (q["kind"], q["wo_id"], q["project"]) == ("validation", "", "proj_a")
     assert morpheus.item_of_question(q) == item["id"]
-    assert f"jarvis morpheus requeue {item['id']}" in q["question"]
+    assert f"jarvis morpheus waive {item['id']}" in q["question"]
+    assert '"action": "requeue"' in q["question"]
+
+
+def test_an_item_that_spent_its_requeue_is_not_offered_one(central):
+    item = queued(central)
+    central.update_morpheus_item(item["id"], state="failed", resolution="script exited 1")
+    central.claim_morpheus_auto_requeue(item["id"], morpheus.MAX_AUTO_REQUEUES)
+    qid = morpheus._ask_neo(catalog(), central.morpheus_item(item["id"]), "")
+    from jarvis.neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        question = neo.get(qid)["question"]
+    finally:
+        neo.close()
+    assert "already spent its one automatic requeue" in question
+    assert f"jarvis morpheus requeue {item['id']}" in question
+
+
+def _verdict(central, item_id: str, **verdict) -> None:
+    q = {"id": 5, "project": "proj_a", "context": json.dumps({"morpheus_item": item_id})}
+    morpheus.record_neo_verdict(central, MorpheusConfig(), q,
+                                {"escalate": False, "answer": "rare path", "reason": "",
+                                 **verdict}, "http://x/neo/question/5")
 
 
 @pytest.mark.parametrize("escalate,level", [(True, "warning"), (False, "info")])
 def test_neo_s_verdict_is_recorded_and_reaches_the_inbox(central, escalate, level):
     item = queued(central)
     central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
-    q = {"id": 5, "project": "proj_a", "context": json.dumps({"morpheus_item": item["id"]})}
-    morpheus.record_neo_verdict(central, q, {"escalate": escalate, "answer": "rare path",
-                                             "reason": ""}, "http://x/neo/question/5")
+    _verdict(central, item["id"], escalate=escalate)
     after = central.morpheus_item(item["id"])
     assert after["state"] == "timedout" and after["resolution"].endswith("Neo: rare path")
     rows = central.conn.execute("SELECT level, title FROM inbox").fetchall()
     assert [(r["level"], "PR #7" in r["title"]) for r in rows] == [(level, True)]
+
+
+def test_neo_s_requeue_verdict_puts_the_item_back_on_the_watch_list(central):
+    item = monitoring(central, script="exit 1")
+    central.update_morpheus_item(item["id"], state="failed", resolution="script exited 1",
+                                 next_check_ts=None, action="neo:5")
+    _verdict(central, item["id"], action="requeue")
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["action"], after["auto_requeues"]) == ("monitoring", "", 1)
+    assert after["resolution"].startswith("re-watched by Neo:")
+    assert after["next_check_ts"] is not None
+
+
+def test_the_second_automatic_requeue_is_refused(central):
+    item = monitoring(central, script="exit 1")
+    central.update_morpheus_item(item["id"], state="failed", resolution="script exited 1")
+    _verdict(central, item["id"], action="requeue")
+    central.update_morpheus_item(item["id"], state="failed", resolution="script exited 1")
+    _verdict(central, item["id"], action="requeue")
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["auto_requeues"]) == ("failed", 1)
+
+
+@pytest.mark.parametrize("verdict", [{"escalate": True, "action": "requeue"},
+                                     {"action": "waive"}, {"action": ""}])
+def test_only_an_answered_requeue_acts_on_the_item(central, verdict):
+    item = monitoring(central, script="exit 1")
+    central.update_morpheus_item(item["id"], state="failed", resolution="script exited 1")
+    _verdict(central, item["id"], **verdict)
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["auto_requeues"]) == ("failed", 0)
+
+
+def test_a_verdict_never_pulls_a_waived_item_back_into_validation(central):
+    item = monitoring(central, script="exit 1")
+    morpheus.waive(central, item["id"], "shipped elsewhere")
+    _verdict(central, item["id"], action="requeue")
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["auto_requeues"]) == ("validated", 0)
 
 
 def test_a_validation_question_cannot_be_answered_like_a_worker_question(central):
@@ -866,6 +995,7 @@ def test_the_daemon_pass_runs_each_check_in_its_project_and_hands_off(
     daemon = Daemon(load_catalog(catalog_file))
     good = monitoring(central, n=1, script="pwd > ran-here; exit 0")
     bad = monitoring(central, n=2, script="exit 1", title="no wo")
+    central.update_morpheus_item(bad["id"], last_exit=1)  # its first exit 1 is behind it
     monkeypatch.setattr(morpheus, "_ask_neo", lambda c, i, note="": 42)
     daemon._morpheus_pass()
     assert central.morpheus_item(good["id"])["state"] == "validated"

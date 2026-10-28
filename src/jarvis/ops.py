@@ -61,7 +61,12 @@ from .daemon import (
     validation_round,
 )
 from .github import GitHubError
-from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
+from .invariants import (
+    PR_CLOSED_BLOCKER,
+    UNLANDED_BLOCKER,
+    pr_pending_blocker,
+    true_blockers,
+)
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .worker_brief import MODEL_ATTRIBUTION_NAMES
 # `ops.IDLE_MANAGER_CAUSE` is an ALIAS: `stuck.IDLE_MANAGER_CAUSE` is the one definition of the cause... (#1008)
@@ -79,6 +84,7 @@ from .project_store import (
     NO_TURN,
     OPEN_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
+    PR_PENDING_EVENT,
     SETTLE_BY_FINISH,
     SETTLE_IN_SESSION,
     TERMINAL_STATUSES,
@@ -435,6 +441,44 @@ def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
         neo.close()
 
 
+_RETRIES_SUFFIX = re.compile(r"\s*\(after \d+ retries — nobody has judged this\)$")
+
+
+def fold_neo_attention(questions: list[dict[str, Any]],
+                       rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per CAUSE with a count, biggest first: one outage is one thing to fix"""
+    from .neo_store import REVIVABLE_KINDS, UNREACHABLE_PREFIX
+
+    groups: dict[tuple[str, ...], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for q, row in zip(questions, rows):
+        reason = q.get("answer_reason") or ""
+        if q["status"] == "failed" and reason.startswith(UNREACHABLE_PREFIX):
+            # Unjudged: the outage is the subject, whatever each question asked
+            key = (q["project"], q.get("kind") or "", "unreachable",
+                   _RETRIES_SUFFIX.sub("", reason))
+        else:
+            # Judged: only the same question asked twice is the same decision
+            key = (q["project"], q.get("kind") or "", q.get("wo_id") or "", q["question"])
+        groups.setdefault(key, []).append((q, row))
+    out = []
+    for key, members in groups.items():
+        q, row = members[-1]
+        ids = [m["id"] for m, _ in members]
+        row = {**row, "count": len(ids), "neo_question_ids": ids}
+        if len(ids) > 1 and key[2] == "unreachable":
+            kind = q.get("kind") or "question"
+            heals = (" — they re-ask themselves once Neo answers again; `jarvis neo list` "
+                     "to read them" if kind in REVIVABLE_KINDS
+                     else " — `jarvis neo list` to read and answer them")
+            row.update(title=f"Neo could not be reached for {len(ids)} {kind} questions",
+                       reason=_RETRIES_SUFFIX.sub("", q.get("answer_reason") or "") + heals,
+                       wo_id=None, decide="jarvis neo list")
+        elif len(ids) > 1:
+            row["title"] = f"{row['title']} (asked {len(ids)}×)"
+        out.append(row)
+    return sorted(out, key=lambda r: -r["count"])
+
+
 def _held_jobs(store: ProjectStore, catalog: Catalog | None = None) -> list[dict[str, Any]]:
     """Scheduled jobs this project is STILL SUPPOSED TO RUN and cannot"""
     cfg = schedule_config_at(store.project_path, catalog)
@@ -669,6 +713,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 store.close()
         inbox = central.unacked_inbox()
         backlog_open = central.list_backlog(status="open")
+        neo_rows = []
         for q in escalated_questions:
             # A `triage` question is the one kind with NO WORKER BEHIND IT (issue #240): nothing is blocked on...
             triage = q.get("kind") == "triage"
@@ -676,7 +721,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             if triage:
                 from . import issues
                 url = (issues.triage_payload(q) or {}).get("issue_url") or ""
-            attention.append({
+            neo_rows.append({
                 "project": q["project"], "wo_id": q["wo_id"],
                 "title": (f"Neo could not confirm a bug's priority: {q['question'][:60]}"
                           if triage else f"Neo escalated: {q['question'][:80]}"),
@@ -690,6 +735,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                            f"jarvis neo show {q['id']}") if triage else
                           f"jarvis neo answer {q['id']} \"…\"",
             })
+        attention.extend(fold_neo_attention(escalated_questions, neo_rows))
         # Gates Neo sent up
         gate_items = []
         # Gate requests that turned out not to be gated actions at all
@@ -3873,6 +3919,9 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     if not pr_url and not store.work_abandoned(wo_id):
         stranding = unlanded_work(store, wo)
         if stranding.produced:
+            # The one parker: every route to `completed` passes here (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §2)
+            if stranding.pushed and kind_contract(wo).lands_code:
+                return park_pr_pending(store, wo, stranding)
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
     # Spec §C of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md
@@ -3887,11 +3936,22 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     return status
 
 
+#: The `pr_url_recorded` sources that route the merge queue; `gate` and `plan_submit` stay inert
+DECLARING_SOURCES = ("user", "auto")
+
+
 def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
-    """The pull request the SUBMITTER declared — the only one that routes the merge queue (#742)"""
-    for event in reversed(store.events_of_kind(wo["id"], "finished")):
-        declared = str(db.from_json(event["payload"], {}).get("pr_url") or "")
-        if declared:
+    """The pull request the SUBMITTER declared (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §8.1)"""
+    # Newest first; read order breaks a timestamp tie, the later row winning
+    events = [(float(e["ts"]), seq, kind, db.from_json(e["payload"], {}))
+              for seq, (kind, e) in enumerate(
+                  (kind, e) for kind in ("finished", "pr_url_recorded")
+                  for e in store.events_of_kind(wo["id"], kind))]
+    for _ts, _seq, kind, payload in sorted(events, key=lambda e: e[:2], reverse=True):
+        declared = str(payload.get("pr_url") or "")
+        if not declared:
+            continue
+        if kind == "finished" or str(payload.get("source") or "") in DECLARING_SOURCES:
             return declared
     return ""
 
@@ -3948,6 +4008,19 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
     store.flag_attention(wo["id"], UNLANDED_BLOCKER)
+    return "needs_review"
+
+
+def park_pr_pending(store: ProjectStore, wo: dict[str, Any],
+                    work: landing.Authored) -> str:
+    """Hold an order whose branch is pushed with no pull request (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §2)"""
+    if store.pr_pending_open(wo["id"]):
+        store.set_status(wo["id"], "needs_review", trigger="pr_pending_repark")
+        return "needs_review"
+    park = {**work.record(), "was": wo["status"]}
+    store.add_event(wo["id"], PR_PENDING_EVENT, park)
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], pr_pending_blocker(wo["id"], park))
     return "needs_review"
 
 
@@ -5012,7 +5085,9 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                 open_requests[0])))
         # Read ONCE, before anything is written: a refused finish must leave the record exactly as it found...
         stranding = unlanded_work(store, _wo, pr_url or "")
-        if stranding.produced and not abandon:
+        # A pushed branch is undertaken to land, not refused; `land_finished` parks it (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §2)
+        if (stranding.produced and not abandon
+                and not (stranding.pushed and kind_contract(_wo).lands_code)):
             raise OpsError(unlanded_refusal(_wo, summary, stranding))
         # `stranding` is the REFUSAL's reading and is deliberately empty for an order carrying a pull...
         work = stranding if stranding.base else authorship(store, _wo)
@@ -5064,6 +5139,45 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
             **({"pr_url": pr_url} if pr_url else {})}
+
+
+def record_pull_request(wo_id: str, url: str, project_name: str | None = None,
+                        source: str = "user") -> dict[str, Any]:
+    """Record the pull request the user opened for a pushed-branch park; never a `finished` event (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §8)"""
+    from . import github
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        # A declaration is never overwritten, as in `gates._record_pull_request`
+        if wo.get("pr_url"):
+            raise OpsError(
+                f"{wo_id} already records {wo['pr_url']}. A pull request is declared "
+                f"once; if that one is wrong, close the order with `jarvis wo done`.")
+        if store.pr_pending_open(wo_id) is None:
+            owed = true_blockers(store, wo)
+            waiting = owed[0] if owed else f"{wo['status']}, with nothing owed"
+            raise OpsError(
+                f"{wo_id} has no pushed branch waiting on a pull request. "
+                f"What it is waiting on: {waiting}.")
+        try:
+            url = github.checked_pr_url(url, store.project_path)
+        except github.UntrustedPullRequest as e:
+            raise OpsError(str(e)) from e
+        store.update_work_order(wo_id, pr_url=url)
+        store.add_event(wo_id, "pr_url_recorded", {"pr_url": url, "source": source})
+        fresh = store.get_work_order(wo_id)
+        status = fresh["status"]
+        # Judge the row it would become before writing the status: the merge poll reads the status
+        probe = {**fresh, "status": "waiting_pr_merge"}
+        if status == "needs_review" and not true_blockers(store, probe):
+            store.set_status(wo_id, "waiting_pr_merge")
+            store.clear_attention(wo_id)
+            status = "waiting_pr_merge"
+        return {"project": name, "wo_id": wo_id, "pr_url": url, "source": source,
+                "status": status}
+    finally:
+        store.close()
 
 
 def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -6248,6 +6362,7 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
                 store.flag_attention(wo_id, "assumptions rejected — send guidance with `jarvis wo send`")
         store.add_event(wo_id, "reviewed", {"accepted": accept, "count": len(pending),
                                             "feedback": feedback})
+        park = store.pr_pending_open(wo_id)
     finally:
         store.close()
 
@@ -6260,6 +6375,10 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
                                       tightened=net == "regex-tightened")
     if learned:
         out["learning_id"], out["learning_ids"] = learned[0], learned
+    # An accept that parked says what still waits (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §7)
+    if park is not None:
+        out["pr_pending"] = {k: park.get(k) or ""
+                             for k in ("branch", "base", "compare_url")}
     if not feedback:
         return out
 

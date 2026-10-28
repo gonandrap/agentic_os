@@ -16,7 +16,7 @@ from typing import Any, Sequence
 
 import pytest
 
-from . import agent_usage, paths, release, systemd_units, usage
+from . import agent_usage, keychain, paths, release, service_manager, systemd_units, usage
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -72,8 +72,12 @@ def gate_environment(root: Path) -> dict[str, str]:
         GH_BIN_ENV: str(_blocked_bin(root, "gh", BLOCKED_GH)),
         # Worker turns stay on the plain-`Popen` transport for the whole suite
         systemd_units.TRANSPORT_ENV: systemd_units.DIRECT,
+        # Production services stay systemd's, so a Mac run never kickstarts the human's own dashboard
+        service_manager.MANAGER_ENV: service_manager.SYSTEMD,
         # The developer's own Claude Code sign-in
         CREDENTIALS_ENV: str(root / "claude-credentials.json"),
+        # ...and its macOS twin, the login Keychain
+        keychain.SECURITY_BIN_ENV: str(root / "no-security"),
         # The developer's own installed `jarvis.service`, which `INV-SERVICE-PATH` reads
         release.UNIT_DIR_ENV: str(root / "systemd-units"),
         # The developer's own production checkout, which `INV-PROD-CLEAN` reads (#202)
@@ -1409,7 +1413,7 @@ elif argv[:2] == ["pr", "list"]:
     # `ops.submit_plan`'s refusal is built on. Registered by `set_open_pr`.
     branch = argv[argv.index("--head") + 1] if "--head" in argv else ""
     rows = json.loads(os.environ.get("FAKE_GH_OPEN_PRS", "{}")).get(branch, [])
-    print(json.dumps([{"url": u} for u in rows]))
+    print(json.dumps([u if isinstance(u, dict) else {"url": u} for u in rows]))
 elif argv[:2] == ["run", "list"]:
     # The BASE branch's CI history. Keyed by branch, because the whole recogniser turns
     # on "was main red when this check ran", and a fake that answered one list for every
@@ -1582,6 +1586,22 @@ elif argv[:2] == ["pr", "diff"]:
         sys.stderr.write("no pull requests found for this URL\n")
         sys.exit(1)
     sys.stdout.write(pr.get("_diff", ""))
+elif argv[:2] == ["pr", "ready"]:
+    # Takes a draft out of draft, through the same overlay a merge writes
+    prs = roster()
+    url = argv[2] if len(argv) > 2 else ""
+    if url not in prs:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    try:
+        with open(merged_path) as f:
+            landed = json.load(f)
+    except (OSError, ValueError):
+        landed = {}
+    landed[url] = {**landed.get(url, {}), "isDraft": False}
+    with open(merged_path, "w") as f:
+        json.dump(landed, f)
+    print(f"Pull request {url} is marked as ready for review")
 elif argv[:2] == ["pr", "merge"]:
     # THE ONE WRITE THE OS EVER MAKES. It is modelled on the property the whole
     # auto-merge design rests on: `--match-head-commit <sha>` is refused by the SERVER
@@ -1813,6 +1833,119 @@ def fake_systemd(tmp_path, monkeypatch):
     return Handle()
 
 
+FAKE_LAUNCHCTL = r"""#!/usr/bin/env python3
+# Fake `launchctl print|kickstart -k`, output shapes copied from the live production Mac
+import json, os, sys
+
+state_dir = os.environ["FAKE_LAUNCHD_DIR"]
+jobs_dir = os.path.join(state_dir, "jobs")
+argv = sys.argv[1:]
+with open(os.path.join(state_dir, "ctl-calls.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": argv}) + "\n")
+
+def load(label):
+    try:
+        with open(os.path.join(jobs_dir, label + ".json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+def missing(label):
+    sys.stderr.write(
+        'Could not find service "%s" in domain for user gui: %s\n' % (label, os.getuid()))
+    sys.exit(113)
+
+if argv[:1] == ["print"] and len(argv) == 2:
+    label = argv[1].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    print("%s = {" % label)
+    print("\tstate = %s" % rec.get("state", "running"))
+    if rec.get("pid") is not None:
+        print("\tpid = %s" % rec["pid"])
+    print("\tlast exit code = %s" % rec.get("exit", 0))
+    print("}")
+elif argv[:2] == ["kickstart", "-k"] and len(argv) == 3:
+    label = argv[2].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    # A new pid proves the restart made a new process
+    rec["pid"] = int(rec.get("pid") or 0) + 1
+    rec["state"] = "running"
+    with open(os.path.join(jobs_dir, label + ".json"), "w") as f:
+        json.dump(rec, f)
+elif argv[:1] == ["bootout"] and len(argv) == 2:
+    label = argv[1].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    os.rename(os.path.join(jobs_dir, label + ".json"),
+              os.path.join(state_dir, label + ".booted-out.json"))
+elif argv[:1] == ["bootstrap"] and len(argv) == 3:
+    fails = os.path.join(state_dir, "bootstrap-failures")
+    left = int(open(fails).read()) if os.path.exists(fails) else 0
+    if left > 0:
+        with open(fails, "w") as f:
+            f.write(str(left - 1))
+        sys.stderr.write("Bootstrap failed: 5: Input/output error\n"); sys.exit(5)
+    label = os.path.basename(argv[2])[:-len(".plist")]
+    old = os.path.join(state_dir, label + ".booted-out.json")
+    try:
+        with open(old) as f:
+            rec = json.load(f)
+        os.unlink(old)
+    except (OSError, ValueError):
+        rec = {}
+    rec["pid"] = int(rec.get("pid") or 0) + 1
+    rec["state"] = "running"
+    rec["plist"] = argv[2]
+    with open(os.path.join(jobs_dir, label + ".json"), "w") as f:
+        json.dump(rec, f)
+else:
+    sys.stderr.write("fake launchctl: unhandled argv %s\n" % argv); sys.exit(2)
+"""
+
+
+@pytest.fixture()
+def fake_launchd(tmp_path, monkeypatch):
+    """Put the two production services on the launchd path, against a fake `launchctl`"""
+    ldir = tmp_path / "fake-launchd"
+    (ldir / "jobs").mkdir(parents=True)
+    ctl_bin = ldir / "launchctl"
+    ctl_bin.write_text(FAKE_LAUNCHCTL)
+    ctl_bin.chmod(ctl_bin.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("FAKE_LAUNCHD_DIR", str(ldir))
+    monkeypatch.setenv(service_manager.LAUNCHCTL_BIN_ENV, str(ctl_bin))
+    monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.LAUNCHD)
+
+    class Handle:
+        dir = ldir
+
+        @property
+        def calls(self) -> list[list[str]]:
+            path = ldir / "ctl-calls.jsonl"
+            return ([json.loads(ln)["argv"] for ln in path.read_text().splitlines()]
+                    if path.exists() else [])
+
+        @property
+        def jobs(self) -> dict[str, dict]:
+            return {p.stem: json.loads(p.read_text())
+                    for p in (ldir / "jobs").glob("*.json")}
+
+        def load(self, label: str, state: str = "running", pid: int | None = 4242,
+                 exit_code: int = 0) -> None:
+            """Make `label` a job launchd knows about"""
+            (ldir / "jobs" / f"{label}.json").write_text(
+                json.dumps({"state": state, "pid": pid, "exit": exit_code}))
+
+        def bootout(self, label: str) -> None:
+            (ldir / "jobs" / f"{label}.json").unlink(missing_ok=True)
+
+    return Handle()
+
+
 #: The repository every fixture in this harness pretends is the OS's bug tracker
 FIXTURE_BUG_REPO = "jarvis-fixture/no-such-tracker"
 FIXTURE_ISSUE_URL = f"https://github.com/{FIXTURE_BUG_REPO}/issues/7"
@@ -1966,7 +2099,7 @@ def fake_gh(tmp_path, monkeypatch):
                    checks: list[dict] | None = None,
                    merge_state: str | None = None, head_oid: str = "",
                    base_oid: str = "", merge_commit: str = "",
-                   head_ref: str = "") -> None:
+                   head_ref: str = "", draft: bool | None = None) -> None:
             """Register what `gh pr view <pr_url>` answers (#232)"""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
@@ -1987,6 +2120,8 @@ def fake_gh(tmp_path, monkeypatch):
             # `mergeCommit.oid`, the commit the merge put on the base
             if merge_commit:
                 row["mergeCommit"] = {"oid": merge_commit}
+            if draft is not None:
+                row["isDraft"] = draft
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
             # "Re-calling re-states it" includes un-doing a merge the fake performed: this is the authoritative...
@@ -2026,7 +2161,7 @@ def fake_gh(tmp_path, monkeypatch):
 
         open_prs: dict[str, list[str]] = {}
 
-        def set_open_pr(self, branch: str, *urls: str) -> None:
+        def set_open_pr(self, branch: str, *urls: str | dict) -> None:
             """What `gh pr list --head <branch> --state open` answers"""
             self.open_prs[branch] = list(urls)
             monkeypatch.setenv("FAKE_GH_OPEN_PRS", json.dumps(self.open_prs))
