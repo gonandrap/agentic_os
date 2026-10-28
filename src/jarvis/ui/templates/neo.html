@@ -172,6 +172,8 @@
     {# A seat-scoped learning is read by that seat alone. Unlabelled it would read as a
        rule the whole of Neo follows, which is the opposite of what it is. #}
     {% if l.seat %}<span class="badge outside">{{ l.seat }} seat</span>{% endif %}
+    {# Blank on rows written before provenance existed — judge a ruling before retracting it #}
+    {% if l.origin %}<span class="sub mono">from {{ l.origin }}</span>{% endif %}
     <span class="sub mono">{{ l.project or 'global' }}</span>
   </div>
   {% else %}

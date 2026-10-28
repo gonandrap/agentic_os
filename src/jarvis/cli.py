@@ -5284,14 +5284,17 @@ def cmd_neo(args: argparse.Namespace) -> int:
         if args.json:
             _print(rows, True)
         else:
+            from . import neo as neo_mod
             for r in rows:
                 scope = r["project"] or "global"
                 retired = (f" [retired: {r['retired_reason']}]"
                            if r["retired_at"] else "")
                 bullet = "⊘" if r["retired_at"] else "•"
                 seat = f" · {r['seat']} seat" if r["seat"] else ""
+                origin = neo_mod.learning_origin(r)
                 print(f"{bullet} #{r['id']} {_stamp(r['ts'])} [{scope}{seat}] "
-                      f"({r['source']}) {r['content']}{retired}")
+                      f"({r['source']}{f' from {origin}' if origin else ''}) "
+                      f"{r['content']}{retired}")
             if not rows:
                 print("Neo has no learnings yet — review its answers to teach it")
     elif args.neo_cmd == "stats":

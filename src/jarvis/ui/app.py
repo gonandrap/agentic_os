@@ -1563,6 +1563,7 @@ def create_app() -> FastAPI:
 
     @app.get("/neo", response_class=HTMLResponse)
     def neo_page(request: Request):
+        from .. import neo as neo_mod
         from ..neo_store import NeoStore
         neo = NeoStore()
         try:
@@ -1578,6 +1579,8 @@ def create_app() -> FastAPI:
                        and not (q["answered_by"] == "neo"
                                 and q["review_status"] == "unreviewed")]
             learnings = neo.all_learnings(limit=100)
+            for learning in learnings:
+                learning["origin"] = neo_mod.learning_origin(learning)
             # How the panel deliberated, for the questions this page already shows
             opinions = {}
             for q in (*in_flight, *escalated, *unreviewed, *history):

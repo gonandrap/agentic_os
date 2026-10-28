@@ -216,6 +216,23 @@ def test_a_learning_is_a_rule_about_a_class_not_a_transcript(reviewable, wide_ne
     assert all(c.startswith("RULE") for c in contents)
 
 
+def test_a_learning_records_the_order_and_assumptions_that_taught_it(reviewable,
+                                                                     project) -> None:
+    """A ruling with no traceable origin cannot be audited before `jarvis neo retract`"""
+    _, wo = reviewable
+    ops.review_work_order(wo["id"], accept=True, feedback="CSV is the house default")
+
+    (learning,) = _learnings()
+    store = ProjectStore(project)
+    try:
+        ids = [str(a["id"]) for a in store.all_assumptions(wo["id"])]
+    finally:
+        store.close()
+    assert learning["wo_id"] == wo["id"]
+    assert learning["origin_kind"] == "assumption"
+    assert learning["origin_id"] == ",".join(ids)
+
+
 def test_a_false_alarm_on_a_held_row_is_recorded_as_a_defect_in_the_net(
         reviewable, project, wide_net) -> None:
     """io-51469add: 'the word migration was a false alarm' must reach the net, like `gate dismiss`"""

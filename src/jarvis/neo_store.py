@@ -39,6 +39,9 @@ SUPERVISOR_SEAT = "supervisor"
 # The seat values a LEARNING may legally carry, which is a wider vocabulary than the panel's roster
 LEARNING_SCOPES = SEATS + (SUPERVISOR_SEAT,)
 
+# What a learning's `origin_id` points at — the record of the review that taught it
+LEARNING_ORIGIN_KINDS = ("assumption", "finding", "alarm", "question")
+
 # WHY an escalation happened, as one groupable label (docs/superpowers/specs/2026-10-01-neo-observability.md)
 ESCALATION_CAUSES_CHOSEN = (
     "high-stakes",
@@ -137,7 +140,13 @@ CREATE TABLE IF NOT EXISTS learnings (
     question_id INTEGER,
     seat TEXT NOT NULL DEFAULT '',           -- '' = global (every seat sees it)
     retired_at REAL,                         -- NULL = standing; set = superseded
-    retired_reason TEXT                      -- why, in the user's words
+    retired_reason TEXT,                     -- why, in the user's words
+    -- WHERE THE RULING CAME FROM, so a stale one can be audited before it is retracted.
+    -- Also in ADDED_COLUMNS: '' on every row written before these columns existed, and
+    -- on anything a person typed at a terminal. Never backfilled by guessing.
+    wo_id TEXT NOT NULL DEFAULT '',          -- the order the review settled
+    origin_kind TEXT NOT NULL DEFAULT '',    -- LEARNING_ORIGIN_KINDS
+    origin_id TEXT NOT NULL DEFAULT ''       -- the record within it, comma-joined if several
 );
 CREATE TABLE IF NOT EXISTS panel_opinions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -178,6 +187,10 @@ ADDED_COLUMNS = {
         # Retraction
         "retired_at": "REAL",
         "retired_reason": "TEXT",
+        # Provenance — the comment on the column in SCHEMA has the reasoning
+        "wo_id": "TEXT NOT NULL DEFAULT ''",
+        "origin_kind": "TEXT NOT NULL DEFAULT ''",
+        "origin_id": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -552,12 +565,17 @@ class NeoStore:
     # -- learnings
 
     def add_learning(self, content: str, project: str = "", source: str = "manual",
-                     question_id: int | None = None, seat: str = "") -> dict[str, Any]:
-        """Record a learning"""
+                     question_id: int | None = None, seat: str = "", wo_id: str = "",
+                     origin_kind: str = "", origin_id: str = "") -> dict[str, Any]:
+        """Record a learning, with the review record that taught it"""
+        if origin_kind and origin_kind not in LEARNING_ORIGIN_KINDS:
+            raise ValueError(f"unknown learning origin kind {origin_kind!r} — the kinds "
+                             f"are: {', '.join(LEARNING_ORIGIN_KINDS)}")
         cur = self.conn.execute(
-            "INSERT INTO learnings (ts, project, content, source, question_id, seat) "
-            "VALUES (?,?,?,?,?,?)",
-            (db.now(), project, content, source, question_id, seat or ""),
+            "INSERT INTO learnings (ts, project, content, source, question_id, seat, "
+            "wo_id, origin_kind, origin_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (db.now(), project, content, source, question_id, seat or "",
+             wo_id or "", origin_kind or "", origin_id or ""),
         )
         row = self.conn.execute("SELECT * FROM learnings WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)

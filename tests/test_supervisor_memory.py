@@ -59,7 +59,7 @@ def _prompts():
 
 def test_a_correction_teaches_the_supervisor_without_touching_neos_prompt(started):
     """THE ONE TEST THAT GRADES THIS WORK ORDER, and it has to be one test"""
-    _, alarm_id = _decided_alarm()
+    wo_id, alarm_id = _decided_alarm()
     neo_before, supervisor_before = _prompts()
 
     ops.review_alarm(alarm_id, approved=False, feedback=RULING)
@@ -77,6 +77,10 @@ def test_a_correction_teaches_the_supervisor_without_touching_neos_prompt(starte
     assert rows[0]["project"] == "proj_a"
     # The sentence carries the verdict it corrects
     assert "long-turn" in rows[0]["content"] and WHY in rows[0]["content"]
+    # …and the alarm it came from, plus the order that alarm fired on
+    assert rows[0]["wo_id"] == wo_id
+    assert rows[0]["origin_kind"] == "alarm"
+    assert rows[0]["origin_id"] == alarm_id
 
 
 def test_an_approved_verdict_teaches_nothing(started):
