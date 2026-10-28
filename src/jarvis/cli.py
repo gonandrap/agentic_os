@@ -4792,6 +4792,9 @@ def cmd_config(args: argparse.Namespace) -> int:
 def cmd_onboard(args: argparse.Namespace) -> int:
     from . import ops
 
+    # The group handler, so a sibling adding `start` branches here as `cmd_config` does
+    if args.ob_cmd != "apply":
+        return 0
     data = ops.onboard_apply(args.draft, catalog_path=args.catalog,
                              dry_run=args.dry_run)
     if args.json:
