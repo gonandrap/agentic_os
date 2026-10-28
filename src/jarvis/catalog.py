@@ -535,6 +535,9 @@ DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
 #: How long one project's red-base episodes are REMEMBERED (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)
 DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS = 168
 
+#: How long a red default branch may heal itself before the OS pays for a fix (wo-6bc0cd90, Neo 2227)
+DEFAULT_FLEET_HEALTH_BASE_FIX_GRACE_MINUTES = 30
+
 #: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`' arrangement
 FLEET_HEALTH_MAP_KEYS = ("thresholds",)
 
@@ -572,6 +575,8 @@ class FleetHealthConfig:
     exempt_kinds: tuple[str, ...] = DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
     #: §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md
     red_episode_retention_hours: int = DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS
+    #: Minutes `main` stays red before `dispatch_base_fix` asks the steward
+    base_fix_grace_minutes: int = DEFAULT_FLEET_HEALTH_BASE_FIX_GRACE_MINUTES
 
     def threshold_seconds(self, status: str) -> float:
         """This status's threshold, in the seconds `stuck.assess` compares"""
@@ -1588,6 +1593,8 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         exempt_kinds=exempt_kinds,
         red_episode_retention_hours=int(raw.get(
             "red_episode_retention_hours", base.red_episode_retention_hours)),
+        base_fix_grace_minutes=int(raw.get(
+            "base_fix_grace_minutes", base.base_fix_grace_minutes)),
     )
     for name, value in vars(cfg).items():
         if name in FLEET_HEALTH_MAP_KEYS or name in FLEET_HEALTH_LIST_KEYS \
