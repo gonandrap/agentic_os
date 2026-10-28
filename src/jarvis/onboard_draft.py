@@ -1,4 +1,4 @@
-"""The onboarding interview's draft file, and the catalog document it becomes (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §0.3, §3)"""
+"""The onboarding interview's draft file, and the catalog document it becomes (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §3)"""
 
 from __future__ import annotations
 
@@ -109,7 +109,7 @@ def save(draft: Draft, path: str | Path) -> Path:
 
 
 def candidate_document(draft: Draft, document: dict[str, Any]) -> dict[str, Any]:
-    """What the catalog document would become. Mutates nothing."""
+    """What the catalog document would become, mutating nothing"""
     from . import ops
 
     candidate = copy.deepcopy(document)

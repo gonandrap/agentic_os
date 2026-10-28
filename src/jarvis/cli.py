@@ -1498,7 +1498,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--reason", default="")
     c.add_argument("--catalog")
 
-    # onboard (the greeting agent's interview) -------------------------------------------... (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §0.2 — `questions` and `explain` are added to THIS group.)
+    # onboard: `questions` and `explain` are added to THIS group (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §0.2)
     ob = sub.add_parser(
         "onboard",
         help="onboard a project: decide what the OS does for it automatically, then "

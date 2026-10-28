@@ -63,7 +63,7 @@ def daemon_pidfile() -> Path:
 
 
 def onboarding_dir() -> Path:
-    """Interview drafts live here, NOT in the project: an abandoned interview leaves the user's repository clean (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §3)"""
+    """Interview drafts live here, NOT in the project (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §3)"""
     return jarvis_home() / "onboarding"
 
 

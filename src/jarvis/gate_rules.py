@@ -870,6 +870,7 @@ def seed_rows() -> list[dict[str, Any]]:
 
 
 # 2: the `config_write` kind, its recogniser and its canaries (the config console). 3: the... (#194)
+
 # 6: `jarvis onboard apply` writes configuration too, so it joins `config_write`
 SEED_VERSION = "6"
 
