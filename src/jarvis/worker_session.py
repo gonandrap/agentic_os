@@ -692,10 +692,11 @@ def remove_closed_sessions(store: ProjectStore) -> list[str]:
 def _prune_worktree_caches(store: ProjectStore, wo: dict[str, Any]) -> None:
     """A build cache `pytest` left untracked is not work, and `claude rm` keeps a worktree for it (#1257)"""
     from . import disk
-    from .evidence import ProjectRef
 
-    tree = worktree_path(ProjectRef(store.project_path), wo)  # type: ignore[arg-type]
-    if tree is None:
+    if not wo.get("worktree"):
+        return
+    tree = Path(store.project_path) / ".claude" / "worktrees" / str(wo["worktree"])
+    if not tree.is_dir():
         return
     pruned = disk.prune_build_caches(tree)
     if pruned:
