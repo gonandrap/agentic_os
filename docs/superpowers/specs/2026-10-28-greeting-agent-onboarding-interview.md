@@ -6,7 +6,7 @@ touches the catalog document, so a freshly adopted project runs on every shipped
 validation off, supervisor off, rules off, fleet health off, the schedule off, evolution in
 shadow, Morpheus on, self-dispatch off. Nobody chose any of that and nobody was told.
 
-This feature adds the missing half. `jarvis onboard <path>` opens an interactive Claude
+This feature adds the missing half. `jarvis onboard start <path>` opens an interactive Claude
 session in the user's own terminal, run by a new persona, `greeting_agent`. It interviews
 the user about every automatic behaviour of the OS, explains the impact of any choice with
 worked examples grounded in the specs and in the config code, shows a diff, and applies
@@ -88,7 +88,7 @@ a project (see §3). No new page under `docs/os/`. No reviving `onboarding.py` o
 ### 0.2 The surface, whole, so no section invents a neighbouring command
 
 ```bash
-jarvis onboard <path> [--name n] [--print-prompt]     # §5 — open the interview
+jarvis onboard start <path> [--name n] [--print-prompt]   # §5 — open the interview
 jarvis onboard questions [--area a] [--json]          # §4 — the catalogue, no model needed
 jarvis onboard explain <area|path> [--project p]      # §4 — impact, example, apply class
 jarvis onboard apply --from <draft.json> [--dry-run]  # §3 — the one validated write
@@ -101,11 +101,17 @@ configuration — the persona never edits JSON (prime directive 1).
 
 **Three sections add a subcommand to the same `onboard` group, so the rule is: whichever
 lands first CREATES the group in `cli.build_parser`, the rest ADD to the existing one.**
-§3 lands first and creates it; §4 adds `questions` and `explain`; §5 adds the bare
-`jarvis onboard <path>`. Without that rule the last two pull requests conflict in
-`build_parser` over a group they both think they own. When the group is complete its
-subcommands are exactly `questions`, `explain`, `apply` — §5 pins that set, so a sixth
-command cannot appear without this section being updated first.
+§3 lands first and creates it; §4 adds `questions` and `explain`; §5 adds `start`. Without
+that rule the last two pull requests conflict in `build_parser` over a group they both
+think they own. When the group is complete its subcommands are exactly `start`,
+`questions`, `explain`, `apply` — §5 pins that set, so a fifth command cannot appear
+without this section being updated first.
+
+**The entry point is a NAMED subcommand, `jarvis onboard start <path>`, not a bare
+`jarvis onboard <path>`.** Once an argparse subparser group carries choices, a bare path is
+refused as an invalid choice, so the two cannot coexist in the shape this repo uses
+everywhere (`add_subparsers(dest=...)` with `required=True`). The path is `start`'s
+positional argument.
 
 ### 0.3 The draft file, frozen here because two children read and write it and never speak
 
@@ -630,7 +636,7 @@ unanswered, and the four commands), and the argv. **The argv is a pure function*
 into `~/.claude.json`, and it runs during `bootstrap_project` — i.e. AFTER the interview.
 An interactive `claude` whose cwd is the not-yet-adopted project would hit Claude Code's
 trust prompt before the interview starts. So the session runs with **cwd =
-`paths.jarvis_home()`** and reaches the target through `--add-dir`. `cli.cmd_onboard` calls
+`paths.jarvis_home()`** and reaches the target through `--add-dir`. `cli.cmd_onboard_start` calls
 `ops.onboard_session` and then `os.execvp` on the argv — a three-line wrapper around the
 pure function, and **nothing in the suite execs `claude`**. `--print-prompt` prints the
 persona root and the opening prompt instead of exec'ing: the escape hatch when `claude` is
@@ -660,9 +666,11 @@ gains one clause pointing at `jarvis onboard`.
    renaming `--from` to `--draft`, and `parse_args` does not. It is the house idiom, not an
    invention.
 2. **The reverse guard on the surface.** The `onboard` subparser's choices are exactly
-   `{questions, explain, apply}` — idiom at `tests/test_rules_cli.py:221`,
+   `{start, questions, explain, apply}` — idiom at `tests/test_rules_cli.py:221`,
    `parser._subparsers._group_actions[0].choices["onboard"]` — so a sibling ADDING a fifth
-   command also goes red until the persona and §0.2 are updated.
+   command also goes red until the persona and §0.2 are updated. The same test asserts
+   `cli.build_parser().parse_args(["onboard", "start", "/tmp/x"])` resolves, which is what
+   keeps the entry point a named subcommand rather than a bare path.
 3. `onboard_session` on a fresh git project returns a draft with every area unanswered and
    an argv carrying `--agent greeting_agent` and an `--add-dir` for the persona root; on an
    already-adopted project the draft is pre-filled from the live resolved config and the
@@ -677,7 +685,7 @@ gains one clause pointing at `jarvis onboard`.
 5. **cwd.** The reported cwd equals `paths.jarvis_home()` and is not inside the project
    path; `--print-prompt` created the persona root and the draft and returned no argv.
 6. **The crib line, in `tests/test_persona.py`** (its own idiom,
-   `test_crib_sheet_documents_every_improvement_order_verb`): `jarvis onboard <path>` is in
+   `test_crib_sheet_documents_every_improvement_order_verb`): `jarvis onboard start <path>` is in
    `CLAUDE.md`, and at most ONE line of it starts with `jarvis onboard`. Nothing else in
    this list asserts `CLAUDE.md` changed at all, so without it a worker can finish believing
    it is done with the crib entry missing. `tests/test_worker_start_budget.py:85`'s
@@ -690,7 +698,7 @@ gains one clause pointing at `jarvis onboard`.
 Nothing in the suite execs `claude`.
 
 **One manual check, reported in the finish summary**, standing in for the eval this feature
-deliberately does not ship: run `jarvis onboard <scratch git repo>` by hand, confirm
+deliberately does not ship: run `jarvis onboard start <scratch git repo>` by hand, confirm
 `--add-dir <root> --agent greeting_agent` takes in an interactive (non-`-p`) session,
 answer two areas, confirm `apply --from … --dry-run` prints the diff, and state whether
 `--agent` or the `--append-system-prompt-file` fallback shipped.
