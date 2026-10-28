@@ -79,11 +79,19 @@
 <h2 style="margin-top: 18px">Knowledge review
   <span class="sub" id="kr-summary" style="text-transform: none; letter-spacing: 0"></span></h2>
 <p class="sub" style="margin: 0">
-  Drag an entry (or a <kbd class="kbd">shift</kbd>-drag box selection) onto a domain to assign
-  it, or into empty space to unassign it; drag a domain into another to nest it. Click
-  anything to open it; right-click for more. <b>Link mode</b> (<kbd class="kbd">l</kbd>):
-  drag from one entry to another to link them. Amber entries are the machine's proposals —
-  accept or move them; green ones a person has decided. Every change is kept with who made it.
+  Drag an entry (or a box selection) onto a domain to assign it, or into empty space to
+  unassign it; drag a domain into another to nest it. Click anything to open it; right-click
+  for more. <b>Link mode</b> (<kbd class="kbd">l</kbd>): drag from one entry to another to
+  link them. Amber entries are the machine's proposals — accept or move them; green ones a
+  person has decided. Every change is kept with who made it.
+</p>
+<p class="sub" style="margin: 4px 0 0">
+  Move around like Figma: <kbd class="kbd">scroll</kbd> pans (<kbd class="kbd">shift</kbd> sideways),
+  <kbd class="kbd">ctrl</kbd>/<kbd class="kbd">⌘</kbd>+scroll or pinch zooms, hold
+  <kbd class="kbd">space</kbd> or the middle button and drag to pan, drag on empty canvas to
+  box-select (<kbd class="kbd">shift</kbd> adds). <kbd class="kbd">shift 1</kbd> fit all ·
+  <kbd class="kbd">shift 2</kbd> zoom to selection · <kbd class="kbd">shift 0</kbd> 100% ·
+  <kbd class="kbd">+</kbd>/<kbd class="kbd">-</kbd> zoom.
 </p>
 
 <div class="kr" id="kr" data-rels="{{ link_rels|join(',') }}">
@@ -248,6 +256,10 @@ window._ = window._ || {
 
   var cy = cytoscape({
     container: $('cy'),
+    // Figma-style navigation is ours (see "-- navigation"): with cytoscape's own panning
+    // and zooming off, a drag on empty canvas box-selects with no modifier.
+    userPanningEnabled: false,
+    userZoomingEnabled: false,
     boxSelectionEnabled: true,
     textureOnViewport: true,
     hideEdgesOnViewport: true,
@@ -821,10 +833,21 @@ window._ = window._ || {
     mode('click the entry to link ' + src + ' to (Esc to cancel)');
   }
 
-  cy.on('cxttap', function (e) {
-    var t = e.target, o = e.originalEvent, x = o.clientX, y = o.clientY;
+  // The context menu rides the browser's own `contextmenu` event, not cytoscape's
+  // `cxttap`: on Linux the native event fires on mouse DOWN, and the two orders fought.
+  // What is under the pointer is whatever cytoscape last reported hovering.
+  var hovered = null;
+  cy.on('mouseover', 'node, edge', function (e) { hovered = e.target; });
+  cy.on('mouseout', 'node, edge', function (e) { if (hovered === e.target) hovered = null; });
+  $('cy').addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+    var r = $('cy').getBoundingClientRect(), pan = cy.pan(), z = cy.zoom();
+    contextMenu(hovered && hovered.inside() ? hovered : cy, e.clientX, e.clientY,
+                { x: (e.clientX - r.left - pan.x) / z, y: (e.clientY - r.top - pan.y) / z });
+  });
+
+  function contextMenu(t, x, y, at) {
     if (t === cy) {
-      var at = e.position;
       menu(x, y, '', [
         { label: '+ new domain here', run: function () { newDomain('', null, at); } },
         { label: 'fit to screen', run: function () { cy.fit(undefined, 30); } },
@@ -848,8 +871,62 @@ window._ = window._ || {
     } else if (t.isEdge()) {
       openEdge(t);
     }
+  }
+
+  // -- navigation, Figma's way: scroll pans, ctrl/⌘+scroll (and a trackpad pinch, which
+  // arrives as ctrl+wheel) zooms at the pointer, space+drag or middle-drag pans.
+
+  var view = $('cy'), nav = { space: false, pan: null };
+  function zoomAt(factor, clientX, clientY) {
+    var r = view.getBoundingClientRect();
+    var level = Math.max(cy.minZoom(), Math.min(cy.maxZoom(), cy.zoom() * factor));
+    cy.zoom({ level: level, renderedPosition: {
+      x: clientX === undefined ? r.width / 2 : clientX - r.left,
+      y: clientY === undefined ? r.height / 2 : clientY - r.top } });
+  }
+  view.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? view.clientHeight : 1;
+    var dx = e.deltaX * unit, dy = e.deltaY * unit;
+    // One notch of a mouse wheel (~100px) zooms ~18%; a pinch sends many small deltas
+    if (e.ctrlKey || e.metaKey) { zoomAt(Math.exp(-dy * 0.002), e.clientX, e.clientY); return; }
+    if (e.shiftKey && !dx) { dx = dy; dy = 0; }
+    cy.panBy({ x: -dx, y: -dy });
+  }, { passive: false });
+  // Capture phase on the container runs before cytoscape's own listeners, so a pan
+  // gesture never also starts a node drag or a box selection.
+  view.addEventListener('mousedown', function (e) {
+    if (!(e.button === 1 || (e.button === 0 && nav.space))) return;
+    e.preventDefault(); e.stopPropagation();
+    nav.pan = { x: e.clientX, y: e.clientY };
+    view.style.cursor = 'grabbing';
+  }, true);
+  window.addEventListener('mousemove', function (e) {
+    if (!nav.pan) return;
+    cy.panBy({ x: e.clientX - nav.pan.x, y: e.clientY - nav.pan.y });
+    nav.pan = { x: e.clientX, y: e.clientY };
+  }, true);
+  window.addEventListener('mouseup', function () {
+    if (!nav.pan) return;
+    nav.pan = null;
+    view.style.cursor = nav.space ? 'grab' : '';
+  }, true);
+  view.addEventListener('auxclick', function (e) { if (e.button === 1) e.preventDefault(); });
+  function typingNow() {
+    var el = document.activeElement;
+    return el && (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || el.isContentEditable);
+  }
+  document.addEventListener('keydown', function (e) {
+    if (e.code !== 'Space' || typingNow()) return;
+    e.preventDefault();  // the page must not scroll
+    if (!nav.space) { nav.space = true; if (!nav.pan) view.style.cursor = 'grab'; }
   });
-  $('cy').addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  document.addEventListener('keyup', function (e) {
+    if (e.code !== 'Space') return;
+    nav.space = false;
+    if (!nav.pan) view.style.cursor = '';
+  });
+  window.addEventListener('blur', function () { nav.space = false; nav.pan = null; view.style.cursor = ''; });
 
   // -- taps: open what was clicked
 
@@ -1027,7 +1104,19 @@ window._ = window._ || {
       if (!typing) closePanel();
       return;
     }
-    if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (typing || e.altKey) return;
+    // Figma's view keys: shift+1 fit, shift+2 selection, shift+0 100%, +/- (or ctrl/⌘ +/-)
+    if (e.shiftKey && e.code === 'Digit1') { e.preventDefault(); cy.fit(undefined, 30); return; }
+    if (e.shiftKey && e.code === 'Digit2') {
+      e.preventDefault();
+      var sel = cy.$(':selected');
+      if (sel.length) cy.fit(sel, 60);
+      return;
+    }
+    if (e.shiftKey && e.code === 'Digit0') { e.preventDefault(); zoomAt(1 / cy.zoom()); return; }
+    if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomAt(1.25); return; }
+    if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomAt(0.8); return; }
+    if (e.ctrlKey || e.metaKey) return;
     if (e.key === 'l') setLinkMode(!state.linkMode);
   });
 
