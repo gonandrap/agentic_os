@@ -446,7 +446,7 @@ _RETRIES_SUFFIX = re.compile(r"\s*\(after \d+ retries — nobody has judged this
 
 def fold_neo_attention(questions: list[dict[str, Any]],
                        rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One row per CAUSE, with a count, the biggest pile first: one outage is one thing to fix, not one per question"""
+    """One row per CAUSE with a count, biggest first: one outage is one thing to fix"""
     from .neo_store import REVIVABLE_KINDS, UNREACHABLE_PREFIX
 
     groups: dict[tuple[str, ...], list[tuple[dict[str, Any], dict[str, Any]]]] = {}

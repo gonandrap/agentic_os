@@ -1,4 +1,4 @@
-"""One outage is one attention row, and the questions it stranded re-ask themselves once Neo answers again"""
+"""One outage is one attention row; what it stranded re-asks itself once Neo answers"""
 
 from __future__ import annotations
 

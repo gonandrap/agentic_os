@@ -321,7 +321,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
         if not reached:
-            # A model replied, so the transport works again: what an outage stranded re-asks itself, once per drain
+            # A model replied, so the transport works: re-ask what an outage stranded, once per drain
             reached = True
             revived = store.revive_unreachable()
             if revived:

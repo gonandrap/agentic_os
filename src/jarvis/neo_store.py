@@ -80,7 +80,7 @@ MAX_ANSWER_ATTEMPTS = 3
 #: How many times one transport-failed question is put back in the queue after Neo answered again
 MAX_REVIVALS = 2
 
-#: The kinds a revival may re-ask: no worker stands behind them, so a late answer cannot reach one that moved on
+#: Kinds a revival may re-ask: no worker behind them, so a late answer reaches no one stale
 REVIVABLE_KINDS = ("validation", "triage")
 
 #: `answer_reason` on a question nobody could put to a model (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)
