@@ -373,11 +373,7 @@ def learnings_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[
                                      false_alarms: frozenset[int] = frozenset(),
                                      tightened: bool = False
                                      ) -> list[tuple[str, list[int]]]:
-    """The user's ruling as RULES Neo applies to the next assumption of the class (io-51469add)
-
-    Each rule comes back with the assumption ids that produced it: one rule covers a whole
-    class, so its provenance is every row in that class (Neo 2246).
-    """
+    """Each rule Neo applies to the next assumption of a class, with the ids that taught it (io-51469add)"""
     from .autoreview import assumption_class
 
     by_class: dict[str, list[dict[str, Any]]] = {}
