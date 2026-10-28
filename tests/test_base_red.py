@@ -706,8 +706,27 @@ def tracker(started, project, fake_gh):
     return started
 
 
-def sweep(daemon, store):
+def sweep(daemon, store, aged: bool = True):
+    """`aged`: the open red episode has outlived `base_fix_grace_minutes`"""
+    if aged:
+        central = CentralStore()
+        held = central.base_red_episodes("proj_a")
+        if held and held[-1][1] is None:
+            held[-1][0] = min(float(held[-1][0]), db.now() - 3600 * 24)
+            central.set_base_red_episodes("proj_a", held)
     daemon.dispatch_base_fix(daemon.catalog.project("proj_a"), store)
+
+
+def test_a_fresh_red_main_waits_out_the_grace_window(tracker, project, fake_gh):
+    """wo-6bc0cd90: a red a worker's merge-heal greens soon costs no steward decision"""
+    store = ProjectStore(project)
+    poll(tracker, store)
+    sweep(tracker, store, aged=False)
+    assert filings(fake_gh) == 0 and orders(store) == []
+    assert not fact().get("issue_url")
+
+    sweep(tracker, store)
+    assert filings(fake_gh) == 1 and fact()["fix_wo_id"]
 
 
 def filings(fake_gh) -> int:
