@@ -904,7 +904,8 @@ def test_every_non_default_param_computes_live(client, project, monkeypatch, que
 
     assert page.status_code == 200
     assert len(calls) == 1
-    assert "s ago" not in page.text
+    # Computed for THIS request, off its path (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+    assert "computed 0s ago" in page.text
 
 
 def test_the_default_zone_spelled_out_still_hits(client, project, monkeypatch):
@@ -927,7 +928,7 @@ def test_a_cached_entry_for_another_window_bound_computes_live(client, project, 
 
     assert "added after refresh" in page.text
     assert len(calls) == 1
-    assert "s ago" not in page.text
+    assert "computed 0s ago" in page.text
 
 
 def test_an_empty_cache_computes_live_as_before(client, project, monkeypatch):
@@ -939,7 +940,7 @@ def test_an_empty_cache_computes_live_as_before(client, project, monkeypatch):
 
     assert "live one" in page.text
     assert len(calls) == 1
-    assert "s ago" not in page.text
+    assert "computed 0s ago" in page.text
 
 
 def test_a_failed_refresh_keeps_the_last_good_entry(client, project, monkeypatch):
@@ -964,3 +965,93 @@ def test_a_failed_refresh_keeps_the_last_good_entry(client, project, monkeypatch
     assert cache.entries == good
     assert [(m, p) for m, p, _ in errors] == [("TASK", "cost/cache/week"),
                                               ("TASK", "cost/cache/5h")]
+
+
+# docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md
+
+
+def test_a_window_that_cannot_be_computed_in_time_renders_the_computing_state(
+        client, project, monkeypatch):
+    """The issue's own shape: the request returns at once instead of holding a pool thread"""
+    import threading
+
+    from jarvis.ui import app as ui_app
+
+    add_recorded_turn(project, ops.create_work_order("proj_a", "slow to price")["id"],
+                      0.05, 48_000)
+    gate = threading.Event()
+    real = ops.cost_report
+    monkeypatch.setattr(ui_app, "WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(ops, "cost_report",
+                        lambda **kw: (gate.wait(10), real(**kw))[1])
+
+    try:
+        page = client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00")
+        assert page.status_code == 200
+        assert "What the work cost — computing" in page.text
+        assert 'http-equiv="refresh"' in page.text
+        assert "slow to price" not in page.text
+    finally:
+        gate.set()
+
+    # The compute lands behind the request, and the next visit is the page itself
+    cache = client.app.state.cost_cache
+    assert _wait_for(lambda: not cache.computing)
+    page = client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00")
+    assert "computed 0s ago" in page.text
+
+
+def _wait_for(predicate, timeout: float = 15.0) -> bool:
+    # clock-exempt: class 3 — waits on a real compute thread, which no patched db.now releases
+    import time as real_time
+
+    deadline = real_time.time() + timeout
+    while real_time.time() < deadline:
+        if predicate():
+            return True
+        real_time.sleep(0.05)
+    return False
+
+
+def test_a_stale_on_demand_entry_is_served_while_it_is_recomputed(client, project,
+                                                                  monkeypatch):
+    """Nobody waits for a window that was computed once: the age is on the page"""
+    import time as real_time
+
+    from jarvis.ui import app as ui_app
+
+    add_recorded_turn(project, ops.create_work_order("proj_a", "priced once")["id"],
+                      0.05, 48_000)
+    cache = client.app.state.cost_cache
+    assert client.get("/cost?project=proj_a").status_code == 200
+    key, = cache.on_demand
+    # clock-exempt: class 3 — `computed_at` is stamped by the UI's own time.time(), so the age must be measured on that clock
+    cache.on_demand[key]["computed_at"] = real_time.time() - ui_app.REFRESH_SECONDS - 1
+    monkeypatch.setattr(ui_app, "WAIT_SECONDS", 0)
+    calls = count_live(monkeypatch)
+
+    page = client.get("/cost?project=proj_a")
+
+    assert page.status_code == 200
+    assert "priced once" in page.text                 # the stale entry, served
+    assert "computed 6" in page.text                  # and labelled 61s old
+    assert _wait_for(lambda: not cache.computing)
+    assert len(calls) == 1                            # the recompute ran behind it
+
+
+def test_an_on_demand_compute_that_raises_renders_the_error_and_keeps_the_last_entry(
+        client, project, monkeypatch):
+    add_recorded_turn(project, ops.create_work_order("proj_a", "priced once")["id"],
+                      0.05, 48_000)
+    cache = client.app.state.cost_cache
+    assert client.get("/cost?project=proj_a").status_code == 200
+    good = dict(cache.on_demand)
+    monkeypatch.setattr(ops, "cost_report",
+                        lambda **_kw: (_ for _ in ()).throw(RuntimeError("no transcripts")))
+
+    # A window with no entry to fall back on: the refusal the reader sees
+    page = client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00")
+
+    assert page.status_code == 200
+    assert "could not be computed" in page.text and "no transcripts" in page.text
+    assert cache.on_demand == good

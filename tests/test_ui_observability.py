@@ -610,6 +610,51 @@ def test_a_wedge_that_never_saturates_the_pool_still_trips(started, monkeypatch)
     assert "lock_waiter" in uilog.stack_dump_path().read_text()
 
 
+def test_one_slow_request_on_a_dashboard_that_keeps_serving_is_not_a_wedge(
+        started, monkeypatch):
+    """Issue 1238: a custom-window /cost held one pool thread for a minute and the UI was restarted"""
+    _fast_probe(monkeypatch, trip_threshold=2)
+    gate = threading.Event()
+    pool = cf.ThreadPoolExecutor(max_workers=4)
+    futs: list = []
+    try:
+        with TestClient(_wedge_app(gate)) as client:
+            try:
+                futs.append(pool.submit(client.get, "/_wedge"))
+                # Older than probe_timeout_seconds, while every other route answers
+                assert _wait_until(
+                    lambda: (client.get("/healthz").json()["oldest_inflight_seconds"]
+                             or 0) > 1)
+                for _ in range(6):
+                    assert client.get("/_sync_control").status_code == 200
+                    # clock-exempt: class 3 — real probe rounds have to elapse for the round to fail
+                    time.sleep(0.6)
+
+                body = client.get("/healthz").json()
+                assert body["wedged"] is False
+                assert body["pool_healthy"] is True
+                assert body["probe_failure_reason"] == ""
+                assert body["inflight"] >= 1
+                assert uilog.read_wedge() is None
+            finally:
+                _release_and_drain(gate, futs)
+    finally:
+        pool.shutdown(wait=False)
+
+
+def test_a_cancelled_request_is_not_progress(started):
+    """A client that gives up on a wedged page must not look like a dashboard that serves"""
+    probe = create_app().state.pool_probe
+
+    key = probe.begin("GET", "/cost")
+    probe.end(key, served=False)
+    assert probe.served == 0
+
+    key = probe.begin("GET", "/cost")
+    probe.end(key)
+    assert probe.served == 1
+
+
 def _next_key(probe) -> int:
     key = probe.begin("GET", "/_counter")
     probe.end(key)
