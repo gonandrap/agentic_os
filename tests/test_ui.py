@@ -86,6 +86,8 @@ def test_dashboard_renders_quiet(client):
     assert r.status_code == 200
     assert "all quiet" in r.text
     assert "proj_a" in r.text
+    # the sidebar lists projects; the dashboard has no projects column (wo-27a8661c)
+    assert "<h2>Projects</h2>" not in r.text
 
 
 def test_dashboard_auto_refresh_is_scoped_to_the_live_regions(client):
