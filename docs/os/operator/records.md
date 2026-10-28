@@ -70,6 +70,9 @@ Morpheus validates every PR that reaches production, in every project.
   the next check repeats it.
 * **Failed and timed out.** Morpheus never diagnoses. `failed` is handed to an
   investigation (or to Neo), and `timedout` (3 days by default) to Neo.
+* **What Neo may do about it.** Reading a transient failure, Neo requeues the item
+  itself — once per item, ever. It never waives: ruling a shipped PR fine with no
+  production evidence stays the user's.
 * **The two commands.** `waive` is the user ruling a PR fine. `requeue` watches it again
   with a fresh deadline.
 * **Its own brake.** By default Morpheus's session pauses with the fleet's `jarvis pause`.
