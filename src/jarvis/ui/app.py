@@ -692,12 +692,16 @@ def nav_projects() -> list[str]:
 
 
 def _decorate_question(q: dict) -> dict:
-    """Add the two display-only fields the `/neo` question blocks render"""
-    from .. import digest, issues, neo
+    """Add the display-only fields the `/neo` question blocks render"""
+    from .. import digest, issues, morpheus, neo
     q["digest_view"] = digest.decode(q.get("digest"))
     q["full_context"] = neo.build_question_prompt(q)
     # `triage` only, and empty everywhere else: the one kind whose subject is a tracker issue rather than...
     q["issue_url"] = (issues.triage_payload(q) or {}).get("issue_url") or ""
+    # `validation` and `findings` are decided on their own record, so the block links to it
+    q["morpheus_item"] = morpheus.item_of_question(q) if q.get("kind") == "validation" else ""
+    located = ops._finding_for_question(q) if q.get("kind") == "findings" else None
+    q["io_url"] = f"/io/{located[0]}/{located[2]['id']}" if located else ""
     return q
 
 
@@ -1710,6 +1714,26 @@ def create_app() -> FastAPI:
         """Shipped PRs watched in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)"""
         return render(request, "morpheus.html", active="morpheus",
                       report=ops.morpheus_report())
+
+    @app.post("/morpheus/{item_id}/waive")
+    def morpheus_waive(item_id: str, reason: str = Form(""), next: str = Form("")):
+        """The user rules a shipped PR working in production"""
+        try:
+            ops.morpheus_waive(item_id, reason)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/morpheus", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
+
+    @app.post("/morpheus/{item_id}/requeue")
+    def morpheus_requeue(item_id: str, next: str = Form("")):
+        """Run a shipped PR's production check again, with a fresh deadline"""
+        try:
+            ops.morpheus_requeue(item_id)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/morpheus", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
 
     @app.get("/steward", response_class=HTMLResponse)
     def steward_page(request: Request):
