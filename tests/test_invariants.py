@@ -236,6 +236,73 @@ def test_a_gate_pending_on_live_work_is_left_alone(project):
     assert store.get_approval(approval["id"])["status"] == "pending"
 
 
+def _gate_whose_reviewer_died(store: ProjectStore, cause: str = "transport-unreachable"):
+    """The state issue #1261 reported: a parked order, a pending gate, a dead question"""
+    from jarvis.neo_store import NeoStore
+
+    wo = store.create_work_order("ship a new version to production")
+    approval = store.add_approval(wo["id"], "auto_merge", "gh pr merge 1234 --squash")
+    store.set_status(wo["id"], "waiting_pr_merge")
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", wo["id"], "merge this pull request?", kind="approval")
+        store.start_review(approval["id"], q["id"])
+        neo.mark(q["id"], "failed", reason="neo could not be reached: OAuth expired",
+                 cause=cause)
+    finally:
+        neo.close()
+    return wo, approval, q
+
+
+def test_a_gate_whose_neo_question_died_comes_to_the_user(project):
+    """Issue #1261: nobody holds the request, so no surface may claim a verdict is coming"""
+    store = ProjectStore(project)
+    wo, approval, q = _gate_whose_reviewer_died(store)
+
+    violations = check_project(store, repair=True)
+
+    assert "INV-GATE-UNJUDGED" in [v.invariant for v in violations]
+    escalated = store.get_approval(approval["id"])
+    # STILL PENDING: nothing was approved or denied, it only changed hands
+    assert escalated["status"] == "pending"
+    assert escalated["escalated"]
+    assert f"question {q['id']}" in escalated["escalation_reason"]
+    # ...and the user now hears about it, on an order no `waiting_input` arm covers
+    blockers = true_blockers(store, store.get_work_order(wo["id"]))
+    assert blockers == [f"gate approval needed: auto_merge (request {approval['id']})"]
+    assert store.get_work_order(wo["id"])["needs_attention"]
+    assert ops.waiting_on(store, store.get_work_order(wo["id"]))["what"] == (
+        "gate_escalated")
+
+
+def test_a_gate_still_with_neo_is_left_alone(project):
+    """The whole point of the gate: while a reviewer really is holding it"""
+    store = ProjectStore(project)
+    _, approval, _ = _gate_whose_reviewer_died(store, cause="")
+    from jarvis.neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        neo.mark(store.get_approval(approval["id"])["neo_question_id"], "queued")
+    finally:
+        neo.close()
+
+    violations = check_project(store, repair=True)
+
+    assert "INV-GATE-UNJUDGED" not in [v.invariant for v in violations]
+    assert not store.get_approval(approval["id"])["escalated"]
+
+
+def test_a_dead_reviewer_is_reported_but_not_escalated_in_reporting_mode(project):
+    store = ProjectStore(project)
+    _, approval, _ = _gate_whose_reviewer_died(store)
+
+    violations = check_project(store, repair=False)
+
+    assert "INV-GATE-UNJUDGED" in [v.invariant for v in violations]
+    assert not store.get_approval(approval["id"])["escalated"]
+
+
 def test_phantom_attention_on_a_finished_order_is_cleared(project):
     """The 'I acked it and it is still in my face' case"""
     store = ProjectStore(project)
