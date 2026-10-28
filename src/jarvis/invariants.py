@@ -462,6 +462,17 @@ def release_base_red_blocker(said: dict[str, Any]) -> str:
         run_url=said.get("run_url") or "")
 
 
+def pr_pending_blocker(wo_id: str, park: dict[str, Any]) -> str:
+    """The pushed-branch-no-pull-request line, from the park payload only (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §5)"""
+    branch = str(park.get("branch") or "its branch")
+    base = str(park.get("base") or "the default branch")
+    url = str(park.get("compare_url") or "")
+    where = (f"open it at {url} (base `{base}`)" if url
+             else f"open one against `{base}`")
+    return (f"branch `{branch}` is pushed and has no pull request — {where}, then "
+            f"`jarvis wo pr {wo_id} <url>`")
+
+
 #: §9: the objection the OS sent about an assumption died on the way to the worker
 OBJECTION_UNDELIVERABLE_BLOCKER = ("the OS objected to an assumption and the objection "
                                    "never reached the worker — decide it yourself")
@@ -787,6 +798,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         # In the body, the pattern `auto_review_at` above already uses: `ops` imports this module
         from .ops import refusal_answered
 
+        # Above the triage and unguarded by `pending`, like PR_CLOSED_BLOCKER (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §5)
+        pr_pending = store.pr_pending_open(wo["id"])
+        if pr_pending is not None:
+            blockers.append(pr_pending_blocker(wo["id"], pr_pending))
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for something different (#224)
         if wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
@@ -807,8 +822,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(REFUSAL_UNANSWERED_DOC_BLOCKER
                             if wo.get("kind") in DOCUMENT_DELIVERY_KINDS
                             else REFUSAL_UNANSWERED_BLOCKER)
-        # 4
-        elif not pending:
+        # 4; a pushed-branch park always follows `finished`
+        elif not pending and pr_pending is None:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43)
     if stuck_message(store, wo, now=now) is not None:
@@ -1063,7 +1078,7 @@ def check_compactions_hold(store: ProjectStore) -> Iterator[Violation]:
                                                   "alarm_id": row["id"]})
             wo = store.get_work_order(wo_id)
             if wo["status"] not in TERMINAL_STATUSES and not wo["needs_attention"]:
-                store.flag_attention(wo_id, reason)
+                store.flag_attention_while(wo_id, reason, str(wo["status"] or ""))
         yield Violation(
             invariant=("INV-COMPACTION-CHAINED" if kind == COMPACTION_CHAINED_ALARM
                        else "INV-COMPACTION-UNPROVEN"),
@@ -1553,8 +1568,10 @@ def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
         return False
     if something_is_out(store, wo_id):
         return False
-    store.set_status(wo_id, "running")
-    return True
+    if getattr(store, "readonly", False):
+        return True  # `jarvis doctor` without --repair: the wait is endable, nothing is written
+    return store.repair_while(wo_id, "waiting_input",
+                              lambda: store.set_status(wo_id, "running"))
 
 
 def neo_question_blocker(question: dict[str, Any]) -> str:
@@ -1583,7 +1600,9 @@ def check_a_working_worker_is_not_waiting(store: ProjectStore) -> Iterator[Viola
             continue
         if not end_wait_if_nothing_is_out(store, wo["id"]):
             continue
-        store.clear_attention(wo["id"])
+        if not readonly and not store.repair_while(
+                wo["id"], "running", lambda: store.clear_attention(wo["id"])):
+            continue  # it moved under the sweep: the writer that moved it owns the flag
         yield Violation(
             invariant="INV-WAIT-WORKING",
             wo_id=wo["id"],
@@ -1608,7 +1627,9 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
         # Only assumptions are enforced strictly (#705)
         if _mentions_assumptions(blockers[0]) == _mentions_assumptions(reason):
             continue
-        store.flag_attention(wo["id"], blockers[0])
+        if not getattr(store, "readonly", False) and not store.flag_attention_while(
+                wo["id"], blockers[0], str(wo["status"] or "")):
+            continue  # it moved under the sweep: the writer that moved it owns the flag
         yield Violation(
             invariant="INV-ATTENTION-REASON",
             wo_id=wo["id"],
@@ -1646,8 +1667,14 @@ def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
         if (wo["origin"] not in UNGOVERNED_ORIGINS
                 or store.pending_assumptions(wo["id"])):
             continue
-        store.set_status(wo["id"], "completed")
-        store.clear_attention(wo["id"])
+
+        def retire() -> None:
+            store.set_status(wo["id"], "completed")
+            store.clear_attention(wo["id"])
+
+        if not getattr(store, "readonly", False) and not store.repair_while(
+                wo["id"], str(wo["status"] or ""), retire):
+            continue  # it moved under the sweep: the writer that moved it owns the status
         yield Violation(
             invariant="INV-ADHOC-NOT-GOVERNED",
             wo_id=wo["id"],
@@ -1668,9 +1695,16 @@ def check_legacy_adhoc_retired(store: ProjectStore) -> Iterator[Violation]:
             continue
         why = ("Jarvis no longer adopts sessions on its own (GitHub issue 47); "
                "this record was closed by the upgrade, not by anything the session did")
-        store.set_status(wo["id"], "completed")
-        store.clear_attention(wo["id"])
-        store.add_event(wo["id"], "session_retired", {"why": why, "was": wo["status"]})
+
+        def retire() -> None:
+            store.set_status(wo["id"], "completed")
+            store.clear_attention(wo["id"])
+            store.add_event(wo["id"], "session_retired",
+                            {"why": why, "was": wo["status"]})
+
+        if not getattr(store, "readonly", False) and not store.repair_while(
+                wo["id"], str(wo["status"] or ""), retire):
+            continue  # it moved under the sweep: the writer that moved it owns the status
         yield Violation(
             invariant="INV-ADHOC-LEGACY-RETIRED",
             wo_id=wo["id"],
@@ -1710,7 +1744,10 @@ def check_no_phantom_attention(store: ProjectStore) -> Iterator[Violation]:
             continue
         if true_blockers(store, wo):
             continue
-        store.clear_attention(wo["id"])
+        if not getattr(store, "readonly", False) and not store.repair_while(
+                wo["id"], str(wo["status"] or ""),
+                lambda: store.clear_attention(wo["id"])):
+            continue  # it moved under the sweep: the writer that moved it owns the flag
         yield Violation(
             invariant="INV-ATTENTION-PHANTOM",
             wo_id=wo["id"],
@@ -1733,7 +1770,10 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
         # An undeliverable objection raises a real blocker on a RUNNING order
         if any(_mentions_assumptions(b) for b in true_blockers(store, wo)):
             continue
-        store.clear_attention(wo["id"])
+        if not getattr(store, "readonly", False) and not store.repair_while(
+                wo["id"], str(wo["status"] or ""),
+                lambda: store.clear_attention(wo["id"])):
+            continue  # it moved under the sweep: the writer that moved it owns the flag
         yield Violation(
             invariant="INV-ATTENTION-PREMATURE",
             wo_id=wo["id"],
@@ -1780,8 +1820,9 @@ def check_messages_are_delivered(store: ProjectStore, *,
         msg, why = found
         waited = int((now - float(msg["ts"])) // SECONDS_PER_MINUTE)
         blockers = [] if wo["needs_attention"] else true_blockers(store, wo, now=now)
-        if blockers and not readonly:
-            store.flag_attention(wo["id"], blockers[0])
+        if blockers and not readonly and not store.flag_attention_while(
+                wo["id"], blockers[0], str(wo["status"] or "")):
+            blockers = []  # it moved under the sweep: the writer that moved it owns the flag
         yield Violation(
             invariant="INV-MESSAGE-STUCK",
             wo_id=wo["id"],
@@ -1834,7 +1875,9 @@ def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
             continue
         blockers = true_blockers(store, wo)
         if blockers:
-            store.flag_attention(wo["id"], blockers[0])
+            if not getattr(store, "readonly", False) and not store.flag_attention_while(
+                    wo["id"], blockers[0], str(wo["status"] or "")):
+                continue  # it moved under the sweep: the writer that moved it owns the flag
             yield Violation(
                 invariant="INV-ATTENTION-BLANK", wo_id=wo["id"],
                 detail="flagged with no reason",
@@ -2075,8 +2118,10 @@ def check_proposed_remedies_are_live(store: ProjectStore) -> Iterator[Violation]
             store.update_alarm(alarm["id"], status="escalated",
                                verdict_reason=f"the {alarm['remedy']} proposal was "
                                               f"abandoned: {why}")
-            store.flag_attention(alarm["wo_id"], ALARM_BLOCKER.format(
-                alarm_id=alarm["id"]))
+            subject = store.get_work_order(alarm["wo_id"]) or {}
+            store.flag_attention_while(
+                alarm["wo_id"], ALARM_BLOCKER.format(alarm_id=alarm["id"]),
+                str(subject.get("status") or ""))
         yield Violation(
             invariant="INV-REMEDY-PROPOSAL-STALE",
             wo_id=alarm["wo_id"],
@@ -2311,6 +2356,8 @@ def _passed_round_never_landed(store: ProjectStore) -> Iterator[Violation]:
         from . import ops as ops_mod
 
         fresh_wo = store.get_work_order(wo_id)
+        if str(fresh_wo["status"] or "") != "validating":
+            continue  # it settled under the sweep: the writer that moved it owns the landing
         status = ops_mod.land_when_cleared(store, fresh_wo)
         store.add_event(wo_id, VALIDATION_LANDED, {"round_id": int(latest["id"])})
         yield Violation(
@@ -2357,11 +2404,17 @@ def _give_up_parked_in_the_merge_queue(store: ProjectStore) -> Iterator[Violatio
                 context=context,
             )
             continue
-        store.set_status(wo_id, "needs_review", trigger=GIVE_UP_REPARKED)
-        # `round` beside the id so `timeline` can name it without a lookup
-        store.add_event(wo_id, GIVE_UP_REPARKED,
-                        {"round_id": int(judged["id"]), "round": int(judged["round"]),
-                         "was": "waiting_pr_merge"})
+
+        def repark() -> None:
+            store.set_status(wo_id, "needs_review", trigger=GIVE_UP_REPARKED)
+            # `round` beside the id so `timeline` can name it without a lookup
+            store.add_event(wo_id, GIVE_UP_REPARKED,
+                            {"round_id": int(judged["id"]),
+                             "round": int(judged["round"]),
+                             "was": "waiting_pr_merge"})
+
+        if not store.repair_while(wo_id, "waiting_pr_merge", repark):
+            continue  # it moved under the sweep: the writer that moved it owns the status
         yield Violation(
             invariant="INV-VALIDATION-STRANDED", wo_id=wo_id, detail=detail,
             repaired=True,
@@ -2379,8 +2432,14 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
         children = store.feature_children(fo_id, kinds=WORKER_CHILDREN)
         if not children or dead_feature_children(store, children):
             continue
-        store.set_feature_status(fo_id, "executing")
-        store.clear_feature_attention(fo_id)
+
+        def reopen() -> None:
+            store.set_feature_status(fo_id, "executing")
+            store.clear_feature_attention(fo_id)
+
+        if not getattr(store, "readonly", False) and not store.repair_while(
+                fo_id, "failed", reopen, kind="fo"):
+            continue  # it moved under the sweep: the writer that moved it owns the status
         # A reopened feature with a `completed` manager has no addressee for its next round's feedback
         from .ops import lower_settled_feature_holds, revive_feature_manager
 
@@ -2462,8 +2521,10 @@ def check_settled_parents_have_no_orphans(store: ProjectStore) -> Iterator[Viola
         if fo["needs_attention"] and current == reason:
             continue  # raised on an earlier tick and still true
         # The child's status and flag are left alone: settling it would discard whatever the flag was about
-        if not readonly:
-            store.flag_feature_attention(fo_id, reason)
+        if not readonly and not store.repair_while(
+                fo_id, str(fo["status"] or ""),
+                lambda: store.flag_feature_attention(fo_id, reason), kind="fo"):
+            continue  # it moved under the sweep: the writer that moved it owns the flag
         yield Violation(
             invariant=INV_FEATURE_ORPHAN_CHILD, subject_id=fo_id,
             detail=(f"{fo_id} is `{fo['status']}` but {len(children)} child"
@@ -2481,7 +2542,9 @@ def check_settled_parents_have_no_orphans(store: ProjectStore) -> Iterator[Viola
                 fo.get("attention_reason") or ""):
             continue
         if not readonly:
-            store.clear_feature_attention(fo["id"])
+            store.repair_while(fo["id"], str(fo["status"] or ""),
+                               lambda: store.clear_feature_attention(fo["id"]),
+                               kind="fo")
 
 
 def _validation_timeout() -> int:
@@ -2803,6 +2866,39 @@ def check_gate_deny_conflict(spec: Any) -> Iterator[Violation]:
         )
 
 
+INV_LAUNCHER_RUNNABLE = "INV-LAUNCHER-RUNNABLE"
+
+
+def check_launcher_runnable(spec: Any) -> Iterator[Violation]:
+    """INV-LAUNCHER-RUNNABLE — a project's session launcher must exist and be executable (docs/superpowers/specs/2026-10-22-session-dispatch.md)"""
+    import os
+    import shutil
+
+    launcher = getattr(spec.worker, "launcher", None)
+    if launcher is None:
+        return
+    for argv in (launcher.command, launcher.open):
+        if not argv:
+            continue
+        program = argv[0]
+        if os.sep in program:
+            runnable = os.path.isfile(program) and os.access(program, os.X_OK)
+        else:
+            runnable = shutil.which(program) is not None
+        if not runnable:
+            yield _launcher_violation(spec, program)
+
+
+def _launcher_violation(spec: Any, program: str) -> Violation:
+    return Violation(
+        invariant=INV_LAUNCHER_RUNNABLE,
+        detail=(f"project {spec.name!r}: worker.launcher {program!r} is missing or not "
+                f"executable, so every session this project dispatches will fail to "
+                f"start. Fix the path in the catalog or `chmod +x` the script."),
+        context={"project": spec.name, "launcher": program},
+    )
+
+
 def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
     """Config-level post-conditions over the catalog itself"""
     found: list[Violation] = []
@@ -2810,6 +2906,7 @@ def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
         if project and spec.name != project:
             continue
         found.extend(check_gate_deny_conflict(spec))
+        found.extend(check_launcher_runnable(spec))
     return found
 
 
@@ -3811,7 +3908,8 @@ def check_project(store: ProjectStore, repair: bool = True,
 class _ReadOnly:
     """Store proxy that swallows repairs, so `check_project(repair=False)` is a pure read"""
 
-    _BLOCKED = ("flag_attention", "flag_attention_while", "clear_attention",
+    _BLOCKED = ("flag_attention", "flag_attention_while", "repair_while",
+                "clear_attention",
                 "add_assumption", "add_event",
                 "set_status", "update_work_order", "supersede_approval",
                 # The bus

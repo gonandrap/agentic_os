@@ -17,6 +17,7 @@ from . import probes as probes_mod
 from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
+from .session_dispatch import Launcher, parse_launcher
 from .navigation import (DOC_DIRS, DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
                          SOURCE_SUFFIXES, SYMBOL_TOOLS, TEXT_SEARCH_TOOLS)
 from .neo_store import Q_KINDS, SEATS
@@ -259,6 +260,8 @@ class WorkerDefaults:
     investigation_effort: str | None = DEFAULT_INVESTIGATION_EFFORT
     # Whether the lead must delegate file edits to its crew (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
     require_crew: bool = False
+    # The local command that launches this project's sessions (docs/superpowers/specs/2026-10-22-session-dispatch.md)
+    launcher: Launcher | None = None
     # What one MCP tool call may take, in milliseconds (#845)
     mcp_tool_timeout_ms: int = DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS
     denied_tools: tuple[str, ...] = DEFAULT_WORKER_DENIED_TOOLS
@@ -2291,6 +2294,13 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
+        try:
+            launcher = parse_launcher(w.get("launcher"), f"project {name}: worker.launcher")
+        except ValueError as e:
+            raise _err(str(e)) from e
+        if launcher is not None and launcher.open and transport != "background":
+            raise _err(f"project {name}: worker.launcher.open opens a background session, "
+                       f"so worker.transport must be background (got {transport!r})")
         require_crew = w.get("require_crew", False)
         if not isinstance(require_crew, bool):
             raise _err(f"project {name}: worker.require_crew must be true or false, "
@@ -2314,6 +2324,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             tool_search=tool_search,
             cache_ttl=cache_ttl,
             transport=transport,
+            launcher=launcher,
             py_nav_hook=py_nav_hook,
             doc_nav_hook=doc_nav_hook,
             doc_read_limit_lines=doc_read_limit_lines,

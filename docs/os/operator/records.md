@@ -66,9 +66,13 @@ Morpheus validates every PR that reaches production, in every project.
 * **How a check gets written.** A subagent turns the PR's `## How to validate in
   production` hints into a read-only check.
 * **How the check runs.** The daemon runs it with no model call: exit 0 = validated,
-  1 = failed, anything else = not yet.
+  1 twice in a row = failed, anything else = not yet. A single exit 1 is a blip until
+  the next check repeats it.
 * **Failed and timed out.** Morpheus never diagnoses. `failed` is handed to an
   investigation (or to Neo), and `timedout` (3 days by default) to Neo.
+* **What Neo may do about it.** Reading a transient failure, Neo requeues the item
+  itself — once per item, ever. It never waives: ruling a shipped PR fine with no
+  production evidence stays the user's.
 * **The two commands.** `waive` is the user ruling a PR fine. `requeue` watches it again
   with a fresh deadline.
 * **Its own brake.** By default Morpheus's session pauses with the fleet's `jarvis pause`.

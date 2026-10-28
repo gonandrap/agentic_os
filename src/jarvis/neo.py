@@ -198,6 +198,8 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         "cause": _escalation_cause(data.get("cause")),
         # A findings verdict's rating on the steward's scale
         "severity": str(data.get("severity") or "")[:20].strip().lower(),
+        # What a `validation` verdict asks the OS to do; that kind decides what it may be
+        "action": str(data.get("action") or "")[:20].strip().lower(),
     }
 
 
@@ -277,6 +279,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
     """Answer every queued question in FIFO order, back-to-back (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)"""
     answer = answer or answer_question
     results = []
+    reached = False
     for _ in range(max_questions):
         q = store.claim_next()
         if q is None:
@@ -319,6 +322,12 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
                 unreachable(q, str(e))
             results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
+        if not reached:
+            # A model replied, so the transport works: re-ask what an outage stranded, once per drain
+            reached = True
+            revived = store.revive_unreachable()
+            if revived:
+                log.info("neo answered again: re-queued unreachable question(s) %s", revived)
         if verdict["escalate"]:
             # Spec §2 of docs/superpowers/specs/2026-10-01-neo-observability.md
             store.mark(q["id"], "escalated", reason=verdict["reason"],

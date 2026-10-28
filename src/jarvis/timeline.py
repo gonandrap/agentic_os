@@ -754,6 +754,12 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == BACKGROUND_UNRESOLVED:
         return ("Backgrounded it again after being sent back — over to you",
                 f"{p.get('attempts')} attempts")
+    if kind == "pr_pending":
+        # Shown however the attention line ranks (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §7)
+        where = f" — open it at {p['compare_url']}" if p.get("compare_url") else ""
+        return ("Pushed, with no pull request yet",
+                f"`{p.get('branch') or 'its branch'}` against "
+                f"`{p.get('base') or 'the default branch'}`{where}")
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "marked_done":

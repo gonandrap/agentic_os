@@ -83,6 +83,23 @@ def serena_allow_rules() -> list[str]:
             for prefix in SERENA_TOOL_PREFIXES for tool in SERENA_READ_TOOLS]
 
 
+def opened_by_harness(project: ProjectSpec) -> bool:
+    launcher = project.worker.launcher
+    return bool(launcher is not None and launcher.open)
+
+
+def worker_tree(project: ProjectSpec, wo: dict[str, Any]) -> Path | None:
+    """The worktree this order's worker edits in, or None while a harness has yet to choose it"""
+    from .session_dispatch import harness_worktree_ok
+
+    recorded = wo.get("worktree")
+    if recorded and Path(str(recorded)).is_absolute():
+        return Path(str(recorded)) if harness_worktree_ok(project.path, recorded) else None
+    if opened_by_harness(project):
+        return None
+    return project.path / ".claude" / "worktrees" / wo["id"]
+
+
 #: Routes EVERY MCP call to the hook (#852)
 MCP_MATCHER = "mcp__.*"
 
@@ -126,12 +143,13 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
 
     # Declarative worker permissions: full edit rights inside its own worktree
     proj_abs = str(project.path).lstrip("/")
-    wt_abs = f"{proj_abs}/.claude/worktrees/{wo['id']}"
+    tree = worker_tree(project, wo)
+    wt_rules = ((f"Edit(//{str(tree).lstrip('/')}/**)",
+                 f"Write(//{str(tree).lstrip('/')}/**)",
+                 f"NotebookEdit(//{str(tree).lstrip('/')}/**)") if tree else ())
     allow = settings.setdefault("permissions", {}).setdefault("allow", [])
     for rule in (
-        f"Edit(//{wt_abs}/**)",
-        f"Write(//{wt_abs}/**)",
-        f"NotebookEdit(//{wt_abs}/**)",
+        *wt_rules,
         f"Read(//{proj_abs}/**)",
         # Read-only code navigation
         *(serena_allow_rules() if serena else ()),
@@ -156,8 +174,10 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     # ONE COPY OF THE PROJECT'S CLAUDE.md reaches the worker
     resolved = project.path.resolve() if project.path.exists() else project.path
     excludes = [str(p) for p in (settings.get("claudeMdExcludes") or [])]
-    for path in hooks.claude_md_excludes(
-            resolved, resolved / ".claude" / "worktrees" / wo["id"]):
+    tree_resolved = (None if tree is None
+                     else Path(tree).resolve() if Path(tree).is_absolute() and Path(tree).exists()
+                     else resolved / ".claude" / "worktrees" / wo["id"])
+    for path in (hooks.claude_md_excludes(resolved, tree_resolved) if tree_resolved else []):
         rel = path.relative_to(resolved)
         for root in dict.fromkeys((resolved, project.path)):
             if str(root / rel) not in excludes:
@@ -215,6 +235,8 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         hooks.TOOL_MANAGED_PATHS_ENV: _json.dumps(
             list(project.worktree.tool_managed_paths)),
     })
+    if opened_by_harness(project):
+        env[hooks.HARNESS_WORKTREE_ENV] = "1"
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1297,15 +1319,16 @@ def dispatch_work_order(
         central.touch_project(project.name)
         return store.get_work_order(wo["id"])
 
+    # `worktree` is written by `start` above, AFTER the row this `wo` was read from
+    tree = store.get_work_order(wo["id"]).get("worktree") or wo["id"]
     # THE CONTEXT LEDGER for the seq-1 dispatch turn
     if turn["seq"] == 1:
-        # `worktree` is written by `start` above, AFTER the row this `wo` was read from
-        context.record(store, project, {**wo, "worktree": wo["id"]}, turn, briefing,
+        context.record(store, project, {**wo, "worktree": tree}, turn, briefing,
                        knowledge=knowledge)
     store.clear_dispatch_attempts(wo["id"])
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {
-        "worktree": wo["id"],
+        "worktree": tree,
         "session_id": store.get_work_order(wo["id"])["session_id"],
         "turn": turn["seq"],
         "pid": turn["pid"],

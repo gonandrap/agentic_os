@@ -440,3 +440,23 @@ def test_a_running_turn_past_its_budget_is_stopped(bg_fleet, fake_claude, monkey
     assert [t["state"] for t in settled] == ["failed"]
     assert any(e["kind"] == "turn_budget_exhausted"
                for e in store.list_events(wo["id"], limit=50))
+
+
+def test_settling_waits_for_the_process_so_an_immediate_resume_cannot_fork(
+        bg_fleet, fake_claude, settle_turns, monkeypatch):
+    """The roster drops the pid before the process exits (fact 8): a bare stop let a resume fork"""
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    waited, bare = [], []
+    real_stop_bg = claude_cli.stop_bg
+    monkeypatch.setattr(claude_cli, "stop_bg",
+                        lambda short, wait=claude_cli.BG_STOP_WAIT_SECONDS:
+                        waited.append(short) or real_stop_bg(short, wait))
+    monkeypatch.setattr(claude_cli, "stop_session",
+                        lambda bg_id: bare.append(bg_id) or True)
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    bg_id = store.get_work_order(wo["id"])["bg_id"]
+    assert bg_id in waited
+    assert bg_id not in bare

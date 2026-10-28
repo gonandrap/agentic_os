@@ -44,6 +44,9 @@ def inbox_flag(project_path: Path, wo_id: str) -> Path:
 OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
 OBJECTION_HANDED_BACK_REASON = "the order delivered its result and the decision is yours"
 
+#: Branch pushed, no pull request yet; payload `Authored.record()` plus `was` (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §4)
+PR_PENDING_EVENT = "pr_pending"
+
 #: An OS-built prompt for this work order was past `claude_cli.MAX_OS_PROMPT_CHARS` (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 OS_PROMPT_REFUSED_EVENT = "os_prompt_refused"
 #: What settles one: the next OS call for this order that actually produced something
@@ -2011,20 +2014,22 @@ class ProjectStore:
                    **extra: Any) -> None:
         """Move a work order, and record the span (docs/superpowers/specs/2026-09-27-time-in-each-state.md)"""
         assert status in WO_STATUSES, status
-        was = self._status_of("work_orders", wo_id)
-        self.update_work_order(wo_id, status=status, **extra)
-        if was == status:
-            return
-        # ONE MOMENT for both rows: the span and the event are one transition
-        at = db.now()
-        self._record_span(wo_id, "wo", was, status, trigger, ts=at)
-        self.add_event(wo_id, "status", {"status": status}, ts=at)
-        # THE CHOKEPOINT, ENFORCED (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
-        tail = self.conn.execute(
-            "SELECT to_status FROM wo_state_spans WHERE order_id=? AND order_kind='wo' "
-            "ORDER BY ts DESC, id DESC LIMIT 1", (wo_id,)).fetchone()
-        assert tail is not None and tail["to_status"] == status, (
-            f"{wo_id} moved to {status!r} without a span beside it")
+        # ONE TRANSACTION for all three rows: a reader between them saw a span with no event (#1205)
+        with db.write_transaction(self.conn):
+            was = self._status_of("work_orders", wo_id)
+            self.update_work_order(wo_id, status=status, **extra)
+            if was == status:
+                return
+            # ONE MOMENT for both rows: the span and the event are one transition
+            at = db.now()
+            self._record_span(wo_id, "wo", was, status, trigger, ts=at)
+            self.add_event(wo_id, "status", {"status": status}, ts=at)
+            # THE CHOKEPOINT, ENFORCED (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
+            tail = self.conn.execute(
+                "SELECT to_status FROM wo_state_spans WHERE order_id=? AND "
+                "order_kind='wo' ORDER BY ts DESC, id DESC LIMIT 1", (wo_id,)).fetchone()
+            assert tail is not None and tail["to_status"] == status, (
+                f"{wo_id} moved to {status!r} without a span beside it")
 
     def _status_of(self, table: str, order_id: str) -> str:
         """The status an order is in right now, '' when the row is not there"""
@@ -2144,17 +2149,21 @@ class ProjectStore:
         self.update_work_order(wo_id, needs_attention=1, attention_reason=reason)
         self.add_event(wo_id, "attention", {"reason": reason})
 
+    def repair_while(self, order_id: str, status: str, repair: Callable[[], None], *,
+                     kind: str = "wo") -> bool:
+        """Apply an invariant repair only while the row is STILL in the status the checker derived from (#1205)"""
+        table = "work_orders" if kind == "wo" else "feature_orders"
+        with db.write_transaction(self.conn):
+            # An empty status is a derivation nothing can be guarded against
+            if not status or self._status_of(table, order_id) != status:
+                return False
+            repair()
+        return True
+
     def flag_attention_while(self, wo_id: str, reason: str, status: str) -> bool:
         """Flag only while the order is STILL in the status the caller derived from (#1205)"""
-        with db.write_transaction(self.conn):
-            cur = self.conn.execute(
-                "UPDATE work_orders SET needs_attention=1, attention_reason=?, "
-                "updated_at=? WHERE id=? AND status=?",
-                (reason, db.now(), wo_id, status))
-            if not cur.rowcount:
-                return False
-            self.add_event(wo_id, "attention", {"reason": reason})
-        return True
+        return self.repair_while(wo_id, status,
+                                 lambda: self.flag_attention(wo_id, reason))
 
     def clear_attention(self, wo_id: str) -> None:
         # The blocker is gone, so any ack against it is spent: if the same reason comes back later it is a...
@@ -2868,6 +2877,18 @@ class ProjectStore:
         since = float(parked[-1]["ts"])
         closed = any(float(e["ts"]) > since
                      for kind in ("finished", "abandoned", "release_completed")
+                     for e in self.events_of_kind(wo_id, kind))
+        return None if closed else db.from_json(parked[-1]["payload"], {})
+
+    def pr_pending_open(self, wo_id: str) -> dict[str, Any] | None:
+        """The open pushed-branch-no-pull-request park's payload, or None (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §4)"""
+        parked = self.events_of_kind(wo_id, PR_PENDING_EVENT)
+        if not parked:
+            return None
+        since = float(parked[-1]["ts"])
+        closed = any(float(e["ts"]) > since
+                     for kind in ("finished", "abandoned", "pr_url_recorded",
+                                  "pr_merged")
                      for e in self.events_of_kind(wo_id, kind))
         return None if closed else db.from_json(parked[-1]["payload"], {})
 

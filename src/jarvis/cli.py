@@ -949,6 +949,14 @@ def build_parser() -> argparse.ArgumentParser:
     dn.add_argument("wo_id")
     dn.add_argument("--project")
 
+    # docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §8
+    pr = wo.add_parser("pr", help="record the pull request you opened for a work order "
+                                  "whose branch is pushed — it goes back in the merge "
+                                  "queue and the OS watches it merge")
+    pr.add_argument("wo_id")
+    pr.add_argument("url")
+    pr.add_argument("--project")
+
     ak = wo.add_parser("ack", help="acknowledge a work order's attention flag — it "
                                    "stops asking for you in status and on the dashboard")
     ak.add_argument("wo_id", nargs="?")
@@ -3540,6 +3548,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.cancel(args.wo_id), args.json)
     elif args.wo_cmd == "done":
         _print(ops.mark_done(args.wo_id, project_name=args.project), args.json)
+    elif args.wo_cmd == "pr":
+        _print(ops.record_pull_request(args.wo_id, args.url,
+                                       project_name=args.project), args.json)
     elif args.wo_cmd == "ack":
         _print(ops.ack_attention(args.wo_id, all_projects=args.all,
                                  project_name=args.project), args.json)
@@ -4000,7 +4011,9 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
         print(f"{item['pr_url']}  release {item['release_tag'] or '—'}"
               f"  work order {item['wo_id'] or '—'}")
         print(f"checks {item['checks']} · last exit {item['last_exit']}"
-              f" · deadline {_stamp(item['deadline_ts'])}")
+              f" · deadline {_stamp(item['deadline_ts'])}"
+              + (f" · {item['auto_requeues']} automatic requeue(s)"
+                 if item.get("auto_requeues") else ""))
         if item["resolution"]:
             print(f"\n{item['resolution']}")
         print(f"\nhints:\n{item['hints'] or '(none)'}")

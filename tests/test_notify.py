@@ -141,3 +141,26 @@ def test_a_sink_called_directly_still_links(sent):
     """Validation needs a CentralStore"""
     notify.sink_telegram(item(), make_catalog())
     assert "<a href" in sent[0]["text"]
+
+
+# -- the desktop sink's binary
+
+
+def test_desktop_prefers_notify_send(monkeypatch):
+    monkeypatch.setattr(notify.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert notify.desktop_argv("T", "B") == ["notify-send", "T", "B"]
+
+
+def test_desktop_falls_back_to_osascript_on_a_mac(monkeypatch):
+    """Title and body ride in argv, so a quote in either cannot break the AppleScript"""
+    monkeypatch.setattr(notify.shutil, "which",
+                        lambda name: "/usr/bin/osascript" if name == "osascript" else None)
+    argv = notify.desktop_argv("Jarvis [p]", 'say "hi"')
+    assert argv[0] == "osascript"
+    assert argv[-2:] == ["Jarvis [p]", 'say "hi"']
+    assert all('"hi"' not in a for a in argv[1:-2])
+
+
+def test_desktop_with_neither_binary_says_so(monkeypatch):
+    monkeypatch.setattr(notify.shutil, "which", lambda name: None)
+    assert notify.desktop_argv("T", "B") is None

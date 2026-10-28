@@ -54,6 +54,10 @@ MAX_KILLS = 3
 KILL_HOLD_SECONDS = 6 * 3600
 #: How much of a script's output is kept
 OUTPUT_TAIL = 2000
+#: What a `validation` verdict may ask the OS to do — a waive stays the user's (issue #1254)
+VERDICT_ACTIONS = ("requeue",)
+#: How many times Neo's own verdict may put one item back on the watch list
+MAX_AUTO_REQUEUES = 1
 
 SECONDS_PER_DAY = 86400
 
@@ -333,14 +337,15 @@ def waive(central: CentralStore, item_id: str, reason: str) -> dict:
     return central.morpheus_item(item_id) or {}
 
 
-def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str) -> dict:
+def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str, *,
+            resolution: str = "") -> dict:
     """Watch it again with a fresh deadline (and a fresh action)"""
     item = _item_or_raise(central, item_id)
     now = db.now()
     central.update_morpheus_item(
         item_id, state="monitoring" if item["script"] else "queued",
         deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY,
-        next_check_ts=now if item["script"] else None, resolution="", action="",
+        next_check_ts=now if item["script"] else None, resolution=resolution, action="",
         action_ts=None)
     _forget_offer(central, item_id)
     return central.morpheus_item(item_id) or {}
@@ -382,7 +387,7 @@ def _cwd(cwd: CwdFor, item: dict[str, Any]) -> Path:
 def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd: CwdFor,
           *, now: float | None = None,
           run: Callable[[str, Path, int], CheckResult] = run_script) -> str:
-    """Run an item's script once and move it by the exit code alone; returns its state"""
+    """Run an item's script once and move it by the exit codes alone; returns its state"""
     now = db.now() if now is None else now
     result = run(item["script"], _cwd(cwd, item), cfg.script_timeout_seconds)
     fields: dict[str, Any] = {"last_check_ts": now, "checks": int(item["checks"]) + 1,
@@ -390,18 +395,24 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
                               "next_check_ts": now + cfg.check_every_minutes * 60}
     if result.exit == EXIT_VALIDATED:
         fields.update(state="validated", next_check_ts=None, resolution="script exited 0")
-    elif result.exit == EXIT_FAILED:
-        fields.update(state="failed", next_check_ts=None, resolution="script exited 1")
+    # One exit 1 may be the environment, not the PR, so `failed` needs a second in a row (#1255)
+    elif result.exit == EXIT_FAILED and item.get("last_exit") == EXIT_FAILED:
+        fields.update(state="failed", next_check_ts=None,
+                      resolution="script exited 1 twice in a row")
     elif now >= float(item["deadline_ts"]):
         fields.update(state="timedout", next_check_ts=None,
-                      resolution=_timeout_reason(item, cfg))
+                      resolution=_timeout_reason(item, cfg, result.exit))
     central.update_morpheus_item(item["id"], **fields)
     return str(fields.get("state", item["state"]))
 
 
-def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig) -> str:
+def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig,
+                    last_exit: int | None = None) -> str:
     if not item.get("script"):
         return f"no script was registered within {cfg.timeout_days:g} day(s)"
+    if last_exit == EXIT_FAILED:
+        return (f"one exit 1 within {cfg.timeout_days:g} day(s), "
+                "never confirmed by a second")
     return (f"no exit 0 or 1 within {cfg.timeout_days:g} day(s) "
             f"(last exit {item.get('last_exit')})")
 
@@ -443,7 +454,7 @@ def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
     if route == "investigate":
         inv_id, note = investigate(catalog, item)
         if inv_id:
-            action = f"investigation:{inv_id}"
+            action = f"{_action_kind(inv_id)}:{inv_id}"
             if central.claim_morpheus_action(item["id"], action):
                 central.add_inbox(
                     project=item.get("project") or _os_project(catalog), level="warning",
@@ -457,6 +468,11 @@ def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
     return action
 
 
+def _action_kind(order_id: str) -> str:
+    """An `io-` id is the improvement order a PR with no work order gets (#1253)"""
+    return "improvement" if order_id.startswith("io-") else "investigation"
+
+
 def _os_project(catalog: Catalog) -> str:
     from . import schedule
 
@@ -464,12 +480,12 @@ def _os_project(catalog: Catalog) -> str:
 
 
 def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
-    """(investigation id, '') or ('', why not) — through the steward, like every OS-filed order"""
+    """(order id, '') or ('', why not) — through the steward, like every OS-filed order"""
     from . import ops, steward
 
     wo_id = item.get("wo_id") or ""
     if not wo_id:
-        return "", "the PR names no work order to investigate"
+        return _improve(catalog, item)
     try:
         project, _path, _wo = ops.find_work_order(wo_id, item.get("project") or None)
     except Exception as e:  # noqa: BLE001
@@ -489,6 +505,26 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
     return str(inv["id"]), ""
 
 
+def _improve(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
+    """An investigation needs an order to investigate; a hand-opened PR is its own evidence (#1253)"""
+    from . import ops, steward
+
+    project = item.get("project") or _os_project(catalog)
+    title = f"PR #{item['pr_number']} {item['state']} production validation"
+    decision = steward.gate(
+        steward.Candidate("morpheus", "critical", project, title,
+                          evidence=(item.get("last_output") or item["resolution"],)),
+        catalog=catalog)
+    if not decision.allowed:
+        return "", f"the steward did not dispatch it ({decision.outcome}: {decision.reason})"
+    try:
+        io = ops.create_improvement_order(project, title, description=_why(item),
+                                          refs=(item["pr_url"],), origin="morpheus")
+    except Exception as e:  # noqa: BLE001 — Neo still gets the item
+        return "", f"the improvement order could not be filed ({e})"
+    return str(io["id"]), ""
+
+
 def _why(item: dict[str, Any]) -> str:
     """The facts Morpheus has, and nothing it does not: it ran a script and read an exit code"""
     return (f"Morpheus: PR #{item['pr_number']} ({item['pr_url']}) of project "
@@ -506,19 +542,33 @@ VALIDATION_QUESTION = """MORPHEUS — a shipped change has no passing production
 {why}
 
 Decide whether the user needs to look. If they do, ESCALATE and say what to look at. If
-not, answer in two sentences; the answer is recorded on the item and it stays {state}.
-They can re-watch it with `jarvis morpheus requeue {id}` or rule it fine with
-`jarvis morpheus waive {id} --reason "…"`."""
+not, answer in two sentences; the answer is recorded on the item.
+{actions}"""
+
+#: The item still has its automatic requeue
+REQUEUE_OFFER = """If the failure was transient — production had not exercised the change yet, a network or
+environment hiccup — add `"action": "requeue"` to your JSON and the OS watches it again
+with a fresh deadline. That is available ONCE per item, and this item still has it.
+Ruling the change fine is the USER'S: recommend `jarvis morpheus waive {id} --reason "…"`,
+never a waive of your own."""
+
+#: It has spent it, so saying `requeue` would only look like an action
+REQUEUE_SPENT = """This item has already spent its one automatic requeue, so `"action": "requeue"` is
+refused and it stays {state}. The user re-watches it with `jarvis morpheus requeue {id}`
+or rules it fine with `jarvis morpheus waive {id} --reason "…"`."""
 
 
 def _ask_neo(catalog: Catalog, item: dict[str, Any], note: str = "") -> int:
     from .neo_store import NeoStore
 
     why = _why(item) + (f"\n\nNo investigation was filed: {note}." if note else "")
+    spent = int(item.get("auto_requeues") or 0) >= MAX_AUTO_REQUEUES
+    offer = REQUEUE_SPENT if spent else REQUEUE_OFFER
+    actions = offer.format(id=item["id"], state=item["state"])
     neo = NeoStore()
     try:
         q = neo.ask(item.get("project") or _os_project(catalog), "",
-                    VALIDATION_QUESTION.format(why=why, state=item["state"], id=item["id"]),
+                    VALIDATION_QUESTION.format(why=why, actions=actions),
                     context=json.dumps({"morpheus_item": item["id"]}), kind="validation")
     finally:
         neo.close()
@@ -533,23 +583,39 @@ def item_of_question(q: dict[str, Any]) -> str:
         return ""
 
 
-def record_neo_verdict(central: CentralStore, q: dict[str, Any],
+def verdict_action(verdict: dict[str, Any]) -> str:
+    """What a `validation` verdict asks the OS to do, or '' for anything else it said"""
+    action = str(verdict.get("action") or "").strip().lower()
+    return action if action in VERDICT_ACTIONS else ""
+
+
+def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, Any],
                        verdict: dict[str, Any], question_url: str = "") -> None:
-    """Neo ruled on a `validation` question: record it, and tell the user what it means"""
+    """Neo ruled on a `validation` question: record it, act on it, and tell the user"""
     item_id = item_of_question(q)
     item = central.morpheus_item(item_id) if item_id else None
     if not item:
         log.warning("validation verdict for question %s names no item", q.get("id"))
         return
     reading = (verdict.get("answer") or verdict.get("reason") or "").strip()
-    central.update_morpheus_item(
-        item_id, resolution=f"{item['resolution']} — Neo: {reading[:600]}".strip(" —"))
+    resolution = f"{item['resolution']} — Neo: {reading[:600]}".strip(" —")
     escalated = bool(verdict.get("escalate"))
+    # The state guard catches the user waiving between the question and the verdict
+    requeued = (not escalated and verdict_action(verdict) == "requeue"
+                and item["state"] in ACTION_STATES
+                and central.claim_morpheus_auto_requeue(item_id, MAX_AUTO_REQUEUES))
+    if requeued:
+        requeue(central, cfg, item_id, resolution=f"re-watched by Neo: {resolution}")
+    else:
+        central.update_morpheus_item(item_id, resolution=resolution)
     central.add_inbox(
         project=q.get("project") or "os", level="warning" if escalated else "info",
         title=(f"PR #{item['pr_number']} {item['state']} production validation"
-               + (" — Neo escalated" if escalated else " — Neo's reading")),
+               + (" — Neo escalated" if escalated else
+                  " — Neo is watching it again" if requeued else " — Neo's reading")),
         body=f"{item['pr_url']}\n{reading[:600]}\n"
+             + ("the OS is validating it again — its one automatic requeue is now spent\n"
+                if requeued else "")
              + (f"{question_url}\n" if question_url else "")
              + f"jarvis morpheus show {item_id}")
 
@@ -571,8 +637,14 @@ For each item you are given, spawn ONE subagent (Task tool), in parallel. Each s
      - runs from the project's production directory, the one given with the item;
      - is READ-ONLY: it inspects production (CLIs with --json, logs, `systemctl --user
        status`, `gh` reads, HTTP GETs) and never changes anything;
-     - exits 0 when production shows the change working, 1 when it shows it not working,
-       and any other code (use 75) when production has not exercised it yet;
+     - exits 0 when production shows the change working;
+     - exits 1 ONLY when production shows THIS PR's own failure signature — the exact
+       symptom the PR fixed, happening again. Anything the PR does not own is NOT a
+       failure: a command that errored, an endpoint that was unreachable, a missing
+       file, a reading stale for its own reason. Those exit 75, and so does every
+       check that could not read what it needed to judge;
+     - exits 75 for everything else, including production not having exercised the
+       change yet;
      - finishes in well under a minute;
   3. registers it: `jarvis morpheus script <item id> --file /tmp/morpheus-<item id>.sh`.
 If the hints cannot be made mechanical, the subagent registers a script that exits 75 and

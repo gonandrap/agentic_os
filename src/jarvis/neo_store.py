@@ -77,6 +77,12 @@ STALE_ANSWERING_SECONDS = 900
 # How many times a question may be returned to the queue before it is given up on
 MAX_ANSWER_ATTEMPTS = 3
 
+#: How many times one transport-failed question is put back in the queue after Neo answered again
+MAX_REVIVALS = 2
+
+#: Kinds a revival may re-ask: no worker behind them, so a late answer reaches no one stale
+REVIVABLE_KINDS = ("validation", "triage")
+
 #: `answer_reason` on a question nobody could put to a model (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)
 UNREACHABLE_PREFIX = "neo could not be reached: "
 
@@ -164,6 +170,8 @@ ADDED_COLUMNS = {
         "digest": "TEXT",
         # Why this escalation happened — §1 of docs/superpowers/specs/2026-10-01-neo-observability.md
         "escalation_cause": "TEXT",
+        # How many times `revive_unreachable` re-queued it
+        "revivals": "INTEGER NOT NULL DEFAULT 0",
     },
     "learnings": {
         "seat": "TEXT NOT NULL DEFAULT ''",
@@ -311,6 +319,19 @@ class NeoStore:
             "retry_after=?, answer_reason=? WHERE id=?",
             (db.now() + retry_delay(attempts), reason, question_id))
         return "queued"
+
+    def revive_unreachable(self, kinds: tuple[str, ...] = REVIVABLE_KINDS,
+                           max_revivals: int = MAX_REVIVALS) -> list[int]:
+        """Re-queue the questions an outage gave up on — call it only once Neo has answered again"""
+        placeholders = ",".join("?" * len(kinds))
+        return [int(r["id"]) for r in self.conn.execute(
+            f"""UPDATE questions
+                   SET status='queued', attempts=0, claimed_at=NULL, retry_after=NULL,
+                       escalation_cause=NULL, revivals=revivals+1
+                 WHERE status='failed' AND escalation_cause='transport-unreachable'
+                   AND kind IN ({placeholders}) AND revivals < ?
+             RETURNING id""",
+            (*kinds, max_revivals)).fetchall()]
 
     def record_answer(self, question_id: int, answer: str, answered_by: str = "neo",
                       reason: str = "") -> None:

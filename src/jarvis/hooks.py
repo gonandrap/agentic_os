@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -730,6 +731,39 @@ def long_foreground_decision(payload: dict[str, Any],
     return _deny(f"{_LONG_SHELL_ADVICE[arm]} {_LONG_WHY}")
 
 
+#: Set in a worker's settings when a harness chose the worktree its session runs in
+HARNESS_WORKTREE_ENV = "JARVIS_HARNESS_WORKTREE"
+
+
+def in_worker_worktree(cwd: str, env: dict[str, str]) -> bool:
+    """Is this cwd the worker's own worktree, in Jarvis's layout or a harness's"""
+    if "/.claude/worktrees/" in cwd:
+        return True
+    root = env.get("JARVIS_PROJECT_PATH")
+    wo_id = env.get("JARVIS_WO_ID")
+    if not (cwd and root and wo_id and env.get(HARNESS_WORKTREE_ENV) == "1"
+            and (Path(root) / ".jarvis").is_dir()):
+        return False
+    # Bound to the worktree recorded for THIS order; none recorded yet fails closed
+    try:
+        store = ProjectStore(Path(root))
+        try:
+            recorded = str(store.get_work_order(wo_id).get("worktree") or "")
+        finally:
+            store.close()
+    except (KeyError, OSError, sqlite3.Error):
+        return False
+    from .session_dispatch import harness_worktree_ok
+
+    if not harness_worktree_ok(Path(root), recorded):
+        return False
+    try:
+        Path(cwd).resolve().relative_to(Path(recorded).resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def crew_edit_decision(payload: dict[str, Any],
                        env: dict[str, str]) -> dict[str, Any] | None:
     """Refuse the LEAD's own file edits, so the delegation is a control and not prose (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)"""
@@ -740,7 +774,7 @@ def crew_edit_decision(payload: dict[str, Any],
     if env.get(WO_KIND_ENV) != "worker" or env.get(REQUIRE_CREW_ENV) != "1":
         return None
     cwd = payload.get("cwd") or ""
-    if "/.claude/worktrees/" not in cwd:
+    if not in_worker_worktree(cwd, env):
         return None
     tool_input = payload.get("tool_input") or {}
     file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
@@ -1176,7 +1210,8 @@ def py_nav_decision(payload: dict[str, Any],
     cwd = payload.get("cwd") or ""
     if not cwd:
         return None
-    root = find_project_root(Path(cwd))
+    root_env = env.get("JARVIS_PROJECT_PATH")
+    root = Path(root_env) if root_env else find_project_root(Path(cwd))
     if root is None or not (root / ".serena" / "project.yml").exists():
         return None
     tool_input = payload.get("tool_input") or {}
@@ -1794,7 +1829,7 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
             return shapeless
         cwd = payload.get("cwd") or ""
         file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
-        if cwd and "/.claude/worktrees/" in cwd:
+        if cwd and in_worker_worktree(cwd, env):
             try:
                 Path(file_path).resolve().relative_to(Path(cwd).resolve())
             except ValueError:
@@ -2397,8 +2432,9 @@ def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore
 
     # Both conditions, in this order: the cheap text test first (hooks.py:441)
     worktree = wo.get("worktree")
-    if not worktree or "/.claude/worktrees/" not in str(cwd):
+    if not worktree or not in_worker_worktree(str(cwd), env):
         return
+    # A harness worktree is recorded as an absolute path, which this join returns unchanged
     expected = root / ".claude" / "worktrees" / str(worktree)
     try:
         if cwd.resolve() != expected.resolve():

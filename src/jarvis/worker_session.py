@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import background, budget, claude_cli, context, systemd_units, usage
+from . import (background, budget, claude_cli, context, session_dispatch, systemd_units,
+               usage)
 from .catalog import ProjectSpec
 from .project_store import (COMPACT_TURN, COST_FROM_TRANSCRIPT, TERMINAL_STATUSES,
                             ProjectStore)
@@ -490,10 +491,15 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     errfile = tdir / f"{turn['seq']}.err"
     store.conn.execute("UPDATE wo_turns SET outfile=?, errfile=? WHERE id=?",
                        (str(outfile), str(errfile), turn["id"]))
+    background = is_background(wo)
+    launch = session_dispatch.for_work_order(
+        project, wo, resume=resume,
+        transport=(claude_cli.TRANSPORT_BACKGROUND if background
+                   else claude_cli.TRANSPORT_HEADLESS))
     try:
-        if is_background(wo):
+        if background:
             wo = _launch_bg(store, wo, prompt, cwd, resume, worktree,
-                            outfile.with_suffix(".prompt"), briefing)
+                            outfile.with_suffix(".prompt"), briefing, launch)
             spawned = claude_cli.SpawnedTurn(pid=None)
         else:
             spawned = claude_cli.spawn_turn(
@@ -508,6 +514,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
                 cache=cache_ttl_env(arm),
                 name=worker_name(wo),
                 worktree=worktree,
+                launch=launch,
                 **briefing,
             )
     except claude_cli.ClaudeCliError as e:
@@ -542,12 +549,13 @@ def is_background(wo: dict[str, Any]) -> bool:
 
 def _launch_bg(store: ProjectStore, wo: dict[str, Any], prompt: str, cwd: Path,
                resume: bool, worktree: str | None, promptfile: Path,
-               briefing: dict[str, Any]) -> dict[str, Any]:
+               briefing: dict[str, Any],
+               launch: session_dispatch.Launch | None = None) -> dict[str, Any]:
     """One prompt into the order's background session — the first opens it (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
     if resume:
         # The briefing rides on the session's saved options and the settings file `briefing_for` rewrote
         entry = claude_cli.resume_bg_turn(wo["session_id"], prompt, cwd,
-                                          promptfile=promptfile)
+                                          promptfile=promptfile, launch=launch)
         if wo.get("bg_id") != entry.id:
             # A revived order: its session was removed when it closed, and the resume restored it
             store.update_work_order(wo["id"], bg_id=entry.id)
@@ -556,8 +564,25 @@ def _launch_bg(store: ProjectStore, wo: dict[str, Any], prompt: str, cwd: Path,
     if wo.get("bg_id"):
         # A session that never wrote a word: retire it rather than leave two
         claude_cli.stop_session(wo["bg_id"])
+    if launch is not None and launch.opens_by_template:
+        inject = session_dispatch.write_inject_dir(
+            launch.project_path / ".jarvis" / "inject" / wo["id"], briefing)
+        entry = claude_cli.spawn_bg_open(
+            launch.open_argv(prompt=claude_cli._bg_prompt(prompt, promptfile),
+                             briefing={**briefing, "inject_dir": inject}),
+            cwd, env=launch.env())
+        # The session manager chose the worktree; every later turn resumes inside it
+        tree = entry.cwd
+        if not tree or not session_dispatch.harness_worktree_ok(launch.project_path, tree):
+            claude_cli.stop_session(entry.id)
+            raise claude_cli.ClaudeCliError(
+                f"session {entry.id} opened outside a worktree of the project "
+                f"({tree or 'no cwd reported'}); refusing to bind the order to it")
+        store.update_work_order(wo["id"], session_id=entry.session_id, bg_id=entry.id,
+                                worktree=tree)
+        return {**wo, "session_id": entry.session_id, "bg_id": entry.id, "worktree": tree}
     entry = claude_cli.spawn_bg_turn(prompt, cwd, _worker_name(wo), worktree=worktree,
-                                     promptfile=promptfile, **briefing)
+                                     promptfile=promptfile, launch=launch, **briefing)
     store.update_work_order(wo["id"], session_id=entry.session_id, bg_id=entry.id)
     return {**wo, "session_id": entry.session_id, "bg_id": entry.id}
 
@@ -896,8 +921,8 @@ def _reap_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
                                        num_turns=(envelope or {}).get("api_calls"),
                                        usage=envelope)
     if entry is not None and entry.alive and budget_cap is None:
-        # Settled and idle: its process holds nothing, and the next prompt restarts it anyway
-        claude_cli.stop_session(entry.id)
+        # Settled and idle; WAIT for the process, or a resume right after forks a copy (fact 8)
+        claude_cli.stop_bg(entry.id)
     return _settle_result(store, turn, result, project_name)
 
 

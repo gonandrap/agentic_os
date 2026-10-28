@@ -71,6 +71,33 @@ enforces the cap (`_bg_over_budget`, every `BG_BUDGET_EVERY`). `jarvis wo respaw
 (the shared `catalog_file` fixture PINS headless; the fake models `--bg` only for `-n`,
 never for the legacy `--name` path).
 
+## Session dispatch: a project's own launcher (spec `docs/superpowers/specs/2026-10-22-session-dispatch.md`)
+
+Catalog `worker.launcher` (path | list | `{command, env}`, parsed by
+`session_dispatch.parse_launcher`) names a LOCAL script that launches the project's
+sessions instead of bare `claude` (e.g. agentic-env behind `claude-ase`).
+`worker_session._launch` builds a `session_dispatch.Launch` per turn and passes
+`launch=` to `spawn_bg_turn` / `resume_bg_turn` / `spawn_turn`; `claude_cli._run` runs
+`launch.argv(args)` + `launch.env()` (`JARVIS_REAL_CLAUDE`, `JARVIS_LAUNCH_*`). Only
+LAUNCHES go through it — `agents`, `stop`, `rm`, `respawn`, Neo stay on the real CLI.
+Contract: exec `$JARVIS_REAL_CLAUDE "$@"`, add nothing on a bg resume (forks a copy),
+no cwd change, no stdout before exec. `INV-LAUNCHER-RUNNABLE` in `check_catalog`.
+Tests: `tests/test_session_dispatch.py`.
+
+TEMPLATE mode `launcher.open` (session managers: `claude-jarvis start @jarvis --model {model}
+--compact-pct {compact_pct} --prompt {prompt} {wo_name}`): bg transport only; turn 1 runs
+the filled template (`claude_cli.spawn_bg_open`, id off its `backgrounded · <id>` stdout),
+the roster `cwd` is stored as the order's `worktree` as an ABSOLUTE path (every
+`<project>/.claude/worktrees/<wt>` join collapses to it); later turns resume bare there.
+`{wo_name}` strips non-alnum (claude-shining rule). Measured live 2.1.309: the CALLER'S ENV
+DOES NOT REACH a `--bg` session; worker settings reach it via `--inject {inject_dir}`:
+`session_dispatch.write_inject_dir` → `.jarvis/inject/<wo>/` (settings-fragment.json =
+worker settings, context.md = append_system_prompt, skills/, agents/), which claude-shining
+layers into the env's settings.local.json (objects merge, lists union, env scalars win;
+agentic-env branch gonzaloraposo-bc/injectSettingsMerge). Verified live: Jarvis env+hooks
+AND harness env+hooks all fire. Not carried: --agent, --effort, --permission-mode. Settle now `stop_bg`s (waits for the
+process): a bare `stop_session` let an immediate resume fork a copy (fact 8).
+
 ## The headless transport (replaced background sessions 2026-08-01; the fallback since 2026-10-22)
 
 **Read `src/jarvis/worker_session.py`'s module docstring first — it is the layer, and it

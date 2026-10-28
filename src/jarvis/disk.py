@@ -59,6 +59,8 @@ def _reclaim_one(project_path: Path,
                  row: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
     """(the event payload for a checkout that is gone now, "") or (None, why it was kept)"""
     name = str(row["worktree"])
+    if Path(name).is_absolute():
+        return None, "a launcher harness opened it, and the harness removes its own worktree"
     path = project_path / ".claude" / "worktrees" / name
     if not path.exists():
         return {"worktree": name, "removed": False, "why": "already gone"}, ""

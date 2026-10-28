@@ -487,7 +487,7 @@ def _make_repo(tmp_path: Path) -> Path:
 _STUB_UV = """#!/bin/sh
 if [ "$1" = "lock" ]; then
   v=$(grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\\1/')
-  sed -i -E '/^name = "jarvis-os"$/{n;s/^version = "[^"]+"$/version = "'"$v"'"/;}' uv.lock
+  awk -v v="$v" 'prev && /^version = / { sub(/"[^"]+"/, "\\"" v "\\"") } { prev = ($0 == "name = \\"jarvis-os\\""); print }' uv.lock > uv.lock.new && mv uv.lock.new uv.lock
 fi
 exit 0
 """
