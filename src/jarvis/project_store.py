@@ -431,6 +431,9 @@ ISSUE_LINK_KINDS = ("cited", "assigned", "raised")
 #: One reclaim of a settled order's checkout — also what `settled_worktrees` excludes on (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md)
 WORKTREE_RECLAIMED_EVENT = "worktree_reclaimed"
 
+#: Why `claude rm` would not take a closed order's session — written once per refusal (#1257)
+SESSION_KEPT_EVENT = "background_session_kept"
+
 #: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
 MAX_PER_SWEEP_ROWS = 50
 

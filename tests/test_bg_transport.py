@@ -129,7 +129,7 @@ def test_the_fake_writes_a_transcript_jarvis_can_price(fake_claude, tmp_path):
 
 # -- a work order's conversation, end to end on the background transport
 
-from jarvis import ops, worker_session  # noqa: E402
+from jarvis import invariants, ops, worker_session  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
 
@@ -367,6 +367,62 @@ def test_a_closed_order_loses_its_session_once(bg_fleet, fake_claude, settle_tur
     calls = len(fake_claude.calls)
     worker_session.poll(store)
     assert len(fake_claude.calls) == calls
+
+
+def _worktree_bg_wo(bg_fleet, settle_turns, leftovers: dict[str, str]):
+    """A settled order whose worktree holds `leftovers` (path -> text), uncommitted (#1257)"""
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    wo = _bg_wo(bg_fleet)
+    tree = project.path / ".claude" / "worktrees" / wo["id"]
+    subprocess.run(["git", "worktree", "add", "-q", "-b", f"b-{wo['id']}", str(tree)],
+                   cwd=project.path, check=True)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+    for rel, text in leftovers.items():
+        path = tree / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return store.get_work_order(wo["id"]), tree
+
+
+def test_an_untracked_build_cache_does_not_keep_a_closed_order_session(
+        bg_fleet, fake_claude, settle_turns):
+    """What `pytest` left behind is regenerable, and `claude rm` kept the session for it (#1257)"""
+    store = bg_fleet["store"]
+    wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {
+        "__pycache__/app.cpython-313.pyc": "x",
+        "tests/__pycache__/test_app.cpython-313.pyc": "x",
+    })
+    store.set_status(wo["id"], "completed")
+
+    worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] is None
+    assert wo["session_id"] not in claude_cli.bg_roster()
+    assert not (tree / "__pycache__").exists()
+
+
+def test_a_session_kept_over_real_work_is_recorded_once(bg_fleet, fake_claude,
+                                                        settle_turns, caplog):
+    """An untracked SOURCE file is not regenerable: the refusal is said once, not every tick (#1257)"""
+    store = bg_fleet["store"]
+    wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {"notes.md": "unsaved work\n"})
+    store.set_status(wo["id"], "completed")
+
+    with caplog.at_level("WARNING"):
+        worker_session.poll(store)
+        worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] == wo["bg_id"]
+    assert (tree / "notes.md").exists()
+    kept = [e for e in store.list_events(wo["id"])
+            if e["kind"] == "background_session_kept"]
+    assert len(kept) == 1
+    assert "uncommitted changes" in json.loads(kept[0]["payload"])["refusal"]
+    assert len([r for r in caplog.records if "kept" in r.getMessage()]) == 1
+    # …and it is surfaced for as long as it lasts
+    assert [v.invariant for v in invariants.check_closed_session_removed(store)] == [
+        "INV-SESSION-KEPT"]
 
 
 def test_a_failed_order_keeps_its_session(bg_fleet, fake_claude, settle_turns):
