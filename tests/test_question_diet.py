@@ -103,7 +103,7 @@ def test_plan_reviewer_persona_no_longer_judges_text_it_does_not_receive():
 
 
 def test_the_persona_describes_the_outline_the_question_actually_carries():
-    """Q1880: the question carries the spec's heading outline, so the persona must not promise spec text or a truncation marker that can no longer appear"""
+    """Q1880: the question carries the spec's heading outline"""
     assert "HEADING OUTLINE" in plans.PLAN_REVIEWER_PERSONA
     assert "TRUNCATED" not in plans.PLAN_REVIEWER_PERSONA
 
@@ -215,14 +215,13 @@ def test_unreferenced_docs_are_the_md_paths_no_reference_covers():
     assert sections.unreferenced_docs(covered) == []
     bare = "I read docs/superpowers/specs/exporter.md and went with CSV."
     assert sections.unreferenced_docs(bare) == ["docs/superpowers/specs/exporter.md"]
-    # Only markdown, and only once per path.
+    # Only markdown, and only once per path
     assert sections.unreferenced_docs("edited src/jarvis/ops.py and tests/t.py") == []
     assert sections.unreferenced_docs("a.md, a.md and b.md") == ["a.md", "b.md"]
 
 
 def test_heading_outline_is_every_heading_line_and_nothing_else():
-    """Neo ruling Q1880: a structural fingerprint for plan review. Same matcher
-    (`HEADING_RE`) as `find_heading`, so the outline and a resolved section agree."""
+    """Neo ruling Q1880: a structural fingerprint for plan review"""
     outline = sections.heading_outline(DESIGN_DOC)
 
     assert outline[:3] == ["# Exporter design", "## 1. Shape", "## 2. Data model"]
@@ -286,11 +285,7 @@ def test_a_referenced_section_reaches_neo_and_the_rest_of_the_doc_does_not(
     assert "union of keys" not in q["context"]  # the rest of the doc stayed home
 
 
-# -- one section, resolved or refused, for BOTH verbs ----------------------------------
-#
-# User decision 2026-10-14 (Neo learning #102): Neo never receives a full spec, only a
-# pointer to ONE specific section resolved to that section's text. A reference that does
-# not resolve is a REFUSAL, never a note in the context and never the whole file.
+# -- one section, resolved or refused, for BOTH verbs
 
 
 def _doc(project):
@@ -303,7 +298,7 @@ def _doc(project):
 def _nothing_recorded(project, wo_id):
     neo = NeoStore()
     try:
-        assert neo.get(1) is None
+        assert [q for q in neo.list_questions() if q["wo_id"] == wo_id] == []
     finally:
         neo.close()
     store = ProjectStore(project)
@@ -311,7 +306,7 @@ def _nothing_recorded(project, wo_id):
         assert store.all_assumptions(wo_id) == []
     finally:
         store.close()
-    # Spec invariant 2: a refused reference writes NOTHING, ASSUMPTIONS.md included.
+    # Spec invariant 2: a refused reference writes NOTHING, ASSUMPTIONS.md included
     md = project / "ASSUMPTIONS.md"
     assert not md.is_file() or wo_id not in md.read_text()
 
@@ -322,8 +317,7 @@ def _both_verbs(wo_id):
 
 
 def test_an_unresolvable_reference_is_refused_in_both_verbs(dispatched, project):
-    """The file is missing, or the heading is. Either way the asker is told which, and
-    nothing is recorded: a silently dropped reference is a question argued from nothing."""
+    """The file is missing, or the heading is"""
     daemon, wo = dispatched
     _doc(project)
 
@@ -355,8 +349,7 @@ TWO_REFS = ('Errors raise per section 3 of design doc '
 
 
 def test_two_cited_sections_both_resolve_in_both_verbs(dispatched, project):
-    """Neo ruling Q1883: NO cardinality cap. `validation.assumption_spec_chars` bounds the
-    text, never a count of sections."""
+    """Neo ruling Q1883: NO cardinality cap"""
     daemon, wo = dispatched
     _doc(project)
 
@@ -366,9 +359,7 @@ def test_two_cited_sections_both_resolve_in_both_verbs(dispatched, project):
 
 def test_assume_stores_every_cited_section_under_one_labelled_snapshot(dispatched,
                                                                       project):
-    """Q1883 + user decision 2026-10-15: three columns, N sections. Each body preceded by
-    its own `<path> § <which>:` line; the pointer columns are parallel newline lists of
-    ALL N, never the first alone."""
+    """Q1883 + user decision 2026-10-15: three columns, N sections"""
     daemon, wo = dispatched
     _doc(project)
 
@@ -389,8 +380,7 @@ def test_assume_stores_every_cited_section_under_one_labelled_snapshot(dispatche
 
 
 def test_assume_resolves_the_section_once_and_stores_the_snapshot(dispatched, project):
-    """kn-924730d7: the worker's worktree is gone by the time the review packet is built,
-    so the pointer is resolved HERE and the section stored on the row."""
+    """kn-924730d7: the worker's worktree is gone by the time the review packet is built"""
     daemon, wo = dispatched
     _doc(project)
 
@@ -423,14 +413,152 @@ def test_an_assumption_with_no_reference_at_all_is_recorded_as_before(dispatched
     assert (row["spec_path"], row["spec_which"], row["spec_text"]) == (None, None, None)
 
 
-# -- ONE TOTAL budget over every cited section (spec invariant 1 on the `ask` path) ----
+# -- one decision per record (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md)
+
+
+def test_an_over_cap_assumption_is_refused_and_told_to_split(dispatched, project):
+    """Test 1: nothing recorded — no row, no ASSUMPTIONS.md append"""
+    daemon, wo = dispatched
+
+    with pytest.raises(ops.OpsError, match="(?i)split") as caught:
+        ops.assume(wo["id"], "z" * 1200)
+
+    msg = str(caught.value)
+    assert "1200 characters" in msg and "1000" in msg
+    assert "jarvis wo assume" in msg
+    _nothing_recorded(project, wo["id"])
+
+
+def test_an_over_cap_question_is_refused_with_the_split_and_reference_hint(dispatched,
+                                                                          project):
+    """Test 2"""
+    daemon, wo = dispatched
+
+    with pytest.raises(ops.OpsError, match="(?i)split") as caught:
+        ops.ask_question(wo["id"], "z" * 2500)
+
+    msg = str(caught.value)
+    assert "2500 characters" in msg and "2000" in msg
+    assert "Q" in msg
+    _nothing_recorded(project, wo["id"])
+
+
+def test_a_project_override_of_each_cap_is_honoured_and_zero_switches_it_off(
+        dispatched, project, catalog_file):
+    """Test 3: the ops-side check reads the project's own `concision` block"""
+    import json
+
+    daemon, wo = dispatched
+    document = json.loads(catalog_file.read_text())
+    document["projects"][0]["concision"] = {"assume_max_chars": 200,
+                                            "question_max_chars": 300}
+    catalog_file.write_text(json.dumps(document))
+
+    with pytest.raises(ops.OpsError, match="the cap is 200"):
+        ops.assume(wo["id"], "z" * 250)
+    with pytest.raises(ops.OpsError, match="the cap is 300"):
+        ops.ask_question(wo["id"], "z" * 350)
+
+    document["projects"][0]["concision"] = {"assume_max_chars": 0,
+                                            "question_max_chars": 0}
+    catalog_file.write_text(json.dumps(document))
+
+    ops.assume(wo["id"], "z" * 2500)
+    ops.ask_question(wo["id"], "z" * 2500)
+
+
+# -- in-text references, keyword-anchored (spec §4)
+
+
+def _asked(wo_id: str, question: str) -> int:
+    """One question on this order, left unanswered"""
+    return ops.ask_question(wo_id, question)["question_id"]
+
+
+def _answer(qid: int, answer: str = "the user said: keep the shim") -> None:
+    neo = NeoStore()
+    try:
+        neo.record_answer(qid, answer, answered_by="user")
+    finally:
+        neo.close()
+
+
+def test_a_cited_earlier_question_reaches_neo_on_the_ask_path(dispatched, project):
+    """Test 4, `ask` half: `jarvis wo ask` resolved no reference at all before this"""
+    daemon, wo = dispatched
+    qid = _asked(wo["id"], "CSV or JSON by default?")
+    _answer(qid)
+
+    ops.ask_question(wo["id"], f"Per Q{qid}, should the header be written too?")
+
+    neo = NeoStore()
+    try:
+        context = neo.get(qid + 1)["context"]
+    finally:
+        neo.close()
+    assert f"Q{qid}" in context
+    assert "the user said: keep the shim" in context
+
+
+def test_an_unknown_or_foreign_reference_is_refused_in_both_verbs(dispatched, project):
+    """Test 6: nothing recorded in either verb"""
+    daemon, wo = dispatched
+    other = ops.create_work_order("proj_a", "another order")
+    daemon.tick()
+    foreign = _asked(other["id"], "what encoding?")
+
+    for verb in _both_verbs(wo["id"]):
+        with pytest.raises(ops.OpsError, match="no such question"):
+            verb("Per Q4242, kept the shim.")
+        with pytest.raises(ops.OpsError, match="another work order"):
+            verb(f"Per Q{foreign}, kept the shim.")
+        with pytest.raises(ops.OpsError, match="no assumption #7"):
+            verb("Per assumption #7, kept the shim.")
+    _nothing_recorded(project, wo["id"])
+
+
+def test_an_issue_or_pr_number_in_the_body_is_not_a_reference(dispatched, project):
+    """Test 7: a BARE `#n` matches nothing, or every body naming an issue would be refused"""
+    daemon, wo = dispatched
+
+    for verb in _both_verbs(wo["id"]):
+        verb("Followed issue #832 and PR #1090, and #7 of the checklist.")
+
+
+def test_a_question_asked_on_this_order_but_unanswered_is_accepted(dispatched, project):
+    """Test 8"""
+    daemon, wo = dispatched
+    qid = _asked(wo["id"], "CSV or JSON by default?")
+
+    ops.assume(wo["id"], f"Per Q{qid}, wrote the header.")
+    ops.ask_question(wo["id"], f"Per Q{qid}, should the footer go too?")
+
+    neo = NeoStore()
+    try:
+        context = neo.get(qid + 1)["context"]
+    finally:
+        neo.close()
+    assert "asked on this order, not answered" in context
+
+
+def test_a_cited_sibling_assumption_is_accepted_on_both_verbs(dispatched, project):
+    """Test 5's write half: the sibling is order-scoped, so `#2` resolves off this order"""
+    daemon, wo = dispatched
+    ops.assume(wo["id"], "wrote the header")
+    ops.assume(wo["id"], "and quoted every field")
+
+    for verb in _both_verbs(wo["id"]):
+        verb("Per assumptions 1 and 2, the exporter stays as it is.")
+
+
+# -- ONE TOTAL budget over every cited section (spec invariant 1 on the `ask` path)
 
 
 UNCITED = "THE-UNCITED-SENTENCE, which nobody asked about."
 
 
 def _doc_of_six(project):
-    """A document whose every section is big, so citing them all would deliver it whole."""
+    """A document whose every section is big, so citing them all would deliver it whole"""
     body = f"# Design\n\n{UNCITED}\n"
     for n, letter in enumerate("abcdef", start=1):
         body += f"\n## {n}. Part {letter}\n\n{letter * 3000}\n"
@@ -441,9 +569,7 @@ def _doc_of_six(project):
 
 
 def test_ask_cannot_emit_a_whole_spec_file_even_citing_every_section(dispatched, project):
-    """Sibling of `test_autoreview.py::test_no_question_builder_can_emit_a_whole_spec_file`
-    for the `ask` verb: `ops.SECTION_SNAPSHOT_CHARS` is a TOTAL over all resolved sections,
-    so every heading cited still cannot carry the document."""
+    """Sibling of `test_autoreview.py::test_no_question_builder_can_emit_a_whole_spec_file` for the `ask`..."""
     daemon, wo = dispatched
     _, body = _doc_of_six(project)
     text = " and ".join(
@@ -465,8 +591,7 @@ def test_ask_cannot_emit_a_whole_spec_file_even_citing_every_section(dispatched,
 
 
 def test_ask_water_fills_so_a_short_section_donates_to_a_long_one(dispatched, project):
-    """Neo ruling Q1884 generalised to N: equal share is a FLOOR, a shorter section donates
-    its remainder, only oversized sections are trimmed."""
+    """Neo ruling Q1884 generalised to N: equal share is a FLOOR"""
     daemon, wo = dispatched
     doc = project / "docs" / "superpowers" / "specs" / "two.md"
     doc.parent.mkdir(parents=True, exist_ok=True)

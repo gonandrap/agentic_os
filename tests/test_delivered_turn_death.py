@@ -136,7 +136,7 @@ def test_the_feature_stays_executing_and_the_child_is_not_dead(started, store):
 
     assert store.get_feature_order(fo["id"])["status"] == "executing"
     assert invariants.dead_feature_children(
-        store, store.feature_children(fo["id"])) == []
+        store, store.feature_children(fo["id"], kinds=("worker",))) == []
     assert store.get_work_order(sibling["id"])["status"] == "pending"
 
 
@@ -148,7 +148,7 @@ def test_a_failed_child_without_the_event_still_fails_its_feature(started, store
     store.set_status(child["id"], "failed")
 
     assert [c["id"] for c in invariants.dead_feature_children(
-        store, store.feature_children(fo["id"]))] == [child["id"]]
+        store, store.feature_children(fo["id"], kinds=("worker",)))] == [child["id"]]
 
     tick(started, store)
 

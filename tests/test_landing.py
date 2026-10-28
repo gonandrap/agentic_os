@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import landing
+from jarvis import landing, project_store
 from jarvis.testing import make_git_project
 
 WO = "wo-abc12345"
@@ -98,12 +98,172 @@ def test_uncommitted_work_counts_as_produced_and_a_clean_tree_does_not(repo):
     assert "src/never_added.py" in produced.dirty   # ...and it still counts
 
 
+@pytest.mark.parametrize("kind", project_store.WO_KINDS)
+def test_a_kinds_own_artifact_is_never_stranded_work(repo, kind):
+    """io-b521d17b: each worktree built WITH the file its kind's contract command consumes"""
+    wo = {"id": f"wo-{kind}", "kind": kind}
+    artifacts = project_store.submission_artifacts(wo)
+    wt = repo.worktree(wo["id"])
+    for name in artifacts:
+        (wt / name).write_text("{}")
+        # The collision the table exists to close: unexcluded, the artifact reads as stranded code
+        assert landing.authored(wt).produced is True
+    assert landing.authored(wt, artifacts).produced is False, kind
+    # …and only the artifact: anything else it wrote still counts
+    (wt / "notes.txt").write_text("x")
+    assert landing.authored(wt, artifacts).dirty == ("notes.txt",), kind
+
+
 def test_a_missing_worktree_is_unreadable_not_produced(repo):
     """"I cannot look" must never be "there is unlanded work\""""
     gone = landing.authored(repo.path / ".claude" / "worktrees" / "wo-vanished")
 
     assert gone.produced is False
     assert gone.unreadable == "no worktree on disk"
+
+
+# -- a pushed branch with no pull request is a state (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md)
+
+
+def _push(repo: Repo, wt: Path, branch: str) -> None:
+    """What the worker does: push the branch, which writes `refs/remotes/origin/…`"""
+    _git(wt, "push", "-q", "origin", branch)
+
+
+def test_a_branch_nobody_pushed_is_not_pushed(repo):
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+
+    work = landing.authored(wt)
+
+    assert work.produced is True
+    assert work.pushed is False
+
+
+def test_a_branch_whose_every_commit_is_on_the_remote_is_pushed(repo):
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+
+    work = landing.authored(wt)
+
+    assert work.produced is True
+    assert work.pushed is True
+
+
+def test_a_pushed_branch_records_the_sha_the_remote_carries(repo):
+    """The auto-attach matches a pull request's head against this SHA"""
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+
+    work = landing.authored(wt)
+
+    assert work.head_sha == _git(wt, "rev-parse", f"refs/remotes/origin/worktree-{WO}").strip()
+    assert work.record()["head_sha"] == work.head_sha
+    assert landing.authored_in(work.record()).head_sha == work.head_sha
+
+
+def test_an_unpushed_branch_records_no_sha(repo):
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+
+    assert landing.authored(wt).head_sha == ""
+
+
+def test_a_remote_behind_the_branch_is_not_pushed(repo):
+    """A commit made after the push leaves the remote behind HEAD"""
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+    repo.commit(wt, "src/more.py", _feature("more"), message="more")
+
+    assert landing.authored(wt).pushed is False
+
+
+def test_uncommitted_files_are_never_pushed(repo):
+    """§1"""
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+    (wt / "src" / "never_added.py").write_text(_feature("orphan"))
+
+    work = landing.authored(wt)
+
+    assert work.dirty
+    assert work.pushed is False
+
+
+def test_the_fixtures_local_origin_yields_no_compare_url_and_still_reads_as_pushed(repo):
+    """THE REGRESSION TEST FOR §3's HOST CHECK, and the reason it is this fixture"""
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+
+    work = landing.authored(wt)
+
+    assert work.pushed is True
+    assert work.compare_url == ""
+
+
+def test_the_record_round_trips_both_new_facts(repo):
+    """`record()` -> JSON -> `authored_in()`"""
+    import json
+
+    original = landing.Authored(branch="worktree-wo-abc12345", base="origin/trunk",
+                                commits=2, dirty=(), pushed=True,
+                                compare_url="https://github.com/acme/proj/compare/"
+                                            "trunk...worktree-wo-abc12345?expand=1")
+
+    read_back = landing.authored_in(json.loads(json.dumps(original.record())))
+
+    assert read_back == original
+
+
+def test_an_event_written_before_this_shipped_reads_as_not_pushed():
+    """§3's backward compatibility, by construction: not-pushed is the safe direction"""
+    legacy = landing.authored_in({"branch": "worktree-wo-abc12345",
+                                  "base": "origin/trunk", "commits": 1, "dirty": []})
+
+    assert legacy is not None
+    assert legacy.pushed is False
+    assert legacy.compare_url == ""
+
+
+# -- the compare URL itself: local git only, and github.com only
+
+
+def _repo_with_origin(tmp_path: Path, remote: str) -> Path:
+    path = make_git_project(tmp_path, "withorigin")
+    _git(path, "remote", "add", "origin", remote)
+    return path
+
+
+def test_the_compare_url_is_built_from_the_origin_and_the_stripped_base(tmp_path):
+    from jarvis import github
+
+    path = _repo_with_origin(tmp_path, "https://github.com/Acme/Proj.git")
+
+    assert github.compare_url(path, "origin/trunk", "worktree-wo-abc12345") == (
+        "https://github.com/acme/proj/compare/trunk...worktree-wo-abc12345?expand=1")
+
+
+def test_a_non_github_origin_has_no_compare_url(tmp_path):
+    """§3"""
+    from jarvis import github
+
+    path = _repo_with_origin(tmp_path, "git@gitlab.com:acme/proj.git")
+
+    assert github.compare_url(path, "origin/main", "worktree-wo-abc12345") is None
+
+
+def test_an_unreadable_origin_has_no_compare_url(tmp_path):
+    from jarvis import github
+
+    path = make_git_project(tmp_path, "noorigin")
+
+    assert github.compare_url(path, "origin/main", "b") is None
+    assert github.compare_url(tmp_path / "nowhere", "origin/main", "b") is None
 
 
 # -- the audit: what GitHub says about the pull request the order recorded

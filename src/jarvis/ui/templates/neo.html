@@ -4,6 +4,9 @@
 {% from "_question.html" import question_body, deliberation, answer_form, review_form %}
 
 {% block content %}
+{# Sections reflow into columns at width — `.flow` in base.html, §5 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+<div class="flow" style="--col: 600px;">
 
 {# Counts live in the tab strip below, not here. #}
 <p class="kv" style="margin-top:18px">
@@ -183,4 +186,5 @@
 </section>
 </div>
 
+</div>
 {% endblock %}

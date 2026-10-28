@@ -26,7 +26,7 @@ OTHER_PR = "https://github.com/acme/proj/pull/8"
 
 
 @pytest.fixture()
-def started(jarvis_home, fake_claude, catalog_file, project):
+def started(jarvis_home, fake_claude, catalog_file, project, live_daemon):
     ops.start_os(str(catalog_file), foreground=True)
     return Daemon(load_catalog(catalog_file))
 
@@ -1197,3 +1197,223 @@ def test_a_held_request_starts_blocking_the_moment_the_case_is_made(
     assert "pr_conflict_rearmed" in [e["kind"] for e in
                                      store.list_events(parked_worker["id"])]
     assert store.pr_repair_attempts(parked_worker["id"], "conflict") == 1   # of 3
+
+
+# -- `jarvis wo pr`: the pull request the worker could not open (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md)
+
+BRANCH = "worktree-wo-pushed"
+
+
+HEAD_SHA = "c" * 40
+
+
+def pr_pending(store, wo_id: str, *, compare_url: str = "",
+               branch: str = BRANCH, head_sha: str = HEAD_SHA) -> None:
+    store.add_event(wo_id, "pr_pending",
+                    {"branch": branch, "base": "origin/main", "commits": 2,
+                     "dirty": [], "pushed": True, "compare_url": compare_url,
+                     "head_sha": head_sha, "was": "running"})
+    store.set_status(wo_id, "needs_review")
+
+
+@pytest.fixture()
+def pushed(started, project):
+    """An order parked on a pushed branch with no pull request"""
+    wo = ops.create_work_order("proj_a", "add feature X")
+    store = ProjectStore(project)
+    try:
+        store.add_event(wo["id"], "finished", {"summary": "pushed the branch"})
+        pr_pending(store, wo["id"])
+    finally:
+        store.close()
+    return wo
+
+
+def test_the_recorded_url_routes_and_the_merge_poll_picks_the_order_up(
+        started, project, fake_gh, pushed):
+    """§8.1, AND IT IS THE FIRST TEST FOR A REASON"""
+    out = ops.record_pull_request(pushed["id"], PR)
+
+    assert out["status"] == "waiting_pr_merge"
+    store = ProjectStore(project)
+    row = store.get_work_order(pushed["id"])
+    assert row["pr_url"] == PR
+    assert ops.routes_on_pull_request(store, row) is True
+    assert store.pr_pending_open(pushed["id"]) is None      # the episode is closed
+    assert not row["needs_attention"]
+
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-10-12T10:00:00Z")
+    poll(started, store)
+
+    assert store.get_work_order(pushed["id"])["status"] == "completed"
+
+
+def test_a_gate_recorded_url_still_routes_nothing(started, project):
+    """The asymmetry §8.1 keeps"""
+    wo = ops.create_work_order("proj_a", "a planner")
+    store = ProjectStore(project)
+    try:
+        store.update_work_order(wo["id"], pr_url=PR)
+        store.add_event(wo["id"], "pr_url_recorded", {"pr_url": PR, "source": "gate"})
+        row = store.get_work_order(wo["id"])
+
+        assert ops.declared_pull_request(store, row) == ""
+        assert ops.routes_on_pull_request(store, row) is False
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("source", ["user", "auto"])
+def test_a_recorded_url_the_user_or_the_os_asserted_is_a_declaration(started, project,
+                                                                     source):
+    """§8.2: the auto-attach routes too, and that is decided rather than inherited"""
+    wo = ops.create_work_order("proj_a", "add feature X")
+    store = ProjectStore(project)
+    try:
+        store.update_work_order(wo["id"], pr_url=PR)
+        store.add_event(wo["id"], "pr_url_recorded", {"pr_url": PR, "source": source})
+        row = store.get_work_order(wo["id"])
+
+        assert ops.declared_pull_request(store, row) == PR
+        assert ops.routes_on_pull_request(store, row) is True
+    finally:
+        store.close()
+
+
+def test_it_refuses_an_order_that_already_declared_one(started, project, pushed):
+    ops.record_pull_request(pushed["id"], PR)
+
+    with pytest.raises(ops.OpsError, match="already"):
+        ops.record_pull_request(pushed["id"], OTHER_PR)
+
+
+def test_it_refuses_an_order_that_is_not_waiting_on_a_pull_request(started, project):
+    """And says what the order IS waiting on, so the refusal is not a dead end"""
+    wo = ops.create_work_order("proj_a", "add feature X")
+    store = ProjectStore(project)
+    try:
+        ops.assume(wo["id"], "polled every 30s")
+        store.set_status(wo["id"], "needs_review")
+    finally:
+        store.close()
+
+    with pytest.raises(ops.OpsError, match="assumption"):
+        ops.record_pull_request(wo["id"], PR)
+
+
+@pytest.mark.parametrize("bad", ["not a url", "-repo=someone/else",
+                                 "https://github.com/acme/proj/compare/a...b"])
+def test_it_refuses_a_url_that_is_not_a_pull_request_on_this_project(started, project,
+                                                                     pushed, bad):
+    """`github.checked_pr_url` refuses these, a compare URL included (§10)"""
+    with pytest.raises(ops.OpsError):
+        ops.record_pull_request(pushed["id"], bad)
+
+    store = ProjectStore(project)
+    assert not store.get_work_order(pushed["id"])["pr_url"]
+
+
+def test_it_refuses_a_work_order_that_does_not_exist(started, project):
+    with pytest.raises(ops.OpsError):
+        ops.record_pull_request("wo-deadbeef", PR)
+
+
+def test_a_pending_assumption_keeps_the_status_and_the_accept_lands_it(started, project,
+                                                                       pushed):
+    """§8's status rule"""
+    ops.assume(pushed["id"], "polled every 30s")
+
+    out = ops.record_pull_request(pushed["id"], PR)
+
+    assert out["status"] == "needs_review"
+    store = ProjectStore(project)
+    assert store.get_work_order(pushed["id"])["pr_url"] == PR
+    assert store.pr_pending_open(pushed["id"]) is None
+
+    assert ops.review_work_order(pushed["id"], accept=True)["status"] == \
+        "waiting_pr_merge"
+
+
+def test_cli_wo_pr_records_it(started, project, pushed, capsys):
+    cli.main(["wo", "pr", pushed["id"], PR])
+
+    store = ProjectStore(project)
+    assert store.get_work_order(pushed["id"])["pr_url"] == PR
+    assert PR in capsys.readouterr().out
+
+
+# -- the daemon's auto-attach (§9)
+
+
+def test_the_poll_attaches_an_open_pull_request_found_on_the_parked_branch(
+        started, project, fake_gh, pushed):
+    """§9"""
+    fake_gh.set_open_pr(BRANCH, {"url": PR, "isCrossRepository": False,
+                                 "headRefOid": HEAD_SHA})
+    store = ProjectStore(project)
+
+    started.attach_pull_requests(started.catalog.project("proj_a"), store)
+
+    row = store.get_work_order(pushed["id"])
+    assert row["pr_url"] == PR
+    assert row["status"] == "waiting_pr_merge"
+    assert ops.routes_on_pull_request(store, row) is True
+    assert json.loads(store.events_of_kind(pushed["id"], "pr_url_recorded")[-1]
+                      ["payload"])["source"] == "auto"
+
+
+def test_the_poll_never_attaches_a_fork_pull_request_on_the_same_branch_name(
+        started, project, fake_gh, pushed):
+    fake_gh.set_open_pr(BRANCH, {"url": PR, "isCrossRepository": True,
+                                 "headRefOid": HEAD_SHA})
+    store = ProjectStore(project)
+
+    started.attach_pull_requests(started.catalog.project("proj_a"), store)
+
+    assert not store.get_work_order(pushed["id"])["pr_url"]
+    assert store.pr_pending_open(pushed["id"]) is not None
+
+
+def test_a_park_with_no_recorded_sha_is_never_auto_attached(started, project, fake_gh):
+    wo = ops.create_work_order("proj_a", "add feature X")
+    store = ProjectStore(project)
+    store.add_event(wo["id"], "finished", {"summary": "pushed the branch"})
+    pr_pending(store, wo["id"], head_sha="")
+    fake_gh.set_open_pr(BRANCH, {"url": PR, "isCrossRepository": False,
+                                 "headRefOid": HEAD_SHA})
+
+    started.attach_pull_requests(started.catalog.project("proj_a"), store)
+
+    assert not store.get_work_order(wo["id"])["pr_url"]
+    assert fake_gh.calls == []
+
+
+def test_no_open_pull_request_on_the_branch_changes_nothing(started, project, fake_gh,
+                                                            pushed):
+    store = ProjectStore(project)
+
+    started.attach_pull_requests(started.catalog.project("proj_a"), store)
+
+    assert not store.get_work_order(pushed["id"])["pr_url"]
+    assert store.pr_pending_open(pushed["id"]) is not None
+
+
+def test_the_auto_attach_degrades_silently_when_gh_raises(started, project, fake_gh,
+                                                          pushed):
+    """`poll_pull_requests`' own treatment of `GhUnavailable` and `GitHubError`"""
+    fake_gh.fail("gh: not authenticated")
+    store = ProjectStore(project)
+
+    started.attach_pull_requests(started.catalog.project("proj_a"), store)
+
+    assert not store.get_work_order(pushed["id"])["pr_url"]
+    assert store.get_work_order(pushed["id"])["status"] == "needs_review"
+
+
+def test_nothing_parked_means_no_subprocess_for_the_attach(started, project, fake_gh):
+    ops.create_work_order("proj_a", "add feature X")
+    store = ProjectStore(project)
+
+    started.attach_pull_requests(started.catalog.project("proj_a"), store)
+
+    assert fake_gh.calls == []

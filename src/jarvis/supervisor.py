@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
-from . import claude_cli, health, holds, structured
+from . import claude_cli, db, health, holds, structured
+from .project_store import WORKER_CHILDREN
 
 log = logging.getLogger("supervisor")
 
@@ -48,6 +48,12 @@ CODEBASE and a work order anyone can act on. `cache-1h-foreign` says a person's 
 must never write, so the only honest outcome is a work order asking a PERSON to add it.
 Never propose a remedy that has the OS edit a user's personal configuration, and never
 answer a `cache-1h-foreign` alarm as though the OS were at fault.
+
+`cache-arm-missed` is fleet-wide in the same way, and it is always the OS's own defect.
+It compares the arm a turn was STAMPED with against the TTL its calls paid: an arm the CLI
+never honoured bought the other rate, so `wo_turns.cache_ttl` records intent only. The
+cure is never the user's settings file — it is the OS setting a variable that OUTRANKS
+every user-owned key for the same behaviour.
 
 READ WHAT A TURN COST BEFORE YOU CALL IT EXPENSIVE. Every turn in the packet carries its
 API call count and the tokens and dollars it actually bought. A turn that made NO API call
@@ -132,6 +138,10 @@ writes, the order under them carries only the foreign key, and the second of the
 reports a condition the OS cannot fix — the remedy is a line in a person's own
 `~/.claude/settings.json`, which Jarvis must never write. Never escalate a
 `cache-1h-foreign` alarm as an OS fault, and never propose a remedy that edits that file.
+`cache-arm-missed` is fleet-wide too and is always an OS fault: the arm a turn was STAMPED
+with is not the TTL its calls paid, so the stamp recorded intent only. Its cure is the OS
+setting a variable that OUTRANKS the user-owned key for the same behaviour, never a change
+to that file either.
 
 READ THE PACKET'S "this session is" LINE BEFORE YOU JUDGE THE NUMBERS. The alarm is
 always raised against a work order, but a work order is not always a worker: it may be a
@@ -439,6 +449,60 @@ def _validation_lines(pstore: Any, fo_id: str, cfg: Any) -> list[str]:
     return lines
 
 
+#: What a work-order packet still has to fit after `_history_lines`, for its equal share
+WO_SECTIONS_AFTER_HISTORY = ("# The session, turn by turn",
+                             "# What was last said about this order")
+
+
+def _for(seconds: float) -> str:
+    hours = seconds / SECONDS_PER_HOUR
+    return f"{hours:.1f} hour(s)" if hours >= 1 else f"{seconds / SECONDS_PER_MINUTE:.0f} minute(s)"
+
+
+def _history_lines(pstore: Any, kind: str, order_id: str, budget: int) -> list[str]:
+    """The spans `ops.state_durations` reads, so the packet cannot be blind to a transition the OS recorded"""
+    from . import db, ops
+
+    now = db.now()
+    reading = (ops.state_durations(pstore, wo_id=order_id, now=now) if kind == "wo"
+               else ops.state_durations(pstore, fo_id=order_id, now=now))
+    lines = ["# Where it has been"]
+    if reading.current_status_since is not None:
+        lines.append(f"now: {reading.current_status} for "
+                     f"{_for(now - reading.current_status_since)}")
+    elif reading.current_status:
+        lines.append(f"now: {reading.current_status} (the recorded spans stop short of it)")
+    else:
+        lines.append("now: settled")
+    # Newest first within an equal share of the budget, then printed oldest first
+    kept: list[str] = []
+    spent = 0
+    for span in reversed(reading.spans):
+        line = (f"- {span.status} for {_for(span.seconds(now))}"
+                + (f" (entered by {span.trigger})" if span.trigger else "")
+                + (" [approximate]" if span.approximate else ""))
+        if kept and spent + len(line) > budget:
+            kept.append(f"…and {len(reading.spans) - len(kept)} earlier status(es)")
+            break
+        spent += len(line) + len("\n")
+        kept.append(line)
+    lines.extend(reversed(kept))
+    if kind == "wo":
+        # The verdict the stillness may be waiting on, which no status name says
+        rounds = pstore.validation_rounds(wo_id=order_id)
+        settled = [r for r in rounds if r["outcome"] != "pending"]
+        if rounds and rounds[-1]["outcome"] == "pending":
+            lines.append(f"validation round {rounds[-1]['round']} is open, opened "
+                         f"{_for(now - float(rounds[-1]['ts'] or now))} ago")
+        if settled:
+            last = settled[-1]
+            lines.append(f"latest validation round {last['round']}: {last['outcome']}, "
+                         f"opened {_for(now - float(last['ts'] or now))} ago")
+        elif not rounds:
+            lines.append("(it has never been through validation)")
+    return lines
+
+
 def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
     """The last `cfg.quoted_turns` of `timeline.build_conversation`"""
     from . import timeline
@@ -447,8 +511,9 @@ def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
     if wo_id is None:
         said.append(NO_CARRIER_LINE)
         return said
+    # The NEWEST page: what was LAST said is the tail, which an ascending LIMIT drops
     conversation = timeline.build_conversation(
-        pstore.list_events(wo_id), pstore.list_messages(wo_id))
+        pstore.list_events(wo_id, newest=True), pstore.list_messages(wo_id))
     for turn in conversation[-cfg.quoted_turns:]:
         said.append(f"- {turn['who']}: "
                     f"{_clip(str(turn.get('content') or ''), cfg.conversation_quote_chars)}")
@@ -505,11 +570,11 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
                 _validation_lines(pstore, fo_id, cfg),
                 _said_lines(pstore, carrier["id"] if carrier else None, cfg)]
         # An equal share of the budget, so the tree's bound moves with the setting and this module goes on...
+        share = cfg.evidence_budget_chars // (len(sections) + len(rest) + 1)
         tree = ["# The child tree",
-                *_child_lines(pstore.feature_children(fo_id),
-                              cfg.evidence_budget_chars
-                              // (len(sections) + len(rest) + 1))]
-        sections += [rest[0], tree, *rest[1:]]
+                *_child_lines(pstore.feature_children(fo_id, kinds=WORKER_CHILDREN), share)]
+        history = _history_lines(pstore, "fo", fo_id, share)
+        sections += [rest[0], history, tree, *rest[1:]]
     else:
         from . import health
 
@@ -527,6 +592,10 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
             f"title: {row.get('title')}",
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
         ])
+        # Ahead of the transcript: a capped packet drops the session read before the status history
+        sections.append(_history_lines(
+            pstore, "wo", row["id"], cfg.evidence_budget_chars
+            // (len(sections) + 1 + len(WO_SECTIONS_AFTER_HISTORY))))
         sections.append(["# The session, turn by turn",
                          *_session_lines(row, inspect_cfg, pstore)])
         sections.append(_said_lines(pstore, row["id"], cfg))
@@ -744,7 +813,7 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
         # BEFORE the generic outage below (#235)
         from .worker_session import RATE_LIMIT_FALLBACK_DELAY
 
-        reopens = exc.limit.reset_at or (time.time() + RATE_LIMIT_FALLBACK_DELAY)
+        reopens = exc.limit.reset_at or (db.now() + RATE_LIMIT_FALLBACK_DELAY)
         pstore.record_health_review(kind, subject_id, fingerprint=fingerprint,
                                     trigger=trigger, outcome="held",
                                     detail=_clip(exc.limit.message, cfg.reason_chars),
@@ -821,7 +890,7 @@ def reassert_health(pstore: Any, project: str, subject: dict[str, Any]) -> dict[
 
 
 def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
-    """What Neo is handed with the question — §3: the supervisor's own reading is APPENDED, never substituted, because Neo is headless and cannot look the packet up"""
+    """What Neo is handed with the question"""
     # Decision #11: packet and model reasoning are both borrowed text, both bounded
     from .provenance import (DESCRIPTION_LIMIT, EVIDENCE_LIMIT, Borrowed,
                              borrowed_block)
@@ -844,7 +913,7 @@ def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
 
 
 def _question_for(verdict: dict[str, Any], alarm: dict[str, Any]) -> str:
-    """The one question put to Neo, never empty: a model that escalates without filling `question` in has still judged, and an empty `questions` row is unanswerable by Neo and unreadable by the user it would be escalated to"""
+    """The one question put to Neo, never empty: a model that escalates without filling `question` in has..."""
     # Decision #11: the model's question and the alarm's reason are borrowed text, bounded
     from .provenance import DESCRIPTION_LIMIT, Borrowed, borrowed_block
 

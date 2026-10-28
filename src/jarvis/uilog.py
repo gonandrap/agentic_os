@@ -11,6 +11,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import db
 from .paths import logs_dir
 
 #: Rotate at 512 KiB, keeping one previous file
@@ -91,7 +92,7 @@ def _append(path: Path, text: str) -> None:
 
 def record_error(method: str, path: str, exc: BaseException) -> None:
     """Write one `[ERROR]` entry, header line plus indented traceback"""
-    stamp = time.strftime(_STAMP, time.localtime())
+    stamp = time.strftime(_STAMP, time.localtime(db.now()))
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     body = "".join(f"    {line}\n" for line in tb.rstrip("\n").splitlines())
     # Newlines in the exception message would forge a second entry; flatten them
@@ -102,7 +103,7 @@ def record_error(method: str, path: str, exc: BaseException) -> None:
 
 def record_access(method: str, path: str, status: int, duration_ms: float) -> None:
     """Write one access line"""
-    stamp = time.strftime(_STAMP, time.localtime())
+    stamp = time.strftime(_STAMP, time.localtime(db.now()))
     _append(access_log_path(),
             f"{stamp} [{status}] {method} {path} {duration_ms:.0f}ms\n")
 
@@ -114,7 +115,7 @@ def dump_stacks(note: str = "") -> Path | None:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size >= MAX_BYTES:
             path.replace(path.with_name(path.name + ".1"))
-        stamp = time.strftime(_STAMP, time.localtime())
+        stamp = time.strftime(_STAMP, time.localtime(db.now()))
         with path.open("a") as f:
             f.write(f"\n{stamp} [WEDGE] {note}\n")
             f.flush()
@@ -134,17 +135,18 @@ def dump_stacks(note: str = "") -> Path | None:
 
 
 def record_wedge(*, limiter: dict[str, int], uptime_seconds: float,
-                 version: str = "") -> dict[str, object]:
+                 version: str = "", reason: str = "threadpool wedged",
+                 ) -> dict[str, object]:
     """Dump the stacks and (re)write the wedge stamp"""
     stamp: dict[str, object] = {
         "since": time.time(), "at": time.time(), "limiter": dict(limiter),
         "uptime_seconds": round(uptime_seconds, 1), "version": version,
-        "dump": str(stack_dump_path()),
+        "dump": str(stack_dump_path()), "reason": reason,
     }
     previous = read_wedge()
     if previous and previous.get("since"):
         stamp["since"] = previous["since"]
-    note = (f"pool wedged — limiter borrowed={limiter.get('borrowed')} "
+    note = (f"{reason} — limiter borrowed={limiter.get('borrowed')} "
             f"available={limiter.get('available')} total={limiter.get('total')} "
             f"waiting={limiter.get('waiting')} uptime={int(uptime_seconds)}s "
             f"version={version or 'unknown'}")
@@ -206,7 +208,7 @@ def read_errors(cursor: str = "",
         offset = _resume_at(cursor, st, head)
         f.seek(offset)
         raw = f.read()
-    cutoff = time.time() - within_seconds
+    cutoff = db.now() - within_seconds
     errors = [e for e in _parse(raw.decode("utf-8", errors="replace"))
               if e.ts >= cutoff]
     # The cursor advances past the entries the filter dropped: they have been read and dismissed
@@ -238,17 +240,43 @@ def _resume_at(cursor: str, st: os.stat_result, head: bytes) -> int:
     return offset
 
 
-def recent_errors(within_seconds: float = ERROR_WINDOW_SECONDS,
-                  limit: int = 5) -> tuple[list[UiError], int]:
-    """The `limit` newest errors inside the window, and how many the window holds"""
-    p = ui_log_path()
+_ACCESS = re.compile(
+    r"^(?P<when>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[(?P<status>\d{3})\] "
+    r"(?P<method>\S+) (?P<path>\S+) \d+ms$"
+)
+
+
+def _tail(p: Path) -> str:
     if not p.exists():
-        return [], 0
+        return ""
     with p.open("rb") as f:
         size = f.seek(0, 2)
         f.seek(max(0, size - TAIL_BYTES))
-        raw = f.read()
-    cutoff = time.time() - within_seconds
-    found = [e for e in _parse(raw.decode("utf-8", errors="replace"))
-             if e.ts >= cutoff]
+        return f.read().decode("utf-8", errors="replace")
+
+
+def _last_success() -> dict[tuple[str, str], float]:
+    """Newest non-error response per (method, path) in the access log's tail"""
+    last: dict[tuple[str, str], float] = {}
+    for line in _tail(access_log_path()).splitlines():
+        m = _ACCESS.match(line)
+        if not m or int(m["status"]) >= 400:
+            continue
+        try:
+            ts = time.mktime(time.strptime(m["when"], _STAMP))
+        except ValueError:
+            continue
+        key = (m["method"], m["path"].split("?", 1)[0])
+        last[key] = max(ts, last.get(key, 0.0))
+    return last
+
+
+def recent_errors(within_seconds: float = ERROR_WINDOW_SECONDS,
+                  limit: int = 5) -> tuple[list[UiError], int]:
+    """The `limit` newest errors inside the window, and how many the window holds"""
+    cutoff = db.now() - within_seconds
+    found = [e for e in _parse(_tail(ui_log_path())) if e.ts >= cutoff]
+    # An error whose route has since served a success is fixed, not standing
+    healed = _last_success() if found else {}
+    found = [e for e in found if healed.get((e.method, e.path), 0.0) <= e.ts]
     return found[-limit:][::-1], len(found)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
+import os
 import threading
 import time
 
@@ -13,13 +14,14 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from jarvis import daemon as daemon_mod  # noqa: E402
-from jarvis import invariants, ops, release, systemd_units, uilog  # noqa: E402
+from jarvis import db, invariants, ops, release, service_manager, uilog  # noqa: E402
 from jarvis.catalog import UiHealthConfig  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
-from jarvis.ui.app import create_app  # noqa: E402
+from jarvis.ui import app as ui_app  # noqa: E402
+from jarvis.ui.app import LoopWatchdog, create_app  # noqa: E402
 
 
 @pytest.fixture()
@@ -97,7 +99,7 @@ def test_the_first_tick_ever_does_not_alert_on_a_log_full_of_history(started,
                                                                     catalog_file):
     """What 0.5.5 actually did to production"""
     uilog.ui_log_path().parent.mkdir(parents=True, exist_ok=True)
-    old = time.strftime(uilog._STAMP, time.localtime(time.time() - 7 * 24 * 3600))
+    old = time.strftime(uilog._STAMP, time.localtime(db.now() - 7 * 24 * 3600))
     with uilog.ui_log_path().open("a") as f:
         for i in range(4):
             f.write(f"{old} [ERROR] GET /neo — UndefinedError: 'opinions{i}' undefined\n"
@@ -277,7 +279,7 @@ def _held_order(project, *, resumed: bool):
     """Issue 887 on the page: 45m worked of 5h24m in `running`, the rest held"""
     from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
-    now = time.time()
+    now = db.now()
     t0 = now - HELD_WALL
     store = ProjectStore(project)
     try:
@@ -395,6 +397,7 @@ def _limiter(client) -> dict:
 
 
 def _wait_until(predicate, timeout: float = 20.0) -> bool:
+    # clock-exempt: class 3 — spin-waits on the wedged anyio thread pool's own limiter figures, which only real threads release
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
@@ -438,6 +441,7 @@ def test_healthz_answers_while_the_pool_is_wedged_and_a_sync_route_cannot(
                 assert _wait_until(
                     lambda: client.get("/healthz").json()["pool_healthy"] is False)
 
+                # clock-exempt: class 4 — the instant compared against is real elapsed wall time proving /healthz answers while the pool is wedged, which no patched jarvis.db.now produces
                 t0 = time.time()
                 r = client.get("/healthz")
                 assert time.time() - t0 < 5          # answers, while wedged
@@ -490,6 +494,75 @@ def test_a_trip_dumps_every_threads_stack_and_stamps_the_wedge(started, monkeypa
     # kn-57fb4919: `[ERROR]` in ui.log is a parsed contract with three readers
     ui_log = uilog.ui_log_path()
     assert "[ERROR]" not in (ui_log.read_text() if ui_log.exists() else "")
+
+
+# -- a BLOCKED EVENT LOOP: the probe is an asyncio task, the watchdog is not (issue #1221)
+
+
+def test_the_watchdog_dumps_while_the_event_loop_is_blocked(started, monkeypatch):
+    """The assertion this fix exists for: no asyncio task can run here, so only a thread can dump"""
+    _fast_probe(monkeypatch, loop_stall_seconds=1)
+    monkeypatch.setattr(ui_app, "WATCHDOG_TICK_SECONDS", 0.2)
+    app = create_app()
+
+    @app.get("/_loopblock")
+    async def loop_blocker():
+        """Blocks the loop itself — not a threadpool token"""
+        # clock-exempt: class 3 — a real sleep is what blocks a real event loop
+        time.sleep(8)
+        return {"ok": True}
+
+    pool = cf.ThreadPoolExecutor(max_workers=2)
+    futs: list = []
+    try:
+        with TestClient(app) as client:
+            futs.append(pool.submit(client.get, "/_loopblock"))
+            assert _wait_until(lambda: uilog.read_wedge() is not None, timeout=20), \
+                "no wedge stamp was written while the event loop was blocked"
+            stamp = uilog.read_wedge()
+            cf.wait(futs, timeout=30)
+    finally:
+        pool.shutdown(wait=False)
+
+    assert str(stamp["reason"]).startswith("event loop stalled")
+    assert stamp["dump"] == str(uilog.stack_dump_path())
+    dump = uilog.stack_dump_path().read_text()
+    assert "event loop stalled" in dump
+    assert "loop_blocker" in dump           # the frame that holds the loop, by name
+
+
+def test_the_watchdog_dumps_once_per_stall_and_re_arms_on_recovery(started, monkeypatch):
+    """A stall lasting hours must not rewrite the dump every tick"""
+    _fast_probe(monkeypatch, loop_stall_seconds=10)
+    probe = create_app().state.pool_probe
+    probe.cfg = ops.ui_health_config()
+    watchdog = LoopWatchdog(probe)
+
+    # clock-exempt: class 3 — the heartbeat the watchdog reads is a time.monotonic() stamp
+    now = time.monotonic()
+    probe.heartbeat = now                       # fresh
+    assert watchdog.check(now) is False
+    probe.heartbeat = now - 11                   # stale past the threshold
+    assert watchdog.check(now) is True
+    assert watchdog.check(now) is False          # still stalled: one dump, not a stream
+    probe.heartbeat = now                        # the loop came back
+    assert watchdog.check(now) is False
+    probe.heartbeat = now - 11                   # and stalled again
+    assert watchdog.check(now) is True
+    assert watchdog.dumps == 2
+
+
+def test_the_watchdog_is_silent_when_ui_health_is_off(started, monkeypatch):
+    """`ui_health.enabled: false` means the dashboard reports nothing about itself"""
+    _fast_probe(monkeypatch, enabled=False, loop_stall_seconds=1)
+    probe = create_app().state.pool_probe
+    probe.cfg = ops.ui_health_config()
+    watchdog = LoopWatchdog(probe)
+
+    # clock-exempt: class 3 — an hour-stale monotonic heartbeat, which no db.now patch reaches
+    probe.heartbeat = time.monotonic() - 3600
+    assert watchdog.check(time.monotonic()) is False
+    assert uilog.read_wedge() is None
 
 
 # -- the detector is cause-independent (review round 1)
@@ -620,9 +693,12 @@ HEALTHY = {
 
 @pytest.fixture()
 def ui_unit(monkeypatch):
-    """`jarvis-ui.service` as systemd sees it — `active` unless a test says otherwise"""
-    state = {"active": True}
-    monkeypatch.setattr(systemd_units, "unit_active", lambda unit: state["active"])
+    """`jarvis-ui.service` as its init system sees it"""
+    state = {"active": True, "uptime": None, "transitioning": False}
+    monkeypatch.setattr(service_manager, "unit_active", lambda unit: state["active"])
+    monkeypatch.setattr(service_manager, "uptime_seconds", lambda unit: state["uptime"])
+    monkeypatch.setattr(service_manager, "unit_transitioning",
+                        lambda unit: state["transitioning"])
     return state
 
 
@@ -688,6 +764,63 @@ def test_a_timeout_and_a_wedged_answer_are_the_same_verdict(wedged, monkeypatch)
     assert runner.calls == [("restart_unit", release.UI_UNIT)]
 
 
+def test_a_release_restart_of_the_dashboard_is_not_a_wedge(wedged, ui_unit):
+    """Every release restarts `jarvis-ui`; the next tick probes before uvicorn binds (issue #1189)"""
+    d, runner, answers = wedged
+    answers[0] = None                     # the port is not open yet
+    ui_unit["uptime"] = 0.07              # systemd restarted it 70ms ago
+
+    assert d.check_ui_health(now=1000.0) == "booting"
+    assert runner.calls == []
+    assert _inbox() == []
+    # Nothing was counted, so the restart cap is intact for a real wedge
+    assert d._ui_restarts() == []
+
+    # Past the grace period an unreachable dashboard IS the wedge it always was
+    ui_unit["uptime"] = 61.0
+    assert d.check_ui_health(now=1100.0) == "restarted"
+    assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+
+def test_the_stop_phase_of_a_restart_is_not_a_wedge(wedged, ui_unit):
+    """While the unit is `deactivating`, uptime still holds the PREVIOUS start (issue #1194)"""
+    d, runner, answers = wedged
+    answers[0] = None                     # the port is already refusing
+    ui_unit["transitioning"] = True
+    ui_unit["uptime"] = 180.0             # the start 3 minutes ago, not the new one
+
+    # The cap is spent, so without the state check this is the false CRITICAL
+    d.central.set_state(daemon_mod.UI_WEDGE_RESTARTS,
+                        db.to_json([995.0, 996.0, 997.0]))
+
+    assert d.check_ui_health(now=1000.0) == "restarting"
+    assert runner.calls == []
+    assert _inbox() == []
+    assert d._ui_restarts() == [995.0, 996.0, 997.0]   # nothing counted
+
+
+def test_a_dashboard_that_answers_wedged_while_booting_is_still_a_wedge(wedged, ui_unit):
+    """The grace period covers silence, not the dashboard's own `wedged: true`"""
+    d, runner, _ = wedged
+    ui_unit["uptime"] = 0.07
+
+    assert d.check_ui_health(now=1000.0) == "restarted"
+    assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+
+def test_the_item_claims_no_stack_dump_when_none_was_written(wedged, monkeypatch):
+    """`uilog.stack_dump_path()` is a path, not evidence that the dashboard dumped (issue #1189)"""
+    d, _, answers = wedged
+    answers[0] = None                     # no payload, so no `stack_dump` either
+
+    assert d.check_ui_health(now=1000.0) == "restarted"
+    body = _inbox()[0]["body"]
+    assert str(uilog.stack_dump_path()) not in body
+    assert "Stacks: none — no stack dump was written" in body
+    assert "wrote NO stack dump" in body
+    assert "Stamp:" not in body           # the dashboard never stamped either
+
+
 def test_the_daily_cap_stops_restarting_and_still_reaches_the_user(wedged):
     d, runner, _ = wedged
     t = 1000.0
@@ -745,11 +878,58 @@ def test_a_failed_restart_says_so_once_and_still_spends_the_cooldown(wedged,
     assert "could not be restarted" in items[0]["title"]
     assert "dbus: connection refused" in items[0]["body"]
     assert WEDGED["stack_dump"] in items[0]["body"]
+    # The one instruction the user acts on by hand names the command THIS host has
+    assert f"systemctl --user restart {release.UI_UNIT}" in items[0]["body"]
 
     # The attempt IS recorded, so the cooldown holds and nothing is said again
     assert d.check_ui_health(now=1010.0) == "cooldown"
     assert len(_inbox()) == 1
     assert len(runner.calls) == 1
+
+
+@pytest.fixture()
+def wedged_on_a_mac(started, catalog_file, monkeypatch, fake_launchd):
+    """The same wedge, on the host this defect was reported from"""
+    answers = [HEALTHY]
+    monkeypatch.setattr(daemon_mod, "fetch_healthz", lambda url, timeout: answers[0])
+    fake_launchd.load("com.jarvis.ui", state="running", pid=73299)
+    d = Daemon(load_catalog(catalog_file))
+    d.release_runner = _FakeRunner()
+    d.check_ui_health(now=0.0)              # one healthy sighting first
+    answers[0] = WEDGED
+    return d, d.release_runner, fake_launchd
+
+
+def test_under_launchd_a_running_label_plus_a_wedge_is_restarted(wedged_on_a_mac):
+    """THE DEFECT, end to end: `systemd_units.unit_active` swallowed the missing-binary `OSError`"""
+    d, runner, _ = wedged_on_a_mac
+
+    assert d.check_ui_health(now=1000.0) == "restarted"
+    assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+
+def test_under_launchd_an_absent_label_is_down_and_nothing_is_restarted(
+        wedged_on_a_mac):
+    """`launchctl bootout gui/$UID/com.jarvis.ui` makes the label unfindable"""
+    d, runner, fake_launchd = wedged_on_a_mac
+    fake_launchd.bootout("com.jarvis.ui")
+
+    assert d.check_ui_health(now=1000.0) == "down"
+    assert runner.calls == []
+    assert _inbox() == []
+
+
+def test_under_launchd_a_failed_restart_names_the_launchctl_command(wedged_on_a_mac,
+                                                                    monkeypatch):
+    """`systemctl --user restart jarvis-ui.service` is not a command this host has"""
+    d, runner, _ = wedged_on_a_mac
+    monkeypatch.setattr(runner, "restart_unit",
+                        lambda unit: (_ for _ in ()).throw(OSError("no launchctl")))
+
+    assert d.check_ui_health(now=1000.0) == "restart_failed"
+    body = _inbox()[0]["body"]
+    assert f"launchctl kickstart -k gui/{os.getuid()}/com.jarvis.ui" in body
+    assert "systemctl" not in body
 
 
 def test_the_ui_health_check_is_off_when_the_catalog_says_so(started, catalog_file,
@@ -777,7 +957,7 @@ def test_doctor_reports_the_wedge_and_the_self_restarts(wedged):
     d, _, _ = wedged
     uilog.record_wedge(limiter=WEDGED["limiter"], uptime_seconds=14400.0,
                        version="0.10.0")
-    assert d.check_ui_health(now=time.time()) == "restarted"
+    assert d.check_ui_health(now=db.now()) == "restarted"
 
     found = [v for v in invariants.check_os() if v.invariant == "INV-UI-WEDGED"]
     assert len(found) == 1
@@ -792,7 +972,7 @@ def test_doctor_stops_reporting_a_wedge_a_day_old(started):
     """The restarted dashboard is a NEW process and never comes back to delete the stamp"""
     uilog.record_wedge(limiter=WEDGED["limiter"], uptime_seconds=1.0, version="0.10.0")
     stamp = uilog.read_wedge()
-    old = time.time() - uilog.ERROR_WINDOW_SECONDS - 60
+    old = db.now() - uilog.ERROR_WINDOW_SECONDS - 60
     uilog.wedge_stamp_path().write_text(
         json.dumps({**stamp, "since": old, "at": old}))
 

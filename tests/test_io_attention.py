@@ -13,6 +13,11 @@ from jarvis.testing import a_report
 TICKS = 7  # > RECONCILE_EVERY_TICKS, so the reconcile pass runs more than once
 
 
+@pytest.fixture(autouse=True)
+def _user_decides(user_decides_findings):
+    """This suite pins the attention the USER's review raises; Neo's is tests/test_findings_neo.py"""
+
+
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
     ops.start_os(str(catalog_file), foreground=True)

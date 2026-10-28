@@ -17,7 +17,8 @@ scenario = pytest.mark.scenario
 
 
 @pytest.fixture()
-def fleet(jarvis_home, fake_claude, tmp_path, claude_json, make_two_projects):
+def fleet(jarvis_home, fake_claude, tmp_path, claude_json, make_two_projects,
+          live_daemon):
     """Two-project fleet, started, with a tickable daemon"""
     return make_two_projects
 
@@ -30,7 +31,8 @@ def make_two_projects(jarvis_home, fake_claude, tmp_path, claude_json):
     claude_json(pa), claude_json(pb)
     catalog = tmp_path / "catalog.json"
     catalog.write_text(json.dumps({
-        "os": {"defaults": {"model": "sonnet"}},
+        # These scenarios read the one-shot argv; the background transport is tests/test_bg_transport.py
+        "os": {"defaults": {"model": "sonnet", "transport": "headless"}},
         "projects": [
             {"name": "proj_a", "path": str(pa)},
             {"name": "proj_b", "path": str(pb), "max_concurrent": 1,
@@ -74,7 +76,7 @@ def turn_calls(fake_claude, resumed=None, expect=0):
 def test_quiet_is_quiet(fleet):
     st = ops.os_status()
     assert st["attention"] == []
-    assert st["daemon"]["running"] is False  # foreground start — no daemon process
+    assert st["daemon"]["running"] is True  # `live_daemon`'s pidfile: a fleet that is UP
     assert {p["name"] for p in st["projects"]} == {"proj_a", "proj_b"}
 
 

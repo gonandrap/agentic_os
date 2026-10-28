@@ -5,6 +5,9 @@ import pytest
 from jarvis import cli, ops
 from jarvis.catalog import CatalogError, load_catalog, parse_catalog
 from jarvis.daemon import Daemon
+from jarvis.central_store import CentralStore
+from jarvis.testing import FIXTURE_BUG_REPO, with_origin
+from tests.test_base_red import MAIN_RED, filings, orders, poll, sweep
 from tests.test_issue_lifecycle import fleet  # noqa: F401
 from tests.test_neo_dispatch import asked, started, work_orders  # noqa: F401
 
@@ -52,6 +55,27 @@ def test_neo_files_no_cleanup_order(asked, project):
     assert not [w for w in work_orders(project) if w["origin"] == "neo"]
 
 
-def test_a_red_main_dispatches_no_fix(catalog_file):
-    # Returns before it reads the project, so no tracker or `gh` is touched
-    assert Daemon(load_catalog(catalog_file)).dispatch_base_fix(None, None) is None
+@pytest.fixture()
+def red_tracker(jarvis_home, fake_claude, catalog_file, project, fake_gh):
+    """`proj_a` IS the OS's own tracker, and its `main` is red"""
+    ops.start_os(str(catalog_file), foreground=True)
+    with_origin(project, FIXTURE_BUG_REPO)
+    fake_gh.set_default_branch(FIXTURE_BUG_REPO, "main")
+    fake_gh.set_runs("main", [MAIN_RED])
+    return Daemon(load_catalog(catalog_file))
+
+
+def test_a_red_main_dispatches_no_fix(red_tracker, fake_gh):
+    """Nothing filed, nothing dispatched"""
+    tracker = red_tracker
+    store = tracker.store_for(tracker.catalog.project("proj_a"))
+    poll(tracker, store)
+    sweep(tracker, store)
+    assert filings(fake_gh) == 0 and orders(store) == []
+    central = CentralStore()
+    try:
+        [row] = central.steward_decisions()
+    finally:
+        central.close()
+    assert (row["origin_kind"], row["outcome"], row["applied"]) == ("red_main",
+                                                                     "dispatch", 0)

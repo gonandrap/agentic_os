@@ -46,11 +46,14 @@ def canonicalise(document: Any) -> str:
     return json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False)
 
 
-def version_id(document: Any, build: str | None = None) -> str:
+def version_id(document: Any, build: str | None = None,
+               salt: str | None = None) -> str:
     """`cfg-` + the first 16 hex of sha256 over the canonical form"""
     canonical = canonicalise(document)
     if build:
         canonical = f"{canonical}\n@build {build}"
+    if salt:
+        canonical = f"{canonical}\n@salt {salt}"
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"cfg-{digest[:16]}"
 

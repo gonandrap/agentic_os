@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from jarvis import uilog
+from jarvis import db, uilog
 
 
 def _boom(msg: str = "kaboom") -> Exception:
@@ -72,7 +72,7 @@ def _write_entry(when: str, path: str) -> None:
 
 
 def _stamp(seconds_ago: float) -> str:
-    return time.strftime(uilog._STAMP, time.localtime(time.time() - seconds_ago))
+    return time.strftime(uilog._STAMP, time.localtime(db.now() - seconds_ago))
 
 
 def test_a_cold_start_does_not_announce_a_log_full_of_history(jarvis_home):
@@ -112,6 +112,20 @@ def test_a_replaced_log_re_announces_only_what_is_still_recent(jarvis_home):
     assert [e.path for e in errors] == ["/two"]
 
 
+def test_the_window_boundary_is_decided_on_one_clock(jarvis_home, clock):
+    """Writer and readers decide the window on one clock, or it moves by a whole day (fo-2891ead5 §7.1)"""
+    with clock.moved(-(uilog.ERROR_WINDOW_SECONDS + 1)):
+        uilog.record_error("GET", "/past-the-cutoff", _boom("a second too old"))
+    with clock.moved(-(uilog.ERROR_WINDOW_SECONDS - 1)):
+        uilog.record_error("GET", "/inside-the-cutoff", _boom("a second too young"))
+
+    errors, _ = uilog.read_errors()
+    assert [e.path for e in errors] == ["/inside-the-cutoff"]
+
+    recent, total = uilog.recent_errors()
+    assert ([e.path for e in recent], total) == (["/inside-the-cutoff"], 1)
+
+
 def test_the_log_rotates_instead_of_growing_without_bound(jarvis_home, monkeypatch):
     """A dashboard stuck in a crash loop must not fill the state directory"""
     monkeypatch.setattr(uilog, "MAX_BYTES", 400)
@@ -135,6 +149,21 @@ def test_errors_age_out_of_the_reporting_window(jarvis_home):
     """The standing "the dashboard is broken" signal has to expire on its own"""
     uilog.record_error("GET", "/old", _boom("ancient"))
     assert uilog.recent_errors(within_seconds=-1) == ([], 0)
+
+
+def test_an_error_clears_once_its_route_serves_a_success_again(jarvis_home):
+    """wo-c93acc14: a fixed 'disk is full' kept NEEDS YOU lit for the whole 24h window"""
+    uilog.ui_log_path().parent.mkdir(parents=True, exist_ok=True)
+    _write_entry(_stamp(120), "/")
+    _write_entry(_stamp(120), "/wo/p/wo-1")
+    with uilog.access_log_path().open("a") as f:
+        f.write(f"{_stamp(180)} [200] GET /wo/p/wo-1 5ms\n")  # before the error: not a recovery
+        f.write(f"{_stamp(60)} [500] GET /wo/p/wo-1 5ms\n")
+        f.write(f"{_stamp(60)} [200] GET /?tab=x 5ms\n")
+
+    recent, total = uilog.recent_errors()
+    assert total == 1
+    assert [e.path for e in recent] == ["/wo/p/wo-1"]
 
 
 def test_access_lines_record_path_query_and_status(jarvis_home):

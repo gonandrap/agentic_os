@@ -713,12 +713,10 @@ def ask_triage(project: str, issue_url: str, title: str, body: str,
     from .neo_store import NeoStore
     from .provenance import TITLE_LIMIT, Borrowed, borrowed_block
 
-    # The title is bounded in the JSON record too: it rides to Neo as `context=`, and
-    # `triage_payload` reads it back as a work order's title, where 300 is already ample.
+    # The title is bounded in the JSON record too: it rides to Neo as `context=`
     context = json.dumps({"issue_url": issue_url, "title": title[:TITLE_LIMIT],
                           "priority": priority, "body": body[:4000]})
-    # Decision #11: the title is borrowed text — whoever filed the bug wrote it — and it
-    # was the one field in this prompt with no bound. The body keeps its own slice.
+    # Decision #11: the title is borrowed text
     quoted_title = borrowed_block(Borrowed(
         label="the tracker issue's title", whose="the agent that filed the bug",
         text=title, limit=TITLE_LIMIT))
@@ -829,8 +827,28 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
         out["reason"] = f"project {q.get('project')!r} is no longer in the catalog"
         return out
 
-    if out["outcome"] == "confirmed" and self_dispatch(catalog):
-        out["wo_id"] = promote_confirmed(spec, payload)
+    from . import steward
+    from .project_store import ProjectStore
+
+    decision = None
+    if out["outcome"] == "confirmed":
+        # The steward's call (spec 2026-10-21 §3.2): Neo's confirmation IS the evidence a...
+
+        store = ProjectStore(spec.path)
+        try:
+            decision = steward.gate(
+                steward.Candidate("bug_agent", out["settled"], spec.name,
+                                  payload.get("title") or url,
+                                  evidence=(f"neo question {q.get('id')} confirmed",),
+                                  parent_wo_id=str(q.get("wo_id") or "")),
+                catalog=catalog, store=store, self_dispatch=self_dispatch(catalog))
+        finally:
+            store.close()
+    if decision is not None and decision.allowed:
+        out["wo_id"] = promote_confirmed(
+            spec, payload, metadata=steward.stamped({}, decision),
+            budget_usd=decision.budget_usd)
+        steward.linked(decision, out["wo_id"])
         if out["backlog_id"]:
             # Only a question asked BEFORE the backlog item stopped being created can have one
             central = CentralStore()
@@ -903,7 +921,8 @@ def was_expedited(wo: dict[str, Any]) -> bool:
 
 
 def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
-                      metadata: dict[str, Any] | None = None) -> str:
+                      metadata: dict[str, Any] | None = None,
+                      budget_usd: float | None = None) -> str:
     """Create the work order a confirmed `critical`/`blocker` earned (#240)"""
     from .ops import create_work_order
     from .project_store import ProjectStore
@@ -919,7 +938,8 @@ def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
         description=WORK_ORDER_BRIEF.format(
             url=url, body=payload.get("body") or "",
             why=why or TRIAGED_WHY.format(priority=priority)),
-        origin="jarvis", issue_url=url, issue_priority=priority, metadata=metadata)
+        origin="jarvis", issue_url=url, issue_priority=priority, metadata=metadata,
+        budget_usd=budget_usd)
     store = ProjectStore(spec.path)
     try:
         # Label it now rather than only on the next sweep: the promotion and the tracker saying so should not...
@@ -965,7 +985,9 @@ def issue_ref_url(target: str, repo: str) -> str:
     return issue_url_for(repo, int(number))
 
 
-def start_work(target: str, project: str | None = None) -> dict[str, Any]:
+def start_work(target: str, project: str | None = None, *,
+               metadata: dict[str, Any] | None = None,
+               budget_usd: float | None = None) -> dict[str, Any]:
     """Open a work order on a tracker issue"""
     from . import github
     from .ops import OpsError, registered_project_paths, resolve_catalog
@@ -999,5 +1021,6 @@ def start_work(target: str, project: str | None = None) -> dict[str, Any]:
     wo_id = promote_confirmed(
         spec, {"issue_url": url, "title": issue.title, "priority": level,
                "body": issue_body(url, repo)},
-        why=STARTED_WHY.format(priority=level or "unrated"))
+        why=STARTED_WHY.format(priority=level or "unrated"), metadata=metadata,
+        budget_usd=budget_usd)
     return {"wo_id": wo_id, "project": spec.name, "issue_url": url, "priority": level}

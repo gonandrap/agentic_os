@@ -1,5 +1,6 @@
 """The supervisor hands an alarm it cannot settle to Neo, and Neo hands back advice (docs/superpowers/specs/2026-08-31-the-supervisor.md)"""
 
+# clock-exempt: class 3 — spin-waits for the real supervisor thread to finish draining before an alarm escalates
 from __future__ import annotations
 
 import json

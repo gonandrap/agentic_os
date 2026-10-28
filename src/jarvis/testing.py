@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -15,7 +16,7 @@ from typing import Any, Sequence
 
 import pytest
 
-from . import agent_usage, paths, release, systemd_units, usage
+from . import agent_usage, keychain, paths, release, service_manager, systemd_units, usage
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -71,8 +72,12 @@ def gate_environment(root: Path) -> dict[str, str]:
         GH_BIN_ENV: str(_blocked_bin(root, "gh", BLOCKED_GH)),
         # Worker turns stay on the plain-`Popen` transport for the whole suite
         systemd_units.TRANSPORT_ENV: systemd_units.DIRECT,
+        # Production services stay systemd's, so a Mac run never kickstarts the human's own dashboard
+        service_manager.MANAGER_ENV: service_manager.SYSTEMD,
         # The developer's own Claude Code sign-in
         CREDENTIALS_ENV: str(root / "claude-credentials.json"),
+        # ...and its macOS twin, the login Keychain
+        keychain.SECURITY_BIN_ENV: str(root / "no-security"),
         # The developer's own installed `jarvis.service`, which `INV-SERVICE-PATH` reads
         release.UNIT_DIR_ENV: str(root / "systemd-units"),
         # The developer's own production checkout, which `INV-PROD-CLEAN` reads (#202)
@@ -131,14 +136,18 @@ def load_sessions():
         return []
 
 def save_sessions(s):
-    with open(sessions_path, "w") as f:
+    # Renamed into place: a background session's child writes this while `agents` reads it
+    tmp = f"{sessions_path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(s, f)
+    os.replace(tmp, sessions_path)
 
 argv = sys.argv[1:]
 # One file per invocation, never a shared append target: worker turns are concurrent
 # detached processes and a worker prompt is far past the 4KB atomic-append ceiling, so
 # a single calls.jsonl loses and interleaves records under any real fan-out.
 os.makedirs(calls_dir, exist_ok=True)
+# clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
 _started = time.time()
 _record_path = os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json")
 
@@ -220,14 +229,19 @@ def _write_call_record(finished=None):
                    "prompt": resolved_prompt(),
                    "started_at": _started, "finished_at": finished,
                    "cache_env": {k: os.environ[k] for k in
-                                 ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H")
+                                 ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H",
+                                  "CLAUDE_CODE_PROMPT_CACHE_TTL",
+                                  "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL")
                                  if k in os.environ}}, f)
     # Renamed into place: `Handle.calls` polls this directory while processes are still
     # running, and a half-written record it cannot parse is a call it silently drops.
     os.replace(tmp, _record_path)
 
-_write_call_record()
-atexit.register(lambda: _write_call_record(time.time()))
+# The detached child that PLAYS a background session is not an invocation anyone made
+if argv[:1] != ["__bg_session__"]:
+    _write_call_record()
+    # clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
+    atexit.register(lambda: _write_call_record(time.time()))
 
 def opt(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
@@ -260,8 +274,191 @@ def emit_headless(result_text):
             "contextWindow": 200000, "maxOutputTokens": 32000}},
     }))
 
+
+# -- A WORKER'S BACKGROUND SESSION (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md).
+# Told apart from the legacy `spawn_background` path by `-n` vs `--name`. Mirrors the facts
+# measured on 2.1.308: `--bg` mints the id and prints `backgrounded · <short>`; the roster
+# carries `pid` + `status` (busy/idle); `--resume` FORKS when the original is still alive or
+# when any flag is passed, and continues the SAME session only bare and stopped; `stop` keeps
+# the entry with no pid; `respawn` brings the process back under the same id; `rm` deletes.
+import fcntl
+
+def _locked_sessions(mutate):
+    with open(sessions_path + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        sessions = load_sessions()
+        out = mutate(sessions)
+        save_sessions(sessions)
+        return out
+
+def _stamp():
+    # clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
+    now = time.time()
+    return (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+            + f".{int(now % 1 * 1000):03d}Z")
+
+def _transcript(sid):
+    root = os.environ.get("JARVIS_TRANSCRIPT_ROOT") or os.path.join(state_dir, "transcripts")
+    d = os.path.join(root, "-fake")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, sid + ".jsonl")
+
+def _say(sid, rows):
+    with open(_transcript(sid), "a") as f:
+        for row in rows:
+            f.write(json.dumps({"timestamp": _stamp(), "sessionId": sid, **row}) + "\n")
+
+def _assistant(sid, n, text, model="claude-fake-1", spent=True):
+    usage = ({"input_tokens": 3, "cache_creation_input_tokens": 1000,
+              "cache_read_input_tokens": 2000, "output_tokens": 100,
+              "cache_creation": {"ephemeral_5m_input_tokens": 1000,
+                                 "ephemeral_1h_input_tokens": 0}}
+             if spent else {"input_tokens": 0, "output_tokens": 0})
+    return {"type": "assistant", "message": {
+        "id": f"msg-{sid[:8]}-{n}-{time.time_ns()}", "model": model, "role": "assistant",
+        "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+        "usage": usage}}
+
+def _set(sid, **fields):
+    def go(sessions):
+        for e in sessions:
+            if e.get("sessionId") == sid:
+                for k, v in fields.items():
+                    if v is None:
+                        e.pop(k, None)
+                    else:
+                        e[k] = v
+    _locked_sessions(go)
+
+def _run_bg_session(sid):
+    """The session's one turn: what the real CLI leaves in the transcript and the roster"""
+    with open(os.path.join(state_dir, "bgprompts", sid)) as f:
+        prompt = f.read()
+    os.makedirs(turns_dir, exist_ok=True)
+    with open(os.path.join(turns_dir, sid + ".jsonl"), "a") as f:
+        f.write(json.dumps(prompt) + "\n")
+    seq = sum(1 for _ in open(os.path.join(turns_dir, sid + ".jsonl")))
+    mode = os.environ.get("FAKE_CLAUDE_TURN", "")
+    _say(sid, [{"type": "user", "message": {"role": "user", "content": prompt}}])
+    hold = os.environ.get("FAKE_CLAUDE_TURN_HOLD")
+    if hold:
+        while os.path.exists(hold):
+            time.sleep(0.02)
+    if mode in ("fail", "silent"):
+        # The process dies mid-turn: no reply, no process
+        _set(sid, pid=None, status=None)
+        return
+    if mode == "rate_limit":
+        reset = os.environ.get("FAKE_CLAUDE_LIMIT_RESET", "11:50pm (America/Los_Angeles)")
+        _say(sid, [_assistant(sid, seq, "You've hit your session limit · resets " + reset,
+                              model="<synthetic>", spent=False)])
+    elif mode == "auth":
+        _say(sid, [_assistant(sid, seq, os.environ.get(
+            "FAKE_CLAUDE_AUTH_MESSAGE",
+            "Failed to authenticate: OAuth session expired and could not be refreshed"),
+            model="<synthetic>", spent=False)])
+    elif mode == "api_error":
+        status = os.environ.get("FAKE_CLAUDE_API_ERROR_STATUS", "500")
+        _say(sid, [_assistant(sid, seq, "working on it"),
+                   _assistant(sid, seq, f"API Error: {status} Internal server error. This "
+                              "is a server-side issue, usually temporary — try again in a "
+                              "moment.", model="<synthetic>", spent=False)])
+    elif mode == "error":
+        _say(sid, [_assistant(sid, seq, "API Error: model call failed",
+                              model="<synthetic>", spent=False)])
+    elif prompt.strip() == "/compact":
+        if os.environ.get("FAKE_CLAUDE_COMPACT") != "noop":
+            _say(sid, [{"type": "system", "subtype": "compact_boundary",
+                        "compactMetadata": {"trigger": "manual", "preTokens": 3003,
+                                            "postTokens": 900}}])
+    else:
+        _say(sid, [_assistant(sid, seq, f"final: {prompt[:60]}")])
+    _set(sid, status="idle", state="done")
+
+if argv[:1] == ["__bg_session__"]:
+    _run_bg_session(argv[1])
+    sys.exit(0)
+
+def _launch_bg_session(sid, prompt):
+    import subprocess
+    os.makedirs(os.path.join(state_dir, "bgprompts"), exist_ok=True)
+    with open(os.path.join(state_dir, "bgprompts", sid), "w") as f:
+        f.write(prompt)
+    child = subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                              "__bg_session__", sid],
+                             # Never the parent's pipes: its caller waits for their EOF
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    return child.pid
+
+def _bg_worker():
+    import uuid
+    prompt = argv[-1] if "--" in argv else ""
+    resumed = opt("--resume")
+    bare = resumed is not None and argv[:4] == ["--bg", "--resume", resumed, "--"]
+    if os.environ.get("FAKE_CLAUDE_BG_FAIL"):
+        sys.stderr.write("bg launch failed (test-forced)\n"); sys.exit(1)
+    sessions = load_sessions()
+    orig = next((e for e in sessions if e.get("sessionId") == resumed), None) if resumed else None
+    if resumed and orig is None and not os.path.exists(os.path.join(turns_dir, resumed + ".jsonl")):
+        sys.stderr.write(f"No conversation found with session ID: {resumed}\n"); sys.exit(1)
+    if resumed and orig is not None and not orig.get("pid") and bare:
+        sid, note = resumed, f"note: woke session {resumed[:8]} with its saved options"
+    elif resumed and orig is None and bare:
+        sid, note = resumed, ""  # a conversation no background agent held yet
+    elif resumed:
+        sid = str(uuid.uuid4())
+        note = (f"note: session {resumed[:8]} is already running in the background, so "
+                f"this started a copy as {sid[:8]}" if orig and orig.get("pid") else
+                f"note: background session {resumed[:8]} keeps its own saved options, so "
+                f"the flags you passed started a copy as {sid[:8]}")
+    else:
+        sid, note = str(uuid.uuid4()), ""
+    wt = opt("--worktree")
+    cwd = os.path.join(os.getcwd(), ".claude", "worktrees", wt) if wt else os.getcwd()
+    name = opt("-n") or (orig or {}).get("name", "")
+    def add(sessions):
+        sessions[:] = [e for e in sessions if e.get("sessionId") != sid]
+        sessions.append({"id": sid[:8], "sessionId": sid, "cwd": (orig or {}).get("cwd", cwd)
+                         if sid == resumed else cwd,
+                         "kind": "background", "name": name, "status": "busy",
+                         "state": "working", "startedAt": 0, "worker": True,
+                         "argv": argv[:-1], "prompt": prompt[:40]})
+    _locked_sessions(add)
+    _set(sid, pid=_launch_bg_session(sid, prompt))
+    if note:
+        sys.stderr.write(note + "\n")
+    print(f"backgrounded · {sid[:8]} · {name}\n  claude stop {sid[:8]}      stop this session")
+
+def _bg_find(short):
+    return next((e for e in load_sessions() if e.get("id") == short), None)
+
 if "--version" in argv:
     print("9.9.9 (fake claude)")
+elif "--bg" in argv and "--name" not in argv:
+    _bg_worker()
+elif argv[:1] in (["stop"], ["kill"]) and (_bg_find(argv[1]) or {}).get("worker"):
+    entry = _bg_find(argv[1])
+    if entry.get("pid"):
+        import signal
+        try:
+            os.killpg(entry["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+    _set(entry["sessionId"], pid=None, status=None)
+    print(f"stopped {argv[1]}")
+elif argv[:1] == ["respawn"]:
+    entry = _bg_find(argv[1])
+    if entry is None:
+        sys.stderr.write(f"no such session {argv[1]}\n"); sys.exit(1)
+    # A respawned session has nothing to do: it comes back idle, under the same id
+    _set(entry["sessionId"], pid=900000 + len(load_sessions()), status="idle")
+    print(f"respawned {argv[1]}")
+elif argv[:1] == ["rm"]:
+    if _bg_find(argv[1]) is None:
+        sys.stderr.write(f"no such session {argv[1]}\n"); sys.exit(1)
+    _locked_sessions(lambda ss: ss.__setitem__(slice(None), [e for e in ss if e.get("id") != argv[1]]))
+    print(f"removed {argv[1]}")
 elif argv[:1] == ["agents"]:
     print(json.dumps(load_sessions()))
 elif "--bg" in argv:
@@ -384,6 +581,7 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
             # Sub-second, because the window it has to land inside is one turn of a test
             # that takes milliseconds: a stamp floored to the second lands BEFORE
             # `started_at` and `usage.said_in_session` drops it.
+            # clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
             now = time.time()
             stamp = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
                      + f".{int(now % 1 * 1000):03d}Z")
@@ -477,6 +675,25 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
     # is the delta — so a correct reader still sees 0.01 and 3,000 written tokens on
     # every turn of a ten-turn order, and a reader that sums the running total sees ten
     # different answers.
+    #
+    # A `/compact` LEAVES A BOUNDARY in the transcript, as the real CLI's does: the OS
+    # settles a compaction turn against it. FAKE_CLAUDE_COMPACT=noop is the turn that
+    # returned ok and summarised nothing (wo-299daf2e).
+    root = os.environ.get("JARVIS_TRANSCRIPT_ROOT")
+    if (prompt.strip() == "/compact" and root
+            and os.environ.get("FAKE_CLAUDE_COMPACT") != "noop"):
+        d = os.path.join(root, "-fake")
+        os.makedirs(d, exist_ok=True)
+        # clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
+        now = time.time()
+        stamp = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+                 + f".{int(now % 1 * 1000):03d}Z")
+        with open(os.path.join(d, sid + ".jsonl"), "a") as f:
+            f.write(json.dumps({
+                "type": "system", "subtype": "compact_boundary", "timestamp": stamp,
+                "compactMetadata": {"trigger": "manual", "preTokens": 3003,
+                                    "postTokens": 900},
+            }) + "\n")
     print(json.dumps({
         "type": "result", "subtype": "success", "is_error": False,
         "session_id": sid, "result": f"final: {prompt[:60]}",
@@ -942,6 +1159,21 @@ elif "-p" in argv and "--resume" not in argv:
             verdict = {"escalate": True, "verdict": "deny", "stakes": "routine",
                        "reason": "test default: assumption reviews escalate unless "
                                  "forced"}
+    elif "Would the user accept it?" in prompt:
+        # One improvement-order finding (`findings.build_finding_question`). Escalates by
+        # default for the plan review's reason; FORCE_FINDING_ACCEPT_<SEVERITY> rates it.
+        rated = next((s for s in ("blocker", "critical", "major", "medium", "minor",
+                                  "cosmetic")
+                      if f"FORCE_FINDING_ACCEPT_{s.upper()}" in prompt), "")
+        if rated:
+            verdict = {"escalate": False, "verdict": "accept", "severity": rated,
+                       "reason": f"test-forced acceptance, rated {rated}"}
+        elif "FORCE_FINDING_REJECT" in prompt:
+            verdict = {"escalate": False, "verdict": "reject", "severity": "medium",
+                       "reason": "test-forced: the evidence does not show the mechanism"}
+        else:
+            verdict = {"escalate": True, "verdict": "", "severity": "medium",
+                       "reason": "test default: findings escalate unless forced"}
     elif "Release this plan?" in prompt:
         # A feature order's plan review — the third question kind, and the third verdict
         # shape. Same defaulting rule as the gate above and for the same reason: a fake
@@ -1181,7 +1413,7 @@ elif argv[:2] == ["pr", "list"]:
     # `ops.submit_plan`'s refusal is built on. Registered by `set_open_pr`.
     branch = argv[argv.index("--head") + 1] if "--head" in argv else ""
     rows = json.loads(os.environ.get("FAKE_GH_OPEN_PRS", "{}")).get(branch, [])
-    print(json.dumps([{"url": u} for u in rows]))
+    print(json.dumps([u if isinstance(u, dict) else {"url": u} for u in rows]))
 elif argv[:2] == ["run", "list"]:
     # The BASE branch's CI history. Keyed by branch, because the whole recogniser turns
     # on "was main red when this check ran", and a fake that answered one list for every
@@ -1354,6 +1586,22 @@ elif argv[:2] == ["pr", "diff"]:
         sys.stderr.write("no pull requests found for this URL\n")
         sys.exit(1)
     sys.stdout.write(pr.get("_diff", ""))
+elif argv[:2] == ["pr", "ready"]:
+    # Takes a draft out of draft, through the same overlay a merge writes
+    prs = roster()
+    url = argv[2] if len(argv) > 2 else ""
+    if url not in prs:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    try:
+        with open(merged_path) as f:
+            landed = json.load(f)
+    except (OSError, ValueError):
+        landed = {}
+    landed[url] = {**landed.get(url, {}), "isDraft": False}
+    with open(merged_path, "w") as f:
+        json.dump(landed, f)
+    print(f"Pull request {url} is marked as ready for review")
 elif argv[:2] == ["pr", "merge"]:
     # THE ONE WRITE THE OS EVER MAKES. It is modelled on the property the whole
     # auto-merge design rests on: `--match-head-commit <sha>` is refused by the SERVER
@@ -1585,6 +1833,119 @@ def fake_systemd(tmp_path, monkeypatch):
     return Handle()
 
 
+FAKE_LAUNCHCTL = r"""#!/usr/bin/env python3
+# Fake `launchctl print|kickstart -k`, output shapes copied from the live production Mac
+import json, os, sys
+
+state_dir = os.environ["FAKE_LAUNCHD_DIR"]
+jobs_dir = os.path.join(state_dir, "jobs")
+argv = sys.argv[1:]
+with open(os.path.join(state_dir, "ctl-calls.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": argv}) + "\n")
+
+def load(label):
+    try:
+        with open(os.path.join(jobs_dir, label + ".json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+def missing(label):
+    sys.stderr.write(
+        'Could not find service "%s" in domain for user gui: %s\n' % (label, os.getuid()))
+    sys.exit(113)
+
+if argv[:1] == ["print"] and len(argv) == 2:
+    label = argv[1].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    print("%s = {" % label)
+    print("\tstate = %s" % rec.get("state", "running"))
+    if rec.get("pid") is not None:
+        print("\tpid = %s" % rec["pid"])
+    print("\tlast exit code = %s" % rec.get("exit", 0))
+    print("}")
+elif argv[:2] == ["kickstart", "-k"] and len(argv) == 3:
+    label = argv[2].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    # A new pid proves the restart made a new process
+    rec["pid"] = int(rec.get("pid") or 0) + 1
+    rec["state"] = "running"
+    with open(os.path.join(jobs_dir, label + ".json"), "w") as f:
+        json.dump(rec, f)
+elif argv[:1] == ["bootout"] and len(argv) == 2:
+    label = argv[1].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    os.rename(os.path.join(jobs_dir, label + ".json"),
+              os.path.join(state_dir, label + ".booted-out.json"))
+elif argv[:1] == ["bootstrap"] and len(argv) == 3:
+    fails = os.path.join(state_dir, "bootstrap-failures")
+    left = int(open(fails).read()) if os.path.exists(fails) else 0
+    if left > 0:
+        with open(fails, "w") as f:
+            f.write(str(left - 1))
+        sys.stderr.write("Bootstrap failed: 5: Input/output error\n"); sys.exit(5)
+    label = os.path.basename(argv[2])[:-len(".plist")]
+    old = os.path.join(state_dir, label + ".booted-out.json")
+    try:
+        with open(old) as f:
+            rec = json.load(f)
+        os.unlink(old)
+    except (OSError, ValueError):
+        rec = {}
+    rec["pid"] = int(rec.get("pid") or 0) + 1
+    rec["state"] = "running"
+    rec["plist"] = argv[2]
+    with open(os.path.join(jobs_dir, label + ".json"), "w") as f:
+        json.dump(rec, f)
+else:
+    sys.stderr.write("fake launchctl: unhandled argv %s\n" % argv); sys.exit(2)
+"""
+
+
+@pytest.fixture()
+def fake_launchd(tmp_path, monkeypatch):
+    """Put the two production services on the launchd path, against a fake `launchctl`"""
+    ldir = tmp_path / "fake-launchd"
+    (ldir / "jobs").mkdir(parents=True)
+    ctl_bin = ldir / "launchctl"
+    ctl_bin.write_text(FAKE_LAUNCHCTL)
+    ctl_bin.chmod(ctl_bin.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("FAKE_LAUNCHD_DIR", str(ldir))
+    monkeypatch.setenv(service_manager.LAUNCHCTL_BIN_ENV, str(ctl_bin))
+    monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.LAUNCHD)
+
+    class Handle:
+        dir = ldir
+
+        @property
+        def calls(self) -> list[list[str]]:
+            path = ldir / "ctl-calls.jsonl"
+            return ([json.loads(ln)["argv"] for ln in path.read_text().splitlines()]
+                    if path.exists() else [])
+
+        @property
+        def jobs(self) -> dict[str, dict]:
+            return {p.stem: json.loads(p.read_text())
+                    for p in (ldir / "jobs").glob("*.json")}
+
+        def load(self, label: str, state: str = "running", pid: int | None = 4242,
+                 exit_code: int = 0) -> None:
+            """Make `label` a job launchd knows about"""
+            (ldir / "jobs" / f"{label}.json").write_text(
+                json.dumps({"state": state, "pid": pid, "exit": exit_code}))
+
+        def bootout(self, label: str) -> None:
+            (ldir / "jobs" / f"{label}.json").unlink(missing_ok=True)
+
+    return Handle()
+
+
 #: The repository every fixture in this harness pretends is the OS's bug tracker
 FIXTURE_BUG_REPO = "jarvis-fixture/no-such-tracker"
 FIXTURE_ISSUE_URL = f"https://github.com/{FIXTURE_BUG_REPO}/issues/7"
@@ -1738,7 +2099,7 @@ def fake_gh(tmp_path, monkeypatch):
                    checks: list[dict] | None = None,
                    merge_state: str | None = None, head_oid: str = "",
                    base_oid: str = "", merge_commit: str = "",
-                   head_ref: str = "") -> None:
+                   head_ref: str = "", draft: bool | None = None) -> None:
             """Register what `gh pr view <pr_url>` answers (#232)"""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
@@ -1759,6 +2120,8 @@ def fake_gh(tmp_path, monkeypatch):
             # `mergeCommit.oid`, the commit the merge put on the base
             if merge_commit:
                 row["mergeCommit"] = {"oid": merge_commit}
+            if draft is not None:
+                row["isDraft"] = draft
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
             # "Re-calling re-states it" includes un-doing a merge the fake performed: this is the authoritative...
@@ -1798,7 +2161,7 @@ def fake_gh(tmp_path, monkeypatch):
 
         open_prs: dict[str, list[str]] = {}
 
-        def set_open_pr(self, branch: str, *urls: str) -> None:
+        def set_open_pr(self, branch: str, *urls: str | dict) -> None:
             """What `gh pr list --head <branch> --state open` answers"""
             self.open_prs[branch] = list(urls)
             monkeypatch.setenv("FAKE_GH_OPEN_PRS", json.dumps(self.open_prs))
@@ -1877,11 +2240,34 @@ def jarvis_home(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_HOME", str(home))
     if not _bills_real_tokens():
         monkeypatch.setenv(agent_usage.SPEND_HOME_ENV, str(home))
+        # A suite run INSIDE a worker session inherits its `JARVIS_WO_ID`
+        monkeypatch.delenv("JARVIS_WO_ID", raising=False)
     # CLAUDE CODE'S TRANSCRIPTS FOLLOW THE HOME, for the same reason and one of their own
     transcripts = tmp_path / "claude-projects"
     transcripts.mkdir(exist_ok=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(transcripts))
     return home
+
+
+@pytest.fixture()
+def live_daemon(jarvis_home):
+    """A fleet whose jarvisd is UP: a pidfile for this process and a fresh reconcile stamp (docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md)"""
+    from . import db
+    from .central_store import CentralStore
+    from .daemon import RECONCILE_EVERY_TICKS, RECONCILE_TICK_KEY, daemon_pidfile
+
+    pidfile = daemon_pidfile()
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    pidfile.write_text(str(os.getpid()))
+    central = CentralStore()
+    try:
+        central.set_state("daemon_started_at", str(db.now()))
+        central.set_state(RECONCILE_TICK_KEY, db.to_json(
+            {"ts": db.now(), "interval": RECONCILE_EVERY_TICKS * 5.0}))
+    finally:
+        central.close()
+    yield
+    pidfile.unlink(missing_ok=True)
 
 
 @pytest.fixture()
@@ -2000,6 +2386,13 @@ def fake_claude(tmp_path, monkeypatch):
         def turns_recover(self) -> None:
             """Undo `turns_fail`/`turns_rate_limited`/`turns_api_error`/ `turns_auth_failed`: turns succeed again"""
             monkeypatch.delenv("FAKE_CLAUDE_TURN", raising=False)
+
+        def compactions_summarise_nothing(self, on: bool = True) -> None:
+            """A `/compact` that returns ok and leaves no boundary — or, `on=False`, a real one again"""
+            if on:
+                monkeypatch.setenv("FAKE_CLAUDE_COMPACT", "noop")
+            else:
+                monkeypatch.delenv("FAKE_CLAUDE_COMPACT", raising=False)
 
         def hold_turns(self) -> Path:
             """Make subsequent turns block until the returned path is deleted"""
@@ -2154,7 +2547,7 @@ def signin(tmp_path, monkeypatch):
             "expiresAt": int((time.time() + 3600) * 1000),
             "refreshTokenExpiresAt": int((time.time() + refresh_expires_in) * 1000),
         }}))
-        # ALWAYS stamped explicitly, including the `at=None` case, and from `time.time()`
+        # clock-exempt: class 4 — a real file mtime, stamped explicitly including at=None
         stamp = time.time() if at is None else at
         os.utime(path, (stamp, stamp))
         return path
@@ -2200,6 +2593,50 @@ def project(tmp_path, claude_json):
     p = make_git_project(tmp_path, "proj_a")
     claude_json(p)  # trusted, like a real project the user works in
     return p
+
+
+#: Seed for every faked `db.now` — 2025-10-09T07:33:20Z, a constant, never time.time()
+TEST_EPOCH = 1760000000.0
+
+
+class _Clock:
+    """A faked `db.now` in four modes (docs/superpowers/specs/2026-10-15-no-test-reads-the-real-clock.md §1)"""
+
+    def __init__(self, at: float) -> None:
+        self.at = at
+        self._step = 0.0
+
+    def __call__(self) -> float:
+        at = self.at
+        self.at += self._step
+        return at
+
+    def advance(self, seconds: float, /) -> float:
+        """Move the clock by SECONDS — positional-only, so `advance(minutes=…)` is a TypeError"""
+        self.at += seconds
+        return self.at
+
+    def ticking(self) -> None:
+        """From here on, every read is strictly later than the last"""
+        self._step = 1.0
+
+    @contextlib.contextmanager
+    def moved(self, seconds: float, /):
+        """One block at a different instant, restored even if the block raises"""
+        before = self.at
+        self.at = before + seconds
+        try:
+            yield self
+        finally:
+            self.at = before
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    """A controlled `db.now`; NOT autouse — `db.now` stamps every row in all three databases"""
+    c = _Clock(TEST_EPOCH)
+    monkeypatch.setattr("jarvis.db.now", c)
+    return c
 
 
 @pytest.fixture()
@@ -2325,7 +2762,8 @@ def catalog_file(tmp_path, project):
     data = {
         "os": {
             # `max_in_flight` well out of the way: the shipped default (3) is TIGHTER than the project default...
-            "defaults": {"model": "sonnet", "max_in_flight": 50},  # permission_mode: auto
+            "defaults": {"model": "sonnet", "max_in_flight": 50,  # permission_mode: auto
+                         "transport": "headless"},
             "notifications": {"sinks": ["log"]},
         },
         "projects": [
@@ -2660,3 +3098,11 @@ def self_dispatch_on(monkeypatch):
 
     monkeypatch.setattr(catalog_mod, "_parse_autonomy", _autonomy)
     monkeypatch.setattr(catalog_mod, "_parse_fleet_health", _fleet_health)
+
+
+@pytest.fixture()
+def user_decides_findings(monkeypatch):
+    """Leave every findings report to the user, as before Neo decided them (`os.neo.review_findings`)"""
+    from . import ops
+
+    monkeypatch.setattr(ops, "findings_reviewed_by_neo", lambda: False)

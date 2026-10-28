@@ -1,5 +1,6 @@
 """An order that wrote code must carry its pull request (INV-PR-RECORDED) (#42)"""
 
+# clock-exempt: class 3 — one real time.sleep(0.01) so two work_abandoned timestamps differ; not a deadline loop
 from __future__ import annotations
 
 import json
@@ -370,6 +371,138 @@ def test_route_a_feature_manager_records_what_it_authored(started, project):
 
     assert _payload(project, manager["id"], "feature_settled")["authored"]["commits"] == 1
     assert [v.wo_id for v in _violations(project)] == [manager["id"]]
+
+
+# -- a pushed branch with no pull request: the third value `unlanded_work` never had (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md)
+
+
+def _pushed_order(project: Path, **kw) -> dict:
+    """`_order`, with the branch pushed the way the worker's own `git push` leaves it"""
+    wo = _order(project, **kw)
+    _git(wo["worktree_path"], "push", "-q", "origin", f"worktree-{wo['id']}")
+    return wo
+
+
+def test_a_kind_that_does_not_land_code_is_still_refused_over_a_pushed_branch(started, project):
+    """An analyst's pushed commit has no pull request route, so the refusal stands"""
+    wo = _pushed_order(project, code="launcher", kind="analyst")
+
+    with pytest.raises(ops.OpsError, match="does not land code"):
+        ops.finish(wo["id"], "pushed a branch it may not land")
+
+    store = ProjectStore(project)
+    try:
+        assert store.pr_pending_open(wo["id"]) is None
+    finally:
+        store.close()
+
+
+def test_finish_no_longer_refuses_a_pushed_branch(started, project):
+    """§2: no refusal, the ordinary path, and `land_finished` parks on `pr_pending`"""
+    wo = _pushed_order(project, code="launcher")
+
+    out = ops.finish(wo["id"], "pushed the branch — the gh account cannot open the PR")
+
+    assert out["status"] == "needs_review"
+    park = _payload(project, wo["id"], "pr_pending")
+    assert park["branch"] == f"worktree-{wo['id']}"
+    assert park["pushed"] is True and park["commits"] == 1
+    assert park["was"] == "pending"      # the status it was held out of
+    # Never the other episode too (§5)
+    store = ProjectStore(project)
+    try:
+        assert store.events_of_kind(wo["id"], "work_unlanded") == []
+        assert store.work_unlanded_open(wo["id"]) is False
+        assert store.pr_pending_open(wo["id"]) is not None
+    finally:
+        store.close()
+
+
+def test_finish_still_refuses_uncommitted_files(started, project):
+    """§1"""
+    wo = _pushed_order(project, code="launcher")
+    (wo["worktree_path"] / "never_added.py").write_text(_feature("orphan"))
+
+    with pytest.raises(ops.OpsError, match="--abandon"):
+        ops.finish(wo["id"], "done")
+
+    assert _row(project, wo["id"])["status"] != "needs_review"
+
+
+def test_finish_still_refuses_a_commit_the_remote_does_not_have(started, project):
+    """No URL would show the user the code, so the refusal stands"""
+    wo = _pushed_order(project, code="launcher")
+    (wo["worktree_path"] / "second.py").write_text(_feature("second"))
+    _git(wo["worktree_path"], "add", "-A")
+    _git(wo["worktree_path"], "commit", "-qm", "after the push")
+
+    with pytest.raises(ops.OpsError, match="--abandon"):
+        ops.finish(wo["id"], "done")
+
+
+def test_the_pr_pending_park_is_written_once_however_many_ticks_run(started, project):
+    """`park_unlanded`'s once-per-episode discipline, mirrored (§2)"""
+    wo = _pushed_order(project, code="scratch")
+    store = ProjectStore(project)
+    try:
+        turn = store.create_turn(wo["id"], "dispatch", "go")
+        store.finish_turn(turn["id"] if isinstance(turn, dict) else turn, "done")
+        store.update_work_order(wo["id"], result_summary="pushed it")
+        store.set_status(wo["id"], "running")
+        for _ in range(5):
+            started.settle_work_order(started.catalog.projects[0], store,
+                                      store.get_work_order(wo["id"]))
+            assert store.get_work_order(wo["id"])["status"] == "needs_review"
+        parks = store.events_of_kind(wo["id"], "pr_pending")
+        flags = store.events_of_kind(wo["id"], "attention")
+    finally:
+        store.close()
+
+    assert len(parks) == 1, f"the park re-fired: {len(parks)} pr_pending events"
+    assert len(flags) == 1, f"the flag re-fired: {len(flags)} attention events"
+
+
+def test_accepting_the_assumptions_parks_on_the_specific_blocker(started, project):
+    """§2's free half and §7.1"""
+    wo = _pushed_order(project, code="watchdogs")
+    ops.assume(wo["id"], "polled every 30s")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "needs_review")
+    finally:
+        store.close()
+
+    out = ops.review_work_order(wo["id"], accept=True)
+
+    assert out["status"] == "needs_review"
+    # §7.2
+    assert out["pr_pending"]["branch"] == f"worktree-{wo['id']}"
+    assert out["pr_pending"]["base"]
+    store = ProjectStore(project)
+    try:
+        row = store.get_work_order(wo["id"])
+        assert invariants.true_blockers(store, row)[0].startswith(
+            f"branch `worktree-{wo['id']}` is pushed and has no pull request")
+    finally:
+        store.close()
+
+
+def test_wo_show_renders_the_park_whatever_the_blocker_ranks(started, project):
+    """§7.2"""
+    from jarvis.timeline import build_timeline
+
+    wo = _pushed_order(project, code="launcher")
+    ops.finish(wo["id"], "pushed it")
+    store = ProjectStore(project)
+    try:
+        entry = next(e for e in build_timeline(store.get_work_order(wo["id"]),
+                                               store.list_events(wo["id"]), [])
+                     if e["kind"] == "pr_pending")
+    finally:
+        store.close()
+
+    assert entry["label"] == "Pushed, with no pull request yet"
+    assert f"worktree-{wo['id']}" in entry["detail"]
 
 
 # -- the invariant

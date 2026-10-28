@@ -18,6 +18,9 @@ WORKER_SUBPROCESS = "worker_subprocess"
 #: The `/compact` the OS sends before a prompt whose cache has expired (`worker_session.compact`)
 COMPACTION = "compaction"
 
+#: Morpheus's long-lived session (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+MORPHEUS = "morpheus"
+
 #: Kinds that belong to the WORKER rather than to the OS
 SUBPROCESS_KINDS = frozenset({WORKER_SUBPROCESS})
 
@@ -53,6 +56,7 @@ KIND_LABELS = {
     OBSERVE_CONTEXT: "reading the context ledger",
     OBSERVE_WHY: "diagnosing why the order is not moving",
     OBSERVE_CONTEXT_WRITE: "recording the context ledger",
+    MORPHEUS: "Morpheus writing validation scripts",
 }
 
 #: Where accounting rows go when that must differ from `$JARVIS_HOME` (#103)

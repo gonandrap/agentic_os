@@ -70,9 +70,7 @@ def test_assumptions_flow(project):
 
 
 def test_add_assumption_still_takes_two_positional_arguments(project):
-    """The cited-section columns are OPTIONAL keywords: every existing caller — the CLI,
-    `invariants.check_assumptions_persisted`, the screenshot scripts — keeps working and
-    writes NULL, which reads as "cited no section"."""
+    """The cited-section columns are OPTIONAL keywords: every existing caller"""
     store = ProjectStore(project)
     wo = store.create_work_order("x")
 
@@ -88,8 +86,7 @@ def test_add_assumption_still_takes_two_positional_arguments(project):
 
 
 def test_the_cited_section_columns_migrate_onto_a_pre_existing_database(project):
-    """Spec test 8: the three columns ship in `ADDED_COLUMNS`, so a database written before
-    them gets them on the next open. Old rows read NULL on all three — "cited no section"."""
+    """Spec test 8: the three columns ship in `ADDED_COLUMNS`"""
     store = ProjectStore(project)
     wo_id = store.create_work_order("filed before the columns existed")["id"]
     db_path = store.db_path
@@ -453,6 +450,119 @@ def test_only_db_write_transaction_opens_a_transaction():
     assert offenders == [], (
         "open transactions with `db.write_transaction`, not a bare BEGIN — its "
         "docstring says what a deferred one costs")
+
+
+def test_a_settling_round_reaches_another_connection_with_its_event(project):
+    """Issue #1203: the invariant sweep read a settled round whose event was not written yet"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+    go, done, ready = threading.Event(), threading.Event(), threading.Event()
+    seen: dict = {}
+
+    def sweeper() -> None:
+        other = ProjectStore(project)   # opened BEFORE the write: construction writes too
+        ready.set()
+        try:
+            assert go.wait(timeout=15)
+            seen["outcome"] = other.latest_validation_round(wo_id=wo["id"])["outcome"]
+            seen["kinds"] = [e["kind"] for e in other.list_events(wo["id"])]
+        finally:
+            other.close()
+            done.set()
+
+    thread = threading.Thread(target=sweeper, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=15)
+
+    def let_the_sweep_read_between_the_two_writes(sql: str) -> None:
+        if sql.strip().upper().startswith("INSERT INTO WO_EVENTS") and not go.is_set():
+            go.set()
+            done.wait(timeout=15)
+
+    store.conn.set_trace_callback(let_the_sweep_read_between_the_two_writes)
+    try:
+        store.settle_validation_round(rnd["id"], "escalated",
+                                      {"round": 1, "round_id": rnd["id"]},
+                                      wo_id=wo["id"], reason="three rounds, no deal")
+    finally:
+        store.conn.set_trace_callback(None)
+        thread.join(timeout=15)
+
+    assert done.is_set(), "the other connection never got its read in"
+    assert (seen["outcome"] == "pending") or ("validation_escalated" in seen["kinds"]), (
+        "a second connection saw the round settled with no event on the timeline")
+    assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "escalated"
+    assert "validation_escalated" in [e["kind"] for e in store.list_events(wo["id"])]
+
+
+def test_a_status_move_reaches_another_connection_with_its_event(project):
+    """Issue #1205: the sweep read a span whose `status` event was not written yet"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    go, done, ready = threading.Event(), threading.Event(), threading.Event()
+    seen: dict = {}
+
+    def sweeper() -> None:
+        other = ProjectStore(project)   # opened BEFORE the write: construction writes too
+        ready.set()
+        try:
+            assert go.wait(timeout=15)
+            seen["spans"] = [s["to_status"] for s in other.state_spans(wo["id"])]
+            seen["events"] = [(db.from_json(e["payload"], {}) or {}).get("status")
+                              for e in other.events_of_kind(wo["id"], "status")]
+        finally:
+            other.close()
+            done.set()
+
+    thread = threading.Thread(target=sweeper, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=15)
+
+    def let_the_sweep_read_between_the_span_and_its_event(sql: str) -> None:
+        # The callback runs BEFORE its statement: the span is written by now, the event is not
+        if sql.strip().upper().startswith("INSERT INTO WO_EVENTS") and not go.is_set():
+            go.set()
+            done.wait(timeout=15)
+
+    store.conn.set_trace_callback(let_the_sweep_read_between_the_span_and_its_event)
+    try:
+        store.set_status(wo["id"], "needs_review")
+    finally:
+        store.conn.set_trace_callback(None)
+        thread.join(timeout=15)
+
+    assert done.is_set(), "the other connection never got its read in"
+    assert "needs_review" not in seen["spans"] or "needs_review" in seen["events"], (
+        "a second connection saw a span with no `status` event beside it")
+    assert "needs_review" in [s["to_status"] for s in store.state_spans(wo["id"])]
+
+
+def test_a_repair_is_dropped_when_the_row_left_the_status_it_derived_from(project):
+    """Issue #1205, second half: a repair writes only against the row it derived from"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    store.set_status(wo["id"], "validating")
+    store.flag_attention(wo["id"], "something")
+
+    def retire() -> None:
+        store.set_status(wo["id"], "completed")
+        store.clear_attention(wo["id"])
+
+    assert store.repair_while(wo["id"], "validating", retire)
+    assert store.get_work_order(wo["id"])["status"] == "completed"
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+    assert not store.repair_while(wo["id"], "validating",
+                                  lambda: store.flag_attention(wo["id"], "stale"))
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+    fo = store.create_feature_order("a feature", description="all of it")
+    store.set_feature_status(fo["id"], "failed")
+    assert not store.repair_while(
+        fo["id"], "executing",
+        lambda: store.flag_feature_attention(fo["id"], "stale"), kind="fo")
+    assert not store.get_feature_order(fo["id"])["needs_attention"]
 
 
 def test_approvals_of_kind_is_not_bounded_by_the_generic_listings_window(project):

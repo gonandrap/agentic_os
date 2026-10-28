@@ -7,11 +7,11 @@ import os
 import re
 import subprocess
 import threading
-import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from . import db
 from .catalog import WiringConfig
 
 #: Nothing in a settings file can unwire one of these individually
@@ -166,7 +166,7 @@ def cached(*, refresh: bool = False) -> Inventory | None:
     """The last inventory, re-read in the background when it is stale or forced"""
     with _LOCK:
         inv = _STATE["inventory"]
-        if inv is not None and not refresh and time.time() - inv.ts < CACHE_SECONDS:
+        if inv is not None and not refresh and db.now() - inv.ts < CACHE_SECONDS:
             return inv
         thread = _STATE["thread"]
         if thread is None or not thread.is_alive():
@@ -188,10 +188,10 @@ def discover(*, refresh: bool = False, timeout: int = 90) -> Inventory:
     """Everything the user has configured, with no project applied"""
     with _LOCK:
         inv = _STATE["inventory"]
-    if not refresh and inv is not None and time.time() - inv.ts < CACHE_SECONDS:
+    if not refresh and inv is not None and db.now() - inv.ts < CACHE_SECONDS:
         return inv
 
-    inv = Inventory(ts=time.time())
+    inv = Inventory(ts=db.now())
     plugin_ids: set[str] = set()
     try:
         for entry in read_plugins(timeout=min(timeout, 30)):
@@ -239,7 +239,7 @@ def discover(*, refresh: bool = False, timeout: int = 90) -> Inventory:
         detail="the skills and workflows the CLI ships (code review, dataviz, …)",
         note="they wire as one block"))
 
-    inv.ts = time.time()  # stamped when the read FINISHED: that is what goes stale
+    inv.ts = db.now()  # stamped when the read FINISHED: that is what goes stale
     with _LOCK:
         _STATE["inventory"] = inv
     return inv

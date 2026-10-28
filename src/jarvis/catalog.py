@@ -17,6 +17,7 @@ from . import probes as probes_mod
 from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
+from .session_dispatch import Launcher, parse_launcher
 from .navigation import (DOC_DIRS, DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
                          SOURCE_SUFFIXES, SYMBOL_TOOLS, TEXT_SEARCH_TOOLS)
 from .neo_store import Q_KINDS, SEATS
@@ -39,6 +40,12 @@ SAFETY_KEYS = (
     "*.schedule.*",
     # Files work nobody typed: same class of act as the scheduler
     "os.autonomy.*",
+    # How much of that the steward may spend, and how deep it may go (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
+    "os.evolution.weekly_usd", "os.evolution.critical_weekly_usd",
+    "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
+    "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_refs_by_kind",
+    "os.evolution.min_precision",
+    "os.evolution.mode",
     # What the OS is permitted to WATCH (docs/superpowers/specs/2026-09-27-self-evolution.md)
     "*.rules.*",
 )
@@ -67,6 +74,9 @@ DEFAULT_WORKER_TOOL_SEARCH = "on"
 # WHICH PROMPT-CACHE TTL a worker TURN's writes are billed at. §1 of... (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
 VALID_WORKER_CACHE_TTL = ("5m", "1h", "cli")
 DEFAULT_WORKER_CACHE_TTL = "5m"
+#: What a worker turn runs on: one `claude --bg` session for the conversation (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+VALID_WORKER_TRANSPORT = ("background", "headless")
+DEFAULT_WORKER_TRANSPORT = "background"
 
 # Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a `.py` path. §6... (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)
 VALID_PY_NAV_HOOK = ("off", "on")
@@ -108,7 +118,15 @@ DEFAULT_BUDGET_USD: float | None = None
 DEFAULT_FEATURE_BUDGET_USD: float | None = None
 
 # THE ONE NON-None SHIPPED BUDGET (docs/superpowers/specs/2026-09-27-investigation-orders.md)
-DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 2.00
+DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 4.00
+# Where 4.00 came from — a string, not a comment, so it is read and tested and never trimmed away
+DEFAULT_INVESTIGATION_BUDGET_MEASUREMENT = (
+    "Measured 2026-10-21 over the 86 investigator work orders in jarvis_os's project db "
+    "(2026-10-01..2026-10-20): first pass (wo_turns.seq=1) min $0.55, median $1.08, "
+    "p90 $1.73, max $2.28, 4 truncated at the old $2.00 cap. The old $2.00 was one pass, "
+    "so 3 of 3 investigations in io-b521d17b stopped budget_exhausted. Sized at two p90 "
+    "passes ($3.46), rounded up. Re-run: per work_orders.kind='investigator', the "
+    "wo_turns.cost_usd of seq=1")
 
 # Cheap by default for the same reason: a diagnosis is reading and quoting, not design
 DEFAULT_INVESTIGATION_MODEL = "sonnet"
@@ -222,6 +240,8 @@ class WorkerDefaults:
     tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL
     cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
+    # Spec 2026-10-22-workers-on-background-sessions.md — see VALID_WORKER_TRANSPORT
+    transport: str = DEFAULT_WORKER_TRANSPORT
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK
     py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK
@@ -238,8 +258,10 @@ class WorkerDefaults:
     investigation_budget_usd: float | None = DEFAULT_INVESTIGATION_BUDGET_USD
     investigation_model: str | None = DEFAULT_INVESTIGATION_MODEL
     investigation_effort: str | None = DEFAULT_INVESTIGATION_EFFORT
-    # Whether the lead must delegate file edits to its crew. §7 of... (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)
-    require_crew: bool = True
+    # Whether the lead must delegate file edits to its crew (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+    require_crew: bool = False
+    # The local command that launches this project's sessions (docs/superpowers/specs/2026-10-22-session-dispatch.md)
+    launcher: Launcher | None = None
     # What one MCP tool call may take, in milliseconds (#845)
     mcp_tool_timeout_ms: int = DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS
     denied_tools: tuple[str, ...] = DEFAULT_WORKER_DENIED_TOOLS
@@ -275,8 +297,13 @@ DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 # How long the reconciler may wait for a merged child's commit to appear on the default branch before... (docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md)
 DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES = 15
 
+# Withdrawn share of early objections that reaches the inbox, 1 = off (io-ce566253)
+DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE = 0.5
+
 #: Which net answers "is this assumption high-stakes?" before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
 STAKES_CLASSIFIER_MODES = ("regex", "shadow", "classifier", "regex-tightened")
+# The measured winner (spec 2026-09-25 §7: precision 0.486 / recall 0.944 vs regex 0.140 / 0.667)
+DEFAULT_STAKES_CLASSIFIER = "regex-tightened"
 
 
 @dataclass
@@ -310,7 +337,9 @@ class ValidationConfig:
     # The cap above, per project
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
     # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
-    stakes_classifier: str = "regex"
+    stakes_classifier: str = DEFAULT_STAKES_CLASSIFIER
+    # WHEN FAILING EARLY OBJECTIONS REACH THE INBOX: withdrawn over sent (io-ce566253)
+    objection_withdrawal_alarm_rate: float = DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE
 
 
 # -- the house style: how terse the OS holds its workers
@@ -321,8 +350,11 @@ class ConcisionConfig:
     """The one number the concision machinery needs per project (docs/superpowers/specs/2026-09-19-concision-enforced.md)"""
 
     summary_max_words: int = concision.DEFAULT_SUMMARY_MAX_WORDS
-    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo send` / `wo assume`... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
+    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo send`... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     message_max_chars: int = concision.DEFAULT_MESSAGE_MAX_CHARS
+    #: ONE DECISION per assumption, ONE question per ask: both 0 switch their check off (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §1)
+    assume_max_chars: int = concision.DEFAULT_ASSUME_MAX_CHARS
+    question_max_chars: int = concision.DEFAULT_QUESTION_MAX_CHARS
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -357,6 +389,9 @@ DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
 #: How long a work order may sit with its turn ended and nothing in flight before...
 DEFAULT_INSPECT_ALARM_PARKED_MINUTES = 60
 
+#: How far back the compaction post-conditions look for a chained or unproven compaction (io-12b7d873)
+DEFAULT_INSPECT_ALARM_COMPACTION_WINDOW_DAYS = 7
+
 # -- the AGGREGATE half of the re-write tax
 
 #: The cohort window, in days
@@ -385,6 +420,9 @@ DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS = 500_000
 #: The same, for turns JARVIS ITSELF dispatched
 DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS = 50_000
 
+#: Tokens a STAMPED turn paid at the TTL it was NOT armed for (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
+DEFAULT_INSPECT_ALARM_CACHE_ARM_MISSED_TOKENS = 50_000
+
 #: `InspectConfig` fields that are a FRACTION, not a count
 INSPECT_FRACTION_KEYS = ("alarm_rewrite_prefix_share", "alarm_rewrite_ttl_share")
 
@@ -407,6 +445,7 @@ class InspectConfig:
     alarm_subagent_tool_minutes: int = DEFAULT_INSPECT_ALARM_SUBAGENT_TOOL_MINUTES
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
+    alarm_compaction_window_days: int = DEFAULT_INSPECT_ALARM_COMPACTION_WINDOW_DAYS
     alarm_rewrite_window_days: int = DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS
     alarm_rewrite_prefix_share: float = DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE
     alarm_rewrite_ttl_share: float = DEFAULT_INSPECT_ALARM_REWRITE_TTL_SHARE
@@ -416,6 +455,8 @@ class InspectConfig:
     alarm_cache_1h_tokens: int = DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS
     alarm_cache_1h_dispatched_tokens: int = \
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
+    alarm_cache_arm_missed_tokens: int = \
+        DEFAULT_INSPECT_ALARM_CACHE_ARM_MISSED_TOKENS
 
 
 # -- `ui_health`: the dashboard's own liveness, and the self-heal that answers it
@@ -438,6 +479,12 @@ DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS = 300
 #: Self-restarts allowed in a rolling 24h
 DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY = 3
 
+#: An unreachable dashboard this recently (re)started is still booting, not wedged
+DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS = 60
+
+#: Heartbeat staleness at which the OS-thread watchdog dumps stacks itself (issue #1221)
+DEFAULT_UI_HEALTH_LOOP_STALL_SECONDS = 90
+
 
 @dataclass
 class UiHealthConfig:
@@ -450,6 +497,8 @@ class UiHealthConfig:
     healthz_timeout_seconds: int = DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS
     restart_cooldown_seconds: int = DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS
     max_restarts_per_day: int = DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY
+    boot_grace_seconds: int = DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS
+    loop_stall_seconds: int = DEFAULT_UI_HEALTH_LOOP_STALL_SECONDS
 
 
 # -- `fleet_health`: when an order that has stopped moving gets investigated. §4 of
@@ -755,6 +804,12 @@ class WiringConfig:
 #: Tracked files an installed TOOL owns and rewrites
 DEFAULT_TOOL_MANAGED_PATHS = (".serena/project.yml",)
 
+#: How long a settled order's checkout is kept before the daemon reclaims it; 0 = never (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md)
+DEFAULT_WORKTREE_RECLAIM_AFTER_HOURS = 24
+
+#: Free gigabytes under which the daemon raises ONE attention item; 0 = never (same spec, §2)
+DEFAULT_DISK_FREE_WARN_GB = 5.0
+
 
 @dataclass
 class WorktreeConfig:
@@ -762,6 +817,7 @@ class WorktreeConfig:
 
     #: Repo-relative paths
     tool_managed_paths: tuple[str, ...] = DEFAULT_TOOL_MANAGED_PATHS
+    reclaim_after_hours: int = DEFAULT_WORKTREE_RECLAIM_AFTER_HOURS
 
 
 @dataclass
@@ -829,12 +885,38 @@ class RemedyConfig:
 #: How many samples a median in the evolution report needs before it is reported as one (§9 of... (docs/superpowers/specs/2026-09-27-self-evolution.md)
 DEFAULT_EVOLUTION_MIN_SAMPLES = 3
 
+#: The steward's ledger (§3.3 of... (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
+DEFAULT_EVOLUTION_WEEKLY_USD = 150.0
+DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD = 60.0
+DEFAULT_EVOLUTION_YIELD_ABOVE_USD = 900.0
+DEFAULT_EVOLUTION_ORDER_BUDGET_USD = 25.0
+DEFAULT_EVOLUTION_MAX_DEPTH = 1
+DEFAULT_EVOLUTION_MAJOR_MIN_REFS = 1
+DEFAULT_EVOLUTION_MEDIUM_MIN_REFS = 3
+#: Per origin kind, in place of the severity's `*_min_refs`: Neo raises a cleanup once, in one verdict
+DEFAULT_EVOLUTION_MIN_REFS_BY_KIND = {"neo_rider": 1}
+DEFAULT_EVOLUTION_MIN_PRECISION = 0.2
+#: `shadow` decides and records but changes no dispatch; `enforce` applies the decision
+EVOLUTION_MODES = ("shadow", "enforce")
+
 
 @dataclass
 class EvolutionConfig:
     """What the §9 evolution report needs before it believes its own numbers.... (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
 
     min_samples: int = DEFAULT_EVOLUTION_MIN_SAMPLES
+    # The steward (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md...
+    weekly_usd: float = DEFAULT_EVOLUTION_WEEKLY_USD
+    critical_weekly_usd: float = DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD
+    yield_above_usd: float = DEFAULT_EVOLUTION_YIELD_ABOVE_USD
+    order_budget_usd: float = DEFAULT_EVOLUTION_ORDER_BUDGET_USD
+    max_depth: int = DEFAULT_EVOLUTION_MAX_DEPTH
+    major_min_refs: int = DEFAULT_EVOLUTION_MAJOR_MIN_REFS
+    medium_min_refs: int = DEFAULT_EVOLUTION_MEDIUM_MIN_REFS
+    min_refs_by_kind: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_EVOLUTION_MIN_REFS_BY_KIND))
+    min_precision: float = DEFAULT_EVOLUTION_MIN_PRECISION
+    mode: str = "shadow"
 
 
 @dataclass
@@ -948,7 +1030,69 @@ class NeoConfig:
     digest_model: str = "haiku"
     #: How much of a question the digest model is shown, clipped and LABELLED (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     digest_max_question_chars: int = DEFAULT_DIGEST_MAX_QUESTION_CHARS
+    #: Neo decides each improvement-order finding for the user; the steward decides what it files
+    review_findings: bool = True
     panel: PanelConfig = field(default_factory=PanelConfig)
+
+
+#: The answers `os.morpheus.on_failed` / `on_timeout` may give
+MORPHEUS_ACTIONS = ("investigate", "neo")
+
+
+@dataclass
+class MorpheusConfig:
+    """Morpheus, the production validator (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)"""
+
+    enabled: bool = True
+    model: str = "sonnet"
+    timeout_days: float = 3.0
+    check_every_minutes: int = 15
+    script_timeout_seconds: int = 60
+    #: Compact Morpheus's session once its context passes this share of the window
+    compact_at: float = 0.30
+    on_failed: str = "investigate"
+    on_timeout: str = "neo"
+    turn_timeout_seconds: int = 900
+
+
+def _parse_morpheus(raw: Any, where: str = "os.morpheus") -> MorpheusConfig:
+    """`os.morpheus`, field-level over the defaults"""
+    base = MorpheusConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    enabled = raw.get("enabled", base.enabled)
+    if not isinstance(enabled, bool):
+        raise _err(f"{where}.enabled must be true or false, got {enabled!r}")
+    try:
+        cfg = MorpheusConfig(
+            enabled=enabled,
+            model=str(raw.get("model", base.model) or base.model),
+            timeout_days=float(raw.get("timeout_days", base.timeout_days)),
+            check_every_minutes=int(raw.get("check_every_minutes",
+                                            base.check_every_minutes)),
+            script_timeout_seconds=int(raw.get("script_timeout_seconds",
+                                               base.script_timeout_seconds)),
+            compact_at=float(raw.get("compact_at", base.compact_at)),
+            on_failed=str(raw.get("on_failed", base.on_failed)),
+            on_timeout=str(raw.get("on_timeout", base.on_timeout)),
+            turn_timeout_seconds=int(raw.get("turn_timeout_seconds",
+                                             base.turn_timeout_seconds)),
+        )
+    except (TypeError, ValueError) as e:
+        raise _err(f"{where}: {e}") from e
+    if cfg.timeout_days <= 0:
+        raise _err(f"{where}.timeout_days must be > 0")
+    for name in ("check_every_minutes", "script_timeout_seconds", "turn_timeout_seconds"):
+        if getattr(cfg, name) < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    if not 0.0 < cfg.compact_at < 1.0:
+        raise _err(f"{where}.compact_at must be a share of the window between 0 and 1, "
+                   f"got {cfg.compact_at}")
+    for name in ("on_failed", "on_timeout"):
+        if getattr(cfg, name) not in MORPHEUS_ACTIONS:
+            raise _err(f"{where}.{name} must be one of {list(MORPHEUS_ACTIONS)}, "
+                       f"got {getattr(cfg, name)!r}")
+    return cfg
 
 
 @dataclass
@@ -962,6 +1106,8 @@ class OsConfig:
     default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL
     default_cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
+    # Spec 2026-10-22-workers-on-background-sessions.md — see VALID_WORKER_TRANSPORT
+    default_transport: str = DEFAULT_WORKER_TRANSPORT
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK
     default_py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK
@@ -986,6 +1132,8 @@ class OsConfig:
     compact_min_context: int | None = DEFAULT_COMPACT_MIN_CONTEXT
     #: Backstop ceiling on one OS-side model call's combined prompt
     max_os_prompt_chars: int = DEFAULT_MAX_OS_PROMPT_CHARS
+    #: The floor the daemon warns under, before SQLite starts failing
+    disk_free_warn_gb: float = DEFAULT_DISK_FREE_WARN_GB
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -1020,6 +1168,7 @@ class OsConfig:
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
     autonomy: AutonomyConfig = field(default_factory=AutonomyConfig)
+    morpheus: MorpheusConfig = field(default_factory=MorpheusConfig)
 
 
 @dataclass
@@ -1075,6 +1224,15 @@ def _compact_min_context_or_err(os_raw: dict[str, Any]) -> int | None:
                    f"{COMPACT_MIN_CONTEXT_MIN}, where compacting costs more than the "
                    f"re-write it replaces (use null to switch compaction off)")
     return value
+
+
+def _disk_free_warn_gb_or_err(os_raw: dict[str, Any]) -> float:
+    """`os.disk_free_warn_gb`, validated at boot — 0 is the off switch"""
+    value = os_raw.get("disk_free_warn_gb", DEFAULT_DISK_FREE_WARN_GB)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise _err(f"os.disk_free_warn_gb must be a non-negative number of gigabytes "
+                   f"(0 to never warn), got {value!r}")
+    return float(value)
 
 
 def _max_os_prompt_chars_or_err(os_raw: dict[str, Any]) -> int:
@@ -1243,7 +1401,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     if assumption_spec_chars < 1:
         raise _err(f"{where}.assumption_spec_chars must be >= 1")
     stakes_classifier = str(
-        raw.get("stakes_classifier", base.stakes_classifier) or "regex")
+        raw.get("stakes_classifier", base.stakes_classifier) or DEFAULT_STAKES_CLASSIFIER)
     if stakes_classifier not in STAKES_CLASSIFIER_MODES:
         # The `roster` precedent: refused loudly rather than shrugged to the default
         raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
@@ -1253,6 +1411,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     if feature_merge_wait_minutes < 0:
         # 0 is legal and means "never defer": check once, flag immediately
         raise _err(f"{where}.feature_merge_wait_minutes must be >= 0")
+    withdrawal_rate = float(raw.get("objection_withdrawal_alarm_rate",
+                                    base.objection_withdrawal_alarm_rate))
+    if not 0.0 <= withdrawal_rate <= 1.0:
+        # A share: 1 means never raise it, 0 means raise it on any withdrawal at all
+        raise _err(f"{where}.objection_withdrawal_alarm_rate must be between 0 and 1")
     max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
     if max_follow_ups < 0:
         # 0 is legal and is NOT the same setting as `follow_ups: false`: it files nothing while leaving every...
@@ -1280,6 +1443,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         auto_review=bool(raw.get("auto_review", base.auto_review)),
         # Same fallback again — see `ValidationConfig.stakes_classifier`
         stakes_classifier=stakes_classifier,
+        objection_withdrawal_alarm_rate=withdrawal_rate,
     )
 
 
@@ -1309,6 +1473,8 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                        base.alarm_write_tokens)),
         alarm_parked_minutes=int(raw.get("alarm_parked_minutes",
                                          base.alarm_parked_minutes)),
+        alarm_compaction_window_days=int(raw.get("alarm_compaction_window_days",
+                                                 base.alarm_compaction_window_days)),
         alarm_rewrite_window_days=int(raw.get("alarm_rewrite_window_days",
                                               base.alarm_rewrite_window_days)),
         alarm_rewrite_prefix_share=float(raw.get("alarm_rewrite_prefix_share",
@@ -1326,6 +1492,9 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
         alarm_cache_1h_dispatched_tokens=int(
             raw.get("alarm_cache_1h_dispatched_tokens",
                     base.alarm_cache_1h_dispatched_tokens)),
+        alarm_cache_arm_missed_tokens=int(
+            raw.get("alarm_cache_arm_missed_tokens",
+                    base.alarm_cache_arm_missed_tokens)),
     )
     for name, value in vars(cfg).items():
         if name in INSPECT_FRACTION_KEYS:
@@ -1360,6 +1529,10 @@ def _parse_ui_health(raw: Any, base: UiHealthConfig | None = None,
                                              base.restart_cooldown_seconds)),
         max_restarts_per_day=int(raw.get("max_restarts_per_day",
                                          base.max_restarts_per_day)),
+        boot_grace_seconds=int(raw.get("boot_grace_seconds",
+                                       base.boot_grace_seconds)),
+        loop_stall_seconds=int(raw.get("loop_stall_seconds",
+                                       base.loop_stall_seconds)),
     )
     for name, value in vars(cfg).items():
         if name != "enabled" and value < 1:
@@ -1594,7 +1767,42 @@ def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
     min_samples = int(raw.get("min_samples", base.min_samples))
     if min_samples < 1:
         raise _err(f"{where}.min_samples must be 1 or more, got {min_samples}")
-    return EvolutionConfig(min_samples=min_samples)
+    money = {}
+    for key in ("weekly_usd", "critical_weekly_usd", "yield_above_usd", "order_budget_usd"):
+        value = float(raw.get(key, getattr(base, key)))
+        if value < 0:
+            raise _err(f"{where}.{key} must be 0 or more, got {value}")
+        money[key] = value
+    # `critical_weekly_usd` above `weekly_usd` is not refused: the steward checks both
+    counts = {}
+    for key in ("max_depth", "major_min_refs", "medium_min_refs"):
+        value = int(raw.get(key, getattr(base, key)))
+        if value < 0:
+            raise _err(f"{where}.{key} must be 0 or more, got {value}")
+        counts[key] = value
+    by_kind = raw.get("min_refs_by_kind", {})
+    if not isinstance(by_kind, dict):
+        raise _err(f"{where}.min_refs_by_kind must be an object of origin kind -> count")
+    from .steward import ORIGIN_KINDS
+
+    # Merged over the base: setting one kind does not silently drop the shipped `neo_rider`
+    counts["min_refs_by_kind"] = dict(base.min_refs_by_kind)
+    for kind, raw_value in by_kind.items():
+        if kind not in ORIGIN_KINDS:
+            raise _err(f"{where}.min_refs_by_kind.{kind}: not an origin kind; "
+                       f"one of {list(ORIGIN_KINDS)}")
+        value = int(raw_value)
+        if value < 0:
+            raise _err(f"{where}.min_refs_by_kind.{kind} must be 0 or more, got {value}")
+        counts["min_refs_by_kind"][kind] = value
+    min_precision = float(raw.get("min_precision", base.min_precision))
+    if not 0 <= min_precision <= 1:
+        raise _err(f"{where}.min_precision must be between 0 and 1, got {min_precision}")
+    mode = str(raw.get("mode", base.mode))
+    if mode not in EVOLUTION_MODES:
+        raise _err(f"{where}.mode must be one of {list(EVOLUTION_MODES)}, got {mode!r}")
+    return EvolutionConfig(min_samples=min_samples, min_precision=min_precision,
+                           mode=mode, **money, **counts)
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
@@ -1615,7 +1823,18 @@ def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
     if 0 < chars < 1000:
         raise _err(f"{where}.message_max_chars of {chars} leaves no message that can "
                    f"pass; use 0 to switch the cap off")
-    return ConcisionConfig(summary_max_words=words, message_max_chars=chars)
+    # No floor clause for these two: 1000 IS the assume cap (spec §1)
+    assume_chars = int(raw.get("assume_max_chars", base.assume_max_chars))
+    if assume_chars < 0:
+        raise _err(f"{where}.assume_max_chars must be 0 (off) or more, got "
+                   f"{assume_chars}")
+    question_chars = int(raw.get("question_max_chars", base.question_max_chars))
+    if question_chars < 0:
+        raise _err(f"{where}.question_max_chars must be 0 (off) or more, got "
+                   f"{question_chars}")
+    return ConcisionConfig(summary_max_words=words, message_max_chars=chars,
+                           assume_max_chars=assume_chars,
+                           question_max_chars=question_chars)
 
 
 def _parse_bugs(raw: Any, base: BugsConfig | None = None,
@@ -1719,7 +1938,11 @@ def _parse_worktree(raw: Any, base: WorktreeConfig | None = None,
             raise _err(f"{where}.tool_managed_paths entry {path!r} must be repo-relative")
         if ".." in PurePosixPath(path).parts:
             raise _err(f"{where}.tool_managed_paths entry {path!r} must not contain '..'")
-    return WorktreeConfig(tool_managed_paths=paths)
+    hours = raw.get("reclaim_after_hours", base.reclaim_after_hours)
+    if isinstance(hours, bool) or not isinstance(hours, int) or hours < 0:
+        raise _err(f"{where}.reclaim_after_hours must be a non-negative integer "
+                   f"(0 to never reclaim)")
+    return WorktreeConfig(tool_managed_paths=paths, reclaim_after_hours=hours)
 
 
 def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
@@ -1903,6 +2126,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         timeout=int(neo_raw.get("timeout", 300)),
         digest_model=str(neo_raw.get("digest_model", "haiku")),
         digest_max_question_chars=_digest_max_question_chars_or_err(neo_raw),
+        review_findings=bool(neo_raw.get("review_findings", True)),
         panel=_parse_panel(neo_raw.get("panel", {})),
     )
 
@@ -1916,6 +2140,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
         # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1
         default_cache_ttl=defaults.get("cache_ttl", DEFAULT_WORKER_CACHE_TTL),
+        default_transport=defaults.get("transport", DEFAULT_WORKER_TRANSPORT),
         # Spec 2026-10-02-serena-the-cheap-path.md §6
         default_py_nav_hook=defaults.get("py_nav_hook", DEFAULT_WORKER_PY_NAV_HOOK),
         # Spec 2026-10-06-navigate-specs-like-code.md §5
@@ -1946,6 +2171,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         cache_health_prefix_share=health_prefix,
         compact_min_context=_compact_min_context_or_err(os_raw),
         max_os_prompt_chars=_max_os_prompt_chars_or_err(os_raw),
+        disk_free_warn_gb=_disk_free_warn_gb_or_err(os_raw),
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 8)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 1000)),
@@ -1972,6 +2198,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         wiring=_parse_wiring(os_raw.get("wiring", {})),
         worktree=_parse_worktree(os_raw.get("worktree", {})),
         autonomy=_parse_autonomy(os_raw.get("autonomy", {})),
+        morpheus=_parse_morpheus(os_raw.get("morpheus", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -1987,6 +2214,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_cache_ttl not in VALID_WORKER_CACHE_TTL:
         raise _err(f"os.defaults.cache_ttl {os_cfg.default_cache_ttl!r} not in "
                    f"{sorted(VALID_WORKER_CACHE_TTL)}")
+    if os_cfg.default_transport not in VALID_WORKER_TRANSPORT:
+        raise _err(f"os.defaults.transport {os_cfg.default_transport!r} not in "
+                   f"{sorted(VALID_WORKER_TRANSPORT)}")
     # Spec 2026-10-02-serena-the-cheap-path.md §6
     if os_cfg.default_py_nav_hook not in VALID_PY_NAV_HOOK:
         raise _err(f"os.defaults.py_nav_hook {os_cfg.default_py_nav_hook!r} not in "
@@ -2044,6 +2274,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if cache_ttl not in VALID_WORKER_CACHE_TTL:
             raise _err(f"project {name}: worker.cache_ttl {cache_ttl!r} not in "
                        f"{sorted(VALID_WORKER_CACHE_TTL)}")
+        transport = w.get("transport", os_cfg.default_transport)
+        if transport not in VALID_WORKER_TRANSPORT:
+            raise _err(f"project {name}: worker.transport {transport!r} not in "
+                       f"{sorted(VALID_WORKER_TRANSPORT)}")
         # Spec 2026-10-02-serena-the-cheap-path.md §6
         py_nav_hook = w.get("py_nav_hook", os_cfg.default_py_nav_hook)
         if py_nav_hook not in VALID_PY_NAV_HOOK:
@@ -2060,7 +2294,14 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
-        require_crew = w.get("require_crew", True)
+        try:
+            launcher = parse_launcher(w.get("launcher"), f"project {name}: worker.launcher")
+        except ValueError as e:
+            raise _err(str(e)) from e
+        if launcher is not None and launcher.open and transport != "background":
+            raise _err(f"project {name}: worker.launcher.open opens a background session, "
+                       f"so worker.transport must be background (got {transport!r})")
+        require_crew = w.get("require_crew", False)
         if not isinstance(require_crew, bool):
             raise _err(f"project {name}: worker.require_crew must be true or false, "
                        f"got {require_crew!r}")
@@ -2082,6 +2323,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             bash_first=bash_first,
             tool_search=tool_search,
             cache_ttl=cache_ttl,
+            transport=transport,
+            launcher=launcher,
             py_nav_hook=py_nav_hook,
             doc_nav_hook=doc_nav_hook,
             doc_read_limit_lines=doc_read_limit_lines,

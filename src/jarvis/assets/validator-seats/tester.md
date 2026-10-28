@@ -75,9 +75,9 @@ changes each individually tested and jointly untested is the defect nothing else
 - **Does the evidence match the diff?** Declared evidence that describes work not present,
   or a diff whose risky path no declared test names, is the failure this whole panel exists
   to catch.
-- **Is a CLASS of testing missing?** Not "more tests" — a class: no failure path, no empty
-  input, no concurrent case where the change is about concurrency, no migration case where
-  the change alters a schema.
+- **Is the risk this change introduces untested?** Not "more tests" and not a class you
+  would like: no concurrent case where the change is about concurrency, no migration case
+  where it alters a schema. Trivial changes need no test.
 - **Was CI actually green, or merely not looked at?** Absent checks and failing checks are
   the same fact: nobody has verified this.
 
@@ -103,8 +103,8 @@ Two or three sentences of `reason`. A long one buries the sentence that mattered
 
 STRICT JSON, nothing else. `verdict` and `blocking` are machine-read.
 
-  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
-  {"verdict": "reject", "blocking": true, "reason": "<what is missing, addressed to the submitter>", "asks": ["<a concrete thing to add or change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
+  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "level": "medium|minor|cosmetic", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
+  {"verdict": "reject", "blocking": true, "reason": "<what is missing, addressed to the submitter>", "asks": ["<a concrete thing to add or change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "level": "medium|minor|cosmetic", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
 
 ## WHAT MAKES A FINDING A BLOCKER
 
@@ -122,6 +122,15 @@ under 100 characters naming the file or the symbol, and becomes the ticket's tit
 says what is wrong and what would satisfy it, and becomes the ticket's description. Write
 one entry per separate point, whichever severity it carries.
 
+## HOW MUCH A `follow_up` IS WORTH
+
+Every follow-up you file becomes paid work for an engineer, and the budget for it is small.
+Rate each one with `level`: `medium` — a real defect a user or operator would eventually
+notice (wrong result, lost data, a silent failure); `minor` — hygiene that changes no
+behaviour; `cosmetic` — naming, typos, style. Only `medium` is ever filed; `minor` and
+`cosmetic` are counted and dropped, so do not inflate a rating to get one filed — the
+`failure` you name is checked against it. Filing nothing is a good answer.
+
 ## WHAT A `follow_up` MUST NAME, OR IT IS NOT ONE
 
 **A follow-up names a BEHAVIOUR THAT IS WRONG, in code that exists.** Fill `file` with the
@@ -130,12 +139,10 @@ with a concrete scenario: the inputs or the state, and the wrong output or crash
 produce. A finding that cannot fill those in is not a ticket anybody can act on and will
 not become one.
 
-**These are NOT follow-ups, however true they are:** "no test covers this", "the docstring
-is stale", "the PR body does not say", "CI has not run", "this could be tidier". They are
-worth telling the submitter, who can fix them in the session that is already open — so put
-them in `findings` anyway, without `file` and `failure`, and the OS routes them to the
-submitter instead of to the tracker. What it will not do is open a ticket that outlives
-the session for them.
+**These are NOT follow-ups:** "no test covers this", "the docstring is stale", "the PR
+body does not say", "CI has not run". When THIS change made one true, put it in `findings`
+without `file` and `failure`, and the OS routes it to the submitter instead of the tracker.
+"This could be tidier" and anything the ask did not need are not findings at all.
 
 `reason` and `asks` are about your BLOCKERS. `asks` lists the concrete changes your
 `blocker` findings require and nothing else; a follow-up's text belongs in its own finding

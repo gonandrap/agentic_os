@@ -368,7 +368,7 @@ def test_a_promoted_hold_is_live_not_stranding(started, store, central):
     central.mark_backlog(item["id"], "promoted")
 
     rows = store.open_preconditions(wo["id"])
-    assert ops._split_preconditions(rows) == ([item["id"]], [])
+    assert ops._split_preconditions(rows, store) == ([item["id"]], [])
 
     with pytest.raises(ops.OpsError) as e:
         ops.unblock_work_order(wo["id"])
@@ -460,6 +460,43 @@ def test_the_status_label_names_the_hold_and_the_way_out(store):
 
     assert "bl-d5baa28b" in label and f"jarvis wo unblock {wo['id']}" in label
     assert "the predicate fix" in label
+
+
+def test_precondition_note_is_the_one_formatter_status_label_prints(store):
+    """§4 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is- not-stuck.md: one..."""
+    one = store.create_work_order("wire the actor")
+    store.add_precondition(one["id"], "bl-d5baa28b")
+    many = store.create_work_order("wire the other actor")
+    store.add_precondition(many["id"], "bl-d5baa28b", note="the predicate fix")
+    store.add_precondition(many["id"], "#1105", note="the sweep")
+
+    for wo in (one, many):
+        rows = store.open_preconditions(wo["id"])
+        label = invariants.status_label(store, store.get_work_order(wo["id"]))
+        assert label == f"pending — {invariants.precondition_note(rows)}"
+
+    assert invariants.status_label(store, store.get_work_order(one["id"])) == (
+        f"pending — held until bl-d5baa28b clears (`jarvis wo unblock {one['id']}`)")
+    assert invariants.status_label(store, store.get_work_order(many["id"])) == (
+        f"pending — held until bl-d5baa28b, #1105 clears "
+        f"(`jarvis wo unblock {many['id']}`) — the predicate fix; the sweep")
+    assert invariants.precondition_note([]) == ""
+
+
+def test_preconditions_of_returns_cleared_rows_where_open_preconditions_cannot(store):
+    """§3.2: the discount is computed from `cleared_at`, which is invisible to `open_preconditions`"""
+    wo = store.create_work_order("wire the actor")
+    store.add_precondition(wo["id"], "bl-d5baa28b")
+    store.add_precondition(wo["id"], "#1105")
+    store.clear_precondition("bl-d5baa28b", by="os")
+
+    rows = store.preconditions_of(wo["id"])
+
+    assert [r["ref"] for r in rows] == ["bl-d5baa28b", "#1105"]
+    assert [r["status"] for r in rows] == ["cleared", "open"]
+    assert rows[0]["cleared_at"] and rows[1]["cleared_at"] is None
+    assert [r["ref"] for r in store.open_preconditions(wo["id"])] == ["#1105"]
+    assert store.preconditions_of("wo-nothing") == []
 
 
 def test_the_precondition_label_outranks_a_dependency(store):

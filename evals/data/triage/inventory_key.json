@@ -1,0 +1,29 @@
+{
+  "fixture": "inventory.py.fixture",
+  "issues": [
+    {"id": "sql-injection", "severity": "major", "anchor": "WHERE name = '{name}'",
+     "why": "user-controlled name is interpolated into SQL: read or destroy the whole database"},
+    {"id": "mutable-default", "severity": "medium", "anchor": "def add_tags(self, item_id, tags=[])",
+     "why": "the default list is shared: every call without tags accumulates 'inventory' and items share one list"},
+    {"id": "page-off-by-one", "severity": "medium", "anchor": "items[start:start + size - 1]",
+     "why": "each page silently drops its last item"},
+    {"id": "swallowed-error", "severity": "medium", "anchor": "except Exception:",
+     "why": "a missing or corrupt price file becomes an empty price list with no error"},
+    {"id": "missing-commit", "severity": "medium", "anchor": "UPDATE items SET qty = qty + ?",
+     "why": "received stock is never committed and is lost when the connection closes"},
+    {"id": "unused-import", "severity": "minor", "anchor": "import os",
+     "why": "os is never used"},
+    {"id": "file-not-closed", "severity": "minor", "anchor": "f = open(path)",
+     "why": "file handle left to the garbage collector; no behavioural change in CPython"},
+    {"id": "quadratic-dedupe", "severity": "minor", "anchor": "seen = []",
+     "why": "list membership makes dedupe O(n^2); irrelevant at shop scale"},
+    {"id": "class-name-case", "severity": "cosmetic", "anchor": "class inventoryManager:",
+     "why": "class name not CapWords"},
+    {"id": "docstring-typo", "severity": "cosmetic", "anchor": "recieve stock",
+     "why": "typo 'recieve'"},
+    {"id": "camelcase-local", "severity": "cosmetic", "anchor": "totalPrice = 0.0",
+     "why": "camelCase local variable"},
+    {"id": "eq-true", "severity": "cosmetic", "anchor": "if taxed == True:",
+     "why": "comparison to True"}
+  ]
+}

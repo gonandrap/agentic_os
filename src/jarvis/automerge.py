@@ -7,7 +7,9 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-from .project_store import validation_standing
+from .probes import BRIEF_MISMATCH
+from .project_store import (ALARM_OPEN_STATUSES, ALARM_REVIEWABLE_STATUSES,
+                            validation_standing)
 from .provenance import (
     CONTEXT_LIMIT,
     DESCRIPTION_LIMIT,
@@ -27,10 +29,13 @@ log = logging.getLogger(__name__)
 GATE_KIND = "auto_merge"
 
 #: EVERY `gh` SUBCOMMAND THIS MODULE MAY RUN
-WRITE_VERBS = (("pr", "merge"),)
+WRITE_VERBS = (("pr", "merge"), ("pr", "ready"))
 
 #: A grant covers ONE merge
 GRANT_USES = 1
+
+#: The OS took its own worker's draft out of draft, for one commit
+READY_EVENT = "automerge_marked_ready"
 
 #: A merge is one API round trip
 MERGE_TIMEOUT = 60
@@ -41,11 +46,14 @@ HELD_STATUS = "status"
 HELD_ASSUMPTIONS = "assumptions"
 #: ITS OWN CODE, never folded into `HELD_ASSUMPTIONS`: the dedupe key above would drop the second of... (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.4)
 HELD_PLAN_ASSUMPTIONS = "plan_assumptions"
+#: An open 'drifted from the ask' finding on the delivery this merge would land (#1063)
+HELD_DRIFT_ALARM = "drift_alarm"
 HELD_NOT_PASSED = "not_passed"
 HELD_SHA_UNRECORDED = "sha_unrecorded"
 HELD_SHA_MOVED = "sha_moved"
 HELD_PR_CLOSED = "pr_closed"
 HELD_NOT_MERGEABLE = "not_mergeable"
+HELD_DRAFT = "draft"
 #: Three worlds `github.PullRequest.checks_green` is false in (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §5)
 HELD_CHECKS_FAILED = "checks_failed"
 HELD_CHECKS_RUNNING = "checks_running"
@@ -101,6 +109,94 @@ class BaseRed:
     issue_os_filed: bool = False
 
 
+#: WHO can still clear a scope-drift finding — what the hold reason has to say (#1063)
+AWAITING_SUPERVISOR = "supervisor"
+AWAITING_NEO = "neo"
+AWAITING_GATE = "gate"
+AWAITING_USER = "user"
+
+#: Each one's wait, as the hold sentence states it
+AWAITING_WAIT = {
+    AWAITING_SUPERVISOR: "the supervisor has not read it yet, and this hold lifts by "
+                         "itself if the next sweep acks it",
+    AWAITING_NEO: "Neo is reading it as question {question}, and this hold lifts by "
+                  "itself if Neo answers in this order's favour",
+    AWAITING_GATE: "the supervisor has asked permission to act on it and that gate "
+                   "request is not decided",
+    AWAITING_USER: "it is with you",
+}
+
+#: The finding's own words, clipped: the whole of it is `jarvis alarms show`'s job
+DRIFT_REASON_CHARS = 300
+
+#: What `failed` means here: the supervisor review errored, and nothing re-queues it (Neo 2202)
+DRIFT_WEDGED = (" The supervisor review of it FAILED, so no sweep will settle it and "
+                "this hold lifts for nobody but you.")
+
+#: The attention line a wedged drift hold raises: a hold nobody will lift is an ASK (Neo 2202)
+DRIFT_BLOCKER = ("scope-drift alarm {alarm_id} is holding the merge and its supervisor "
+                 "review failed — `jarvis alarms review {alarm_id}`")
+
+
+@dataclass(frozen=True)
+class DriftAlarm:
+    """An open 'drifted from the ask' finding, and who can still clear it"""
+
+    alarm_id: str
+    reason: str
+    awaiting: str
+    status: str = ""
+    question_id: int = 0
+    #: `failed` self-clears for nobody, so the hold is flagged rather than waited out
+    wedged: bool = False
+
+
+def open_drift_alarm(alarms: Any) -> dict[str, Any] | None:
+    """The newest UNSETTLED scope-drift finding among one order's alarms (#1063)"""
+    found = [a for a in alarms
+             if str(a.get("probe") or "") == BRIEF_MISMATCH
+             and str(a.get("status") or "") in ALARM_OPEN_STATUSES
+             and str(a.get("review_status") or "") == "unreviewed"]
+    return found[-1] if found else None
+
+
+def drift_hold(alarm: dict[str, Any],
+               question: dict[str, Any] | None = None) -> DriftAlarm:
+    """`open_drift_alarm`'s row as the hold reads it: who owes the answer (#1063)"""
+    from .neo_store import NEO_HELD_Q_STATUSES
+
+    status = str(alarm.get("status") or "")
+    if status in ("raised", "reviewing"):
+        awaiting = AWAITING_SUPERVISOR
+    elif status == "proposed":
+        awaiting = AWAITING_GATE
+    elif status == "escalated" \
+            and str((question or {}).get("status") or "") in NEO_HELD_Q_STATUSES:
+        awaiting = AWAITING_NEO
+    else:
+        # `escalated` that Neo declined or never asked about, and `failed`
+        awaiting = AWAITING_USER
+    return DriftAlarm(alarm_id=str(alarm.get("id") or ""),
+                      reason=str(alarm.get("reason") or ""),
+                      awaiting=awaiting, status=status,
+                      question_id=int(alarm.get("neo_question_id") or 0),
+                      wedged=status == "failed")
+
+
+def drift_reason(drift: DriftAlarm) -> str:
+    """The hold sentence: which finding, what it says, and who clears it (#1063)"""
+    wait = AWAITING_WAIT[drift.awaiting].format(
+        question=f"#{drift.question_id}" if drift.question_id else "it")
+    # `jarvis alarms review` REFUSES every other status, so the sentence must not name it
+    settle = (f" and settle it with `jarvis alarms review {drift.alarm_id}`"
+              if drift.status in ALARM_REVIEWABLE_STATUSES else "")
+    return (f"the supervisor flagged this delivery as drifted from the ask — alarm "
+            f"{drift.alarm_id}: {drift.reason[:DRIFT_REASON_CHARS]}. Nothing merges "
+            f"over an open scope-drift finding, and {wait}."
+            f"{DRIFT_WEDGED if drift.wedged else ''} Read it with `jarvis alarms show "
+            f"{drift.alarm_id}`{settle}")
+
+
 @dataclass(frozen=True)
 class Decision:
     """Armed, or held with a reason a person can read"""
@@ -114,6 +210,10 @@ class Decision:
     head_sha: str = ""
     round_id: int = 0
     round_n: int = 0
+    #: `ops.CATCH_UP_*` when a refused catch-up produced this hold — the outcome, not its prose (#1173)
+    catch_up: str = ""
+    #: `ops.CATCH_UP_DEFER_*` beside it: which wait a deferral is (#1188)
+    catch_up_cause: str = ""
 
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
@@ -121,40 +221,15 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
 
 
 def hold_payload(decision: Decision) -> dict[str, Any]:
-    """The `automerge_held` event payload, in ONE place.
-
-    `Daemon._note_automerge_held` writes through this and the tests build their rows
-    through it, so the payload's shape has a single definition: a hand-written key in a
-    test could otherwise go on passing after the writer renamed one. HERE rather than in
-    `daemon`, because every reader of these keys — `ops.automerge_state`,
-    `ops._automerge_hold_is_stale`, `ops.force_validation_state` — is reading this
-    module's `Decision` back out, and `daemon` is not importable from a pure test of it.
-    """
+    """The `automerge_held` event payload, in ONE place"""
     return {"code": decision.code, "reason": decision.reason,
             "judged_sha": decision.judged_sha, "head_sha": decision.head_sha,
-            "round": decision.round_n}
+            "round": decision.round_n, "catch_up": decision.catch_up,
+            "catch_up_cause": decision.catch_up_cause}
 
 
 def hold_is_live(state: dict[str, Any] | None) -> bool:
-    """Is this `ops.automerge_state` row a hold the OS is making NOW, by the record?
-
-    The first two conditions of §3 of docs/superpowers/specs/2026-10-20-a-merge-held-for-
-    running-checks-is-not-stuck.md: the newest row is an `automerge_held` event and
-    `automerge_state` has not marked it stale. A STALE HOLD IS NO HOLD — the event is
-    immutable and `automerge_state` marks rather than drops it, so a marked one is history
-    (docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
-    merging.md §2).
-
-    THE CODE IS DELIBERATELY NOT TESTED HERE. Its three callers each want a different
-    answer about it — `invariants.automerge_checks_note` admits `HELD_CHECKS_RUNNING`
-    alone, `ops.rule_facts` publishes whichever code it is, and `ops.force_validation_
-    state` diagnoses two of them — so folding a code test in would make this predicate
-    one caller's and the other two would keep their own copy.
-
-    HERE rather than in `ops` or `invariants`: `ops` imports `invariants`, so a home in
-    `ops` is unreachable from `invariants`, and the codes this row carries are this
-    module's vocabulary. `automerge` imports neither, so no cycle is created.
-    """
+    """Is this `ops.automerge_state` row a hold the OS is making NOW, by the record?"""
     return bool(state) and state.get("kind") == "automerge_held" \
         and not state.get("stale")
 
@@ -168,15 +243,24 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
     moved = f"`{base}` has moved to {oid}" if oid else f"`{base}` has moved"
     caught = (f"caught up with `{base}` at {oid}" if oid
               else f"caught up with `{base}`")
+    cause = str(getattr(catch_up, "cause", "") or "")
+    # #1188: a deferral nothing can prove is an ASK, not a retry the OS owns
+    deferred = (
+        f"{moved}, and the head of this branch is not the commit the panel judged: the "
+        f"OS could not prove it is that commit plus merges of `{base}`, so it will NOT "
+        f"catch this branch up. Merge it by hand, re-judge it "
+        f"(`jarvis validation force`), or `jarvis wo send` the worker"
+        if cause == ops.CATCH_UP_DEFER_CARRY_UNPROVEN else
+        f"{moved}; the branch is being caught up as soon as "
+        f"{catch_up.reason or 'the work in flight'} finishes — the OS retries every "
+        f"tick")
     reason = {
-        ops.CATCH_UP_DEFERRED:
-            f"{moved}; the branch is being caught up as soon as "
-            f"{catch_up.reason or 'the work in flight'} finishes — the OS retries every "
-            f"tick",
+        ops.CATCH_UP_DEFERRED: deferred,
+        # The reason says whether the OS chases again, so the tail must not claim it never will (#1215)
         ops.CATCH_UP_EXHAUSTED:
             f"{moved} and the OS has stopped catching this branch up: "
-            f"{catch_up.reason or 'its budget is spent'}. It will NOT try again: merge it "
-            f"by hand, or `jarvis wo send` the worker to rebase",
+            f"{catch_up.reason or 'its budget is spent'}. Merge it by hand, or "
+            f"`jarvis wo send` the worker to rebase",
         ops.CATCH_UP_FAILED:
             f"{moved} and the update did not run: "
             f"{catch_up.reason or 'the OS could not say why'}. The OS retries next tick",
@@ -184,13 +268,15 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
             f"{caught}; CI is running on the new head",
     }.get(catch_up.outcome, f"{moved} and this branch does not contain it")
     return _held(HELD_BASE_MOVED, reason,
-                 head_sha=str(getattr(pr, "head_oid", "") or ""))
+                 head_sha=str(getattr(pr, "head_oid", "") or ""),
+                 catch_up=str(catch_up.outcome or ""), catch_up_cause=cause)
 
 
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
            *, validated_head: str | None,
            pending_assumptions: bool = False,
            plan_assumptions: str = "",
+           drift: DriftAlarm | None = None,
            base_red: BaseRed | None = None,
            base_behind: BaseBehind | None = None) -> Decision:
     """May the OS merge this pull request right now? (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4)"""
@@ -213,6 +299,9 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"the plan this work order implements is still waiting on you — "
                      f"assumptions on {plan_assumptions}, and the machine does not "
                      f"merge over a decision a person owes")
+    # Beside the two above and before every environmental fact: a finding about THIS artifact (#1063)
+    if drift is not None:
+        return _held(HELD_DRIFT_ALARM, drift_reason(drift))
     # Spec docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4
     on_the_break = str(wo.get("issue_url") or "")
     fixes_the_break = bool(base_red is not None and on_the_break
@@ -292,6 +381,12 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"CI was cancelled on this commit, not failed — "
                      f"{checks_evidence(aborted)} — and GitHub blocks the merge until "
                      f"it is re-run", **fields)
+    # LAST BEFORE THE MERGE STATE: a draft held here is one the OS may mark ready itself
+    if getattr(pr, "draft", False) or \
+            str(getattr(pr, "merge_state", "") or "").upper() == "DRAFT":
+        return _held(HELD_DRAFT,
+                     "the pull request is a draft, and GitHub refuses to merge a draft "
+                     "until it is marked ready for review", **fields)
     if str(getattr(pr, "merge_state", "") or "").upper() != "CLEAN":
         return _held(HELD_MERGE_STATE_UNCLEAN,
                      f"GitHub reports the merge state as "
@@ -334,6 +429,30 @@ def decided_sha(payload: dict[str, Any]) -> str:
     return str(payload.get("head_sha") or "") or sha_of_command(payload.get("command"))
 
 
+def mark_ready(store: Any, wo: dict[str, Any], head_sha: str, cwd: Any = None) -> bool:
+    """Take the order's own draft out of draft, once per commit; the merge stays gated"""
+    from . import db, github
+    from .github import gh_bin
+
+    if any(str(db.from_json(e["payload"], {}).get("head_sha") or "") == head_sha
+           for e in store.events_of_kind(wo["id"], READY_EVENT)):
+        return False
+    url = github.checked_pr_url(str(wo.get("pr_url") or ""), cwd=cwd)
+    try:
+        proc = subprocess.run([gh_bin(), "pr", "ready", url], capture_output=True,
+                              text=True, timeout=MERGE_TIMEOUT,
+                              cwd=str(cwd) if cwd is not None else None)
+        failure = "" if proc.returncode == 0 else (
+            (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}")
+    except (OSError, subprocess.SubprocessError) as e:
+        failure = str(e)
+    store.add_event(wo["id"], READY_EVENT, {"head_sha": head_sha, "pr_url": url,
+                                            "failure": failure[:500]})
+    log.info("marked %s ready for review at %s%s", url, head_sha[:10],
+             f" — failed: {failure}" if failure else "")
+    return not failure
+
+
 def _merge_args(pr_url: str, sha: str) -> list[str]:
     """`gh`'s arguments for one merge, without the binary (#253)"""
     return ["pr", "merge", pr_url, "--squash", "--match-head-commit", sha]
@@ -362,7 +481,7 @@ def protection_fact(protection: Any, base: str) -> str:
     if protection is None:
         return (f"`{base}` carries no branch protection rules: this gate and "
                 f"`--match-head-commit` are the only things standing between this commit "
-                f"and the default branch, so read the evidence above on that footing.")
+                f"and `{base}`, so read the evidence above on that footing.")
     names = protection.required_checks
     if not names:
         return (f"`{base}` is protected, and the protection requires no status check: "
@@ -407,7 +526,7 @@ def _request_question(project: str, wo: dict[str, Any], decision: Decision,
                  text=wo.get("description") or "", limit=DESCRIPTION_LIMIT)))
     parts += [
         "# What it cannot undo\n"
-        "The squash lands on the default branch. No branch is deleted, here or on the "
+        f"The squash lands on `{base}`. No branch is deleted, here or on the "
         "remote. The work order completes."
         + (f"\n{protection}" if protection else ""),
         "Approve it to let the OS merge, or deny it with a reason. Denying leaves the "

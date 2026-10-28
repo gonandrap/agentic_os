@@ -133,10 +133,31 @@ def main_pid(unit: str, attempts: int = 20, delay: float = 0.05) -> int | None:
     return None
 
 
+#: States a restart passes through, where the unit serves nothing and is not faulty either
+_TRANSITIONAL = ("activating", "reloading", "deactivating")
+
+
 def unit_active(unit: str) -> bool:
     """Is the unit still running?"""
     state = _show(unit, "ActiveState")
-    return state in ("active", "activating", "reloading", "deactivating")
+    return state in ("active", *_TRANSITIONAL)
+
+
+def unit_transitioning(unit: str) -> bool:
+    """Is the unit mid-restart — stopping or starting? (issue #1194)"""
+    return _show(unit, "ActiveState") in _TRANSITIONAL
+
+
+def uptime_seconds(unit: str) -> float | None:
+    """How long since the unit last left `inactive` — `None` when systemd will not say"""
+    raw = _show(unit, "InactiveExitTimestampMonotonic")
+    try:
+        started = int(raw) / 1_000_000          # systemd reports CLOCK_MONOTONIC µs
+    except ValueError:
+        return None
+    if started <= 0:
+        return None
+    return max(0.0, time.monotonic() - started)
 
 
 def stop_unit(unit: str) -> bool:

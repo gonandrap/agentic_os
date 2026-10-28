@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from jarvis import db
 from jarvis import budget, ops
 from jarvis.catalog import CatalogError, parse_catalog
 from jarvis.claude_cli import turn_args
@@ -62,7 +63,7 @@ def tick_until_reserved(daemon, store, fo_id: str, timeout: float = 15.0) -> dic
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         daemon.tick()
-        cut = [c for c in store.feature_children(fo_id) if c["budget_reserved_usd"]]
+        cut = [c for c in store.feature_children(fo_id, kinds=("worker",)) if c["budget_reserved_usd"]]
         if cut:
             return cut[0]
         time.sleep(0.05)
@@ -240,7 +241,7 @@ def test_a_cap_is_not_tripped_by_the_session_running_total(started, store, tmp_p
         turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
         out = turn_file(tmp_path, i, own=own, cumulative=cum, cost=cost)
         store.conn.execute("UPDATE wo_turns SET outfile=?, started_at=? WHERE id=?",
-                           (str(out), time.time() - 60, turn["id"]))
+                           (str(out), db.now() - 60, turn["id"]))
         worker_session.poll(store)
         cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
         assert cap is not None and cap.remaining_usd > 0, f"cut short at turn {i}"
@@ -448,6 +449,51 @@ def test_clearing_the_budget_resumes_it_too(started, store, fake_claude, monkeyp
     assert sent, "the clear never launched an uncapped turn"
 
 
+def _parked(started, store, fake_claude, monkeypatch) -> dict:
+    monkeypatch.setenv("FAKE_CLAUDE_TURN", "budget")
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
+    started.tick()
+    fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+    assert tick_until_parked(started, store, wo["id"]) == "budget_exhausted"
+    monkeypatch.delenv("FAKE_CLAUDE_TURN")
+    return store.get_work_order(wo["id"])
+
+
+@pytest.mark.parametrize("let_through", ["allow", "lift"])
+def test_a_raise_under_the_pause_is_held_until_the_pause_lets_it_through(
+        started, store, fake_claude, monkeypatch, let_through):
+    """Issue #1130: the pause is THE BRAKE, and a budget raise is not a way round it"""
+    wo = _parked(started, store, fake_claude, monkeypatch)
+    ops.pause_fleet(reason="spend")
+    before = len(worker_calls(fake_claude))
+
+    out = ops.set_work_order_budget(wo["id"], 20.0)
+    assert not out["resumed"]
+    assert f"jarvis resume {wo['id']}" in out["note"]
+    assert store.get_work_order(wo["id"])["budget_usd"] == 20.0
+    started.tick()
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "budget_exhausted"
+    assert f"jarvis resume {wo['id']}" in row["attention_reason"]
+    assert len(worker_calls(fake_claude)) == before
+
+    ops.resume_fleet([wo["id"]]) if let_through == "allow" else ops.resume_fleet(everything=True)
+    started.tick()
+    assert store.get_work_order(wo["id"])["status"] != "budget_exhausted"
+    assert fake_claude.wait_calls(
+        lambda c: wo["session_id"] in c["argv"] and len(worker_calls(fake_claude)) > before)
+
+
+def test_a_raise_on_an_allow_listed_order_resumes_at_once(
+        started, store, fake_claude, monkeypatch):
+    wo = _parked(started, store, fake_claude, monkeypatch)
+    ops.pause_fleet(reason="spend", allow=[wo["id"]])
+
+    out = ops.set_work_order_budget(wo["id"], 20.0)
+    assert out["resumed"], out
+    assert store.get_work_order(wo["id"])["status"] != "budget_exhausted"
+
+
 # -- the family budget
 
 
@@ -478,7 +524,7 @@ def test_two_parallel_children_are_never_handed_the_same_remainder(
     for _ in range(4):
         started.tick()
 
-    children = store.feature_children(fo["id"])
+    children = store.feature_children(fo["id"], kinds=("worker",))
     reserved = [c["budget_reserved_usd"] for c in children
                 if c["budget_reserved_usd"] is not None]
     assert len(reserved) == 2, [dict(c) for c in children]
@@ -513,7 +559,7 @@ def test_a_settled_child_releases_the_rest_of_its_slice(started, store):
     fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    children = store.feature_children(fo["id"])
+    children = store.feature_children(fo["id"], kinds=("worker",))
 
     central = CentralStore()
     try:
@@ -535,7 +581,7 @@ def test_a_child_that_runs_out_is_told_what_its_feature_still_has(started, store
     fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    child = store.feature_children(fo["id"])[0]
+    child = store.feature_children(fo["id"], kinds=("worker",))[0]
     bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 1)
 
     central = CentralStore()
@@ -553,7 +599,7 @@ def test_a_feature_stops_when_the_whole_family_has_spent_its_budget(started, sto
     fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    for child in store.feature_children(fo["id"]):
+    for child in store.feature_children(fo["id"], kinds=("worker",)):
         bill_the_turn(store, child["id"], 9.0)
     started.tick()
 
@@ -569,7 +615,7 @@ def test_a_feature_with_no_budget_reserves_nothing(started, store):
     for _ in range(4):
         started.tick()
     assert all(c["budget_reserved_usd"] is None
-               for c in store.feature_children(fo["id"]))
+               for c in store.feature_children(fo["id"], kinds=("worker",)))
     assert budget.pool(store, None, store.get_feature_order(fo["id"])) is None
 
 
@@ -577,7 +623,7 @@ def test_topping_up_a_feature_puts_it_back_to_executing(started, store):
     fo = a_feature(started, store, "reader", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    for child in store.feature_children(fo["id"]):
+    for child in store.feature_children(fo["id"], kinds=("worker",)):
         bill_the_turn(store, child["id"], 20.0)
     started.tick()
     assert store.get_feature_order(fo["id"])["status"] == "budget_exhausted"
@@ -815,13 +861,17 @@ def test_a_child_stopped_on_its_slice_is_resumable_by_topping_the_child_up(
     fo = a_feature(started, store, "reader", "writer", budget_usd=20.0)
     for _ in range(4):
         started.tick()
-    child = store.feature_children(fo["id"])[0]
+    child = store.feature_children(fo["id"], kinds=("worker",))[0]
     slice_usd = child["budget_reserved_usd"]
     assert slice_usd, "the fixture never reserved, so the claim is vacuous"
 
     # Billed rather than acted out through the fake CLI: exhaustion is answered from the ACCOUNTING
     store.set_status(child["id"], "running")
     bill_the_turn(store, child["id"], slice_usd + 1.0)
+    # CUT SHORT by the slice: a top-up relaunches only a turn that FAILED (io-12b7d873)
+    store.conn.execute("UPDATE wo_turns SET state='failed', error=? WHERE id=?",
+                       ("Reached maximum budget ($1.0)",
+                        store.latest_turn(child["id"])["id"]))
     started.tick()
     assert store.get_work_order(child["id"])["status"] == "budget_exhausted"
 
@@ -858,7 +908,7 @@ def test_a_re_cut_never_promises_money_the_family_does_not_have(started, store):
     fo = a_feature(started, store, "reader", "writer", budget_usd=20.0)
     for _ in range(4):
         started.tick()
-    child = store.feature_children(fo["id"])[0]
+    child = store.feature_children(fo["id"], kinds=("worker",))[0]
     bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 0.5)
     started.tick()
 
@@ -1066,7 +1116,7 @@ def test_the_family_is_not_the_worker_children(started, store):
     fo = store.get_feature_order(inv["id"])
 
     assert [c["id"] for c in budget.family(store, fo)] == [child]
-    assert store.feature_children(inv["id"]) == []
+    assert store.feature_children(inv["id"], kinds=("worker",)) == []
 
 
 def test_a_planner_overspending_never_parks_the_feature(started, store):
@@ -1133,7 +1183,7 @@ def test_a_parked_feature_child_still_says_feature(started, store):
     fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    child = store.feature_children(fo["id"])[0]
+    child = store.feature_children(fo["id"], kinds=("worker",))[0]
     bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 1)
 
     central = CentralStore()
@@ -1220,6 +1270,34 @@ def test_a_settled_investigator_is_never_parked_on_its_budget(started, store):
         central.close()
 
 
+def test_a_message_to_a_settled_overspent_order_is_settled_once(started, store,
+                                                                fake_claude):
+    """Issue #1195: `escalate` declines a settled order, so no hold ever forms for its messages"""
+    from jarvis.central_store import CentralStore
+
+    wo = store.create_work_order("done and overspent", description="the ask")
+    store.update_work_order(wo["id"], session_id="sess-1")
+    store.set_status(wo["id"], "completed")
+    over_its_cap(started, store, wo["id"])
+    msg_id = store.queue_message(wo["id"], "one more thing")
+
+    started.tick()
+    started.tick()
+
+    msg = store.list_messages(wo["id"])[0]
+    assert msg["id"] == msg_id and msg["status"] == "failed"
+    assert "budget spent" in msg["last_error"]
+    assert worker_calls(fake_claude) == []
+    # One attempt, not one per tick
+    assert len(store.events_of_kind(wo["id"], "delivering")) == 1
+    central = CentralStore()
+    try:
+        told = [i for i in central.unacked_inbox() if i["wo_id"] == wo["id"]]
+    finally:
+        central.close()
+    assert len(told) == 1 and "never received 1 message" in told[0]["title"]
+
+
 def test_a_live_investigator_with_no_verdict_still_parks(started, store):
     """The control for the guard above"""
     investigator = _investigator(store, verdict=False)
@@ -1235,3 +1313,96 @@ def test_a_live_investigator_with_no_verdict_still_parks(started, store):
 
 # Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
 pytestmark = pytest.mark.usefixtures("self_dispatch_on")
+
+
+# -- the LAUNCH floor (io-b521d17b, turn-below-one-call)
+
+
+def test_a_remainder_under_one_call_is_not_launched(started, store, fake_claude):
+    """A turn handed less than one call costs dies on its first call and overshoots its cap"""
+    wo = ops.create_work_order("proj_a", "nearly broke", description="do it",
+                               budget_usd=budget.LAUNCH_FLOOR_USD / 2)
+    started.tick()
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == budget.EXHAUSTED
+    assert not worker_calls(fake_claude)
+    assert "less than one call costs" in row["attention_reason"]
+    assert f"${budget.LAUNCH_FLOOR_USD / 2:.2f} left" in row["attention_reason"]
+
+
+def test_the_floor_never_moves_the_cap_the_user_typed(started, store):
+    """`Ceiling.exhausted` and `remaining_usd` are untouched: the floor is a launch decision only"""
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "nearly broke", description="do it",
+                               budget_usd=0.50)
+    bill_the_turn(store, wo["id"], 0.47)
+    central = CentralStore()
+    try:
+        row = store.get_work_order(wo["id"])
+        cap = budget.ceiling(store, central, row)
+        assert cap.cap_usd == 0.50
+        assert cap.remaining_usd == pytest.approx(0.03)
+        assert not cap.exhausted
+        assert budget.exhaustion(store, central, row) is None
+        refused = budget.launch_refusal(store, central, row)
+        assert refused is not None and refused.below_floor
+    finally:
+        central.close()
+
+
+def test_a_remainder_at_the_floor_still_launches(started, store, fake_claude):
+    """The negative control: one call's worth left is a turn the OS may start"""
+    ops.create_work_order("proj_a", "funded", description="do it",
+                          budget_usd=budget.LAUNCH_FLOOR_USD)
+    started.tick()
+
+    assert fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+
+
+def test_the_floor_carries_its_measurement():
+    """The provenance sits beside the constant, re-runnable (the finding's DONE clause)"""
+    said = budget.LAUNCH_FLOOR_MEASUREMENT
+    assert "Measured 2026-10-21" in said and "Re-run:" in said
+    assert "Bound used: p10" in said
+
+
+# -- a first-pass exhaustion is a default-sizing signal (io-b521d17b)
+
+
+def test_an_investigation_spent_on_its_first_pass_says_the_default_is_undersized(
+        started, store):
+    inv = _an_investigation(store)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
+
+    line = store.get_work_order(child)["attention_reason"]
+    assert "FIRST pass" in line
+    assert "worker.investigation_budget_usd" in line
+
+
+def test_a_later_pass_is_an_ordinary_overrun(started, store):
+    """The control: a second turn spending the rest is not a sizing story"""
+    inv = _an_investigation(store)
+    child = store.create_work_order(f"work on {inv['id']}", description="look",
+                                    kind="investigator", parent_id=inv["id"])
+    store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+    store.set_feature_status(inv["id"], "planning")
+    store.update_work_order(child["id"], budget_reserved_usd=inv["budget_usd"],
+                            status="running")
+    bill_the_turn(store, child["id"], 1.0)
+    bill_the_turn(store, child["id"], 9.0)
+    started.tick()
+
+    row = store.get_work_order(child["id"])
+    assert row["status"] == budget.EXHAUSTED
+    assert "FIRST pass" not in row["attention_reason"]
+
+
+def test_the_investigation_default_funds_two_measured_passes():
+    """Sized against what it bounds: the p90 first pass recorded beside the constant, twice"""
+    from jarvis import catalog
+
+    assert catalog.DEFAULT_INVESTIGATION_BUDGET_USD >= 2 * 1.73
+    said = catalog.DEFAULT_INVESTIGATION_BUDGET_MEASUREMENT
+    assert "Measured 2026-10-21" in said and "p90 $1.73" in said and "Re-run:" in said

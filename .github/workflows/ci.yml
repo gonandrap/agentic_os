@@ -84,6 +84,13 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
+      # In this required job so it blocks without a ruleset edit
+      - name: Comments and docstrings stay one line
+        run: |
+          python scripts/trim_comments.py --check || {
+            echo "::error::A comment or docstring is not in one-line form — over one line, or a trailing period the checker strips. The 'OVERLONG <path>' lines above name the files; rewrite each comment as one line yourself rather than letting 'scripts/trim_comments.py' truncate it."
+            exit 1
+          }
       - run: pytest evals -q -n auto --timeout=60
       - name: Upload scorecard
         if: always()
@@ -95,7 +102,9 @@ jobs:
 
   browser:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Two bounded install attempts (180s each) over ~1.5m of checkout, pip and pytest,
+    # measured on run 39842661725 attempt 2; the install is what ate the old 12m (#1193)
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -104,5 +113,28 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
-      - run: playwright install --with-deps chromium
+      - name: Install chromium and its apt deps
+        # A stalled apt mirror must fail THIS step, not eat the job budget (#1193, kn-ffab4362).
+        # timeout signals the group as the runner user, which cannot reach the root-owned
+        # apt-get child, so attempt 2 must clear the dpkg lock itself first (#1219).
+        run: |
+          reap_apt() {
+            sudo pkill -TERM -x '(apt-get|apt|dpkg)' 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              pgrep -x '(apt-get|apt|dpkg)' >/dev/null || break
+              sleep 1
+            done
+            sudo pkill -KILL -x '(apt-get|apt|dpkg)' 2>/dev/null || true
+            sleep 2
+            sudo dpkg --configure -a || true
+          }
+          for attempt in 1 2; do
+            if timeout 180 playwright install --with-deps chromium; then exit 0; fi
+            if [ "$attempt" = 1 ]; then
+              echo "::warning::playwright install attempt 1 stalled or failed after 180s; reaping apt and retrying"
+              reap_apt
+            fi
+          done
+          echo "::error::playwright install --with-deps chromium failed twice at 180s each, each attempt against a cleared dpkg lock — a slow apt mirror is the usual cause, not this commit"
+          exit 1
       - run: pytest tests_browser -q --timeout=60

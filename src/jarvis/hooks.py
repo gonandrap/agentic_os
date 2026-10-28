@@ -6,6 +6,8 @@ import json
 import os
 import re
 import shlex
+import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -22,7 +24,7 @@ from .navigation import (
     is_spec_path,
     navigates_source,
 )
-from .project_store import ProjectStore
+from .project_store import WO_KIND_CONTRACTS, ProjectStore, inbox_flag
 
 # A Bash command every worker must be able to run without a permission prompt: a chain of `cd <dir>`...
 _SHELL_DANGEROUS = re.compile(r"[|;`$<>]")
@@ -170,7 +172,14 @@ def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str,
 
 #: The `##` headings a PR body must carry
 PR_BODY_SECTIONS = ("Summary", "Implementation notes", "Questions asked to Neo",
-                    "Alarms raised", "Learnings", "Test evidence", "Screenshots")
+                    "Alarms raised", "Learnings", "Test evidence",
+                    # `morpheus.SECTION`: production validation is an OS function, for every project
+                    "How to validate in production", "Screenshots")
+
+#: A repo shipping this checker has the one-line-comment rule in required CI (issue 1231)
+COMMENT_CHECKER = "scripts/trim_comments.py"
+#: Separated-value `git` options, whose value is not the subcommand
+_GIT_FLAGS_WITH_A_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 
 # GitHub renders neither of these, so neither can mislink or count as content
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -283,6 +292,76 @@ def pr_body_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, 
     )
 
 
+def pushes_a_branch(command: str) -> bool:
+    """Whether this command runs `git push` (issue 1231)"""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    starts_a_command = True
+    for i, word in enumerate(words):
+        if word in ("&&", "||", ";", "|"):
+            starts_a_command = True
+            continue
+        if starts_a_command and (word == "git" or word.endswith("/git")):
+            skip_value = False
+            for arg in words[i + 1:]:
+                if arg in ("&&", "||", ";", "|"):
+                    break
+                if skip_value:
+                    skip_value = False
+                    continue
+                if arg.startswith("-"):
+                    skip_value = arg in _GIT_FLAGS_WITH_A_VALUE
+                    continue
+                if arg == "push":
+                    return True
+                break
+        starts_a_command = False
+    return False
+
+
+def overlong_comments(cwd: str) -> tuple[list[str], int] | None:
+    """The repo's own one-line-comment checker over `cwd`: the files it names and its exit code"""
+    script = Path(cwd) / COMMENT_CHECKER
+    if not cwd or not script.is_file():
+        return None
+    try:
+        done = subprocess.run(
+            [sys.executable, str(script), "--check"],
+            cwd=cwd, capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    named = [line.split(" ", 1)[1] for line in done.stdout.splitlines() if line.startswith("OVERLONG ")]
+    return named, done.returncode
+
+
+def overlong_comment_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """Keep a push from spending a CI round on a rule the repository can check locally (issue 1231)"""
+    if not env.get("JARVIS_WO_ID"):
+        return None
+    command = (payload.get("tool_input") or {}).get("command", "")
+    if not pushes_a_branch(command):
+        return None
+    cwd = payload.get("cwd") or ""
+    result = overlong_comments(cwd)
+    if result is None:
+        return None
+    named, code = result
+    if code == 0:
+        return None
+    return _deny(
+        "This push would be red on CI: a comment or docstring in these files is not in the one-line "
+        "form the checker requires (over one line, or a trailing period it strips).\n"
+        + "".join(f"  - {p}\n" for p in named)
+        + f"Rewrite each one AS ONE LINE yourself, with no trailing period, keeping the pointer it "
+          f"carries. Do NOT run `{COMMENT_CHECKER}` without `--check` to fix it: it truncates the "
+          f"overflow to `...` and the half it deletes is usually the reference the comment existed "
+          f"for. Then `uv run python {COMMENT_CHECKER} --check` must report `0 file(s) would change`."
+    )
+
+
 def finish_summary_decision(payload: dict[str, Any],
                             env: dict[str, str]) -> dict[str, Any] | None:
     """Refuse a `jarvis wo finish --summary` longer than the cap (docs/superpowers/specs/2026-09-19-concision-enforced.md)"""
@@ -305,7 +384,7 @@ def finish_summary_decision(payload: dict[str, Any],
         f"is captured onto the work order verbatim and is what the user and Neo "
         f"actually read. Nothing is lost by moving it there.\n"
         f"  - Evidence goes in `--evidence`, not in the summary.\n"
-        f"Your `i-have-adhd` and `caveman` skills are how to shorten it without "
+        f"Your `caveman` skill is how to shorten it without "
         f"dropping anything that matters."
     )
 
@@ -341,14 +420,25 @@ def payload_reference_decision(payload: dict[str, Any],
             f"saw it, so the flood is paid for whatever the cap downstream then says.\n"
             f"  - {_INSTEAD}"
         )
-    cap = concision.message_cap(env)
+    # One cap per kind (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §3)
+    caps = {"message": concision.message_cap(env),
+            "assume": concision.assume_cap(env),
+            "question": concision.question_cap(env)}
     for subcommand, kind, text in concision.jarvis_payload_args(command):
-        limit = cap if kind == "message" else concision.QUESTION_MAX_CHARS
+        limit = caps.get(kind, 0)
         if not limit or len(text) <= limit:
             continue
+        split = ("\n  - SPLIT it: ONE decision per `jarvis wo assume` — the option "
+                 "taken, the strongest alternative rejected and why. A second "
+                 "decision is a second `jarvis wo assume`; cite the first in it "
+                 "by its `#n`."
+                 if kind == "assume" else
+                 "\n  - SPLIT it: ONE question per `jarvis wo ask`, and cite the "
+                 "first in the second by its `Q<id>`."
+                 if kind == "question" else "")
         return _deny(
             f"This `{subcommand}` {kind} is {len(text)} characters; the cap is "
-            f"{limit}.\n"
+            f"{limit}.{split}\n"
             f"  - {_INSTEAD}\n"
             f"  - A diff, a log, a file or a JSON dump never belongs in a `jarvis` "
             f"argument: it is read once by a model and paid for in every turn "
@@ -641,6 +731,39 @@ def long_foreground_decision(payload: dict[str, Any],
     return _deny(f"{_LONG_SHELL_ADVICE[arm]} {_LONG_WHY}")
 
 
+#: Set in a worker's settings when a harness chose the worktree its session runs in
+HARNESS_WORKTREE_ENV = "JARVIS_HARNESS_WORKTREE"
+
+
+def in_worker_worktree(cwd: str, env: dict[str, str]) -> bool:
+    """Is this cwd the worker's own worktree, in Jarvis's layout or a harness's"""
+    if "/.claude/worktrees/" in cwd:
+        return True
+    root = env.get("JARVIS_PROJECT_PATH")
+    wo_id = env.get("JARVIS_WO_ID")
+    if not (cwd and root and wo_id and env.get(HARNESS_WORKTREE_ENV) == "1"
+            and (Path(root) / ".jarvis").is_dir()):
+        return False
+    # Bound to the worktree recorded for THIS order; none recorded yet fails closed
+    try:
+        store = ProjectStore(Path(root))
+        try:
+            recorded = str(store.get_work_order(wo_id).get("worktree") or "")
+        finally:
+            store.close()
+    except (KeyError, OSError, sqlite3.Error):
+        return False
+    from .session_dispatch import harness_worktree_ok
+
+    if not harness_worktree_ok(Path(root), recorded):
+        return False
+    try:
+        Path(cwd).resolve().relative_to(Path(recorded).resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def crew_edit_decision(payload: dict[str, Any],
                        env: dict[str, str]) -> dict[str, Any] | None:
     """Refuse the LEAD's own file edits, so the delegation is a control and not prose (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)"""
@@ -651,7 +774,7 @@ def crew_edit_decision(payload: dict[str, Any],
     if env.get(WO_KIND_ENV) != "worker" or env.get(REQUIRE_CREW_ENV) != "1":
         return None
     cwd = payload.get("cwd") or ""
-    if "/.claude/worktrees/" not in cwd:
+    if not in_worker_worktree(cwd, env):
         return None
     tool_input = payload.get("tool_input") or {}
     file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
@@ -671,8 +794,8 @@ def crew_edit_decision(payload: dict[str, Any],
     )
 
 
-#: The one file an investigator may write, relative to its worktree
-VERDICT_FILE = "verdict.json"
+#: The one file an investigator may write, relative to its worktree — its row in the kind table
+VERDICT_FILE = WO_KIND_CONTRACTS["investigator"].artifact
 
 #: `(program, subcommand)` pairs an investigator may run (docs/superpowers/specs/2026-09-27-investigation-orders.md)
 INVESTIGATOR_READS = frozenset({
@@ -1087,7 +1210,8 @@ def py_nav_decision(payload: dict[str, Any],
     cwd = payload.get("cwd") or ""
     if not cwd:
         return None
-    root = find_project_root(Path(cwd))
+    root_env = env.get("JARVIS_PROJECT_PATH")
+    root = Path(root_env) if root_env else find_project_root(Path(cwd))
     if root is None or not (root / ".serena" / "project.yml").exists():
         return None
     tool_input = payload.get("tool_input") or {}
@@ -1583,6 +1707,9 @@ def uncollected_task_turn_block(store: ProjectStore, wo_id: str,
     from . import background
     from .invariants import TERMINAL_STATUSES
 
+    # A background session outlives its turn and is woken by the task (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+    if env.get(TURN_TRANSPORT_ENV) != TRANSPORT_HEADLESS:
+        return None
     # One continuation, not a loop: a task that is genuinely hung must not make the turn unendable
     if payload.get("stop_hook_active"):
         return None
@@ -1630,6 +1757,10 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         unreviewable = pr_body_decision(payload, env)
         if unreviewable is not None:
             return unreviewable
+        # Beside the PR gates, which is where the push that triggers CI belongs (issue 1231)
+        red = overlong_comment_decision(payload, env)
+        if red is not None:
+            return red
         # BEFORE the auto-allow below, which would otherwise wave every `jarvis …` through and make the cap...
         overlong = finish_summary_decision(payload, env)
         if overlong is not None:
@@ -1698,7 +1829,7 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
             return shapeless
         cwd = payload.get("cwd") or ""
         file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
-        if cwd and "/.claude/worktrees/" in cwd:
+        if cwd and in_worker_worktree(cwd, env):
             try:
                 Path(file_path).resolve().relative_to(Path(cwd).resolve())
             except ValueError:
@@ -2078,13 +2209,19 @@ def compaction_brief(store: ProjectStore, wo: dict[str, Any], project: str) -> s
     if wo.get("description"):
         lines += ["", "## The original ask, verbatim", "", wo["description"]]
 
-    lines += ["", *worker_brief_core(wo_id, wo["title"], project)]
+    lines += ["", *worker_brief_core(wo_id, wo["title"], project,
+                                     transport=wo.get("transport"))]
     return "\n".join(lines)
 
 
-def worker_brief_core(wo_id: str, title: str, project: str) -> list[str]:
+def worker_brief_core(wo_id: str, title: str, project: str,
+                      transport: str | None = None) -> list[str]:
     from .worker_brief import core_contract
-    return core_contract(wo_id, title, project, has_knowledge=True)
+    # The worker's own env is the declaration when the row predates the column
+    return core_contract(
+        wo_id, title, project, has_knowledge=True,
+        transport=transport or os.environ.get(TURN_TRANSPORT_ENV) or TRANSPORT_HEADLESS,
+        require_crew=os.environ.get(REQUIRE_CREW_ENV) == "1")
 
 
 def resume_after_compaction(env: dict[str, str], root: Path, store: ProjectStore,
@@ -2151,6 +2288,66 @@ def _post_tool_compaction(env: dict[str, str], cwd: Path) -> dict[str, Any] | No
         store.close()
 
 
+#: Queued rows that are a whole TURN's prompt, not words for a worker mid-turn: the daemon sends them
+NOT_MID_TURN_SOURCES = frozenset({"relaunch", "background-orphan"})
+
+MID_TURN_HEADER = (
+    "MESSAGE FOR YOU, delivered mid-turn by Jarvis OS (it would otherwise have waited for "
+    "your turn to end). Read it now and adjust what you are doing; where it conflicts "
+    "with your plan, it wins. Do not stop to acknowledge it, act on it.")
+
+
+def _post_tool_delivery(payload: dict[str, Any], env: dict[str, str],
+                        cwd: Path) -> dict[str, Any] | None:
+    """Hot path: one `stat` unless a message waits (docs/superpowers/specs/2026-10-22-messages-delivered-mid-turn.md)"""
+    if payload.get("agent_type"):
+        return None  # a subagent's context is not the lead's; the lead's next call takes it
+    ctx = _worker_context(env, cwd)
+    if ctx is None:
+        return None
+    root, wo_id = ctx
+    flag = inbox_flag(root, wo_id)
+    if not flag.exists():
+        return None
+    store = ProjectStore(root)
+    try:
+        return deliver_mid_turn(store, wo_id, str(payload.get("session_id") or ""),
+                                flag=flag)
+    except KeyError:
+        return None
+    finally:
+        store.close()
+
+
+def deliver_mid_turn(store: ProjectStore, wo_id: str, session_id: str,
+                     flag: Path | None = None) -> dict[str, Any] | None:
+    """PostToolUse: hand the running lead every message queued for it, as context"""
+    from .ops import stamp_objection_delivery
+
+    wo = store.get_work_order(wo_id)
+    turn = store.latest_turn(wo_id)
+    if (wo["status"] != "running" or turn is None or turn["state"] != "running"
+            or turn["kind"] == "compact"
+            or (session_id and wo.get("session_id") and session_id != wo["session_id"])):
+        return None  # the flag stays: the daemon's delivery is the one that spends these
+    # Spent BEFORE reading: a message queued after this point re-arms it
+    if flag is not None:
+        flag.unlink(missing_ok=True)
+    claimed = [m for m in store.deliverable_messages(wo_id)
+               if m.get("source") not in NOT_MID_TURN_SOURCES
+               and store.claim_message(int(m["id"]))]
+    if not claimed:
+        return None
+    ids = [int(m["id"]) for m in claimed]
+    for msg_id in ids:
+        stamp_objection_delivery(store, msg_id)
+    store.add_event(wo_id, "message_delivered",
+                    {"msg_ids": ids, "turn": turn["seq"], "mid_turn": True})
+    text = "\n\n".join(m["content"] for m in claimed)
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                   "additionalContext": f"{MID_TURN_HEADER}\n\n{text}"}}
+
+
 def find_project_root(cwd: Path) -> Path | None:
     """Map a hook cwd (possibly a worktree under .claude/worktrees/) to the project root that holds..."""
     cwd = cwd.resolve()
@@ -2169,6 +2366,13 @@ def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> boo
     """Is this hook coming from the session the work order is actually bound to?"""
     bound = store.get_work_order(wo_id).get("session_id")
     return not bound or not session_id or bound == session_id
+
+
+#: Claude Code's idle-timer `Notification`, verbatim: matched with == and never a substring
+IDLE_PROMPT = "Claude is waiting for your input"
+
+#: The `notification_ignored` reason, shared with INV-WAIT-WORKING's repair note
+IDLE_WHILE_WORKING = "idle prompt while the worker's turn is in flight"
 
 
 def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
@@ -2228,8 +2432,9 @@ def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore
 
     # Both conditions, in this order: the cheap text test first (hooks.py:441)
     worktree = wo.get("worktree")
-    if not worktree or "/.claude/worktrees/" not in str(cwd):
+    if not worktree or not in_worker_worktree(str(cwd), env):
         return
+    # A harness worktree is recorded as an absolute path, which this join returns unchanged
     expected = root / ".claude" / "worktrees" / str(worktree)
     try:
         if cwd.resolve() != expected.resolve():
@@ -2293,7 +2498,8 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
     if event == "PostToolUse":
         # The memory mirror is a side effect and runs either way
         captured = capture_memory_write(payload, env)
-        return _post_tool_compaction(env, cwd) or captured
+        return (_post_tool_compaction(env, cwd) or _post_tool_delivery(payload, env, cwd)
+                or captured)
 
     if event == "PreCompact":
         return _pre_compact(payload, env, cwd)
@@ -2379,6 +2585,15 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
                 })
                 return {"wo_id": wo_id, "event": event, "ignored": True}
             message = payload.get("message") or "Worker needs attention"
+            # The idle timer fires on a session that is still mid-tool-call (issue 1166)
+            from .worker_session import busy
+
+            if message == IDLE_PROMPT and busy(store, wo_id):
+                store.add_event(wo_id, "notification_ignored", {
+                    "message": message,
+                    "reason": IDLE_WHILE_WORKING,
+                })
+                return {"wo_id": wo_id, "event": event, "ignored": True}
             if wo["status"] in ("running", "dispatching"):
                 store.set_status(wo_id, "waiting_input")
             store.flag_attention(wo_id, message)

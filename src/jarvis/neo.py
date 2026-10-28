@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
-from . import claude_cli, structured
+from . import claude_cli, db, structured
 from .neo_store import ESCALATION_CAUSES_CHOSEN, NeoStore
 
 log = logging.getLogger("neo")
@@ -103,13 +102,15 @@ def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50
                         learnings_chars: int = LEARNINGS_CHAR_BUDGET) -> str:
     """Persona + learnings"""
     from .autoreview import ASSUMPTION_REVIEWER_PERSONA
+    from .findings import FINDINGS_REVIEWER_PERSONA
     from .gates import REVIEWER_PERSONA
     from .plans import PLAN_REVIEWER_PERSONA
     from .supervisor import ALARM_REVIEWER_PERSONA
 
     persona = {"approval": REVIEWER_PERSONA, "plan": PLAN_REVIEWER_PERSONA,
                "alarm": ALARM_REVIEWER_PERSONA,
-               "assumption": ASSUMPTION_REVIEWER_PERSONA}.get(kind, PERSONA)
+               "assumption": ASSUMPTION_REVIEWER_PERSONA,
+               "findings": FINDINGS_REVIEWER_PERSONA}.get(kind, PERSONA)
     parts = [persona, "", "# Learnings (from the user's reviews of your past answers)"]
     parts += render_learnings(store.learnings(project, limit=learnings_limit),
                               budget=learnings_chars)
@@ -123,7 +124,9 @@ def build_question_prompt(q: dict[str, Any]) -> str:
     ]
     if q.get("context"):
         # A plan question's context IS the subject — the spec being judged (§5)
-        label = "Spec under review" if q.get("kind") == "plan" else "Work order context"
+        label = {"plan": "Spec under review",
+                 "findings": "Improvement order"}.get(q.get("kind") or "",
+                                                      "Work order context")
         parts.append(f"{label}:\n{q['context']}")
     parts += ["", f"Worker question:\n{q['question']}"]
     return "\n".join(parts)
@@ -132,6 +135,8 @@ def build_question_prompt(q: dict[str, Any]) -> str:
 # What Neo may write in `verdict`, and the status it means
 _VERDICT_ALIASES = {
     "approve": "approved", "approved": "approved",
+    # A findings verdict says accept/reject; it means what approve/deny means everywhere else
+    "accept": "approved", "accepted": "approved",
     "deny": "denied", "denied": "denied", "reject": "denied", "rejected": "denied",
     "dismiss": "dismissed", "dismissed": "dismissed",
 }
@@ -191,6 +196,10 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         "stakes": str(data.get("stakes") or "")[:20].strip().lower(),
         # Read exactly as `stakes` is — normalised (docs/superpowers/specs/2026-10-01-neo-observability.md)
         "cause": _escalation_cause(data.get("cause")),
+        # A findings verdict's rating on the steward's scale
+        "severity": str(data.get("severity") or "")[:20].strip().lower(),
+        # What a `validation` verdict asks the OS to do; that kind decides what it may be
+        "action": str(data.get("action") or "")[:20].strip().lower(),
     }
 
 
@@ -270,6 +279,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
     """Answer every queued question in FIFO order, back-to-back (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)"""
     answer = answer or answer_question
     results = []
+    reached = False
     for _ in range(max_questions):
         q = store.claim_next()
         if q is None:
@@ -280,7 +290,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             # BEFORE the generic outage below (#235)
             from .worker_session import RATE_LIMIT_FALLBACK_DELAY
 
-            reopens = e.limit.reset_at or (time.time() + RATE_LIMIT_FALLBACK_DELAY)
+            reopens = e.limit.reset_at or (db.now() + RATE_LIMIT_FALLBACK_DELAY)
             store.hold_claim(q["id"], e.limit.message, reopens)
             log.info("neo question %s held until the usage window reopens", q["id"])
             results.append({"question": q, "verdict": None, "outcome": "held"})
@@ -312,6 +322,12 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
                 unreachable(q, str(e))
             results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
+        if not reached:
+            # A model replied, so the transport works: re-ask what an outage stranded, once per drain
+            reached = True
+            revived = store.revive_unreachable()
+            if revived:
+                log.info("neo answered again: re-queued unreachable question(s) %s", revived)
         if verdict["escalate"]:
             # Spec §2 of docs/superpowers/specs/2026-10-01-neo-observability.md
             store.mark(q["id"], "escalated", reason=verdict["reason"],
@@ -320,7 +336,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
         else:
             # `text`, not `answer`: `answer` is the injected answerer above
             text = verdict["answer"]
-            if q.get("kind") in ("approval", "plan"):
+            if q.get("kind") in ("approval", "plan", "findings"):
                 # A ruling lives in `verdict`, not in prose
                 text = (verdict.get("verdict") or "denied").upper()
             store.record_answer(q["id"], text, answered_by="neo",
@@ -339,10 +355,35 @@ def learning_from_review(q: dict[str, Any], feedback: str) -> str:
             f"\"{(q.get('answer') or '')[:200]}\". The user corrected me: {feedback}")
 
 
-def learning_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[str, Any]],
-                                    accepted: bool, feedback: str) -> str:
-    """Distill the user's verdict on a work order's assumptions into a learning"""
-    what = "; ".join(f"\"{a['content'][:200]}\"" for a in assumptions[:5]) or "(none recorded)"
-    verdict = "accepted" if accepted else "rejected"
-    return (f"On work order \"{wo.get('title', '')[:120]}\" a worker decided: {what}. "
-            f"The user {verdict} that: {feedback}")
+#: What a no-reason ruling says instead of a reason, and what makes it dedupable
+NO_REASON_RULING = "no reason given — the user decided it as the worker recorded it"
+
+
+def learnings_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[str, Any]],
+                                     accepted: bool, feedback: str, *,
+                                     false_alarms: frozenset[int] = frozenset(),
+                                     tightened: bool = False) -> list[str]:
+    """The user's ruling as RULES Neo applies to the next assumption of the class (io-51469add)"""
+    from .autoreview import assumption_class
+
+    by_class: dict[str, list[dict[str, Any]]] = {}
+    for a in assumptions:
+        by_class.setdefault(assumption_class(str(a.get("content") or ""),
+                                             tightened=tightened), []).append(a)
+    feedback = (feedback or "").strip()
+    rules = []
+    for cls, rows in by_class.items():
+        if not feedback:
+            # Deterministic text, so the caller can dedupe it: one rule per class, not one per order
+            verdict = "accepted it unchanged" if accepted else "rejected it"
+            rules.append(f"RULE (from the user's assumption reviews): for {cls}, the user "
+                         f"{verdict} — {NO_REASON_RULING}.")
+            continue
+        verdict = "accepted" if accepted else "rejected"
+        alarm = (" The user called the high-stakes net's match on it a FALSE ALARM."
+                 if any(int(a.get("id") or 0) in false_alarms for a in rows) else "")
+        example = "; ".join(f"\"{str(a.get('content') or '')[:200]}\"" for a in rows[:3])
+        rules.append(f"RULE (from the user's review of {wo.get('id') or 'a work order'}): "
+                     f"for {cls}, the user {verdict} it. Reason: {feedback}.{alarm} "
+                     f"Example, on \"{str(wo.get('title') or '')[:120]}\": {example}")
+    return rules

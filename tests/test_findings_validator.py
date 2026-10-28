@@ -5,11 +5,16 @@ from __future__ import annotations
 import pytest
 
 from jarvis.findings import (
+    MAX_EVIDENCE,
+    MAX_FIELD_CHARS,
     MAX_FINDINGS,
+    MAX_QUOTE_CHARS,
+    MAX_SUMMARY_CHARS,
     MIN_FIELD_CHARS,
     MIN_QUOTE_CHARS,
     FindingsError,
     parse_report,
+    render_digest,
     render_finding,
     render_report,
     review_headline,
@@ -162,6 +167,30 @@ def test_a_prose_field_exactly_at_the_floor_is_fine(field):
     assert out["findings"][0][field] == exact
 
 
+@pytest.mark.parametrize("field", sorted(MAX_FIELD_CHARS))
+def test_a_prose_field_over_its_cap_is_refused(field):
+    """A finding the user has to wade through is one they skim rather than decide"""
+    cap = MAX_FIELD_CHARS[field]
+    with pytest.raises(FindingsError) as e:
+        parse_report(report(finding("a", **{field: "x" * (cap + 1)})))
+
+    assert any(f"`{field}` is {cap + 1} characters, over the {cap}" in p
+               for p in e.value.problems)
+
+
+@pytest.mark.parametrize("field", sorted(MAX_FIELD_CHARS))
+def test_a_prose_field_exactly_at_its_cap_is_fine(field):
+    exact = "x" * MAX_FIELD_CHARS[field]
+    out = parse_report(report(finding("a", **{field: exact})))
+
+    assert out["findings"][0][field] == exact
+
+
+def test_a_summary_longer_than_one_line_is_refused():
+    with pytest.raises(FindingsError, match=f"over the {MAX_SUMMARY_CHARS}"):
+        parse_report(report(finding("a"), summary="x" * (MAX_SUMMARY_CHARS + 1)))
+
+
 # -- rejection 4: evidence
 
 
@@ -204,6 +233,20 @@ def test_a_quote_exactly_at_the_floor_is_fine():
         {"source": "jarvis wo list", "quote": exact}])))
 
     assert out["findings"][0]["evidence"][0]["quote"] == exact
+
+
+def test_a_quote_over_its_cap_is_refused():
+    """The line that proves the point, not the screen around it"""
+    with pytest.raises(FindingsError, match=f"over the {MAX_QUOTE_CHARS}"):
+        parse_report(report(finding("a", evidence=[
+            {"source": "jarvis wo list", "quote": "x" * (MAX_QUOTE_CHARS + 1)}])))
+
+
+def test_more_quotes_than_the_cap_is_refused():
+    quotes = [{"source": "jarvis wo list", "quote": f"dispatched {n}h ago, no turns"}
+              for n in range(MAX_EVIDENCE + 1)]
+    with pytest.raises(FindingsError, match=f"over the {MAX_EVIDENCE}"):
+        parse_report(report(finding("a", evidence=quotes)))
 
 
 # -- rejection 5: proposed orders
@@ -328,3 +371,19 @@ def test_the_review_headline_leads_with_the_counts_and_names_the_command():
     assert line.startswith("3 findings on io-1234abcd")
     assert "1 accepted" in line and "1 rejected" in line and "1 awaiting you" in line
     assert "jarvis io review io-1234abcd" in line
+
+
+def test_the_digest_is_one_line_per_finding_plus_its_work():
+    """What `jarvis io show` prints by default: the reader decides from this before opening any finding"""
+    long_root = "The reconciler forgets rows. " * 30
+    rep = parse_report(report(finding("dispatch", root_cause=long_root[:600]),
+                              finding("polling")))
+
+    lines = render_digest(rep)
+
+    assert lines[0] == rep["summary"]
+    head = [line for line in lines if line.startswith("- [dispatch] pending: ")]
+    assert len(head) == 1 and head[0].endswith("…") and len(head[0]) < 260
+    assert any(line.startswith("    do: ") for line in lines)
+    assert any("order (work): Re-derive dispatch state" in line for line in lines)
+    assert "evidence" not in "\n".join(lines)

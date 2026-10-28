@@ -246,6 +246,25 @@ def test_the_cap_stops_the_os_chasing_a_fast_moving_base(started, project, fake_
     assert len(updates(store, wo)) == ops.CATCH_UP_MAX
 
 
+def test_catch_ups_older_than_the_window_do_not_hold_a_mergeable_branch(
+        started, project, fake_gh, local_proof):
+    """#1215: the cap is a RATE — three green catch-ups must not retire the chase for ever"""
+    opt_in(started)
+    store, wo = parked(project)
+    stale = db.now() - ops.CATCH_UP_WINDOW_SECONDS - 60
+    for i in range(ops.CATCH_UP_MAX):
+        store.add_event(wo["id"], invariants.PR_BASE_UPDATED_EVENT,
+                        {"base": "main", "base_sha": f"{i}" * 40,
+                         "cause": ops.BASE_UPDATE_BEHIND}, ts=stale)
+    behind_pr(fake_gh, base_oid=BASE_OID2)
+    local_proof["tip"] = BASE_OID2
+
+    poll(started, store)
+
+    assert fake_gh.updates == [PR]
+    assert ops.catch_up_attempts(store, wo["id"]) == 1
+
+
 def test_a_head_that_moved_between_the_re_read_and_the_update_is_not_updated(
         started, project, fake_gh, local_proof, monkeypatch):
     """GUARD 6"""
@@ -426,7 +445,8 @@ def test_an_exhausted_catch_up_names_the_cap_and_proposes_nothing(started, proje
 
     [row] = held(store, wo)
     assert row["code"] == "base_moved"
-    assert f"the cap ({ops.CATCH_UP_MAX})" in row["reason"] and "will NOT" in row["reason"]
+    assert f"the cap ({ops.CATCH_UP_MAX})" in row["reason"]
+    assert "once that window clears" in row["reason"]
     assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []
 
 
@@ -474,3 +494,135 @@ def test_a_fetch_that_fails_holds_rather_than_proposing(started, project, fake_g
 
     assert [h["code"] for h in held(store, wo)] == ["base_moved"]
     assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []
+
+
+# -- 20. the cap is exhausted, and a human has to be told (#1173)
+
+
+def merges(fake_gh) -> list[str]:
+    return [c["argv"][2] for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+
+
+def at_the_cap(started, project, fake_gh, local_proof):
+    """A granted merge whose base has run on past a `pr.base_oid` that lags it (#1173)"""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh, base_oid=BASE_OID)
+    local_proof["contains"] = {BASE_OID}      # up to date when the grant was given
+
+    poll(started, store)                      # armed -> a request is filed
+    [approval] = store.list_approvals(wo["id"])
+    gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
+                         project="proj_a")
+
+    for i in range(ops.CATCH_UP_MAX):
+        ops.record_base_update(store, wo, base="main", base_sha=f"{i}" * 40,
+                               head_before=JUDGED, head_after=JUDGED, checks=(),
+                               cause=ops.BASE_UPDATE_BEHIND)
+    # `main` moved again; GitHub's cached `baseRefOid` still names the contained commit
+    local_proof["tip"] = BASE_OID2
+    return store, wo
+
+
+def test_a_base_that_outran_the_cached_reading_holds_at_the_cap(started, project,
+                                                                fake_gh, local_proof):
+    """THE MEASURED CASE, issue #1173: the granted merge could only refuse, every tick"""
+    store, wo = at_the_cap(started, project, fake_gh, local_proof)
+
+    poll(started, store)
+    poll(started, store)
+
+    assert merges(fake_gh) == [] and fake_gh.updates == []
+    # NOT ATTEMPTED AT ALL: the granted merge was refused as stale on every tick before
+    assert store.events_of_kind(wo["id"], ops.MERGE_BASE_STALE_EVENT) == []
+    [row] = held(store, wo)
+    assert row["code"] == "base_moved" and row["catch_up"] == ops.CATCH_UP_EXHAUSTED
+    assert f"the cap ({ops.CATCH_UP_MAX})" in row["reason"]
+    # ...and the order asks the user, instead of sitting on a hold nobody owns
+    assert invariants.CATCH_UP_EXHAUSTED_BLOCKER in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))
+    list(invariants.check_blocked_work_is_surfaced(store))
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"] == 1
+    assert fresh["attention_reason"] == invariants.CATCH_UP_EXHAUSTED_BLOCKER
+
+
+def lagging(monkeypatch) -> dict:
+    """GitHub publishing the merge commit AFTER the OS re-reads the head (#1188)"""
+    real = github.pr_view
+    lag = {"on": True}
+
+    def view(url, cwd=None):
+        pr = real(url, cwd=cwd)
+        return dataclasses.replace(pr, head_oid=JUDGED) if lag["on"] else pr
+
+    monkeypatch.setattr(github, "pr_view", view)
+    return lag
+
+
+def test_a_merge_commit_published_late_is_carried_and_not_deferred_for_ever(
+        started, project, fake_gh, local_proof, monkeypatch):
+    """#1188: the head the OS'S OWN catch-up produced held the order for 2.5h"""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh)
+    lag = lagging(monkeypatch)
+
+    poll(started, store)                      # the update lands; the re-read lags it
+    [row] = updates(store, wo)
+    assert row["head_before"] == JUDGED and row["head_after"] == JUDGED
+
+    # GitHub publishes the merge commit, and `main` moves on again
+    lag["on"] = False
+    local_proof["tip"] = BASE_OID2
+    poll(started, store)
+
+    carried = [db.from_json(e["payload"], {})
+               for e in store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)]
+    assert [c["carried_head_sha"] for c in carried] == [UPDATED]
+    assert invariants.CARRY_UNPROVEN_BLOCKER not in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))
+
+
+def test_a_head_the_os_cannot_prove_asks_the_user_instead_of_deferring(
+        started, project, fake_gh, local_proof, monkeypatch):
+    """#1188's other arm, Neo question 2153: a hold nothing can prove must be VISIBLE"""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh, head=PUSHED)           # somebody else's commit at the head
+    local_proof["tip"] = BASE_OID2
+    monkeypatch.setattr(branchproof, "diff_fingerprint",
+                        lambda repo, base_ref, sha: "fp-" + sha)
+
+    poll(started, store)
+
+    [row] = held(store, wo)
+    assert row["code"] == "base_moved" and row["catch_up"] == ops.CATCH_UP_DEFERRED
+    assert row["catch_up_cause"] == ops.CATCH_UP_DEFER_CARRY_UNPROVEN
+    assert "will NOT" in row["reason"] and "retries every tick" not in row["reason"]
+    assert fake_gh.updates == []
+    assert invariants.CARRY_UNPROVEN_BLOCKER in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))
+    list(invariants.check_blocked_work_is_surfaced(store))
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"] == 1
+    assert fresh["attention_reason"] == invariants.CARRY_UNPROVEN_BLOCKER
+
+
+def test_the_exhausted_hold_is_not_overwritten_by_a_lesser_reading(started, project,
+                                                                   fake_gh, local_proof):
+    """§3.1's rule, one hold later: `mergeable` going UNKNOWN must not retire the ask (#1173)"""
+    store, wo = at_the_cap(started, project, fake_gh, local_proof)
+    poll(started, store)
+
+    # The fetch fails, so nothing contradicts the cached base, and GitHub stops answering
+    local_proof["fetch"] = False
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=BASE_OID, mergeable="UNKNOWN")
+
+    poll(started, store)
+
+    [row] = held(store, wo)
+    assert row["code"] == "base_moved" and row["catch_up"] == ops.CATCH_UP_EXHAUSTED
+    assert invariants.CATCH_UP_EXHAUSTED_BLOCKER in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))

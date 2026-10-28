@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}Morpheus — Jarvis{% endblock %}
+{% block content %}
+{# Sections reflow into columns at width — `.flow` in base.html, §5 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+<div class="flow" style="--col: 600px;">
+
+{# docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md #}
+{% set tone = {"queued": "tone-active", "monitoring": "tone-active", "validated": "tone-ok",
+               "failed": "tone-bad", "timedout": "tone-warn"} %}
+
+{# A long script or output opens in a modal: expanded in its cell it stretched the table. #}
+{% macro peek(id, label, heading, text) -%}
+<button type="button" class="peek" data-peek="{{ id }}">{{ label }}</button>
+<dialog id="{{ id }}" class="peek-modal" aria-label="{{ heading }}">
+  <div class="peek-head"><span class="mono">{{ heading }}</span>
+    <form method="dialog"><button aria-label="close">✕</button></form></div>
+  <pre class="request-text">{{ text }}</pre>
+</dialog>
+{%- endmacro %}
+<style>
+  .peek { background: var(--raised); color: var(--ink-2); border: 1px solid var(--line);
+          border-radius: 6px; padding: 2px 9px; font: 12px var(--mono); cursor: pointer; }
+  .peek:hover { color: var(--ink); border-color: var(--ink-3); }
+  .peek-modal { width: min(900px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
+                background: var(--surface); color: var(--ink); border: 1px solid var(--line);
+                border-radius: 8px; padding: 14px 16px; }
+  .peek-modal::backdrop { background: rgb(0 0 0 / 0.6); }
+  .peek-modal .request-text { max-height: calc(100vh - 160px); margin: 0; }
+  .peek-head { display: flex; justify-content: space-between; align-items: center;
+               gap: 12px; margin-bottom: 10px; color: var(--ink-2); font-size: 13px; }
+  .peek-head form { margin: 0; }
+</style>
+
+<p class="kv" style="margin-top:18px">
+  Every PR that reached production, in every project, watched until its check exits 0.
+  Morpheus only runs the check and reads the exit code; a PR that fails or times out is
+  handed to an investigation or to Neo, once.
+  <span class="counts">({% for s, n in report.counts.items() %}{{ n }} {{ s }}{{ " · " if not loop.last }}{% endfor %})</span>
+</p>
+
+<h2>Session</h2>
+<div class="panel">
+  {% set sess = report.session %}
+  <table>
+    <tr><th>state</th><td class="mono">
+      {% if report.enabled == false %}<span class="tone-warn">disabled (os.morpheus.enabled)</span>
+      {% elif report.pause.override == "paused" %}<span class="tone-warn">paused by <span class="mono">jarvis morpheus pause</span> — checks still run, no session turns</span>{% if report.pause.reason %} · {{ report.pause.reason }}{% endif %}
+      {% elif report.pause.override == "running" %}<span class="tone-ok">running by <span class="mono">jarvis morpheus unpause</span>{% if report.pause.fleet_paused %}, through the fleet pause{% endif %}</span>{% if report.pause.reason %} · {{ report.pause.reason }}{% endif %}
+      {% elif report.paused %}<span class="tone-warn">paused with the fleet — checks still run, no session turns</span>
+      {% else %}<span class="tone-ok">unpaused (follows the fleet)</span>{% endif %}</td></tr>
+    {# the state row above is the pause MODE; this one is what the session is doing (issue #1162) #}
+    {% set act = report.activity %}
+    <tr><th>activity</th><td class="mono">
+      {% if act.turn_in_flight %}<span class="tone-active">{{ act.turn_kind or "turn" }} in flight since {{ fmt_ts(act.turn_started_ts) }}</span>
+      {% elif act.abandoned_turn_ts %}<span class="tone-warn">idle — the {{ act.turn_kind or "turn" }} started {{ fmt_ts(act.abandoned_turn_ts) }} never finished</span>
+      {% else %}idle{% if act.due %} · {{ act.due }} queued due now{% endif %}{% endif %}
+      {% if act.usage_hold_until %}<br><span class="tone-warn">held until {{ fmt_ts(act.usage_hold_until) }} (usage limit)</span>{% endif %}
+      {% if act.kill_hold_until %}<br><span class="tone-warn">held until {{ fmt_ts(act.kill_hold_until) }} or the next release ({{ act.kills }} killed turns in a row)</span>{% endif %}
+      {% set why = {"error": " after a failed turn", "offer": " after an offer"} %}
+      {% for h in act.held %}<br>{{ h.id }} offered {{ h.offers }} of {{ act.max_offers }}:
+        {% if h.exhausted %}no offer left, it will time out
+        {% else %}held back{{ why.get(h.cause, "") }} until {{ fmt_ts(h.next_offer_ts) }}{% endif %}
+      {% endfor %}</td></tr>
+    <tr><th>session</th><td class="mono">{{ sess.get('session_id') or "not started" }}</td></tr>
+    <tr><th>turns</th><td class="mono">{{ sess.get('turns') or 0 }} · {{ sess.get('compactions') or 0 }} compaction(s)
+      {% if sess.get('compact_due') %}· <span class="tone-warn">compaction due</span>{% endif %}</td></tr>
+    <tr><th>context</th><td class="mono">
+      {% if sess.get('context_share') is not none %}{{ "%.0f"|format(sess.get('context_share') * 100) }}%
+      ({{ fmt_tok(sess.get('context_peak')) }} of {{ fmt_tok(sess.get('context_window')) }}){% else %}—{% endif %}</td></tr>
+    <tr><th>last turn</th><td class="mono">{{ fmt_ts(sess.get('last_turn_ts')) if sess.get('last_turn_ts') else "—" }}
+      {% if sess.get('last_turn_kind') %}· {{ sess.get('last_turn_kind') }}{% endif %}</td></tr>
+    {% if sess.get('last_error') %}<tr><th>last error</th><td class="mono tone-bad">{{ sess.get('last_error') }}</td></tr>{% endif %}
+    <tr><th>last release</th><td class="mono">{{ report.last_release or "—" }}</td></tr>
+  </table>
+</div>
+
+<h2>Pull requests</h2>
+<div class="panel">
+  <table>
+    <tr><th>id</th><th>project</th><th>PR</th><th>state</th><th>check</th><th>runs</th>
+      <th>deadline</th><th>output</th><th>handed to</th></tr>
+    {% for i in report["items"] %}
+    <tr id="{{ i.id }}">
+      <td class="mono" style="white-space:nowrap;user-select:all" title="click to select, then copy">{{ i.id }}</td>
+      <td class="mono">{{ i.project or "—" }}</td>
+      <td class="mono" style="white-space:nowrap"><a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a></td>
+      <td class="mono {{ tone[i.state] }}">{{ i.state }}</td>
+      <td class="mono">{% if i.script %}{{ peek(i.id ~ "-check", i.script_source, "check · " ~ i.id ~ " · #" ~ i.pr_number, i.script) }}{% else %}—{% endif %}</td>
+      <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
+      <td class="mono" style="white-space:nowrap">{{ fmt_ts(i.deadline_ts) }}</td>
+      <td class="mono">{% if i.last_output %}{{ peek(i.id ~ "-tail", "tail", "output · " ~ i.id ~ " · #" ~ i.pr_number, i.last_output) }}{% else %}—{% endif %}</td>
+      <td class="mono" style="word-break:break-all">{{ i.action or "—" }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="empty">nothing queued — a release or a merge fills this</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<p class="sub">from a terminal: <span class="mono">jarvis morpheus status</span> ·
+  <span class="mono">jarvis morpheus show &lt;id&gt;</span> ·
+  <span class="mono">jarvis morpheus waive &lt;id&gt; --reason "…"</span> ·
+  <span class="mono">jarvis morpheus requeue &lt;id&gt;</span> ·
+  <span class="mono">jarvis morpheus pause|unpause --reason "…"</span> ·
+  <span class="mono">jarvis morpheus follow-fleet</span></p>
+
+<script>
+document.querySelectorAll('[data-peek]').forEach(function (b) {
+  b.addEventListener('click', function () { document.getElementById(b.dataset.peek).showModal(); });
+});
+// A click on the backdrop lands on the dialog itself, never on its content.
+document.querySelectorAll('.peek-modal').forEach(function (d) {
+  d.addEventListener('click', function (e) { if (e.target === d) d.close(); });
+});
+</script>
+
+</div>
+{% endblock %}

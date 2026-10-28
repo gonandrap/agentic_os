@@ -38,15 +38,14 @@ def test_the_skill_reaches_every_worker_and_can_be_model_invoked(project):
     from jarvis import bootstrap
 
     roots = bootstrap.install_agent_assets(project, kind="worker")
-    delivered = [r / ".claude" / "skills" / "i-have-adhd" / "SKILL.md" for r in roots]
+    delivered = [r / ".claude" / "skills" / "ponytail" / "SKILL.md" for r in roots]
     hit = [p for p in delivered if p.is_file()]
     assert hit, f"skill not delivered to any --add-dir root: {roots}"
     text = hit[0].read_text()
     assert "disable-model-invocation" not in text
-    # The description is what decides whether the model ever loads it
-    front = text.split("---")[1]
-    for surface in ("work-order message", "PR body", "code comment"):
-        assert surface in front, f"description does not mention {surface!r}"
+    assert "full (default)" in text
+    # Disabled by the user: neither delivered nor shipped
+    assert not any((r / ".claude" / "skills" / "i-have-adhd").exists() for r in roots)
 
 
 def test_caveman_is_adapted_and_says_so(project):
@@ -89,10 +88,10 @@ def test_both_skills_ship_their_licences(project):
     """Both copies are third-party MIT inside a GPL-3.0 repo"""
     from jarvis import bootstrap
 
-    for name in ("i-have-adhd", "caveman"):
+    for name in ("ponytail", "caveman"):
         assert "MIT License" in (ASSETS / "skills" / name / "LICENSE").read_text()
     roots = bootstrap.install_agent_assets(project, kind="worker")
-    for name in ("i-have-adhd", "caveman"):
+    for name in ("ponytail", "caveman"):
         assert any((r / ".claude" / "skills" / name / "LICENSE").is_file()
                    for r in roots), f"{name} licence did not reach the worker tree"
 
@@ -152,6 +151,58 @@ def test_a_project_can_switch_the_message_cap_off_but_not_set_a_nonsense_one():
     for bad in (500, -1):
         with pytest.raises(CatalogError):
             _parse_concision({"message_max_chars": bad})
+
+
+# -- the assumption and question caps (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §1)
+
+def test_the_two_new_caps_default_to_one_thousand_and_two_thousand():
+    from jarvis import concision, sections
+    from jarvis.catalog import _parse_concision
+
+    assert concision.DEFAULT_ASSUME_MAX_CHARS == 1000
+    assert concision.DEFAULT_QUESTION_MAX_CHARS == 2000
+    # `concision` owns the number; `sections` re-exports it
+    assert sections.QUESTION_MAX_CHARS == concision.DEFAULT_QUESTION_MAX_CHARS
+    assert _parse_concision({}).assume_max_chars == 1000
+    assert _parse_concision({}).question_max_chars == 2000
+
+
+@pytest.mark.parametrize("key", ["assume_max_chars", "question_max_chars"])
+def test_a_project_can_tune_or_switch_each_new_cap_off_but_not_go_negative(key):
+    from jarvis.catalog import CatalogError, _parse_concision
+
+    assert getattr(_parse_concision({key: 0}), key) == 0
+    assert getattr(_parse_concision({key: 400}), key) == 400
+    with pytest.raises(CatalogError, match=f"{key} must be 0"):
+        _parse_concision({key: -1})
+
+
+def test_both_new_caps_travel_to_the_worker_by_env(project, jarvis_home):
+    """The hook refuses before the shell expands anything, so it carries them as env"""
+    from jarvis import concision
+    from jarvis.catalog import ConcisionConfig
+
+    written = json.loads(
+        _write_worker_settings(_spec(project), {"id": "wo-conc06"}).read_text())
+    assert written["env"][concision.ASSUME_CAP_ENV] == "1000"
+    assert written["env"][concision.QUESTION_CAP_ENV] == "2000"
+
+    tighter = json.loads(_write_worker_settings(
+        _spec(project, concision=ConcisionConfig(assume_max_chars=300,
+                                                 question_max_chars=700)),
+        {"id": "wo-conc07"}).read_text())
+    assert concision.assume_cap(tighter["env"]) == 300
+    assert concision.question_cap(tighter["env"]) == 700
+
+
+@pytest.mark.parametrize("raw", [None, "", "nonsense", "-5"])
+def test_an_unusable_env_value_falls_back_to_the_default(raw):
+    from jarvis import concision
+
+    env = {} if raw is None else {concision.ASSUME_CAP_ENV: raw,
+                                  concision.QUESTION_CAP_ENV: raw}
+    assert concision.assume_cap(env) == concision.DEFAULT_ASSUME_MAX_CHARS
+    assert concision.question_cap(env) == concision.DEFAULT_QUESTION_MAX_CHARS
 
 
 # -- the subagent transport (SS5.1)

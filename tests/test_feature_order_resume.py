@@ -56,7 +56,7 @@ def a_released_feature(daemon, store, *keys: str) -> dict:
 def a_failed_feature(daemon, store, *keys: str) -> tuple[dict, list[dict]]:
     """A feature settled `failed` by its first child, the rest completed"""
     fo = a_released_feature(daemon, store, *keys)
-    kids = store.feature_children(fo["id"])
+    kids = store.feature_children(fo["id"], kinds=("worker",))
     store.set_status(kids[0]["id"], "failed")
     for c in kids[1:]:
         store.set_status(c["id"], "completed")
@@ -182,7 +182,7 @@ def test_resume_without_a_fix_files_nothing(started, store):
     out = ops.resume_feature_order(fo["id"])
 
     assert out["fix_wo_id"] is None
-    assert len(store.feature_children(fo["id"])) == 2
+    assert len(store.feature_children(fo["id"], kinds=("worker",))) == 2
 
 
 def test_resume_refuses_a_feature_that_is_not_failed(started, store):
@@ -366,7 +366,7 @@ def test_the_cli_resumes_and_says_what_it_filed(started, store, capsys):
     assert "executing" in out
     assert store.get_feature_order(fo["id"])["status"] == "executing"
     assert any(c["title"] == "redo the exporter"
-               for c in store.feature_children(fo["id"]))
+               for c in store.feature_children(fo["id"], kinds=("worker",)))
 
 
 def test_the_metadata_key_survives_a_feature_that_already_had_metadata(started, store):

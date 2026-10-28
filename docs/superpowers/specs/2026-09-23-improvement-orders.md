@@ -377,6 +377,13 @@ revision fixes all of them.
   not an argument;
 * `evidence` empty, an entry with no `source` or no `quote`, or a `quote` under
   `MIN_QUOTE_CHARS = 20`;
+* a prose field over its `MAX_FIELD_CHARS` cap (symptom 300, root_cause 600,
+  why_insufficient 300, recommendation 400), a `summary` over `MAX_SUMMARY_CHARS = 160`,
+  more than `MAX_EVIDENCE = 4` quotes, or a quote over `MAX_QUOTE_CHARS = 300`. Added
+  2026-10-22 after io-c74f22c3 shipped ~20 KB of findings: the floor stops a label, the
+  cap stops a lab notebook, and the user decides only what they can read. Detail a worker
+  needs belongs in the proposed order's `description`. The evidence caps are passed by
+  `parse_report` only; `verdicts` shares `parse_evidence` without them;
 * a proposed order with no `title`, a `type` outside `("work", "feature")`, a non-string
   `project`, or a `description` failing `plans._description_problems` — reused rather than
   reimplemented, because that description becomes a real brief read cold by a stranger and
@@ -390,6 +397,9 @@ revision fixes all of them.
 `render_finding(finding)` and `render_report(report)` return line lists and are shared by
 `jarvis io show` and the dashboard page, so the two cannot drift.
 `review_headline(io, report)` returns the counts-first line the attention reason uses.
+`render_digest(report)` is `jarvis io show`'s default: one line of root cause, one of
+recommendation, and the order titles per finding; `--finding <key>` prints one finding in
+full and `--full` all of them.
 
 This section also lands `a_report(**overrides)` in `src/jarvis/testing.py` beside the
 `improvement_order` fixture: a document `parse_report` accepts, every field overridable so a
@@ -525,6 +535,60 @@ line is the only part most workers ever see unprompted. The entry opens
 about…". The remaining fields follow as labelled paragraphs.
 
 ### 5.5 Neo: rejections teach it, and nothing else is built
+
+> **Amended 2026-10-22: Neo now decides findings, and the steward decides their spend.**
+> The user ruled that a report must not wait on them finding by finding. The OS is meant
+> to be as autonomous as possible. The seam described below is now built, with two
+> departures from it. As built:
+>
+> * `ops.submit_findings` asks Neo ONE `kind='findings'` question per pending finding
+>   (`findings.build_finding_question`: that finding's argument, evidence and proposed
+>   orders, each brief clipped to 600 characters; the io's observation as context). It
+>   keeps the question id on the finding as `neo_question_id`. The io gets NO attention
+>   item while every finding is with Neo. `plan_question_id` stays NULL. A question the
+>   store refuses as too large leaves that finding to the user.
+> * Neo answers accept / reject / escalate and RATES the defect on the steward's §3.0
+>   scale (`findings.FINDINGS_REVIEWER_PERSONA`). `ops.apply_findings_verdict` applies it.
+>   - **Reject:** the finding is rejected `decided_by='neo'`. First departure: the seam
+>     said accept-only. A Neo rejection writes NO Neo learning, because Neo learning from
+>     its own ruling is a loop. Only the user's rejection teaches it.
+>   - **Accept with no proposed orders:** accepted outright. Nothing is spent, so nothing
+>     is the steward's to decide.
+>   - **Accept with orders:** second departure, the steward is in the loop. A
+>     Neo-accepted finding is no longer user-originated (steward A8 still holds for
+>     findings the USER accepts). It goes to `steward.gate` as origin kind `io_finding`,
+>     with Neo's severity, the evidence sources as evidence, and the io's evidence-ref
+>     count as recurrence. `allowed` files the orders stamped and budgeted. In `enforce`
+>     with `self_dispatch` on, `queue` accepts the diagnosis and HOLDS its orders
+>     (`orders_held`, drained by `ops.reoffer_io_finding`), and `drop` rejects it
+>     `decided_by='steward'`. Anything else (`ask`, `self_dispatch` off, an unreadable
+>     catalog) leaves the finding pending for the user, with Neo's reading and the
+>     steward's reason on it.
+>   - **Escalate, or Neo unreachable / refused:** the finding is the user's. The
+>     attention item is raised at that transition, and one inbox row goes out.
+> * The user can decide any finding at any time; doing so closes Neo's open question.
+>   `INV-NEO-ESCALATION-STALE` closes an escalated one the user decided since. A
+>   resubmission closes the old report's questions.
+> * The OS deciding writes a `findings_decided` event and the user a `findings_reviewed`
+>   one, so `steward.touched` (detector precision) never counts Neo as the user.
+> * `os.neo.review_findings` (default `true`) switches it off: every finding waits for
+>   the user, as before.
+> * A report Neo was never asked about (submitted before this landed, or while the switch
+>   was off) is offered to Neo by the daemon on its reconcile cadence
+>   (`ops.offer_unasked_findings`, `findings.never_offered`). Each pending finding with no
+>   `neo_question_id`, no `neo_verdict` and no `neo_unasked` is asked once. A question the
+>   store refuses as too large marks the finding `neo_unasked`, so it is never offered
+>   again. The io's attention is cleared when nothing is left for the user and re-raised
+>   with the new headline otherwise. A finding the user decided while Neo was being asked
+>   keeps the user's decision, and its question is superseded. The fleet pause holds the
+>   offer, because a Neo question is spend.
+> * `jarvis io ask-neo <io-id>` (`ops.ask_neo_about_findings`) does the same by hand, for
+>   one report, and wider (`findings.reaskable`): it also re-asks a finding Neo escalated,
+>   could not be reached for, or was refused as too large. It skips one Neo accepted,
+>   which waits only on the user's yes to the spend. User-typed, so the pause does not
+>   hold it.
+>
+> The original text follows.
 
 A rejection adds a Neo learning (`NeoStore.add_learning`) carrying the user's feedback and
 the finding's root cause, scoped to the project — the same path

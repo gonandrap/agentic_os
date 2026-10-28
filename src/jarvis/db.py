@@ -24,7 +24,11 @@ def connect(path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """One all-or-nothing unit of work"""
+    """One all-or-nothing unit of work, reentrant: the outermost one owns the commit"""
+    if conn.in_transaction:
+        # The connection is in autocommit (`connect`), so this is an explicit BEGIN of ours
+        yield conn
+        return
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
@@ -32,6 +36,22 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+
+
+def add_missing_columns(conn: sqlite3.Connection,
+                        added: Mapping[str, Mapping[str, str]]) -> None:
+    """ALTER in each column a table lacks; a column a concurrent opener just added is not an error"""
+    for table, columns in added.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, decl in columns.items():
+            if name in have:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            except sqlite3.OperationalError as e:
+                # Two processes opening one fresh store both saw the column missing
+                if "duplicate column name" not in str(e):
+                    raise
 
 
 def now() -> float:

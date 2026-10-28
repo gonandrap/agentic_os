@@ -245,6 +245,15 @@ def verdict_stored(store: ProjectStore, wo: dict[str, Any]) -> bool:
     return bool((db.from_json(fo.get("plan"), {}) or {}).get("classification"))
 
 
+def verdict_landed(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Did this investigator's verdict land: stored, investigation `completed`, on its timeline?"""
+    if not verdict_stored(store, wo):
+        return False
+    if store.get_feature_order(str(wo["parent_id"]))["status"] != "completed":
+        return False
+    return bool(store.events_of_kind(wo["id"], "verdict_submitted"))
+
+
 def settle_headline(inv_id: str, verdict: dict[str, Any]) -> str:
     """The attention line a WAITING_ON_USER verdict raises — §2.5, step 6"""
     return (f"{inv_id}: {verdict.get('subject', '')} is waiting on you — "

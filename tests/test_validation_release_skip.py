@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
@@ -105,7 +104,7 @@ def green_base() -> None:
     central = CentralStore()
     try:
         central.set_base_health("proj_a", {"red": False, "base": "main",
-                                           "checked_at": time.time()})
+                                           "checked_at": db.now()})
     finally:
         central.close()
 

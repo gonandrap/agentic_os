@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, ops, worker_session
+from jarvis import claude_cli, db, ops, worker_session
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
@@ -130,6 +130,7 @@ def test_an_empty_reply_falls_back_to_what_the_stop_hook_saw(fleet):
                  "last_assistant_message": "what the hook saw"},
                 {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT_PATH": str(fleet["path"])})
     # the process finishes, but its result field is blank
+    # clock-exempt: class 3 — spin-waits for the real worker process to exit before its outfile is rewritten
     while claude_cli.process_alive(store.latest_turn(wo["id"])["pid"]):
         time.sleep(0.02)
     Path(turn["outfile"]).write_text(json.dumps(
@@ -153,7 +154,7 @@ def test_a_long_running_turn_is_reported_not_killed(fleet, fake_claude, settle_t
     assert store.get_work_order(wo["id"])["status"] == "running"
 
     assert not worker_session.is_stalled(turn)
-    aged = {**turn, "started_at": time.time() - worker_session.TURN_STALL_SECONDS - 1}
+    aged = {**turn, "started_at": db.now() - worker_session.TURN_STALL_SECONDS - 1}
     assert worker_session.is_stalled(aged)
 
     store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
@@ -183,6 +184,7 @@ def test_cancel_kills_the_process_group(fleet, fake_claude):
     out = worker_session.cancel(store, wo["id"])
 
     assert out["stopped"] is True and out["seq"] == 1
+    # clock-exempt: class 3 — spin-waits for the cancelled process group to really die
     deadline = time.monotonic() + 5
     while claude_cli.process_alive(turn["pid"]) and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -211,6 +213,18 @@ def test_process_alive_rejects_a_pid_that_is_not_a_claude(fake_claude):
     assert claude_cli.process_alive(os.getpid()) is False
 
 
+def test_process_alive_rejects_a_non_claude_pid_without_proc(fake_claude, monkeypatch):
+    """macOS has no /proc, so the pid-reuse guard asks `ps` instead of trusting the signal"""
+    import os
+
+    real = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda self: (
+        (_ for _ in ()).throw(OSError("no /proc")) if str(self).startswith("/proc/")
+        else real(self)))
+
+    assert claude_cli.process_alive(os.getpid()) is False
+
+
 def test_a_finished_turn_is_not_reported_alive_as_a_zombie(fleet):
     """Nothing waits on a detached turn, so on exit it becomes a **zombie**"""
     import os
@@ -220,6 +234,7 @@ def test_a_finished_turn_is_not_reported_alive_as_a_zombie(fleet):
     turn, _ = worker_session.start(store, project, wo, "go")
 
     # wait for the process to finish WITHOUT reaping it — that is what makes a zombie
+    # clock-exempt: class 3 — spin-waits for an unreaped turn to become a zombie, which only the OS can do
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if Path(turn["outfile"]).exists() and Path(turn["outfile"]).read_text().strip():
@@ -255,7 +270,7 @@ def test_a_work_order_in_flight_at_upgrade_is_surfaced_not_failed(fleet):
                             job_id="bg-42")
     store.set_status(wo["id"], "running")
     store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
-                       (time.time() - 3600, wo["id"]))
+                       (db.now() - 3600, wo["id"]))
 
     fleet["daemon"].settle_work_order(fleet["project"], store,
                                       store.get_work_order(wo["id"]))
@@ -273,7 +288,7 @@ def test_a_work_order_claimed_but_never_launched_still_fails(fleet):
     wo = _wo(fleet)
     store.set_status(wo["id"], "dispatching")
     store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
-                       (time.time() - 3600, wo["id"]))
+                       (db.now() - 3600, wo["id"]))
 
     fleet["daemon"].settle_work_order(fleet["project"], store,
                                       store.get_work_order(wo["id"]))

@@ -1,4 +1,4 @@
-"""A work order that stopped, and nothing coming for it"""
+"""A work order that stopped, and nothing coming for it (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from jarvis import db, ops
+from jarvis import db, invariants, ops
 from jarvis.central_store import CentralStore
 from jarvis.invariants import (
     PARKED_BLOCKER,
@@ -22,12 +22,23 @@ from jarvis.project_store import ProjectStore
 LONG_ENOUGH = 90 * 60
 
 
-def _parked_running(store: ProjectStore, title: str = "the parked one") -> dict:
-    """The shape `Daemon.settle_work_order` leaves behind when it never gets there: the turn is reaped and..."""
+def _parked(store: ProjectStore, title: str = "the parked one") -> dict:
+    """A row NO PASS SELECTS: the turn is reaped and done"""
     wo = store.create_work_order(title)
-    store.set_status(wo["id"], "running")
+    store.update_work_order(wo["id"], session_id="sess-1")
     turn = store.create_turn(wo["id"], "dispatch", "do the thing")
     store.finish_turn(turn["id"], "done", result="waiting on exact counts")
+    store.set_status(wo["id"], "waiting_pr_merge")
+    return store.get_work_order(wo["id"])
+
+
+def _waiting_on_a_delegate(store: ProjectStore) -> dict:
+    """A worker parked in `waiting_input`, where the gate and question passes DO select"""
+    wo = store.create_work_order("asked the delegate something")
+    store.update_work_order(wo["id"], session_id="sess-1")
+    turn = store.create_turn(wo["id"], "dispatch", "do the thing")
+    store.finish_turn(turn["id"], "done", result="waiting on the gate")
+    store.set_status(wo["id"], "waiting_input")
     return store.get_work_order(wo["id"])
 
 
@@ -47,15 +58,6 @@ def _wo_a4bd6958(store: ProjectStore) -> dict:
     return store.get_work_order(wo["id"])
 
 
-def _rewind(monkeypatch, seconds: float):
-    """Build the fixture `seconds` in the past, with the clock still MOVING"""
-    was = db.now
-    base = was() - seconds
-    ticks = iter(range(100_000))
-    monkeypatch.setattr(db, "now", lambda: base + next(ticks))
-    return lambda: monkeypatch.setattr(db, "now", was)
-
-
 def _later(store: ProjectStore, wo_id: str) -> float:
     """Long enough after this work order's last turn ended for the threshold to bite"""
     return float(store.latest_turn(wo_id)["ended_at"]) + LONG_ENOUGH
@@ -64,9 +66,11 @@ def _later(store: ProjectStore, wo_id: str) -> float:
 # -- the two shapes it must catch
 
 
-def test_a_settled_turn_on_a_running_order_is_parked_once_the_threshold_passes(project):
+def test_a_settled_turn_on_a_row_no_pass_selects_is_parked_once_the_threshold_passes(
+        project):
+    """GitHub issue 100's half of this suite"""
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
 
     assert parked_reason(store, wo, now=float(wo["updated_at"])) is None
     assert parked_reason(store, wo, now=_later(store, wo["id"])) == PARKED_BLOCKER
@@ -116,7 +120,7 @@ def test_a_dependency_blocked_order_is_not_parked(project):
 
 def test_a_gate_blocked_order_is_not_parked(project):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _waiting_on_a_delegate(store)
     store.add_approval(wo["id"], "pr_merge", "gh pr merge 42")
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) is None
@@ -124,7 +128,7 @@ def test_a_gate_blocked_order_is_not_parked(project):
 
 def test_an_order_with_a_pending_neo_question_is_not_parked(project):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _waiting_on_a_delegate(store)
     neo = NeoStore()
     try:
         neo.ask("proj_a", wo["id"], "which way round?")
@@ -147,8 +151,9 @@ def test_an_order_with_a_turn_in_flight_is_not_parked(project):
 def test_a_queued_message_is_not_parked(project):
     """The next turn is already written down; the daemon delivers it"""
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _waiting_on_a_delegate(store)
     store.queue_message(wo["id"], "carry on")
+    wo = store.get_work_order(wo["id"])
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) is None
 
@@ -171,7 +176,9 @@ def test_a_turn_waiting_on_its_scheduled_retry_is_not_parked(project):
 def test_an_idle_manager_is_never_parked(project):
     """A project manager is idle BY DESIGN between its feature's messages (#264)"""
     store = ProjectStore(project)
-    wo = store.create_work_order("manage the feature", kind="manager")
+    wo = store.create_work_order(
+        "manage the feature", kind="manager",
+        parent_id=store.create_feature_order("widen the supervisor", "…")["id"])
     store.set_status(wo["id"], "idle")
     turn = store.create_turn(wo["id"], "dispatch", "manage it")
     store.finish_turn(turn["id"], "done", result="nothing to do")
@@ -207,12 +214,12 @@ def test_an_injected_session_is_never_parked(project):
 # -- the reconcile tick, and the surface
 
 
-def test_the_reconciler_flags_a_parked_running_order(project, monkeypatch):
+def test_the_reconciler_flags_a_parked_running_order(project, clock):
     """INV-ATTENTION-MISSING must select `running` for this: a status it skips has its blocker derived..."""
     store = ProjectStore(project)
-    restore = _rewind(monkeypatch, LONG_ENOUGH)
-    wo = _parked_running(store)
-    restore()
+    clock.ticking()                          # the rows must still be strictly ordered
+    with clock.moved(-LONG_ENOUGH):
+        wo = _parked(store)
 
     violations = check_project(store)
 
@@ -224,12 +231,12 @@ def test_the_reconciler_flags_a_parked_running_order(project, monkeypatch):
 
 
 def test_a_read_only_doctor_run_reports_the_parking_without_raising_it(
-        project, monkeypatch):
+        project, clock):
     """`jarvis doctor` runs every invariant through `invariants._ReadOnly`"""
     store = ProjectStore(project)
-    restore = _rewind(monkeypatch, LONG_ENOUGH)
-    wo = _parked_running(store)
-    restore()
+    clock.ticking()
+    with clock.moved(-LONG_ENOUGH):
+        wo = _parked(store)
 
     violations = check_project(store, repair=False)
 
@@ -238,12 +245,12 @@ def test_a_read_only_doctor_run_reports_the_parking_without_raising_it(
 
 
 def test_jarvis_status_names_the_parked_order_and_what_it_is_parked_on(
-        project, catalog_file, monkeypatch):
+        project, catalog_file, clock):
     store = ProjectStore(project)
-    restore = _rewind(monkeypatch, LONG_ENOUGH)
-    parked = _parked_running(store)
-    masked = _wo_a4bd6958(store)
-    restore()
+    clock.ticking()
+    with clock.moved(-LONG_ENOUGH):
+        parked = _parked(store)
+        masked = _wo_a4bd6958(store)
     check_project(store)
     store.close()
     _register(catalog_file)
@@ -257,14 +264,14 @@ def test_jarvis_status_names_the_parked_order_and_what_it_is_parked_on(
 
 
 def test_a_parked_child_is_named_on_its_feature_orders_rolled_up_line(
-        project, catalog_file, monkeypatch):
+        project, catalog_file, clock):
     """A feature's children get ONE rolled-up line instead of a line each, and wo-a4bd6958 was a child"""
     store = ProjectStore(project)
     fo = store.create_feature_order("widen the supervisor", "…")
-    restore = _rewind(monkeypatch, LONG_ENOUGH)
-    child = _wo_a4bd6958(store)
-    store.update_work_order(child["id"], parent_id=fo["id"])
-    restore()
+    clock.ticking()
+    with clock.moved(-LONG_ENOUGH):
+        child = _wo_a4bd6958(store)
+        store.update_work_order(child["id"], parent_id=fo["id"])
     check_project(store)
     store.close()
     _register(catalog_file)
@@ -277,17 +284,17 @@ def test_a_parked_child_is_named_on_its_feature_orders_rolled_up_line(
 
 
 def test_the_dashboard_shows_the_blocker_the_flag_could_not_carry(
-        project, catalog_file, jarvis_home, fake_claude, monkeypatch):
+        project, catalog_file, jarvis_home, fake_claude, clock):
     """`attention_reason` is one column fed from `true_blockers[0]`"""
     from fastapi.testclient import TestClient
 
     from jarvis.ui.app import create_app
 
     store = ProjectStore(project)
-    restore = _rewind(monkeypatch, LONG_ENOUGH)
-    masked = _wo_a4bd6958(store)
-    ordinary = _parked_running(store, title="nothing to add")
-    restore()
+    clock.ticking()
+    with clock.moved(-LONG_ENOUGH):
+        masked = _wo_a4bd6958(store)
+        ordinary = _parked(store, title="nothing to add")
     check_project(store)  # the reconciler is what puts the flag on `ordinary`
     store.close()
     ops.start_os(str(catalog_file), foreground=True)
@@ -336,7 +343,7 @@ def _set_inspect(catalog_file, *, os_block: dict | None = None,
 @pytest.mark.parametrize("minutes,parked", [(600, False), (10, True)])
 def test_the_threshold_is_a_fleet_setting(project, catalog_file, minutes, parked):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     _set_inspect(catalog_file, os_block={"alarm_parked_minutes": minutes})
 
     got = parked_reason(store, wo, now=_later(store, wo["id"]))
@@ -347,7 +354,7 @@ def test_the_threshold_is_a_fleet_setting(project, catalog_file, minutes, parked
 def test_a_project_overrides_the_fleet_threshold_and_inherits_the_rest(
         project, catalog_file):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     _set_inspect(catalog_file, os_block={"alarm_parked_minutes": 10},
                  project_block={"alarm_parked_minutes": 600})
 
@@ -357,17 +364,19 @@ def test_a_project_overrides_the_fleet_threshold_and_inherits_the_rest(
 
 def test_disabling_the_inspect_alarms_disables_the_parked_check(project, catalog_file):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     _set_inspect(catalog_file, os_block={"enabled": False})
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) is None
-    assert true_blockers(store, wo, now=_later(store, wo["id"])) == []
+    # ...and what is left is the line the THRESHOLD does not govern: the alarms switch turns off "it has...
+    assert true_blockers(store, wo, now=_later(store, wo["id"])) == [
+        invariants.NO_ACTOR_BLOCKER.format(status="waiting_pr_merge")]
 
 
 def test_the_parked_reason_does_not_move_with_the_clock(project):
     """It is compared against `attention_reason` and stored by `ack_attention`"""
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     ended = float(store.latest_turn(wo["id"])["ended_at"])
 
     assert (parked_reason(store, wo, now=ended + LONG_ENOUGH)
@@ -376,7 +385,7 @@ def test_the_parked_reason_does_not_move_with_the_clock(project):
 
 def test_acknowledging_a_parked_order_puts_the_flag_down_for_good(project):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     now = _later(store, wo["id"])
     store.ack_attention(wo["id"], true_blockers(store, wo, now=now))
 
@@ -386,11 +395,65 @@ def test_acknowledging_a_parked_order_puts_the_flag_down_for_good(project):
 def test_nothing_here_nudges_a_worker(project):
     """The supervisor's gated remedy is the OS's one path into a worker's inbox... (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5)"""
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     check_project(store)
 
     assert store.queued_messages(wo["id"]) == []
-    assert store.get_work_order(wo["id"])["status"] == "running"
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+# -- 5a: the verdict is the predicate
+
+
+def test_a_settled_work_order_is_never_asked_who_owns_it(project):
+    """The gate is `OPEN_STATUSES`, not `PARKABLE_STATUSES`"""
+    store = ProjectStore(project)
+    wo = _parked(store)
+    store.set_status(wo["id"], "completed")
+
+    assert parked_reason(store, store.get_work_order(wo["id"]),
+                         now=_later(store, wo["id"])) is None
+
+
+def test_it_never_asks_ops_waiting_on(project, monkeypatch):
+    """§5a: cutting the `parked_reason` to `waiting_on` edge is what lets section 6 rebase `waiting_on` on..."""
+    store = ProjectStore(project)
+    wo = _parked(store)
+    monkeypatch.setattr(ops, "waiting_on",
+                        lambda *a, **k: pytest.fail("parked_reason asked waiting_on"))
+
+    parked_reason(store, wo, now=_later(store, wo["id"]))
+
+
+def test_the_caller_can_hand_over_a_verdict_it_already_derived(project):
+    """The sentinel is NOT None, and that distinction is the argument's whole point: a caller that derived..."""
+    store = ProjectStore(project)
+    wo = _parked(store)
+    now = _later(store, wo["id"])
+    somebody = ops.Actor(pass_name="Daemon.settle_turns", why="…",
+                         predicate="daemon.settles_turn")
+
+    assert parked_reason(store, wo, now=now, actor=somebody) is None
+    assert parked_reason(store, wo, now=now, actor=None) == PARKED_BLOCKER
+    assert parked_reason(store, wo, now=now,
+                         actor=invariants.ACTOR_NOT_DERIVED) == \
+        parked_reason(store, wo, now=now)
+
+
+def test_resume_auto_still_nudges_a_parked_worker(project, catalog_file):
+    """The other half of the GitHub issue 100 pin: the flag is one surface"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("stopped mid-task")
+    store.set_status(wo["id"], "running")
+    turn = store.create_turn(wo["id"], "dispatch", "do the thing")
+    store.finish_turn(turn["id"], "done", result="waiting on exact counts")
+    wo = store.get_work_order(wo["id"])
+    store.close()
+    _register(catalog_file)
+
+    answer = ops.resume_in_auto(wo["id"])
+
+    assert answer["nudged"] is True
 
 
 # -- 2b: a head the OS has already judged is not an undelivered one
@@ -399,57 +462,56 @@ def test_nothing_here_nudges_a_worker(project):
 JUDGED = "1f2e3d4c5b6a7980112233445566778899aabbcc"
 
 
-def _judged_then_replied(store: ProjectStore, monkeypatch, *, head: str,
+def _judged_then_replied(store: ProjectStore, clock, *, head: str,
                          judged: str) -> dict:
     """wo-3312682f: delivered, judged green, then a reply turn the OS itself opened"""
-    restore = _rewind(monkeypatch, 4 * LONG_ENOUGH)
-    wo = store.create_work_order("delivered behind a pull request")
-    first = store.create_turn(wo["id"], "dispatch", "do it")
-    store.finish_turn(first["id"], "done", result="opened the PR")
-    store.add_event(wo["id"], "finished", {"summary": "opened the PR"})
-    round_ = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
-    store.set_validation_head(round_["id"], judged)
-    store.close_validation_round(round_["id"], "passed", "green")
-    msg = store.queue_message(wo["id"], "the gate request was dismissed", source="gate",
-                              status="delivered")
-    reply = store.create_turn(wo["id"], "message", "it was dismissed", msg_id=msg)
-    store.finish_turn(reply["id"], "done", result="noted, nothing to do")
-    store.set_status(wo["id"], "needs_review", pr_url="https://example/pull/1",
-                     pr_head_oid=head, pr_head_seen_at=db.now())
-    restore()
+    clock.ticking()
+    with clock.moved(-4 * LONG_ENOUGH):
+        wo = store.create_work_order("delivered behind a pull request")
+        first = store.create_turn(wo["id"], "dispatch", "do it")
+        store.finish_turn(first["id"], "done", result="opened the PR")
+        store.add_event(wo["id"], "finished", {"summary": "opened the PR"})
+        round_ = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+        store.set_validation_head(round_["id"], judged)
+        store.close_validation_round(round_["id"], "passed", "green")
+        msg = store.queue_message(wo["id"], "the gate request was dismissed", source="gate",
+                                  status="delivered")
+        reply = store.create_turn(wo["id"], "message", "it was dismissed", msg_id=msg)
+        store.finish_turn(reply["id"], "done", result="noted, nothing to do")
+        store.set_status(wo["id"], "needs_review", pr_url="https://example/pull/1",
+                         pr_head_oid=head, pr_head_seen_at=db.now())
     return store.get_work_order(wo["id"])
 
 
-def test_a_reply_turn_on_an_already_judged_head_is_not_a_stale_finish(project,
-                                                                     monkeypatch):
+def test_a_reply_turn_on_an_already_judged_head_is_not_a_stale_finish(project, clock):
     """Spec §2b"""
     store = ProjectStore(project)
-    wo = _judged_then_replied(store, monkeypatch, head=JUDGED, judged=JUDGED)
+    wo = _judged_then_replied(store, clock, head=JUDGED, judged=JUDGED)
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) is None
 
 
-def test_a_round_that_recorded_no_commit_is_no_excuse(project, monkeypatch):
+def test_a_round_that_recorded_no_commit_is_no_excuse(project, clock):
     """Spec §2b: an EMPTY head is never read as equal"""
     store = ProjectStore(project)
-    wo = _judged_then_replied(store, monkeypatch, head="", judged="")
+    wo = _judged_then_replied(store, clock, head="", judged="")
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) == STALE_FINISH_BLOCKER
 
 
 def test_a_head_that_moved_past_the_judged_commit_still_reports_the_stale_finish(
-        project, monkeypatch):
+        project, clock):
     """The worker pushed after the round passed: that IS something undeclared"""
     store = ProjectStore(project)
-    wo = _judged_then_replied(store, monkeypatch, head="0" * 40, judged=JUDGED)
+    wo = _judged_then_replied(store, clock, head="0" * 40, judged=JUDGED)
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) == STALE_FINISH_BLOCKER
 
 
-def test_the_merged_head_excuses_it_too(project, monkeypatch):
+def test_the_merged_head_excuses_it_too(project, clock):
     """The other member of the judged set: the newest `pr_merged` event's `head_oid`"""
     store = ProjectStore(project)
-    wo = _judged_then_replied(store, monkeypatch, head=JUDGED, judged="")
+    wo = _judged_then_replied(store, clock, head=JUDGED, judged="")
     store.add_event(wo["id"], "pr_merged", {"head_oid": JUDGED})
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) is None

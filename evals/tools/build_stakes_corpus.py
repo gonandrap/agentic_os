@@ -81,8 +81,12 @@ def rows_of(wo_id: str, labels: dict[str, Any]) -> list[dict[str, Any]]:
         if not text:
             continue
         row_id = f"{wo_id}#{a.get('n')}"
-        category, uncertain, why = (labels.get(row_id)
-                                    or ["none", False, "unlabelled: routine by default"])
+        # The user's own `jarvis wo review --false-alarm` is a label: routine, and checked
+        alarm = str(a.get("stakes_false_alarm") or "")
+        fallback = (["none", False, f"the user called the net's match on {alarm!r} a "
+                                    f"false alarm"] if alarm
+                    else ["none", False, "unlabelled: routine by default"])
+        category, uncertain, why = labels.get(row_id) or fallback
         if category not in (*HIGH_CATEGORIES, "none"):
             raise SystemExit(f"{row_id}: {category!r} is not a stakes category")
         out.append({"id": row_id, "text": text,

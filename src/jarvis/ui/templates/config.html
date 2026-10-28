@@ -9,6 +9,8 @@
   .cfg-layout { display: grid; grid-template-columns: 236px minmax(0, 1fr);
                 gap: 16px; align-items: start; }
   @media (max-width: 820px) { .cfg-layout { grid-template-columns: 1fr; } }
+  @media (min-width: 821px) { .cfg-layout > .panel:first-child { position: sticky; top: 64px;
+    max-height: calc(100vh - 80px); overflow-y: auto; } }
 
   .cfg-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
              margin: 14px 0 10px; }
@@ -120,6 +122,15 @@
   <button class="primary">Search</button>
   {% if q %}<a class="sub" href="/config?scope={{ scope|urlencode }}">clear</a>{% endif %}
 </form>
+{# A project's settings sit next to what they produce — 2026-10-22 spec §4. #}
+{% if scope != 'os' %}
+<div class="jumps" style="margin: 0 0 12px;">
+  <a href="/project/{{ scope_short }}">{{ scope_short }}</a>
+  <a href="/project/{{ scope_short }}/prompt">its worker prompt</a>
+  <a href="#wiring">what reaches its workers</a>
+  <a href="#cfg-history">history</a>
+</div>
+{% endif %}
 
 <div class="cfg-legend sub">
   <span><span class="tone-warn">⚠</span> a safety setting: it changes what a worker is
@@ -249,7 +260,10 @@
   {% endif %}
 </div>
 
-<h2>History</h2>
+{# History and the diff side by side at width (2026-10-22 spec §5). #}
+<div class="grid" style="--col: 640px;">
+<div class="sec">
+<h2 id="cfg-history">History</h2>
 <div class="panel">
   {% for row in history %}
   <div class="msg" id="{{ row.id }}">
@@ -272,7 +286,9 @@
     <code>jarvis config adopt</code> records the file as the first</div>
   {% endfor %}
 </div>
+</div>
 
+<div class="sec sticky-col">
 <h2>Diff</h2>
 <div class="panel" style="padding: 10px 16px">
   <form method="get" action="/config" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center">
@@ -309,6 +325,8 @@
   {% else %}
   <div class="sub" style="margin-top:8px">pick two versions to compare</div>
   {% endif %}
+</div>
+</div>
 </div>
 
 {% endblock %}

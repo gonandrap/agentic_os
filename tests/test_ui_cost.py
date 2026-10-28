@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -12,6 +11,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from jarvis import db  # noqa: E402
 from jarvis import ops, usage  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
@@ -334,7 +334,7 @@ def test_the_bill_names_every_actor_and_the_tokens_each_spent(client, project,
 def test_the_bill_page_names_the_residue_and_what_it_could_not_measure(
         client, project, transcript):
     """§7 and §9: the residue row, the placeholder sentence"""
-    now = time.time()
+    now = db.now()
     wo = ops.create_work_order("proj_a", "with a placeholder subagent")
     transcript("sess-residue", write_tok=1_000, read=5_000, out=6_000, at=now + 5,
                subagents=[{"write_tok": 1_000, "read": 2_000, "out": 5,
@@ -843,3 +843,124 @@ def test_the_cost_page_writes_nothing(client, project):
     before = counts()
     assert client.get("/cost?window=5h").status_code == 200
     assert counts() == before
+
+
+# docs/superpowers/specs/2026-10-22-cost-tab-precompute.md
+
+
+def seed_cache(client, project, name="week"):
+    """A real cached entry with one work order in it, then a live compute that must not run"""
+    add_recorded_turn(project, ops.create_work_order("proj_a", "cached sentinel")["id"],
+                      0.05, 48_000)
+    cache = client.app.state.cost_cache
+    cache.entries[name] = cache.compute(name)
+    add_recorded_turn(project, ops.create_work_order("proj_a", "added after refresh")["id"],
+                      0.05, 48_000)
+    return cache
+
+
+def count_live(monkeypatch) -> list:
+    calls: list = []
+    real = ops.cost_report
+
+    def counted(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(ops, "cost_report", counted)
+    return calls
+
+
+def test_a_cached_window_is_served_without_recomputing(client, project, monkeypatch):
+    seed_cache(client, project)
+    calls = count_live(monkeypatch)
+
+    page = client.get("/cost")
+
+    assert page.status_code == 200
+    assert "cached sentinel" in page.text
+    assert "added after refresh" not in page.text
+    assert "computed " in page.text and "s ago" in page.text
+    assert calls == []
+
+
+def test_the_5h_window_is_served_from_cache(client, project, monkeypatch):
+    seed_cache(client, project, "5h")
+    calls = count_live(monkeypatch)
+
+    page = client.get("/cost?window=5h")
+
+    assert "cached sentinel" in page.text and "added after refresh" not in page.text
+    assert calls == []
+
+
+@pytest.mark.parametrize("query", ["project=proj_a", "offset=-1", "since=2026-01-01T00:00",
+                                   "tz=Asia/Tokyo"])
+def test_every_non_default_param_computes_live(client, project, monkeypatch, query):
+    seed_cache(client, project)
+    calls = count_live(monkeypatch)
+
+    page = client.get(f"/cost?{query}")
+
+    assert page.status_code == 200
+    assert len(calls) == 1
+    assert "s ago" not in page.text
+
+
+def test_the_default_zone_spelled_out_still_hits(client, project, monkeypatch):
+    seed_cache(client, project)
+    calls = count_live(monkeypatch)
+
+    page = client.get(f"/cost?tz={ops.cost_zone(None, None)}")
+
+    assert "cached sentinel" in page.text and "added after refresh" not in page.text
+    assert calls == []
+
+
+def test_a_cached_entry_for_another_window_bound_computes_live(client, project, monkeypatch):
+    cache = seed_cache(client, project)
+    cache.entries["week"]["window"] = dict(cache.entries["week"]["window"],
+                                           since=cache.entries["week"]["window"]["since"] - 1)
+    calls = count_live(monkeypatch)
+
+    page = client.get("/cost")
+
+    assert "added after refresh" in page.text
+    assert len(calls) == 1
+    assert "s ago" not in page.text
+
+
+def test_an_empty_cache_computes_live_as_before(client, project, monkeypatch):
+    add_recorded_turn(project, ops.create_work_order("proj_a", "live one")["id"], 0.05, 48_000)
+    assert client.app.state.cost_cache.entries == {}
+    calls = count_live(monkeypatch)
+
+    page = client.get("/cost")
+
+    assert "live one" in page.text
+    assert len(calls) == 1
+    assert "s ago" not in page.text
+
+
+def test_a_failed_refresh_keeps_the_last_good_entry(client, project, monkeypatch):
+    import anyio
+
+    from jarvis import uilog
+
+    cache = client.app.state.cost_cache
+    anyio.run(cache.refresh)
+    assert set(cache.entries) == {"week", "5h"}
+    good = dict(cache.entries)
+
+    errors: list = []
+    monkeypatch.setattr(uilog, "record_error", lambda *a: errors.append(a))
+
+    def boom(**_kwargs):
+        raise RuntimeError("transcripts went away")
+
+    monkeypatch.setattr(ops, "cost_report", boom)
+    anyio.run(cache.refresh)
+
+    assert cache.entries == good
+    assert [(m, p) for m, p, _ in errors] == [("TASK", "cost/cache/week"),
+                                              ("TASK", "cost/cache/5h")]

@@ -57,6 +57,32 @@ which of the USER'S OWN MCP servers, skills and plugins reach this project's wor
 
 check the OS's own post-conditions; read-only unless --repair. The daemon runs the same checks every reconcile tick.
 
+## `jarvis morpheus status / show <mv-id> / waive <mv-id> --reason "…" / requeue <mv-id>`
+
+Morpheus validates every PR that reaches production, in every project.
+
+* **What queues a PR.** For the OS itself that is a release. For any other project it
+  is a merge.
+* **How a check gets written.** A subagent turns the PR's `## How to validate in
+  production` hints into a read-only check.
+* **How the check runs.** The daemon runs it with no model call: exit 0 = validated,
+  1 twice in a row = failed, anything else = not yet. A single exit 1 is a blip until
+  the next check repeats it.
+* **Failed and timed out.** Morpheus never diagnoses. `failed` is handed to an
+  investigation (or to Neo), and `timedout` (3 days by default) to Neo.
+* **What Neo may do about it.** Reading a transient failure, Neo requeues the item
+  itself — once per item, ever. It never waives: ruling a shipped PR fine with no
+  production evidence stays the user's.
+* **The two commands.** `waive` is the user ruling a PR fine. `requeue` watches it again
+  with a fresh deadline.
+* **Its own brake.** By default Morpheus's session pauses with the fleet's `jarvis pause`.
+  `jarvis morpheus pause --reason "…"` holds it while the fleet runs. `jarvis morpheus
+  unpause --reason "…"` lets it run even through a fleet pause. `jarvis morpheus
+  follow-fleet` drops either pin. Checks run either way; they spend nothing.
+
+Dashboard: `/morpheus`. Spec:
+docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md.
+
 ## `jarvis ui`
 
 dashboard at http://127.0.0.1:8787

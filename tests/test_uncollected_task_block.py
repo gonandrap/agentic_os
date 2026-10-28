@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import gates, hooks, ops
+from jarvis import db, gates, hooks, ops
 from jarvis.hooks import handle_hook
 from jarvis.invariants import TERMINAL_STATUSES
 from jarvis.project_store import ProjectStore
@@ -87,10 +87,12 @@ def worker(jarvis_home, fake_claude, catalog_file, project, tmp_path):
     turn = store.create_turn(wo["id"], kind="message", prompt="go")
     # Back-dated because the guard scans up to `until=time.time()`: see BACK_DATED
     store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
-                       (time.time() - BACK_DATED, turn["id"]))
+                       (db.now() - BACK_DATED, turn["id"]))
     store.conn.commit()
     env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT": "proj_a",
-           "JARVIS_PROJECT_PATH": str(project), "JARVIS_GATES": ALL_GATES.to_json()}
+           "JARVIS_PROJECT_PATH": str(project), "JARVIS_GATES": ALL_GATES.to_json(),
+           # The block is the one-shot turn's; a background session is woken instead
+           "JARVIS_TURN_TRANSPORT": "headless"}
 
     class Handle:
         def __init__(self):
@@ -125,10 +127,19 @@ def worker(jarvis_home, fake_claude, catalog_file, project, tmp_path):
 
 def test_fixture_turn_is_back_dated(worker):
     """The fixture's own post-condition: every row these tests write must be in the past"""
+    # clock-exempt: class 4 — the same real clock the guard bounds its scan with (src/jarvis/hooks.py until=time.time())
     started = worker.started()
 
     assert time.time() - started >= BACK_DATED - 1
     assert started + 0.001 < started + 0.002 < time.time()
+
+
+def test_a_background_session_is_never_held_open(worker):
+    """It outlives the turn and the task wakes it (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    env = {**worker.env, "JARVIS_TURN_TRANSPORT": "background"}
+    assert hooks.uncollected_task_turn_block(
+        worker.store, worker.wo_id,
+        worker.payload(_launch(worker.started() + 0.001)), env) is None
 
 
 def test_turn_with_uncollected_bash_task_blocked(worker):
@@ -241,4 +252,4 @@ def test_block_writes_a_timeline_event(worker):
     payload = json.loads(held[0]["payload"])
     assert payload["session_id"] == SESSION
     assert payload["jobs"] == ["b51fl7bhe"]
-    assert time.time() - held[0]["ts"] < 60
+    assert db.now() - held[0]["ts"] < 60

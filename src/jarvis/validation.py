@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from . import claude_cli, seats, structured
+from . import claude_cli, concision, seats, structured
 from .bootstrap import ASSETS
 from .project_store import VALIDATOR_SEATS
 
@@ -145,7 +145,7 @@ def build_shared_prefix(packet: EvidencePacket, project: str,
 def build_seat_prompt(seat: str) -> str:
     """One seat's own half of its prompt: who it is and what its mandate is"""
     _, mandate = definition(seat)
-    return "\n".join([SEAT_HEADER.format(seat=seat), "", mandate])
+    return "\n".join([SEAT_HEADER.format(seat=seat), "", mandate, "", concision.REVIEW_SCOPE])
 
 
 def build_packet_prompt(packet: EvidencePacket) -> str:
@@ -213,6 +213,8 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
               else "the worker's worktree")
     parts.append(f"## The change, as collected from {origin}\n"
                  f"`{packet.base or '?'}` → `{packet.head or '?'}`")
+    if packet.diff_scope:
+        parts.append(_scope_section(packet))
     listed = "\n".join(f"- {f}" for f in packet.files) or "(no files changed)"
     parts.append(f"## Every file this change touches ({len(packet.files)}) — "
                  f"this list is NEVER truncated\n{listed}")
@@ -228,6 +230,25 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
             "rather than passing what you did not read.")
     parts.append(f"## The diff\n```diff\n{packet.diff or '(empty)'}\n```")
     return "\n\n".join(parts)
+
+
+def _scope_section(packet: EvidencePacket) -> str:
+    """What the feature's diff was narrowed to, and what it still may carry (issue 985)"""
+    if packet.diff_scope == "children":
+        listed = "\n".join(
+            f"- {c.get('id') or '?'} — `{c.get('merge_commit')}`"
+            for c in packet.children if c.get("merge_commit"))
+        return ("## The diff is SCOPED TO THIS FEATURE'S OWN CHILDREN\n"
+                "The range above ends at the default branch, which also carries other "
+                "features. The diff below is restricted to the paths these children's "
+                f"merge commits touched:\n{listed}\n"
+                "A file one of them touched may still hold a line from another "
+                "feature. Judge this feature's children.")
+    return ("## THE DIFF IS NOT SCOPED TO THIS FEATURE\n"
+            "No merge commit is recorded for any child, so the diff below is every "
+            "change on the default branch since this feature started and may carry "
+            "work belonging to other features. Say that you could not attribute the "
+            "code rather than raising findings about work this feature did not do.")
 
 
 def _history_section(packet: EvidencePacket) -> str:
@@ -434,9 +455,17 @@ def _parsed_findings(data: Mapping[str, Any]) -> list[dict[str, str]]:
         if not title and not detail:
             continue
         severity = BLOCKER if item.get("severity") == BLOCKER else FOLLOW_UP
-        out.append({"severity": severity, "title": title, "detail": detail,
-                    **_anchor(item)})
+        found = {"severity": severity, "title": title, "detail": detail, **_anchor(item)}
+        level = str(item.get("level") or "").strip().lower()
+        if severity == FOLLOW_UP and level:
+            # Spec 2026-10-21 §3.1: how much a follow-up is worth
+            found["level"] = level if level in FOLLOW_UP_LEVELS else "medium"
+        out.append(found)
     return out
+
+
+#: A follow-up's worth on the steward's scale (spec 2026-10-21 §3.0); `major` and above is a blocker
+FOLLOW_UP_LEVELS = ("medium", "minor", "cosmetic")
 
 
 #: What a follow-up must name before it can become a tracker issue (docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md)
@@ -680,7 +709,8 @@ def _follow_ups(opinions: Sequence[seats.Opinion], round_no: int) -> list[dict[s
         row = {"seat": op.seat, "status": op.status, "reply": op.raw}
         out += [{"seat": op.seat, "title": f["title"], "detail": f["detail"],
                  "round": round_no,
-                 **{k: f.get(k, "") for k in ANCHOR_KEYS}}
+                 **{k: f.get(k, "") for k in ANCHOR_KEYS},
+                 **({"level": f["level"]} if f.get("level") else {})}
                 for f in follow_ups(findings(row))]
     return out
 

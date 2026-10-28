@@ -26,7 +26,9 @@ USER_HELD_Q_STATUSES = ("escalated", "failed")
 OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 
 # What Neo is being asked for (docs/superpowers/specs/2026-08-31-the-supervisor.md)
-Q_KINDS = ("question", "approval", "plan", "alarm", "triage", "assumption")
+#: `validation` is Morpheus asking about a shipped PR
+Q_KINDS = ("question", "approval", "plan", "alarm", "triage", "assumption", "validation",
+           "findings")
 
 # The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md
 SEATS = ("premise", "record", "blast", "taste", "chair")
@@ -74,6 +76,12 @@ STALE_ANSWERING_SECONDS = 900
 
 # How many times a question may be returned to the queue before it is given up on
 MAX_ANSWER_ATTEMPTS = 3
+
+#: How many times one transport-failed question is put back in the queue after Neo answered again
+MAX_REVIVALS = 2
+
+#: Kinds a revival may re-ask: no worker behind them, so a late answer reaches no one stale
+REVIVABLE_KINDS = ("validation", "triage")
 
 #: `answer_reason` on a question nobody could put to a model (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)
 UNREACHABLE_PREFIX = "neo could not be reached: "
@@ -162,6 +170,8 @@ ADDED_COLUMNS = {
         "digest": "TEXT",
         # Why this escalation happened — §1 of docs/superpowers/specs/2026-10-01-neo-observability.md
         "escalation_cause": "TEXT",
+        # How many times `revive_unreachable` re-queued it
+        "revivals": "INTEGER NOT NULL DEFAULT 0",
     },
     "learnings": {
         "seat": "TEXT NOT NULL DEFAULT ''",
@@ -181,14 +191,7 @@ class NeoStore:
         self._migrate()
 
     def _migrate(self) -> None:
-        for table, columns in ADDED_COLUMNS.items():
-            have = {
-                r["name"]
-                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-            for name, decl in columns.items():
-                if name not in have:
-                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        db.add_missing_columns(self.conn, ADDED_COLUMNS)
 
     def close(self) -> None:
         self.conn.close()
@@ -316,6 +319,19 @@ class NeoStore:
             "retry_after=?, answer_reason=? WHERE id=?",
             (db.now() + retry_delay(attempts), reason, question_id))
         return "queued"
+
+    def revive_unreachable(self, kinds: tuple[str, ...] = REVIVABLE_KINDS,
+                           max_revivals: int = MAX_REVIVALS) -> list[int]:
+        """Re-queue the questions an outage gave up on — call it only once Neo has answered again"""
+        placeholders = ",".join("?" * len(kinds))
+        return [int(r["id"]) for r in self.conn.execute(
+            f"""UPDATE questions
+                   SET status='queued', attempts=0, claimed_at=NULL, retry_after=NULL,
+                       escalation_cause=NULL, revivals=revivals+1
+                 WHERE status='failed' AND escalation_cause='transport-unreachable'
+                   AND kind IN ({placeholders}) AND revivals < ?
+             RETURNING id""",
+            (*kinds, max_revivals)).fetchall()]
 
     def record_answer(self, question_id: int, answer: str, answered_by: str = "neo",
                       reason: str = "") -> None:
@@ -545,6 +561,12 @@ class NeoStore:
         )
         row = self.conn.execute("SELECT * FROM learnings WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)
+
+    def has_active_learning(self, content: str, project: str = "") -> bool:
+        """Is this exact sentence already an unretired learning of this project?"""
+        return self.conn.execute(
+            "SELECT 1 FROM learnings WHERE project=? AND content=? AND retired_at IS NULL",
+            (project, content)).fetchone() is not None
 
     def retract_learning(self, learning_id: int, reason: str) -> dict[str, Any]:
         """Retire a learning the user has superseded"""

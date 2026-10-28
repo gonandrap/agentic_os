@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import plistlib
 import re
 import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 
+from . import service_manager
 from .paths import production_code_dir, run_dir
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -29,6 +31,9 @@ BATCH_KEY = "release_for_issues"
 #: Said once per BROKEN COMMIT when a release that delivered no release is re-parked to wait for the...
 RED_DEFER_EVENT = "release_deferred_red_base"
 
+#: Said when a release order finished having cut NO release, on any base (issue #1206)
+NOTHING_SHIPPED_EVENT = "release_shipped_nothing"
+
 #: Said ONCE PER EPISODE when that wait runs past `Daemon.RED_PARK_AFTER_SECONDS` and the release asks...
 RED_PARK_EVENT = "release_park_red_base"
 
@@ -41,15 +46,25 @@ def is_release_order(wo: dict[str, Any]) -> bool:
     return isinstance(meta.get(BATCH_KEY), list)
 
 #: Where `scripts/install_prod_service.sh` installs the two units
-UNIT_DIR_ENV = "JARVIS_SYSTEMD_UNIT_DIR"
+UNIT_DIR_ENV = service_manager.UNIT_DIR_ENV
 
 
 def unit_dir() -> Path:
-    return Path(os.environ.get(UNIT_DIR_ENV) or "~/.config/systemd/user").expanduser()
+    default = ("~/Library/LaunchAgents" if service_manager.manager() == service_manager.LAUNCHD
+               else "~/.config/systemd/user")
+    return Path(os.environ.get(UNIT_DIR_ENV) or default).expanduser()
 
 
 def unit_environment(unit: str, name: str) -> str | None:
-    """One `Environment=<name>=…` value from an installed unit, or None"""
+    """One environment value from an installed unit — or its launchd plist — or None"""
+    if service_manager.manager() == service_manager.LAUNCHD:
+        try:
+            with (unit_dir() / f"{service_manager.label(unit)}.plist").open("rb") as f:
+                env = plistlib.load(f).get("EnvironmentVariables") or {}
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            return None
+        value = env.get(name) if isinstance(env, dict) else None
+        return value if isinstance(value, str) else None
     try:
         text = (unit_dir() / unit).read_text(encoding="utf-8")
     except OSError:
@@ -166,14 +181,43 @@ class SystemdRunner:
             return None
         if usec <= 0:
             return None
+        # Class 4: converts between two real clocks, CLOCK_BOOTTIME and the epoch (docs/superpowers/specs/2026-10-15-burn-down-the-clock-hygiene-allowlist.md §0.9)
         boot_epoch = time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
         return boot_epoch + usec / 1e6
+
+
+class LaunchdRunner:
+    """`SystemdRunner`'s three questions, asked of launchd via `service_manager`"""
+
+    def restart_unit(self, unit: str) -> None:
+        service_manager.restart(unit)
+
+    def restart_unit_detached(self, unit: str, tag: str) -> None:
+        service_manager.restart_detached(unit, tag)
+
+    def unit_start_time(self, unit: str) -> float | None:
+        return service_manager.start_time(unit)
+
+
+class ServiceRunner(Protocol):
+    """What `maybe_restart` and `verify_on_boot` need of a runner, fakes included"""
+
+    def restart_unit(self, unit: str) -> None: ...
+    def restart_unit_detached(self, unit: str, tag: str) -> None: ...
+    def unit_start_time(self, unit: str) -> float | None: ...
+
+
+def service_runner() -> ServiceRunner:
+    """The runner for this host's init system — classes looked up at call time so tests can rebind them"""
+    if service_manager.manager() == service_manager.LAUNCHD:
+        return LaunchdRunner()
+    return SystemdRunner()
 
 
 # -- the reconcile-tick half
 
 
-def maybe_restart(store_for: StoreLookup, runner: SystemdRunner | None = None,
+def maybe_restart(store_for: StoreLookup, runner: ServiceRunner | None = None,
                   now: float | None = None) -> str | None:
     """Apply a staged release once its shipping worker has settled"""
     marker = read_marker()
@@ -199,7 +243,7 @@ def maybe_restart(store_for: StoreLookup, runner: SystemdRunner | None = None,
     marker["restart_at"] = now if now is not None else time.time()
     write_marker(marker)  # before any unit moves: the daemon may not survive this
 
-    runner = runner or SystemdRunner()
+    runner = runner or service_runner()
     runner.restart_unit(UI_UNIT)  # never hosts us; safe inline (kn-58429229 ordering)
     runner.restart_unit_detached(DAEMON_UNIT, tag)
     log.info("release %s: restarted %s, queued detached restart of %s",
@@ -210,7 +254,7 @@ def maybe_restart(store_for: StoreLookup, runner: SystemdRunner | None = None,
 # -- the boot half
 
 
-def verify_on_boot(store_for: StoreLookup, runner: SystemdRunner | None = None,
+def verify_on_boot(store_for: StoreLookup, runner: ServiceRunner | None = None,
                    now: float | None = None) -> dict[str, Any] | None:
     """Prove a restarting (or long-stranded staged) release actually applied"""
     marker = read_marker()
@@ -230,7 +274,7 @@ def verify_on_boot(store_for: StoreLookup, runner: SystemdRunner | None = None,
     wo_id = marker.get("wo_id") or ""
     version = marker.get("version") or ""
     tag = marker.get("tag") or f"jarvis-{version}"
-    runner = runner or SystemdRunner()
+    runner = runner or service_runner()
 
     problems: list[str] = []
     prod_version = _production_version()

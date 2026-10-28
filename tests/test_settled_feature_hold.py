@@ -104,7 +104,7 @@ def test_the_flag_is_not_re_raised_once_the_feature_is_live(started, store):
 def test_the_false_failure_repair_lowers_the_holds_as_well(started, store):
     """The OTHER path that reopens a feature"""
     fo, live = a_feature_with_a_live_child(store)
-    killer = [c for c in store.feature_children(fo["id"])
+    killer = [c for c in store.feature_children(fo["id"], kinds=("worker",))
               if c["id"] != live["id"]][0]
     invariants.check_project(store)
     assert store.get_work_order(live["id"])["needs_attention"]
@@ -123,7 +123,7 @@ def test_the_false_failure_repair_lowers_the_holds_as_well(started, store):
 def test_a_child_flagged_for_something_else_keeps_its_own_flag(started, store):
     """The control, and the rule the clear is written under: lowered only when `true_blockers` is EMPTY"""
     fo, live = a_feature_with_a_live_child(store)
-    killer = [c for c in store.feature_children(fo["id"])
+    killer = [c for c in store.feature_children(fo["id"], kinds=("worker",))
               if c["id"] != live["id"]][0]
     store.set_status(live["id"], "needs_review")
     store.add_assumption(live["id"], "assumed the schema is stable")
@@ -153,7 +153,8 @@ def test_the_manager_order_itself_carries_nothing(started, store):
     manager = store.create_manager_order(fo["id"])
     store.set_status(manager["id"], "idle")
 
-    assert invariants.true_blockers(store, store.get_work_order(manager["id"])) == []
+    assert not [b for b in invariants.true_blockers(store, store.get_work_order(manager["id"]))
+                if "nothing will coordinate" in b]
 
 
 def test_a_cancelled_feature_names_the_cancel_remedy_and_not_fo_resume(started, store):

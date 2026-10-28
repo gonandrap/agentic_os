@@ -110,7 +110,7 @@ def transcripts(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def fleet(jarvis_home, project, fake_claude, catalog_file):
+def fleet(jarvis_home, project, fake_claude, catalog_file, live_daemon):
     """The OS started over one project, with a daemon to drive dispatch by hand"""
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon

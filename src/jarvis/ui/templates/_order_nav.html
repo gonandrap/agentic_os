@@ -1,0 +1,41 @@
+{# AN ORDER'S OWN NAVIGATION — §2 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. The same strip on
+   every page about one work order (the record, its debugging page, its prompts, its bill)
+   so that "back to debugging", "the PR" and "this project's config" are each one click
+   from anywhere inside the order. Links only: nothing here states a fact about the order
+   that the pages themselves do not. #}
+{% macro order_nav(project, wo, here) %}
+{% set base = '/wo/' ~ project ~ '/' ~ wo.id %}
+<nav class="order-nav" aria-label="this work order">
+  {% for key, label, href in [('record', 'record', base),
+                              ('debug', 'debug', base ~ '/debug'),
+                              ('prompt', 'prompts', base ~ '/prompt'),
+                              ('cost', 'cost', '/cost/' ~ project ~ '/' ~ wo.id)] %}
+  {% if here == key %}<span class="here">{{ label }}</span>{% else %}<a href="{{ href }}">{{ label }}</a>{% endif %}
+  {% endfor %}
+  <span class="sep">│</span>
+  {% if wo.pr_url %}<a class="ext" href="{{ wo.pr_url }}" rel="noopener">pull request ↗</a>{% endif %}
+  {% if wo.parent_id %}<a class="ext" href="{{ order_path(project, wo.parent_id) }}">parent {{ wo.parent_id }}</a>{% endif %}
+  <a class="ext" href="/project/{{ project }}">{{ project }}</a>
+  <a class="ext" href="/config?scope={{ ('projects.' ~ project)|urlencode }}">its config</a>
+  <a class="ext" href="/project/{{ project }}/prompt">its worker prompt</a>
+  <span class="title" title="{{ wo.title }}">{{ wo.title }}</span>
+</nav>
+{% endmacro %}
+
+{# The debugging page's blocks, one click each — the page is long by nature, so the way
+   into it is a row of addresses rather than a scroll. #}
+{% macro debug_jumps(base) %}
+<div class="jumps" aria-label="jump to">
+  <a href="{{ base }}#block-diagnosis">why not moving</a>
+  <a href="{{ base }}#dbg-held">holds</a>
+  <a href="{{ base }}#dbg-way">the way through</a>
+  <a href="{{ base }}#block-fix">clearing it</a>
+  <a href="{{ base }}#block-live">right now</a>
+  <a href="{{ base }}#block-anatomy">where the time went</a>
+  <a href="{{ base }}#dbg-turns">turn by turn</a>
+  <a href="{{ base }}#dbg-tools">tool profile</a>
+  <a href="{{ base }}#dbg-writes">cache writes</a>
+  <a href="{{ base }}#block-context">context window</a>
+</div>
+{% endmacro %}

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import branchproof, claude_cli, evidence, ops, validation
+from jarvis import branchproof, claude_cli, db, evidence, ops, validation
 from jarvis.catalog import load_catalog
 from jarvis.daemon import (FEATURE_HANDOFF_EVENT, FEATURE_MANAGER_SILENT,
                            FEATURE_MANAGER_STALLED,
@@ -159,7 +159,7 @@ class Fleet:
 
     def land_children(self, fo_id: str, store: ProjectStore) -> None:
         """Every child of this feature completed, with a result the packet can carry"""
-        for child in store.feature_children(fo_id):
+        for child in store.feature_children(fo_id, kinds=("worker",)):
             store.update_work_order(child["id"],
                                     result_summary=f"built {child['title']}")
             store.set_status(child["id"], "completed")
@@ -377,6 +377,55 @@ def test_the_base_is_recorded_at_release_and_bounds_the_diff(fleet):
         store.close()
 
 
+def test_the_diff_is_scoped_to_the_childrens_own_merge_commits(fleet):
+    """A sibling feature merged into the same base is not this feature's work (issue 985)"""
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one", "two")
+        children = store.feature_children(fo_id, kinds=("worker",))
+        mine = fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        store.add_event(children[0]["id"], "pr_merged", {"merge_commit": mine})
+        fleet.merge("fleetcost.py", "def fleetcost():\n    return 0\n")
+        fleet.land_children(fo_id, store)
+
+        packet = ops.collect_feature_evidence(
+            store, fleet.project, store.get_feature_order(fo_id),
+            declared="", summary="", cfg=fleet.daemon.catalog.os.validation)
+
+        assert packet.diff_scope == "children"
+        assert "exporter.py" in packet.files
+        assert "fleetcost.py" not in packet.files, "a sibling feature is in the packet"
+        assert "fleetcost" not in packet.diff
+        assert "def export" in packet.diff
+        assert "exporter.py" in packet.stat and "fleetcost.py" not in packet.stat
+        prompt = validation.build_packet_prompt(packet)
+        assert "SCOPED TO THIS FEATURE'S OWN CHILDREN" in prompt
+        assert mine in prompt, "the prompt does not say what scoped the diff"
+    finally:
+        store.close()
+
+
+def test_a_feature_with_no_recorded_merge_commit_declares_its_diff_unscoped(fleet):
+    """The fallback is today's range, said out loud rather than passed off as the feature"""
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.merge("fleetcost.py", "def fleetcost():\n    return 0\n")
+        fleet.land_children(fo_id, store)
+
+        packet = ops.collect_feature_evidence(
+            store, fleet.project, store.get_feature_order(fo_id),
+            declared="", summary="", cfg=fleet.daemon.catalog.os.validation)
+
+        assert packet.diff_scope == "unscoped"
+        assert {"exporter.py", "fleetcost.py"} <= set(packet.files)
+        assert "THE DIFF IS NOT SCOPED TO THIS FEATURE" in \
+            validation.build_packet_prompt(packet)
+    finally:
+        store.close()
+
+
 def test_a_feature_with_no_base_escalates_without_calling_the_panel(fleet):
     """A guessed base produces a confidently wrong diff"""
     validator = Validator(passed())
@@ -413,7 +462,7 @@ def test_a_side_effect_does_not_excuse_a_feature_from_having_a_base(fleet):
         fo_id = fleet.release("no base", "one")
         fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
         fleet.land_children(fo_id, store)
-        for child in store.feature_children(fo_id):
+        for child in store.feature_children(fo_id, kinds=("worker",)):
             ops.learn_add("something durable", wo_id=str(child["id"]))
         store.update_feature_order(fo_id, base_sha=None)
 
@@ -443,7 +492,7 @@ def test_a_features_side_effects_are_the_union_of_its_childrens(fleet):
         fo_id = fleet.release("CSV export", "one")
         fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
         fleet.land_children(fo_id, store)
-        children = [str(c["id"]) for c in store.feature_children(fo_id)]
+        children = [str(c["id"]) for c in store.feature_children(fo_id, kinds=("worker",))]
         assert children, "the fixture produced no children to aggregate"
         for i, child in enumerate(children):
             ops.learn_add(f"child {i} learned something", wo_id=child)
@@ -492,7 +541,7 @@ def test_a_feature_whose_children_only_shipped_a_RELEASE_is_voided(
     try:
         fo_id = fleet.release("ship 0.11.0", "one")
         fleet.land_children(fo_id, store)  # a release merges nothing to the branch
-        for child in store.feature_children(fo_id):
+        for child in store.feature_children(fo_id, kinds=("worker",)):
             # The approved-and-used gate the attestation leans on, granted BEFORE the tag is cut
             row = store.add_approval(str(child["id"]), "release", "ship 0.11.0",
                                      matched="shipit")
@@ -982,7 +1031,7 @@ def test_a_failed_child_still_fails_the_feature_with_a_manager_open(fleet):
     try:
         fo_id = fleet.release("CSV export", "one", "two")
         fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
-        children = store.feature_children(fo_id)
+        children = store.feature_children(fo_id, kinds=("worker",))
         store.set_status(children[0]["id"], "failed")
         store.set_status(children[1]["id"], "completed")
         manager = store.manager_work_order(fo_id)
@@ -1127,7 +1176,7 @@ def test_a_feature_round_met_by_a_usage_window_waits_rather_than_spending_a_retr
     fleet.reconfigure(max_rounds=1)
     validator = Validator(UsageLimitError(UsageLimit(
         message="You've hit your session limit · resets 11:50pm (America/Los_Angeles)",
-        reset_at=time.time() + 3600)))
+        reset_at=db.now() + 3600)))
     fleet.daemon.validator = validator
     store = fleet.store()
     try:
@@ -1163,7 +1212,7 @@ def test_a_feature_round_the_shut_window_skips_records_the_hold(fleet):
         assert store.get_feature_order(fo_id)["status"] == "validating"
 
         state = fleet_mod.Fleet(3, 0, fleet_mod.Outage(
-            project="proj_a", wo_id="wo-1", reopens_at=time.time() + 3600,
+            project="proj_a", wo_id="wo-1", reopens_at=db.now() + 3600,
             message="You've hit your session limit · resets 11:50pm"))
         for _ in range(3):
             fleet.daemon.feature_validation_tick(fleet.spec, store, state)
@@ -1186,7 +1235,7 @@ def test_a_held_feature_round_carries_the_cause_on_the_ROUND(fleet):
 
     fleet.daemon.validator = Validator(UsageLimitError(UsageLimit(
         message="You've hit your session limit · resets 11:50pm (America/Los_Angeles)",
-        reset_at=time.time() + 3600)))
+        reset_at=db.now() + 3600)))
     store = fleet.store()
     try:
         fo_id = fleet.release("CSV export", "one")
@@ -1238,7 +1287,7 @@ def test_a_feature_round_whose_seats_could_not_authenticate_is_held(fleet):
         events = ops.feature_events_of_kind(store, fo_id, "validation_failed")
         until, cause = validation_hold(events, 1)
         assert cause == VALIDATION_AUTH_CAUSE
-        assert until > time.time()
+        assert until > db.now()
 
         # The STREAK is counted from those events
         Daemon._feature_auth_held(fleet.daemon, store, store.get_feature_order(fo_id),
@@ -1415,7 +1464,7 @@ def _pr_merged(store: ProjectStore, child_id: str, sha: str,
                *, minutes_ago: float = 0.0) -> None:
     """What the merge poller records when a child's pull request lands"""
     store.add_event(child_id, "pr_merged", {"merge_commit": sha},
-                    ts=time.time() - minutes_ago * 60)
+                    ts=db.now() - minutes_ago * 60)
 
 
 def _route(fleet, store, fo_id: str) -> bool:
@@ -1483,7 +1532,7 @@ def test_a_child_whose_merge_is_not_in_the_head_defers_the_round(fleet):
     store = fleet.store()
     try:
         fo_id = _landed_feature(fleet, store)
-        child = store.feature_children(fo_id)[0]
+        child = store.feature_children(fo_id, kinds=("worker",))[0]
         _pr_merged(store, child["id"], _dangling_commit(fleet))
 
         assert _route(fleet, store, fo_id) is True, "deferred, so: leave it alone"
@@ -1503,7 +1552,7 @@ def test_settle_features_does_not_complete_a_deferred_feature(fleet):
     store = fleet.store()
     try:
         fo_id = _landed_feature(fleet, store)
-        child = store.feature_children(fo_id)[0]
+        child = store.feature_children(fo_id, kinds=("worker",))[0]
         _pr_merged(store, child["id"], _dangling_commit(fleet))
 
         fleet.tick()
@@ -1522,7 +1571,7 @@ def test_a_deferred_feature_clears_itself_once_the_fetch_finds_the_merge(fleet,
     store = fleet.store()
     try:
         fo_id = _landed_feature(fleet, store)
-        child = store.feature_children(fo_id)[0]
+        child = store.feature_children(fo_id, kinds=("worker",))[0]
         sha = _dangling_commit(fleet)
         _pr_merged(store, child["id"], sha)
 
@@ -1551,7 +1600,7 @@ def test_the_check_failing_defers_rather_than_completing_the_feature(fleet, monk
     store = fleet.store()
     try:
         fo_id = _landed_feature(fleet, store)
-        child = store.feature_children(fo_id)[0]
+        child = store.feature_children(fo_id, kinds=("worker",))[0]
         _pr_merged(store, child["id"], evidence.default_branch_head(fleet.project))
 
         def boom(*a, **kw):
@@ -1576,7 +1625,7 @@ def test_past_the_bound_the_feature_asks_the_user_and_still_opens_no_round(fleet
     store = fleet.store()
     try:
         fo_id = _landed_feature(fleet, store)
-        child = store.feature_children(fo_id)[0]
+        child = store.feature_children(fo_id, kinds=("worker",))[0]
         commit = _dangling_commit(fleet)
         waited = fleet.spec.validation.feature_merge_wait_minutes + 1
         _pr_merged(store, child["id"], commit, minutes_ago=waited)
@@ -1602,7 +1651,7 @@ def test_one_defer_event_per_distinct_state(fleet):
     store = fleet.store()
     try:
         fo_id = _landed_feature(fleet, store)
-        child = store.feature_children(fo_id)[0]
+        child = store.feature_children(fo_id, kinds=("worker",))[0]
         commit = _dangling_commit(fleet)
         _pr_merged(store, child["id"], commit)
 
@@ -1619,7 +1668,7 @@ def test_one_defer_event_per_distinct_state(fleet):
 
         store.conn.execute(
             "UPDATE wo_events SET ts=? WHERE wo_id=? AND kind='pr_merged'",
-            (time.time() - (fleet.spec.validation.feature_merge_wait_minutes + 1) * 60,
+            (db.now() - (fleet.spec.validation.feature_merge_wait_minutes + 1) * 60,
              child["id"]))
         store.conn.commit()
 
@@ -1643,7 +1692,7 @@ def test_every_child_integrated_opens_the_round_as_today(fleet):
         fo_id = fleet.release("CSV export", "one", "two")
         merged = fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
         fleet.land_children(fo_id, store)
-        first, second = store.feature_children(fo_id)
+        first, second = store.feature_children(fo_id, kinds=("worker",))
         _pr_merged(store, first["id"], merged)   # landed on the head
         # `second` has no pr_url and no merge event: it delivered without a PR
 
@@ -1671,7 +1720,7 @@ def test_a_failing_fetch_defers_rather_than_judging_a_stale_head(fleet, monkeypa
     store = fleet.store()
     try:
         fo_id = _landed_feature(fleet, store)
-        child = store.feature_children(fo_id)[0]
+        child = store.feature_children(fo_id, kinds=("worker",))[0]
         _pr_merged(store, child["id"], _dangling_commit(fleet))
 
         fleet.daemon.settle_features(fleet.spec, store)
@@ -1691,7 +1740,7 @@ def test_fo_submit_errors_to_the_caller_instead_of_deferring(fleet, monkeypatch)
     store = fleet.store()
     try:
         fo_id = _landed_feature(fleet, store)
-        child = store.feature_children(fo_id)[0]
+        child = store.feature_children(fo_id, kinds=("worker",))[0]
         commit = _dangling_commit(fleet)
         _pr_merged(store, child["id"], commit)
         head = evidence.default_branch_head(fleet.project)

@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from jarvis import fleet as fleet_mod
+from jarvis import db, fleet as fleet_mod
 from jarvis.invariants import (CI_HOLD_NOTE, FLEET_HELD_STATUSES, fleet_hold_note,
                                parallel_round_note, status_label, validation_hold_note)
 from jarvis.project_store import (VALIDATION_CI_CAUSE, VALIDATION_HELD_CAUSE,
@@ -19,7 +19,7 @@ REFUSAL = "You've hit your session limit · resets 11:50pm (America/Los_Angeles)
 
 def outage(in_seconds: float, wo_id: str = "wo-1") -> fleet_mod.Outage:
     return fleet_mod.Outage(project="proj_a", wo_id=wo_id,
-                            reopens_at=time.time() + in_seconds, message=REFUSAL)
+                            reopens_at=db.now() + in_seconds, message=REFUSAL)
 
 
 def shut(in_seconds: float = 3600, wo_id: str = "wo-1") -> fleet_mod.Fleet:
@@ -28,7 +28,7 @@ def shut(in_seconds: float = 3600, wo_id: str = "wo-1") -> fleet_mod.Fleet:
 
 def shut_then_reopened() -> fleet_mod.Fleet:
     """A reading taken DURING a window that has since reopened"""
-    return fleet_mod.Fleet(3, 0, outage(-1), at=time.time() - 3600)
+    return fleet_mod.Fleet(3, 0, outage(-1), at=db.now() - 3600)
 
 
 def held_events(store, wo_id: str) -> list[dict]:
@@ -250,20 +250,20 @@ def _payload(cause: str, reopens_at: float) -> str:
 def test_a_round_waiting_on_ci_is_never_described_as_a_spent_window():
     """The live text: "the Claude usage window is spent"""
     note = validation_hold_note(_Events(_payload(VALIDATION_CI_CAUSE,
-                                                 time.time() + 60)), "wo-1", 1)
+                                                 db.now() + 60)), "wo-1", 1)
     assert note == CI_HOLD_NOTE
     assert "usage window" not in note
 
 
 def test_a_round_held_by_the_window_still_names_the_window_and_the_moment():
     note = validation_hold_note(_Events(_payload(VALIDATION_HELD_CAUSE,
-                                                 time.time() + 3600)), "wo-1", 1)
+                                                 db.now() + 3600)), "wo-1", 1)
     assert "usage window is spent" in note and "resumes by itself at" in note
 
 
 def test_the_cause_that_wins_is_the_one_the_tick_is_honouring():
     """A window that shut while CI was still running holds for the LATER moment"""
-    now = time.time()
+    now = db.now()
     both = _Events(_payload(VALIDATION_CI_CAUSE, now + 60),
                    _payload(VALIDATION_HELD_CAUSE, now + 3600))
     assert "usage window is spent" in validation_hold_note(both, "wo-1", 1)
@@ -275,5 +275,5 @@ def test_the_cause_that_wins_is_the_one_the_tick_is_honouring():
 
 def test_a_lifted_hold_says_nothing():
     assert validation_hold_note(_Events(_payload(VALIDATION_HELD_CAUSE,
-                                                 time.time() - 1)), "wo-1", 1) == ""
+                                                 db.now() - 1)), "wo-1", 1) == ""
     assert validation_hold_note(_Events(), "wo-1", 1) == ""

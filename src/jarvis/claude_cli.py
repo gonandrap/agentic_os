@@ -18,10 +18,14 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
-from . import systemd_units
+from . import keychain, systemd_units
+
+
+if TYPE_CHECKING:
+    from .session_dispatch import Launch
 
 
 log = logging.getLogger("jarvisd.claude")
@@ -35,8 +39,13 @@ PROMPT_CACHE_5M_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
 #: Buy the ONE-HOUR write instead, for the `worker.cache_ttl` arm that asks for it (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
 PROMPT_CACHE_1H_ENV_KEY = "ENABLE_PROMPT_CACHING_1H"
 
+#: The TTL keys the CLI reads ABOVE settings promptCacheTtl/subagentPromptCacheTtl (#1187)
+PROMPT_CACHE_TTL_ENV_KEYS = ("CLAUDE_CODE_PROMPT_CACHE_TTL",
+                             "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL")
+
 #: Every variable this decision OWNS
-CACHE_TTL_KEYS = (*PROMPT_CACHE_5M_ENV, PROMPT_CACHE_1H_ENV_KEY)
+CACHE_TTL_KEYS = (*PROMPT_CACHE_5M_ENV, PROMPT_CACHE_1H_ENV_KEY,
+                  *PROMPT_CACHE_TTL_ENV_KEYS)
 
 
 #: WHICH TRANSPORT this session's turns run on, declared rather than assumed (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)
@@ -52,6 +61,9 @@ def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
 
 #: Above this many BYTES a system prompt goes to the CLI in a file rather than in argv (docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md)
 SYSTEM_PROMPT_ARGV_LIMIT = 64 * 1024
+
+#: Above this many BYTES a background turn's prompt goes by FILE: `--bg` reads no stdin (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+BG_PROMPT_ARGV_LIMIT = 1024
 
 #: Above this many BYTES the USER prompt goes to the CLI on STDIN rather than in argv (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)
 PROMPT_ARGV_LIMIT = 64 * 1024
@@ -154,16 +166,24 @@ def version() -> str:
     return out.strip()
 
 
+def _launch_argv(args: list[str], launch: Launch | None) -> list[str]:
+    return launch.argv(args) if launch is not None else [claude_bin(), *args]
+
+
 def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
          env_extra: dict[str, str] | None = None,
-         stdin_text: str | None = None) -> str:
+         stdin_text: str | None = None, launch: Launch | None = None,
+         argv: list[str] | None = None) -> str:
     """One `claude` call, waited for (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)"""
     env = os.environ.copy()
     # `env_extra` is caller intent and must win over the cache default; ambient env loses
     env.update(cache_env(env_extra))
+    if launch is not None:
+        env.update(launch.env())
+    argv = argv or _launch_argv(args, launch)
     try:
         proc = subprocess.run(
-            [claude_bin(), *args],
+            argv,
             cwd=cwd,
             env=env,
             capture_output=True,
@@ -173,19 +193,19 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
             timeout=timeout,
         )
     except FileNotFoundError as e:
-        raise ClaudeCliError(f"`{claude_bin()}` not found on PATH") from e
+        raise ClaudeCliError(f"`{argv[0]}` not found on PATH") from e
     except subprocess.TimeoutExpired as e:
         raise ClaudeCliError(f"`claude {' '.join(args[:3])}...` timed out after {timeout}s") from e
     except OSError as e:
         # AFTER `FileNotFoundError`, which is an `OSError` and keeps its own message
         if e.errno == errno.E2BIG:
             raise InputTooLargeError(
-                f"`{claude_bin()}` could not be started: the input was too large for the "
+                f"`{argv[0]}` could not be started: the input was too large for the "
                 f"command line ({sum(len(a.encode()) for a in args)} bytes of arguments)"
             ) from e
-        raise ClaudeCliError(f"could not start `{claude_bin()}`: {e}") from e
+        raise ClaudeCliError(f"could not start `{argv[0]}`: {e}") from e
     if proc.returncode != 0:
-        raise _cli_failure(args, proc.returncode, proc.stdout, proc.stderr)
+        raise _cli_failure(args or argv, proc.returncode, proc.stdout, proc.stderr)
     return proc.stdout
 
 
@@ -363,6 +383,197 @@ def stop_session(bg_id: str) -> bool:
         return True
     except ClaudeCliError:
         return False
+
+
+# -- worker turns on a background session (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+
+#: `agents --json` `status` of a session with nothing left to do; anything else is `busy`
+BG_IDLE = "idle"
+
+#: How long `stop_bg` waits for the process to leave the roster before giving up
+BG_STOP_WAIT_SECONDS = 15.0
+
+#: How long `spawn_bg_turn` waits for a just-backgrounded session to be listed
+BG_LIST_WAIT_SECONDS = 15.0
+
+_BACKGROUNDED_RE = re.compile(r"backgrounded\s+·\s+([0-9a-f]{6,})")
+
+
+@dataclass(frozen=True)
+class BgEntry:
+    """One session of `claude agents --json --all`, with what liveness needs"""
+
+    id: str
+    session_id: str
+    #: None when the session has no process: stopped, crashed, or never started
+    pid: int | None
+    #: `busy` / `idle`, present only while there is a process
+    status: str
+    state: str
+    cwd: str = ""
+
+    @property
+    def alive(self) -> bool:
+        return self.pid is not None
+
+    @property
+    def idle(self) -> bool:
+        """Settled: no turn running and no background task of its own in flight (fact 10)"""
+        return self.alive and self.status == BG_IDLE
+
+
+def bg_roster(timeout: int = 60) -> dict[str, BgEntry]:
+    """Every background session, keyed by its full session id"""
+    out = _run(["agents", "--json", "--all"], timeout=timeout)
+    try:
+        data = json.loads(out or "[]")
+    except json.JSONDecodeError as e:
+        raise ClaudeCliError(f"unparseable `claude agents --json` output: {out[:200]}") from e
+    roster: dict[str, BgEntry] = {}
+    for item in data if isinstance(data, list) else []:
+        sid = str(item.get("sessionId") or "")
+        if not sid or item.get("kind", "background") != "background":
+            continue
+        pid = item.get("pid")
+        roster[sid] = BgEntry(id=str(item.get("id") or sid[:8]), session_id=sid,
+                              pid=int(pid) if isinstance(pid, int) else None,
+                              status=str(item.get("status") or ""),
+                              state=str(item.get("state") or ""),
+                              cwd=str(item.get("cwd") or ""))
+    return roster
+
+
+def _bg_prompt(prompt: str, promptfile: Path | None) -> str:
+    """The prompt as argv carries it: `--bg` reads no stdin, so an oversized one goes by file"""
+    if len(prompt.encode()) <= BG_PROMPT_ARGV_LIMIT or promptfile is None:
+        return prompt
+    promptfile.parent.mkdir(parents=True, exist_ok=True)
+    promptfile.write_text(prompt, encoding="utf-8")
+    return (f"Your full instructions for this turn are in {promptfile} — read that "
+            f"whole file first and follow it exactly as if it were this message.")
+
+
+def _short_id(out: str) -> str:
+    m = _BACKGROUNDED_RE.search(out or "") or _JOB_ID_RE.search(out or "")
+    if not m:
+        raise ClaudeCliError(f"`claude --bg` reported no session id: {(out or '')[:300]}")
+    return m.group(1)
+
+
+def spawn_bg_turn(prompt: str, cwd: Path, name: str, worktree: str | None = None,
+                  promptfile: Path | None = None, launch: Launch | None = None,
+                  **briefing: Any) -> BgEntry:
+    """Open a worker's background session with its first prompt; returns its roster entry"""
+    args = ["--bg", "-n", name]
+    if worktree:
+        args += ["--worktree", worktree]
+    # `max_budget_usd` is `--print`-only: `worker_session.poll` enforces the cap instead
+    briefing.pop("max_budget_usd", None)
+    args += _briefing_args(**briefing)
+    args += ["--", _bg_prompt(prompt, promptfile)]
+    short = _short_id(_run(args, cwd=cwd, timeout=120, launch=launch))
+    # `--bg` mints the id (fact 1); the roster is where the full one is read
+    deadline = time.monotonic() + BG_LIST_WAIT_SECONDS
+    while True:
+        for entry in bg_roster().values():
+            if entry.id == short:
+                return entry
+        if time.monotonic() >= deadline:
+            raise ClaudeCliError(f"background session {short} never appeared in "
+                                 f"`claude agents`")
+        time.sleep(0.25)
+
+
+def spawn_bg_open(argv: list[str], cwd: Path, env: dict[str, str] | None = None,
+                  timeout: int = 600) -> BgEntry:
+    """Open a background session through a session manager's own command (docs/superpowers/specs/2026-10-22-session-dispatch.md)"""
+    # Bind only a session that is new: a manager's output may quote other sessions
+    before = {e.id for e in bg_roster().values()}
+    out = _run([], cwd=cwd, timeout=timeout, env_extra=env, argv=argv)
+    fresh = [m.group(1) for m in _BACKGROUNDED_RE.finditer(out or "")
+             if m.group(1) not in before]
+    if not fresh:
+        raise ClaudeCliError(f"`{Path(argv[0]).name}` reported no new background session: "
+                             f"{(out or '')[-300:]}")
+    short = fresh[-1]
+    deadline = time.monotonic() + BG_LIST_WAIT_SECONDS
+    while True:
+        for entry in bg_roster().values():
+            if entry.id == short:
+                return entry
+        if time.monotonic() >= deadline:
+            raise ClaudeCliError(f"background session {short} never appeared in "
+                                 f"`claude agents`")
+        time.sleep(0.25)
+
+
+def _pid_running(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def stop_bg(short: str, wait: float = BG_STOP_WAIT_SECONDS) -> bool:
+    """`claude stop`, then wait until the PROCESS is gone — the roster drops its pid ~0.6s earlier (fact 8)"""
+    before = next((e for e in bg_roster().values() if e.id == short), None)
+    try:
+        _run(["stop", short], timeout=30)
+    except ClaudeCliError:
+        pass  # already stopped is as good; the roster below is the verdict
+    deadline = time.monotonic() + wait
+    while True:
+        entry = next((e for e in bg_roster().values() if e.id == short), None)
+        if ((entry is None or not entry.alive)
+                and not _pid_running(before.pid if before else None)):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def resume_bg_turn(session_id: str, prompt: str, cwd: Path,
+                   promptfile: Path | None = None,
+                   launch: Launch | None = None) -> BgEntry:
+    """Send the next prompt to a worker's own session: stopped first, resumed BARE (facts 5-8)"""
+    short = session_id[:8]
+    entry = bg_roster().get(session_id)
+    if entry is not None and entry.alive and not stop_bg(entry.id):
+        raise ClaudeCliError(f"background session {entry.id} would not stop; not "
+                             f"resuming it, which would fork a copy")
+    # NO flags: any flag, or a live original, starts a copy under a new id
+    out = _run(["--bg", "--resume", session_id, "--", _bg_prompt(prompt, promptfile)],
+               cwd=cwd, timeout=120, launch=launch)
+    got = _short_id(out)
+    if got != short:
+        # A copy is a second conversation: take it down and refuse rather than drift onto it
+        stop_session(got)
+        remove_bg(got)
+        raise ClaudeCliError(f"resuming {short} started a copy ({got}) instead: "
+                             f"{out.strip()[:300]}")
+    resumed = bg_roster().get(session_id)
+    return resumed or BgEntry(id=short, session_id=session_id, pid=None, status="",
+                              state="")
+
+
+def respawn_bg(short: str) -> bool:
+    """Restart a session's process under the same id, sending nothing (fact 11)"""
+    try:
+        _run(["respawn", short], timeout=60)
+        return True
+    except ClaudeCliError:
+        return False
+
+
+def remove_bg(short: str) -> str | None:
+    """`claude rm`: the session, and its worktree when that is safe; its report, or None on failure"""
+    try:
+        return (_run(["rm", short], timeout=60) or "").strip()
+    except ClaudeCliError:
+        return None
 
 
 # -- worker turns (the transport every worker conversation runs on)
@@ -607,6 +818,7 @@ class SpawnedTurn:
 def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
                errfile: Path, resume: bool = False, unit: str | None = None,
                cache: dict[str, str] | None = None,
+               launch: Launch | None = None,
                **kwargs: Any) -> SpawnedTurn:
     """Start one worker turn; returns the pid to track it by and the unit it runs in (#133)"""
     outfile.parent.mkdir(parents=True, exist_ok=True)
@@ -619,6 +831,9 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
     # Stripped first so the `cli` arm's ABSENCE survives a daemon whose own process carries the flag
     env = {k: v for k, v in os.environ.items() if k not in CACHE_TTL_KEYS}
     env.update(cache_env() if cache is None else cache)
+    if launch is not None:
+        env.update(launch.env())
+    argv = _launch_argv(args, launch)
     if unit and systemd_units.use_transient_units():
         prefix = systemd_units.run_prefix(
             unit, cwd=cwd, outfile=outfile, errfile=errfile, env=env,
@@ -627,7 +842,7 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
         )
         try:
             # No redirection here: the unit's own StandardOutput= writes the result file
-            done = subprocess.run([*prefix, claude_bin(), *args], capture_output=True,
+            done = subprocess.run([*prefix, *argv], capture_output=True,
                                   text=True, timeout=60)
         except (OSError, subprocess.SubprocessError) as e:
             log.warning("systemd-run unavailable for %s (%s) — spawning directly",
@@ -651,7 +866,7 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
             if promptfile is not None:
                 stdin = stack.enter_context(promptfile.open("rb"))
             proc = subprocess.Popen(
-                [claude_bin(), *args],
+                argv,
                 cwd=cwd,
                 env=env,
                 stdin=stdin,
@@ -662,10 +877,10 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
     except OSError as e:
         if e.errno == errno.E2BIG:
             raise InputTooLargeError(
-                f"`{claude_bin()}` could not be started: the input was too large for the "
+                f"`{argv[0]}` could not be started: the input was too large for the "
                 f"command line ({sum(len(a.encode()) for a in args)} bytes of arguments)"
             ) from e
-        raise ClaudeCliError(f"could not start `{claude_bin()}`: {e}") from e
+        raise ClaudeCliError(f"could not start `{argv[0]}`: {e}") from e
     return SpawnedTurn(pid=proc.pid)
 
 
@@ -890,6 +1105,9 @@ _TRANSIENT_TEXT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+#: `terminal_reason` of a background turn whose session process died before it settled (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+SESSION_LOST = "session_lost"
+
 #: The status the CLI names in the message body when the envelope's own field is missing
 _TRANSIENT_STATUS_RE = re.compile(r"API Error:\s*(5\d\d)\b", re.IGNORECASE)
 
@@ -909,6 +1127,9 @@ def transient_failure(text: str | None, *, terminal_reason: str | None = None,
         return None
     if usage_limit(text) is not None:
         return None  # the window, not the transport — the branch above owns it
+    if terminal_reason == SESSION_LOST:
+        # The process died under the turn: the transport, whatever the work had reached
+        return TransientFailure(message=_summarise(text), status=None)
     if api_error_status is not None:
         # The CLI said what happened
         if api_error_status < 500:
@@ -966,6 +1187,18 @@ def auth_failure(text: str | None) -> AuthFailure | None:
     return AuthFailure(message=_summarise(text))
 
 
+# The CLI's `model_not_found` texts, verbatim from the 2.1.308 bundle
+_MODEL_REJECTED_RE = re.compile(
+    r"There's an issue with the selected model \(([^)]*)\)"
+    r"|The model (\S+) is not available on your")
+
+
+def model_rejected(text: str | None) -> str | None:
+    """The model id a failed turn says claude refused, or None"""
+    m = _MODEL_REJECTED_RE.search(text or "")
+    return (m.group(1) or m.group(2)) if m else None
+
+
 #: Where Claude Code keeps the OAuth session it signs in with and refreshes
 CREDENTIALS_ENV = "JARVIS_CLAUDE_CREDENTIALS"
 
@@ -977,14 +1210,52 @@ def credentials_path() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / ".credentials.json"
 
 
-def signin_changed_at() -> float | None:
-    """When Claude Code's stored sign-in last changed, or None if nothing can be said"""
+#: The login-Keychain item Claude Code signs in to on a Mac, in place of `.credentials.json`
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+@dataclass
+class StoredSignin:
+    #: The parsed JSON — `claudeAiOauth` holds the OAuth session
+    data: Any
+    #: When it last changed, or None when its store would not say
+    changed_at: float | None
+    #: Where it was read from, for messages: a path or the Keychain item
+    source: str
+
+
+def stored_signin() -> StoredSignin | None:
+    """The credentials file, else on a Mac the Keychain item; `None` when neither exists"""
     path = credentials_path()
     try:
         changed = path.stat().st_mtime
-        raw = json.loads(path.read_text())
-    except (OSError, ValueError):
+        raw = path.read_text()
+    except FileNotFoundError:
+        if os.environ.get(CREDENTIALS_ENV) or os.environ.get("CLAUDE_CONFIG_DIR"):
+            return None  # an explicit file, or a config dir whose Keychain item is named apart
+        item = keychain.generic_password(KEYCHAIN_SERVICE)
+        if item is None:
+            return None
+        changed, raw, where = item.modified_at, item.secret, f"Keychain item {KEYCHAIN_SERVICE!r}"
+    except OSError:
+        raise ValueError(f"{path} is unreadable") from None
+    else:
+        where = str(path)
+    try:
+        return StoredSignin(data=json.loads(raw), changed_at=changed, source=where)
+    except ValueError:
+        raise ValueError(f"{where} is not JSON") from None
+
+
+def signin_changed_at() -> float | None:
+    """When Claude Code's stored sign-in last changed, or None if nothing can be said"""
+    try:
+        stored = stored_signin()
+    except ValueError:
         return None
+    if stored is None or stored.changed_at is None:
+        return None
+    raw, changed = stored.data, stored.changed_at
     oauth = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
     expires = oauth.get("refreshTokenExpiresAt") if isinstance(oauth, dict) else None
     if isinstance(expires, (int, float)) and not isinstance(expires, bool) and \
@@ -1010,11 +1281,16 @@ def process_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True  # alive, just not ours to signal
+    want = Path(claude_bin()).name
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
-        return True  # no /proc (or it vanished mid-read) — trust the signal
-    want = Path(claude_bin()).name
+        from . import service_manager
+
+        tokens = service_manager.command_line(pid)  # macOS has no /proc
+        if tokens is None:
+            return True  # it vanished mid-read, or `ps` would not say — trust the signal
+        return any(Path(tok).name == want for tok in tokens)
     return any(Path(tok).name == want
                for tok in raw.decode(errors="replace").split("\0") if tok)
 
@@ -1230,6 +1506,37 @@ def run_headless(prompt: str, system_prompt: str | None = None,
                                permission_mode=permission_mode,
                                env_extra=env_extra, settings=settings,
                                keep_default_context=keep_default_context).text
+
+
+def run_session_turn(prompt: str, session_id: str, *, resume: bool, cwd: Path,
+                     model: str | None = None, append_system_prompt: str | None = None,
+                     permission_mode: str | None = None,
+                     add_dirs: list[Path] | None = None,
+                     timeout: int = 900) -> HeadlessResult:
+    """One waited-for turn of a LONG-LIVED OS session (Morpheus): `--session-id` first, `--resume` after"""
+    args = turn_args(prompt, session_id, resume, model=model,
+                     permission_mode=permission_mode,
+                     append_system_prompt=append_system_prompt, add_dirs=add_dirs or None)
+    started = time.monotonic()
+    out = _run(args, cwd=cwd, timeout=timeout)
+    latency_ms = int((time.monotonic() - started) * 1000)
+    try:
+        data: Any = json.loads(out)
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
+        return HeadlessResult(text=out, model=model or "", prompt_chars=len(prompt),
+                              latency_ms=latency_ms, session_id=session_id)
+    served = list(data.get("modelUsage") or {})
+    usage = derive_turn_usage(data)
+    if usage is not None:
+        usage["prompt_chars"] = len(prompt)
+        usage["latency_ms"] = latency_ms
+    return HeadlessResult(
+        text=str(data.get("result") or ""), usage=usage,
+        session_id=str(data.get("session_id") or session_id),
+        model=(served[0] if len(served) == 1 else "") or model or "",
+        prompt_chars=len(prompt), latency_ms=latency_ms)
 
 
 def unpack_headless(value: HeadlessResult | str) -> tuple[str, dict[str, Any] | None]:

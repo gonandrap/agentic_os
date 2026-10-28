@@ -45,7 +45,60 @@ Skipped entirely when no work order is parked, so an idle fleet spawns no subpro
 A `gh` that cannot answer warns ONCE per project per daemon run (`pr_poll_warned`) and
 leaves the work order parked; `jarvis wo done` is still the manual way out.
 
-## The transport: headless turns (replaced background sessions, 2026-08-01)
+## The transport is per order: `background` (default since 2026-10-22) or `headless`
+
+`worker.transport` (catalog) is read at the FIRST launch and recorded on
+`work_orders.transport`; `worker_session.transport_of()` / `is_background()` decide every
+later turn. Rows from before the column with a session are headless.
+
+**Background** (spec `docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md`,
+facts measured on CLI 2.1.308, spike `scripts/spike_bg_transport.py`): ONE `claude --bg`
+session per order. Turn 1 = `claude_cli.spawn_bg_turn` (`--bg -n … --worktree …
+[briefing] -- prompt`; the CLI MINTS the id, read off `claude agents --json --all` and
+stored as `session_id` + `bg_id`). Turn n = `resume_bg_turn`: `claude stop`, wait until
+the roster shows no pid, then `claude --bg --resume <sid> -- <msg>` with NO flags — a
+live original or any flag forks a copy (it is detected and removed). `worker_session.poll`
+reads liveness from the roster (`BgEntry.idle` = settled; `busy` covers the worker's own
+background tasks, so a turn spans them), builds the `TurnResult` from the transcript
+(`usage.window_envelope`, subagents included) + the Stop hook's last message, and stops
+the idle session after settling. A synthetic assistant message is the error text the
+pause machinery reads; a dead session with no Stop since the prompt is
+`claude_cli.SESSION_LOST` → transient pause. `--max-budget-usd` is print-only, so poll
+enforces the cap (`_bg_over_budget`, every `BG_BUDGET_EVERY`). `jarvis wo respawn` =
+`claude respawn` (same id, sends nothing); `wo delete` = `claude rm`, and every poll `claude rm`s the session of a completed/cancelled order (`remove_closed_sessions`; a removed id still resumes as the same session). Prompts over 1 KB go by file. The one-shot hooks
+(background refusal, long-foreground refusal, Stop uncollected-task block) key on
+`JARVIS_TURN_TRANSPORT=headless` and are silent here. Tests: `tests/test_bg_transport.py`
+(the shared `catalog_file` fixture PINS headless; the fake models `--bg` only for `-n`,
+never for the legacy `--name` path).
+
+## Session dispatch: a project's own launcher (spec `docs/superpowers/specs/2026-10-22-session-dispatch.md`)
+
+Catalog `worker.launcher` (path | list | `{command, env}`, parsed by
+`session_dispatch.parse_launcher`) names a LOCAL script that launches the project's
+sessions instead of bare `claude` (e.g. agentic-env behind `claude-ase`).
+`worker_session._launch` builds a `session_dispatch.Launch` per turn and passes
+`launch=` to `spawn_bg_turn` / `resume_bg_turn` / `spawn_turn`; `claude_cli._run` runs
+`launch.argv(args)` + `launch.env()` (`JARVIS_REAL_CLAUDE`, `JARVIS_LAUNCH_*`). Only
+LAUNCHES go through it — `agents`, `stop`, `rm`, `respawn`, Neo stay on the real CLI.
+Contract: exec `$JARVIS_REAL_CLAUDE "$@"`, add nothing on a bg resume (forks a copy),
+no cwd change, no stdout before exec. `INV-LAUNCHER-RUNNABLE` in `check_catalog`.
+Tests: `tests/test_session_dispatch.py`.
+
+TEMPLATE mode `launcher.open` (session managers: `claude-jarvis start @jarvis --model {model}
+--compact-pct {compact_pct} --prompt {prompt} {wo_name}`): bg transport only; turn 1 runs
+the filled template (`claude_cli.spawn_bg_open`, id off its `backgrounded · <id>` stdout),
+the roster `cwd` is stored as the order's `worktree` as an ABSOLUTE path (every
+`<project>/.claude/worktrees/<wt>` join collapses to it); later turns resume bare there.
+`{wo_name}` strips non-alnum (claude-shining rule). Measured live 2.1.309: the CALLER'S ENV
+DOES NOT REACH a `--bg` session; worker settings reach it via `--inject {inject_dir}`:
+`session_dispatch.write_inject_dir` → `.jarvis/inject/<wo>/` (settings-fragment.json =
+worker settings, context.md = append_system_prompt, skills/, agents/), which claude-shining
+layers into the env's settings.local.json (objects merge, lists union, env scalars win;
+agentic-env branch gonzaloraposo-bc/injectSettingsMerge). Verified live: Jarvis env+hooks
+AND harness env+hooks all fire. Not carried: --agent, --effort, --permission-mode. Settle now `stop_bg`s (waits for the
+process): a bare `stop_session` let an immediate resume fork a copy (fact 8).
+
+## The headless transport (replaced background sessions 2026-08-01; the fallback since 2026-10-22)
 
 **Read `src/jarvis/worker_session.py`'s module docstring first — it is the layer, and it
 explains the why.** Design doc:
@@ -154,6 +207,13 @@ fire on EVERY turn** (`SessionStart.source == "resume"` from turn 2 on).
 read). Only `track_injected_sessions` + `check_invariants` stay on the
 `RECONCILE_EVERY_TICKS` cadence, and only the first needs `claude agents --json` — which
 it skips entirely on ticks where no project has a live `injected` row.
+
+**Mid-turn delivery** (docs/superpowers/specs/2026-10-22-messages-delivered-mid-turn.md): while
+a turn runs, the worker's own `PostToolUse` hook (`hooks.deliver_mid_turn`) claims queued
+messages and returns them as `additionalContext` at the lead's next tool call. It is gated
+by `.jarvis/inbox/<wo>.pending` (touched by `queue_message`), which costs one `stat` per
+tool call. Subagent calls, compaction turns, and `relaunch`/`background-orphan` rows are
+skipped. `deliver_messages` handles whatever is still queued when the turn ends.
 
 ## Self-healing when the transport fails (usage limit: wo-996c7344, PR 89;
 ## API errors: wo-50958234)
@@ -314,3 +374,15 @@ requires anyway. `jarvis doctor` lists leftover `[WO …]` agents with no open w
 - `spawn_background()` / `list_background_sessions()` / `stop_session()` — injected-session
   tracking and the migration path only.
 - Deleted with the old transport: `job_result()`, `jobs_dir()`, `send_to_session()`.
+
+## How each kind settles — `project_store.WO_KIND_CONTRACTS`
+
+One row per `WO_KINDS` entry: `route` (`finish` = the join; `in_session` = its submission
+settles it via `ops.settle_in_session`, never stopping its own session; `idle` = manager),
+`artifact` (plan.json / report.json / verdict.json — excluded from `landing.authored`'s
+dirty set, so it is never "stranded work"), `submit` (its contract command), `lands_code`
+(drives `ops.unlanded_refusal`'s remedies) and `assumptions_reviewed` (False for the
+investigator: `invariants.reviewable_assumptions` keeps its calls out of `true_blockers`).
+`ops.close_out` REFUSES when `JARVIS_WO_ID` is its target — it kills the caller's session.
+`Daemon.settle_landed_investigators` retires flags/status on investigators whose verdict landed.
+`ProjectStore.feature_children(fo_id, kinds=…)` — `kinds` is required (`WORKER_CHILDREN` or None).

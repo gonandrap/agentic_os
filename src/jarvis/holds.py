@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from . import db
@@ -80,6 +79,8 @@ class Hold:
     cause: str
     started: float
     ended: float | None = None
+    #: What the timeline pairs this hold on — a Neo question id, an approval id, a round, a message id
+    key: Any = field(default=None, compare=False)
 
     @property
     def open(self) -> bool:
@@ -87,7 +88,7 @@ class Hold:
 
     def finish(self, now: float | None = None) -> float:
         return self.ended if self.ended is not None else (
-            time.time() if now is None else now)
+            db.now() if now is None else now)
 
     @property
     def phrase(self) -> str:
@@ -107,7 +108,7 @@ class Hold:
 def held(store: ProjectStore, wo_id: str, *,
          now: float | None = None) -> list[Hold]:
     """Every interval the OS's record says this work order was held, oldest first"""
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     spans = _episodes(store.list_events(wo_id, limit=_EVENT_LIMIT))
     spans = _outside(spans, _working(store.list_turns(wo_id), now), now)
     return _merge(spans, now)
@@ -116,7 +117,7 @@ def held(store: ProjectStore, wo_id: str, *,
 def held_family(store: ProjectStore, wo_ids: Sequence[str], *,
                 now: float | None = None) -> list[Hold]:
     """Every interval NO member of this family could run — a feature order's hold (docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md)"""
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     episodes: list[Hold] = []
     turns: list[dict[str, Any]] = []
     for wo_id in wo_ids:
@@ -148,7 +149,7 @@ def _close_synthesised(open_holds: dict[tuple[str, Any], Hold], done: list[Hold]
     """End the unkeyed hold synthesised for a held round, if one is open"""
     hold = open_holds.pop((cause, None), None)
     if hold is not None:
-        done.append(Hold(hold.cause, hold.started, max(ts, hold.started)))
+        done.append(Hold(hold.cause, hold.started, max(ts, hold.started), hold.key))
 
 
 def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
@@ -172,7 +173,7 @@ def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
                 if cause in causes and (field is None or key in keys):
                     hold = open_holds.pop((cause, key))
                     done.append(Hold(hold.cause, hold.started,
-                                     max(ts, hold.started)))
+                                     max(ts, hold.started), hold.key))
         # Every terminal of a held round ends the synthesised hold, not only the resubmission (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
         if kind in _SYNTHESIS_CLOSERS:
             for synthesised in (PAUSE_USAGE_LIMIT, PAUSE_AUTH):
@@ -196,7 +197,7 @@ def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
         if cause not in HOLD_CAUSES:
             continue
         key = _key(payload, field)
-        open_holds[(cause, key)] = Hold(cause, ts)
+        open_holds[(cause, key)] = Hold(cause, ts, key=key)
     done.extend(open_holds.values())
     done.sort(key=lambda h: h.started)
     return done
@@ -225,11 +226,11 @@ def _outside(spans: Sequence[Hold], working: Sequence[tuple[float, float]],
             if stop <= cursor or start >= end:
                 continue
             if start > cursor:
-                out.append(Hold(hold.cause, cursor, start))
+                out.append(Hold(hold.cause, cursor, start, hold.key))
             cursor = max(cursor, stop)
         if end > cursor:
             out.append(Hold(hold.cause, cursor,
-                            None if hold.open and end >= now else end))
+                            None if hold.open and end >= now else end, hold.key))
     out.sort(key=lambda h: h.started)
     return out
 
@@ -243,7 +244,7 @@ def _merge(spans: Sequence[Hold], now: float) -> list[Hold]:
         if end - start < _MIN_HOLD:
             continue
         out.append(Hold(hold.cause, start,
-                        None if hold.open and end >= now else end))
+                        None if hold.open and end >= now else end, hold.key))
         cursor = end
     return out
 

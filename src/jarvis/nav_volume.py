@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
 from .catalog import NavigationConfig
+from . import db
 from . import navigation
 from . import usage
 
@@ -289,7 +289,7 @@ def read_tree(root: Path | None = None, cfg: NavigationConfig | None = None, *,
     vol = NavigationVolume(scope="fleet", window_days=days)
     if not root.is_dir():
         return vol
-    cutoff = (time.time() - days * 86400) if days else None
+    cutoff = (db.now() - days * 86400) if days else None
 
     def fresh(path: Path) -> bool:
         if cutoff is None:

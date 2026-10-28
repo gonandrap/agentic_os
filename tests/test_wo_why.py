@@ -74,7 +74,7 @@ def test_disagreement_reported_when_the_blocker_does_not_need_the_user(started,
     """`true_blockers` wants the user; `waiting_on` says a turn is in flight"""
     wo = an_order(started)
     ops.assume(wo["id"], "exporting CSV by default")
-    monkeypatch.setattr(ops, "waiting_on", lambda store, w: {
+    monkeypatch.setattr(ops, "waiting_on", lambda store, w, now=None: {
         "what": "turn_running", "stalled": False,
         "detail": "a turn is in flight — the worker is working"})
 
@@ -92,7 +92,7 @@ def test_disagreement_reported_when_the_blocker_does_not_need_the_user(started,
 def test_disagreement_reported_when_nothing_needs_the_user(started, monkeypatch):
     """The other direction: `waiting_on` names a user wait `true_blockers` does not"""
     wo = an_order(started)
-    monkeypatch.setattr(ops, "waiting_on", lambda store, w: {
+    monkeypatch.setattr(ops, "waiting_on", lambda store, w, now=None: {
         "what": "assumptions", "stalled": False,
         "detail": f"1 assumption(s) await your review — `jarvis wo review {wo['id']}`"})
     monkeypatch.setattr(invariants, "true_blockers", lambda store, w, now=None: [])
@@ -538,7 +538,7 @@ def test_resume_auto_is_withheld_from_an_idle_manager(started, project):
 def test_resume_auto_is_withheld_when_a_nudge_is_actively_wrong(started, monkeypatch):
     """The `NUDGE_IS_WRONG` arm itself, which store state cannot reach"""
     wo = an_order(started)
-    monkeypatch.setattr(ops, "waiting_on", lambda store, w: {
+    monkeypatch.setattr(ops, "waiting_on", lambda store, w, now=None: {
         "what": "message_stuck", "stalled": True,
         "detail": "a message is queued undelivered"})
 

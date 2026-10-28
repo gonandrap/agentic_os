@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, ops, systemd_units, worker_session
+from jarvis import claude_cli, db, ops, systemd_units, worker_session
 from jarvis.catalog import load_catalog
 from jarvis.project_store import ProjectStore
 
@@ -78,6 +78,31 @@ def test_the_suite_itself_is_pinned_to_the_direct_transport() -> None:
 def test_the_cgroup_probe_reads_the_real_thing() -> None:
     """Not mocked anywhere else in this file, so it gets one test against /proc"""
     assert isinstance(systemd_units.in_service_cgroup(), bool)
+
+
+def test_a_units_uptime_is_read_off_the_same_monotonic_clock(monkeypatch) -> None:
+    """systemd reports CLOCK_MONOTONIC µs, which is what `time.monotonic()` reads (issue #1189)"""
+    monkeypatch.setattr(systemd_units.time, "monotonic", lambda: 1_000.0)
+    monkeypatch.setattr(systemd_units, "_show",
+                        lambda unit, prop: str(int(987.5 * 1_000_000)))
+    assert systemd_units.uptime_seconds("jarvis-ui.service") == 12.5
+
+
+@pytest.mark.parametrize("state,transitioning", [
+    ("deactivating", True), ("activating", True), ("reloading", True),
+    ("active", False), ("inactive", False), ("failed", False), ("", False),
+])
+def test_only_a_restarts_own_states_count_as_transitioning(monkeypatch, state,
+                                                           transitioning) -> None:
+    """A restart's stop phase is `deactivating`, and uptime still holds the old start (issue #1194)"""
+    monkeypatch.setattr(systemd_units, "_show", lambda unit, prop: state)
+    assert systemd_units.unit_transitioning("jarvis-ui.service") is transitioning
+
+
+@pytest.mark.parametrize("answer", ["", "0", "not-a-number"])
+def test_an_unknown_uptime_is_none_rather_than_a_guess(monkeypatch, answer) -> None:
+    monkeypatch.setattr(systemd_units, "_show", lambda unit, prop: answer)
+    assert systemd_units.uptime_seconds("jarvis-ui.service") is None
 
 
 # -- what the unit is told
@@ -261,7 +286,7 @@ def test_a_unit_that_never_reported_a_pid_is_not_reaped_as_dead(
     assert turn["pid"] is None and turn["unit"]
     # Past the "spawned this instant" grace, so only the unit can save it
     store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
-                       (time.time() - 120, turn["id"]))
+                       (db.now() - 120, turn["id"]))
 
     assert worker_session.poll(store) == []
     assert store.get_turn(turn["id"])["state"] == "running"
@@ -327,6 +352,7 @@ def _ctl_calls(fake_systemd) -> list[dict]:
 
 def _wait_until(done: Callable[[], bool], message: str,
                 timeout: float = 15.0) -> None:
+    # clock-exempt: class 3 — spin-waits on a caller-supplied predicate about a real transient unit
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if done():
@@ -340,6 +366,7 @@ def _has_result(outfile: Path) -> bool:
 
 
 def _wait_for_result(outfile: Path, timeout: float = 15.0) -> None:
+    # clock-exempt: class 3 — spin-waits for a real worker subprocess to write its result file
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _has_result(outfile):
@@ -349,6 +376,7 @@ def _wait_for_result(outfile: Path, timeout: float = 15.0) -> None:
 
 
 def _poll_until_settled(store, timeout: float = 15.0) -> list[dict]:
+    # clock-exempt: class 3 — spin-waits for worker_session.poll to reap a turn whose unit is really gone
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         settled = worker_session.poll(store)
@@ -372,8 +400,15 @@ def _worker_env(project, *, wo: dict | None = None, **worker) -> dict:
     return json.loads(out.read_text())["env"]
 
 
-def test_worker_settings_declare_headless_transport(project, jarvis_home) -> None:
+def test_worker_settings_declare_the_order_s_transport(project, jarvis_home) -> None:
+    """The ORDER's transport, which the one-shot hooks key on (spec 2026-10-22)"""
     assert _worker_env(project)[claude_cli.TURN_TRANSPORT_ENV] \
+        == claude_cli.TRANSPORT_BACKGROUND
+    assert _worker_env(project, transport="headless")[claude_cli.TURN_TRANSPORT_ENV] \
+        == claude_cli.TRANSPORT_HEADLESS
+    # An order keeps the transport its session was born on, whatever the catalog says now
+    born = {"id": "wo-tt02", "title": "t", "transport": "headless"}
+    assert _worker_env(project, wo=born)[claude_cli.TURN_TRANSPORT_ENV] \
         == claude_cli.TRANSPORT_HEADLESS
 
 
@@ -404,9 +439,9 @@ def test_background_spawn_declares_background_transport(project, monkeypatch) ->
 
 
 def test_worker_settings_carry_the_require_crew_switch(project, jarvis_home) -> None:
-    """The off switch the default-true refusal is defended by"""
-    assert _worker_env(project)["JARVIS_REQUIRE_CREW"] == "1"
-    assert _worker_env(project, require_crew=False)["JARVIS_REQUIRE_CREW"] == "0"
+    """The switch the crew refusal reads; off by default since spec 2026-10-22"""
+    assert _worker_env(project)["JARVIS_REQUIRE_CREW"] == "0"
+    assert _worker_env(project, require_crew=True)["JARVIS_REQUIRE_CREW"] == "1"
 
 
 def test_worker_settings_carry_the_work_orders_kind(project, jarvis_home) -> None:

@@ -166,6 +166,30 @@ This supersedes the "deliberately not fixed" note in `kn-fa9311fc`. That note's 
 the answer is already the adjacent message, so do not attach it to the event too — is
 exactly why the now-empty event line is worth dropping.
 
+### 2026-10-21: the user is the speaker only when the OS can prove it
+
+`source` decided the speaker, with a fall-through: any inbound source not on
+`UNAUTHORED_SOURCES` or the two named arms read `you → worker`. That default was in the wrong
+direction. The early objection (`ops.file_assumption_objection`) is delivered off the bus
+with `source="bus"` and deliberately unattributed, and it rendered as the user speaking — on
+wo-58ea1ef9 a withdrawn OS objection looked like a lost user message (io-ce566253,
+`objection-reads-as-the-user`). Adding `"bus"` would have been wrong twice over: the next
+new source is misattributed again by default, and the bus also carries `review_feedback`
+and `deferral_request`.
+
+The rule now: **`you → worker` only for a row with `authored_by == MESSAGE_AUTHOR_USER`.**
+`neo` and `supervisor` keep their own tags, and everything else — every
+`UNAUTHORED_SOURCES` member, every source nobody has named yet — is `jarvis → worker`.
+`UNAUTHORED_SOURCES` and the named arms are a label lookup; they no longer decide
+attribution. This is the same reading `ProjectStore.user_messages` uses to quote the user's
+words into a gate request, and `tests/test_timeline.py` pins the two equal.
+
+**Accepted consequence.** Rows written before `authored_by` existed (and the OS-composed
+relays that carry the user's text inside an OS sentence: `wo review --reject` feedback, a
+Neo correction, the `resume-auto` nudge, all `source="jarvis"` and unstamped) now read
+`jarvis → worker`. That is honest: `''` is documented as "unknown", and a record that says
+Jarvis carried it is truer than one that asserts the user typed it.
+
 ---
 
 ## 6. Three readings, not one scroll

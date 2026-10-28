@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -15,7 +16,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
+from .. import bill, db, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -137,7 +138,7 @@ def _counts_by_status(statuses) -> list[tuple[str, int]]:
 def fmt_age(ts: float | None) -> str:
     if not ts:
         return "–"
-    d = time.time() - ts
+    d = db.now() - ts
     for limit, unit, div in ((90, "s", 1), (5400, "m", 60), (129600, "h", 3600)):
         if d < limit:
             return f"{int(d / div)}{unit}"
@@ -148,7 +149,7 @@ def fmt_left(ts: float | None) -> str:
     """How long until a deadline — the mirror of `fmt_age`"""
     if not ts:
         return "–"
-    d = ts - time.time()
+    d = ts - db.now()
     if d <= 0:
         return "any moment now"
     return f"{int(d / 60)}m" if d >= 60 else f"{int(d)}s"
@@ -235,6 +236,7 @@ class PoolProbe:
         from .. import bugreport
         from ..catalog import UiHealthConfig
 
+        # Real clock: one half of the self-consistent uptime pair (docs/superpowers/specs/2026-10-15-burn-down-the-clock-hygiene-allowlist.md §0.9)
         self.started_at = time.time()
         # The settings the probe last resolved
         self.cfg = UiHealthConfig()
@@ -242,6 +244,11 @@ class PoolProbe:
         self.consecutive_failures = 0
         self.wedged_since: float | None = None
         self.stack_dump: str | None = None
+        # Stamped every round, read by `LoopWatchdog` from a plain thread (issue #1221)
+        self.heartbeat = time.monotonic()
+        # The last figures measured ON the loop: a watchdog thread cannot read the limiter
+        self.last_limiter: dict[str, int] = {"borrowed": 0, "available": 0,
+                                             "total": 0, "waiting": 0}
         # Routed requests in flight, keyed by a counter: a monotonic start time and a label
         self._inflight: dict[int, tuple[float, str]] = {}
         self._inflight_seq = 0
@@ -339,6 +346,7 @@ class PoolProbe:
 
     def _trip(self) -> None:
         """Dump this process's stacks — the only way to get the frames at all, since py-spy could not attach"""
+        # Pairs with `started_at` on the same clock (docs/superpowers/specs/2026-10-15-burn-down-the-clock-hygiene-allowlist.md §0.9)
         stamp = uilog.record_wedge(limiter=self.limiter_figures(),
                                    uptime_seconds=time.time() - self.started_at,
                                    version=self.version)
@@ -350,11 +358,120 @@ class PoolProbe:
         import anyio
 
         while True:
+            self.heartbeat = time.monotonic()
+            self.last_limiter = self.limiter_figures()
             # Re-resolved every round, so `jarvis config set os.ui_health.…` is in force without restarting the...
             self.cfg = ops.ui_health_config()
             if self.cfg.enabled:
                 await self.step(self.cfg)
             await anyio.sleep(max(1, self.cfg.probe_interval_seconds))
+
+
+#: How often the watchdog thread looks at the heartbeat
+WATCHDOG_TICK_SECONDS = 5
+
+
+class LoopWatchdog:
+    """The dump path that survives a BLOCKED event loop: a plain OS thread (issue #1221)"""
+
+    def __init__(self, probe: PoolProbe) -> None:
+        self.probe = probe
+        self.dumps = 0
+        # One dump per stall, re-armed when the loop starts stamping again
+        self.armed = True
+        self._stop = threading.Event()
+
+    def check(self, now: float) -> bool:
+        """Did this look at the heartbeat dump the stacks?"""
+        # `probe.cfg`, not `ops.ui_health_config()`: this thread must touch nothing the wedge can hold
+        cfg = self.probe.cfg
+        stale = now - self.probe.heartbeat
+        if not cfg.enabled or stale <= max(1, cfg.loop_stall_seconds):
+            self.armed = True
+            return False
+        if not self.armed:
+            return False
+        self.armed = False
+        uilog.record_wedge(limiter=self.probe.last_limiter,
+                           uptime_seconds=time.time() - self.probe.started_at,
+                           version=self.probe.version,
+                           reason=f"event loop stalled {stale:.0f}s — no probe round "
+                                  f"since, so the loop itself is blocked")
+        self.dumps += 1
+        return True
+
+    def run(self) -> None:
+        """The thread body: look, sleep, repeat — never awaits anything"""
+        while not self._stop.is_set():
+            try:
+                self.check(time.monotonic())
+            except Exception:  # noqa: BLE001 — a watchdog that dies is worse than one that misses
+                pass
+            self._stop.wait(WATCHDOG_TICK_SECONDS)
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.run, name="jarvis-ui-watchdog",
+                                  daemon=True)
+        thread.start()
+        return thread
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def _cost_payloads(picked: dict, project: str, method: str = "TASK") -> dict:
+    """The three /cost payloads for one resolved window (docs/superpowers/specs/2026-10-22-cost-tab-precompute.md)"""
+    report = ops.cost_report(project=project or None, window=picked)
+    # The distribution is a SECTION of this page
+    try:
+        fleet = ops.fleet_cost(project=project or None, resolved=picked)["fleet"]
+    except Exception:                                   # noqa: BLE001
+        fleet = None
+    # The meter is a THIRD payload from the same resolved window
+    try:
+        meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
+    except Exception as e:                              # noqa: BLE001
+        uilog.record_error(method, "cost/meter", e)
+        meter = None
+    return {"report": report, "fleet": fleet, "meter": meter}
+
+
+REFRESH_SECONDS = 60
+
+
+class CostCache:
+    """Default /cost windows, precomputed (docs/superpowers/specs/2026-10-22-cost-tab-precompute.md)"""
+
+    def __init__(self) -> None:
+        self.entries: dict[str, dict] = {}
+
+    def compute(self, name: str) -> dict:
+        picked = ops.cost_window(window=name)
+        return {"window": picked, **_cost_payloads(picked, ""), "computed_at": time.time()}
+
+    def lookup(self, picked: dict) -> dict | None:
+        entry = self.entries.get(picked.get("window") or "")
+        if entry is None or ((entry["window"]["since"], entry["window"]["until"])
+                             != (picked["since"], picked["until"])):
+            return None
+        return entry
+
+    async def refresh(self) -> None:
+        """One round over every named window; a failure keeps the last good entry"""
+        import anyio
+
+        for name in fleetcost.WINDOW_NAMES:
+            try:
+                self.entries[name] = await anyio.to_thread.run_sync(self.compute, name)
+            except Exception as e:                      # noqa: BLE001
+                uilog.record_error("TASK", f"cost/cache/{name}", e)
+
+    async def run(self) -> None:
+        import anyio
+
+        while True:
+            await self.refresh()
+            await anyio.sleep(REFRESH_SECONDS)
 
 
 def _stale_link_hint(name: str, wo_id: str) -> str:
@@ -484,6 +601,14 @@ def brake_state() -> dict | None:
         fl["ramp"] = {**fl["ramp"], "since_text": invariants.clock(fl["ramp"]["since"]),
                       "until_text": invariants.clock(fl["ramp"]["until"])}
     return fl
+
+
+def nav_projects() -> list[str]:
+    """Every registered project, for the sidebar — an empty list rather than a broken page"""
+    try:
+        return sorted(ops.registered_project_paths())
+    except Exception:  # noqa: BLE001 — chrome must never be what fails a page
+        return []
 
 
 def _decorate_question(q: dict) -> dict:
@@ -733,21 +858,28 @@ def wiring_groups(scope: str, *, refresh: bool = False) -> dict[str, object]:
 
 def create_app() -> FastAPI:
     probe = PoolProbe()
+    cost_cache = CostCache()
+    watchdog = LoopWatchdog(probe)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        """Owns the liveness probe task (spec §2)"""
+        """Owns the liveness probe task (spec §2) and the watchdog thread (issue #1221)"""
         import anyio
 
+        watchdog.start()
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
+            tg.start_soon(cost_cache.run)
             try:
                 yield
             finally:
+                watchdog.stop()
                 tg.cancel_scope.cancel()
 
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.pool_probe = probe
+    app.state.cost_cache = cost_cache
+    app.state.loop_watchdog = watchdog
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
@@ -763,12 +895,15 @@ def create_app() -> FastAPI:
         return response
 
     # Inside the factory, like every other same-tier import in this file: `cli` and `ui` are one tier and...
-    from ..cli import PART_LABELS, PART_SHORT, _held_phrase
+    from ..cli import (ATTENTION_LIST_NOTE, INBOX_LIST_NOTE, PART_LABELS, PART_SHORT,
+                       _held_phrase)
 
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         gate_display=gate_display,
+        # What each list is and which command clears it — the same words `jarvis status` prints (io-d2a5dd69)
+        attention_list_note=ATTENTION_LIST_NOTE, inbox_list_note=INBOX_LIST_NOTE,
         # Every link to an order's page goes through this — see `order_path` (#997)
         order_path=order_path,
         # A round's word, tone and icon — the same tuple `ops.round_line` and `automerge.decide` render from (#581)
@@ -832,6 +967,10 @@ def create_app() -> FastAPI:
         ctx["gate_badge"] = gate_badge()
         ctx["alarm_badge"] = alarm_badge()
         ctx["brake"] = brake_state()
+        # The sidebar's project list, and which of them this page is about (2026-10-22 spec §1)
+        ctx["nav_projects"] = nav_projects()
+        here = ctx.get("project") or ctx.get("project_name")
+        ctx["project_here"] = here if isinstance(here, str) else ""
         return templates.TemplateResponse(request, template, ctx,
                                           status_code=status_code)
 
@@ -889,7 +1028,7 @@ def create_app() -> FastAPI:
             wo["status"] for wo in rows if wo["status"] not in FEATURED_STATUSES)
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
                       featured=featured, rest=rest, rest_counts=rest_counts,
-                      revealed=revealed)
+                      revealed=revealed, model_ids=ops.suggested_model_ids())
 
     @app.get("/search", response_class=HTMLResponse)
     def search_page(request: Request, q: str = "", project: str = "", kind: str = ""):
@@ -1093,7 +1232,7 @@ def create_app() -> FastAPI:
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
     def work_order(request: Request, name: str, wo_id: str, debug: str = "",
-                   forced: str = "", retried: str = ""):
+                   forced: str = "", retried: str = "", events: str = ""):
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
@@ -1101,7 +1240,11 @@ def create_app() -> FastAPI:
                           hint=_stale_link_hint(name, wo_id), status_code=404)
         store = ProjectStore(path)
         try:
-            events = store.list_events(wo_id)
+            # THE NEWEST PAGE, and how much is behind it — `jarvis wo show`'s rule (io-12b7d873)
+            every = events == "all"
+            events_page = store.list_events(wo_id, limit=None if every else 200,
+                                            newest=True)
+            events_hidden = store.count_events(wo_id) - len(events_page)
             messages = store.list_messages(wo_id)
             # Both lists: `assumptions` is the record, `unreviewed` is the ask — §4
             assumptions = ops.assumptions_with_rulings(store, wo_id)
@@ -1167,11 +1310,12 @@ def create_app() -> FastAPI:
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
                       retry=retry, retried_line=retried_line, harvest=harvest,
-                      timeline=build_timeline(wo, events, messages,
+                      timeline=build_timeline(wo, events_page, messages,
                                               include_debug=show_debug),
-                      debug=show_debug, debug_count=count_debug(events),
+                      events_hidden=events_hidden, events_all=every,
+                      debug=show_debug, debug_count=count_debug(events_page),
                       # What was said, and what happened — two readings of one record, neither derivable from the other
-                      conversation=build_conversation(events, messages),
+                      conversation=build_conversation(events_page, messages),
                       assumptions=assumptions, unreviewed=unreviewed, review=review,
                       approvals=approvals, bill=bill, states=states,
                       turn_lines=turn_lines_by_message(bill))
@@ -1194,6 +1338,31 @@ def create_app() -> FastAPI:
             anatomy=_block("the anatomy", ops.inspect_report, wo_id, pname),
             context=_block("the context ledger", ops.context_report, wo_id, pname))
 
+    @app.get("/wo/{name}/{wo_id}/prompt", response_class=HTMLResponse)
+    def work_order_prompt(request: Request, name: str, wo_id: str):
+        """Every prompt this order's conversation was sent, turn by turn (2026-10-22 spec §4)"""
+        try:
+            got = ops.worker_prompts(wo_id, name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e),
+                          hint=_stale_link_hint(name, wo_id), status_code=404)
+        return render(request, "prompt.html", project=got["project"], wo=got["wo"],
+                      turns=got["turns"])
+
+    @app.get("/project/{name}/prompt", response_class=HTMLResponse)
+    def project_prompt(request: Request, name: str):
+        """What a new work order on this project would be told today (2026-10-22 spec §4)"""
+        try:
+            preview = ops.project_prompt_preview(name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e), status_code=404)
+        return render(request, "project_prompt.html", project=name, preview=preview)
+
+    @app.get("/go/{ref:path}")
+    def go(ref: str):
+        """Any id the OS mints, to the page that shows it (2026-10-22 spec §1)"""
+        return RedirectResponse(ops.resolve_ref(ref), status_code=303)
+
     @app.get("/api/wo/{name}/{wo_id}/live")
     def work_order_live(name: str, wo_id: str):
         """`ops.live_report` as JSON, nothing reshaped — what the debugging page polls"""
@@ -1214,24 +1383,24 @@ def create_app() -> FastAPI:
                                      offset=_offset_param(offset), tz=tz or None,
                                      since=_in_zone(since, zone) if since else None,
                                      until=_in_zone(until, zone) if until else None)
-            report = ops.cost_report(project=project or None, window=picked)
+            # docs/superpowers/specs/2026-10-22-cost-tab-precompute.md §Matching rule
+            entry = None
+            if (not project and offset in ("", "0") and not since and not until
+                    and (not tz or tz == ops.cost_zone(None, None))):
+                entry = cost_cache.lookup(picked)
+            if entry is not None:
+                picked, payloads = entry["window"], entry
+            else:
+                payloads = _cost_payloads(picked, project, request.method)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
-        # The distribution is a SECTION of this page
-        try:
-            fleet = ops.fleet_cost(project=project or None, resolved=picked)["fleet"]
-        except Exception:                                   # noqa: BLE001
-            fleet = None
-        # The meter is a THIRD payload from the same resolved window
-        try:
-            meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
-        except Exception as e:                              # noqa: BLE001
-            uilog.record_error(request.method, "cost/meter", e)
-            meter = None
+        report, fleet, meter = payloads["report"], payloads["fleet"], payloads["meter"]
+        cached_at = entry["computed_at"] if entry is not None else None
         # Its own variable and never read out of `fleet`: losing the section must not lose the window the...
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
                       project=project, fleet=fleet, meter=meter, window=picked,
+                      cached_at=cached_at, now=time.time(),
                       window_inputs=_window_inputs(picked),
                       projects=sorted(ops.registered_project_paths()))
 
@@ -1272,23 +1441,27 @@ def create_app() -> FastAPI:
                       blockers=blockers)
 
     @app.get("/knowledge", response_class=HTMLResponse)
-    def knowledge(request: Request):
+    def knowledge(request: Request, topic: str = "", q: str = ""):
         """The base, and what it costs against what it is used for"""
         from ..central_store import PINNED_TAG, has_tag, headline
+        # An empty form field means every topic; "(none)" is how the page names untopicked rows
+        topic_filter = None if not topic else "" if topic == "(none)" else topic
         central = CentralStore()
         try:
-            rows = central.search_knowledge("", limit=200)
+            rows = central.search_knowledge(q.strip(), limit=200, topic=topic_filter)
             topics = central.knowledge_topics()
             hits = central.knowledge_hit_counts()
         finally:
             central.close()
-        rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
+        if not q.strip():  # a word search keeps its rank order
+            rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
         for r in rows:
             r["pinned"] = has_tag(r["tags"], PINNED_TAG)
             r["headline"] = headline(r["content"])
             r["reads"] = hits.get(r["id"], 0)
         return render(request, "knowledge.html", active="knowledge", rows=rows,
-                      topics=topics, usage=ops.knowledge_usage_report(limit=8))
+                      topics=topics, topic=topic, q=q,
+                      usage=ops.knowledge_usage_report(limit=8))
 
     @app.post("/knowledge/pin")
     def knowledge_pin(kn_id: str = Form(...), pinned: str = Form("")):
@@ -1357,8 +1530,16 @@ def create_app() -> FastAPI:
             return render(request, "error.html", active="neo",
                           message=f"neo question {question_id} not found",
                           status_code=404)
+        # The order it came from, for the links back to it, its PR and its debugging page
+        origin = None
+        if q.get("wo_id"):
+            try:
+                _, _, origin = ops.find_work_order(q["wo_id"], q.get("project"))
+            except ops.OpsError:
+                pass
         return render(request, "neo_question.html", active="neo",
-                      q=_decorate_question(q), opinions=opinions)
+                      q=_decorate_question(q), opinions=opinions, origin=origin,
+                      project_name=q.get("project"))
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):
@@ -1432,6 +1613,18 @@ def create_app() -> FastAPI:
         return render(request, "stuck.html", active="stuck",
                       over=[r for r in rows if r["stuck"]],
                       rest=[r for r in rows if not r["stuck"]])
+
+    @app.get("/morpheus", response_class=HTMLResponse)
+    def morpheus_page(request: Request):
+        """Shipped PRs watched in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)"""
+        return render(request, "morpheus.html", active="morpheus",
+                      report=ops.morpheus_report())
+
+    @app.get("/steward", response_class=HTMLResponse)
+    def steward_page(request: Request):
+        """Self-work the steward queued: what still waits, what was re-offered, what expired (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)"""
+        return render(request, "steward.html", active="steward",
+                      report=ops.steward_queue_report())
 
     @app.get("/evolution", response_class=HTMLResponse)
     def evolution_page(request: Request, days: int = 90):
@@ -1821,11 +2014,7 @@ def create_app() -> FastAPI:
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):
-        central = CentralStore()
-        try:
-            central.ack_inbox(int(inbox_id) if inbox_id else None)
-        finally:
-            central.close()
+        ops.ack_inbox(int(inbox_id) if inbox_id else None)
         return RedirectResponse("/inbox", status_code=303)
 
     @app.post("/backlog/promote/{item_id}")

@@ -28,10 +28,9 @@ this should not land as written. It just does not force the outcome.
 
 # WHAT TO LOOK AT
 
-- **The unexplained decision.** Code that says WHAT and never WHY is the code the next
-  person "simplifies" back into the bug it was fixing. A subtle ordering, an unobvious
-  default, a workaround for someone else's behaviour: if the reason is not written down,
-  it does not exist.
+- **The unexplained decision.** A subtle ordering, an unobvious default, a workaround for
+  someone else's behaviour, with no one-line why: the next person "simplifies" it back into
+  the bug. One line is enough; never ask for more.
 - **The trap left in place.** A branch that silently does nothing, an error swallowed, a
   default that hides a misconfiguration, a name that says the opposite of what the code
   does.
@@ -41,9 +40,6 @@ this should not land as written. It just does not force the outcome.
   change contradicts. A wrong comment is worse than no comment, because it is believed.
 - **Consistency with the surrounding code.** Not with your taste — with the file it is in.
   A change that invents a second convention makes the reader learn two.
-- **The failure that will be silent.** When this goes wrong at three in the morning, will
-  anything say so? An operation with no log, no error and no post-condition check is one
-  nobody will be able to diagnose.
 
 **Judge what is here, not what you would have written.** Formatting, naming preference and
 "I would have split this" are not findings unless you can say what will go wrong.
@@ -92,8 +88,8 @@ Two or three sentences of `reason`. A long one buries the sentence that mattered
 
 STRICT JSON, nothing else.
 
-  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
-  {"verdict": "reject", "blocking": false, "reason": "<what the next person will get wrong, addressed to the submitter>", "asks": ["<a concrete thing to change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
+  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "level": "medium|minor|cosmetic", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
+  {"verdict": "reject", "blocking": false, "reason": "<what the next person will get wrong, addressed to the submitter>", "asks": ["<a concrete thing to change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "level": "medium|minor|cosmetic", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
 
 ## WHAT MAKES A FINDING A BLOCKER
 
@@ -117,6 +113,15 @@ under 100 characters naming the file or the symbol, and becomes the ticket's tit
 says what is wrong and what would satisfy it, and becomes the ticket's description. Write
 one entry per separate point, whichever severity it carries.
 
+## HOW MUCH A `follow_up` IS WORTH
+
+Every follow-up you file becomes paid work for an engineer, and the budget for it is small.
+Rate each one with `level`: `medium` — a real defect a user or operator would eventually
+notice (wrong result, lost data, a silent failure); `minor` — hygiene that changes no
+behaviour; `cosmetic` — naming, typos, style. Only `medium` is ever filed; `minor` and
+`cosmetic` are counted and dropped, so do not inflate a rating to get one filed — the
+`failure` you name is checked against it. Filing nothing is a good answer.
+
 ## WHAT A `follow_up` MUST NAME, OR IT IS NOT ONE
 
 **A follow-up names a BEHAVIOUR THAT IS WRONG, in code that exists.** Fill `file` with the
@@ -125,12 +130,10 @@ with a concrete scenario: the inputs or the state, and the wrong output or crash
 produce. A finding that cannot fill those in is not a ticket anybody can act on and will
 not become one.
 
-**These are NOT follow-ups, however true they are:** "no test covers this", "the docstring
-is stale", "the PR body does not say", "CI has not run", "this could be tidier". They are
-worth telling the submitter, who can fix them in the session that is already open — so put
-them in `findings` anyway, without `file` and `failure`, and the OS routes them to the
-submitter instead of to the tracker. What it will not do is open a ticket that outlives
-the session for them.
+**These are NOT follow-ups:** "no test covers this", "the docstring is stale", "the PR
+body does not say", "CI has not run". When THIS change made one true, put it in `findings`
+without `file` and `failure`, and the OS routes it to the submitter instead of the tracker.
+"This could be tidier" and anything the ask did not need are not findings at all.
 
 `reason` and `asks` are about your BLOCKERS. `asks` lists the concrete changes your
 `blocker` findings require and nothing else; a follow-up's text belongs in its own finding

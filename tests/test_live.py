@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+from jarvis import db
 from jarvis import cli, inspection, live, ops, usage
 from jarvis.project_store import ProjectStore
 
@@ -549,9 +549,9 @@ def test_live_report_publishes_exactly_the_documented_keys(registered,
     finally:
         store.close()
     write_transcript.write("live-sess", [
-        prompt_row(time.time() - 40, DISPATCH),
-        assistant_row(time.time() - 30, "m1"),
-        tool_use_row(time.time() - 20, "t1", "Bash", {"command": "uv run pytest -q"}),
+        prompt_row(db.now() - 40, DISPATCH),
+        assistant_row(db.now() - 30, "m1"),
+        tool_use_row(db.now() - 20, "t1", "Bash", {"command": "uv run pytest -q"}),
     ])
 
     payload = ops.live_report(wo["id"])
@@ -572,8 +572,8 @@ def test_jarvis_watch_once_json_prints_the_payload_unchanged(registered,
         store.conn.commit()
     finally:
         store.close()
-    write_transcript.write("live-sess", [prompt_row(time.time() - 40, DISPATCH),
-                                        assistant_row(time.time() - 30, "m1")])
+    write_transcript.write("live-sess", [prompt_row(db.now() - 40, DISPATCH),
+                                        assistant_row(db.now() - 30, "m1")])
     expected = ops.live_report(wo["id"])
 
     assert cli.main(["watch", wo["id"], "--once", "--json"]) == 0
@@ -597,9 +597,9 @@ def test_the_human_frame_shows_the_payload_s_own_values(registered, write_transc
     finally:
         store.close()
     write_transcript.write("live-sess", [
-        prompt_row(time.time() - 40, DISPATCH),
-        assistant_row(time.time() - 30, "m1"),
-        tool_use_row(time.time() - 20, "t1", "Bash", {"command": "uv run pytest -q"}),
+        prompt_row(db.now() - 40, DISPATCH),
+        assistant_row(db.now() - 30, "m1"),
+        tool_use_row(db.now() - 20, "t1", "Bash", {"command": "uv run pytest -q"}),
     ])
     payload = ops.live_report(wo["id"])
 

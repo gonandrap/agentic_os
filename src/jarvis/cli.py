@@ -60,6 +60,22 @@ def _readable_conversation(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+#: How many of a work order's newest events `jarvis wo show` renders by default
+WO_SHOW_EVENTS = 200
+
+
+def _readable_events(detail: dict[str, Any]) -> dict[str, Any]:
+    """The event counts as one sentence, and only when something was cut"""
+    row = dict(detail)
+    row.pop("events_shown", None)
+    hidden = row.pop("events_hidden", 0) or 0
+    if hidden:
+        row["events_hidden"] = (
+            f"{hidden} earlier event{'s' if hidden != 1 else ''} not shown — "
+            f"`jarvis wo show {row.get('id')} --events 0` renders them all")
+    return row
+
+
 def _readable_preconditions(detail: dict[str, Any]) -> dict[str, Any]:
     """The holds collapsed to one line each — §2.7"""
     row = dict(detail)
@@ -323,9 +339,11 @@ def _pretty(data: Any, indent: int = 0) -> None:
 
 
 def _age(ts: float | None) -> str:
+    from . import db  # lazily, like every other sibling this module reaches for
+
     if not ts:
         return "-"
-    delta = time.time() - ts
+    delta = db.now() - ts
     if delta < 90:
         return f"{int(delta)}s"
     if delta < 5400:
@@ -353,6 +371,63 @@ LIST_PRIORITY = {"running": 0, "waiting_pr_merge": 1}
 ORIGIN_BADGE = {"jarvis": "🤖 jarvis", "ui": "🖥 ui", "manual": "⚠ manual",
                 "adhoc": "⚠ ad-hoc", "injected": "🔗 injected", "neo": "🧠 neo",
                 "schedule": "⏰ scheduled"}
+
+
+# Prose out of argv: the worktree guard reads a quoted argument as a command (issue 1209)
+_PROSE_FILE_HELP = ("read this text from a file instead of the command line, or - for "
+                    "stdin. A file rather than an argument on purpose: prose whose "
+                    "first word names a binary is refused before jarvis runs")
+_PROSE_FILE_SLOTS = {
+    "question_file": "question",
+    "content_file": "content",
+    "message_file": "message",
+    "summary_file": "summary",
+    "feedback_file": "feedback",
+    "why_file": "why",
+    "evidence_file": "evidence",
+}
+# The slots whose argparse requirement this mechanism relaxed; one of the two must arrive
+_PROSE_SLOT_REQUIRED = {"question", "content", "message", "summary"}
+
+
+def fill_prose_from_files(args: argparse.Namespace) -> None:
+    """Resolve every --<slot>-file into its slot, before anything reads the slot"""
+    from .ops import OpsError
+    from_stdin = ""
+    for opt, slot in _PROSE_FILE_SLOTS.items():
+        if not hasattr(args, opt):
+            continue
+        flag = "--" + opt.replace("_", "-")
+        path = getattr(args, opt) or ""
+        if not path:
+            if slot in _PROSE_SLOT_REQUIRED and not getattr(args, slot, None):
+                raise OpsError(f"pass the {slot} as an argument or with {flag} PATH")
+            continue
+        if getattr(args, slot, None):
+            raise OpsError(f"the {slot} was given twice: as an argument and with "
+                               f"{flag}")
+        if path == "-":
+            if from_stdin:
+                raise OpsError(f"only one argument can be read from stdin, and "
+                                   f"{from_stdin} already is")
+            from_stdin = flag
+            text = sys.stdin.read().strip()
+        else:
+            file = Path(path)
+            if not file.is_file():
+                raise OpsError(f"no such {slot} file: {file}")
+            text = file.read_text().strip()
+        if not text:
+            raise OpsError(f"{flag} {path} is empty, so there is no {slot} to record")
+        # The word cap lives in the PreToolUse hook, which sees argv only
+        if slot == "summary" and os.environ.get("JARVIS_WO_ID"):
+            from . import concision
+            cap, words = concision.summary_cap(), concision.word_count(text)
+            if cap and words > cap:
+                raise OpsError(f"this {flag} is {words} words; the cap is {cap}. The "
+                               f"summary is the HEADLINE — the detail belongs in the "
+                               f"final message of your turn")
+        setattr(args, slot, text)
 
 
 class _VersionAction(argparse.Action):
@@ -583,6 +658,21 @@ def build_parser() -> argparse.ArgumentParser:
                                       "bug repository)")
     sp.add_argument("--json", action="store_true")
 
+    # docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md
+    steward = sub.add_parser(
+        "steward",
+        help="what the OS may spend on itself: the ledger, and every decision with its rule",
+    ).add_subparsers(dest="steward_cmd", required=True)
+    sp = steward.add_parser("ledger", help="this week's evolution spend against the cap")
+    sp.add_argument("--json", action="store_true")
+    sp = steward.add_parser("decisions", help="every decision, newest first")
+    sp.add_argument("--limit", type=int, default=30)
+    sp.add_argument("--json", action="store_true")
+    sp = steward.add_parser("why", help="the decisions that led to, or came from, one order")
+    sp.add_argument("wo_id")
+    sp.add_argument("--json", action="store_true")
+    sp = steward.add_parser("digest", help="the weekly digest, now (sends nothing)")
+
     # `jarvis alarms` and `jarvis alarms <project>` are the two spellings that already exist (docs/superpowers/specs/2026-08-31-the-supervisor.md)
     alarms = sub.add_parser(
         "alarms",
@@ -614,6 +704,52 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--feedback", default="", help="required with --reject")
     sp.add_argument("--project")
     sp.add_argument("--json", action="store_true")
+
+    # Morpheus: production validation of shipped PRs (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+    mo = sub.add_parser(
+        "morpheus", help="Morpheus: every shipped PR watched in production until validated",
+    ).add_subparsers(dest="morpheus_cmd", required=True)
+    m = mo.add_parser("status", help="counts by state, the session, then every PR")
+    m.add_argument("--all", action="store_true", help="list settled PRs too")
+    m = mo.add_parser("show", help="one PR: its hints, script, last output and action")
+    m.add_argument("item_id")
+    m = mo.add_parser("enqueue-release",
+                      help="queue every PR a release carries (shipit runs this)")
+    m.add_argument("tag", help="the release tag, e.g. jarvis-0.9.3")
+    m.add_argument("--from", dest="from_ref",
+                   help="the previous release's ref (default: the tag before TAG)")
+    m.add_argument("--to", dest="to_ref", help="the shipped commit (default: TAG)")
+    m.add_argument("--repo", help="the git checkout to read (default: production's)")
+    m.add_argument("--project", help="the onboarded project the release is of (default: "
+                                     "the one whose origin is --repo, else the OS)")
+    m = mo.add_parser("add", help="queue one PR by number or URL, outside a release")
+    m.add_argument("pr")
+    m.add_argument("--repo", help="the git checkout whose origin owns a bare PR number")
+    m.add_argument("--release", default="", help="the release to file it under")
+    m.add_argument("--project", help="the onboarded project the PR is of (default: "
+                                     "matched by the PR's repository)")
+    m = mo.add_parser("script", help="(Morpheus's subagents) give a PR its validation "
+                                     "script; a queued PR starts being monitored")
+    m.add_argument("item_id")
+    m.add_argument("--file", required=True, help="the script, or - for stdin")
+    m.add_argument("--source", default="agent", choices=["agent", "user"])
+    m = mo.add_parser("check", help="run a PR's script now, the way the daemon would")
+    m.add_argument("item_id")
+    m = mo.add_parser("waive", help="rule a PR validated yourself")
+    m.add_argument("item_id")
+    m.add_argument("--reason", required=True)
+    m = mo.add_parser("requeue", help="watch a settled PR again with a fresh deadline")
+    m.add_argument("item_id")
+    m = mo.add_parser("pause", help="hold Morpheus's session turns, whatever the fleet does "
+                                    "(checks still run; they spend nothing)")
+    m.add_argument("--reason", required=True)
+    m = mo.add_parser("unpause", help="let Morpheus's session turns run, even through a "
+                                      "fleet `jarvis pause`")
+    m.add_argument("--reason", required=True)
+    mo.add_parser("follow-fleet", help="drop the pause/unpause pin: Morpheus pauses with "
+                                       "the fleet again")
+    for m in mo.choices.values():
+        m.add_argument("--json", action="store_true", help="machine-readable output")
 
     # §7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets- investigated.md
     sp = sub.add_parser(
@@ -659,12 +795,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "one is dispatched (same project only)")
     # §2.3 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md
     c.add_argument("--blocked-by", action="append", default=None, metavar="REF",
-                   help="something that is NOT a work order and must clear before this "
-                        "one is dispatched (`bl-…`, `kn-…`, `io-…`, `#123`, a URL, or "
-                        "the words for the wait). Repeatable. It becomes a row the claim "
-                        "SQL evaluates, so the order stays `pending` and costs no worker "
-                        "turn; the OS clears a `bl-` ref itself once the backlog item "
-                        "settles, and `jarvis wo unblock` clears the rest")
+                   help="something that is NOT a work order COMPLETING and must clear "
+                        "before this one is dispatched (`deployed:<wo-id|sha>`, `bl-…`, "
+                        "`kn-…`, `io-…`, `#123`, a URL, or the words for the wait). "
+                        "Repeatable. It becomes a row the claim SQL evaluates, so the "
+                        "order stays `pending` and costs no worker turn. The OS clears "
+                        "two kinds itself: a `bl-` ref once the backlog item settles, "
+                        "and a `deployed:` ref once a release carrying that commit is "
+                        "what production RUNS — which `--depends-on` can never say, "
+                        "since a dependency completes at merge. `jarvis wo unblock` "
+                        "clears the rest")
     c.add_argument("--parent", default="",
                    help="file it UNDER this feature order: it becomes one of the "
                         "feature's children, so the feature waits for it and shows it "
@@ -730,23 +870,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--project")
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
+    s.add_argument("--events", type=int, default=WO_SHOW_EVENTS, metavar="N",
+                   help=f"how many of the NEWEST events the timeline renders (default "
+                        f"{WO_SHOW_EVENTS}); 0 renders every one")
 
     # §9.2 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md
     m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
                                    "on a failed order this also revives the session; "
                                    "`wo retry` is the named form")
     m.add_argument("wo_id")
-    m.add_argument("message")
+    m.add_argument("message", nargs="?")
+    m.add_argument("--message-file", dest="message_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     m.add_argument("--project")
     m.add_argument("--source", default="jarvis", choices=["jarvis", "ui", "direct"])
 
     a = wo.add_parser("assume", help="(workers) record an assumption for user review")
     a.add_argument("wo_id")
-    a.add_argument("content")
+    a.add_argument("content", nargs="?")
+    a.add_argument("--content-file", dest="content_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
 
     q = wo.add_parser("ask", help="(workers) ask a question — Neo answers as the user")
     q.add_argument("wo_id")
-    q.add_argument("question")
+    q.add_argument("question", nargs="?")
+    q.add_argument("--question-file", dest="question_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     q.add_argument("--project")
 
     d = wo.add_parser("defer", help="(workers) hand off work that is not this work "
@@ -764,7 +913,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     f = wo.add_parser("finish", help="(workers) mark a work order finished")
     f.add_argument("wo_id")
-    f.add_argument("--summary", required=True)
+    f.add_argument("--summary", default="")
+    f.add_argument("--summary-file", dest="summary_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     f.add_argument("--pr", default="", metavar="URL",
                    help="the pull request this work order opened — parks it in "
                         "'waiting for PR merge' instead of completing it, so it stays "
@@ -783,6 +934,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--feedback", default="",
                    help="your reasoning — teaches Neo, and on --reject is delivered "
                         "to the worker as guidance")
+    r.add_argument("--feedback-file", dest="feedback_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
+    r.add_argument("--false-alarm", action="store_true",
+                   help="the high-stakes net was WRONG to hold these: record a defect "
+                        "in the net that fired (also read from 'false alarm' in "
+                        "--feedback)")
 
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
@@ -791,6 +948,14 @@ def build_parser() -> argparse.ArgumentParser:
                                     "finished; stops the worker if one is still running")
     dn.add_argument("wo_id")
     dn.add_argument("--project")
+
+    # docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §8
+    pr = wo.add_parser("pr", help="record the pull request you opened for a work order "
+                                  "whose branch is pushed — it goes back in the merge "
+                                  "queue and the OS watches it merge")
+    pr.add_argument("wo_id")
+    pr.add_argument("url")
+    pr.add_argument("--project")
 
     ak = wo.add_parser("ack", help="acknowledge a work order's attention flag — it "
                                    "stops asking for you in status and on the dashboard")
@@ -849,7 +1014,16 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("wo_id")
     rt.add_argument("--message", help="what to tell the worker; omitted sends the OS's "
                                       "own relaunch note, unattributed")
+    rt.add_argument("--model", help="relaunch on this model id instead (e.g. after "
+                                    "claude rejected the order's own)")
     rt.add_argument("--project")
+
+    # docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md
+    rs = wo.add_parser("respawn", help="restart a background-transport order's own session "
+                                       "process under the SAME id (`claude respawn`), e.g. "
+                                       "after a Claude Code upgrade; sends nothing")
+    rs.add_argument("wo_id")
+    rs.add_argument("--project")
 
     wy = wo.add_parser("why", help="why is this order not moving: what it waits for, "
                                    "what has held it, what the OS spent on it, and the "
@@ -999,6 +1173,11 @@ def build_parser() -> argparse.ArgumentParser:
                                    "and the evidence it was filed with")
     i.add_argument("io_id")
     i.add_argument("--project")
+    i.add_argument("--full", action="store_true",
+                   help="every finding in full, and the whole brief (default: one line "
+                        "per finding)")
+    i.add_argument("--finding", metavar="KEY",
+                   help="only this finding, in full")
 
     i = io.add_parser("report", help="(analysts) submit the findings report — the "
                                      "analyst's terminal action, and what settles its "
@@ -1028,6 +1207,12 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--accept-all", dest="accept_all", action="store_true",
                    help="accept every finding still awaiting you. Cannot be combined "
                         "with --reject")
+    i.add_argument("--project")
+
+    i = io.add_parser("ask-neo", help="put the findings awaiting you to Neo: never asked, "
+                                      "escalated, or Neo was unreachable. Skips any Neo "
+                                      "accepted, which wait only on your yes to the spend")
+    i.add_argument("io_id")
     i.add_argument("--project")
 
     i = io.add_parser("cancel", help="stop an improvement order and its analyst")
@@ -1121,6 +1306,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "different question; the block message states yours")
     g.add_argument("--evidence", default="",
                    help="what a reviewer can check — the reviewer sees only this")
+    g.add_argument("--why-file", dest="why_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
+    g.add_argument("--evidence-file", dest="evidence_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     g.add_argument("--project")
     g = ga.add_parser(
         "contest",
@@ -1347,7 +1536,9 @@ def build_parser() -> argparse.ArgumentParser:
     kn = sub.add_parser("learn", help="central knowledge base").add_subparsers(
         dest="kn_cmd", required=True)
     k = kn.add_parser("add")
-    k.add_argument("content")
+    k.add_argument("content", nargs="?")
+    k.add_argument("--content-file", dest="content_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     k.add_argument("--project", default="", help="omit for a global learning")
     k.add_argument("--topic", default="")
     k.add_argument("--tags", default="")
@@ -1586,6 +1777,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                  "reopening)" if r.get("tripped") else ""))
     if st["attention"]:
         print(f"\n⚠ NEEDS YOUR ATTENTION ({len(st['attention'])}):")
+        print(f"   {ATTENTION_LIST_NOTE}")
         for a in st["attention"]:
             ident = a["wo_id"] or a.get("fo_id")
             print(f"  • [{a['project']}]{' ' + ident if ident else ''} {a['title']} "
@@ -1605,6 +1797,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if st["inbox"]["unacked"]:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
+        print(f"   {INBOX_LIST_NOTE}")
     neo = st.get("neo", {})
     if (neo.get("queued") or neo.get("unreviewed") or neo.get("escalated")
             or neo.get("failed")):
@@ -2561,6 +2754,66 @@ def cmd_issues(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_steward(args: argparse.Namespace) -> int:
+    """`jarvis steward …` — read-only views of the steward's ledger and decisions"""
+    from dataclasses import asdict
+
+    from . import ops, steward
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        if args.steward_cmd == "digest":
+            print(steward.render_digest(steward.digest(ops.resolve_catalog(), central)))
+            return 0
+        if args.steward_cmd == "ledger":
+            catalog = ops.resolve_catalog()
+            cfg = catalog.os.evolution
+            book = steward.ledger(catalog, central)
+            if args.json:
+                print(json.dumps({"mode": cfg.mode, **asdict(book),
+                                  "weekly_usd": cfg.weekly_usd,
+                                  "critical_weekly_usd": cfg.critical_weekly_usd,
+                                  "yield_above_usd": cfg.yield_above_usd}))
+                return 0
+            print(f"mode {cfg.mode}; self_dispatch "
+                  f"{'on' if catalog.os.autonomy.self_dispatch else 'off'}")
+            print(f"evolution  ${book.evolution_usd:8.2f} of ${cfg.weekly_usd:.2f}")
+            print(f"critical   ${book.critical_usd:8.2f} of ${cfg.critical_weekly_usd:.2f}")
+            print(f"fleet      ${book.fleet_usd:8.2f} (new self-work waits above "
+                  f"${cfg.yield_above_usd:.2f})")
+            return 0
+        rows = (central.steward_decisions(wo_id=args.wo_id) if args.steward_cmd == "why"
+                else central.steward_decisions(limit=args.limit))
+        if args.json:
+            print(json.dumps(rows))
+            return 0
+        if not rows:
+            print("no steward decisions" + (f" about {args.wo_id}"
+                                            if args.steward_cmd == "why" else ""))
+            return 0
+        queue = central.steward_queue_counts()
+        if args.steward_cmd == "decisions" and any(queue.values()):
+            print(steward.queue_line(queue))
+        for r in rows:
+            applied = "applied" if r["applied"] else r["mode"]
+            to = f" -> {r['wo_id']}" if r["wo_id"] else ""
+            print(f"#{r['id']} {_age(r['ts'])} ago [{r['outcome']}/{applied}] "
+                  f"{r['origin_kind']} {r['severity']}"
+                  + (f" (claimed {r['claimed_severity']})"
+                     if r["claimed_severity"] and r["claimed_severity"] != r["severity"]
+                     else "")
+                  + f" gen {r['generation']}: {r['subject'][:80]}{to}")
+            print(f"    {r['rule']}: {r['reason']}")
+            if r.get("queue_state"):
+                # Queued means deferred: say whether it still waits, and what happened last
+                note = f": {r['queue_note']}" if r.get("queue_note") else ""
+                print(f"    queue {r['queue_state']}{note}")
+        return 0
+    finally:
+        central.close()
+
+
 def cmd_alarms(args: argparse.Namespace) -> int:
     """The dashboard's `/alarms` page in the terminal — the CLI is the OS"""
     from . import ops
@@ -3204,7 +3457,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
         name, path, wo = ops.find_work_order(args.wo_id, args.project)
         store = ProjectStore(path)
         try:
-            events = store.list_events(args.wo_id)
+            # THE NEWEST PAGE, and the cut said out loud (io-12b7d873)
+            events = store.list_events(args.wo_id, limit=args.events or None,
+                                       newest=True)
+            hidden = store.count_events(args.wo_id) - len(events)
             messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
@@ -3215,6 +3471,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "preconditions": ops.open_preconditions(store, wo),
                 # What has already been dismissed on this order, decoded
                 "seen_blockers": invariants.acknowledged(wo),
+                # Always present under `--json`: a quiet order and a cut one must read differently
+                "events_shown": len(events),
+                "events_hidden": hidden,
                 "timeline": build_timeline(wo, events, messages,
                                            include_debug=args.debug),
                 # What was said, in order, whoever spoke
@@ -3265,7 +3524,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
             _readable_automerge(_readable_harvest(_readable_alarms(
                 _readable_time_in_state(_readable_rounds(_readable_issues(
                     _readable_self_evolution(_readable_preconditions(
-                        _readable_conversation(detail)))))))))))))
+                        _readable_events(_readable_conversation(detail))))))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -3287,11 +3546,15 @@ def cmd_wo(args: argparse.Namespace) -> int:
                           evidence=args.evidence, abandon=args.abandon), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
-                                     feedback=args.feedback), args.json)
+                                     feedback=args.feedback,
+                                     false_alarm=args.false_alarm), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
     elif args.wo_cmd == "done":
         _print(ops.mark_done(args.wo_id, project_name=args.project), args.json)
+    elif args.wo_cmd == "pr":
+        _print(ops.record_pull_request(args.wo_id, args.url,
+                                       project_name=args.project), args.json)
     elif args.wo_cmd == "ack":
         _print(ops.ack_attention(args.wo_id, all_projects=args.all,
                                  project_name=args.project), args.json)
@@ -3320,8 +3583,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                                   force=args.force), args.json)
     elif args.wo_cmd == "retry":
         # `relay=True` as `send` does: `ops.user_authorship` decides whether this process is a surface the...
-        _print(ops.retry(args.wo_id, message=args.message,
+        _print(ops.retry(args.wo_id, message=args.message, model=args.model,
                          project_name=args.project, relay=True), args.json)
+    elif args.wo_cmd == "respawn":
+        _print(ops.respawn_worker(args.wo_id, project_name=args.project), args.json)
     elif args.wo_cmd == "why":
         diagnosis = ops.diagnose(args.wo_id, project_name=args.project)
         if args.json:
@@ -3623,9 +3888,15 @@ def cmd_io(args: argparse.Namespace) -> int:
             d = detail["by_decision"]
             print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
                   f"[{detail['project']}] {detail['title']} ({detail['status_label']})")
+            neo = detail.get("with_neo") or 0
             print(f"\n{detail['findings']} findings: {d['accepted']} accepted, "
-                  f"{d['rejected']} rejected, {d['pending']} awaiting you")
-            print(f"\n{detail['observation']}\n")
+                  f"{d['rejected']} rejected, {d['pending'] - neo} awaiting you"
+                  + (f", {neo} with Neo" if neo else ""))
+            observation = detail["observation"]
+            if not (args.full or args.finding):
+                # The brief is the filer's; the findings are what the reader acts on
+                observation = findings.clip(observation, 300)
+            print(f"\n{observation}\n")
             if detail["attention_reason"]:
                 print(f"⚠ {detail['attention_reason']}\n")
             if detail["evidence_refs"]:
@@ -3640,12 +3911,25 @@ def cmd_io(args: argparse.Namespace) -> int:
                 print(f"\nanalyst: {a['id']} ({a['status']})")
             if detail["alarms"]:
                 print(f"\nalarms: {ops.alarm_standing_line(detail['alarms'])}")
-            if detail["report"].get("findings"):
+            report = detail["report"]
+            if args.finding:
+                keep = [f for f in report.get("findings") or []
+                        if f.get("key") == args.finding]
+                if not keep:
+                    raise ops.OpsError(
+                        f"no finding {args.finding!r} on {detail['id']}; it has: "
+                        f"{', '.join(f.get('key', '') for f in report.get('findings') or [])}")
+                report = {"findings": keep}
+            if report.get("findings"):
                 # §4.4's renderer, with each accepted finding's filed orders and their LIVE status resolved once by...
                 print()
-                for line in findings.render_report(detail["report"],
-                                                   detail["filed_orders"]):
+                render = (findings.render_report if args.full or args.finding
+                          else findings.render_digest)
+                for line in render(report, detail["filed_orders"]):
                     print(line)
+                if not (args.full or args.finding):
+                    print(f"\none finding in full: jarvis io show {detail['id']} "
+                          f"--finding <key>   (all: --full)")
 
     elif args.io_cmd == "review":
         _print(ops.review_findings(args.io_id, accept=args.accept,
@@ -3653,6 +3937,9 @@ def cmd_io(args: argparse.Namespace) -> int:
                                    feedback=args.feedback,
                                    accept_all=args.accept_all,
                                    project_name=args.project), args.json)
+
+    elif args.io_cmd == "ask-neo":
+        _print(ops.ask_neo_about_findings(args.io_id, args.project), args.json)
 
     elif args.io_cmd == "report":
         path = Path(args.from_file)
@@ -3678,6 +3965,140 @@ def cmd_io(args: argparse.Namespace) -> int:
                    args.json)
 
     return 0
+
+
+MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "failed": "✗",
+                 "timedout": "⌛"}
+
+
+def _morpheus_line(item: dict) -> str:
+    action = f" → {item['action']}" if item.get("action") else ""
+    return (f"{MORPHEUS_ICON.get(item['state'], '•')} {item['id']} "
+            f"[{item.get('project') or '?'}] PR #{item['pr_number']} "
+            f"{item['state']}{action} — {item['pr_title'][:70]}")
+
+
+def cmd_morpheus(args: argparse.Namespace) -> int:
+    """`jarvis morpheus …` — a thin wrapper over `ops.morpheus_*`"""
+    from . import ops
+
+    if args.morpheus_cmd == "status":
+        rep = ops.morpheus_report()
+        if not args.all:
+            rep["items"] = [i for i in rep["items"]
+                            if i["state"] in ("queued", "monitoring") or
+                            (i["state"] in ("failed", "timedout"))]
+        if args.json:
+            _print(rep, True)
+            return 0
+        c = rep["counts"]
+        sess = rep["session"]
+        print(" · ".join(f"{n} {s}" for s, n in c.items()) +
+              (f" · last release {rep['last_release']}" if rep["last_release"] else ""))
+        share = sess.get("context_share")
+        print(f"session: {sess.get('session_id') or 'not started'}"
+              f" · {sess.get('turns') or 0} turn(s)"
+              f" · {sess.get('compactions') or 0} compaction(s)"
+              + (f" · context {share:.0%}" if share is not None else "")
+              + f" · {_morpheus_pause_text(rep['pause'])}"
+              + f" · {_morpheus_activity_text(rep['activity'])}"
+              + (f" · last error: {sess['last_error']}" if sess.get("last_error") else ""))
+        for item in rep["items"]:
+            print(_morpheus_line(item))
+        return 0
+    if args.morpheus_cmd == "show":
+        item = ops.morpheus_item(args.item_id)
+        if args.json:
+            _print(item, True)
+            return 0
+        print(_morpheus_line(item))
+        print(f"{item['pr_url']}  release {item['release_tag'] or '—'}"
+              f"  work order {item['wo_id'] or '—'}")
+        print(f"checks {item['checks']} · last exit {item['last_exit']}"
+              f" · deadline {_stamp(item['deadline_ts'])}"
+              + (f" · {item['auto_requeues']} automatic requeue(s)"
+                 if item.get("auto_requeues") else ""))
+        if item["resolution"]:
+            print(f"\n{item['resolution']}")
+        print(f"\nhints:\n{item['hints'] or '(none)'}")
+        print(f"\nscript ({item['script_source'] or 'none yet'}):\n{item['script'] or '—'}")
+        if item["last_output"]:
+            print(f"\nlast output:\n{item['last_output']}")
+        return 0
+    if args.morpheus_cmd == "enqueue-release":
+        _print(ops.morpheus_enqueue_release(args.tag, args.from_ref, args.to_ref,
+                                            args.repo, args.project), args.json)
+        return 0
+    if args.morpheus_cmd == "add":
+        item = ops.morpheus_add(args.pr, args.repo, args.release, args.project)
+        _print(item if args.json else {"queued": item["id"], "state": item["state"]},
+               args.json)
+        return 0
+    if args.morpheus_cmd == "script":
+        text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text()
+        item = ops.morpheus_set_script(args.item_id, text, args.source)
+        _print({"id": item["id"], "state": item["state"],
+                "note": "the daemon runs it every check_every_minutes from production"},
+               args.json)
+        return 0
+    if args.morpheus_cmd == "check":
+        item = ops.morpheus_check(args.item_id)
+        _print(item if args.json else {
+            "id": item["id"], "state": item["state"],
+            "exit": item.get("probe_exit", item["last_exit"]),
+            "output": item.get("probe_output", item["last_output"])}, args.json)
+        return 0
+    if args.morpheus_cmd == "waive":
+        item = ops.morpheus_waive(args.item_id, args.reason)
+        _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
+    if args.morpheus_cmd == "requeue":
+        item = ops.morpheus_requeue(args.item_id)
+        _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
+    if args.morpheus_cmd in ("pause", "unpause", "follow-fleet"):
+        mode = {"pause": "paused", "unpause": "running"}.get(args.morpheus_cmd)
+        state = ops.morpheus_pause(mode, getattr(args, "reason", ""))
+        if args.json:
+            _print(state, True)
+        else:
+            print(_morpheus_pause_text(state))
+        return 0
+    return 1
+
+
+def _morpheus_pause_text(pause: dict) -> str:
+    fleet = "fleet paused" if pause["fleet_paused"] else "fleet running"
+    if pause["override"] == "paused":
+        return f"PAUSED by `morpheus pause` ({fleet}): {pause['reason']}"
+    if pause["override"] == "running":
+        return f"RUNNING by `morpheus unpause` ({fleet}): {pause['reason']}"
+    return ("PAUSED with the fleet (no session turns)" if pause["paused"]
+            else "unpaused (follows the fleet)")
+
+
+def _morpheus_activity_text(act: dict) -> str:
+    """The pause mode says what is ALLOWED; this says what the session is doing (issue #1162)"""
+    if act["turn_in_flight"]:
+        return (f"{act['turn_kind'] or 'turn'} in flight since "
+                f"{_stamp(act['turn_started_ts'])}")
+    if act.get("abandoned_turn_ts"):
+        parts = [f"idle (the {act['turn_kind'] or 'turn'} started "
+                 f"{_stamp(act['abandoned_turn_ts'])} never finished)"]
+    else:
+        parts = [f"idle · {act['due']} queued due now" if act["due"] else "idle"]
+    if act.get("usage_hold_until"):
+        parts.append(f"held until {_stamp(act['usage_hold_until'])} (usage limit)")
+    if act.get("kill_hold_until"):
+        parts.append(f"held until {_stamp(act['kill_hold_until'])} or the next release "
+                     f"({act['kills']} killed turns in a row)")
+    for h in act["held"]:
+        why = {"error": " after a failed turn", "offer": " after an offer"}.get(h["cause"], "")
+        parts.append(f"{h['id']} offered {h['offers']} of {act['max_offers']}: "
+                     + ("no offer left, it will time out"
+                        if h["exhausted"]
+                        else f"held back{why} until {_stamp(h['next_offer_ts'])}"))
+    return " · ".join(parts)
 
 
 def cmd_investigate(args: argparse.Namespace) -> int:
@@ -3733,6 +4154,10 @@ def cmd_investigate(args: argparse.Namespace) -> int:
                 print()
                 for line in verdicts.render_verdict(detail["verdict"]):
                     print(line)
+            if detail["assumptions"]:
+                print("\nthe investigator's calls (on record, for nobody's review):")
+                for a in detail["assumptions"]:
+                    print(f"  {a['n']}. {a['content']}")
 
     elif args.inv_cmd == "cancel":
         _print(ops.cancel_investigation_order(args.inv_id, args.project), args.json)
@@ -4223,7 +4648,9 @@ def _print_config_versions(rows: list[dict]) -> None:
         head = "●" if row.get("head") else " "
         reason = f" · {row['reason']}" if row["reason"] else ""
         print(f"{head} {row['id']}  {row['actor']} · {_age(row['ts'])} ago{reason}")
-        for change in row["changes"][:4]:
+        # Changed and removed first: truncation hid them behind a release's defaults (1235)
+        shown = sorted(row["changes"], key=lambda c: c.get("kind") == "added")
+        for change in shown[:4]:
             print(f"      {_cfg_change(change)}")
         if len(row["changes"]) > 4:
             print(f"      … and {len(row['changes']) - 4} more")
@@ -4498,8 +4925,34 @@ def _ms(value: int | None) -> str:
 def _objection_line(counts: dict[str, Any]) -> str:
     """What the OS's objections did, in one clause — `ops.neo_stats_report`'s figures"""
     return (f"{counts['sent']} sent · {counts['delivered']} delivered · "
+            f"{counts.get('acted_on', 0)} acted on · "
             f"{counts['withdrawn']} withdrawn ({counts['stopped']} the order stopped, "
-            f"{counts['handed_back']} handed to you, {counts['other']} other)")
+            f"{counts['handed_back']} handed to you, {counts['other']} other) · "
+            f"withdrawal rate {_pct(counts.get('withdrawal_rate'))}")
+
+
+def _print_assumption_rows(a: dict[str, Any]) -> None:
+    """THE HEADLINE: what happened to each assumption ROW (io-51469add)"""
+    rates = a["rates"]
+    print(f"ASSUMPTIONS — {a['rows']} row{'' if a['rows'] == 1 else 's'}, "
+          f"{a['settled']} settled; the rate your review list shows")
+    print(f"  decided by Neo      {a['neo_decided']:>4}  {_pct(rates['neo_decided'])}")
+    print(f"  escalated to you    {a['neo_escalated']:>4}  "
+          f"{_pct(rates['neo_escalated'])}  (Neo saw it and it came to you)")
+    print(f"  never reached Neo   {a['never_reached_neo']:>4}  "
+          f"{_pct(rates['never_reached_neo'])}  (held before any model call)")
+    for code, n in sorted(a["never_reached_by_hold"].items(), key=lambda kv: -kv[1]):
+        print(f"    {code:<22} {n:>4}")
+    u = a["unsettled"]
+    age = ("" if u["median_age_days"] is None else
+           f", median age {u['median_age_days']}d, oldest {u['max_age_days']}d")
+    print(f"  still unsettled     {u['count']:>4}  ({u['reached_neo']} reached Neo, "
+          f"{u['never_reached_neo']} never did{age}) — out of the rates")
+    d, net = a["dropped_rulings"], a["stakes_net"]
+    print(f"  dropped rulings     {d['total']:>4}  ({d['re_asked']} re-asked; the rest "
+          f"came to you)")
+    print(f"  high-stakes net     {net['held']:>4} held · {net['false_alarms']} you "
+          f"called a false alarm · {_pct(net['false_alarm_rate'])}")
 
 
 def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
@@ -4509,10 +4962,14 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
         return
     q = res["questions"]
     window = f", last {res['days']}d" if res["days"] else ", all time"
-    print(f"{res['scope']}{window} — {q['asked']} question"
+    print(f"{res['scope']}{window} — {res['assumptions']['rows']} assumption row"
+          f"{'' if res['assumptions']['rows'] == 1 else 's'}, {q['asked']} question"
           f"{'' if q['asked'] == 1 else 's'} asked\n")
+    _print_assumption_rows(res["assumptions"])
+    print(f"  objections          {_objection_line(res['objections'])}\n")
 
-    print("OUTCOMES")
+    print("QUESTIONS — plumbing telemetry")
+    print(f"  note: {res['questions_note']}")
     print(f"  answered by Neo   {q['answered']}")
     print(f"  escalated         {q['escalated']}")
     print(f"  unreachable       {q['failed']}  (Neo was never reached — NOT judged)")
@@ -4523,8 +4980,6 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     # Its own figure, never blended into the escalation rate: a crash is not a decision
     print(f"  unreachable rate  {_pct(q['unreachable_rate'])}  "
           f"(same denominator — NOT escalations)")
-    # ONE LINE, beside the rate — §5 of docs/superpowers/specs/2026-10-20-an-objection-is-...
-    print(f"  objections        {_objection_line(res['objections'])}")
 
     if res["by_day"]:
         print("\nTHE TREND — one line per day, newest last")
@@ -4763,7 +5218,9 @@ def cmd_brief(args: argparse.Namespace) -> int:
                                       gates_enabled=gates_enabled,
                                       serena=os.environ.get("JARVIS_SERENA") != "0",
                                       tool_search=os.environ.get(
-                                          "JARVIS_TOOL_SEARCH", "cli")))
+                                          "JARVIS_TOOL_SEARCH", "cli"),
+                                      transport=os.environ.get(
+                                          "JARVIS_TURN_TRANSPORT", "background")))
     return 0
 
 
@@ -5006,17 +5463,29 @@ def cmd_bug(args: argparse.Namespace) -> int:
     else:
         # The nested `pickup` flattened to the one line a reporting agent needs: whether anything is going to...
         _print({k: v for k, v in result.items() if k != "pickup"}, False)
-        print(pickup_note(result["pickup"]))
+        if result.get("duplicate_of"):
+            print(f"already filed as {result['duplicate_of']} — your evidence is a "
+                  f"comment there, and no second issue was opened")
+        else:
+            print(pickup_note(result["pickup"]))
     return 0
 
 
+#: What each of the two lists IS and which command clears it
+ATTENTION_LIST_NOTE = ("derived from each order's state every tick; clears when the "
+                       "condition goes, or with `jarvis wo ack <id>`")
+INBOX_LIST_NOTE = ("a log of notifications; `jarvis inbox ack` marks them read — one "
+                   "raised with an attention flag lowers that flag too, unless a "
+                   "decision is pending")
+
+
 def cmd_inbox(args: argparse.Namespace) -> int:
+    from . import ops
     from .central_store import CentralStore
     central = CentralStore()
     try:
         if args.ib_cmd == "ack":
-            n = central.ack_inbox(args.inbox_id)
-            _print({"acked": n}, args.json)
+            _print(ops.ack_inbox(args.inbox_id), args.json)
         else:
             items = central.unacked_inbox()
             if args.json:
@@ -5067,6 +5536,7 @@ def main(argv: list[str] | None = None) -> int:
     from .neo_store import QuestionTooLargeError
     from .ops import OpsError
     try:
+        fill_prose_from_files(args)
         if args.cmd == "start":
             return cmd_start(args)
         if args.cmd == "stop":
@@ -5089,6 +5559,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_watch(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
+        if args.cmd == "steward":
+            return cmd_steward(args)
         if args.cmd == "stuck":
             return cmd_stuck(args)
         if args.cmd == "search":
@@ -5110,6 +5582,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_io(args)
         if args.cmd == "investigate":
             return cmd_investigate(args)
+        if args.cmd == "morpheus":
+            return cmd_morpheus(args)
         if args.cmd == "gate":
             return cmd_gate(args)
         if args.cmd == "rules":

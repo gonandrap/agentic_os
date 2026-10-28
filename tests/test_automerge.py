@@ -8,11 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import automerge, db, gate_rules, gates, invariants, ops
+from jarvis import automerge, db, gate_rules, gates, invariants, ops, probes
 from jarvis.catalog import ValidationConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.github import PullRequest
-from jarvis.project_store import ProjectStore
+from jarvis.project_store import (ALARM_OPEN_STATUSES, ALARM_SETTLED_STATUSES,
+                                  ProjectStore)
 
 PR = "https://github.com/acme/proj/pull/7"
 JUDGED = "a1b2c3d4e5f6000000000000000000000000aaaa"
@@ -1331,6 +1332,187 @@ def test_a_ruled_plan_merges_on_the_next_poll(started, project, fake_gh):
     assert store.get_work_order(wo["id"])["status"] == "completed"
 
 
+# -- a delivery flagged short of its brief (#1063)
+
+
+DRIFT = "the PR covers spec section 5c only; Neo's answer directed 5b/5c/5d"
+
+
+def alarm_row(**over) -> dict:
+    """One `wo_alarms` row as the readers see it: a health finding of scope drift"""
+    return {"id": "al-0a0c1657", "reason": DRIFT, "probe": probes.BRIEF_MISMATCH,
+            "status": "escalated", "review_status": "unreviewed",
+            "neo_question_id": 0, **over}
+
+
+def drifted(store, wo, *, status: str = "escalated", question_id: int = 0) -> dict:
+    """A 'drifted from the ask' finding on this order, as the supervisor leaves it"""
+    alarm = store.add_finding(wo["id"], kind=probes.BRIEF_MISMATCH, reason=DRIFT,
+                              source="health", probe=probes.BRIEF_MISMATCH)
+    store.update_alarm(alarm["id"], status=status, verdict="escalate",
+                       **({"neo_question_id": question_id} if question_id else {}))
+    return store.get_alarm(alarm["id"])
+
+
+def test_an_open_scope_drift_finding_holds_the_merge_and_names_the_alarm():
+    """THE BUG: no condition consulted the alarms, so a green `main` was all that held it"""
+    decision = decide(rnd(), drift=automerge.drift_hold(
+        alarm_row(neo_question_id=1734), {"status": "queued"}))
+
+    assert not decision.armed and decision.code == automerge.HELD_DRIFT_ALARM
+    assert "al-0a0c1657" in decision.reason and DRIFT in decision.reason
+    assert "#1734" in decision.reason and "Neo is reading it" in decision.reason
+
+
+def test_the_drift_hold_outranks_a_red_base_so_the_reason_is_not_only_base_red():
+    """The incident's complaint verbatim: the hold reason mentioned only `base_red`"""
+    decision = decide(rnd(), drift=automerge.drift_hold(alarm_row()),
+                      base_red=BASE_RED)
+
+    assert decision.code == automerge.HELD_DRIFT_ALARM
+    assert BASE_RED.run_url not in decision.reason
+
+
+def test_no_drift_fact_arms_it():
+    """NEGATIVE: `None` is "no open finding", and the ordinary case writes nothing"""
+    assert decide(rnd(), drift=None).armed
+
+
+@pytest.mark.parametrize("status", ALARM_OPEN_STATUSES)
+def test_every_unsettled_status_is_an_open_drift_finding(status):
+    """Neo 2202 chose the wide reading: a finding nobody has answered yet holds the merge"""
+    assert automerge.open_drift_alarm([alarm_row(status=status)]) is not None
+
+
+@pytest.mark.parametrize("status", ALARM_SETTLED_STATUSES)
+def test_a_settled_finding_holds_nothing(status):
+    """`acked` is Neo's own answer path: `daemon._deliver_alarm_verdict` writes it"""
+    assert automerge.open_drift_alarm([alarm_row(status=status)]) is None
+
+
+@pytest.mark.parametrize("review", ["approved", "corrected"])
+def test_a_finding_the_user_has_reviewed_holds_nothing(review):
+    assert automerge.open_drift_alarm([alarm_row(review_status=review)]) is None
+
+
+def test_only_the_scope_drift_probe_holds_the_merge():
+    """A cost alarm and the other health probes are not this hold's business"""
+    assert automerge.open_drift_alarm([alarm_row(probe="no-progress"),
+                                       alarm_row(probe=None)]) is None
+
+
+def test_the_newest_open_finding_is_the_one_held_on():
+    """`alarms_of` is oldest first"""
+    assert automerge.open_drift_alarm(
+        [alarm_row(id="al-old"), alarm_row(id="al-new")])["id"] == "al-new"
+
+
+@pytest.mark.parametrize("status, question, awaiting", [
+    ("raised", None, automerge.AWAITING_SUPERVISOR),
+    ("reviewing", None, automerge.AWAITING_SUPERVISOR),
+    ("proposed", None, automerge.AWAITING_GATE),
+    ("escalated", {"status": "queued"}, automerge.AWAITING_NEO),
+    ("escalated", {"status": "answering"}, automerge.AWAITING_NEO),
+    # Neo declined and the alarm stayed `escalated` — `daemon._deliver_alarm_verdict`
+    ("escalated", {"status": "escalated"}, automerge.AWAITING_USER),
+    ("escalated", None, automerge.AWAITING_USER),
+    ("failed", None, automerge.AWAITING_USER),
+])
+def test_the_hold_says_who_can_still_clear_it(status, question, awaiting):
+    hold = automerge.drift_hold(alarm_row(status=status, neo_question_id=1734), question)
+
+    assert hold.awaiting == awaiting
+    assert hold.wedged == (status == "failed")
+    assert automerge.AWAITING_WAIT[awaiting].split("{")[0] in automerge.drift_reason(hold)
+
+
+@pytest.mark.parametrize("status", ["raised", "reviewing", "proposed"])
+def test_the_hold_names_no_command_that_would_be_refused(status):
+    """`ops.review_alarm` takes only a decided or failed alarm: naming it otherwise is a dead end"""
+    reason = automerge.drift_reason(automerge.drift_hold(alarm_row(status=status)))
+
+    assert "alarms review" not in reason
+    assert "jarvis alarms show al-0a0c1657" in reason
+
+
+def test_a_failed_supervisor_review_says_the_hold_lifts_for_nobody_else():
+    """Neo 2202's caveat: nothing re-queues `failed`, so the sentence must not promise a sweep"""
+    reason = automerge.drift_reason(automerge.drift_hold(alarm_row(status="failed")))
+
+    assert automerge.DRIFT_WEDGED.strip() in reason
+    assert "al-0a0c1657" in reason
+
+
+def test_a_green_pull_request_with_an_open_drift_finding_is_not_merged(
+        started, project, fake_gh):
+    """wo-03f47919's shape: green PR, green `main`, and the drift question still open"""
+    store, wo = arm(started, project, auto_merge=True)
+    alarm = drifted(store, wo, question_id=1734)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+
+    poll(started, store)
+
+    assert store.list_approvals(wo["id"]) == []
+    assert [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]] == []
+    [held] = [db.from_json(e["payload"], {})
+              for e in store.events_of_kind(wo["id"], "automerge_held")]
+    assert held["code"] == automerge.HELD_DRIFT_ALARM
+    assert alarm["id"] in held["reason"]
+    # `jarvis wo show`'s own reading of the same hold
+    assert ops.automerge_state(store, store.get_work_order(wo["id"]))["code"] == \
+        automerge.HELD_DRIFT_ALARM
+
+
+def test_a_drift_finding_neo_answered_lifts_the_hold_by_itself(
+        started, project, fake_gh):
+    """`acked` is what `_deliver_alarm_verdict` writes when Neo answers in the order's favour"""
+    store, wo = arm(started, project, auto_merge=True)
+    alarm = drifted(store, wo)
+    store.update_alarm(alarm["id"], status="acked", verdict="ack", note="5c is the ask")
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+
+    poll(started, store)
+
+    assert [a["kind"] for a in store.list_approvals(wo["id"])] == [gates.AUTO_MERGE]
+
+
+def test_a_drift_finding_the_user_settles_merges_on_the_next_poll(
+        started, project, fake_gh):
+    store, wo = arm(started, project, auto_merge=True)
+    alarm = drifted(store, wo)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    poll(started, store)
+    assert store.list_approvals(wo["id"]) == []
+
+    ops.review_alarm(alarm["id"], True, project_name="proj_a")
+    poll(started, store)
+    approval = store.list_approvals(wo["id"])[0]
+    gates.apply_decision(store, approval["id"], "approved", "the panel read it", "neo",
+                         project="proj_a")
+    poll(started, store)
+
+    assert [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+    assert store.get_work_order(wo["id"])["status"] == "completed"
+
+
+def test_a_failed_drift_review_is_a_true_blocker_and_has_an_exit(
+        started, project, fake_gh):
+    """Neo 2202's caveat: a hold nothing will lift is an ASK, never a silent wait"""
+    store, wo = arm(started, project, auto_merge=True)
+    alarm = drifted(store, wo, status="failed")
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+
+    poll(started, store)
+
+    row = store.get_work_order(wo["id"])
+    blocker = automerge.DRIFT_BLOCKER.format(alarm_id=alarm["id"])
+    assert invariants.true_blockers(store, row) == [blocker]
+    # ...and `jarvis alarms review` takes a `failed` alarm, so the user can clear it
+    assert ops.review_alarm(alarm["id"], True,
+                            project_name="proj_a")["review"] == "approved"
+    assert invariants.true_blockers(store, store.get_work_order(wo["id"])) == []
+
+
 # -- the request proves itself
 
 
@@ -1361,6 +1543,50 @@ def proposed(store, checks=(), **kw):
 def parked(started, project):
     store, _wo = arm(started, project, auto_merge=True)
     return store
+
+
+def readies(fake_gh) -> list:
+    return [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "ready"]]
+
+
+def test_a_draft_the_panel_passed_is_marked_ready_and_then_proposed(
+        started, project, fake_gh):
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   draft=True)
+
+    poll(started, store)
+
+    assert [c["argv"][2] for c in readies(fake_gh)] == [PR]
+    [event] = store.events_of_kind(wo["id"], automerge.READY_EVENT)
+    assert JUDGED in event["payload"]
+    poll(started, store)
+    assert store.list_approvals(wo["id"])[0]["status"] == "pending"
+    assert len(readies(fake_gh)) == 1
+
+
+def test_a_draft_is_marked_ready_once_per_commit(started, project, fake_gh):
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   draft=True)
+    poll(started, store)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   draft=True)
+
+    poll(started, store)
+
+    assert len(readies(fake_gh)) == 1
+    assert store.list_approvals(wo["id"]) == []
+
+
+def test_a_draft_the_panel_has_not_passed_stays_a_draft(started, project, fake_gh):
+    store, wo = arm(started, project, auto_merge=True, outcome="rejected")
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   draft=True)
+
+    poll(started, store)
+
+    assert readies(fake_gh) == []
 
 
 def test_the_reviewer_is_told_what_each_check_concluded(parked):
@@ -1447,6 +1673,53 @@ def test_with_no_protection_fact_the_request_makes_no_claim_about_protection():
                            round_n=2), PR, checks=tuple(GREEN), protection="")
 
     assert "branch protection" not in text.lower()
+
+
+def test_a_draft_pull_request_is_held_before_any_request_is_filed():
+    decision = decide(rnd(), pull=pr(draft=True))
+
+    assert not decision.armed
+    assert decision.code == automerge.HELD_DRAFT
+
+
+def test_a_draft_with_red_ci_is_held_on_ci_not_on_being_a_draft():
+    """Only a draft that would otherwise merge is the OS's to mark ready"""
+    decision = decide(rnd(), pull=pr(draft=True, checks=(check("unit", "FAILURE"),)))
+
+    assert decision.code == automerge.HELD_CHECKS_FAILED
+
+
+def test_a_merge_state_of_draft_reads_as_a_draft():
+    decision = decide(rnd(), pull=pr(draft=True, merge_state="DRAFT"))
+
+    assert decision.code == automerge.HELD_DRAFT
+
+
+def test_the_poll_reads_whether_the_pull_request_is_a_draft(monkeypatch):
+    from jarvis import github
+
+    monkeypatch.setattr(github, "checked_pr_url", lambda url, cwd=None: url)
+    monkeypatch.setattr(github, "_run", lambda args, **kw: (
+        '{"state": "OPEN", "isDraft": true}' if "isDraft" in args[-1] else '{"state": "OPEN"}'))
+
+    assert github.pr_view(PR).draft
+
+
+def test_the_request_names_the_base_the_squash_lands_on():
+    text = automerge._request_question(
+        "proj_a", {"id": "wo-1", "title": "t"},
+        automerge.Decision(armed=True, code="", reason="r", judged_sha=JUDGED,
+                           round_n=2), PR, checks=(), base="release/x")
+
+    assert "The squash lands on `release/x`." in text
+    assert "default branch" not in text
+
+
+def test_an_unprotected_base_names_itself_as_where_the_commit_lands():
+    fact = automerge.protection_fact(None, "release/x")
+
+    assert "default branch" not in fact
+    assert "`release/x`" in fact
 
 
 def test_a_protection_fact_is_rendered_verbatim_and_nowhere_else():

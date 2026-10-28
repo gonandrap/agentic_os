@@ -47,6 +47,17 @@ is what workers did. Removed; `tests/test_worker_brief.py` carries a negative as
 it cannot come back. `CORE_BUDGET_CHARS = 3220` is asserted by two tests — trim your own
 prose rather than raising it.
 
+## 2026-10-22: the one-line comment rule is checked before the push (issue 1231)
+
+Five of six fresh jarvis_os orders spent their first CI round red on the evals job's
+`scripts/trim_comments.py --check` step alone. `hooks.overlong_comment_decision` now denies
+a worker's `git push` when that checker — in any repo that ships `hooks.COMMENT_CHECKER` —
+reports a change, and names the files: `--check` prints `OVERLONG <rel>` per file.
+Two facts the old CI message hid: the checker also strips a **trailing period** from a
+one-line comment, which is most of what went red; and per `kn-17c9af66` the worker must
+rewrite the line by hand, because the trimmer truncates the overflow to `...`.
+Tests: `tests/test_overlong_comment_hook.py` (runs the real checker over a tmp repo).
+
 ## Proof
 
 `evals/llm/test_house_style_ab.py` (opt-in, `JARVIS_EVALS_LLM=1`). A marker-cut A/B scored
@@ -57,3 +68,12 @@ the report. Plus 15 mechanism tests in `tests/test_concision_mechanisms.py`.
 
 Design record: `docs/superpowers/specs/2026-09-19-concision-enforced.md`.
 Open calls with reversal criteria: `ASSUMPTIONS.md` 82 and 83.
+
+## 2026-10-21: ponytail replaces i-have-adhd
+
+`i-have-adhd` no longer ships to workers (`assets/skills/` copy deleted; the dashboard
+digest's own copy under `assets/digest/` stays). `ponytail` (verbatim, MIT,
+`assets/skills/ponytail/`) took its slot: house style's `## Scope` section carries its
+`full`-level rules; `concision.REVIEW_SCOPE` carries the reviewer half into every
+validation seat (`validation.build_seat_prompt`) and Neo's assumption persona carries a
+paragraph of it. `caveman` unchanged. `ASSUMPTIONS.md` 86.

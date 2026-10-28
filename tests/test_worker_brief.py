@@ -123,6 +123,9 @@ def test_every_core_command_string_parses():
     assert len(cmds) >= 5, "the core stopped teaching its commands inline"
     for cmd in cmds:
         tokens = [re.sub(r"<[^>]*>", "x", t) or "x" for t in shlex.split(cmd)][1:]
+        # Prose names a verb without its arguments ("a second `jarvis wo assume`")
+        if all(t.isalpha() for t in tokens):
+            continue
         try:
             parser.parse_args(tokens)
         except SystemExit:
@@ -185,7 +188,7 @@ def test_contract_section_contains_everything_the_old_contract_had():
         "REBUILDING",
         "jarvis wo assume wo-brief01",
         "should be RARE",
-        "a call you made with NO doubt",
+        "ONE DECISION you made with NO doubt",
         "Record EVERY such call, including the small and obvious ones",
         "only audit trail",
         # Deferred work reached the backlog by the worker filing it itself until `jarvis wo defer` routed it...
@@ -382,10 +385,34 @@ def test_cli_brief_bare_lists_the_sections(jarvis_home, capsys):
 
 # -- the crew (spec 2026-09-23-the-crew-a-worker-must-use.md SS6)
 
+def _crew_spec():
+    """`SPEC` with the crew REQUIRED, which is no longer the default"""
+    import dataclasses
+    return dataclasses.replace(SPEC, worker=dataclasses.replace(SPEC.worker,
+                                                                require_crew=True))
+
+
 def test_worker_core_names_both_crew_seats():
     p = _prompt()
     assert "jarvis-spec-writer" in p and "jarvis-implementer" in p
-    assert "# Your crew" in p
+    # Off by default: the seats are offered, the lead does the work (spec 2026-10-22)
+    assert "# Your crew" not in p
+    assert "# Subagents" in p and "DO THE WORK YOURSELF" in p
+
+
+def test_a_required_crew_still_gets_the_lead_block():
+    from jarvis.dispatch import build_worker_prompt
+    out = build_worker_prompt(dict(WO, id="wo-crew05"), _crew_spec())
+    assert "# Your crew" in out and "refused by a hook" in out
+    assert "DO THE WORK YOURSELF" not in out
+
+
+def test_the_subagent_block_says_not_to_watch_a_seat():
+    """38 `git diff --stat` calls across seven orders were a lead re-checking its seats"""
+    from jarvis import worker_brief
+    block = "\n".join(worker_brief.crew_block(require_crew=False))
+    assert "read the final diff ONCE" in block
+    assert "do not watch its progress" in block
 
 
 def test_worker_core_keeps_git_the_pr_and_the_record_with_the_lead():
@@ -395,7 +422,9 @@ def test_worker_core_keeps_git_the_pr_and_the_record_with_the_lead():
     for kept in ("git", "pr", "`jarvis", "review"):
         assert kept in core.lower()
     # the lead's own editing is refused by a hook, so the block states the mechanism
-    assert "refused" in core.lower()
+    crew = "\n".join(worker_brief.core_contract("wo-crew01", "t", "p1",
+                                                has_knowledge=False, require_crew=True))
+    assert "refused by a hook" in crew
 
 
 def test_planner_prompt_names_no_crew_through_the_production_path():
@@ -422,7 +451,7 @@ def test_the_same_path_with_kind_worker_does_carry_the_crew():
         wo = dict(WO, id="wo-crew04")
         if kind:
             wo["kind"] = kind
-        out = build_worker_prompt(wo, SPEC)
+        out = build_worker_prompt(wo, _crew_spec())
         assert "# Your crew" in out
         assert "jarvis-spec-writer" in out and "jarvis-implementer" in out
 
@@ -449,7 +478,8 @@ def test_core_contract_carries_the_poll_rhythm():
     from jarvis import worker_brief
 
     core = "\n".join(worker_brief.core_contract("wo-brief01", "t", "p1",
-                                               has_knowledge=False))
+                                               has_knowledge=False,
+                                               transport="headless"))
     bullet = [line for line in core.split("\n")
               if line.startswith("- **A turn is one-shot")]
 
@@ -480,7 +510,8 @@ def test_standing_instructions_carry_the_carve_out():
     """The same rewrite at prose length"""
     from jarvis import worker_brief
 
-    section = worker_brief.render_section("record", wo_id="wo-brief01", project="p1")
+    section = worker_brief.render_section("record", wo_id="wo-brief01", project="p1",
+                                          transport="headless")
 
     assert "So work that outlasts one command runs in the FOREGROUND" not in section
     assert "run_in_background" in section
@@ -610,3 +641,36 @@ def test_the_common_briefing_tail_reaches_the_posture_through_worker_brief():
     assert worker_brief.navigation_section() in tail
     for command in SPEC_COMMANDS:
         assert command in tail
+
+
+# -- docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md: a turn that wakes
+
+
+def test_a_background_worker_is_told_it_is_woken_and_never_to_poll():
+    from jarvis import worker_brief
+
+    core = "\n".join(worker_brief.core_contract("wo-bg01", "t", "p1",
+                                                has_knowledge=False,
+                                                transport="background"))
+    assert "it wakes you" in core and "NEVER poll it" in core
+    for gone in ("3-4 minutes", "240 seconds", "one-shot", "Stop hook refuses"):
+        assert gone not in core
+
+
+def test_a_background_record_section_drops_the_poll_rhythm():
+    from jarvis import worker_brief
+
+    section = worker_brief.render_section("record", wo_id="wo-bg01", project="p1",
+                                          transport="background")
+    assert "# Your session stays up between turns" in section
+    assert "3-4 minutes" not in section and "# A turn is one-shot" not in section
+
+
+def test_the_brief_follows_the_order_s_own_transport():
+    """An order keeps the transport its session was born on (`work_orders.transport`)"""
+    from jarvis.dispatch import build_worker_prompt
+
+    born_headless = build_worker_prompt(dict(WO, id="wo-bg02", transport="headless"), SPEC)
+    born_bg = build_worker_prompt(dict(WO, id="wo-bg03", transport="background"), SPEC)
+    assert "one-shot" in born_headless and "one-shot" not in born_bg
+    assert "it wakes you" in born_bg

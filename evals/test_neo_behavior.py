@@ -16,7 +16,7 @@ scenario = pytest.mark.scenario
 
 
 @pytest.fixture()
-def daemon(jarvis_home, fake_claude, catalog_file):
+def daemon(jarvis_home, fake_claude, catalog_file, live_daemon):
     ops.start_os(str(catalog_file), foreground=True)
     return Daemon(load_catalog(catalog_file))
 

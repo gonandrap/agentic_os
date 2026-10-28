@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .project_store import WORKER_CHILDREN
+
 if TYPE_CHECKING:
     from .ops import Actor
 
@@ -54,7 +56,7 @@ def fingerprint(pstore: Any, subject: dict[str, Any]) -> str:
     row = subject["row"]
     if subject["kind"] == "feature_order":
         # A feature has no session, so what moves is its children and its rounds
-        children = pstore.feature_children(row["id"])
+        children = pstore.feature_children(row["id"], kinds=WORKER_CHILDREN)
         latest = pstore.latest_validation_round(fo_id=row["id"])
         parts = [
             str(row.get("status") or ""),
@@ -132,7 +134,7 @@ def _children_blocker(pstore: Any, row: dict[str, Any], cfg: Any) -> str | None:
     """A FEATURE's stillness is its children's, and nothing else explains it (Neo q1220)"""
     from .project_store import TERMINAL_STATUSES
 
-    open_children = [c for c in pstore.feature_children(row["id"])
+    open_children = [c for c in pstore.feature_children(row["id"], kinds=WORKER_CHILDREN)
                      if c.get("status") not in TERMINAL_STATUSES]
     if not open_children or any(c.get("status") == "running" for c in open_children):
         return None

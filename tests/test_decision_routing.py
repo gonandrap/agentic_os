@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from jarvis import ops
@@ -59,7 +61,7 @@ def test_contract_says_ask_before_building(contract: str) -> None:
 
 def test_contract_makes_assumptions_the_rare_case(contract: str) -> None:
     assert "should be RARE" in contract
-    assert "a call you made with NO doubt" in contract
+    assert "ONE DECISION you made with NO doubt" in contract
 
 
 def test_contract_still_demands_every_assumption_be_recorded(contract: str) -> None:
@@ -75,15 +77,13 @@ def test_contract_preempts_the_rationalisations_for_guessing(contract: str) -> N
         assert excuse in contract, f"unaddressed rationalisation: {excuse!r}"
 
 
-#: The ONE spelling of a spec citation — `sections.REF_RE`'s in-text form, as the
-#: `jarvis wo ask` guidance already teaches it. There is no `--section` flag.
+#: The ONE spelling of a spec citation
 SECTION_FORM = 'section 3 of design doc "docs/superpowers/specs/feature.md"'
 
 
 @pytest.mark.parametrize("kind", ["planner", "analyst", "investigator", "manager"])
 def test_every_kinds_assume_line_cites_a_spec_by_section(kind, catalog_file) -> None:
-    """User decision 2026-10-14 (Neo learning #102): an assumption cites ONE section of a
-    spec in-text. Never a pasted document, never a whole document named."""
+    """User decision 2026-10-14 (Neo learning #102): an assumption cites ONE section of a spec in-text"""
     spec = load_catalog(catalog_file).projects[0]
     prompt = build_worker_prompt({"id": "wo-k", "title": "t", "description": "d",
                                   "kind": kind, "parent_id": "fo-1"}, spec,
@@ -95,6 +95,38 @@ def test_every_kinds_assume_line_cites_a_spec_by_section(kind, catalog_file) -> 
         assert "section" in line, line
     assert any(SECTION_FORM in ln for ln in lines), lines
     assert any("never by pasting" in ln for ln in lines), lines
+
+
+#: Spec §5: the in-text reference form, keyword-anchored
+REF_FORM = ("Q1234", "assumption #2")
+
+
+@pytest.mark.parametrize("kind", ["planner", "analyst", "investigator", "manager"])
+def test_every_kinds_assume_guidance_asks_for_one_decision(kind, catalog_file) -> None:
+    """Test 10: an assumption carrying three decisions is what the cap and this shape fix"""
+    spec = load_catalog(catalog_file).projects[0]
+    prompt = build_worker_prompt({"id": "wo-k", "title": "t", "description": "d",
+                                  "kind": kind, "parent_id": "fo-1"}, spec,
+                                 knowledge=[])
+
+    lines = [ln for ln in prompt.splitlines() if "`jarvis wo assume" in ln]
+    assert lines, f"no assume guidance in the {kind} prompt"
+    for line in lines:
+        assert "ONE" in line, line
+    joined = "\n".join(lines)
+    assert "a second decision is a second `jarvis wo assume`" in joined
+    assert "1000" in joined
+    for form in REF_FORM:
+        assert form in joined, joined
+
+
+def test_the_default_brief_asks_for_one_decision_and_names_both_caps(contract) -> None:
+    """Test 10 for the two `worker_brief` sites"""
+    assert "ONE DECISION" in contract
+    assert "a second decision is a second `jarvis wo assume`" in contract
+    assert "1000" in contract and "2000" in contract
+    for form in REF_FORM:
+        assert form in contract
 
 
 def test_operation_template_mirrors_the_contract() -> None:
@@ -110,6 +142,11 @@ def test_operation_template_mirrors_the_contract() -> None:
     assert "The trigger is **doubt**, not importance" in tmpl
     assert "this should be rare" in tmpl.lower()
     assert "no doubt" in tmpl
+    # Spec §5: one decision per assumption, and the in-text reference form
+    assert "one decision" in tmpl.lower()
+    assert "second `jarvis wo assume`" in tmpl
+    for form in REF_FORM:
+        assert form in tmpl
 
 
 # -- the user's verdict becomes a Neo learning
@@ -125,6 +162,16 @@ def reviewable(started, project):
     return daemon, wo
 
 
+@pytest.fixture()
+def wide_net(monkeypatch):
+    """The wide `regex` net, which holds 'migration'; the tightened default does not"""
+    import dataclasses
+
+    real = ops.validation_config
+    monkeypatch.setattr(ops, "validation_config", lambda name: dataclasses.replace(
+        real(name), stakes_classifier="regex"))
+
+
 def _learnings():
     neo = NeoStore()
     try:
@@ -133,13 +180,86 @@ def _learnings():
         neo.close()
 
 
-def test_review_without_feedback_teaches_nothing(reviewable) -> None:
-    """Unchanged behaviour: a bare accept still just settles the work order"""
+def test_review_without_feedback_still_teaches_the_class_once(reviewable) -> None:
+    """io-51469add: a bare accept is a ruling too — 'the user accepted this class unchanged'"""
     _, wo = reviewable
     out = ops.review_work_order(wo["id"], accept=True)
     assert out["reviewed"] == 1
+    assert out["learning_id"]
+
+    (learning,) = _learnings()
+    assert learning["source"] == "review"
+    assert learning["content"].startswith("RULE")
+    assert "routine assumption" in learning["content"]
+    assert "accepted it unchanged" in learning["content"]
+
+    # The same reasonless ruling on the same class is ONE rule, however many orders repeat it
+    again = ops.create_work_order("proj_a", "build the importer")
+    ops.assume(again["id"], "assumed the import reads CSV too")
+    ops.finish(again["id"], "shipped")
+    out = ops.review_work_order(again["id"], accept=True)
     assert "learning_id" not in out
-    assert _learnings() == []
+    assert len(_learnings()) == 1
+
+
+def test_a_learning_is_a_rule_about_a_class_not_a_transcript(reviewable, wide_net) -> None:
+    """The class is the high-stakes word the row carries, so it matches the NEXT row like it"""
+    _, wo = reviewable
+    ops.assume(wo["id"], "ran the database migration on the scratch copy first")
+    ops.review_work_order(wo["id"], accept=True, feedback="scratch copies are mine to touch")
+
+    contents = sorted(row["content"] for row in _learnings())
+    assert len(contents) == 2
+    assert any("mentions 'migration'" in c and "accepted" in c
+               and "scratch copies are mine to touch" in c for c in contents)
+    assert any("routine assumption" in c for c in contents)
+    assert all(c.startswith("RULE") for c in contents)
+
+
+def test_a_false_alarm_on_a_held_row_is_recorded_as_a_defect_in_the_net(
+        reviewable, project, wide_net) -> None:
+    """io-51469add: 'the word migration was a false alarm' must reach the net, like `gate dismiss`"""
+    from jarvis import autoreview
+
+    _, wo = reviewable
+    ops.assume(wo["id"], "ran the database migration on the scratch copy first")
+    store = ProjectStore(project)
+    try:
+        held = store.all_assumptions(wo["id"])[1]
+        store.add_event(wo["id"], "autoreview_held", {
+            "code": autoreview.HELD_HIGH_STAKES, "assumption_id": held["id"], "n": 2,
+            "reason": "assumption #2 mentions 'migration' — the OS does not decide "
+                      "those for you"})
+    finally:
+        store.close()
+
+    out = ops.review_work_order(wo["id"], accept=True,
+                                feedback="the word migration was a false alarm")
+
+    assert out["false_alarms"] == 1
+    store = ProjectStore(project)
+    try:
+        (event,) = store.events_of_kind(wo["id"], ops.STAKES_FALSE_ALARM_EVENT)
+        payload = json.loads(event["payload"])
+        assert payload["assumption_id"] == held["id"]
+        assert payload["net"] == "regex" and payload["marker"].lower() == "migration"
+        rows = ops.assumptions_with_rulings(store, wo["id"])
+        assert [r["stakes_false_alarm"] for r in rows] == ["", payload["marker"]]
+    finally:
+        store.close()
+    assert any("FALSE ALARM" in row["content"] for row in _learnings())
+
+
+def test_false_alarm_without_a_held_row_records_nothing(reviewable, project) -> None:
+    """Only a row the net actually held can be the net's defect"""
+    _, wo = reviewable
+    out = ops.review_work_order(wo["id"], accept=True, false_alarm=True)
+    assert "false_alarms" not in out
+    store = ProjectStore(project)
+    try:
+        assert store.events_of_kind(wo["id"], ops.STAKES_FALSE_ALARM_EVENT) == []
+    finally:
+        store.close()
 
 
 def test_accepting_with_feedback_teaches_neo(reviewable, project) -> None:
@@ -153,7 +273,7 @@ def test_accepting_with_feedback_teaches_neo(reviewable, project) -> None:
     assert learning["project"] == "proj_a"
     assert "assumed the export defaults to CSV" in learning["content"]
     assert "CSV is always the right default" in learning["content"]
-    assert "accepted" in learning["content"]
+    assert "accepted" in learning["content"] and learning["content"].startswith("RULE")
 
     store = ProjectStore(project)
     try:

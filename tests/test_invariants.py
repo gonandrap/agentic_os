@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -19,7 +18,7 @@ from jarvis.invariants import (
     status_label,
     true_blockers,
 )
-from jarvis.project_store import ProjectStore
+from jarvis.project_store import OPEN_STATUSES, ProjectStore
 
 IDLE_NOTIFICATION = "Claude is waiting for your input"
 
@@ -577,6 +576,44 @@ def test_a_validating_work_order_with_a_real_blocker_is_surfaced(project):
     assert fresh["attention_reason"] == "1 assumption pending your review"
 
 
+def test_the_attention_repair_is_dropped_when_the_order_settled_under_the_sweep(project,
+                                                                                monkeypatch):
+    """Issue #1205: the sweep derives from a row read a write earlier"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("quietly stuck mid-review")
+    store.add_assumption(wo["id"], "something needing a decision")
+    store.set_status(wo["id"], "validating")
+    store.open_validation_round(wo_id=wo["id"], fingerprint="abc")
+    store.clear_attention(wo["id"])
+    stale = store.get_work_order(wo["id"])      # the row as the sweep read it
+    # The validation thread settles it while the sweep is deriving
+    store.set_status(wo["id"], "completed")
+    store.clear_attention(wo["id"])
+    monkeypatch.setattr(store, "list_work_orders", lambda *a, **k: [stale])
+
+    assert list(invariants.check_blocked_work_is_surfaced(store)) == []
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_the_phantom_clear_is_dropped_when_the_order_moved_under_the_sweep(project,
+                                                                           monkeypatch):
+    """Issue #1205: a clear derived from a settled row must not land on a retried one"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("retried after it settled")
+    store.set_status(wo["id"], "completed")
+    store.flag_attention(wo["id"], "a flag with nothing behind it")
+    stale = store.get_work_order(wo["id"])      # the row as the sweep read it
+    # `jarvis wo retry` moves it while the sweep is deriving
+    store.set_status(wo["id"], "running")
+    store.flag_attention(wo["id"], "the retry's own blocker")
+    monkeypatch.setattr(store, "list_work_orders", lambda *a, **k: [stale])
+
+    assert list(invariants.check_no_phantom_attention(store)) == []
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"] == 1
+    assert fresh["attention_reason"] == "the retry's own blocker"
+
+
 def test_a_closed_pull_request_outranks_an_escalated_review(project):
     """Both branches live under the same `needs_review` roof"""
     store = ProjectStore(project)
@@ -619,7 +656,7 @@ def _stranded(store: ProjectStore, *, age: float, outcome: str = "pending",
     if outcome != "pending":
         store.close_validation_round(rnd["id"], outcome)
     store.conn.execute("UPDATE validation_rounds SET ts=? WHERE id=?",
-                       (time.time() - age, rnd["id"]))
+                       (db.now() - age, rnd["id"]))
     return unit["id"], rnd
 
 
@@ -1005,26 +1042,17 @@ def _owning(monkeypatch, tmp_path, project, **kw) -> ProjectStore:
     return ProjectStore(project)
 
 
-def test_the_os_sweep_switched_off_is_reported_critical(monkeypatch, tmp_path, project):
+def test_the_os_sweep_switched_off_in_the_catalog_is_deliberate(monkeypatch, tmp_path, project):
     store = _owning(monkeypatch, tmp_path, project, health=False)
 
-    (violation,) = _dark(store)
-
-    assert violation.invariant == "INV-OS-HEALTH-SWEEP-DARK"
-    assert violation.level == "critical"
-    assert not violation.repaired, "re-enabling it would be the OS editing the catalog"
-    assert "DISABLED" in violation.detail
-    assert "health_enabled" in violation.detail
+    assert _dark(store) == []
     store.close()
 
 
-def test_the_supervisor_switch_takes_the_sweep_dark_too(monkeypatch, tmp_path, project):
-    """Two switches, either of which is fatal: `_health_projects` requires both"""
+def test_the_supervisor_switch_off_is_deliberate_too(monkeypatch, tmp_path, project):
     store = _owning(monkeypatch, tmp_path, project, enabled=False)
 
-    (violation,) = _dark(store)
-
-    assert "supervisor.enabled" in violation.detail
+    assert _dark(store) == []
     store.close()
 
 
@@ -1666,7 +1694,7 @@ def _refused_then_pushed(store: ProjectStore, *, head: str, judged: str,
     store.close_validation_round(round_["id"], "passed", "green")
     store.add_event(wo["id"], "reviewed", {"accepted": False})
     store.set_status(wo["id"], "needs_review", pr_url="https://example/pull/2",
-                     pr_head_oid=head, pr_head_seen_at=time.time())
+                     pr_head_oid=head, pr_head_seen_at=db.now())
     return store.get_work_order(wo["id"])
 
 
@@ -1783,7 +1811,7 @@ def _sweep_run(tmp_path, project, *, projects=None, os_extra=None, **row) -> Pat
         central.set_state("catalog_path", str(path))
         if row:
             central.set_state(Daemon.STUCK_RUN_KEY, db.to_json(
-                {"ts": time.time(), "scanned": 0, "candidates": 0, "opened": 0,
+                {"ts": db.now(), "scanned": 0, "candidates": 0, "opened": 0,
                  "skipped": {}, "excluded": "", "error": "", **row}))
     finally:
         central.close()
@@ -1829,14 +1857,14 @@ def test_sweep_dark_raises_after_the_window(jarvis_home, tmp_path, project, monk
 
     _own_the_os(monkeypatch, project)
     window = catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
-    _sweep_run(tmp_path, project, ts=time.time() - (window + 1) * 60)
+    _sweep_run(tmp_path, project, ts=db.now() - (window + 1) * 60)
     store = ProjectStore(project)
 
     (violation,) = _stuck_dark(store)
     assert violation.context["cause"] == "dark"
     assert window == 180
 
-    _sweep_run(tmp_path, project, ts=time.time() - (window - 1) * 60)
+    _sweep_run(tmp_path, project, ts=db.now() - (window - 1) * 60)
     assert _stuck_dark(store) == []
     store.close()
 
@@ -1846,11 +1874,11 @@ def test_the_fleet_catalog_value_is_what_the_check_judges_by(
     """`sweep_dark_minutes` is a CATALOG setting"""
     _own_the_os(monkeypatch, project)
     silence = 20 * 60  # 20 minutes — well inside the shipped 180
-    _sweep_run(tmp_path, project, ts=time.time() - silence)
+    _sweep_run(tmp_path, project, ts=db.now() - silence)
     store = ProjectStore(project)
     assert _stuck_dark(store) == []
 
-    _sweep_run(tmp_path, project, ts=time.time() - silence,
+    _sweep_run(tmp_path, project, ts=db.now() - silence,
                os_extra={"fleet_health": {"sweep_dark_minutes": 10}})
     (violation,) = _stuck_dark(store)
     assert violation.context["cause"] == "dark"
@@ -1932,7 +1960,7 @@ def _stuck_attention(catalog) -> list:
 
 
 def test_a_standing_critical_violation_reaches_the_attention_list(
-        jarvis_home, project, catalog_file, monkeypatch):
+        jarvis_home, project, catalog_file, monkeypatch, live_daemon):
     """Neo 1084: `jarvis status` read HEALTHY over a standing critical violation"""
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
@@ -2494,7 +2522,9 @@ def test_a_stalled_pull_request_ends_the_tick_as_an_attention_item(
 
         row = store.get_work_order(wo["id"])
         assert bool(row["needs_attention"])
-        assert row["attention_reason"] == invariants.NO_ACTOR_BLOCKER
+        # The string names the STATUS (§5b): `.format` is what this child landed
+        assert row["attention_reason"] == invariants.NO_ACTOR_BLOCKER.format(
+            status="waiting_pr_merge")
     finally:
         store.close()
 
@@ -2591,6 +2621,185 @@ def test_the_pointer_check_runs_on_the_slow_cadence_only():
     """§2.3: its population is every feature order a project has ever had and its repair lists the whole..."""
     assert invariants.check_spec_pointer_resolves in invariants.SLOW_INVARIANTS
     assert invariants.check_spec_pointer_resolves not in invariants.INVARIANTS
+
+
+# -- 5b/5d: an OPEN row no pass selects says so
+
+#: (status, what makes the row) — each derives no actor from `ops.scheduled_actor`
+NO_ACTOR_SHAPES = [
+    pytest.param("validating", id="validating-with-no-round"),
+    pytest.param("waiting_pr_merge", id="waiting-pr-merge-with-no-pr-url"),
+]
+
+
+def _no_actor_row(store: ProjectStore, status: str) -> dict:
+    """A delivered work order parked in `status` with nothing for a pass to select"""
+    wo = store.create_work_order("add feature X", status=status)
+    store.update_work_order(wo["id"], result_summary="done")
+    return store.get_work_order(wo["id"])
+
+
+@pytest.mark.parametrize("status", NO_ACTOR_SHAPES)
+def test_an_open_row_no_pass_selects_names_the_hole(project, status):
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, status)
+
+    assert ops.scheduled_actor(store, wo) is None, "the premise: nobody will act"
+    assert true_blockers(store, wo) == [
+        invariants.NO_ACTOR_BLOCKER.format(status=status)]
+
+
+@pytest.mark.parametrize("status", NO_ACTOR_SHAPES)
+def test_the_no_actor_line_carries_no_elapsed_time(project, status):
+    """§2: INV-ATTENTION-REASON re-derives it and `ack_attention` stores it verbatim"""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, status)
+
+    early = true_blockers(store, wo, now=db.now())
+    late = true_blockers(store, wo, now=db.now() + 40 * 60 * 60)
+
+    assert early == late != []
+
+
+def test_a_round_the_panel_owns_names_nobody_new(project):
+    """The other half of line 579's pairing"""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, "validating")
+    store.open_validation_round(wo_id=wo["id"], fingerprint="fp-1")
+
+    assert true_blockers(store, store.get_work_order(wo["id"])) == []
+
+
+def test_the_new_arm_never_doubles_a_line_that_already_names_the_stop(project):
+    """Neo's precedence ruling: the parked tail first"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("delivered, sent back to work, stopped again")
+    early = store.create_turn(wo["id"], "dispatch", "plan it")
+    store.finish_turn(early["id"], "done", result="submitted the plan")
+    store.update_work_order(wo["id"], result_summary="planned it")
+    store.add_event(wo["id"], "finished", {"summary": "planned it"})
+    store.add_assumption(wo["id"], "one call I made")
+    later_turn = store.create_turn(wo["id"], "message", "go and open the PR")
+    store.finish_turn(later_turn["id"], "done", result="waiting on exact counts")
+    store.set_status(wo["id"], "needs_review")
+    wo = store.get_work_order(wo["id"])
+    later = float(store.latest_turn(wo["id"])["ended_at"]) + 90 * 60
+
+    assert ops.scheduled_actor(store, wo, now=later) is None, "the premise"
+    assert true_blockers(store, wo, now=later) == [
+        "1 assumption pending your review", invariants.STALE_FINISH_BLOCKER]
+
+
+def test_an_ungoverned_open_row_is_still_asked_for_nothing(project):
+    """`UNGOVERNED_ORIGINS` stays load-bearing (§1 prohibition 3): both the settler and the retry sweep..."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("a legacy background agent", origin="adhoc",
+                                 status="running")
+    turn = store.create_turn(wo["id"], "dispatch", "whatever it was doing")
+    store.finish_turn(turn["id"], "done", result="…")
+    wo = store.get_work_order(wo["id"])
+    later = float(store.latest_turn(wo["id"])["ended_at"]) + 90 * 60
+
+    assert ops.scheduled_actor(store, wo, now=later) is None, "the premise"
+    assert true_blockers(store, wo, now=later) == []
+
+
+def test_the_actor_is_derived_once_per_derivation(project, monkeypatch):
+    """§5d's cost clause: `true_blockers` runs for every work order on every reconcile tick"""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, "validating")
+    calls: list[str] = []
+    real = ops.scheduled_actor
+    monkeypatch.setattr(ops, "scheduled_actor",
+                        lambda *a, **k: calls.append(a[1]["id"]) or real(*a, **k))
+
+    assert true_blockers(store, wo) != []
+    assert calls == [wo["id"]]
+
+
+def test_a_settled_row_costs_the_tick_no_verdict_at_all(project, monkeypatch):
+    """The same clause from the other end: `SCHEDULED_ACTORS` is keyed by `OPEN_STATUSES`"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="completed")
+    monkeypatch.setattr(ops, "scheduled_actor",
+                        lambda *a, **k: pytest.fail("a settled row was asked"))
+
+    assert true_blockers(store, store.get_work_order(wo["id"])) == []
+
+
+@pytest.mark.parametrize("status", NO_ACTOR_SHAPES)
+def test_the_hole_ends_the_tick_flagged_and_acks_for_good(jarvis_home, project,
+                                                          catalog_file, status):
+    """§5d end to end: the reason INV-ATTENTION-REASON re-derives"""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    ops.start_os(str(catalog_file), foreground=True)
+    catalog = load_catalog(catalog_file)
+    daemon, store = Daemon(catalog), ProjectStore(project)
+    try:
+        wo = _no_actor_row(store, status)
+
+        daemon.check_invariants(catalog.projects[0], store)
+
+        row = store.get_work_order(wo["id"])
+        assert (bool(row["needs_attention"]), row["attention_reason"]) == (
+            True, invariants.NO_ACTOR_BLOCKER.format(status=status))
+        # INV-ATTENTION-REASON rewrites any reason this function cannot re-derive: the flag surviving a...
+        daemon.check_invariants(catalog.projects[0], store)
+        assert store.get_work_order(wo["id"])["attention_reason"] == \
+            invariants.NO_ACTOR_BLOCKER.format(status=status)
+
+        ops.ack_attention(wo["id"])
+        assert not bool(store.get_work_order(wo["id"])["needs_attention"])
+
+        daemon.check_invariants(catalog.projects[0], store)
+        assert not bool(store.get_work_order(wo["id"])["needs_attention"])
+    finally:
+        store.close()
+
+
+# -- the label stops promising a round nobody is going to judge
+
+
+def test_the_validating_label_does_not_promise_a_round_nobody_will_judge(project):
+    """`ops.scheduled_actor` is None, so the round count is a false promise"""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, "validating")
+
+    assert ops.scheduled_actor(store, wo) is None
+    label = status_label(store, wo)
+
+    assert label == "validating — no review is scheduled"
+    assert "review round" not in label
+
+
+#: Today's label per open status — NO default and NO `.get`: a new member must KeyError here
+ACTOR_LABELS = {
+    "pending": "pending",
+    "dispatching": "dispatching",
+    "running": "running",
+    "idle": "idle — waiting for a message from its feature",
+    "waiting_input": "waiting_input",
+    "validating": "validating — review round 1 of 3",
+    "needs_review": "needs_review",
+    "waiting_pr_merge": "waiting_pr_merge",
+    "budget_exhausted": "budget spent — cleared, resuming shortly",
+}
+
+GATED_COMMAND = "gh " + "pr merge 42"  # split so the recogniser does not gate this file
+
+
+@pytest.mark.parametrize("status", OPEN_STATUSES)
+def test_a_row_with_an_actor_keeps_todays_label(jarvis_home, project, status):
+    """`REVIEWS_GATE` is under every open status, so one open request is the uniform recipe"""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, status)
+    store.add_approval(wo["id"], "pr_merge", GATED_COMMAND)
+    wo = store.get_work_order(wo["id"])
+
+    assert ops.scheduled_actor(store, wo) is not None
+    assert status_label(store, wo) == ACTOR_LABELS[status]
 
 
 # Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)

@@ -133,16 +133,29 @@ def sink_telegram(item: dict[str, Any], catalog: Catalog) -> str:
         return f"error: {e}"
 
 
+#: AppleScript reading title and body from argv, so neither needs quoting into the script
+_OSASCRIPT = ["-e", "on run argv", "-e",
+              "display notification (item 2 of argv) with title (item 1 of argv)",
+              "-e", "end run"]
+
+
+def desktop_argv(title: str, body: str) -> list[str] | None:
+    """`notify-send` on Linux, `osascript` on a Mac, `None` when neither is installed"""
+    if shutil.which("notify-send"):
+        return ["notify-send", title, body]
+    if shutil.which("osascript"):
+        return ["osascript", *_OSASCRIPT, title, body]
+    return None
+
+
 def sink_desktop(item: dict[str, Any], catalog: Catalog) -> str:
     if external_sinks_disabled():
         return f"skipped: {DISABLE_EXTERNAL_SINKS_ENV} set"
-    if not shutil.which("notify-send"):
-        return "skipped: notify-send not available"
+    argv = desktop_argv(f"Jarvis [{item['project']}]", f"{item['title']}\n{item['body']}")
+    if argv is None:
+        return "skipped: neither notify-send nor osascript is available"
     try:
-        subprocess.run(
-            ["notify-send", f"Jarvis [{item['project']}]", f"{item['title']}\n{item['body']}"],
-            timeout=10, check=False,
-        )
+        subprocess.run(argv, timeout=10, check=False)
         return "ok"
     except Exception as e:  # noqa: BLE001
         return f"error: {e}"

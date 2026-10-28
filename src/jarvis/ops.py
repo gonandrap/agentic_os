@@ -18,6 +18,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
+from urllib.parse import quote
 
 log = logging.getLogger("jarvis.ops")
 
@@ -27,6 +28,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
 from .catalog import (
+    DEFAULT_STAKES_CLASSIFIER,
     DEFAULT_VALIDATION_FOLLOW_UP_CAP,
     SAFETY_KEYS,
     Catalog,
@@ -36,8 +38,8 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import (budget, bus, config_version, db, fleet, harvest, health, invariants,
-               observability, release, rules, timeline)
+from . import (budget, bus, concision, config_version, db, fleet, harvest, health,
+               invariants, observability, release, rules, timeline)
 from .release import RED_DEFER_EVENT, RED_PARK_EVENT
 from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
@@ -47,6 +49,7 @@ from .central_store import MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES, CentralSt
 from .daemon import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
+    RECONCILE_TICK_KEY,
     answers_question,
     daemon_running,
     delivers_message,
@@ -54,31 +57,47 @@ from .daemon import (
     polls_pull_request,
     retries_turn,
     reviews_gate,
-    runnable_round,
     settles_turn,
+    validation_round,
 )
 from .github import GitHubError
-from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
+from .invariants import (
+    PR_CLOSED_BLOCKER,
+    UNLANDED_BLOCKER,
+    pr_pending_blocker,
+    true_blockers,
+)
 from .paths import daemon_pidfile, ensure_home, logs_dir
+from .worker_brief import MODEL_ATTRIBUTION_NAMES
 # `ops.IDLE_MANAGER_CAUSE` is an ALIAS: `stuck.IDLE_MANAGER_CAUSE` is the one definition of the cause... (#1008)
 from .stuck import IDLE_MANAGER_CAUSE  # noqa: F401
 from .project_store import (
+    ALARM_REVIEWABLE_STATUSES,
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     COUNTED_VALIDATION_OUTCOMES,
+    FAMILY_CHILD_KINDS,
+    FORCEABLE_STATUSES,
     FO_OPEN_STATUSES,
     FO_STATUSES,
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
-    FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
+    PR_PENDING_EVENT,
+    SETTLE_BY_FINISH,
+    SETTLE_IN_SESSION,
     TERMINAL_STATUSES,
+    WORKER_CHILDREN,
     WO_STATUSES,
     ProjectStore,
     claim_sql_selects,
+    decide_command,
     feature_status_label,
     is_feature_order_id,
+    kind_contract,
+    order_path,
+    submission_artifacts,
     validation_standing,
 )
 
@@ -365,6 +384,14 @@ def orphaned_worker_sessions() -> list[dict[str, Any]]:
     named = [s for s in sessions if s.name.startswith("[WO ")]
     if not named:
         return []
+    # A STOPPED worker session holds nothing: every closed background-transport order leaves one (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+    try:
+        roster = claude_cli.bg_roster()
+    except claude_cli.ClaudeCliError:
+        roster = {}
+    named = [s for s in named
+             if not (s.session_id in roster and not roster[s.session_id].alive
+                     and roster[s.session_id].state in claude_cli.FINISHED_STATES)]
 
     live_sessions: set[str] = set()
     for name, path in registered_project_paths().items():  # noqa: B007
@@ -407,9 +434,49 @@ def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
     try:
         return (neo.counts(),
                 [q for q in neo.list_questions(statuses=("escalated", "failed"))
-                 if q.get("kind") not in ("approval", "plan", "alarm", "assumption")])
+                 if q.get("kind") not in ("approval", "plan", "alarm", "assumption",
+                                          # its improvement order carries the attention
+                                          "findings")])
     finally:
         neo.close()
+
+
+_RETRIES_SUFFIX = re.compile(r"\s*\(after \d+ retries — nobody has judged this\)$")
+
+
+def fold_neo_attention(questions: list[dict[str, Any]],
+                       rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per CAUSE with a count, biggest first: one outage is one thing to fix"""
+    from .neo_store import REVIVABLE_KINDS, UNREACHABLE_PREFIX
+
+    groups: dict[tuple[str, ...], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for q, row in zip(questions, rows):
+        reason = q.get("answer_reason") or ""
+        if q["status"] == "failed" and reason.startswith(UNREACHABLE_PREFIX):
+            # Unjudged: the outage is the subject, whatever each question asked
+            key = (q["project"], q.get("kind") or "", "unreachable",
+                   _RETRIES_SUFFIX.sub("", reason))
+        else:
+            # Judged: only the same question asked twice is the same decision
+            key = (q["project"], q.get("kind") or "", q.get("wo_id") or "", q["question"])
+        groups.setdefault(key, []).append((q, row))
+    out = []
+    for key, members in groups.items():
+        q, row = members[-1]
+        ids = [m["id"] for m, _ in members]
+        row = {**row, "count": len(ids), "neo_question_ids": ids}
+        if len(ids) > 1 and key[2] == "unreachable":
+            kind = q.get("kind") or "question"
+            heals = (" — they re-ask themselves once Neo answers again; `jarvis neo list` "
+                     "to read them" if kind in REVIVABLE_KINDS
+                     else " — `jarvis neo list` to read and answer them")
+            row.update(title=f"Neo could not be reached for {len(ids)} {kind} questions",
+                       reason=_RETRIES_SUFFIX.sub("", q.get("answer_reason") or "") + heals,
+                       wo_id=None, decide="jarvis neo list")
+        elif len(ids) > 1:
+            row["title"] = f"{row['title']} (asked {len(ids)}×)"
+        out.append(row)
+    return sorted(out, key=lambda r: -r["count"])
 
 
 def _held_jobs(store: ProjectStore, catalog: Catalog | None = None) -> list[dict[str, Any]]:
@@ -421,6 +488,54 @@ def _held_jobs(store: ProjectStore, catalog: Catalog | None = None) -> list[dict
              "reason": st["held_reason"] or "", "wo_id": st["last_wo_id"]}
             for st in store.list_schedule_states()
             if st["held_since"] and st["job_id"] in cfg.jobs]
+
+
+#: §2b: dark once the newest stamp is older than max(MIN_SECONDS, interval * INTERVALS)
+DAEMON_DARK_INTERVALS = 10
+DAEMON_DARK_MIN_SECONDS = 300
+
+
+def _daemon_liveness(central: CentralStore, pid: int | None) -> dict[str, Any] | None:
+    """ONE fleet-level item when jarvisd is stopped or dark, else None (docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md)"""
+    if pid is None:
+        path = central.get_state("catalog_path")
+        return {
+            "project": "os", "wo_id": None,
+            "title": "jarvisd is not running", "status": "daemon",
+            "reason": "nothing is dispatching work orders, relaunching turns, "
+                      "delivering messages or settling any work order",
+            "cause": "stopped",
+            "decide": f"jarvis start --catalog {path}" if path else "jarvis start",
+        }
+    stamp = db.from_json(central.get_state(RECONCILE_TICK_KEY), None)
+    ts = interval = 0.0
+    if isinstance(stamp, dict):
+        try:
+            ts = float(stamp.get("ts") or 0.0)
+            interval = float(stamp.get("interval") or 0.0)
+        except (TypeError, ValueError):  # a malformed stamp is no stamp
+            ts = interval = 0.0
+    if not ts:
+        # §2b: with no stamp the age is measured from the start, and with neither nothing fires
+        interval = 0.0
+        try:
+            ts = float(central.get_state("daemon_started_at") or 0.0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if not ts:
+            return None
+    dark = db.now() - ts
+    if dark < max(float(DAEMON_DARK_MIN_SECONDS), interval * DAEMON_DARK_INTERVALS):
+        return None
+    # No `decide`: no jarvis verb restarts a wedged daemon (§2b)
+    return {
+        "project": "os", "wo_id": None,
+        "title": "jarvisd is dark", "status": "daemon",
+        "reason": f"pid {pid} is alive but has completed no reconcile pass for "
+                  f"{int(dark / 60)}m — nothing is being dispatched, relaunched, "
+                  f"delivered or settled",
+        "cause": "dark",
+    }
 
 
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
@@ -505,7 +620,10 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         except KeyError:  # deleted out from under its children
                             by_id[parent_id] = {}
                 for fo_id, fo in by_id.items():
-                    kids = rolled_up.get(fo_id, [])
+                    # THE ACCESSOR `feature_progress` reads, so the label and the rollup agree
+                    owed = {k["id"] for k in rolled_up.get(fo_id, [])}
+                    kids = [k for k in store.feature_children(fo_id, kinds=None)
+                            if k["id"] in owed]
                     if not fo or not (fo["needs_attention"] or kids):
                         continue
                     reasons = []
@@ -529,8 +647,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "reason": body if improvement
                                   else f"{progress['label']} — {body}",
                         "rolled_up": [k["id"] for k in kids],
-                        "decide": (f"jarvis io review {fo_id}" if improvement
-                                   else f"jarvis fo show {fo_id}"),
+                        "decide": decide_command(fo.get("kind"), fo_id),
                     })
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
@@ -596,6 +713,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 store.close()
         inbox = central.unacked_inbox()
         backlog_open = central.list_backlog(status="open")
+        neo_rows = []
         for q in escalated_questions:
             # A `triage` question is the one kind with NO WORKER BEHIND IT (issue #240): nothing is blocked on...
             triage = q.get("kind") == "triage"
@@ -603,7 +721,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             if triage:
                 from . import issues
                 url = (issues.triage_payload(q) or {}).get("issue_url") or ""
-            attention.append({
+            neo_rows.append({
                 "project": q["project"], "wo_id": q["wo_id"],
                 "title": (f"Neo could not confirm a bug's priority: {q['question'][:60]}"
                           if triage else f"Neo escalated: {q['question'][:80]}"),
@@ -617,6 +735,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                            f"jarvis neo show {q['id']}") if triage else
                           f"jarvis neo answer {q['id']} \"…\"",
             })
+        attention.extend(fold_neo_attention(escalated_questions, neo_rows))
         # Gates Neo sent up
         gate_items = []
         # Gate requests that turned out not to be gated actions at all
@@ -653,6 +772,10 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                           f"{int(ui['window_seconds'] / 3600)}h — latest: "
                           f"{ui['recent'][0]['summary']}. Full traceback: {ui['log']}",
             })
+        # Beside it, under the same argument: the daemon is the OS (docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md)
+        liveness = _daemon_liveness(central, pid)
+        if liveness:
+            attention.append(liveness)
         return {
             "daemon": {
                 "running": pid is not None,
@@ -698,6 +821,35 @@ def registered_project_paths() -> dict[str, Path]:
         central.close()
 
 
+MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
+_MODEL_ID_RE = re.compile(r"(?:opus|sonnet|haiku|fable"
+                          r"|claude-(?:opus|sonnet|haiku|fable)-\d+(?:-\d+)*(?:-\d{8})?)"
+                          r"(?:\[1m\])?")
+
+
+def suggested_model_ids() -> list[str]:
+    """What the create forms offer: the aliases, then every id the OS knows by name"""
+    return [*MODEL_ALIASES, *MODEL_ATTRIBUTION_NAMES]
+
+
+def _model_shaped(model: str) -> bool:
+    return bool(_MODEL_ID_RE.fullmatch(model)) or model in MODEL_ATTRIBUTION_NAMES
+
+
+def check_model_id(model: str | None) -> None:
+    """Refuse a model id claude would reject, before anything is filed or relaunched"""
+    import difflib
+
+    if not model or _model_shaped(model):
+        return
+    dashed = model.replace(".", "-")
+    hint = ([dashed] if _model_shaped(dashed)
+            else difflib.get_close_matches(model, suggested_model_ids(), n=1))
+    raise OpsError(f"unknown model id {model!r}"
+                   + (f" — did you mean {hint[0]!r}?" if hint
+                      else f" — use one of {', '.join(MODEL_ALIASES)} or a full claude-… id"))
+
+
 def create_work_order(project_name: str, title: str, description: str = "",
                       origin: str = "jarvis", model: str | None = None,
                       effort: str | None = None, permission_mode: str | None = None,
@@ -718,6 +870,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
     """File a work order (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
     from . import preconditions
 
+    check_model_id(model)
     paths = registered_project_paths()
     if project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
@@ -745,9 +898,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
             f"\"{stated}\" — and nothing holds it back, so jarvisd would claim and "
             f"dispatch it (wo-314221b5 cost 0.93 USD this way). Wire the hold: "
             f"`--depends-on <wo-id>` when another work order in this project must "
-            f"COMPLETE first, or `--blocked-by <bl-…|kn-…|io-…|#issue|text>` when it "
-            f"waits on something that is not a work order. The brief may keep the "
-            f"sentence either way."
+            f"COMPLETE first, `--blocked-by deployed:<wo-id|sha>` when it needs that "
+            f"work order's code RUNNING in production and not merely merged, or "
+            f"`--blocked-by <bl-…|kn-…|io-…|#issue|text>` when it waits on something "
+            f"that is not a work order. The brief may keep the sentence either way."
         )
     store = ProjectStore(paths[project_name])
     try:
@@ -1006,7 +1160,8 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "msg_id": msg_id, "note": note,
-            "delivery": "jarvisd delivers when the worker is idle"}
+            "delivery": ("delivered at the worker's next tool call if it is mid-turn, "
+                         "otherwise as its next turn")}
 
 
 #: What a message-less `jarvis wo retry` puts on the queue. §3 of... (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)
@@ -1099,8 +1254,9 @@ def harvest_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | N
 
 
 def retry(wo_id: str, message: str | None = None, project_name: str | None = None,
-          relay: bool = False) -> dict[str, Any]:
+          relay: bool = False, model: str | None = None) -> dict[str, Any]:
     """`jarvis wo retry` — relaunch a `failed` work order in its own session (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)"""
+    check_model_id(model)
     name, path, wo = find_work_order(wo_id, project_name)
     refusal = retry_refusal(wo)
     if refusal is not None:
@@ -1108,6 +1264,9 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
     # §6 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk beats...
     brief_store = ProjectStore(path)
     try:
+        if model:
+            # Before the send: the relaunch reads `model` off the row
+            brief_store.update_work_order(wo_id, model=model)
         text = (message if message is not None
                 else (harvest.retry_brief(brief_store, wo) or RETRY_NOTE))
     finally:
@@ -1128,7 +1287,8 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
             "note": retry_queued_notice(sent["msg_id"]), "assumptions": len(pending)}
 
 
-def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
+def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
+               now: float | None = None) -> dict[str, Any]:
     """What this work order is actually waiting for, and whether a nudge could help"""
     from . import worker_session
     from .invariants import awaiting_neo, neo_question_blocker
@@ -1180,7 +1340,7 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
         # ...unless the delivery this promises has stopped happening
         from .invariants import stuck_message
 
-        found = stuck_message(store, wo)
+        found = stuck_message(store, wo, now=now)
         if found is not None:
             msg, why = found
             return {"what": "message_stuck", "stalled": False,
@@ -1617,7 +1777,7 @@ def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
 
 def _family_of(store: ProjectStore, fo_id: str) -> list[str]:
     """Every work order a feature is made of: its children, its planner, its manager (docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md)"""
-    family = [c["id"] for c in store.feature_children(fo_id)]
+    family = [c["id"] for c in store.feature_children(fo_id, kinds=WORKER_CHILDREN)]
     fo = store.get_feature_order(fo_id)
     if fo.get("plan_wo_id"):
         family.append(str(fo["plan_wo_id"]))
@@ -1648,9 +1808,9 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
     """How long this order has been in its status, and how long it spent in each before"""
     if bool(wo_id) == bool(fo_id):
         raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
-    from . import holds as holds_mod
+    from . import db, holds as holds_mod
 
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     kind = "wo" if wo_id else "fo"
     order_id = wo_id or fo_id
     # THE READER SUBTRACTS, not its five callers: an optional `spans=` would reproduce issue 887 for...
@@ -1771,7 +1931,9 @@ def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
         unexplained = {"seconds": None, "seconds_human": None, "residual": True,
                        "note": NO_TRANSCRIPT_NOTE}
     # `as_dict` verbatim plus the FORMATTED duration
-    rows = [{**h.as_dict(now), "seconds_human": ago_phrase(h.as_dict(now)["seconds"])}
+    rows = [{**h.as_dict(now), "seconds_human": ago_phrase(h.as_dict(now)["seconds"]),
+             # What held it, so a surface can link there — `None` when the record names nothing
+             "key": h.key}
             for h in episodes]
     return {"episodes": rows, "by_cause": by_cause,
             "open": next((r for r in reversed(rows) if r["open"]), None),
@@ -1880,7 +2042,7 @@ def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     try:
         # One read for one row, the way `os_status` takes one for a whole listing: the account's state can... (#714)
         held_by_fleet = fleet_if_held([wo])
-        blocker = waiting_on(store, wo)
+        blocker = waiting_on(store, wo, now=now)
         needs_you = invariants.true_blockers(store, wo, now)
         # §8 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md
         actor = (scheduled_actor(store, wo, now)
@@ -2225,11 +2387,21 @@ def fix_flag_notice(flag: str) -> str | None:
 
 
 def assume(wo_id: str, content: str) -> dict[str, Any]:
-    """Record an assumption: DB row + ASSUMPTIONS.md append + conditional review flag (#711); cited sections are resolved and snapshotted HERE (kn-924730d7), N of them in one labelled `spec_text` (Q1883) with `spec_path`/`spec_which` PARALLEL NEWLINE LISTS of all N in the same order (user decision 2026-10-15)"""
+    """Record an assumption: DB row + ASSUMPTIONS.md append + conditional review flag (#711)"""
     from . import sections
     from .invariants import neo_reviews_later
 
     name, path, wo = find_work_order(wo_id)
+    # ONE DECISION per assumption, refused never trimmed (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §2)
+    cap = _concision_cap(name, "assume_max_chars", concision.DEFAULT_ASSUME_MAX_CHARS)
+    if cap and len(content) > cap:
+        raise OpsError(
+            f"that assumption is {len(content)} characters; the cap is {cap}. An "
+            f"assumption is ONE DECISION — the option you took, the strongest "
+            f"alternative you rejected and why. Split it: a second decision is a "
+            f"second `jarvis wo assume`, and cite this one in that one by its `#n` "
+            f"(e.g. `per assumption #2`). Nothing was recorded.")
+    _cited_blocks(name, path, wo, content)
     cited = _section_blocks(path, wo, content)
     store = ProjectStore(path)
     try:
@@ -2238,7 +2410,8 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
                                  "spec_which": "\n".join(w for _, w, _ in cited),
                                  "spec_text": sections.label_sections(cited)}
                                 if cited else {}))
-        if not neo_reviews_later(store, wo):
+        # An investigator's call is its diagnosis's audit trail, reviewed by nobody
+        if kind_contract(wo).assumptions_reviewed and not neo_reviews_later(store, wo):
             store.flag_attention(wo_id, "assumptions pending review")
     finally:
         store.close()
@@ -2400,9 +2573,11 @@ def follow_up_admissible(finding: Mapping[str, Any]) -> bool:
 
 def follow_up_feedback(follow_ups: Sequence[Mapping[str, Any]]) -> str:
     """The inadmissible findings, as a note for the SUBMITTER, or "\""""
+    # Spec 2026-10-21 §3.1: a follow-up a seat rated `minor`/`cosmetic` is dropped
     lines = [f"- {follow_up_key(f.get('title'))}"
-             for f in follow_ups if not follow_up_admissible(f)
-             and follow_up_key(f.get("title"))]
+             for f in follow_ups if follow_up_key(f.get("title"))
+             and f.get("level") not in ("minor", "cosmetic")
+             and (not follow_up_admissible(f) or f.get("level") == "medium")]
     if not lines:
         return ""
     return ("\n\nAlso raised, and not blocking — worth fixing here rather than "
@@ -2422,11 +2597,95 @@ def follow_up_repo(project_path: Path) -> str:
     return f"{pair[0]}/{pair[1]}" if pair else ""
 
 
+def _steward_follow_ups(store: ProjectStore, project: ProjectSpec, unit_id: str,
+                        pending: Sequence[Mapping[str, Any]],
+                        payload: dict[str, Any],
+                        context: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The panel stops filing on its own say-so (spec 2026-10-21 §3.1, A5)"""
+    from . import steward
+
+    try:
+        catalog = resolve_catalog()
+    except Exception:  # noqa: BLE001 — see the docstring
+        return list(pending)
+    allowed, held = [], []
+    decided: dict[int, dict[str, Any]] = {}
+    for finding in pending:
+        decision = steward.gate(
+            steward.Candidate("panel", str(finding.get("level") or "medium"),
+                              project.name, str(finding.get("title") or ""),
+                              evidence=(str(finding.get("failure") or ""),),
+                              parent_wo_id=unit_id,
+                              file=str(finding.get("file") or ""),
+                              # A held finding is filed LATER from this (`steward.drain`, #1181)
+                              payload={**context, "finding": dict(finding)}),
+            catalog=catalog, store=store, self_dispatch=True)
+        kept = decided.get(decision.duplicate_of)
+        if kept is not None and not decision.allowed:
+            # One patch covers every seat's wording, so the brief carries them all (Q2109)
+            kept.setdefault("also_worded", []).append(str(finding.get("title") or ""))
+            held.append((finding, decision))
+            continue
+        row = dict(finding)
+        if not decision.duplicate_of:
+            decided[decision.decision_id] = row
+        if decision.allowed:
+            allowed.append(row)
+        else:
+            held.append((row, decision))
+    if held:
+        # `queued`: kept whole on the decision and filed once the steward has room (#1181)
+        payload["steward_held"] = [
+            {"title": f.get("title"), "level": f.get("level"),
+             "decision_id": d.duplicate_of or d.decision_id, "outcome": d.outcome,
+             "queued": d.outcome == "queue" and not d.duplicate_of}
+            for f, d in held]
+    return allowed
+
+
+def reoffer_panel_follow_up(row: Mapping[str, Any], candidate: Any,
+                            decision: Any) -> str:
+    """File one queued panel finding the steward now has room for (`steward.drain`, #1181)"""
+    from . import steward
+
+    held = candidate.payload or {}
+    finding = dict(held.get("finding") or {})
+    if not finding:
+        raise OpsError(f"steward decision #{row['id']} kept no finding to file")
+    # Every seat's wording that folded onto it while it waited: one patch covers them all
+    also = steward.candidate_wordings(row)
+    if also:
+        finding["also_worded"] = [*(finding.get("also_worded") or ()), *also]
+    # The severer wording an escalation kept is the one filed
+    finding["title"], finding["level"] = candidate.subject, decision.severity
+    catalog = resolve_catalog()
+    spec = project_spec(catalog, candidate.project)
+    store = ProjectStore(spec.path)
+    try:
+        filed = file_validation_follow_ups(
+            store, spec, {"round": int(held.get("round") or 0),
+                          "id": int(held.get("round_id") or 0),
+                          "pr_url": str(held.get("pr_url") or "")},
+            [finding], spec.validation, wo_id=held.get("wo_id") or None,
+            fo_id=held.get("fo_id") or None, steward_decided=True)
+    finally:
+        store.close()
+    if filed["failed"]:
+        # The tracker could not be read or written: still queued, offered again next pass
+        raise OpsError(filed.get("reason") or "the follow-up could not be filed")
+    urls = [i["url"] for i in filed["items"]]
+    # Said on the decision's queue note: where the finding went, when not to a tracker issue
+    return (urls[0] if urls else "kept on the internal record" if filed["withheld"]
+            else "dropped over the follow-up cap" if filed["dropped"]
+            else "already on the tracker")
+
+
 def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
                                round_row: Mapping[str, Any],
                                follow_ups: Sequence[Mapping[str, Any]],
                                cfg: Any, *, wo_id: str | None = None,
-                               fo_id: str | None = None) -> dict[str, Any]:
+                               fo_id: str | None = None,
+                               steward_decided: bool = False) -> dict[str, Any]:
     """Keep this unit's non-blocking findings — on the tracker if they may travel there"""
     from . import issues
 
@@ -2442,6 +2701,14 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     pending = _distinct([f for f in follow_ups if follow_up_admissible(f)])
     if not pending:
         return payload
+    if not steward_decided:
+        # `steward_decided`: the steward already said yes to these — a re-offered queue
+        pending = _steward_follow_ups(
+            store, project, unit_id, pending, payload,
+            {"round": n, "round_id": round_id, "pr_url": str(round_row.get("pr_url") or ""),
+             "wo_id": wo_id, "fo_id": fo_id})
+    if not pending:
+        return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
     kept = {str(row["digest"]) for row in store.internal_follow_ups(unit_id)}
     # THE ORDER'S OWN HISTORY, both halves, both local
@@ -2542,7 +2809,7 @@ def _record_filing(store: ProjectStore, payload: dict[str, Any], *,
                    wo_id: str | None, fo_id: str | None) -> dict[str, Any]:
     """Write the event, unless the round had nothing at all to say"""
     if (payload["items"] or payload["withheld"] or payload["dropped"]
-            or payload["failed"]):
+            or payload["failed"] or payload.get("steward_held")):
         if wo_id:
             store.add_event(wo_id, FOLLOW_UPS_EVENT, payload)
         else:
@@ -2559,6 +2826,8 @@ def _follow_up_body(finding: Mapping[str, Any], *, unit_id: str, round_no: int,
     where = " ".join(x for x in (str(finding.get("file") or "").strip(),
                                  str(finding.get("symbol") or "").strip()) if x)
     failure = str(finding.get("failure") or "").strip()
+    # The wordings the steward collapsed onto this one: one patch covers them all (Q2109)
+    also = [str(t).strip() for t in finding.get("also_worded") or () if str(t).strip()]
     footer = [
         "",
         "---",
@@ -2571,6 +2840,8 @@ def _follow_up_body(finding: Mapping[str, Any], *, unit_id: str, round_no: int,
     return "\n".join([detail or "_The seat recorded no detail._",
                       *([f"\n**Where:** `{where}`"] if where else []),
                       *([f"\n**Failure:** {failure}"] if failure else []),
+                      *(["\n**Other seats worded the same defect as:**",
+                         *(f"- {t}" for t in also)] if also else []),
                       *footer])
 
 
@@ -2770,7 +3041,7 @@ AUTOMERGE_TERMINAL = "automerge_merged"
 
 def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
                                 open_end: float) -> list[tuple[float, float]]:
-    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks, each ending at the horizon a `gh` outage leaves (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
+    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
     from . import db
     from .automerge import HELD_CHECKS_RUNNING
 
@@ -3238,7 +3509,12 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
         if unreachable:
             ruling["unreachable"] = unreachable
     base = store.all_assumptions(wo_id)
+    # The net the user called wrong, read by the stakes corpus builder (io-51469add)
+    alarms = {int(p.get("assumption_id") or 0): str(p.get("marker") or p.get("net") or "")
+              for p in (db.from_json(e["payload"], {}) for e in
+                        store.events_of_kind(wo_id, STAKES_FALSE_ALARM_EVENT))}
     rows = [{**a, "os_ruling": newest.get(int(a.get("id") or 0)),
+             "stakes_false_alarm": alarms.get(int(a.get("id") or 0), ""),
              # Both derivations read the carrier and the timeline
              "objection_undeliverable": (bool(a.get("objection_envelope_id"))
                                          and invariants.objection_undeliverable(store, a)),
@@ -3261,7 +3537,7 @@ def _overtaken(store: ProjectStore, wo_id: str) -> dict[str, int] | None:
     fo = store.feature_order_for_planner(wo_id)
     if fo is None or fo.get("plan_wo_id") != wo_id:
         return None
-    children = store.feature_children(fo["id"])
+    children = store.feature_children(fo["id"], kinds=WORKER_CHILDREN)
     merged = sum(1 for c in children if store.events_of_kind(c["id"], "pr_merged"))
     return {"merged": merged, "of": len(children)} if merged else None
 
@@ -3309,6 +3585,48 @@ def objection_response(store: ProjectStore, a: dict[str, Any], *,
     return min(acts, key=lambda act: act["ts"])
 
 
+#: The shortest verbatim run of an objection's reason that counts as quoting it (io-ce566253)
+OBJECTION_QUOTE_MIN_CHARS = 40
+
+
+def stamp_objection_delivery(store: ProjectStore, msg_id: int) -> None:
+    """An objection that actually went out is DELIVERED, stamped here and nowhere"""
+    envelope = store.envelope_for_message(int(msg_id))
+    if envelope is None:
+        _stamp_late_objection_delivery(store, msg_id)
+        return
+    if envelope["kind"] != "assumption_objection":
+        return
+    a = store.assumption_for_envelope(int(envelope["id"]))
+    if a is not None and a.get("objection_delivered_ts") is None:
+        store.mark_objection_delivered(int(a["id"]))
+
+
+def _stamp_late_objection_delivery(store: ProjectStore, msg_id: int) -> None:
+    """An ordinary message that QUOTES an undelivered objection delivered it, late (io-ce566253)"""
+    msg = store.get_message(int(msg_id))
+    if not msg or msg.get("direction") != "user_to_agent":
+        return
+    for a in store.undelivered_objections(str(msg["wo_id"])):
+        if objection_quoted_in(str(msg.get("content") or ""), a):
+            store.mark_objection_delivered(int(a["id"]), late_msg_id=int(msg_id))
+
+
+def objection_quoted_in(content: str, a: dict[str, Any]) -> bool:
+    """Does `content` carry this objection — half its reason verbatim, case and spacing aside?"""
+    import difflib
+
+    def norm(text: str) -> str:
+        return " ".join(text.lower().split())
+
+    reason, body = norm(str(a.get("provisional_reason") or "")), norm(content)
+    if len(reason) < OBJECTION_QUOTE_MIN_CHARS or not body:
+        return False
+    run = difflib.SequenceMatcher(None, reason, body, autojunk=False).find_longest_match(
+        0, len(reason), 0, len(body)).size
+    return run >= max(OBJECTION_QUOTE_MIN_CHARS, len(reason) // 2)
+
+
 def objection_response_line(a: dict[str, Any]) -> str:
     """WHAT THE WORKER DID about the objection, or that it still owes an answer"""
     delivered = a.get("objection_delivered_ts")
@@ -3333,6 +3651,9 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
     ruling = a.get("os_ruling") or {}
     kind, reason = str(ruling.get("kind") or ""), str(ruling.get("reason") or "").strip()
     question = ruling.get("neo_question_id")
+    if kind == "autoreview_escalated" and ruling.get("re_asked"):
+        return (f"The OS dropped Neo's ruling (question {question}) and will ask again"
+                f"{' — ' + reason if reason else ''}")
     if kind == "autoreview_escalated":
         asked = f" (question {question})" if question else ""
         return f"Neo escalated{asked}{': ' + reason if reason else ''}"
@@ -3394,6 +3715,9 @@ def objection_line(a: dict[str, Any]) -> str:
     transport = str(a.get("objection_transport") or "") or "queue"
     sent = f" at {_stamp(a['objection_sent_ts'])}" if a.get("objection_sent_ts") else ""
     head = f"objection sent to the worker over the {transport}{sent}"
+    if a.get("objection_delivered_ts") and a.get("objection_late_msg_id"):
+        return (f"{head}, delivered late at {_stamp(a['objection_delivered_ts'])} "
+                f"in message {a['objection_late_msg_id']}")
     if a.get("objection_delivered_ts"):
         return f"{head}, delivered at {_stamp(a['objection_delivered_ts'])}"
     if a.get("objection_withdrawn_ts"):
@@ -3435,6 +3759,9 @@ def _autoreview_line(state: dict[str, Any]) -> str:
     if kind == "autoreview_accepted":
         return (f"assumption #{n} accepted by the OS (Neo, "
                 f"{state.get('model') or 'model not recorded'}) — "
+                f"{state.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_escalated" and state.get("re_asked") and not since:
+        return (f"assumption #{n} goes back to Neo — the OS dropped its ruling: "
                 f"{state.get('reason') or 'no reason recorded'}")
     if kind == "autoreview_escalated":
         return (f"assumption #{n} left with you — "
@@ -3555,6 +3882,23 @@ def config_version_line(version_id: str | None) -> str:
     return f"{version_id} ({since} versions since)" if since else version_id
 
 
+def concision_config(project: str | None = None) -> Any:
+    """The concision settings in force for `project` — or the OS's — or None"""
+    try:
+        catalog = resolve_catalog()
+        if project is None:
+            return catalog.os.concision
+        return catalog.project(project).concision
+    except (OpsError, CatalogError, OSError, ValueError):
+        return None
+
+
+def _concision_cap(project: str | None, field: str, default: int) -> int:
+    """One per-project character cap, falling back to the fleet default (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §2)"""
+    cfg = concision_config(project)
+    return default if cfg is None else int(getattr(cfg, field, default))
+
+
 def validation_config(project: str | None = None) -> Any:
     """The validation settings in force for `project` — or the OS's — or None"""
     try:
@@ -3575,6 +3919,9 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     if not pr_url and not store.work_abandoned(wo_id):
         stranding = unlanded_work(store, wo)
         if stranding.produced:
+            # The one parker: every route to `completed` passes here (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §2)
+            if stranding.pushed and kind_contract(wo).lands_code:
+                return park_pr_pending(store, wo, stranding)
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
     # Spec §C of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md
@@ -3589,11 +3936,22 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     return status
 
 
+#: The `pr_url_recorded` sources that route the merge queue; `gate` and `plan_submit` stay inert
+DECLARING_SOURCES = ("user", "auto")
+
+
 def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
-    """The pull request the SUBMITTER declared — the only one that routes the merge queue (#742)"""
-    for event in reversed(store.events_of_kind(wo["id"], "finished")):
-        declared = str(db.from_json(event["payload"], {}).get("pr_url") or "")
-        if declared:
+    """The pull request the SUBMITTER declared (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §8.1)"""
+    # Newest first; read order breaks a timestamp tie, the later row winning
+    events = [(float(e["ts"]), seq, kind, db.from_json(e["payload"], {}))
+              for seq, (kind, e) in enumerate(
+                  (kind, e) for kind in ("finished", "pr_url_recorded")
+                  for e in store.events_of_kind(wo["id"], kind))]
+    for _ts, _seq, kind, payload in sorted(events, key=lambda e: e[:2], reverse=True):
+        declared = str(payload.get("pr_url") or "")
+        if not declared:
+            continue
+        if kind == "finished" or str(payload.get("source") or "") in DECLARING_SOURCES:
             return declared
     return ""
 
@@ -3623,7 +3981,8 @@ def authorship(store: ProjectStore, wo: dict[str, Any]) -> landing.Authored:
     from . import landing
 
     recorded = store.get_work_order(wo["id"])
-    return landing.authored(landing.worktree_of(store.project_path, recorded))
+    return landing.authored(landing.worktree_of(store.project_path, recorded),
+                            submission_artifacts(recorded))
 
 
 def unmerged_pull_request(store: ProjectStore, wo_id: str) -> str:
@@ -3649,6 +4008,19 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
     store.flag_attention(wo["id"], UNLANDED_BLOCKER)
+    return "needs_review"
+
+
+def park_pr_pending(store: ProjectStore, wo: dict[str, Any],
+                    work: landing.Authored) -> str:
+    """Hold an order whose branch is pushed with no pull request (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §2)"""
+    if store.pr_pending_open(wo["id"]):
+        store.set_status(wo["id"], "needs_review", trigger="pr_pending_repark")
+        return "needs_review"
+    park = {**work.record(), "was": wo["status"]}
+    store.add_event(wo["id"], PR_PENDING_EVENT, park)
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], pr_pending_blocker(wo["id"], park))
     return "needs_review"
 
 
@@ -3762,6 +4134,18 @@ def first_red_hold(store: ProjectStore, wo_id: str) -> float | None:
     return min(stamps) if stamps else None
 
 
+def park_unshipped_release(store: ProjectStore, wo: dict[str, Any]) -> str | None:
+    """A release order that cut NO release asks the user instead of completing (issue #1206)"""
+    wo_id = str(wo["id"])
+    if not release.is_release_order(wo) or _release_effects(store, wo_id):
+        return None
+    store.add_event(wo_id, release.NOTHING_SHIPPED_EVENT, {"was": wo["status"]})
+    store.set_status(wo_id, "needs_review", trigger="release_shipped_nothing")
+    store.flag_attention(
+        wo_id, invariants.RELEASE_NOTHING_SHIPPED_BLOCKER.format(wo_id=wo_id))
+    return "needs_review"
+
+
 def park_red_release(store: ProjectStore, wo_id: str, fact: dict[str, Any]) -> str:
     """Past the threshold the release stops waiting and asks the user (§3)"""
     if store.release_red_park_open(wo_id):
@@ -3781,7 +4165,7 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
     """THE JOIN: where a finished work order sits, given BOTH gates over it (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §2)"""
     assert not (panel_cleared and panel_open), "the panel is settled or it is not"
     wo_id = wo["id"]
-    if store.pending_assumptions(wo_id):
+    if invariants.reviewable_assumptions(store, wo):
         store.set_status(wo_id, "needs_review")
         store.flag_attention(wo_id, "assumptions pending review")
         return "needs_review"
@@ -3885,10 +4269,10 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
     from .invariants import VALIDATION_STUCK_BLOCKER
 
     wo_id = wo["id"]
-    store.close_validation_round(round_id, "escalated", reason)
-    store.add_event(wo_id, "validation_escalated",
-                    {"round": n, "round_id": round_id, "reason": reason,
-                     "cause": cause})
+    store.settle_validation_round(
+        round_id, "escalated",
+        {"round": n, "round_id": round_id, "reason": reason, "cause": cause},
+        wo_id=wo_id, reason=reason)
     store.set_status(wo_id, "needs_review")
     store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
     store.add_notification(
@@ -3896,7 +4280,7 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
         title=ESCALATION_TITLE.format(
             unit=wo_id, n=n, verb=ESCALATION_VERB[ESCALATION_FAMILY[cause]]),
         body=escalation_body(reason), level="warning", wo_id=wo_id,
-        source="validation",
+        source="validation", paired=True,
     )
 
 
@@ -4509,7 +4893,7 @@ def unintegrated_children(project_path: Path, store: ProjectStore, fo_id: str, h
     from . import branchproof
 
     missing: list[tuple[dict[str, Any], str]] = []
-    for child in store.feature_children(fo_id):
+    for child in store.feature_children(fo_id, kinds=WORKER_CHILDREN):
         # The children `settle_features` counted
         if child["superseded"] or child["status"] != "completed":
             continue
@@ -4527,9 +4911,11 @@ def collect_feature_evidence(store: ProjectStore, project_path: Path,
     from . import evidence as evidence_mod
 
     children = []
-    for child in store.feature_children(fo["id"]):
+    for child in store.feature_children(fo["id"], kinds=WORKER_CHILDREN):
         last = store.latest_validation_round(wo_id=child["id"])
-        children.append({**child, "declared": str((last or {}).get("evidence") or "")})
+        # `merge_commit` is what scopes the feature's diff to its own children (issue 985)
+        children.append({**child, "declared": str((last or {}).get("evidence") or ""),
+                         "merge_commit": recorded_merge_commit(store, child)})
     return evidence_mod.collect_feature(project_path, fo, children, declared=declared,
                                         summary=summary, diff_chars=cfg.diff_chars,
                                         side_effects=feature_side_effects(store,
@@ -4643,10 +5029,24 @@ def gate_still_open(wo_id: str, request: dict[str, Any]) -> str:
             f"a privileged action nobody ruled on. {way_on}")
 
 
-def unlanded_refusal(wo_id: str, summary: str, work: landing.Authored) -> str:
-    """Why this work order may not finish, and the three ways on (#232)"""
+def unlanded_refusal(wo: dict[str, Any], summary: str, work: landing.Authored) -> str:
+    """Why this work order may not finish, and only the ways on its OWN kind may take (#232)"""
     from . import landing as landing_mod
 
+    wo_id = str(wo["id"])
+    contract = kind_contract(wo)
+    if not contract.lands_code:
+        # NO LANDING ROUTE TO OFFER: commit, push and `--pr` are outside this kind's write surface
+        submit = contract.submit.format(fo_id=wo.get("parent_id") or "<order-id>")
+        files = ", ".join(f"`{f}`" for f in work.dirty[:5]) or work.describe()
+        return (
+            f"{wo_id} is the {wo.get('kind')} of its order: it does not land code, so "
+            f"nothing it leaves in its worktree can be delivered. Its artifact is "
+            f"`{contract.artifact}` and its submission is `{submit}` — but the worktree "
+            f"also holds {files}, which no submission consumes and no command of yours "
+            f"may land. End your turn naming those files: what happens to them is the "
+            f"user's call."
+        )
     named = landing_mod.pr_urls_in(summary)
     if named:
         lead = (f"Your summary names {named[0]}, but you did not pass it as `--pr`. "
@@ -4685,8 +5085,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                 open_requests[0])))
         # Read ONCE, before anything is written: a refused finish must leave the record exactly as it found...
         stranding = unlanded_work(store, _wo, pr_url or "")
-        if stranding.produced and not abandon:
-            raise OpsError(unlanded_refusal(wo_id, summary, stranding))
+        # A pushed branch is undertaken to land, not refused; `land_finished` parks it (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §2)
+        if (stranding.produced and not abandon
+                and not (stranding.pushed and kind_contract(_wo).lands_code)):
+            raise OpsError(unlanded_refusal(_wo, summary, stranding))
         # `stranding` is the REFUSAL's reading and is deliberately empty for an order carrying a pull...
         work = stranding if stranding.base else authorship(store, _wo)
         fields: dict[str, Any] = {"result_summary": summary}
@@ -4713,6 +5115,11 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         if deferred is not None:
             return {"project": name, "wo_id": wo_id, "status": deferred,
                     **({"pr_url": pr_url} if pr_url else {})}
+        # The red base is one reason a release cuts nothing; `completed` is wrong for every other
+        unshipped = park_unshipped_release(store, fresh)
+        if unshipped is not None:
+            return {"project": name, "wo_id": wo_id, "status": unshipped,
+                    **({"pr_url": pr_url} if pr_url else {})}
         opened = bounced = None
         # The overlay: `pr_url` is not written until `land_when_cleared` below (2026-10-01 spec §2
         submits = validation_applies(cfg, {**fresh, "pr_url": pr_url}, store)
@@ -4732,6 +5139,45 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
             **({"pr_url": pr_url} if pr_url else {})}
+
+
+def record_pull_request(wo_id: str, url: str, project_name: str | None = None,
+                        source: str = "user") -> dict[str, Any]:
+    """Record the pull request the user opened for a pushed-branch park; never a `finished` event (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §8)"""
+    from . import github
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        # A declaration is never overwritten, as in `gates._record_pull_request`
+        if wo.get("pr_url"):
+            raise OpsError(
+                f"{wo_id} already records {wo['pr_url']}. A pull request is declared "
+                f"once; if that one is wrong, close the order with `jarvis wo done`.")
+        if store.pr_pending_open(wo_id) is None:
+            owed = true_blockers(store, wo)
+            waiting = owed[0] if owed else f"{wo['status']}, with nothing owed"
+            raise OpsError(
+                f"{wo_id} has no pushed branch waiting on a pull request. "
+                f"What it is waiting on: {waiting}.")
+        try:
+            url = github.checked_pr_url(url, store.project_path)
+        except github.UntrustedPullRequest as e:
+            raise OpsError(str(e)) from e
+        store.update_work_order(wo_id, pr_url=url)
+        store.add_event(wo_id, "pr_url_recorded", {"pr_url": url, "source": source})
+        fresh = store.get_work_order(wo_id)
+        status = fresh["status"]
+        # Judge the row it would become before writing the status: the merge poll reads the status
+        probe = {**fresh, "status": "waiting_pr_merge"}
+        if status == "needs_review" and not true_blockers(store, probe):
+            store.set_status(wo_id, "waiting_pr_merge")
+            store.clear_attention(wo_id)
+            status = "waiting_pr_merge"
+        return {"project": name, "wo_id": wo_id, "pr_url": url, "source": source,
+                "status": status}
+    finally:
+        store.close()
 
 
 def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -4763,7 +5209,14 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
 
 def close_out(store: ProjectStore, wo: dict[str, Any], event: str, *, why: str,
               payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Settle a work order as `completed` and take its worker down with it"""
+    """Settle a work order as `completed` and take its worker down with it, from OUTSIDE it"""
+    if os.environ.get("JARVIS_WO_ID") == wo["id"]:
+        # THE CALLER IS INSIDE THE SESSION THIS WOULD KILL, and every write after it (io-d2a5dd69)
+        raise OpsError(
+            f"refusing to close {wo['id']} from inside its own session: closing it stops "
+            f"that session, and this process with it, before the close is recorded. A "
+            f"work order settles itself through its own contract command "
+            f"(`settle_in_session`), never through `close_out`.")
     stopped = stop_worker_session(wo, store)
     store.set_status(wo["id"], "completed")
     store.clear_attention(wo["id"])
@@ -4774,6 +5227,15 @@ def close_out(store: ProjectStore, wo: dict[str, Any], event: str, *, why: str,
                         {**{k: v for k, v in stopped.items() if k != "stopped"},
                          "reason": why})
     return stopped
+
+
+def settle_in_session(store: ProjectStore, wo: dict[str, Any], event: str, *,
+                      payload: dict[str, Any] | None = None) -> None:
+    """Settle a work order `completed` from INSIDE its own turn (io-d2a5dd69)"""
+    store.set_status(wo["id"], "completed", trigger="submitted")
+    store.clear_attention(wo["id"])
+    store.add_event(wo["id"], event, {**(payload or {}), "was": wo["status"],
+                                      "session_stopped": False})
 
 
 def mark_backlog_done(wo: dict[str, Any]) -> None:
@@ -4793,9 +5255,10 @@ def void_round_for_settled_pr(store: ProjectStore, wo: dict[str, Any],
     rnd = store.latest_validation_round(wo_id=wo["id"])
     if not rnd or not store.round_machine_owns(rnd):
         return None
-    store.close_validation_round(rnd["id"], "void", reason)
-    store.add_event(wo["id"], "validation_void",
-                    {"round": rnd["round"], "round_id": rnd["id"], "reason": reason})
+    store.settle_validation_round(
+        rnd["id"], "void",
+        {"round": rnd["round"], "round_id": rnd["id"], "reason": reason},
+        wo_id=wo["id"], reason=reason)
     return int(rnd["round"])
 
 
@@ -5066,6 +5529,8 @@ BASE_UPDATE_BASE_RED = "base_red"
 
 #: How many times the OS may catch one pull request up with a MOVING base
 CATCH_UP_MAX = 3
+#: ...WITHIN THIS WINDOW: a RATE, not a lifetime budget (#1215, Neo 2191)
+CATCH_UP_WINDOW_SECONDS = 2 * 3600
 
 #: A merge the OS refused because the base moved under the judged commit — spec 2026-09-28 §3.1
 MERGE_BASE_STALE_EVENT = "automerge_base_stale"
@@ -5077,6 +5542,12 @@ CATCH_UP_DEFERRED = "deferred"
 CATCH_UP_EXHAUSTED = "exhausted"
 CATCH_UP_FAILED = "failed"
 
+#: `CatchUp.cause` on a DEFERRED outcome: the three waits are not one wait (#1188)
+CATCH_UP_DEFER_IN_FLIGHT = "in_flight"
+CATCH_UP_DEFER_HEAD_MOVED = "head_moved"
+#: The head moved off the judged commit AND no carry could be proven onto it
+CATCH_UP_DEFER_CARRY_UNPROVEN = "carry_unproven"
+
 
 @dataclass(frozen=True)
 class CatchUp:
@@ -5086,6 +5557,8 @@ class CatchUp:
     outcome: str
     reason: str = ""
     base_tip: str = ""
+    #: `CATCH_UP_DEFER_*` on a DEFERRED outcome: WHICH wait, so a caller can answer it
+    cause: str = ""
 
 
 #: How many times the OS may RE-JUDGE a merge it asked for itself, outside the round budget (docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.6)
@@ -5232,14 +5705,15 @@ def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: 
                      "reason": reason, "cause": cause})
 
 
-def catch_up_attempts(store: ProjectStore, wo_id: str) -> int:
-    """How often the OS has already caught this pull request up with a moving base"""
+def catch_up_attempts(store: ProjectStore, wo_id: str, *, now: float = 0.0) -> int:
+    """How often the OS has caught this pull request up within `CATCH_UP_WINDOW_SECONDS`"""
     from . import invariants as invariants_mod
 
+    since = (now or db.now()) - CATCH_UP_WINDOW_SECONDS
     n = 0
     for row in store.events_of_kind(wo_id, invariants_mod.PR_BASE_UPDATED_EVENT):
         payload = db.from_json(row.get("payload"), {}) or {}
-        if payload.get("cause") == BASE_UPDATE_BEHIND:
+        if payload.get("cause") == BASE_UPDATE_BEHIND and float(row["ts"] or 0.0) >= since:
             n += 1
     return n
 
@@ -5419,6 +5893,30 @@ def stop_worker_session(wo: dict[str, Any], store: ProjectStore) -> dict[str, An
     return {"stopped": False, "bg_id": bg_id, "reason": "`claude stop` failed"}
 
 
+def respawn_worker(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Restart an order's background session process under the same id, sending nothing (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    from . import claude_cli, worker_session
+
+    _name, path, wo = find_work_order(wo_id, project_name)
+    if not worker_session.is_background(wo) or not wo.get("bg_id"):
+        raise OpsError(f"{wo_id} does not run on a background session — nothing to respawn")
+    store = ProjectStore(path)
+    try:
+        if worker_session.busy(store, wo_id):
+            # A restart under a running turn would end it wherever it had got to
+            raise OpsError(f"{wo_id} has a turn in flight; respawn it once that settles")
+        ok = claude_cli.respawn_bg(str(wo["bg_id"]))
+        if ok:
+            store.add_event(wo_id, "session_respawned", {"bg_id": wo["bg_id"],
+                                                         "session_id": wo["session_id"]})
+    finally:
+        store.close()
+    if not ok:
+        raise OpsError(f"`claude respawn {wo['bg_id']}` failed")
+    return {"wo_id": wo_id, "bg_id": wo["bg_id"], "session_id": wo["session_id"],
+            "respawned": True}
+
+
 def cancel(wo_id: str) -> dict[str, Any]:
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
@@ -5481,7 +5979,61 @@ def ack_attention(wo_id: str | None = None, all_projects: bool = False,
                 acknowledged.append(wo["id"])
         finally:
             store.close()
-    return {"acknowledged": acknowledged, "skipped": skipped}
+    # ...and the notifications raised WITH those flags are the same incident
+    read = 0
+    if acknowledged:
+        central = CentralStore()
+        try:
+            read = sum(central.ack_paired_inbox(w) for w in acknowledged)
+        finally:
+            central.close()
+    return {"acknowledged": acknowledged, "skipped": skipped, "inbox_read": read}
+
+
+def ack_inbox(inbox_id: int | None = None) -> dict[str, Any]:
+    """`jarvis inbox ack` — mark notifications read"""
+    from .invariants import true_blockers
+
+    central = CentralStore()
+    try:
+        if inbox_id is None:
+            items = central.unacked_inbox()
+        else:
+            one = central.get_inbox(inbox_id)
+            items = [one] if one and one["status"] != "acked" else []
+        n = central.ack_inbox(inbox_id)
+    finally:
+        central.close()
+    paths = registered_project_paths()
+    lowered: list[str] = []
+    kept: list[dict[str, str]] = []
+    for it in items:
+        # A standalone notification has nothing paired to lower
+        if it.get("paired_reason") is None or not it.get("wo_id"):
+            continue
+        path = paths.get(it["project"])
+        if path is None or not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            try:
+                wo = store.get_work_order(it["wo_id"])
+            except KeyError:
+                continue
+            # Only the SAME incident: a flag that has since moved on is a new thing to see
+            if not wo["needs_attention"] or wo.get("attention_reason") != it["paired_reason"]:
+                continue
+            blockers = true_blockers(store, wo)
+            if ack_refusal(wo, blockers) is not None:
+                # A pending decision is never dismissed by reading a notification
+                kept.append({"wo_id": wo["id"],
+                             "reason": ack_decision_blocker(blockers) or ""})
+                continue
+            store.ack_attention(wo["id"], blockers)
+            lowered.append(wo["id"])
+        finally:
+            store.close()
+    return {"acked": n, "attention_lowered": lowered, "attention_kept": kept}
 
 
 def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -5531,7 +6083,7 @@ def unblock_work_order(wo_id: str, drop_all: bool = False,
         if not blockers and not rows:
             raise OpsError(f"{wo_id} is not blocked by anything")
         cut = blockers if drop_all else invariants.dead_dependencies(store, wo)
-        live, stranding = _split_preconditions(rows)
+        live, stranding = _split_preconditions(rows, store)
         clearable = stranding + (live if drop_all else [])
         if not cut and not clearable:
             raise OpsError(
@@ -5551,14 +6103,23 @@ def unblock_work_order(wo_id: str, drop_all: bool = False,
             "preconditions_cleared": cleared}
 
 
-def _split_preconditions(rows: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+def _split_preconditions(rows: list[dict[str, Any]],
+                         store: ProjectStore) -> tuple[list[str], list[str]]:
     """(live, stranding) refs — what the daemon can still clear, and what it never can"""
+    from . import preconditions
+
     live: list[str] = []
     stranding: list[str] = []
     central = CentralStore()
     try:
         for row in rows:
             ref = str(row["ref"])
+            target = preconditions.deployed_target(ref)
+            if target:
+                # docs/superpowers/specs/2026-10-22-a-deployed-precondition-clears-itself.md §2.3
+                (live if _deployed_hold_is_live(store, target)
+                 else stranding).append(ref)
+                continue
             item = central.get_backlog(ref) if ref.startswith("bl-") else None
             # Unsettled, NOT just `open`: a `promoted` item is still one the daemon can clear later
             (live if item is not None
@@ -5567,6 +6128,17 @@ def _split_preconditions(rows: list[dict[str, Any]]) -> tuple[list[str], list[st
     finally:
         central.close()
     return live, stranding
+
+
+def _deployed_hold_is_live(store: ProjectStore, target: str) -> bool:
+    """Can the daemon still resolve this `deployed:` target to a commit it can test?"""
+    if not target.startswith("wo-"):
+        return True
+    try:
+        store.get_work_order(target)
+    except KeyError:
+        return False
+    return True
 
 
 def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -5578,6 +6150,11 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
         deleted = store.delete_work_order(wo_id)
     finally:
         store.close()
+    if wo.get("transport") == "background" and wo.get("bg_id"):
+        # The order's ONE session goes with it (`claude rm` keeps a worktree holding unpushed work)
+        from . import claude_cli
+        deleted["background_session"] = int(
+            claude_cli.remove_bg(str(wo["bg_id"])) is not None)
     central = CentralStore()
     try:
         deleted.update(central.purge_work_order(wo_id))
@@ -5607,7 +6184,9 @@ def exempt_from_validation(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Is this submission one no panel round may open over?"""
     from . import verdicts
 
-    return wo.get("kind") == "investigator" and verdicts.verdict_stored(store, wo)
+    # THE KIND TABLE, not a kind name: a kind settled by its submission is never judged by a panel
+    return (kind_contract(wo).route == SETTLE_IN_SESSION
+            and verdicts.verdict_stored(store, wo))
 
 
 def validation_applies(cfg: Any, wo: dict[str, Any], store: ProjectStore) -> bool:
@@ -5699,14 +6278,77 @@ def record_provisional_verdict(store: ProjectStore, wo: dict[str, Any],
         "neo_question_id": question_id, "decided_by": ASSUMPTION_DECIDER_OS})
 
 
-def review_work_order(wo_id: str, accept: bool = True,
-                      feedback: str = "") -> dict[str, Any]:
+#: The event a user's 'false alarm' writes: a defect in the high-stakes net, never an authorisation
+STAKES_FALSE_ALARM_EVENT = "autoreview_stakes_false_alarm"
+
+#: The user's own words for a net that fired on nothing (wo-764454c5, wo-8fd40f1a)
+FALSE_ALARM_RE = re.compile(r"\bfalse[ -]alarm", re.IGNORECASE)
+
+
+def _record_stakes_false_alarms(store: ProjectStore, wo_id: str,
+                                pending: list[dict[str, Any]], *, feedback: str,
+                                net: str) -> frozenset[int]:
+    """A user's 'false alarm' on a row the high-stakes net held is a CLASSIFIER DEFECT"""
+    from . import autoreview
+
+    held: dict[int, dict[str, Any]] = {}
+    for event in store.events_of_kind(wo_id, "autoreview_held"):
+        payload = db.from_json(event["payload"], {})
+        if payload.get("code") == autoreview.HELD_HIGH_STAKES:
+            held[int(payload.get("assumption_id") or 0)] = payload
+    recorded = set()
+    for a in pending:
+        hold = held.get(int(a["id"]))
+        if hold is None:
+            continue
+        content = str(a.get("content") or "")
+        store.add_event(wo_id, STAKES_FALSE_ALARM_EVENT, {
+            "assumption_id": a["id"], "n": a.get("n"), "net": net,
+            "marker": autoreview.high_stakes_marker(
+                content, tightened=net == "regex-tightened"),
+            "hold_reason": str(hold.get("reason") or ""), "feedback": feedback})
+        recorded.add(int(a["id"]))
+    return frozenset(recorded)
+
+
+def _teach_assumption_rules(project: str, wo: dict[str, Any], rows: list[dict[str, Any]],
+                            accepted: bool, feedback: str, *,
+                            false_alarms: frozenset[int] = frozenset(),
+                            tightened: bool = False) -> list[int]:
+    """Write the user's ruling as rule-shaped learnings — a no-reason one only once per class"""
+    from . import neo as neo_mod
+    from .neo_store import NeoStore
+
+    if not rows:
+        return []
+    rules = neo_mod.learnings_from_assumption_review(
+        wo, rows, accepted, feedback, false_alarms=false_alarms, tightened=tightened)
+    neo = NeoStore()
+    try:
+        ids = []
+        for rule in rules:
+            # A reasonless rule is the same sentence every time: writing it twice would crowd real rules out
+            if not (feedback or "").strip() and neo.has_active_learning(rule, project):
+                continue
+            ids.append(int(neo.add_learning(rule, project=project, source="review")["id"]))
+        return ids
+    finally:
+        neo.close()
+
+
+def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
+                      false_alarm: bool = False) -> dict[str, Any]:
     """Accept (or reject) all pending assumptions and settle the work order"""
     name, path, wo = find_work_order(wo_id)
     cfg = validation_config(name)
+    net = str(getattr(cfg, "stakes_classifier", "") or DEFAULT_STAKES_CLASSIFIER)
     store = ProjectStore(path)
     try:
-        pending = store.pending_assumptions(wo_id)
+        pending = [a for a in store.all_assumptions(wo_id) if a["status"] == "pending"]
+        alarms: frozenset[int] = frozenset()
+        if false_alarm or FALSE_ALARM_RE.search(feedback or ""):
+            alarms = _record_stakes_false_alarms(store, wo_id, pending,
+                                                 feedback=feedback, net=net)
         for a in pending:
             # STAMPED `user` RATHER THAN LEFT EMPTY
             store.review_assumption(a["id"], "accepted" if accept else "rejected",
@@ -5720,25 +6362,25 @@ def review_work_order(wo_id: str, accept: bool = True,
                 store.flag_attention(wo_id, "assumptions rejected — send guidance with `jarvis wo send`")
         store.add_event(wo_id, "reviewed", {"accepted": accept, "count": len(pending),
                                             "feedback": feedback})
+        park = store.pr_pending_open(wo_id)
     finally:
         store.close()
 
     out = {"project": name, "wo_id": wo_id, "reviewed": len(pending), "accepted": accept,
            "status": status}
+    if alarms:
+        out["false_alarms"] = len(alarms)
+    learned = _teach_assumption_rules(name, wo, pending, accept, feedback,
+                                      false_alarms=alarms,
+                                      tightened=net == "regex-tightened")
+    if learned:
+        out["learning_id"], out["learning_ids"] = learned[0], learned
+    # An accept that parked says what still waits (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §7)
+    if park is not None:
+        out["pr_pending"] = {k: park.get(k) or ""
+                             for k in ("branch", "base", "compare_url")}
     if not feedback:
         return out
-
-    from . import neo as neo_mod
-    from .neo_store import NeoStore
-    neo = NeoStore()
-    try:
-        learning = neo.add_learning(
-            neo_mod.learning_from_assumption_review(wo, pending, accept, feedback),
-            project=name, source="review",
-        )
-    finally:
-        neo.close()
-    out["learning_id"] = learning["id"]
 
     # A rejection without guidance reaching the worker just strands it
     if not accept and wo["status"] in OPEN_STATUSES:
@@ -5843,9 +6485,86 @@ def find_feature_order(fo_id: str, project_name: str | None = None
     raise OpsError(f"feature order {fo_id!r} not found in any registered project")
 
 
+#: Every id the OS mints that has a page, and the shapes a reader types for the rest
+_REF_ID = re.compile(r"^(wo|fo|io|inv|kn|al|mv|bl)-[0-9a-f]{8}$")
+_REF_NUMBERED = re.compile(r"^(q|gate-|issue-|#)?(\d+)$")
+
+
+def resolve_ref(ref: str) -> str:
+    """The dashboard page that shows this id — `/go/<id>` (docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md §1)"""
+    ref = ref.strip()
+    search = "/search?q=" + quote(ref)
+    numbered = _REF_NUMBERED.match(ref.lower())
+    if numbered:
+        kind, n = numbered.groups()
+        if kind == "gate-":
+            return f"/gates#gate-{n}"
+        if kind in ("issue-", "#"):
+            return "/search?q=" + quote(f"#{n}")
+        # a bare number is the one id a reader is shown without a prefix: a Neo question's
+        return f"/neo/question/{n}"
+    found = _REF_ID.match(ref.lower())
+    if not found:
+        return search
+    rid, prefix = found.group(0), found.group(1)
+    try:
+        if prefix == "wo":
+            name, _, _ = find_work_order(rid)
+            return order_path(name, rid)
+        if prefix in ("fo", "io", "inv"):
+            name, _, _ = find_feature_order(rid)
+            return order_path(name, rid)
+        if prefix == "al":
+            name, _, _ = _find_alarm(rid)
+            return f"/alarms/{name}/{rid}"
+    except OpsError:
+        return search
+    # Listed on one fleet-wide page each, and addressed there by their own id
+    return {"kn": "/knowledge", "mv": "/morpheus", "bl": "/backlog"}[prefix] + f"#{rid}"
+
+
+def worker_prompts(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Every prompt the OS sent this order's conversation, turn by turn — `wo_turns.prompt` verbatim"""
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        turns = store.list_turns(wo_id, limit=10_000)
+    finally:
+        store.close()
+    return {"project": name, "wo": wo,
+            "turns": [{"seq": t["seq"], "kind": t["kind"], "state": t["state"],
+                       "started_at": t["started_at"], "msg_id": t["msg_id"],
+                       "prompt": t["prompt"], "chars": len(t["prompt"] or "")}
+                      for t in turns]}
+
+
+#: The placeholder a prompt preview is composed for
+PREVIEW_WO = {"id": "wo-00000000", "title": "(the title of a new work order)",
+              "description": "(its description — the brief the user or Jarvis wrote)"}
+
+
+def project_prompt_preview(name: str) -> dict[str, Any]:
+    """What a NEW work order on this project would be told today, and the OPERATION.md beside it"""
+    from .dispatch import build_worker_prompt, knowledge_for
+
+    catalog = resolve_catalog()
+    spec = project_spec(catalog, name)
+    central = CentralStore()
+    try:
+        knowledge = knowledge_for(central, spec, PREVIEW_WO, catalog.os)
+    finally:
+        central.close()
+    operation = spec.path / "OPERATION.md"
+    return {"project": name, "path": str(spec.path), "wo": PREVIEW_WO,
+            "prompt": build_worker_prompt(dict(PREVIEW_WO), spec, knowledge),
+            "operation_path": str(operation),
+            "operation": operation.read_text() if operation.is_file() else None}
+
+
 def feature_progress(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any]:
-    """How far along this feature order is, derived from its children every time"""
-    children = store.feature_children(fo["id"])
+    """How far along this family is, from the children its kind exists to run"""
+    children = store.feature_children(
+        fo["id"], kinds=FAMILY_CHILD_KINDS[fo.get("kind") or "feature"])
     done = sum(1 for c in children if c["status"] == "completed")
     return {
         "children": len(children),
@@ -5950,6 +6669,66 @@ def family_prose(kind: str | None) -> tuple[str, str]:
     return _KIND_FAMILY.get(kind or "feature", _KIND_FAMILY["feature"])
 
 
+#: Said to a WORKER whose improvement order the steward did not dispatch (Q2134)
+IO_STEWARD_REFUSED = (
+    "the steward did not dispatch this improvement order ({outcome}): {reason} "
+    "(decision #{decision_id}). Nothing was created and nothing is spending. It is on "
+    "the record: `jarvis steward decisions`"
+)
+#: Said to a WORKER whose improvement order the steward QUEUED: kept, and filed later (#61)
+IO_STEWARD_QUEUED = (
+    "the steward did not dispatch this improvement order yet (queue): {reason} "
+    "(decision #{decision_id}). Nothing is spending now; the observation is kept whole and "
+    "the OS files it by itself once the evolution ledger has room. Do not file it again. "
+    "It is on the record: `jarvis steward decisions`"
+)
+#: Said to a WORKER whose io could not be decided at all: no decision is not a yes (#60)
+IO_STEWARD_UNREADABLE = (
+    "the steward could not read the catalog, so it cannot decide this improvement order "
+    "({error}). Nothing was created. A worker's io waits for a readable catalog; ask the "
+    "user to run `jarvis doctor`, or put the observation in your summary instead"
+)
+#: `decide` said dispatch and the master switch said no (`os.autonomy.self_dispatch`)
+IO_SELF_DISPATCH_OFF = ("`os.autonomy.self_dispatch` is off, so the OS files nothing "
+                        "nobody typed")
+
+
+def _gate_improvement_order(project_name: str, title: str, refs: Sequence[str],
+                            store: ProjectStore, *, description: str = "",
+                            origin: str = "jarvis",
+                            budget_usd: float | None = None) -> Any:
+    """The steward's call on an io a WORKER filed, or None when the user typed it (Q2134)"""
+    from . import steward
+
+    parent_wo_id = os.environ.get("JARVIS_WO_ID") or ""
+    if not parent_wo_id:
+        return None  # spec §3.2 decision 1 rule 1: the user typed it
+    try:
+        catalog = resolve_catalog()
+    except (OpsError, CatalogError, OSError, ValueError) as e:
+        # A FAILURE IS NEVER A VERDICT (kn-40db1828), and work nobody typed needs a yes (#60)
+        log.warning("steward: catalog unreadable; %s io create refused", project_name)
+        raise OpsError(IO_STEWARD_UNREADABLE.format(error=str(e)[:200])) from e
+    decision = steward.gate(
+        steward.Candidate("worker_io", "major", project_name, title,
+                          evidence=tuple(refs), parent_wo_id=parent_wo_id,
+                          refs=len(refs),
+                          # Everything `reoffer_improvement_order` needs to file it later
+                          payload={"title": title, "description": description,
+                                   "refs": list(refs), "origin": origin,
+                                   "budget_usd": budget_usd}),
+        catalog=catalog, store=store)
+    if not decision.allowed and decision.outcome == "queue" and not decision.duplicate_of:
+        raise OpsError(IO_STEWARD_QUEUED.format(reason=decision.reason,
+                                                decision_id=decision.decision_id))
+    if not decision.allowed:
+        raise OpsError(IO_STEWARD_REFUSED.format(
+            outcome=decision.outcome, decision_id=decision.decision_id,
+            reason=(IO_SELF_DISPATCH_OFF if decision.would_dispatch
+                    else decision.reason)))
+    return decision
+
+
 def create_improvement_order(project_name: str, title: str, description: str = "",
                              refs: Sequence[str] = (),
                              budget_usd: float | None = None,
@@ -5974,15 +6753,134 @@ def create_improvement_order(project_name: str, title: str, description: str = "
         )
     store = ProjectStore(paths[project_name])
     try:
-        return store.create_feature_order(
-            title=title, description=description, origin=origin,
-            kind="improvement",
-            metadata={EVIDENCE_REFS_KEY: refs},
-            # The family here is the order plus its analyst
-            budget_usd=(budget_usd if budget_usd is not None
-                        else budget.feature_default_for(_spec_or_none(project_name))))
+        decision = _gate_improvement_order(project_name, title, refs, store,
+                                           description=description, origin=origin,
+                                           budget_usd=budget_usd)
+        return _file_improvement_order(store, project_name, title, description, refs,
+                                       budget_usd, origin, decision)
     finally:
         store.close()
+
+
+def _file_improvement_order(store: ProjectStore, project_name: str, title: str,
+                            description: str, refs: Sequence[str],
+                            budget_usd: float | None, origin: str,
+                            decision: Any) -> dict[str, Any]:
+    """Create the io — now, or when the steward re-offers a queued one (#61)"""
+    from . import steward
+
+    metadata: dict[str, Any] = {EVIDENCE_REFS_KEY: list(refs)}
+    if decision is not None:
+        metadata = steward.stamped(metadata, decision)
+        if decision.budget_usd is not None:
+            budget_usd = decision.budget_usd
+    io = store.create_feature_order(
+        title=title, description=description, origin=origin,
+        kind="improvement",
+        metadata=metadata,
+        # The family here is the order plus its analyst
+        budget_usd=(budget_usd if budget_usd is not None
+                    else budget.feature_default_for(_spec_or_none(project_name))))
+    if decision is not None:
+        steward.linked(decision, io["id"], store=store)
+    return io
+
+
+def reoffer_improvement_order(row: Mapping[str, Any], candidate: Any,
+                              decision: Any) -> str:
+    """File a worker's queued io the steward now has room for (`steward.drain`, #61)"""
+    held = candidate.payload or {}
+    paths = registered_project_paths()
+    if candidate.project not in paths:
+        raise OpsError(f"project {candidate.project!r} is not registered")
+    store = ProjectStore(paths[candidate.project])
+    try:
+        io = _file_improvement_order(
+            store, candidate.project, candidate.subject or str(held.get("title") or ""),
+            str(held.get("description") or ""), list(held.get("refs") or ()),
+            held.get("budget_usd"), str(held.get("origin") or "jarvis"), decision)
+    finally:
+        store.close()
+    # `linked` already ran with the store at hand; `drain` linking again is a no-op
+    return str(io["id"])
+
+
+def file_neo_cleanup(store: ProjectStore, rider: Mapping[str, Any],
+                     decision: Any) -> dict[str, Any]:
+    """The pre-approved ledger cleanup Neo asked for — now, or when the steward re-offers it"""
+    from . import steward
+    from .project_store import PRE_APPROVED_KEY
+
+    question_id, from_wo = rider["question_id"], rider["wo_id"]
+    description = "\n\n".join(filter(None, [
+        rider.get("description") or "",
+        f"Neo filed this while answering question {question_id} on {from_wo}. "
+        f"The correction is ALREADY APPROVED — make it. The stores are append-only, "
+        f"so the remedy is to APPEND an entry that supersedes the wrong one "
+        f"(`jarvis learn add` for the knowledge base, `jarvis neo learn` for Neo's "
+        f"own learnings), naming what it replaces and why.",
+    ]))
+    wo = store.create_work_order(
+        title=rider["title"], description=description, origin="neo",
+        metadata=steward.stamped({PRE_APPROVED_KEY: {
+            "by": "neo",
+            "scope": "correcting the recorded ledger entries this work order names",
+            "neo_question_id": question_id,
+            "from_wo": from_wo,
+        }}, decision), budget_usd=decision.budget_usd,
+    )
+    steward.linked(decision, wo["id"], store=store)
+    try:
+        store.add_event(from_wo, "neo_dispatched",
+                        {"neo_question_id": question_id, "cleanup_wo_id": wo["id"]})
+    except Exception:  # noqa: BLE001 — the order it came from may be gone by a re-offer
+        log.warning("neo cleanup %s filed; %s is gone, so no event there", wo["id"],
+                    from_wo)
+    log.info("neo dispatched pre-approved cleanup %s from %s", wo["id"], from_wo)
+    return wo
+
+
+def reoffer_neo_cleanup(row: Mapping[str, Any], candidate: Any, decision: Any) -> str:
+    """File a queued Neo cleanup the steward now has room for (`steward.drain`)"""
+    rider = candidate.payload or {}
+    if not rider.get("title"):
+        raise OpsError(f"steward decision #{row['id']} kept no cleanup to file")
+    paths = registered_project_paths()
+    if candidate.project not in paths:
+        raise OpsError(f"project {candidate.project!r} is not registered")
+    store = ProjectStore(paths[candidate.project])
+    try:
+        return str(file_neo_cleanup(store, rider, decision)["id"])
+    finally:
+        store.close()
+
+
+def steward_queue_report(limit: int = 200) -> dict[str, Any]:
+    """The dashboard's `/steward`: queue counts first, then each queued decision"""
+    from . import steward
+
+    central = CentralStore()
+    try:
+        counts = central.steward_queue_counts()
+        rows = central.steward_queue_rows(limit)
+    finally:
+        central.close()
+    items = [{k: r[k] for k in ("id", "ts", "project", "origin_kind", "severity",
+                                "subject", "rule", "reason", "wo_id",
+                                "queue_state", "queue_note", "queue_ts")} for r in rows]
+    return {"counts": {s: counts.get(s, 0) for s in ("waiting", "reoffered", "expired")},
+            "line": steward.queue_line(counts),
+            "waiting": [i for i in items if i["queue_state"] == "waiting"],
+            "settled": [i for i in items if i["queue_state"] != "waiting"]}
+
+
+def steward_dispatchers() -> dict[str, Any]:
+    """How `steward.drain` dispatches a queued decision, per origin kind (#1181)"""
+    from . import remedies
+
+    return {"panel": reoffer_panel_follow_up, "worker_io": reoffer_improvement_order,
+            "remedy": remedies.reoffer_file_work_order, "neo_rider": reoffer_neo_cleanup,
+            "io_finding": reoffer_io_finding}
 
 
 def list_improvement_orders(project_name: str | None = None,
@@ -6003,6 +6901,10 @@ def show_improvement_order(io_id: str, project_name: str | None = None) -> dict[
     for f in findings:
         status = (f or {}).get("status") or "pending" if isinstance(f, dict) else "pending"
         by_decision[status if status in by_decision else "pending"] += 1
+    from . import findings as findings_mod
+
+    # Of the pending ones, those Neo is still deciding: they owe the user nothing yet
+    with_neo = sum(1 for f in findings if isinstance(f, dict) and findings_mod.with_neo(f))
     metadata = db.from_json(fo.get("metadata"), {}) or {}
     store = ProjectStore(path)
     try:
@@ -6020,6 +6922,7 @@ def show_improvement_order(io_id: str, project_name: str | None = None) -> dict[
         "project": name, **fo,
         "findings": len(findings),
         "by_decision": by_decision,
+        "with_neo": with_neo,
         "report": report if isinstance(report, dict) else {},
         "filed_orders": _filed_orders(findings),
         "observation": fo["description"],
@@ -6103,17 +7006,30 @@ def submit_findings(io_id: str, doc: Any,
     for finding in report["findings"]:
         finding["status"] = "pending"
 
+    # A resubmission replaces the findings Neo was asked about, so those questions are moot
+    previous = db.from_json(fo.get("plan"), None)
+    if isinstance(previous, dict):
+        _supersede_finding_questions(
+            previous.get("findings") or [], f"SUPERSEDED — {io_id}'s report was resubmitted",
+            "the analyst replaced the report this finding belonged to")
+    neo_review = findings_reviewed_by_neo()
+    unasked = _ask_findings_review(name, fo, report) if neo_review else []
+
     store = ProjectStore(path)
     try:
         # The WHOLE document, replacing whatever was there: a resubmission discards every decision already...
         store.update_feature_order(io_id, plan=db.to_json(report))
         store.set_feature_status(io_id, "plan_review")
-        # EXACTLY ONE attention item, raised HERE
-        store.flag_feature_attention(io_id, findings.review_headline(fo, report))
+        # EXACTLY ONE attention item, raised HERE — unless every finding is Neo's to decide
+        if neo_review and not unasked:
+            store.clear_feature_attention(io_id)
+        else:
+            store.flag_feature_attention(io_id, findings.review_headline(fo, report))
         analyst_open = False
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "findings_submitted", {
                 "improvement_order": io_id, "findings": len(report["findings"]),
+                "neo_questions": len(report["findings"]) - len(unasked) if neo_review else 0,
             })
             try:
                 analyst = store.get_work_order(fo["plan_wo_id"])
@@ -6126,22 +7042,29 @@ def submit_findings(io_id: str, doc: Any,
     out: dict[str, Any] = {
         "project": name, "io_id": io_id, "status": "plan_review",
         "findings": len(report["findings"]),
-        "note": "queued for the user's decision — end your turn. If it is sent back, the "
-                "reason arrives as your next user turn and you revise from this session.",
+        "note": ("queued for Neo's decision, finding by finding" if neo_review and not unasked
+                 else "queued for the user's decision")
+                + " — end your turn. If it is sent back, the reason arrives as your next "
+                  "user turn and you revise from this session.",
     }
     if analyst_open:
-        # Only while it is still open
-        out["analyst"] = finish(
-            fo["plan_wo_id"],
-            f"submitted findings for {io_id}: {len(report['findings'])} findings",
-        )
+        # Only while it is still open; a refusal AFTER the report is stored is not a rejection
+        try:
+            out["analyst"] = _settle_submitter(
+                path, fo["plan_wo_id"],
+                f"submitted findings for {io_id}: {len(report['findings'])} findings",
+                "findings_submitted_settled", {"improvement_order": io_id})
+        except OpsError as e:
+            out["warning"] = submitter_unsettled("report", io_id, fo["plan_wo_id"], e)
     return out
 
 
 def review_findings(io_id: str, accept: Sequence[str] = (),
                     reject: dict[str, str] | None = None, feedback: str = "",
                     decided_by: str = "user", accept_all: bool = False,
-                    project_name: str | None = None) -> dict[str, Any]:
+                    project_name: str | None = None, *,
+                    steward_decision: Any = None,
+                    file_orders: bool = True) -> dict[str, Any]:
     """Decide a findings report, finding by finding"""
     from . import findings
     from .neo_store import NeoStore
@@ -6198,13 +7121,16 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
         if (f.get("status") or "pending") == "pending":
             continue
         # The ONE re-decision allowed: a finding whose decision stands but whose orders did not file (§5.2)
-        if key in accepted_keys and f.get("filing_error"):
+        if key in accepted_keys and (f.get("filing_error") or f.get("orders_held")):
             continue
         raise OpsError(
             f"{key!r} is already {f['status']} on {io_id} — a decision is taken once. "
             f"`jarvis io show {io_id}` for what was decided."
         )
 
+    # Taken BEFORE the decisions below, which end `with_neo` for every finding they decide
+    neo_was_deciding = [dict(by_key[k]) for k in (*accepted_keys, *rejections)
+                        if findings.with_neo(by_key[k])]
     created: list[dict[str, Any]] = []
     learnings: list[str] = []
     errors: list[dict[str, str]] = []
@@ -6217,63 +7143,47 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
                               wo_id=fo.get("plan_wo_id") or "")
             f["knowledge_id"] = entry["id"]
             learnings.append(entry["id"])
-        filed = f.setdefault("created_orders", [])
-        done = {o.get("index") for o in filed}
-        error = ""
-        for i, order in enumerate(f.get("proposed_orders") or []):
-            if i in done:
-                continue
-            target = (order.get("project") or "").strip() or name
-            order_type = order.get("type") or "work"
-            # FIRST LINE names the improvement order: the worker sees this description and nothing else
-            description = (
-                f"Filed from improvement order {io_id} — run `jarvis io show {io_id}` "
-                f"for the root cause this fixes.\n\n{order.get('description', '')}"
-            )
-            try:
-                if order_type == "feature":
-                    row = create_feature_order(target, order.get("title", ""),
-                                               description=description,
-                                               metadata={ORIGIN_IO_KEY: io_id})
-                else:
-                    row = create_work_order(target, order.get("title", ""),
-                                            description=description, parent_id=None,
-                                            metadata={ORIGIN_IO_KEY: io_id})
-            except OpsError as e:
-                error = str(e)
+        if file_orders:
+            made, error = _file_finding_orders(name, io_id, f, steward_decision)
+            created += made
+            if error:
                 errors.append({"key": key, "error": error})
-                break
-            filed.append({"index": i, "id": row["id"], "type": order_type,
-                          "title": order.get("title", ""), "project": target})
-            created.append({"id": row["id"], "type": order_type,
-                            "title": order.get("title", "")})
-        if error:
-            f["filing_error"] = error
-        else:
-            f.pop("filing_error", None)
+            if decided_by == "user":
+                # The user's yes files it now; a steward queue row still waiting finds nothing left to file
+                f.pop("orders_held", None)
+        elif f.get("proposed_orders"):
+            f["orders_held"] = int(getattr(steward_decision, "decision_id", 0) or 0) or True
         # The DECISION is written once
         if f.get("status") != "accepted":
             f.update(status="accepted", decided_by=decided_by, decided_at=db.now(),
                      feedback=feedback)
 
-    if rejections:
+    for key, reason in rejections.items():
+        by_key[key].update(status="rejected", decided_by=decided_by, decided_at=db.now(),
+                           feedback=reason)
+    if rejections and decided_by == "user":
+        # Only the user's refusal teaches Neo: Neo learning from its own rulings would be a loop
         neo = NeoStore()
         try:
             for key, reason in rejections.items():
-                f = by_key[key]
-                f.update(status="rejected", decided_by=decided_by, decided_at=db.now(),
-                         feedback=reason)
                 neo.add_learning(
-                    findings.rejection_learning(fo, f, reason, decided_by),
+                    findings.rejection_learning(fo, by_key[key], reason, decided_by),
                     project=name, source="review")
         finally:
             neo.close()
+    if decided_by == "user":
+        # The user got there first: the question Neo still holds about it is moot
+        _supersede_finding_questions(
+            neo_was_deciding, "SUPERSEDED — the user decided this finding",
+            f"decided with `jarvis io review {io_id}`")
 
     pending = [f for f in report["findings"]
                if (f.get("status") or "pending") == "pending"]
     stuck = [f for f in report["findings"] if f.get("filing_error")]
     status = "completed" if not pending and not stuck else "plan_review"
     reason = ""
+    # Only what waits on the USER raises the flag; a finding Neo is still deciding owes them nothing
+    owed = [f for f in pending if not findings.with_neo(f)]
 
     store = ProjectStore(path)
     try:
@@ -6289,10 +7199,14 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
                 f"`jarvis io review {io_id} --accept {stuck[0]['key']}`"
             )
             store.flag_feature_attention(io_id, reason)
-        else:
+        elif owed:
             store.flag_feature_attention(io_id, findings.review_headline(fo, report))
+        else:
+            store.clear_feature_attention(io_id)
         if fo.get("plan_wo_id"):
-            store.add_event(fo["plan_wo_id"], "findings_reviewed", {
+            # A separate kind for the OS deciding: `steward.touched` must count only the user
+            kind = "findings_reviewed" if decided_by == "user" else "findings_decided"
+            store.add_event(fo["plan_wo_id"], kind, {
                 "improvement_order": io_id, "by": decided_by,
                 "accepted": accepted_keys, "rejected": sorted(rejections),
                 "created": [c["id"] for c in created],
@@ -6314,6 +7228,423 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
 
     return {"project": name, "io_id": io_id, "status": status, "created": created,
             "learnings": learnings, "rejected": sorted(rejections), "errors": errors}
+
+
+def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
+                         decision: Any = None) -> tuple[list[dict[str, Any]], str]:
+    """File the finding's proposed orders not filed yet: (created, error), stopping at the first failure"""
+    from . import steward
+
+    filed = f.setdefault("created_orders", [])
+    done = {o.get("index") for o in filed}
+    created: list[dict[str, Any]] = []
+    error = ""
+    for i, order in enumerate(f.get("proposed_orders") or []):
+        if i in done:
+            continue
+        target = (order.get("project") or "").strip() or name
+        order_type = order.get("type") or "work"
+        # FIRST LINE names the improvement order: the worker sees this description and nothing else
+        description = (
+            f"Filed from improvement order {io_id} — run `jarvis io show {io_id}` "
+            f"for the root cause this fixes.\n\n{order.get('description', '')}"
+        )
+        metadata: dict[str, Any] = {ORIGIN_IO_KEY: io_id}
+        budget_usd = None
+        if decision is not None:
+            # Work nobody typed: on the evolution ledger, under the budget the steward set
+            metadata = steward.stamped(metadata, decision)
+            budget_usd = decision.budget_usd
+        try:
+            if order_type == "feature":
+                row = create_feature_order(target, order.get("title", ""),
+                                           description=description,
+                                           metadata=metadata, budget_usd=budget_usd)
+            else:
+                row = create_work_order(target, order.get("title", ""),
+                                        description=description, parent_id=None,
+                                        metadata=metadata, budget_usd=budget_usd)
+        except OpsError as e:
+            error = str(e)
+            break
+        if decision is not None and not filed:
+            # One decision, linked to the first order it led to
+            steward.linked(decision, row["id"])
+        filed.append({"index": i, "id": row["id"], "type": order_type,
+                      "title": order.get("title", ""), "project": target})
+        created.append({"id": row["id"], "type": order_type,
+                        "title": order.get("title", "")})
+    if error:
+        f["filing_error"] = error
+    else:
+        f.pop("filing_error", None)
+    return created, error
+
+
+# -- Neo decides findings for the user
+
+
+def findings_reviewed_by_neo() -> bool:
+    """Is a findings report Neo's to decide?"""
+    try:
+        cfg = resolve_catalog().os.neo
+    except (OpsError, CatalogError, OSError, ValueError) as e:
+        # A FAILURE IS NEVER A VERDICT (kn-40db1828): nobody decides for the user on a guess
+        log.warning("findings review: catalog unreadable (%s); the user decides", e)
+        return False
+    return bool(cfg.enabled and cfg.review_findings)
+
+
+def _ask_findings_review(name: str, fo: dict[str, Any], report: dict[str, Any],
+                         eligible: Callable[[dict[str, Any]], bool] | None = None
+                         ) -> list[str]:
+    """One atomic Neo question per eligible finding, its id kept on it; the keys it could not ask"""
+    from . import findings
+    from .neo_store import NeoStore, QuestionTooLargeError
+
+    eligible = eligible or findings.never_offered
+    # Hung off the analyst, as a plan question hangs off its planner; the io itself when there is none
+    asker = fo.get("plan_wo_id") or fo["id"]
+    context = findings.build_finding_context(fo, report)
+    unasked: list[str] = []
+    neo = NeoStore()
+    try:
+        for f in report["findings"]:
+            if not eligible(f):
+                continue
+            # A re-ask starts clean: the old ruling or refusal no longer stands
+            for field in ("neo_question_id", "neo_verdict", "neo_unasked"):
+                f.pop(field, None)
+            try:
+                q = neo.ask(name, asker, findings.build_finding_question(fo, f),
+                            context=context, kind="findings")
+            except QuestionTooLargeError as e:
+                # Refused, never trimmed: this one stays the user's, and is never offered again
+                log.warning("[%s] %s/%s: not asked of Neo: %s", name, fo["id"], f["key"], e)
+                f["neo_unasked"] = str(e)[:200]
+                unasked.append(f["key"])
+                continue
+            f["neo_question_id"] = q["id"]
+    finally:
+        neo.close()
+    return unasked
+
+
+def offer_unasked_findings(name: str, path: Path) -> list[str]:
+    """Put each waiting report's never-asked findings to Neo, once; the io ids offered"""
+    from . import findings
+    from .neo_store import NeoStore
+
+    if not findings_reviewed_by_neo():
+        return []
+    store = ProjectStore(path)
+    try:
+        waiting = store.list_feature_orders(("plan_review",), kind="improvement")
+    finally:
+        store.close()
+    offered: list[str] = []
+    for fo in waiting:
+        report = db.from_json(fo.get("plan"), None)
+        if not isinstance(report, dict) or not any(
+                isinstance(f, dict) and findings.never_offered(f)
+                for f in report.get("findings") or []):
+            continue
+        if _offer_to_neo(name, path, fo, report, findings.never_offered, by="daemon"):
+            offered.append(fo["id"])
+    return offered
+
+
+def _offer_to_neo(name: str, path: Path, fo: dict[str, Any], report: dict[str, Any],
+                  eligible: Callable[[dict[str, Any]], bool], *, by: str
+                  ) -> dict[str, list[str]] | None:
+    """Ask Neo about one report's eligible findings and store the outcome; None when the io moved on"""
+    from . import findings
+    from .neo_store import NeoStore
+
+    _ask_findings_review(name, fo, report, eligible)
+    asked = {f["key"]: f for f in report["findings"] if isinstance(f, dict)}
+    moot: list[int] = []
+    out: dict[str, list[str]] | None = None
+    store = ProjectStore(path)
+    try:
+        # Re-read: the user may have decided a finding while Neo was being asked
+        fo = store.get_feature_order(fo["id"])
+        current = db.from_json(fo.get("plan"), None)
+        if fo["status"] != "plan_review" or not isinstance(current, dict):
+            moot = [f["neo_question_id"] for f in asked.values() if f.get("neo_question_id")]
+        else:
+            out = {"asked": [], "not_asked": []}
+            for f in current.get("findings") or []:
+                src = asked.get(f.get("key")) if isinstance(f, dict) else None
+                if src is None:
+                    continue
+                if eligible(f):
+                    for field in ("neo_question_id", "neo_verdict", "neo_unasked"):
+                        if src.get(field):
+                            f[field] = src[field]
+                        else:
+                            f.pop(field, None)
+                    if f.get("neo_question_id"):
+                        out["asked"].append(f["key"])
+                    elif f.get("neo_unasked"):
+                        out["not_asked"].append(f["key"])
+                elif src.get("neo_question_id") and \
+                        src["neo_question_id"] != f.get("neo_question_id"):
+                    moot.append(src["neo_question_id"])
+            store.update_feature_order(fo["id"], plan=db.to_json(current))
+            owed = [f for f in current.get("findings") or []
+                    if isinstance(f, dict)
+                    and (f.get("status") or "pending") == "pending"
+                    and not findings.with_neo(f)]
+            # The transition, never re-derived on a tick (kn-089de524)
+            if owed:
+                store.flag_feature_attention(fo["id"], findings.review_headline(fo, current))
+            else:
+                store.clear_feature_attention(fo["id"])
+            if fo.get("plan_wo_id"):
+                store.add_event(fo["plan_wo_id"], "findings_offered_to_neo", {
+                    "improvement_order": fo["id"], "by": by,
+                    "neo_questions": sum(1 for f in current.get("findings") or []
+                                         if isinstance(f, dict) and findings.with_neo(f)),
+                })
+    finally:
+        store.close()
+    if moot:
+        neo = NeoStore()
+        try:
+            for qid in moot:
+                neo.supersede(qid, f"SUPERSEDED — {fo['id']} was decided while Neo was asked",
+                              "the user decided this finding first")
+        finally:
+            neo.close()
+    return out
+
+
+def ask_neo_about_findings(io_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis io ask-neo`: put a report's findings back to Neo, by hand"""
+    from . import findings
+
+    name, path, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo show")
+    if fo["status"] != "plan_review":
+        raise OpsError(f"{io_id} is {fo['status']}: only a report waiting for decisions "
+                       f"(`plan_review`) has findings to ask Neo about")
+    if not findings_reviewed_by_neo():
+        raise OpsError("Neo does not decide findings: `os.neo.enabled` or "
+                       "`os.neo.review_findings` is off in the catalog")
+    report = db.from_json(fo.get("plan"), None)
+    if not isinstance(report, dict) or not any(
+            isinstance(f, dict) and findings.reaskable(f)
+            for f in report.get("findings") or []):
+        return {"project": name, "io_id": io_id, "asked": [], "not_asked": [],
+                "note": "nothing to ask: every finding is decided, already with Neo, or "
+                        "accepted by Neo and waiting only on your yes to its spend"}
+    out = _offer_to_neo(name, path, fo, report, findings.reaskable, by="user")
+    if out is None:
+        raise OpsError(f"{io_id} was decided while Neo was being asked; nothing changed")
+    return {"project": name, "io_id": io_id, **out,
+            "note": (f"{len(out['asked'])} finding(s) with Neo; its rulings arrive on the "
+                     f"next Neo drain — `jarvis io show {io_id}`")
+                    + (f". Too large to ask, still yours: {', '.join(out['not_asked'])}"
+                       if out["not_asked"] else "")}
+
+
+def _supersede_finding_questions(found: Sequence[Any], answer: str, why: str) -> None:
+    """Close the Neo questions still open about these findings"""
+    from . import findings
+    from .neo_store import NeoStore
+
+    open_ids = [f["neo_question_id"] for f in found
+                if isinstance(f, dict) and findings.with_neo(f)]
+    if not open_ids:
+        return
+    neo = NeoStore()
+    try:
+        for qid in open_ids:
+            neo.supersede(qid, answer, why)
+    finally:
+        neo.close()
+
+
+def _finding_for_question(q: Mapping[str, Any]
+                          ) -> tuple[str, Path, dict[str, Any], dict[str, Any],
+                                     dict[str, Any]] | None:
+    """(project, path, io, report, finding) a findings question is about, or None"""
+    path = registered_project_paths().get(str(q.get("project") or ""))
+    if path is None:
+        return None
+    store = ProjectStore(path)
+    try:
+        fo = store.feature_order_for_planner(str(q.get("wo_id") or ""))
+    finally:
+        store.close()
+    if not fo or fo.get("kind") != "improvement":
+        return None
+    report = db.from_json(fo.get("plan"), None)
+    if not isinstance(report, dict):
+        return None
+    finding = next((f for f in report.get("findings") or []
+                    if isinstance(f, dict) and f.get("neo_question_id") == q["id"]), None)
+    if finding is None:
+        return None
+    return str(q["project"]), path, fo, report, finding
+
+
+def _store_report(path: Path, io_id: str, report: dict[str, Any]) -> None:
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(io_id, plan=db.to_json(report))
+    finally:
+        store.close()
+
+
+def _finding_to_user(name: str, path: Path, fo: dict[str, Any], report: dict[str, Any],
+                     finding: dict[str, Any], why: str) -> dict[str, Any]:
+    """The OS could not decide this finding: it is the user's, with the reason attached"""
+    from . import findings
+
+    io_id, key = fo["id"], finding["key"]
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(io_id, plan=db.to_json(report))
+        # Raised at this transition only, never re-derived on a tick (kn-089de524)
+        store.flag_feature_attention(
+            io_id, f"{findings.review_headline(fo, report)} ({key}: {why})"[:400])
+    finally:
+        store.close()
+    central = CentralStore()
+    try:
+        central.add_inbox(
+            project=name, level="warning",
+            title=f"{io_id}: finding {key!r} needs your decision",
+            body=f"{fo['title']}\n{why}\n\n"
+                 f"Read it with: jarvis io show {io_id} --finding {key}\n"
+                 f"Then: jarvis io review {io_id} --accept {key}\n"
+                 f"  or: jarvis io review {io_id} --reject {key} --feedback \"...\"",
+            wo_id=fo.get("plan_wo_id") or None)
+    finally:
+        central.close()
+    return {"project": name, "io_id": io_id, "key": key, "status": "plan_review",
+            "decided": False, "reason": why}
+
+
+def apply_findings_verdict(q: Mapping[str, Any], verdict: Mapping[str, Any]
+                           ) -> dict[str, Any]:
+    """Neo ruled on one finding: reject it, hand it to the user, or let the steward decide its spend"""
+    from . import steward
+
+    located = _finding_for_question(q)
+    if located is None:
+        return {"decided": False, "reason": f"question {q.get('id')} decides no finding"}
+    name, path, fo, report, f = located
+    io_id, key = fo["id"], f["key"]
+    if fo["status"] != "plan_review" or (f.get("status") or "pending") != "pending" \
+            or f.get("neo_verdict"):
+        # The user got there first through `jarvis io review`
+        return {"decided": False, "reason": f"{io_id}/{key} is already decided"}
+
+    reason = " ".join(str(verdict.get("reason") or "").split())[:300]
+    accepted = bool(verdict.get("approve")) and not verdict.get("escalate")
+    severity = steward.normalise(str(verdict.get("severity") or ""))
+    f["neo_verdict"] = {
+        "question_id": q["id"], "escalate": bool(verdict.get("escalate")),
+        "verdict": "" if verdict.get("escalate") else ("accept" if accepted else "reject"),
+        "severity": severity, "reason": reason,
+    }
+    if verdict.get("escalate"):
+        return _finding_to_user(name, path, fo, report, f,
+                                f"Neo escalated it: {reason or 'no reason given'}")
+    if not accepted:
+        _store_report(path, io_id, report)
+        return review_findings(io_id, reject={key: f"Neo: {reason or 'rejected'}"},
+                               decided_by="neo", project_name=name)
+    if not f.get("proposed_orders"):
+        # A diagnosis with no work to file spends nothing, so nothing is the steward's to decide
+        _store_report(path, io_id, report)
+        return review_findings(io_id, accept=[key], feedback=f"Neo: {reason}",
+                               decided_by="neo", project_name=name)
+
+    try:
+        catalog = resolve_catalog()
+    except (OpsError, CatalogError, OSError, ValueError) as e:
+        # A FAILURE IS NEVER A VERDICT: work nobody typed needs a yes
+        return _finding_to_user(name, path, fo, report, f,
+                                f"Neo accepts it, but the steward could not read the "
+                                f"catalog to decide its spend ({str(e)[:120]})")
+    store = ProjectStore(path)
+    try:
+        decision = steward.gate(
+            steward.Candidate(
+                "io_finding", severity, name,
+                f"{io_id}/{key}: {' '.join(str(f.get('root_cause') or '').split())}"[:300],
+                evidence=tuple(str(e.get("source") or "") for e in f.get("evidence") or []),
+                parent_wo_id=str(fo.get("plan_wo_id") or ""),
+                # Distinct records the improvement order was opened on: its recurrence
+                refs=len(evidence_refs(fo)),
+                # Everything `reoffer_io_finding` needs to file it later
+                payload={"io_id": io_id, "key": key}),
+            catalog=catalog, store=store)
+    finally:
+        store.close()
+    f["steward"] = {"decision_id": decision.decision_id, "outcome": decision.outcome,
+                    "rule": decision.rule, "reason": decision.reason,
+                    "severity": decision.severity, "mode": decision.mode}
+    _store_report(path, io_id, report)
+    feedback = f"Neo: {reason}"
+    if decision.allowed:
+        return review_findings(io_id, accept=[key], feedback=feedback, decided_by="neo",
+                               project_name=name, steward_decision=decision)
+    self_dispatch = bool(catalog.os.autonomy.self_dispatch)
+    if decision.mode == "enforce" and self_dispatch:
+        if decision.outcome == "drop":
+            return review_findings(
+                io_id, reject={key: f"the steward drops it: {decision.reason}"},
+                decided_by="steward", project_name=name)
+        if decision.outcome == "queue":
+            # The diagnosis stands now; its orders wait for room in the steward's queue
+            return review_findings(io_id, accept=[key], feedback=feedback,
+                                   decided_by="neo", project_name=name,
+                                   steward_decision=decision, file_orders=False)
+    why = (IO_SELF_DISPATCH_OFF if not self_dispatch
+           else f"steward decision #{decision.decision_id}: {decision.reason}")
+    return _finding_to_user(name, path, fo, report, f,
+                            f"Neo accepts it ({severity}), and filing its orders needs "
+                            f"your yes — {why}")
+
+
+def findings_question_unanswered(q: Mapping[str, Any], detail: str) -> dict[str, Any]:
+    """Neo could not be asked or reached: NOBODY decided, so the finding is the user's"""
+    return apply_findings_verdict(q, {
+        "escalate": True, "severity": "",
+        "reason": f"Neo could not decide it — {detail[:200]}"})
+
+
+def reoffer_io_finding(row: Mapping[str, Any], candidate: Any, decision: Any) -> str:
+    """File the orders of a Neo-accepted finding the steward now has room for (`steward.drain`)"""
+    held = candidate.payload or {}
+    io_id, key = str(held.get("io_id") or ""), str(held.get("key") or "")
+    name, path, fo = find_feature_order(io_id, candidate.project)
+    report = db.from_json(fo.get("plan"), None) or {}
+    f = next((x for x in report.get("findings") or []
+              if isinstance(x, dict) and x.get("key") == key), None)
+    if f is None or f.get("status") != "accepted" or not f.get("orders_held"):
+        return ""  # decided or filed some other way meanwhile: nothing left to file
+    created, error = _file_finding_orders(name, io_id, f, decision)
+    if not error:
+        f.pop("orders_held", None)
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(io_id, plan=db.to_json(report))
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "findings_decided", {
+                "improvement_order": io_id, "by": "steward", "accepted": [],
+                "rejected": [], "created": [c["id"] for c in created],
+                "errors": [error] if error else []})
+    finally:
+        store.close()
+    if error:
+        raise OpsError(error)  # it stays queued, and is offered again next pass
+    return created[0]["id"] if created else ""
 
 
 # -- investigation orders
@@ -6442,8 +7773,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
                                 UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                plan_hold_spans, validation_ci_hold_spans,
-                                validation_hold)
+                                plan_hold_spans, precondition_hold_spans,
+                                validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
     thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
@@ -6504,10 +7835,17 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                     sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
                             for e in pstore.events_of_kind(str(planner_id), k)),
                            key=lambda e: float(e["ts"])), since, now)
+        # AN ORDER HELD BY AN OPEN PRECONDITION IS NOT STUCK (§2
+        pre_held, pre_spans = False, []
+        if wo["status"] == "pending":
+            pre_held = bool(pstore.open_preconditions(wo["id"]))
+            pre_spans = precondition_hold_spans(
+                pstore.preconditions_of(wo["id"]), since, now)
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans + automerge_spans + budget_spans)
+            + ci_spans + base_red_spans + plan_spans + automerge_spans
+            + budget_spans + pre_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -6536,6 +7874,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE
                             if wo["status"] == budget.EXHAUSTED
+                            # Above both `pending` holds, §3.3 (Neo 1982): `status_label` keeps the same ranking
+                            else stuck.PRECONDITION_CAUSE if pre_held
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact about one feature's plan
                             else stuck.PLAN_ASSUMPTION_CAUSE if plan_held else ""),
@@ -6548,9 +7888,11 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         blocker = true_blockers(pstore, wo, now=now)
         out.append({
             "project": project_name, "wo": wo, "verdict": verdict,
-            # The outstanding-child note before the empty answer: one formatter shared with `status_label`
+            # The outstanding-child note before the empty answer: one formatter shared with `status_label` The...
             "blocker": (blocker[0] if blocker
                         else invariants.outstanding_children_note(pstore, wo)
+                        or invariants.precondition_note(
+                            pstore.open_preconditions(wo["id"]) if pre_held else [])
                         or invariants.plan_hold_note(
                             pstore.plan_hold(wo) if plan_held else None)
                         # §5 of the 2026-10-20 spec, after the plan hold, which is `pending`-only and cannot co-occur with it
@@ -6569,9 +7911,9 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
 def stuck_report(project_name: str | None = None,
                  now: float | None = None) -> list[dict[str, Any]]:
     """Every open order and how the sweep judges it. §7: ONE reader, two renderers"""
-    from . import stuck
+    from . import db, stuck
 
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     catalog = resolve_catalog()
     paths = registered_project_paths()
     rows: list[dict[str, Any]] = []
@@ -6653,11 +7995,15 @@ def show_investigation_order(inv_id: str, project_name: str | None = None
     store = ProjectStore(path)
     try:
         investigator = None
+        calls: list[dict[str, Any]] = []
         if fo.get("plan_wo_id"):
             try:
                 row = store.get_work_order(fo["plan_wo_id"])
                 investigator = {k: row[k] for k in ("id", "title", "status",
                                                     "result_summary")}
+                # THE CALLS THE DIAGNOSIS RESTS ON: its audit trail, not a review item
+                calls = [{"n": a["n"], "content": a["content"]}
+                         for a in store.all_assumptions(row["id"])]
             except KeyError:
                 investigator = None  # deleted out from under it; the link was released
         alarms = store.alarms_for_feature(inv_id)
@@ -6672,6 +8018,7 @@ def show_investigation_order(inv_id: str, project_name: str | None = None
         "filed": verdict.get("filed") or None,
         "filing_error": verdict.get("filing_error") or "",
         "investigator": investigator,
+        "assumptions": calls,
         "status_label": feature_status_label("investigation", fo["status"]),
         "alarms": alarms,
     }
@@ -6781,24 +8128,12 @@ def submit_verdict(inv_id: str, doc: Any,
                 })
             except (KeyError, sqlite3.IntegrityError):
                 pass  # not this project's work order any more
-        settled: dict[str, Any] | None = None
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {
                 "investigation": inv_id, "classification": classification,
                 "classified_by": verdict["classified_by"],
                 "filed": (verdict.get("filed") or {}).get("issue_url"),
             })
-            try:
-                investigator = store.get_work_order(fo["plan_wo_id"])
-            except KeyError:
-                investigator = None  # deleted; the link was released
-            if investigator is not None:
-                summary = f"submitted a {classification} verdict for {inv_id}"
-                store.update_work_order(fo["plan_wo_id"], result_summary=summary)
-                settled = close_out(
-                    store, investigator, "verdict_submitted_settled", why=summary,
-                    payload={"investigation": inv_id,
-                             "classification": classification})
     finally:
         store.close()
 
@@ -6808,10 +8143,49 @@ def submit_verdict(inv_id: str, doc: Any,
         "classified_by": verdict["classified_by"],
         "note": "the investigation is settled — end your turn.",
     }
-    if settled is not None:
-        out["investigator"] = {"wo_id": fo["plan_wo_id"], "status": "completed",
-                               "session_stopped": settled["stopped"]}
+    if fo.get("plan_wo_id"):
+        # AFTER THE VERDICT IS DURABLE: a failure here is not a rejection
+        try:
+            settled = _settle_submitter(path, fo["plan_wo_id"],
+                                        f"submitted a {classification} verdict for "
+                                        f"{inv_id}", "verdict_submitted_settled",
+                                        {"investigation": inv_id,
+                                         "classification": classification})
+        except (OpsError, sqlite3.Error) as e:
+            out["warning"] = submitter_unsettled("verdict", inv_id, fo["plan_wo_id"], e)
+        else:
+            if settled is not None:
+                out["investigator"] = settled
     return out
+
+
+def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
+                      payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Settle the work order whose submission was just stored, BY ITS KIND'S ROUTE"""
+    store = ProjectStore(path)
+    try:
+        try:
+            wo = store.get_work_order(wo_id)
+        except KeyError:
+            return None  # deleted; the link was released
+        route = kind_contract(wo).route
+        if route == SETTLE_IN_SESSION:
+            store.update_work_order(wo_id, result_summary=summary)
+            settle_in_session(store, wo, event, payload=payload)
+            return {"wo_id": wo_id, "status": "completed", "session_stopped": False}
+    finally:
+        store.close()
+    if route == SETTLE_BY_FINISH:
+        return finish(wo_id, summary)
+    raise OpsError(f"{wo_id} is a {wo.get('kind') or 'worker'}, whose kind settles by "
+                   f"{route!r} and never by a submission")
+
+
+def submitter_unsettled(what: str, order_id: str, wo_id: str, error: Exception) -> str:
+    """The submission IS stored; only settling its work order failed (io-b521d17b)"""
+    return (f"your {what} for {order_id} IS stored and {order_id} has taken it — do "
+            f"NOT resubmit it. Only settling your work order {wo_id} failed, and that "
+            f"is the OS's to clear, not yours: {error}")
 
 
 def _verdict_duplicate(project: str, subject: str, verdict: dict[str, Any],
@@ -6873,7 +8247,7 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
                                   "attention_reason", "pr_url", "superseded")},
              "depends_on": store.dependencies(c),
              "status_label": invariants.status_label(store, c)}
-            for c in store.feature_children(fo_id)
+            for c in store.feature_children(fo_id, kinds=WORKER_CHILDREN)
         ]
         planner = None
         if fo.get("plan_wo_id"):
@@ -7073,7 +8447,9 @@ def submit_plan(fo_id: str, doc: Any,
         # The planner has no more to say until the review lands
         summary = f"submitted a plan for {fo_id}: {len(plan['children'])} work orders"
         try:
-            out["planner"] = finish(fo["plan_wo_id"], summary)
+            out["planner"] = _settle_submitter(path, fo["plan_wo_id"], summary,
+                                               "plan_submitted_settled",
+                                               {"feature_order": fo_id})
         except OpsError as e:
             # docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md
             out["warning"] = _planner_unsettled(path, fo_id, fo["plan_wo_id"],
@@ -7322,7 +8698,7 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
         raise OpsError(f"{fo_id} is already {fo['status']}")
     store = ProjectStore(path)
     try:
-        owned = store.feature_children(fo_id)
+        owned = store.feature_children(fo_id, kinds=WORKER_CHILDREN)
         if fo.get("plan_wo_id"):
             try:
                 owned.append(store.get_work_order(fo["plan_wo_id"]))
@@ -7406,7 +8782,7 @@ def resume_feature_order(fo_id: str, fix: str = "",
         )
     store = ProjectStore(path)
     try:
-        children = store.feature_children(fo_id)
+        children = store.feature_children(fo_id, kinds=WORKER_CHILDREN)
         dead = dead_feature_children(store, children)
         if dead:
             store.supersede_children(fo_id, [c["id"] for c in dead], note=fix)
@@ -7433,16 +8809,12 @@ def resume_feature_order(fo_id: str, fix: str = "",
 
 # -- Neo (OS answerer agent)
 
-#: The most ALL referenced sections together may ride to Neo — a TOTAL, never per section (per section, a text citing every heading delivered the whole document); cuts are announced, never silent
+#: The most ALL referenced sections together may ride to Neo
 SECTION_SNAPSHOT_CHARS = 6000
 
 
 def _section_candidates(path: Path, wo: dict[str, Any], ref_path: str) -> list[Path]:
-    """Every place this worker could be naming, in order of authority.
-
-    Split out of `_resolve_section` so a refusal can tell "no such file" from "no such
-    heading" without a second list that could disagree with the resolver's.
-    """
+    """Every place this worker could be naming, in order of authority"""
     candidates = []
     if Path(ref_path).is_absolute():
         candidates.append(Path(ref_path))
@@ -7470,12 +8842,7 @@ def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
 
 
 def _water_fill(sizes: list[int], total: int) -> list[int]:
-    """What each block may spend of one `total`: equal share is a FLOOR, a block under its
-    share donates the remainder to the rest, repeated until stable.
-
-    Neo ruling Q1884 ("half is a FLOOR an under-floor block donates its remainder from")
-    generalised from 2 blocks to N. `autoreview._share` is the 2-block case at render time.
-    """
+    """What each block may spend of one `total`: equal share is a FLOOR"""
     allowed = list(sizes)
     open_ = set(range(len(sizes)))
     budget = total
@@ -7493,28 +8860,13 @@ def _water_fill(sizes: list[int], total: int) -> list[int]:
     return allowed
 
 
-#: The in-text form, shown in every refusal below. There is no `--section` flag: the
-#: reference lives inside the sentence (`sections.REF_RE`), and this is its one spelling.
+#: The in-text form, shown in every refusal below
 SECTION_FORM_HINT = 'from section 3 of design doc "docs/superpowers/specs/feature.md": …'
 
 
 def _section_blocks(path: Path, wo: dict[str, Any],
                     text: str) -> list[tuple[str, str, str]]:
-    """Every design-doc section this text cites, resolved: `(path, which, section)`.
-
-    Both `jarvis wo ask` and `jarvis wo assume` resolve through here, so the two verbs
-    cannot drift — user decision 2026-10-14 (Neo learning #102): Neo never receives a
-    full spec, only pointers to specific sections, resolved to those sections' text.
-
-    NO CARDINALITY CAP (Neo ruling Q1883): `validation.assumption_spec_chars` bounds the
-    text, never a count of sections. Two refusals, and each leaves the caller a move: a
-    document named with no section (nothing to resolve), and a reference that does not
-    resolve (the whole file is never substituted, and it is never silently dropped).
-
-    `SECTION_SNAPSHOT_CHARS` is ONE TOTAL over every resolved section, water-filled
-    (`_water_fill`), so citing every heading of a document cannot deliver the document —
-    on the `ask` path and in the stored `assumptions.spec_text` alike.
-    """
+    """Every design-doc section this text cites, resolved: `(path, which, section)` (#102)"""
     from . import sections
 
     refs = sections.find_refs(text)
@@ -7545,24 +8897,61 @@ def _section_blocks(path: Path, wo: dict[str, Any],
             for (ref_path, which, section), cap in zip(out, allowed)]
 
 
-def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
-    """(Workers) queue a question for Neo instead of stalling on the user: waiting_input with NO user-attention flag, every in-text section reference resolved HERE and snapshotted, their TOTAL bounded by `SECTION_SNAPSHOT_CHARS`, an unresolvable reference or a document named with no section both REFUSALS (`_section_blocks`)"""
+#: The in-text form of a reference to an earlier question or a sibling assumption (spec §4)
+REF_FORM_HINT = "per Q1234 / per assumption #2"
+
+
+def _cited_blocks(project: str, path: Path, wo: dict[str, Any], text: str) -> str:
+    """Every in-text question or sibling reference this text names, RESOLVED"""
+    from . import autoreview
     from .neo_store import NeoStore
 
-    if len(question) > QUESTION_MAX_CHARS:
-        raise OpsError(
-            f"that question is {len(question)} characters; the cap is "
-            f"{QUESTION_MAX_CHARS}. A question to Neo is one paragraph — the decision, "
-            f"the options, your recommendation — arguing from a design artifact it "
-            f"references in-text, e.g. `from section 3 of design doc "
-            f"\"docs/superpowers/specs/feature.md\": …`. The referenced section is delivered to "
-            f"whoever answers, alongside your paragraph; you do not need to paste it."
-        )
+    if not (autoreview.cited_question_ids(text) or autoreview.cited_sibling_ns(text)):
+        return ""
+    store = ProjectStore(path)
+    try:
+        siblings = store.all_assumptions(wo["id"]) or []
+    finally:
+        store.close()
+    neo = NeoStore()
+    try:
+        problem = autoreview.cited_ref_problem(neo, wo["id"], text, siblings)
+        if problem:
+            raise OpsError(
+                f"{problem}. The reference is what whoever answers reads, so nothing "
+                f"is recorded until it resolves. The form is in-text and "
+                f"keyword-anchored — {REF_FORM_HINT}.")
+        return autoreview.cited_context(neo, wo["id"], text, siblings,
+                                        cfg=validation_config(project))
+    finally:
+        neo.close()
+
+
+def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
+    """(Workers) queue a question for Neo instead of stalling on the user: waiting_input with NO..."""
+    from .neo_store import NeoStore
 
     name, path, wo = find_work_order(wo_id, project_name)
+    cap = _concision_cap(name, "question_max_chars",
+                         concision.DEFAULT_QUESTION_MAX_CHARS)
+    if cap and len(question) > cap:
+        raise OpsError(
+            f"that question is {len(question)} characters; the cap is "
+            f"{cap}. A question to Neo is ONE QUESTION, in one paragraph — the "
+            f"decision, the options, your recommendation — arguing from a design "
+            f"artifact it references in-text, e.g. `from section 3 of design doc "
+            f"\"docs/superpowers/specs/feature.md\": …`. The referenced section is delivered to "
+            f"whoever answers, alongside your paragraph; you do not need to paste it. "
+            f"Split it: a second question is a second `jarvis wo ask`, and cite this "
+            f"one in that one by its `Q<id>`. Nothing was recorded."
+        )
+
     context = f"{wo['title']}\n{(wo.get('description') or '')[:800]}"
     for ref_path, which, section in _section_blocks(path, wo, question):
         context += f"\n\nReferenced artifact — {ref_path} § {which}:\n{section}"
+    cited = _cited_blocks(name, path, wo, question)
+    if cited:
+        context += f"\n\nReferences this question names:\n{cited}"
     neo = NeoStore()
     try:
         q = neo.ask(name, wo_id, question, context=context)
@@ -7583,7 +8972,7 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
         out["warning"] = (
             f"that question is {len(question)} characters — aim for one paragraph, and "
             f"reference the design artifact section it argues from in-text instead of "
-            f"pasting context (the cap is {QUESTION_MAX_CHARS})"
+            f"pasting context (the cap is {cap or QUESTION_MAX_CHARS})"
         )
     return out
 
@@ -7660,8 +9049,8 @@ def neo_review(question_id: int, approved: bool, feedback: str = "",
     finally:
         neo.close()
     forwarded = False
-    # TWO KINDS HAVE NO WORKER TO FORWARD A CORRECTION TO (#240)
-    if not approved and q.get("kind") in ("triage", "assumption"):
+    # THREE KINDS HAVE NO WORKER TO FORWARD A CORRECTION TO (#240)
+    if not approved and q.get("kind") in ("triage", "assumption", "findings"):
         return {"question_id": question_id, "review": "corrected",
                 "learning_recorded": learning is not None,
                 "learning_seat": seat or "all seats",
@@ -7739,6 +9128,25 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
             raise OpsError(f"neo question {question_id} is a bug-priority "
                            f"re-assessment, and no work order is waiting on it — "
                            f"{_triage_promote_hint(q)}")
+        # Nor a findings one: the analyst has settled, and the decision is taken on the io
+        if q.get("kind") == "findings":
+            located = _finding_for_question(q)
+            io_id, key = ((located[2]["id"], located[4]["key"]) if located
+                          else ("<io-id>", "<key>"))
+            raise OpsError(
+                f"neo question {question_id} decides an improvement-order finding, and "
+                f"no worker is waiting on it — decide the finding instead: "
+                f"jarvis io review {io_id} --accept {key}, or "
+                f"jarvis io review {io_id} --reject {key} --feedback \"...\"")
+        # Nor a Morpheus one: the PR is decided on its item, not by messaging anyone
+        if q.get("kind") == "validation":
+            from . import morpheus
+
+            item = morpheus.item_of_question(q) or "<mv-id>"
+            raise OpsError(f"neo question {question_id} is about a shipped PR's production "
+                           f"validation, and no work order is waiting on it — decide it "
+                           f"on the item: jarvis morpheus waive {item} --reason \"...\" "
+                           f"or jarvis morpheus requeue {item}")
         neo.record_answer(question_id, answer, answered_by="user")
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:
@@ -8483,7 +9891,7 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
             put("automerge_code", str((state or {}).get("code") or ""))
 
     if need("waiting_on"):
-        put("waiting_on", str(waiting_on(store, wo).get("what") or ""))
+        put("waiting_on", str(waiting_on(store, wo, now=now).get("what") or ""))
 
     if need("validation_round"):
         latest = store.latest_validation_round(wo_id=wo_id)
@@ -10299,7 +11707,7 @@ def _cost_for_target(target: str, project: str | None,
                 pass
         units.extend(_unit_row(name, child, index, _turn_rows(store, child["id"]),
                                os_groups.get(child["id"], ()))
-                     for child in store.feature_children(fo["id"]))
+                     for child in store.feature_children(fo["id"], kinds=WORKER_CHILDREN))
     finally:
         store.close()
     return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
@@ -10416,7 +11824,7 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
                         ids.append(store.get_work_order(planner_id))
                     except KeyError:
                         pass
-                ids.extend(store.feature_children(record["id"]))
+                ids.extend(store.feature_children(record["id"], kinds=WORKER_CHILDREN))
             finally:
                 store.close()
             scope_project = scope_project or name
@@ -10734,7 +12142,7 @@ def inspect_report(target: str, project: str | None = None, *,
             except KeyError:
                 pass
         units.extend(unit(name, child, store)
-                     for child in store.feature_children(fo["id"]))
+                     for child in store.feature_children(fo["id"], kinds=WORKER_CHILDREN))
     finally:
         store.close()
     cfg = settings(name)
@@ -10747,7 +12155,7 @@ def inspect_report(target: str, project: str | None = None, *,
 def live_report(target: str, project: str | None = None, *,
                 reader: Any = None, now: float | None = None) -> dict[str, Any]:
     """What this work order's turn is doing RIGHT NOW — `jarvis watch`'s one entry point"""
-    from . import holds, live
+    from . import db, holds, live
     from . import worker_session as ws
 
     name, path, wo = find_work_order(target, project)
@@ -10760,7 +12168,7 @@ def live_report(target: str, project: str | None = None, *,
             wo_id=wo["id"], project=name,
             turn_in_flight=ws.busy(store, wo["id"]) is not None,
             settled=wo["status"] not in OPEN_STATUSES,
-            now=time.time() if now is None else now,
+            now=db.now() if now is None else now,
             holds=holds.held(store, wo["id"]),
             write_floor=inspect_config(name).report_write_floor,
         ).as_dict()
@@ -11151,7 +12559,8 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
         raise OpsError("a correction needs feedback — what should the supervisor "
                        "have decided?")
     name, path, row = _find_alarm(alarm_id, project_name)
-    if row["alarm_status"] not in ("acked", "escalated"):
+    # `failed` is reviewable because nothing re-queues it and it can hold a merge (#1063)
+    if row["alarm_status"] not in ALARM_REVIEWABLE_STATUSES:
         # A REFUSAL THAT DOES NOT SAY WHERE TO GO IS A BUG REPORT
         where = ""
         if row["alarm_status"] == "proposed":
@@ -11160,8 +12569,9 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
                      f"answer it with `jarvis gate approve {gate}` or "
                      f"`jarvis gate deny {gate} --reason \"…\"`")
         raise OpsError(f"alarm {alarm_id} is {row['alarm_status']}, and only an alarm "
-                       f"the supervisor has decided ('acked' or 'escalated') can be "
-                       f"reviewed{where}")
+                       f"the supervisor has decided or could not decide "
+                       f"({', '.join(repr(s) for s in ALARM_REVIEWABLE_STATUSES)}) can "
+                       f"be reviewed{where}")
     review = "approved" if approved else "corrected"
     store = ProjectStore(path)
     try:
@@ -11473,7 +12883,7 @@ def side_effects_of(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
 def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]]:
     """Every child's side effects, in the feature's own child order"""
     effects: list[dict[str, Any]] = []
-    for child in store.feature_children(fo_id):
+    for child in store.feature_children(fo_id, kinds=WORKER_CHILDREN):
         for effect in side_effects_of(store, str(child["id"])):
             effects.append({**effect, "wo_id": str(child["id"])})
     return effects
@@ -11583,6 +12993,83 @@ NEO_ESCALATION_INVISIBLE_NOTE = (
     "could not be read, never became a Neo question at all — so those are not in these "
     "counts, in any class"
 )
+
+
+#: What the question counts are, said beside them now that they are not the headline (io-51469add)
+NEO_QUESTIONS_PLUMBING_NOTE = (
+    "PLUMBING, not the rate you feel: one assumption row makes 0, 1 or 2 questions "
+    "(none when a net holds it before any model call, two when an early reading is "
+    "confirmed), and a superseded question is the OS closing one, not Neo deciding — "
+    "the ASSUMPTIONS block above is per row"
+)
+
+#: The three buckets every assumption row lands in, the kn-18a6444b recipe's names
+ASSUMPTION_BUCKETS = ("neo_decided", "neo_escalated", "never_reached_neo")
+
+
+def _share(n: int, of: int) -> float | None:
+    return round(n / of, 4) if of else None
+
+
+def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
+                            now: float | None = None) -> dict[str, Any]:
+    """Neo's assumption rate PER ROW, three buckets, unsettled apart (kn-18a6444b)"""
+    now = db.now() if now is None else now
+    out: dict[str, Any] = {key: 0 for key in ASSUMPTION_BUCKETS}
+    never_by_hold: dict[str, int] = {}
+    unsettled = {"count": 0, "reached_neo": 0, "never_reached_neo": 0}
+    ages: list[float] = []
+    rows = high = alarms = 0
+    dropped = {"total": 0, "re_asked": 0}
+    for f in facts:
+        for key in dropped:
+            dropped[key] += int(f["dropped"][key])
+        high += len(f["high_stakes"])
+        alarms += len(f["false_alarms"] & f["high_stakes"])
+        for a in f["rows"]:
+            rows += 1
+            aid = int(a["id"])
+            # Reached = a question was ever filed: the column, or the ask event a cleared link leaves behind
+            reached = bool(a.get("neo_question_id") or a.get("confirm_question_id")
+                           or aid in f["asked"])
+            if str(a.get("status") or "") == "pending":
+                unsettled["count"] += 1
+                unsettled["reached_neo" if reached else "never_reached_neo"] += 1
+                ages.append(max(0.0, now - float(a.get("ts") or now)) / 86400)
+                continue
+            # The DECIDER column alone, never prose: kn-18a6444b's trap 1
+            if str(a.get("decided_by") or "") == "neo":
+                out["neo_decided"] += 1
+            elif reached:
+                out["neo_escalated"] += 1
+            else:
+                out["never_reached_neo"] += 1
+                code = f["last_hold"].get(aid) or "no hold recorded"
+                never_by_hold[code] = never_by_hold.get(code, 0) + 1
+    settled = sum(out[key] for key in ASSUMPTION_BUCKETS)
+    ages.sort()
+    unsettled["median_age_days"] = (round(ages[len(ages) // 2], 1) if ages else None)
+    unsettled["max_age_days"] = round(ages[-1], 1) if ages else None
+    return {
+        "rows": rows, "settled": settled, **out,
+        "rates": {key: _share(out[key], settled) for key in ASSUMPTION_BUCKETS},
+        "never_reached_by_hold": never_by_hold,
+        "unsettled": unsettled,
+        "dropped_rulings": dropped,
+        # The net's own defect rate, the `jarvis gate rules` false-positive idiom
+        "stakes_net": {"held": high, "false_alarms": alarms,
+                       "false_alarm_rate": _share(alarms, high)},
+    }
+
+
+def objection_outcomes(store: ProjectStore, since: float | None = None) -> dict[str, Any]:
+    """Sent, delivered, ACTED ON, withdrawn — `objection_counts` plus `objection_response` (io-ce566253)"""
+    counted = store.objection_counts(since=since)
+    acted = 0
+    for a in store.delivered_objections(since=since):
+        if objection_response(store, a) is not None:
+            acted += 1
+    return {**counted, "acted_on": acted}
 
 
 def _escalation_rate(answered: int, escalated: int, failed: int) -> float | None:
@@ -11760,8 +13247,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     work_orders = feature_orders = 0
     wo_questions = fo_questions = 0
     # WHAT THE OBJECTIONS DID, beside the escalation rate (docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md)
-    objections: dict[str, Any] = {"sent": 0, "delivered": 0, "withdrawn": 0,
-                                  "by_reason": {}}
+    objections: dict[str, Any] = {"sent": 0, "delivered": 0, "acted_on": 0,
+                                  "withdrawn": 0, "by_reason": {}}
+    row_facts: list[dict[str, Any]] = []
     for name, path in sorted(scope.items()):
         store = ProjectStore(path)
         try:
@@ -11771,10 +13259,11 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
             features = [fo for fo in store.list_feature_orders(kind="feature",
                                                                limit=10_000)
                         if since is None or (fo["created_at"] or 0) >= since]
-            counted = store.objection_counts(since=since)
+            counted = objection_outcomes(store, since=since)
+            row_facts.append(store.assumption_review_facts(since=since))
         finally:
             store.close()
-        for key in ("sent", "delivered", "withdrawn"):
+        for key in ("sent", "delivered", "acted_on", "withdrawn"):
             objections[key] += int(counted[key])
         for reason, n in counted["by_reason"].items():
             objections["by_reason"][reason] = (
@@ -11796,6 +13285,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     objections["handed_back"] = int(
         objections["by_reason"].get(OBJECTION_HANDED_BACK_REASON, 0))
     objections["other"] = int(objections["by_reason"].get("other", 0))
+    objections["withdrawal_rate"] = _share(objections["withdrawn"], objections["sent"])
     per_order = {
         "work_orders": work_orders,
         "questions_per_wo": (round(wo_questions / work_orders, 2)
@@ -11807,7 +13297,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
 
     return {
         "scope": project or "fleet", "days": days, "since": since,
-        "questions": questions,
+        # THE HEADLINE: per assumption ROW, what the user's inbox actually shows (io-51469add)
+        "assumptions": assumption_row_outcomes(row_facts),
+        "questions": questions, "questions_note": NEO_QUESTIONS_PLUMBING_NOTE,
         "objections": objections,
         "by_kind": by_kind, "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
         "by_project": by_project,
@@ -11887,21 +13379,60 @@ def set_work_order_budget(wo_id: str, amount: float | None,
         if fresh["status"] == budget.EXHAUSTED and fresh.get("budget_reserved_usd"):
             budget.reserve(store, central, fresh)
             fresh = store.get_work_order(wo_id)
-        cap = budget.ceiling(store, central, fresh)
         spend = budget.spent(store, central, wo_id)
         if fresh["status"] == budget.EXHAUSTED:
-            if cap is not None and cap.exhausted:
-                note = _still_capped_note(
-                    cap, spend.total_usd, _parent_of(store, fresh),
-                    _feature_unreserved(store, central, fresh))
-            else:
-                resumed, note = _resume_after_budget(store, name, fresh)
+            resumed, note = resume_raised_budget(store, central, name, fresh,
+                                                 fleet.load_pause(central))
     finally:
         central.close()
         store.close()
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
             "budget_usd": amount, "previous_usd": wo.get("budget_usd"),
             "spent_usd": spend.total_usd, "resumed": resumed, "note": note}
+
+
+#: A raised budget's relaunch the user's pause held back (#1130)
+BUDGET_RESUME_HELD = "budget_resume_held"
+#: That held relaunch has been let go: the pause lifted or the order was allow-listed
+BUDGET_RESUME_RELEASED = "budget_resume_released"
+
+
+def budget_resume_outstanding(store: ProjectStore, wo_id: str) -> bool:
+    """Is a raised budget's relaunch still waiting on the pause"""
+    held = store.last_event_of_kind(wo_id, BUDGET_RESUME_HELD)
+    if held is None:
+        return False
+    later = (store.last_event_of_kind(wo_id, k)
+             for k in ("budget_exhausted", BUDGET_RESUME_RELEASED))
+    return not any(e is not None and e["ts"] >= held["ts"] for e in later)
+
+
+def budget_held_note(wo_id: str) -> str:
+    """Why a raised budget did not relaunch: the fleet is paused (#1130)"""
+    return (f"budget raised, but held by the fleet pause — `jarvis resume {wo_id}` "
+            "lets it through, and it resumes on its own once the pause lifts")
+
+
+def resume_raised_budget(store: ProjectStore, central: CentralStore, project_name: str,
+                         wo: dict[str, Any],
+                         pause: fleet.FleetPause | None) -> tuple[bool, str]:
+    """Relaunch a parked order whose budget now has room — unless the user's pause holds it (#1130)"""
+    cap = budget.ceiling(store, central, wo)
+    if cap is not None and cap.exhausted:
+        return False, _still_capped_note(
+            cap, budget.spent(store, central, wo["id"]).total_usd, _parent_of(store, wo),
+            _feature_unreserved(store, central, wo))
+    refused = budget.launch_refusal(store, central, wo)
+    if refused is not None:
+        # Raised, but by less than one call: the next turn would be refused, so it stays parked and says why
+        store.flag_attention(wo["id"], refused.reason)
+        return False, refused.reason
+    if pause is not None and not pause.allows(wo["id"]):
+        note = budget_held_note(wo["id"])
+        store.flag_attention(wo["id"], note)
+        store.add_event(wo["id"], BUDGET_RESUME_HELD, {"cause": "fleet_paused"})
+        return False, note
+    return _resume_after_budget(store, project_name, wo)
 
 
 def _still_capped_note(cap: budget.Ceiling, spent_usd: float,
@@ -11969,14 +13500,24 @@ def _resume_after_budget(store: ProjectStore, project_name: str,
     )
     store.set_status(wo["id"], "running")
     store.clear_attention(wo["id"])
+    queued = store.queued_messages(wo["id"])
     # A RELAUNCH THIS ORDER IS ALREADY HOLDING IS THE RESUME
-    if any(m["source"] == worker_session.RESUME_SOURCE
-           for m in store.queued_messages(wo["id"])):
+    if any(m["source"] == worker_session.RESUME_SOURCE for m in queued):
         return True, "its queued relaunch goes out on the next tick"
+    # DECIDED BY THE TURN'S STATE, NOT ITS KIND: only a FAILED turn is relaunched (io-12b7d873)
+    if turn["state"] != "failed":
+        if queued:
+            return True, "its queued message goes out on the next tick"
+        return True, (f"nothing to relaunch — turn {turn['seq']} had finished; it "
+                      "settles from its record on the next tick")
     try:
         turn_row = worker_session.compact_before_relaunch(
             store, spec, wo, catalog.os.compact_min_context, pause=pause)
         fresh = turn_row or worker_session.retry(store, spec, wo, pause)
+        if fresh is None:
+            return True, (f"turn {turn['seq']}'s compaction had landed — "
+                          + ("its queued message goes out on the next tick" if queued
+                             else "nothing left to relaunch"))
     except budget.BudgetExhausted as e:
         budget.escalate(store, store.get_work_order(wo["id"]), e.exhausted)
         return False, "still has no headroom — it stopped again immediately"
@@ -12086,7 +13627,7 @@ def _pr_poll_why(store: ProjectStore, wo: dict[str, Any],
     return PR_POLL_WHY
 
 
-#: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no status filter and filing an `awaiting_case` request does not park the row, so a held request outlives it (wo-715db5af, Neo 1987)
+#: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no...
 REVIEWS_GATE = _Pass(
     "Daemon._neo_drain",
     "a privileged-action request is open and the user does not hold it. "
@@ -12098,11 +13639,23 @@ REVIEWS_GATE = _Pass(
     "whatever status it was filed under",
     "daemon.reviews_gate", reviews_gate)
 
+#: Shared for REVIEWS_GATE's reason: the panel's sweep filters on `OPEN_STATUSES` (issue #1199)
+JUDGES_ROUND = _Pass(
+    "Daemon.validation_tick",
+    "the panel owns a round on this row, so it judges it — a validation "
+    "hold only DELAYS that turn (`daemon.runnable_round` is the pass's own "
+    "now-or-not test; §2: None means nobody will act, never not yet). "
+    "`Daemon.validation_tick` sweeps `work_orders_awaiting_validation`, which "
+    "filters on `OPEN_STATUSES` and not on `validating`: since issue 212 a round "
+    "runs in PARALLEL with the status the delivery left behind",
+    "daemon.validation_round", validation_round)
+
 #: Keyed in `OPEN_STATUSES` order
 SCHEDULED_ACTORS: dict[str, ActorPasses] = {
     "pending": ActorPasses((
         _Pass("Daemon.dispatch_pending", _pending_why,
               "project_store.claim_sql_selects", claim_sql_selects),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "dispatching": ActorPasses((
@@ -12110,6 +13663,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "the claim is inside its grace or a turn is already on record, so the "
               "settler will move this row",
               "daemon.settles_turn", settles_turn),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "running": ActorPasses((
@@ -12124,6 +13678,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         _Pass("Daemon.deliver_messages",
               "a queued message is deliverable, so it goes out as the next turn",
               "daemon.delivers_message", delivers_message),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "idle": ActorPasses((
@@ -12133,6 +13688,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "including `bus.ChildrenLanded` from `Daemon.settle_features` via "
               "`ops.revive_feature_manager`",
               "ops.manager_awaiting_feature", manager_awaiting_feature),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "waiting_input": ActorPasses((
@@ -12145,13 +13701,11 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         _Pass("Daemon._neo_drain",
               "Neo still holds the question this order is parked on",
               "daemon.answers_question", answers_question),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     "validating": ActorPasses((
-        _Pass("Daemon.validation_tick",
-              "a runnable round is on record and its hold has lifted, so the panel "
-              "judges it",
-              "daemon.runnable_round", runnable_round),
+        JUDGES_ROUND,
         _Pass("Daemon.poll_pull_requests",
               "the row carries a routing pull request, so the poll asks GitHub what "
               "became of it",
@@ -12159,7 +13713,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         REVIEWS_GATE,
     )),
     # The USER is the actor: `true_blockers`' four-way triage always yields a line for a governed order
-    "needs_review": ActorPasses((REVIEWS_GATE,), none_because=(
+    "needs_review": ActorPasses((JUDGES_ROUND, REVIEWS_GATE), none_because=(
         "no daemon pass of its own — the user reviews it, and "
         "`invariants.true_blockers` is what puts it in front of them")),
     "waiting_pr_merge": ActorPasses((
@@ -12167,10 +13721,11 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         _Pass("Daemon.poll_pull_requests", _pr_poll_why,
               "daemon.polls_and_can_act_on_pull_request",
               polls_and_can_act_on_pull_request),
+        JUDGES_ROUND,
         REVIEWS_GATE,
     )),
     # Deliberately none: `project_store.NOT_RETRIED` excludes it and `Daemon.settle_work_order` returns...
-    "budget_exhausted": ActorPasses((REVIEWS_GATE,), none_because=(
+    "budget_exhausted": ActorPasses((JUDGES_ROUND, REVIEWS_GATE), none_because=(
         "no daemon pass, by design — the actor is the user via "
         "`ops.set_work_order_budget`, because raising the budget resumes the order")),
 }
@@ -12185,3 +13740,195 @@ def scheduled_actor(store: ProjectStore, wo: dict[str, Any],
                          why=p.why(store, wo, now=now) if callable(p.why) else p.why,
                          predicate=p.predicate)
     return None
+
+
+# -- morpheus: production validation of shipped PRs (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+
+def _morpheus_catalog() -> Catalog:
+    """The registered catalog, or the defaults when none is (a fresh home still has a queue)"""
+    from .catalog import OsConfig
+
+    try:
+        return load_catalog(_catalog_file())
+    except (OpsError, CatalogError):
+        return Catalog(os=OsConfig(), projects=[])
+
+
+def _morpheus_repo(repo: str | None) -> Path:
+    """Where the release's git history lives: given, else production's checkout, else here"""
+    from .paths import production_code_dir
+
+    if repo:
+        return Path(repo).expanduser().resolve()
+    prod = production_code_dir()
+    return prod if (prod / ".git").exists() else Path.cwd()
+
+
+def _morpheus_project(catalog: Catalog, project: str | None, slug: str = "") -> str:
+    """The project a PR belongs to: named, else the one whose origin is `slug`, else the OS"""
+    from . import morpheus, schedule
+
+    if project:
+        if catalog.projects and project not in {p.name for p in catalog.projects}:
+            raise OpsError(f"project {project!r} is not in the catalog")
+        return project
+    for p in catalog.projects:
+        if slug and p.path.is_dir() and morpheus.repo_slug(p.path) == slug:
+            return p.name
+    return schedule.os_project((p.name, p.path) for p in catalog.projects) or ""
+
+
+def _morpheus_cwd(catalog: Catalog, item: dict[str, Any]) -> Path:
+    """Where an item's script runs: its project's production directory"""
+    from . import schedule
+    from .paths import production_code_dir
+
+    os_name = schedule.os_project((p.name, p.path) for p in catalog.projects)
+    prod = production_code_dir()
+    if item.get("project") == os_name and prod.is_dir():
+        return prod
+    for p in catalog.projects:
+        if p.name == item.get("project") and p.path.is_dir():
+            return p.path
+    return prod if prod.is_dir() else Path.cwd()
+
+
+def morpheus_report() -> dict[str, Any]:
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.report(central, _morpheus_catalog())
+    finally:
+        central.close()
+
+
+def morpheus_item(item_id: str) -> dict[str, Any]:
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id)
+    finally:
+        central.close()
+    if not item:
+        raise OpsError(f"no morpheus item {item_id!r} — `jarvis morpheus status` lists them")
+    return item
+
+
+def morpheus_enqueue_release(tag: str, from_ref: str | None = None,
+                             to_ref: str | None = None,
+                             repo: str | None = None,
+                             project: str | None = None) -> dict[str, Any]:
+    import subprocess
+
+    from . import morpheus
+
+    catalog = _morpheus_catalog()
+    where = _morpheus_repo(repo)
+    central = CentralStore()
+    try:
+        return morpheus.enqueue_release(
+            central, catalog.os.morpheus, where, tag, from_ref=from_ref, to_ref=to_ref,
+            project=_morpheus_project(catalog, project, morpheus.repo_slug(where)))
+    except subprocess.CalledProcessError as e:
+        raise OpsError(f"git could not read the release range: "
+                       f"{(e.stderr or '').strip()[:300]}") from e
+    finally:
+        central.close()
+
+
+def morpheus_add(pr: str, repo: str | None = None, release: str = "",
+                 project: str | None = None) -> dict[str, Any]:
+    """Queue one PR by number or URL, outside any release"""
+    from . import morpheus
+
+    m = re.search(r"(?:github\.com/([^/]+/[^/]+)/pull/)?#?(\d+)\s*$", pr.strip())
+    if not m:
+        raise OpsError(f"{pr!r} is not a PR number or URL")
+    slug = m.group(1) or morpheus.repo_slug(_morpheus_repo(repo))
+    if not slug:
+        raise OpsError("cannot tell which repository — pass the PR's full URL")
+    try:
+        body = morpheus.fetch_pr(slug, int(m.group(2)), _morpheus_repo(repo))
+    except Exception as e:  # noqa: BLE001
+        raise OpsError(str(e)) from e
+    catalog = _morpheus_catalog()
+    central = CentralStore()
+    try:
+        item = morpheus.enqueue(central, catalog.os.morpheus, body,
+                                project=_morpheus_project(catalog, project, slug),
+                                repo=slug, release_tag=release)
+    finally:
+        central.close()
+    if item is None:
+        raise OpsError(f"PR #{body.number} is already queued — `jarvis morpheus status`")
+    return item
+
+
+def morpheus_set_script(item_id: str, script: str, source: str = "agent") -> dict[str, Any]:
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.set_script(central, item_id, script, source)
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+
+
+def morpheus_check(item_id: str) -> dict[str, Any]:
+    """Run an item's script now, the way the daemon would"""
+    from . import morpheus
+
+    item = morpheus_item(item_id)
+    if not item["script"]:
+        raise OpsError(f"{item_id} has no script yet — "
+                       f"`jarvis morpheus script {item_id} --file <path>`")
+    catalog = _morpheus_catalog()
+    cwd = _morpheus_cwd(catalog, item)
+    central = CentralStore()
+    try:
+        cfg = catalog.os.morpheus
+        if item["state"] in morpheus.OPEN_STATES:
+            morpheus.check(central, cfg, item, cwd)
+            return central.morpheus_item(item_id) or {}
+        # A settled item is only probed: its state is the record and stays put
+        result = morpheus.run_script(item["script"], cwd, cfg.script_timeout_seconds)
+        return {**item, "probe_exit": result.exit, "probe_output": result.output}
+    finally:
+        central.close()
+
+
+def morpheus_waive(item_id: str, reason: str) -> dict[str, Any]:
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.waive(central, item_id, reason)
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+
+
+def morpheus_pause(mode: str | None, reason: str = "") -> dict[str, Any]:
+    """Pin Morpheus's session paused or running whatever the fleet does; None follows the fleet"""
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.set_pause(central, mode, reason)
+    finally:
+        central.close()
+
+
+def morpheus_requeue(item_id: str) -> dict[str, Any]:
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.requeue(central, _morpheus_catalog().os.morpheus, item_id)
+    except KeyError as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()

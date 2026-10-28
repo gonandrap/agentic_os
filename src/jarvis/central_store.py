@@ -6,7 +6,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from . import db
 from .paths import central_db_path, ensure_home
@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS inbox (
     body TEXT NOT NULL DEFAULT '',
     wo_id TEXT,
     status TEXT NOT NULL DEFAULT 'new',     -- new | notified | acked
-    sink_results TEXT
+    sink_results TEXT,
+    paired_reason TEXT                      -- also in ADDED_COLUMNS
 );
 CREATE TABLE IF NOT EXISTS backlog (
     id TEXT PRIMARY KEY,
@@ -435,7 +436,7 @@ CREATE INDEX IF NOT EXISTS idx_rule_recurrences_detector
 -- ran, not configuration anyone needs to run, so it is rendered and diffed — never fed
 -- back to `parse_catalog` (§6).
 CREATE TABLE IF NOT EXISTS os_config_versions (
-    id             TEXT PRIMARY KEY,        -- cfg-<sha256(document_json)[:16]>
+    id             TEXT PRIMARY KEY,        -- cfg-<sha256(document_json[+build][+salt])[:16]>
     ts             REAL NOT NULL,
     actor          TEXT NOT NULL,           -- user | file | release | <wo-id>
     reason         TEXT NOT NULL DEFAULT '',
@@ -471,6 +472,70 @@ CREATE TABLE IF NOT EXISTS usage_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_samples_ts ON usage_samples(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_samples_ok ON usage_samples(ok, ts);
+
+-- Every decision the steward made about work the OS proposed for itself: what, why, and
+-- whether it was applied. docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md §3.2.
+-- `applied` is 0 in shadow mode and for any outcome that is not `dispatch`; `outcome` is
+-- what the steward WOULD do either way, so a shadow week reads as the enforced one would.
+CREATE TABLE IF NOT EXISTS steward_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    project TEXT NOT NULL DEFAULT '',
+    origin_kind TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL,
+    claimed_severity TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL,                  -- dispatch | queue | drop | ask
+    rule TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL,                     -- shadow | enforce
+    applied INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0,
+    parent_wo_id TEXT NOT NULL DEFAULT '',
+    wo_id TEXT NOT NULL DEFAULT '',         -- the order it led to, once one exists
+    budget_usd REAL,
+    -- The mechanical dedupe bucket (`steward.dedupe_key`): origin unit + file, '' for a
+    -- candidate that names no code; `duplicate_of` names the decision this one restates.
+    dedupe_key TEXT NOT NULL DEFAULT '',
+    duplicate_of INTEGER NOT NULL DEFAULT 0,
+    -- The whole candidate (`steward.Candidate` plus the wordings folded onto it), so a
+    -- `queue` can be re-offered later (#1181); `queue_state` is '' | waiting | reoffered |
+    -- expired, `queue_note` says why, `queue_ts` when it last changed.
+    candidate_json TEXT NOT NULL DEFAULT '{}',
+    queue_state TEXT NOT NULL DEFAULT '',
+    queue_note TEXT NOT NULL DEFAULT '',
+    queue_ts REAL
+);
+-- Morpheus's queue: one shipped PR being validated in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+CREATE TABLE IF NOT EXISTS morpheus_items (
+    id TEXT PRIMARY KEY,                    -- mv-xxxxxxxx
+    project TEXT NOT NULL DEFAULT '',       -- the onboarded project the PR belongs to
+    repo TEXT NOT NULL DEFAULT '',          -- owner/name
+    pr_number INTEGER NOT NULL,
+    pr_url TEXT NOT NULL DEFAULT '',
+    pr_title TEXT NOT NULL DEFAULT '',
+    wo_id TEXT NOT NULL DEFAULT '',         -- the work order the PR title names, if any
+    release_tag TEXT NOT NULL DEFAULT '',
+    hints TEXT NOT NULL DEFAULT '',         -- the PR's validation section, verbatim
+    script TEXT NOT NULL DEFAULT '',
+    script_source TEXT NOT NULL DEFAULT '', -- agent | user
+    state TEXT NOT NULL,                    -- queued | monitoring | validated | failed | timedout
+    created_ts REAL NOT NULL,
+    updated_ts REAL NOT NULL,
+    deadline_ts REAL NOT NULL,
+    last_check_ts REAL,
+    next_check_ts REAL,
+    checks INTEGER NOT NULL DEFAULT 0,
+    last_exit INTEGER,
+    last_output TEXT NOT NULL DEFAULT '',
+    resolution TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',        -- neo:<qid> | investigation:<id> | improvement:<io-id> | none:<why>
+    action_ts REAL,
+    auto_requeues INTEGER NOT NULL DEFAULT 0,  -- requeues Neo's own verdict has spent (capped)
+    UNIQUE (repo, pr_number)
+);
+CREATE INDEX IF NOT EXISTS idx_morpheus_items_state ON morpheus_items(state);
+CREATE INDEX IF NOT EXISTS idx_steward_decisions_ts ON steward_decisions(ts);
 CREATE INDEX IF NOT EXISTS idx_os_config_versions_ts ON os_config_versions(ts);
 CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
@@ -513,6 +578,16 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 
 # Columns added after the first release, exactly as in `neo_store` and `project_store`
 ADDED_COLUMNS = {
+    "morpheus_items": {
+        # A home that ran this table before items were per project
+        "project": "TEXT NOT NULL DEFAULT ''",
+        # …and before Neo's verdict could act on an item (issue #1254)
+        "auto_requeues": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "inbox": {
+        # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
+        "paired_reason": "TEXT",
+    },
     "knowledge": {
         # Retraction
         "retired_at": "REAL",
@@ -536,7 +611,24 @@ ADDED_COLUMNS = {
         # How long the call took, in milliseconds (docs/superpowers/specs/2026-10-01-neo-observability.md)
         "latency_ms": "INTEGER",
     },
+    "steward_decisions": {
+        # Dedupe before queue/dispatch (spec §3.2, `steward.dedupe_key`)
+        "dedupe_key": "TEXT NOT NULL DEFAULT ''",
+        "duplicate_of": "INTEGER NOT NULL DEFAULT 0",
+        # Queued means deferred, not dropped (#1181, `steward.drain`)
+        "candidate_json": "TEXT NOT NULL DEFAULT '{}'",
+        "queue_state": "TEXT NOT NULL DEFAULT ''",
+        "queue_note": "TEXT NOT NULL DEFAULT ''",
+        "queue_ts": "REAL",
+    },
 }
+
+# Indexes over columns ADDED_COLUMNS backfills, which SCHEMA runs too early to see
+POST_MIGRATION_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_steward_decisions_dedupe
+    ON steward_decisions(dedupe_key, duplicate_of);
+CREATE INDEX IF NOT EXISTS idx_steward_decisions_queue ON steward_decisions(queue_state);
+"""
 
 
 class CentralStore:
@@ -551,14 +643,8 @@ class CentralStore:
         self._seed_detectors()
 
     def _migrate(self) -> None:
-        for table, columns in ADDED_COLUMNS.items():
-            have = {
-                r["name"]
-                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-            for name, decl in columns.items():
-                if name not in have:
-                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        db.add_missing_columns(self.conn, ADDED_COLUMNS)
+        self.conn.executescript(POST_MIGRATION_SCHEMA)
 
     def _ensure_fts(self) -> bool:
         """Create the search index and backfill it once (docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §4)"""
@@ -619,13 +705,116 @@ class CentralStore:
 
     # -- inbox
 
-    def add_inbox(self, project: str, title: str, body: str = "", level: str = "info",
-                  wo_id: str | None = None) -> int:
+    def record_steward_decision(self, row: dict[str, Any]) -> int:
+        """One steward decision (`steward.gate`)"""
+        cols = ("project", "origin_kind", "subject", "severity", "claimed_severity",
+                "outcome", "rule", "reason", "mode", "applied", "generation",
+                "parent_wo_id", "wo_id", "budget_usd", "dedupe_key", "duplicate_of",
+                "candidate_json", "queue_state")
+        blank: dict[str, Any] = {"applied": 0, "generation": 0, "budget_usd": None,
+                                 "duplicate_of": 0, "candidate_json": "{}"}
         cur = self.conn.execute(
-            "INSERT INTO inbox (ts, project, level, title, body, wo_id) VALUES (?,?,?,?,?,?)",
-            (db.now(), project, level, title, body, wo_id),
+            f"INSERT INTO steward_decisions (ts, {', '.join(cols)}) "
+            f"VALUES (?{', ?' * len(cols)})",
+            (row.get("ts") or db.now(),
+             *(row.get(c, blank.get(c, "")) for c in cols)))
+        return int(cur.lastrowid)
+
+    def steward_dedupe_bucket(self, dedupe_key: str,
+                              limit: int = 50) -> list[dict[str, Any]]:
+        """One dedupe bucket's own decisions, newest first: never a duplicate, never a drop"""
+        rows = self.conn.execute(
+            "SELECT id, ts, severity, outcome, rule, applied, wo_id, subject, candidate_json, "
+            "queue_state FROM steward_decisions "
+            "WHERE dedupe_key=? AND duplicate_of=0 AND outcome<>'drop' "
+            "ORDER BY id DESC LIMIT ?",
+            (dedupe_key, limit))
+        return [dict(r) for r in rows.fetchall()]
+
+    #: What `update_steward_decision` may re-decide on a recorded row
+    STEWARD_REDECIDE = ("severity", "claimed_severity", "outcome", "rule", "reason",
+                        "applied", "budget_usd", "subject", "candidate_json",
+                        "queue_state", "queue_note", "queue_ts")
+
+    def update_steward_decision(self, decision_id: int,
+                                fields: Mapping[str, Any]) -> None:
+        """Re-decide a recorded decision in place: a severer wording of its defect (Q2133)"""
+        cols = [c for c in self.STEWARD_REDECIDE if c in fields]
+        if not cols:
+            return
+        self.conn.execute(
+            f"UPDATE steward_decisions SET {', '.join(f'{c}=?' for c in cols)} WHERE id=?",
+            (*(fields[c] for c in cols), decision_id))
+
+    def link_steward_decision(self, decision_id: int, wo_id: str) -> None:
+        """Name the order a decision led to, once the caller has created it"""
+        self.conn.execute("UPDATE steward_decisions SET wo_id=? WHERE id=?",
+                          (wo_id, decision_id))
+
+    def steward_decision(self, decision_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM steward_decisions WHERE id=?",
+                                (decision_id,)).fetchone()
+        return dict(row) if row else None
+
+    def steward_queue(self, state: str = "waiting") -> list[dict[str, Any]]:
+        """The decisions in one queue state, oldest first (`steward.drain`)"""
+        rows = self.conn.execute(
+            "SELECT * FROM steward_decisions WHERE queue_state=? ORDER BY ts, id", (state,))
+        return [dict(r) for r in rows.fetchall()]
+
+    def steward_queue_rows(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Every decision ever queued for a re-offer: waiting first, then the latest change"""
+        rows = self.conn.execute(
+            "SELECT * FROM steward_decisions WHERE queue_state<>'' "
+            "ORDER BY queue_state<>'waiting', COALESCE(queue_ts, ts) DESC, id DESC LIMIT ?",
+            (limit,))
+        return [dict(r) for r in rows.fetchall()]
+
+    def steward_queue_counts(self) -> dict[str, int]:
+        """{queue_state: n} over every decision that was ever queued for a re-offer"""
+        rows = self.conn.execute(
+            "SELECT queue_state, COUNT(*) AS n FROM steward_decisions WHERE queue_state<>'' "
+            "GROUP BY queue_state")
+        return {r["queue_state"]: int(r["n"]) for r in rows.fetchall()}
+
+    def steward_decisions(self, since: float = 0.0, *, wo_id: str = "",
+                          limit: int = 500) -> list[dict[str, Any]]:
+        """Decisions newest first, optionally only those about (or leading to) one order"""
+        if wo_id:
+            rows = self.conn.execute(
+                "SELECT * FROM steward_decisions WHERE (wo_id=? OR parent_wo_id=?) "
+                "AND ts>=? ORDER BY id DESC LIMIT ?", (wo_id, wo_id, since, limit))
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM steward_decisions WHERE ts>=? ORDER BY id DESC LIMIT ?",
+                (since, limit))
+        return [dict(r) for r in rows.fetchall()]
+
+    def call_cost_since(self, since: float) -> float:
+        """Everything the OS's own calls cost since `since`, fleet-wide"""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM agent_calls WHERE ts>=?",
+            (since,)).fetchone()
+        return float(row["c"] or 0.0)
+
+    def add_inbox(self, project: str, title: str, body: str = "", level: str = "info",
+                  wo_id: str | None = None, paired_reason: str | None = None) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO inbox (ts, project, level, title, body, wo_id, paired_reason) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (db.now(), project, level, title, body, wo_id, paired_reason),
         )
         return int(cur.lastrowid)
+
+    def get_inbox(self, inbox_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM inbox WHERE id=?", (inbox_id,)).fetchone()
+        return dict(row) if row else None
+
+    def ack_paired_inbox(self, wo_id: str) -> int:
+        """Mark read every notification raised alongside this work order's attention flag"""
+        return self.conn.execute(
+            "UPDATE inbox SET status='acked' WHERE wo_id=? AND paired_reason IS NOT NULL "
+            "AND status != 'acked'", (wo_id,)).rowcount
 
     def purge_work_order(self, wo_id: str) -> dict[str, int]:
         """Drop every central trace of a deleted work order"""
@@ -641,6 +830,12 @@ class CentralStore:
         ).rowcount
         return {"inbox": inbox, "agent_calls": calls, "knowledge_reads": reads,
                 "backlog_reopened": backlog}
+
+    def inbox_titled_since(self, project: str, title: str, since: float) -> bool:
+        """Has this exact item been raised for this project since `since`, acked or not?"""
+        return self.conn.execute(
+            "SELECT 1 FROM inbox WHERE project=? AND title=? AND ts >= ? LIMIT 1",
+            (project, title, since)).fetchone() is not None
 
     def unacked_inbox(self, level: str | None = None) -> list[dict[str, Any]]:
         if level:
@@ -1572,18 +1767,27 @@ class CentralStore:
 
         build = (schema_version if schema_version is not None
                  else bugreport.jarvis_version())
-        vid = config_version.version_id(document,
-                                        build=build if actor == "release" else None)
-        existing = self.get_config_version(vid)
-        if existing is not None:
-            self.set_state(CONFIG_HEAD_KEY, vid)
-            return existing
+        salted = build if actor == "release" else None
+        vid = config_version.version_id(document, build=salted)
+        head = self.head_config_version()
+        # An edit that changes nothing: same document, same build, already head (1235)
+        if (head is not None and head["schema_version"] == build
+                and config_version.canonicalise(head["document"])
+                == config_version.canonicalise(document)):
+            return head
+        ts = db.now()
+        attempt = 0
+        while self.get_config_version(vid) is not None:
+            # A repeat of an OLDER document is its own event, and head never rewinds (1235)
+            attempt += 1
+            vid = config_version.version_id(document, build=salted,
+                                            salt=f"{ts}#{attempt}")
         self.conn.execute(
             """INSERT INTO os_config_versions
                (id, ts, actor, reason, schema_version, document_json, resolved_json,
                 changes_json, source_path)
                VALUES (?,?,?,?,?,?,?,?,?)""",
-            (vid, db.now(), actor, reason, build,
+            (vid, ts, actor, reason, build,
              config_version.canonicalise(document),
              db.to_json(resolved), db.to_json(changes or []), source_path),
         )
@@ -1768,6 +1972,73 @@ class CentralStore:
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         return db.rows_to_dicts(self.conn.execute(
             f"SELECT kind, latency_ms FROM agent_calls {clause}", params).fetchall())
+
+    # -- morpheus: production validation of shipped PRs
+
+    def add_morpheus_item(self, *, project: str, repo: str, pr_number: int, pr_url: str, pr_title: str,
+                          wo_id: str, release_tag: str, hints: str, script: str,
+                          script_source: str, state: str, deadline_ts: float,
+                          resolution: str = "", now: float | None = None
+                          ) -> dict[str, Any] | None:
+        """Queue one PR; None when that PR is already queued (one item per PR, ever)"""
+        ts = db.now() if now is None else now
+        item_id = db.new_id("mv")
+        cur = self.conn.execute(
+            """INSERT OR IGNORE INTO morpheus_items
+               (id, project, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints,
+                script, script_source, state, created_ts, updated_ts, deadline_ts,
+                next_check_ts, resolution)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (item_id, project, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints,
+             script, script_source, state, ts, ts, deadline_ts,
+             ts if state == "monitoring" else None, resolution))
+        return self.morpheus_item(item_id) if cur.rowcount else None
+
+    def morpheus_item(self, item_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM morpheus_items WHERE id=?",
+                                (item_id,)).fetchone()
+        return dict(row) if row else None
+
+    def morpheus_items(self, states: Sequence[str] | None = None,
+                       limit: int = 500) -> list[dict[str, Any]]:
+        """Newest first"""
+        where, params = "", []
+        if states:
+            where = f"WHERE state IN ({','.join('?' * len(states))})"
+            params = list(states)
+        return db.rows_to_dicts(self.conn.execute(
+            f"SELECT * FROM morpheus_items {where} ORDER BY created_ts DESC, pr_number DESC "
+            f"LIMIT ?", (*params, limit)).fetchall())
+
+    def morpheus_counts(self) -> dict[str, int]:
+        return {r["state"]: r["n"] for r in self.conn.execute(
+            "SELECT state, COUNT(*) AS n FROM morpheus_items GROUP BY state").fetchall()}
+
+    def update_morpheus_item(self, item_id: str, **fields: Any) -> None:
+        """Write the named columns, stamping `updated_ts`"""
+        allowed = {"script", "script_source", "state", "deadline_ts", "last_check_ts",
+                   "next_check_ts", "checks", "last_exit", "last_output", "resolution",
+                   "action", "action_ts", "hints"}
+        bad = set(fields) - allowed
+        assert not bad, bad
+        fields["updated_ts"] = db.now()
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(f"UPDATE morpheus_items SET {cols} WHERE id=?",
+                          (*fields.values(), item_id))
+
+    def claim_morpheus_action(self, item_id: str, action: str) -> bool:
+        """Record the action ONCE: False when another pass already took it"""
+        cur = self.conn.execute(
+            "UPDATE morpheus_items SET action=?, action_ts=?, updated_ts=? "
+            "WHERE id=? AND action=''", (action, db.now(), db.now(), item_id))
+        return cur.rowcount == 1
+
+    def claim_morpheus_auto_requeue(self, item_id: str, limit: int) -> bool:
+        """Spend one automatic requeue: False once the item has spent `limit` of them"""
+        cur = self.conn.execute(
+            "UPDATE morpheus_items SET auto_requeues=auto_requeues+1, updated_ts=? "
+            "WHERE id=? AND auto_requeues<?", (db.now(), item_id, limit))
+        return cur.rowcount == 1
 
     # -- os state
 

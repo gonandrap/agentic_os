@@ -535,6 +535,8 @@ def park(daemon, *, auto_review: bool, auto_merge: bool = False,
     spec.validation.enabled = True
     spec.validation.auto_review = auto_review
     spec.validation.auto_merge = auto_merge
+    # These pin the wide net's hold wording; the tightened default words its holds differently
+    spec.validation.stakes_classifier = "regex"
     wo = ops.create_work_order("proj_a", "add feature X", description=description)
     for text in assumptions:
         ops.assume(wo["id"], text)
@@ -1934,6 +1936,80 @@ def test_only_the_assumption_being_ruled_on_contributes_citations():
     assert "Q905" not in out
 
 
+#: Spec §4a: a sibling reference is keyword-anchored, and a bare `#n` matches nothing
+def test_a_cited_sibling_assumption_renders_with_its_ruling():
+    """Test 5"""
+    sibling = assumption(id=9, n=3, status="approved", decided_by="user",
+                         decided_reason="CSV is what the exporter already writes",
+                         content="wrote the header row")
+    cites = assumption(id=10, n=4, content="Per assumption #3, quoted every field")
+    out = record(siblings=[sibling, cites], ruling_on=cites)
+
+    assert "#3" in out
+    assert "wrote the header row" in out
+    assert "approved" in out
+    assert "by the user" in out
+    assert "CSV is what the exporter already writes" in out
+
+
+def test_several_siblings_cited_in_one_phrase_all_resolve():
+    first = assumption(id=9, n=2, content="wrote the header row")
+    second = assumption(id=11, n=3, content="quoted every field")
+    cites = assumption(id=10, n=4, content="Per assumptions 2 and 3, kept the shim")
+    out = record(siblings=[first, second, cites], ruling_on=cites)
+
+    assert "wrote the header row" in out and "quoted every field" in out
+
+
+def test_a_cited_high_stakes_sibling_is_still_withheld():
+    """Test 5's second half: citing a sibling does not lift the withholding net"""
+    sibling = assumption(id=9, n=3, status="pending",
+                         content="deleted the production database dump")
+    cites = assumption(id=10, n=4, content="Per assumption #3, kept the shim")
+    out = record(siblings=[sibling, cites], ruling_on=cites)
+
+    assert "production database dump" not in out
+    assert "withheld" in out
+
+
+def test_a_bare_number_in_the_text_cites_nothing():
+    """Test 7: `issue #832` and `PR #1090` are not references"""
+    sibling = assumption(id=9, n=2, content="wrote the header row")
+    cites = assumption(id=10, n=4, content="Followed issue #832 and PR #2, per #2")
+    out = record(siblings=[sibling, cites], ruling_on=cites)
+
+    assert "wrote the header row" not in out
+
+
+def test_the_scanner_is_keyword_anchored_for_both_kinds():
+    assert autoreview.cited_question_ids("per Q887 and neo question 888") == [887, 888]
+    assert autoreview.cited_question_ids("issue #832 and PR #1090") == []
+    assert autoreview.cited_sibling_ns("per assumption #2") == [2]
+    assert autoreview.cited_sibling_ns("per assumptions 2 and 3") == [2, 3]
+    assert autoreview.cited_sibling_ns("issue #832") == []
+
+
+def test_the_resolved_refs_on_the_ask_path_are_bounded_by_the_record_cap():
+    """Test 4's bound: `validation.decision_record_chars`, one resolver for both verbs"""
+    short = autoreview.cited_context(FakeNeo(qrow(id=887, answer="keep the shim")),
+                                     "wo-1", "Per Q887, and the footer?", [])
+    assert "Q887" in short and "keep the shim" in short
+
+    tight = autoreview.cited_context(
+        FakeNeo(qrow(id=887, answer="y" * 9000)), "wo-1", "Per Q887, and the footer?",
+        [], cfg=ValidationConfig(decision_record_chars=500))
+    assert "y" * 9000 not in tight
+    assert len(tight) < 1200
+
+
+def test_an_assumption_already_stored_over_the_cap_still_reviews():
+    """Test 9: the caps are write-time only — no length check in `autoreview`"""
+    stored = assumption(content="z" * 4000)
+    out = autoreview._ruling_question("p", WO, stored, [stored])   # noqa: SLF001
+
+    assert "z" * 4000 in out
+
+
 def test_a_cited_question_on_another_work_order_is_named_and_not_quoted():
     """Content from a different order has not been through this order's evidence gates"""
     cites = assumption(content="as Q887 decided")
@@ -2197,7 +2273,7 @@ def test_the_instruction_tells_the_reviewer_to_cite_the_section_not_escalate():
         assert "cite the section" in packet
 
 
-# -- the section the ASSUMPTION cites (user decision 2026-10-14, Neo learning #102) ----
+# -- the section the ASSUMPTION cites (user decision 2026-10-14, Neo learning #102)
 
 
 CITED_HEADER = "# THE SPEC SECTION THIS ASSUMPTION CITES"
@@ -2205,14 +2281,13 @@ CITED_TEXT = "## 4. Retries\n\nThree attempts, then park and say so."
 
 
 def citing(**over) -> dict:
-    """An assumption whose own cited section was resolved and stored at assume time."""
+    """An assumption whose own cited section was resolved and stored at assume time"""
     return assumption(**{"spec_path": "docs/superpowers/specs/2026-10-14-retries.md",
                          "spec_which": "4. Retries", "spec_text": CITED_TEXT, **over})
 
 
 def test_the_section_the_assumption_cites_rides_in_both_packets():
-    """It SUPPLEMENTS the work order's own spec block, never replaces it: one is the
-    section the order was built to, the other the section this sentence argues from."""
+    """It SUPPLEMENTS the work order's own spec block"""
     for build in (
         lambda neo_: autoreview.propose(SpecStore(), neo_, "p", CHILD, citing(),
                                         [assumption()]),
@@ -2225,7 +2300,7 @@ def test_the_section_the_assumption_cites_rides_in_both_packets():
         assert CITED_HEADER in packet
         assert ("docs/superpowers/specs/2026-10-14-retries.md § 4. Retries") in packet
         assert "Three attempts, then park and say so." in packet
-        # The work order's own section is still there, and first.
+        # The work order's own section is still there, and first
         assert SPEC_HEADER in packet and "retries three times and then parks" in packet
         assert packet.index(SPEC_HEADER) < packet.index(CITED_HEADER)
 
@@ -2243,8 +2318,7 @@ TWO_CITED = ("docs/a.md § 3:\n## 3. Errors\n\nThey raise.\n\n"
 
 
 def test_the_reference_line_names_every_section_that_was_cited():
-    """User decision 2026-10-15: the pointer columns are parallel newline lists, so the
-    reference line names ALL N — no reference is invisible on it."""
+    """User decision 2026-10-15: the pointer columns are parallel newline lists"""
     neo_ = FakeNeo(qrow())
 
     autoreview.propose(SpecStore(), neo_, "p", CHILD,
@@ -2285,11 +2359,11 @@ def test_the_truncation_note_repeats_every_cited_reference():
             "docs/a.md § 3; docs/b.md § Data model]") in packet
 
 
-# -- one budget, need-based, half as a FLOOR (Neo ruling Q1884) ------------------------
+# -- one budget, need-based, half as a FLOOR (Neo ruling Q1884)
 
 
 def doc_with(remedy_chars: int) -> str:
-    """The fixture document with `2. The remedy` grown to exactly `remedy_chars`."""
+    """The fixture document with `2"""
     head = "## 2. The remedy\n\n"
     return (f"# Design\n\n## 1. Why\n\nBecause.\n\n{head}"
             f"{'r' * (remedy_chars - len(head))}\n\n## 3. Later\n\nNo.\n")
@@ -2310,8 +2384,7 @@ def one_packet(doc: str, cited: str, chars: int) -> str:
 
 
 def test_neither_block_is_trimmed_when_both_fit():
-    """Q1884: each block takes only what it NEEDS. A flat half starved one block while
-    the other's half sat unused."""
+    """Q1884: each block takes only what it NEEDS"""
     packet = one_packet(doc_with(200), cite_of(3000), 4000)
 
     assert "spec section truncated" not in packet
@@ -2319,8 +2392,7 @@ def test_neither_block_is_trimmed_when_both_fit():
 
 
 def test_half_is_a_floor_the_under_floor_block_donates_its_remainder_from():
-    """200 + 9000 over a 4000 budget: the 200 stays whole and only the oversized block
-    is trimmed, to `chars - 200`."""
+    """200 + 9000 over a 4000 budget: the 200 stays whole and only the oversized block is trimmed"""
     packet = one_packet(doc_with(200), cite_of(9000), 4000)
 
     assert packet.count("spec section truncated") == 1
@@ -2349,10 +2421,7 @@ UNCITED = "THE-UNCITED-SENTENCE, which nobody asked about."
 
 
 def test_no_question_builder_can_emit_a_whole_spec_file():
-    """The regression the decision exists to prevent: a payload carrying a DOCUMENT. The
-    builders pinned by name: `propose`, `propose_confirmation`, `plans.build_plan_context`.
-    `ops.ask_question` is pinned by its sibling, tests/test_question_diet.py
-    ::test_ask_cannot_emit_a_whole_spec_file_even_citing_every_section."""
+    """The regression the decision exists to prevent: a payload carrying a DOCUMENT"""
     big = (f"# Design\n\n## 1. Why\n\n{UNCITED}\n" + "w" * 9000
            + "\n\n## 2. The remedy\n\n" + "r" * 9000 + "\n\n## 3. Later\n\n"
            + "l" * 9000 + "\n")
@@ -2372,8 +2441,7 @@ def test_no_question_builder_can_emit_a_whole_spec_file():
         assert UNCITED not in packet
         assert "w" * 100 not in packet      # §1 is not this child's section
         assert "l" * 100 not in packet      # nor is §3
-        # §2 IS this child's section, and arrives bounded by the budget — all of it bar
-        # the short cited section's need (Q1884).
+        # §2 IS this child's section, and arrives bounded by the budget
         longest = max(len(run) for run in re.findall(r"r+", packet))
         assert 0 < longest < 200
 
@@ -2403,3 +2471,77 @@ def test_answered_questions_is_newest_first_and_keeps_every_kind(started):
         assert neo_store.answered_questions("wo-rec", limit=1) == got[:1]
     finally:
         neo_store.close()
+
+
+# -- a transient drop on the ASK path is re-asked (io-51469add, finding `dropped-rulings`)
+
+
+def test_an_ask_dropped_because_the_status_flipped_is_asked_again(started):
+    """The confirmation path's #833 retry, one path along: wo-764454c5, wo-8fd40f1a"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (first,) = questions()
+    store.set_status(wo["id"], "running", trigger="test")
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "pending" and row["neo_question_id"] is None
+    spent = next(q for q in questions() if q["id"] == first["id"])
+    # Never `escalated`: after the link is cleared nobody could answer it
+    assert spent["status"] == "answered"
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["dropped"] == autoreview.HELD_STATUS
+    assert escalated["re_asked"] is True
+    line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "goes back to Neo" in line and "left with you" not in line
+
+    store.set_status(wo["id"], "needs_review", trigger="test")
+    ask(started, store)
+
+    (second,) = [q for q in questions() if q["id"] != first["id"]]
+    assert store.all_assumptions(wo["id"])[0]["neo_question_id"] == second["id"]
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "accepted" and row["decided_by"] == "neo"
+
+
+def test_a_high_stakes_drop_on_the_ask_path_keeps_its_link_and_is_the_users(started):
+    """Non-transient codes are NEVER re-asked: the row really is the user's"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (first,) = questions()
+    row = store.all_assumptions(wo["id"])[0]
+    store.conn.execute("UPDATE assumptions SET content=? WHERE id=?", (SECRET, row["id"]))
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["neo_question_id"] == first["id"]
+    assert questions()[0]["status"] == "escalated"
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["dropped"] == autoreview.HELD_HIGH_STAKES
+    assert escalated["re_asked"] is False
+
+    ask(started, store)
+    assert [q["id"] for q in questions()] == [first["id"]]
+
+
+def test_an_ask_dropped_on_a_cancelled_order_is_not_re_armed(started):
+    """`status` is transient only while the order can come back to `needs_review`"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (first,) = questions()
+    ops.cancel(wo["id"])
+
+    drain(started)
+
+    assert store.all_assumptions(wo["id"])[0]["neo_question_id"] == first["id"]
+    assert questions()[0]["status"] == "escalated"
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["re_asked"] is False

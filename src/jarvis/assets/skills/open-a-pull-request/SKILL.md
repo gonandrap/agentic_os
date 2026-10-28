@@ -15,18 +15,11 @@ A `gh pr create` whose body is missing a section, or which contains a bare `#N`,
 **denied by a hook** with the fix named. Filling the template correctly the first time
 is faster than being sent back.
 
-## 0. Load the house style first
+## 0. The house style applies
 
-```
-Skill(skill="i-have-adhd")
-```
-
-The body you are about to write is the longest single thing this work order produces,
-and it is read by someone who already has the diff. Load `i-have-adhd` before drafting
-it, not after — it decides what goes in and in what order, which is not a thing you can
-apply to a finished draft without rewriting it. `caveman` compresses the wording of what
-it selects; both are in force for a Jarvis work order whether or not you open them, and
-opening them gets you the examples.
+The body is the longest thing this work order produces, read by someone who already has
+the diff. `caveman` compresses its wording; `ponytail` keeps it to what the ask needed.
+Both are in force for a Jarvis work order whether or not you open them.
 
 ## 1. Get the template
 
@@ -121,6 +114,22 @@ UI row above says the tests passed, and server-rendered assertions see strings, 
 layout — 13 of them passed on the page that wrapped every table row onto three lines.
 `scripts/screenshot_config_console.py` is the shape to copy; playwright and chromium are
 already installed. Write `None — no rendered surface changed.` when none applies.
+
+**How to validate in production** — required in every project the OS runs. Once the PR
+reaches production, Morpheus watches it there until a check says it works. For the OS
+itself that is the release; for every other project it is the merge. Write **hints**:
+
+* what production activity shows the change working;
+* where to look: a command, a log line, a page, or a count that should move.
+
+A Morpheus subagent turns the hints into a read-only check that runs on a schedule. A
+command you write is a hint, and is never run as written. Example: "after the next stuck
+sweep, `jarvis stuck --json` lists budget-capped orders as `excluded`, not stuck."
+
+If production has nothing to show (docs, tests or comments only), write
+`None — <reason>`.
+
+The hook denies a body without the section, or with only the template comment.
 
 ## 3. Link every image by raw URL at the commit SHA
 

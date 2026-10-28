@@ -2,7 +2,7 @@
 {% block title %}Knowledge — Jarvis{% endblock %}
 {% block content %}
 
-<h2>Knowledge base <span class="sub">({{ rows|length }} entries)</span></h2>
+<h2>Knowledge base <span class="sub">({{ rows|length }} entries{% if topic or q %} matching{% if topic %} topic <b>{{ topic }}</b>{% endif %}{% if q %} “{{ q }}”{% endif %}{% endif %})</span></h2>
 <p class="sub">
   Workers get this as an <strong>index</strong> and pull entries on demand
   (<code>jarvis learn search</code> says which entries match — headline, id and one
@@ -56,7 +56,7 @@
     <table>
       {% for m in usage.could_have_read %}
       <tr>
-        <td class="mono"><a href="/wo/{{ m.wo_id }}">{{ m.wo_id }}</a></td>
+        <td class="mono"><a href="/go/{{ m.wo_id }}">{{ m.wo_id }}</a></td>
         <td>{{ m.title }}</td>
         <td class="mono sub">{% for e in m.entries %}{{ e.id }} {% endfor %}</td>
       </tr>
@@ -77,20 +77,31 @@
   {% endif %}
 </div>
 
+<form class="panel search-form" method="get" action="/knowledge">
+  <input type="text" name="topic" value="{{ topic }}" list="kn-topics"
+         placeholder="topic — type to find one" aria-label="topic">
+  <datalist id="kn-topics">
+    {% for t, n in topics %}<option value="{{ t or '(none)' }}">{{ n }} entries</option>{% endfor %}
+  </datalist>
+  <input type="text" name="q" value="{{ q }}" placeholder="words in the entry" aria-label="words">
+  <button>filter</button>
+  {% if topic or q %}<a href="/knowledge">clear</a>{% endif %}
+</form>
+
 {% if topics %}
-<div class="panel">
-  <b>topics</b>
-  <span class="sub">{% for t, n in topics %}{{ t or '(none)' }} ({{ n }}){% if not loop.last %} · {% endif %}{% endfor %}</span>
-</div>
+<details class="panel disclosure" {{ 'open' if not topic }}>
+  <summary><b>topics</b> <span class="sub">({{ topics|length }}, biggest first — click one to filter)</span></summary>
+  <div class="sub" style="padding: 6px 16px 10px; line-height: 1.8">{% for t, n in topics %}{% set name = t or '(none)' %}<a href="/knowledge?topic={{ name|urlencode }}"{% if name == topic %} class="here"{% endif %}>{{ name }}</a> ({{ n }}){% if not loop.last %} · {% endif %}{% endfor %}</div>
+</details>
 {% endif %}
 
 <div class="panel">
   <table>
     <tr><th>scope</th><th>topic</th><th>index line</th><th>reads</th><th>age</th><th></th></tr>
     {% for k in rows %}
-    <tr>
+    <tr id="{{ k.id }}">
       <td class="mono">{{ k.project or 'global' }}</td>
-      <td class="mono">{{ k.topic or '–' }}</td>
+      <td class="mono"><a href="/knowledge?topic={{ (k.topic or '(none)')|urlencode }}">{{ k.topic or '–' }}</a></td>
       <td>
         <details class="disclosure">
           <summary>{% if k.pinned %}📌 {% endif %}{{ k.headline }}</summary>

@@ -9,6 +9,7 @@ from jarvis.catalog import DEFAULT_MESSAGING_STUCK_MINUTES, parse_catalog
 from jarvis.invariants import (
     MESSAGE_STUCK_BLOCKER,
     PARKED_BLOCKER,
+    check_messages_are_delivered,
     check_project,
     parked_reason,
     stuck_message,
@@ -115,18 +116,41 @@ def test_resume_auto_says_what_is_holding_it_and_does_not_send_another(project):
     assert f"message {msg_id}" in answer["detail"]
 
 
-def test_a_stuck_message_speaks_instead_of_the_parked_line(project):
-    """One stopped worker, one sentence: PARKED_BLOCKER would only say it went quiet"""
+def test_waiting_on_answers_from_the_instant_it_is_given(project):
+    """The passed instant alone flips it; the message row stays current (spec §6.5)"""
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store)
+
+    assert ops.waiting_on(store, wo)["what"] == "queued_message"
+    assert ops.waiting_on(store, wo, now=_now(store, wo["id"]))["what"] == "message_stuck"
+
+
+def test_the_invariant_answers_from_the_instant_it_is_given(project):
+    """`check_project` forwards no instant, so the invariant is called direct (spec §6.5)"""
+    store = ProjectStore(project)
+    wo = _sent_and_never_delivered(store)
+    msg_id = store.queued_messages(wo["id"])[0]["id"]
+
+    assert list(check_messages_are_delivered(store)) == []
+
+    found = list(check_messages_are_delivered(store, now=_now(store, wo["id"])))
+
+    assert [v.context["msg_id"] for v in found] == [msg_id]
+
+
+def test_a_stuck_message_speaks_instead_of_the_parked_line(project):
+    """One stopped worker, one sentence: PARKED_BLOCKER would only say it went quiet (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)"""
+    store = ProjectStore(project)
+    wo = _sent_and_never_delivered(store, status="waiting_pr_merge")
     _age_the_message(store, wo["id"])
     _age_the_turn(store, wo["id"])
 
     assert ops.waiting_on(store, wo)["what"] == "message_stuck"
-    assert parked_reason(store, wo) is None
+    assert true_blockers(store, wo) == [MESSAGE_STUCK_BLOCKER]
 
     store.mark_message(store.queued_messages(wo["id"])[0]["id"], "delivered")
 
+    assert true_blockers(store, wo) == [PARKED_BLOCKER]
     assert parked_reason(store, wo) == PARKED_BLOCKER
 
 

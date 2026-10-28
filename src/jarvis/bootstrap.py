@@ -17,7 +17,7 @@ from .catalog import ProjectSpec
 from .paths import project_state_dir
 
 # v5 = v4's privileged-action gates section + the decision-routing rewrite (Neo as first responder)
-TEMPLATE_VERSION = 14
+TEMPLATE_VERSION = 16
 ASSETS = Path(__file__).parent / "assets"
 
 

@@ -13,6 +13,7 @@ from jarvis.testing import (  # noqa: F401
     claude_json,
     fake_claude,
     jarvis_home,
+    live_daemon,
     make_git_project,
     project,
     self_dispatch_on,

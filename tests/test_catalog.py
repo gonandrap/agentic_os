@@ -428,10 +428,11 @@ def test_validation_settings_round_trip():
 # -- the stakes classifier: three values, not a boolean
 
 
-def test_the_stakes_classifier_ships_on_the_regex():
-    """SS3.4"""
-    assert parse_catalog({"projects": []}).os.validation.stakes_classifier == "regex"
-    assert validation_of({}).stakes_classifier == "regex"
+def test_the_stakes_classifier_ships_on_the_tightened_regex():
+    """io-51469add: the measured winner is the default; `regex` stays selectable"""
+    assert parse_catalog({"projects": []}).os.validation.stakes_classifier == "regex-tightened"
+    assert validation_of({}).stakes_classifier == "regex-tightened"
+    assert validation_of({"stakes_classifier": "regex"}).stakes_classifier == "regex"
 
 
 @pytest.mark.parametrize("mode", ["regex", "shadow", "classifier"])
@@ -594,10 +595,23 @@ def test_the_guard_rail_on_the_floor_is_itself_configurable():
         parse_catalog({"os": {"cold_prefix_floor_max": 0}, "projects": []})
 
 
-def test_worker_require_crew_defaults_true():
-    """§7 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md: the crew is the default"""
+def test_worker_require_crew_defaults_false():
+    """docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md: the lead does the work"""
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
-    assert cat.projects[0].worker.require_crew is True
+    assert cat.projects[0].worker.require_crew is False
+
+
+def test_worker_transport_defaults_and_validates():
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.projects[0].worker.transport == "background"
+    cat = parse_catalog({"os": {"defaults": {"transport": "headless"}},
+                         "projects": [{"name": "a", "path": "/tmp/a"},
+                                      {"name": "b", "path": "/tmp/b",
+                                       "worker": {"transport": "background"}}]})
+    assert [p.worker.transport for p in cat.projects] == ["headless", "background"]
+    with pytest.raises(CatalogError, match="worker.transport"):
+        parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                     "worker": {"transport": "bg"}}]})
 
 
 def test_worker_require_crew_parsed():
@@ -1235,6 +1249,7 @@ def test_an_evolution_block_that_is_not_an_object_is_refused_naming_the_project(
 
 def test_ui_health_ships_the_measured_defaults_fleet_wide_and_per_project():
     from jarvis.catalog import (
+        DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS,
         DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS,
         DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY,
         DEFAULT_UI_HEALTH_PROBE_INTERVAL_SECONDS,
@@ -1251,10 +1266,12 @@ def test_ui_health_ships_the_measured_defaults_fleet_wide_and_per_project():
     assert DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS == 5
     assert DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS == 300
     assert DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY == 3
+    assert DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS == 60
     assert cat.os.ui_health.enabled is True
     assert cat.os.ui_health.probe_interval_seconds == 15
     assert cat.projects[0].ui_health.probe_timeout_seconds == 20
     assert cat.projects[0].ui_health.max_restarts_per_day == 3
+    assert cat.projects[0].ui_health.boot_grace_seconds == 60
 
 
 def test_a_project_naming_one_ui_health_key_inherits_the_rest():
@@ -1284,7 +1301,7 @@ def test_an_absurd_ui_health_value_is_refused_naming_the_key():
     """Every one is a count or a duration"""
     for key in ("probe_interval_seconds", "probe_timeout_seconds", "trip_threshold",
                 "healthz_timeout_seconds", "restart_cooldown_seconds",
-                "max_restarts_per_day"):
+                "max_restarts_per_day", "boot_grace_seconds"):
         for bad in (0, -1):
             with pytest.raises(CatalogError, match=f"os.ui_health.{key} must be >= 1"):
                 parse_catalog({"os": {"ui_health": {key: bad}}, "projects": []})

@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from jarvis import claude_cli, invariants, ops, worker_session
+from jarvis import claude_cli, db, invariants, ops, testing, worker_session
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
@@ -21,12 +21,17 @@ LIVE_REFUSAL = "You've hit your session limit · resets 11:50pm (America/Los_Ang
 
 
 def test_reads_the_live_refusal():
-    limit = claude_cli.usage_limit(LIVE_REFUSAL)
+    """Issue #1066: the moment is resolved against the instant asked, never the reader's clock"""
+    tz = ZoneInfo("America/Los_Angeles")
+    asked = datetime.fromtimestamp(testing.TEST_EPOCH, tz)
+    limit = claude_cli.usage_limit(LIVE_REFUSAL, now=testing.TEST_EPOCH)
     assert limit is not None
     assert limit.reset_at is not None
-    when = datetime.fromtimestamp(limit.reset_at, ZoneInfo("America/Los_Angeles"))
+    when = datetime.fromtimestamp(limit.reset_at, tz)
     assert (when.hour, when.minute) == (23, 50)
-    assert limit.reset_at > time.time()
+    # TEST_EPOCH is 01:53 in that zone, so 11:50pm is later the same local day
+    assert limit.reset_at == pytest.approx(
+        asked.replace(hour=23, minute=50, second=0, microsecond=0).timestamp(), abs=1)
 
 
 def test_resolves_the_next_occurrence_of_the_clock_time():
@@ -269,7 +274,7 @@ def test_the_deadline_does_not_move_when_the_asking_clock_does(store, monkeypatc
 
 def test_the_relative_reset_counts_from_the_turn_not_from_now(store):
     """"resets in 2h 15m" is the worse half of the same bug: read against the asking clock it is..."""
-    ended = time.time() - 6 * 3600
+    ended = db.now() - 6 * 3600
     _refused(store, error="You've hit your session limit · resets in 2h 15m")
     _age(store, "wo-test", ended)
     pause = worker_session.turn_pause(store, "wo-test")
@@ -362,7 +367,7 @@ def test_an_overdue_pause_is_reported_rather_than_sitting_silently(store):
     """INV-PAUSE-OVERDUE"""
     store.set_status("wo-test", "running")
     _refused(store, error=LIVE_REFUSAL)
-    _age(store, "wo-test", time.time() - 30 * 3600)   # reset was ~a day ago
+    _age(store, "wo-test", db.now() - 30 * 3600)   # reset was ~a day ago
 
     violations = [v for v in invariants.check_paused_turns_resume(store)]
     assert len(violations) == 1, "an overdue pause must be reported"
@@ -385,9 +390,9 @@ def test_a_pause_just_barely_overdue_is_given_its_grace(store):
     """The retry pass runs about every ten seconds"""
     store.set_status("wo-test", "running")
     # The epoch form, so the deadline is stated outright and the arithmetic is exact rather than a...
-    due_five_minutes_ago = time.time() - 5 * 60
+    due_five_minutes_ago = db.now() - 5 * 60
     _refused(store, error=f"Claude AI usage limit reached|{int(due_five_minutes_ago)}")
-    _age(store, "wo-test", time.time() - 3600)
+    _age(store, "wo-test", db.now() - 3600)
     pause = worker_session.turn_pause(store, "wo-test")
     assert pause.due() and pause.retry_at == pytest.approx(due_five_minutes_ago, abs=1)
     assert list(invariants.check_paused_turns_resume(store)) == []
@@ -398,7 +403,7 @@ def test_an_exhausted_pause_is_left_to_the_attention_flag(store):
     store.set_status("wo-test", "running")
     for _ in range(worker_session.MAX_RATE_LIMIT_RETRIES + 1):
         _refused(store, error=LIVE_REFUSAL)
-    _age(store, "wo-test", time.time() - 30 * 3600)
+    _age(store, "wo-test", db.now() - 30 * 3600)
     assert worker_session.turn_pause(store, "wo-test").exhausted
     assert list(invariants.check_paused_turns_resume(store)) == []
 
@@ -442,7 +447,7 @@ def test_an_older_turns_deadline_is_not_compared_against_a_newer_pause(store):
     first = store.latest_turn("wo-test")
     store.add_event("wo-test", "turn_paused", {
         "seq": first["seq"], "reason": worker_session.PAUSE_USAGE_LIMIT,
-        "reset_at": time.time() - 5 * 86400})
+        "reset_at": db.now() - 5 * 86400})
     _refused(store, error=LIVE_REFUSAL)          # a second refusal, no event planted
     assert store.latest_turn("wo-test")["seq"] != first["seq"]
     assert list(invariants.check_pause_deadline_stable(store)) == []
@@ -461,7 +466,7 @@ def test_the_daemon_stops_reporting_once_the_retry_actually_fires(started, fake_
     _tick(daemon)
 
     turn = store.latest_turn(wo["id"])
-    aged = time.time() - 3 * 86400
+    aged = db.now() - 3 * 86400
     store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
                        (aged - 1, aged, turn["id"]))
     store.conn.commit()
@@ -554,7 +559,7 @@ def test_a_clock_time_reset_comes_due_without_the_error_being_rewritten(
     # Three days pass
     fake_claude.turns_recover()
     turn = store.latest_turn(wo["id"])
-    aged = time.time() - 3 * 86400
+    aged = db.now() - 3 * 86400
     store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
                        (aged - 1, aged, turn["id"]))
     store.conn.commit()

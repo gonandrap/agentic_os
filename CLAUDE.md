@@ -58,10 +58,12 @@ jarvis fo agent <id>                       # rebuild the feature's agent type fr
 jarvis fo resume <id> [--fix "what still needs doing"]  # a FAILED feature back to work
 jarvis io create <project> "title" -d "<what you saw>" --ref <id|#n|url> ...  # "io" = improvement order: root cause, not a patch
 jarvis io list [project] [--all] / show <id>    # counts first, then each finding
-jarvis io review <id> [--accept <key>] [--reject <key>] [--feedback "why"] [--accept-all]
+jarvis io review <id> [--accept <key>] [--reject <key>] [--feedback "why"] [--accept-all]   # only what Neo escalated
+jarvis io ask-neo <id>                     # put findings awaiting you (back) to Neo
 jarvis io cancel <id>                      # filed orders from accepted findings stay
 jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settles itself; a GAP files an issue, dispatches nothing
 jarvis investigate list / show <inv-id> / cancel <inv-id>
+jarvis morpheus status / show|waive|requeue <mv-id> / pause|unpause|follow-fleet   # PRs validated in prod; own brake
 jarvis backlog promote <id> --as feature   # intake -> feature order
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
@@ -70,6 +72,7 @@ jarvis wo budget <id> [<usd>] [--clear]    # dollar ceiling on one order; raisin
 jarvis fo budget <id> [<usd>] [--clear]    # family budget for a whole feature
 jarvis wo ack <id> / --all                 # "seen it" — refuses on pending assumptions
 jarvis wo done <id>                        # user closes it; PR-parked orders close themselves on merge
+jarvis wo pr <id> <url>                    # record a PR the user opened by hand for a pushed branch
 jarvis wo hide <id> / unhide <id>          # declutter, record kept
 jarvis wo delete <id> --yes                # irreversible
 jarvis wo resume-auto <id>                 # what is it ACTUALLY waiting on?
@@ -97,6 +100,7 @@ jarvis doctor [project] [--repair]         # the OS's own post-conditions
 jarvis cost [project|wo-id|fo-id]          # tokens: worker half + Jarvis's own half
 jarvis inspect <wo-id|fo-id>               # where the TIME went, and why each cache write happened
 jarvis alarms [project]                    # turns the OS flagged while they burned
+jarvis steward ledger|decisions|why <wo-id>|digest   # what the OS may spend on ITSELF, and each decision's rule
 jarvis adopt <path>                        # migrate a project into the OS
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```

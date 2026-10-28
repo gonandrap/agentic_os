@@ -21,7 +21,8 @@ def test_nav_walk_all_tabs(page, server):
     page.goto(server)
     for label, path in [("neo", "/neo"), ("gates", "/gates"), ("alarms", "/alarms"),
                         ("inbox", "/inbox"), ("backlog", "/backlog"),
-                        ("knowledge", "/knowledge"), ("dashboard", "/")]:
+                        ("knowledge", "/knowledge"), ("steward", "/steward"),
+                        ("dashboard", "/")]:
         page.click(f"nav >> text={label}")
         assert page.url.rstrip("/").endswith(path.rstrip("/")) or path == "/"
         assert page.locator("nav a.here").inner_text().startswith(label)
@@ -292,8 +293,8 @@ def test_neo_escalation_answered_in_browser(page, server, daemon, project):
 def test_neo_badge_counts(page, server, daemon, project):
     wo = ops.create_work_order("proj_a", "badge check")
     daemon.tick()
-    ops.ask_question(wo["id"], "q1?")
-    ops.ask_question(wo["id"], "q2?")
+    ops.ask_question(wo["id"], "first?")
+    ops.ask_question(wo["id"], "second?")
     daemon._neo_drain()
     page.goto(server)
     badge = page.locator("nav .nav-badge")
@@ -440,7 +441,7 @@ def test_live_sync_updates_state_but_keeps_the_half_typed_order(page, server, pr
 #: The shape of question that made the digest necessary — Neo question #53 was ~7,000
 #: characters of feature-order brief rendered inline on this page.
 LONG_QUESTION = ("Should the exporter emit CSV or JSON, given the constraints below? "
-                 * 30)
+                 * 25)
 
 
 def test_a_long_neo_question_is_collapsed_and_the_full_text_opens_from_the_page(

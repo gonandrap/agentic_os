@@ -1,9 +1,11 @@
 {% extends "base.html" %}
 {% block title %}{{ io.id }} — Jarvis{% endblock %}
 {% block content %}
-{# §6.1 of docs/superpowers/specs/2026-09-23-improvement-orders.md. Counts first, then
-   the observation and the evidence, then one card per finding: a finding is only
-   judgeable next to the record it was quoted from, and this is where it is decided. #}
+{# §6.1 of docs/superpowers/specs/2026-09-23-improvement-orders.md, laid out by §5 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md: counts, then the
+   findings as cards the reader DECIDES on, then — beside them at width, below them when
+   narrow — the brief, the evidence it was given and the analyst that read it. The brief
+   is long prose and the findings are what is acted on, so the findings come first. #}
 {% set m = fo_status_meta.get(io.status, {'word': io.status, 'icon': '•', 'tone': 'muted'}) %}
 {% set findings = io.report.findings or [] %}
 
@@ -16,57 +18,85 @@
   · <a href="/project/{{ project }}">{{ project }}</a>
   · {{ io.findings }} findings
   · {{ io.by_decision.pending }} pending
+  {% if io.with_neo %}· {{ io.with_neo }} with Neo{% endif %}
   · {{ io.by_decision.accepted }} accepted
   · {{ io.by_decision.rejected }} rejected
   · {{ fmt_age(io.created_at) }}
   · <a href="/cost/{{ project }}/{{ io.id }}">its bill →</a>
 </p>
+<div class="jumps" aria-label="jump to">
+  <a href="#findings">findings</a>
+  <a href="#brief">the brief</a>
+  {% if io.analyst %}
+  {% set analyst_href = order_path(project, io.analyst.id) %}
+  <a href="{{ analyst_href }}">the analyst · {{ io.analyst.status }}</a>
+  <a href="{{ analyst_href }}#pending">what it asks of you</a>
+  <a href="{{ analyst_href }}#tab-conversation">its questions</a>
+  <a href="{{ analyst_href }}/debug">its debug</a>
+  {% endif %}
+</div>
 
-{% if error %}<div class="panel"><div class="row tone-bad">✗ {{ error }}</div></div>{% endif %}
+{% if error %}<div class="panel" style="margin-top: 12px;"><div class="row tone-bad">✗ {{ error }}</div></div>{% endif %}
 
 {% if io.needs_attention %}
-<div class="panel"><div class="row tone-warn">◭ {{ io.attention_reason }}</div></div>
+<div class="panel" style="margin-top: 12px;"><div class="row tone-warn">◭ {{ io.attention_reason }}</div></div>
 {% endif %}
 
-<h3>The observation</h3>
-<div class="panel"><div class="row"><div class="grow">{{ io.observation }}</div></div></div>
-
-{% if io.evidence_refs %}
-{# The refs as the user typed them — unresolved on purpose (§2.6): one that does not
-   resolve is a finding about the OS's records, not an error on this page. #}
-<p class="sub">evidence: {% for ref in io.evidence_refs %}
-  <span class="mono">{{ ref }}</span>{{ ', ' if not loop.last }}{% endfor %}</p>
-{% endif %}
-
-{% if io.analyst %}
-<p class="sub">analyst:
-  <a class="mono" href="/wo/{{ project }}/{{ io.analyst.id }}">{{ io.analyst.id }}</a>
-  ({{ io.analyst.status }})
-  {% if io.analyst.result_summary %}— {{ io.analyst.result_summary }}{% endif %}
-</p>
-{% endif %}
-
+<div class="grid io-layout" style="--col: 520px;">
+<div class="io-findings">
 {% if io.report.summary %}
-<h3>Findings — {{ io.report.summary }}</h3>
+<h2 id="findings">Findings — {{ io.report.summary }}</h2>
 {% else %}
-<h3>Findings</h3>
+<h2 id="findings">Findings</h2>
 {% endif %}
+{# One card per finding, folded to its key, its standing and its symptom; a pending one
+   is open, because that is the one asking for a decision. `#finding-<key>` opens one. #}
 {% for f in findings %}
 {% set status = f.status or 'pending' %}
-<div class="panel">
+{# Neo holds a pending finding until it rules; only what it hands back is the user's #}
+{% set with_neo = status == 'pending' and f.neo_question_id and not f.neo_verdict %}
+<details class="turn panel" id="finding-{{ f.key }}" style="margin-bottom: 10px;"
+         {% if (status == 'pending' and not with_neo) or f.filing_error %}open{% endif %}>
+  <summary>
   <div class="row">
-    <div class="grow">
-      <span class="mono">{{ f.key }}</span> <strong>{{ f.symptom }}</strong>
-      <div class="sub">root cause: {{ f.root_cause }}</div>
-      <div class="sub">why the obvious fix is not enough: {{ f.why_insufficient }}</div>
-      <div class="sub">recommendation: {{ f.recommendation }}</div>
-      {% for e in f.evidence or [] %}
-      <div class="sub"><span class="mono">{{ e.source }}</span> — “{{ e.quote }}”</div>
-      {% endfor %}
+    <span class="mono">{{ f.key }}</span>
+    <span class="st tone-{{ 'muted' if with_neo else 'warn' if status == 'pending' else 'ok' if status == 'accepted' else 'muted' }}">{{ 'with Neo' if with_neo else status }}{% if f.decided_by and f.decided_by != 'user' and status != 'pending' %} by {{ f.decided_by }}{% endif %}</span>
+    <strong class="grow clamp1" title="{{ f.symptom }}">{{ f.symptom }}</strong>
+  </div>
+  </summary>
+  <div class="row">
+    <div class="grow measure">
+      <div class="sub"><strong>root cause:</strong> {{ f.root_cause }}</div>
+      <div class="sub"><strong>why the obvious fix is not enough:</strong> {{ f.why_insufficient }}</div>
+      <div class="sub"><strong>recommendation:</strong> {{ f.recommendation }}</div>
+      {% if f.evidence %}
+      <details class="disclosure">
+        <summary>evidence · {{ f.evidence|length }}</summary>
+        {% for e in f.evidence %}
+        <div class="sub" style="margin-top: 6px;"><span class="mono">{{ e.source }}</span></div>
+        <pre class="request-text" style="max-height: 220px;">“{{ e.quote }}”</pre>
+        {% endfor %}
+      </details>
+      {% endif %}
       {% for o in f.proposed_orders or [] %}
-      <div class="sub">proposes {{ o.type }} order in {{ o.project or project }}:
-        <strong>{{ o.title }}</strong> — {{ o.description }}</div>
+      <details class="disclosure">
+        <summary>proposes {{ o.type }} order in {{ o.project or project }}: {{ o.title }}</summary>
+        <div class="sub">proposes {{ o.type }} order in {{ o.project or project }}:
+          <strong>{{ o.title }}</strong> — {{ o.description }}</div>
+      </details>
       {% endfor %}
+      {% if f.neo_verdict %}
+      <div class="sub"><strong>Neo</strong>
+        ({{ 'escalated' if f.neo_verdict.escalate else f.neo_verdict.verdict }}{% if f.neo_verdict.severity %}, rated {{ f.neo_verdict.severity }}{% endif %}):
+        {{ f.neo_verdict.reason }}</div>
+      {% endif %}
+      {% if f.steward %}
+      <div class="sub"><strong>steward</strong> decision #{{ f.steward.decision_id }}
+        ({{ f.steward.outcome }}, {{ f.steward.rule }}): {{ f.steward.reason }}</div>
+      {% endif %}
+      {% if f.orders_held %}
+      <div class="sub">its orders wait in the steward's queue for room — accepting again files them now, as yours</div>
+      {% endif %}
       {% if f.filing_error %}
       <div class="sub tone-bad">✗ {{ f.filing_error }} — accepting again retries it</div>
       {% endif %}
@@ -85,7 +115,7 @@
       {% endif %}
     </div>
   </div>
-  {% if status == 'pending' or f.filing_error %}
+  {% if status == 'pending' or f.filing_error or f.orders_held %}
   {# The decision is taken where the finding is read. Both forms post to the one review
      route, which holds no logic of its own. #}
   <div class="row">
@@ -95,7 +125,7 @@
     </form>
   </div>
   <div class="row">
-    <form method="post" action="/io/{{ project }}/{{ io.id }}/review">
+    <form method="post" action="/io/{{ project }}/{{ io.id }}/review" style="display: flex; gap: 8px; width: 100%;">
       <input type="hidden" name="key" value="{{ f.key }}">
       {# `required`: `ops.review_findings` refuses a reasonless rejection, and the reason
          is the only thing the analyst and the knowledge entry ever read. #}
@@ -105,11 +135,41 @@
     </form>
   </div>
   {% endif %}
-</div>
+</details>
 {% else %}
 <div class="panel"><div class="empty">
   no report yet — the analyst is still working, and an order in analysis asks nothing
 </div></div>
 {% endfor %}
+</div>
+
+<div class="io-context">
+<h2 id="brief">The brief</h2>
+{# Collapsed: it is the order's input, read once; the findings are its output. #}
+<div class="panel">
+  <details class="disclosure" style="margin: 10px 16px;">
+    <summary>the observation the analyst was given · {{ io.observation|length }} chars</summary>
+    <div class="measure" style="white-space: pre-wrap; margin-top: 8px;">{{ io.observation }}</div>
+  </details>
+</div>
+
+{% if io.evidence_refs %}
+{# The refs as the user typed them — unresolved on purpose (§2.6): one that does not
+   resolve is a finding about the OS's records, not an error on this page. Each is a
+   link to wherever `/go/` can take it; the text is still exactly what was typed. #}
+<p class="sub">evidence: {% for ref in io.evidence_refs %}
+  {%- if ref.startswith('http://') or ref.startswith('https://') %}<a class="mono" href="{{ ref }}" rel="noopener">{{ ref }}</a>
+  {%- else %}<a class="mono" href="/go/{{ ref|urlencode }}">{{ ref }}</a>{% endif %}{{ ', ' if not loop.last }}{% endfor %}</p>
+{% endif %}
+
+{% if io.analyst %}
+<p class="sub">analyst:
+  <a class="mono" href="/wo/{{ project }}/{{ io.analyst.id }}">{{ io.analyst.id }}</a>
+  ({{ io.analyst.status }})
+  {% if io.analyst.result_summary %}— {{ io.analyst.result_summary }}{% endif %}
+</p>
+{% endif %}
+</div>
+</div>
 
 {% endblock %}

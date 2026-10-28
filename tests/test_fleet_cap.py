@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime, timezone
 
 import pytest
 
-from jarvis import fleet, invariants, ops, worker_session
+from jarvis import db, fleet, invariants, ops, worker_session
 from jarvis.catalog import DEFAULT_MAX_IN_FLIGHT, CatalogError, load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
@@ -337,7 +336,7 @@ def test_a_held_back_order_says_what_it_is_waiting_for(tmp_path, project):
 
     held = fleet.Fleet(3, 0, fleet.Outage(
         project="proj_a", wo_id="wo-0a512472",
-        reopens_at=time.time() + 3600, message=REFUSAL))
+        reopens_at=db.now() + 3600, message=REFUSAL))
     assert "usage window is spent" in invariants.status_label(store, row, held)
     # No fleet view, no fleet clause: a caller holding one project's store cannot know
     assert invariants.status_label(store, row) == "pending"
@@ -445,7 +444,7 @@ def _refused_at(store: ProjectStore, wo_id: str, *, ended: float, reset: float):
 def test_an_outage_hold_is_recorded_and_does_not_stall_the_sweep(jarvis_home, tmp_path,
                                                                  project):
     """The outage half of the same hold (#714)"""
-    now = time.time()
+    now = db.now()
     catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=3)
     ops.start_os(str(catalog_path), foreground=True)
     catalog = load_catalog(catalog_path)
@@ -479,7 +478,7 @@ def test_an_outage_hold_is_recorded_and_does_not_stall_the_sweep(jarvis_home, tm
 
 def test_a_project_cap_hold_names_the_slot_it_waits_for(jarvis_home, tmp_path, project):
     """The second door, with the fleet wide open: a resume out of `needs_review` takes a `max_concurrent`..."""
-    now = time.time()
+    now = db.now()
     catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=50,
                             max_concurrent=1, name="catalog-project-cap.json")
     ops.start_os(str(catalog_path), foreground=True)

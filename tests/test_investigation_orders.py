@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -11,8 +10,9 @@ import pytest
 from test_health_sweep import (HOUR, park_order, stuck_catalog,  # noqa: F401
                                stuck_os)
 
+from jarvis import db
 from jarvis import claude_cli, cli, dispatch, hooks, ops, project_store, verdicts
-from jarvis.catalog import load_catalog
+from jarvis.catalog import DEFAULT_INVESTIGATION_BUDGET_USD, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 from jarvis.testing import a_verdict
@@ -534,6 +534,59 @@ def test_an_ordinary_worker_is_untouched_by_the_mcp_rule():
         assert hooks.preflight_decision(payload, _env(kind="worker")) is None, tool
 
 
+def _pretooluse_matcher(project, kind: str) -> str:
+    """The injected hook's own PreToolUse matcher in one work order's settings file"""
+    import re as _re
+
+    from jarvis.bootstrap import jarvis_hook_command
+    from jarvis.catalog import ProjectSpec
+
+    spec = ProjectSpec(name="proj_a", path=project, description="")
+    settings = json.loads(dispatch._write_worker_settings(
+        spec, {"id": f"wo-mcp-{kind}", "title": "t", "kind": kind}).read_text())
+    ours = [e for e in settings["hooks"]["PreToolUse"]
+            if any(h.get("command") == jarvis_hook_command() for h in e["hooks"])]
+    assert len(ours) == 1
+    _re.compile(ours[0]["matcher"])  # a matcher Claude Code cannot compile matches nothing
+    return ours[0]["matcher"]
+
+
+def _cli_matches(matcher: str, tool: str) -> bool:
+    """Claude Code's own rule: a matcher of only [A-Za-z0-9_|] is a list of EXACT tool names"""
+    import re as _re
+
+    if _re.fullmatch(r"[A-Za-z0-9_|]+", matcher):
+        return tool in matcher.split("|")
+    return _re.search(matcher, tool) is not None
+
+
+def test_the_investigators_matcher_routes_every_mcp_call_to_the_hook(project, jarvis_home):
+    """The hook holds the allowlist; the matcher decides whether it ever runs (#852)"""
+    investigator = _pretooluse_matcher(project, "investigator")
+    worker = _pretooluse_matcher(project, "worker")
+    for tool in MCP_WRITES + MCP_READS:
+        assert _cli_matches(investigator, tool), tool
+    # The negative control: an ordinary worker still pays the hook on NO MCP write
+    for tool in MCP_WRITES:
+        assert not _cli_matches(worker, tool), tool
+
+
+def test_a_bare_mcp_prefix_alternative_would_have_matched_nothing():
+    """Why MCP_MATCHER carries `.*`: round 1 of this order shipped the bare prefix and failed open"""
+    assert not _cli_matches("Bash|Edit|mcp__", "mcp__serena__create_text_file")
+    assert _cli_matches(f"Bash|Edit|{dispatch.MCP_MATCHER}",
+                        "mcp__serena__create_text_file")
+
+
+def test_settings_with_no_jarvis_hook_entry_refuse_to_widen():
+    """A silent no-op here is a read-only guarantee with nowhere to run"""
+    settings = {"hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"command": "/some/other/hook"}]}]}}
+
+    with pytest.raises(RuntimeError, match="investigator cannot be dispatched"):
+        dispatch.widen_mcp_matcher(settings)
+
+
 def test_a_piped_read_still_runs():
     for command in PIPED_READS:
         assert _decision(
@@ -587,7 +640,7 @@ def test_an_investigation_is_an_inv_row_carrying_its_subject(started, store):
     assert json.loads(row["metadata"])[ops.SUBJECT_KEY] == subject
     assert row["status"] == "pending"
     # §2.8: the daemon is the caller, so an uncapped default would be an uncapped loop
-    assert row["budget_usd"] == pytest.approx(2.00)
+    assert row["budget_usd"] == pytest.approx(DEFAULT_INVESTIGATION_BUDGET_USD)
     shown = ops.show_investigation_order(inv["id"])
     assert shown["subject"] == subject
     assert shown["status_label"] == "pending"
@@ -823,7 +876,7 @@ def test_the_family_budget_works_on_an_inv_id_and_refuses_every_other(started, s
                                                                      improvement_order):
     """Obligation 5"""
     inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
-    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == pytest.approx(2.00)
+    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == pytest.approx(DEFAULT_INVESTIGATION_BUDGET_USD)
     assert ops.set_investigation_budget(inv["id"], 9.0)["budget_usd"] == 9.0
     assert ops.investigation_order_budget(inv["id"])["budget_usd"] == 9.0
     assert ops.set_investigation_budget(inv["id"], None)["budget_usd"] is None
@@ -841,7 +894,7 @@ def test_the_cli_shows_and_sets_the_investigation_budget(started, store, capsys)
     """Obligation 5 through the surface the note names, word for word"""
     inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
     assert cli.main(["investigate", "budget", inv["id"], "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["budget_usd"] == pytest.approx(2.00)
+    assert json.loads(capsys.readouterr().out)["budget_usd"] == pytest.approx(DEFAULT_INVESTIGATION_BUDGET_USD)
 
     assert cli.main(["investigate", "budget", inv["id"], "$12.50", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["budget_usd"] == 12.5
@@ -894,9 +947,9 @@ def _panel_on(catalog_file) -> None:
     Path(catalog_file).write_text(json.dumps(data))
 
 
-def test_a_verdict_settles_the_investigator_completed_and_stops_it(
+def test_a_verdict_settles_the_investigator_completed_in_its_own_session(
         started, store, catalog_file, fake_claude):
-    """§2.1: `close_out`, not `finish` — completed, flag down, session dead"""
+    """io-d2a5dd69: completed and flag down WITHOUT killing the session the verdict command runs in"""
     from jarvis.daemon import Daemon
 
     _panel_on(catalog_file)
@@ -917,8 +970,9 @@ def test_a_verdict_settles_the_investigator_completed_and_stops_it(
     assert row["result_summary"]
     kinds = [e["kind"] for e in store.list_events(investigator)]
     assert "verdict_submitted_settled" in kinds
-    assert "session_stopped" in kinds
-    assert not claude_cli.process_alive(turn["pid"])
+    # The caller is a child of this turn: stopping it would kill the command mid-write
+    assert "session_stopped" not in kinds
+    assert claude_cli.process_alive(turn["pid"])
     assert store.validation_rounds(wo_id=investigator) == []
 
 
@@ -1333,9 +1387,10 @@ def test_the_burning_turn_judge_knows_what_an_investigator_is():
 def test_the_investigation_knobs_ship_cheap_and_are_one_edit():
     from jarvis import catalog
 
-    assert catalog.DEFAULT_INVESTIGATION_BUDGET_USD == 2.00
+    # Two measured passes (io-b521d17b): $2.00 equalled one, so it stopped every investigation it funded
+    assert catalog.DEFAULT_INVESTIGATION_BUDGET_USD == 4.00
     defaults = catalog.WorkerDefaults()
-    assert defaults.investigation_budget_usd == 2.00
+    assert defaults.investigation_budget_usd == 4.00
     assert defaults.investigation_model and defaults.investigation_effort
 
 
@@ -1387,7 +1442,7 @@ def _settle(store, inv_id: str, hours_ago: float) -> None:
     """One investigation settled `hours_ago` — the cooldown's clock (§6b)"""
     store.set_feature_status(inv_id, "completed")
     store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
-                       (time.time() - hours_ago * HOUR, inv_id))
+                       (db.now() - hours_ago * HOUR, inv_id))
     store.conn.commit()
 
 
@@ -1425,13 +1480,13 @@ def test_cooldown_holds_until_the_fingerprint_changes(stuck_os):
     # The situation HAS changed, but the cooldown has not run: "it moved" and "it is better" are not the...
     park_order(store, wo["id"], "needs_review", hours=5)
     store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
-                       (time.time() - HOUR, first))
+                       (db.now() - HOUR, first))
     store.conn.commit()
     daemon.stuck_tick(None)
     assert len(_opened("proj_a")) == 1
 
     store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
-                       (time.time() - 13 * HOUR, first))
+                       (db.now() - 13 * HOUR, first))
     store.conn.commit()
     daemon.stuck_tick(None)
     assert len(_opened("proj_a")) == 2

@@ -2,10 +2,26 @@
 
 from __future__ import annotations
 
-from .concision import DEFAULT_SUMMARY_MAX_WORDS as SUMMARY_MAX_WORDS
+from .concision import DEFAULT_ASSUME_MAX_CHARS, DEFAULT_SUMMARY_MAX_WORDS as SUMMARY_MAX_WORDS
 
 WO_PLACEHOLDER = "<wo-id>"
 PROJECT_PLACEHOLDER = "<project>"
+
+#: The one spelling of a spec citation (`sections.REF_RE`); there is no `--section` flag
+SECTION_FORM = 'from section 3 of design doc "docs/superpowers/specs/feature.md": …'
+
+
+def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
+    """The `wo assume` bullet every brief carries: ONE decision, the cap, the in-text reference form (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §5)"""
+    return (
+        f"- `jarvis wo assume {wo_id} \"...\"`: ONE DECISION you made with NO doubt "
+        f"— choice, rejected alternative, why; ≤{DEFAULT_ASSUME_MAX_CHARS} "
+        f"chars; a second decision is a second `jarvis wo assume` citing it "
+        f"(`per Q1234`/`per assumption #2`)."
+        # Dropped in the CORE only: `CORE_BUDGET_CHARS` leaves no room for it there
+        + (f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), never by "
+           f"pasting it and never by naming a whole document." if cite_spec else "")
+        + tail)
 
 #: Budget for the rendered core contract block (between "# Operating contract" and "# Full... (docs/superpowers/specs/2026-08-22-agent-concision.md)
 CORE_BUDGET_CHARS = 3900
@@ -96,7 +112,8 @@ def render_section(name: str, *, wo_id: str | None = None,
                    project: str | None = None,
                    gates_enabled: tuple[str, ...] | None = None,
                    serena: bool = True,
-                   tool_search: str = "cli") -> str:
+                   tool_search: str = "cli",
+                   transport: str = "background") -> str:
     """One full section, rendered with real ids when the caller has them"""
     wo = wo_id or WO_PLACEHOLDER
     proj = project or PROJECT_PLACEHOLDER
@@ -105,7 +122,7 @@ def render_section(name: str, *, wo_id: str | None = None,
     if name == "gates":
         return gates_section(wo, enabled=gates_enabled)
     if name == "record":
-        return record_section(wo)
+        return record_section(wo, transport)
     if name == "navigation":
         return navigation_section(serena, tool_search=tool_search)
     if name == "concision":
@@ -117,10 +134,69 @@ def render_section(name: str, *, wo_id: str | None = None,
 
 # -- the core
 
+#: The two turn transports (`claude_cli.TRANSPORT_*`), spelled here so this module stays a leaf
+TRANSPORT_BACKGROUND = "background"
+TRANSPORT_HEADLESS = "headless"
+
+
+def long_work_bullet(transport: str) -> str:
+    """How a worker runs work that outlasts one command, which depends on what a turn IS (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    if transport == TRANSPORT_HEADLESS:
+        return (
+            "- **A turn is one-shot and NOTHING wakes you when a background job "
+            "ends.** Long work — a whole-suite run, a CI watcher, a "
+            "`jarvis-implementer` or `jarvis-spec-writer` seat — runs in the BACKGROUND "
+            "(`run_in_background: true`); the FOREGROUND call is REFUSED. Collect it "
+            "with `BashOutput`/`TaskOutput` every 3-4 minutes, never one call past 240 "
+            "seconds: your prompt cache lives 5 minutes and a call after it re-sends "
+            "this whole conversation. Nothing else may be backgrounded, and never END a "
+            "turn with a task uncollected — the Stop hook refuses it — or claim you "
+            "will be re-invoked.")
+    return (
+        "- **Long work runs in the background, and it wakes you.** A whole-suite run, "
+        "a CI watcher, a subagent: `run_in_background: true`, then keep working or "
+        "end your turn — its result arrives as a notification. NEVER poll it: no "
+        "`sleep` loops, no `TaskOutput`/`BashOutput` check-ins, no `git diff` to see "
+        "how far a subagent got. Each of those re-reads this whole conversation.")
+
+
+def crew_block(require_crew: bool) -> list[str]:
+    """What an ordinary worker is told about its two subagent seats (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    if require_crew:
+        # spec 2026-09-23-the-crew-a-worker-must-use.md SS6
+        return [
+            "",
+            "# Your crew",
+            "You are a LEAD with two subagents, and delegating is the job, not a "
+            "courtesy: spec writing goes to `jarvis-spec-writer`, code and tests go to "
+            "`jarvis-implementer` (TDD, failing test first).",
+            "- YOURS, and neither of theirs: git, the PR, every `jarvis` command, the "
+            "work-order record (messages, assumptions, the finish summary), and REVIEW "
+            "of what they hand back — it is a draft until you have read it.",
+            "- Your OWN `Edit`/`Write` inside the worktree is refused by a hook, so "
+            "route it through `jarvis-implementer`.",
+        ]
+    return [
+        "",
+        "# Subagents",
+        "DO THE WORK YOURSELF: read, edit, test, commit. A subagent re-reads the code "
+        "you already read and you then re-read what it wrote, so delegating a change "
+        "you could make yourself costs it twice. `jarvis-implementer` and "
+        "`jarvis-spec-writer` exist for a LARGE, self-contained chunk you can specify "
+        "completely, or independent work you want done in parallel.",
+        "- A subagent inherits none of your context: brief it fully. Its hand-back is its "
+        "report — read the final diff ONCE before you commit; do not watch its progress.",
+    ]
+
+
 def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
                   gate_names: tuple[str, ...] = (),
-                  kind: str = "worker") -> list[str]:
+                  kind: str = "worker",
+                  transport: str = TRANSPORT_BACKGROUND,
+                  require_crew: bool = False) -> list[str]:
     """The compressed operating contract: only the invariants a worker cannot be allowed to discover by..."""
+    from .sections import QUESTION_MAX_CHARS
+
     lines = [
         "# Operating contract",
         "You MUST follow it. This is the compressed core; the full contract with "
@@ -131,13 +207,13 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"`[{wo_id}] {title[:40]}`. `gh pr create` with any other title is blocked.",
         f"- **Neo is your first responder. Any doubt goes to it.** "
         f"`jarvis wo ask {wo_id} \"<your question>\"`, then END YOUR TURN; the "
-        f"answer arrives as your next user turn, usually within a minute. This is "
-        f"the normal, expected way to work: it is not an escalation and it does not "
+        f"answer arrives as your next user turn, usually within a minute. "
+        f"Normal: it is not an escalation and it does not "
         f"interrupt the user. The trigger is DOUBT, not importance — if you catch "
         f"yourself weighing options or thinking \"either would work\", you are in "
         f"doubt: Ask BEFORE you build on it, not after. A question is one "
-        f"paragraph: the decision, the options, your recommendation — do not paste "
-        f"context.",
+        f"paragraph: the decision, the options, your recommendation — no pasted "
+        f"context; ≤{QUESTION_MAX_CHARS} chars.",
         "  - Do not talk yourself out of asking: \"It's reversible\", \"it's only "
         "an implementation detail\", \"I'll note it as an assumption\" are "
         "rationalisations for guessing.",
@@ -145,10 +221,9 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             "  - But LOOK IT UP FIRST when a headline in the knowledge-base index "
             "below names the area you are unsure about — a lookup is not a doubt.",
         ] if has_knowledge else []),
-        f"- `jarvis wo assume {wo_id} \"...\"` is for the OTHER case, and it should "
-        f"be RARE: a call you made with NO doubt. Record EVERY such call, including "
-        f"the small and obvious ones — the work order record is the only audit "
-        f"trail anyone gets. Never a guess: if you are guessing, ask.",
+        assume_shape(wo_id, cite_spec=False,
+                     tail=" It should be RARE. Record EVERY such call, including "
+                          "the small and obvious ones: the only audit trail."),
         *([
             f"- READ the OS knowledge base before you touch an area it covers — it "
             f"is INDEXED at the end of this prompt, not pasted into it: "
@@ -172,15 +247,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"action>\"`, by the NUMBER the block printed, never by re-typing the "
             f"command (full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
-        f"- **A turn is one-shot and NOTHING wakes you when a background job "
-        f"ends.** Long work — a whole-suite run, a CI watcher, a "
-        f"`jarvis-implementer` or `jarvis-spec-writer` seat — runs in the BACKGROUND "
-        f"(`run_in_background: true`); the FOREGROUND call is REFUSED. Collect it "
-        f"with `BashOutput`/`TaskOutput` every 3-4 minutes, never one call past 240 "
-        f"seconds: your prompt cache lives 5 minutes and a call after it re-sends "
-        f"this whole conversation. Nothing else may be backgrounded, and never END a "
-        f"turn with a task uncollected — the Stop hook refuses it — or claim you "
-        f"will be re-invoked.",
+        long_work_bullet(transport),
         f"- **Point, do not explain; say each thing ONCE.** A code comment is one "
         f"line citing the spec that explains it (`docs/superpowers/specs/`), not "
         f"the explanation. A PR body hints; the diff explains. Never restate what "
@@ -201,19 +268,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"SHA, path with a line range, or the command that reproduces it. An "
         f"oversized argument and a `$(git diff …)` are refused before the command "
         f"runs.",
-        # spec 2026-09-23-the-crew-a-worker-must-use.md SS6
-        *([
-            "",
-            "# Your crew",
-            "You are a LEAD with two subagents, and delegating is the job, not a "
-            "courtesy: spec writing goes to `jarvis-spec-writer`, code and tests go to "
-            "`jarvis-implementer` (TDD, failing test first).",
-            "- YOURS, and neither of theirs: git, the PR, every `jarvis` command, the "
-            "work-order record (messages, assumptions, the finish summary), and REVIEW "
-            "of what they hand back — it is a draft until you have read it.",
-            "- Your OWN `Edit`/`Write` inside the worktree is refused by a hook, so "
-            "route it through `jarvis-implementer`.",
-        ] if kind == "worker" else []),
+        *(crew_block(require_crew) if kind == "worker" else []),
     ]
     return lines
 
@@ -297,15 +352,16 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
         "reason to go looking instead of recording a call you made with no doubt. "
         "(Your prompt carries the index only when the knowledge base has entries; "
         "with no index there is nothing to look up.)",
-        f"- `jarvis wo assume {wo_id} \"...\"` is for the OTHER case, and it "
-        f"should be RARE: a call you made with NO doubt — you followed an existing "
-        f"convention, the work order implied it, the codebase left one sensible "
-        f"option. Record EVERY such call, including the small and obvious ones "
-        f"(naming, file layout, which convention you followed, how you split the "
-        f"commits): recording is cheap and the work order record is the only audit "
-        f"trail anyone gets. An assumption is a disclosure of something you were "
-        f"SURE about. It is never a guess you are hoping nobody checks — if you "
-        f"are guessing, ask instead.",
+        assume_shape(wo_id, tail=" It is the OTHER case and should be RARE: you "
+                                 "followed an existing convention, the work order "
+                                 "implied it, the codebase left one sensible option. "
+                                 "Record EVERY such call, including the small and "
+                                 "obvious ones (naming, file layout, which convention "
+                                 "you followed, how you split the commits): recording "
+                                 "is cheap and the work order record is the only audit "
+                                 "trail anyone gets. It is a disclosure of something "
+                                 "you were SURE about, never a guess you are hoping "
+                                 "nobody checks — if you are guessing, ask instead."),
         f"- Found work that is real but is not THIS work order's job? Do not file "
         f"it yourself and do not leave a note: `jarvis wo defer {wo_id} \"<title>\" "
         f"--why \"<why it should not be done now>\"` (add `--neo-question <id>` if "
@@ -350,7 +406,55 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
     return "\n".join(lines)
 
 
-def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
+def turn_section(transport: str) -> list[str]:
+    """What a turn IS, in full — `long_work_bullet`'s long form (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    if transport == TRANSPORT_HEADLESS:
+        return [
+            "# A turn is one-shot",
+            "Your session is a single `claude -p --resume` process, and ending a turn "
+            "exits it. Everything you started inside it goes too: a backgrounded "
+            "command is killed or orphaned, and either way nobody reads its output, "
+            "because no event re-invokes a worker when a job it launched finishes. "
+            "Exactly three things start your next turn — an answer to `jarvis wo ask`, "
+            "a verdict on a gate you requested, a message the user sends you.",
+            "",
+            "So work that outlasts one command runs in the BACKGROUND and you POLL it: "
+            "`run_in_background: true`, then `BashOutput` / `TaskOutput` every 3-4 "
+            "minutes until it reports finished, and no single call blocking longer than "
+            "240 seconds. The reason is the clock, not taste — your prompt cache lives "
+            "5 minutes, so a call more than 300 seconds after the previous one re-sends "
+            "this whole conversation at the 1.25x write rate, where a check-in inside "
+            "the window is a 0.1x read. This is the ONLY work that may be backgrounded: "
+            "a whole-suite test run, a CI watcher, a `jarvis-implementer` or "
+            "`jarvis-spec-writer` seat, a long wait. The FOREGROUND call is refused for "
+            "those and backgrounding anything else still is. You may also split it "
+            "into pieces that each fit inside a turn. If it fits in neither, say so and "
+            "ask — a turn that ends on a question is a turn the "
+            "OS understands. NEVER end a turn with a task uncollected: the Stop hook "
+            "refuses it, and ending kills the task. A turn that ends on \"I'll pick this "
+            "up when the "
+            "background run finishes\" is the work order abandoned mid-task, and the "
+            "user is flagged for it.",
+        ]
+    return [
+        "# Your session stays up between turns",
+        "Your session is a Claude Code background session that lives for the whole "
+        "work order. A turn ends when you stop talking, but the session does not: "
+        "anything you started with `run_in_background: true` keeps running, and when "
+        "it finishes its result arrives as a notification that starts your next turn "
+        "by itself. A subagent works the same way.",
+        "",
+        "So work that outlasts one command runs in the BACKGROUND and you do NOT "
+        "watch it: no `sleep` loops, no `TaskOutput` / `BashOutput` check-ins, no "
+        "`git diff` to see how far a subagent got. Each of those calls re-reads this "
+        "whole conversation; waiting for the notification costs nothing. Keep "
+        "working on something else, or end the turn. Messages from Neo and the user "
+        "wait until the session is idle, so they never cut a background job short.",
+    ]
+
+
+def record_section(wo_id: str = WO_PLACEHOLDER,
+                   transport: str = TRANSPORT_BACKGROUND) -> str:
     """What the outside world sees, plus the finishing protocol in full"""
     lines = [
         "# What the outside world sees",
@@ -427,31 +531,7 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         "Do not stop without finishing: a session that ends with neither "
         f"`jarvis wo finish` nor an open question is invisible work.",
         "",
-        "# A turn is one-shot",
-        "Your session is a single `claude -p --resume` process, and ending a turn "
-        "exits it. Everything you started inside it goes too: a backgrounded "
-        "command is killed or orphaned, and either way nobody reads its output, "
-        "because no event re-invokes a worker when a job it launched finishes. "
-        "Exactly three things start your next turn — an answer to `jarvis wo ask`, "
-        "a verdict on a gate you requested, a message the user sends you.",
-        "",
-        "So work that outlasts one command runs in the BACKGROUND and you POLL it: "
-        "`run_in_background: true`, then `BashOutput` / `TaskOutput` every 3-4 "
-        "minutes until it reports finished, and no single call blocking longer than "
-        "240 seconds. The reason is the clock, not taste — your prompt cache lives "
-        "5 minutes, so a call more than 300 seconds after the previous one re-sends "
-        "this whole conversation at the 1.25x write rate, where a check-in inside "
-        "the window is a 0.1x read. This is the ONLY work that may be backgrounded: "
-        "a whole-suite test run, a CI watcher, a `jarvis-implementer` or "
-        "`jarvis-spec-writer` seat, a long wait. The FOREGROUND call is refused for "
-        "those and backgrounding anything else still is. You may also split it "
-        "into pieces that each fit inside a turn. If it fits in neither, say so and "
-        "ask — a turn that ends on a question is a turn the "
-        "OS understands. NEVER end a turn with a task uncollected: the Stop hook "
-        "refuses it, and ending kills the task. A turn that ends on \"I'll pick this "
-        "up when the "
-        "background run finishes\" is the work order abandoned mid-task, and the "
-        "user is flagged for it.",
+        *turn_section(transport),
     ]
     return "\n".join(lines)
 
@@ -577,7 +657,7 @@ def concision_section() -> str:
         "# Point, do not explain",
         "Three surfaces, one rule each. The HOUSE STYLE governs how you write all "
         "three and everything else — it is injected into every turn of your session "
-        "and its rules are your `caveman` and `i-have-adhd` skills "
+        "and its rules are your `caveman` and `ponytail` skills "
         "(docs/superpowers/specs/2026-09-19-concision-enforced.md). This section is "
         "what the style cannot know: which surface holds what.",
         "",

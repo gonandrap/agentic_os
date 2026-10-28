@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Steward — Jarvis{% endblock %}
+{% block content %}
+{# Sections reflow into columns at width — `.flow` in base.html, §5 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+<div class="flow" style="--col: 760px;">
+
+{# docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md, "The queue drains".
+   Read-only: the counts and rows are `ops.steward_queue_report`'s, the same the CLI prints. #}
+{% set tone = {"waiting": "tone-active", "reoffered": "tone-ok", "expired": "tone-warn"} %}
+
+{% macro rows(items, empty) -%}
+  <table>
+    <tr><th>decision</th><th>state</th><th>severity</th><th>origin</th><th>project</th>
+      <th>subject</th><th>age</th><th>note</th></tr>
+    {% for i in items %}
+    <tr id="decision-{{ i.id }}">
+      <td class="mono" style="white-space:nowrap;user-select:all">#{{ i.id }}</td>
+      <td class="mono {{ tone.get(i.queue_state, '') }}">{{ i.queue_state }}</td>
+      <td class="mono">{{ i.severity }}</td>
+      <td class="mono">{{ i.origin_kind }}</td>
+      <td class="mono">{% if i.project %}<a href="/project/{{ i.project }}">{{ i.project }}</a>{% else %}—{% endif %}</td>
+      <td title="{{ i.rule }}: {{ i.reason }}">{{ i.subject }}{% if i.wo_id %} <span class="mono">→ {{ i.wo_id }}</span>{% endif %}</td>
+      <td class="mono" style="white-space:nowrap" title="{{ fmt_ts(i.ts) }}">{{ fmt_age(i.ts) }}</td>
+      <td class="mono">{{ i.queue_note or "—" }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="empty">{{ empty }}</td></tr>
+    {% endfor %}
+  </table>
+{%- endmacro %}
+
+<p class="kv" style="margin-top:18px">
+  Self-work the steward queued rather than dispatched. A waiting decision is re-offered
+  against the current ledger by the daemon; it is never forced through.
+  <span class="counts">({{ report.counts.waiting }} waiting ·
+    {{ report.counts.reoffered }} re-offered · {{ report.counts.expired }} expired)</span>
+</p>
+<p class="sub">{{ report.line }}</p>
+<p class="sub">from a terminal: <span class="mono">jarvis steward decisions</span> ·
+  <span class="mono">jarvis steward digest</span> ·
+  <span class="mono">jarvis steward ledger</span></p>
+
+<h2 id="waiting">Waiting</h2>
+<div class="panel" id="steward-waiting">
+  {{ rows(report.waiting, "nothing queued — the steward is holding no self-work back") }}
+</div>
+
+<h2 id="settled">Re-offered and expired</h2>
+<div class="panel" id="steward-settled">
+  {{ rows(report.settled, "nothing re-offered or expired yet") }}
+</div>
+
+</div>
+{% endblock %}

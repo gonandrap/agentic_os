@@ -8,10 +8,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import claude_cli
+from . import claude_cli, release
 from .catalog import OsConfig, ProjectSpec
 from .central_store import CentralStore, KnowledgeBrief
-from .project_store import MAX_DISPATCH_ATTEMPTS, ProjectStore
+from .project_store import MAX_DISPATCH_ATTEMPTS, WORKER_CHILDREN, ProjectStore
 
 
 def _worker_path() -> str:
@@ -35,6 +35,10 @@ SERENA_READ_TOOLS = (
 SERENA_TOOL_PREFIXES = ("mcp__serena__", "mcp__plugin_serena_serena__")
 
 
+#: The ship script by the exact path the `shipit` skill invokes, and nothing wider (#1206)
+RELEASE_ALLOW_RULES = ("Bash(scripts/shipit.sh:*)",)
+
+
 # The two undocumented keys in the 2.1.284 binary that decide `auto` mode's bash-first steer:... (docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md)
 BASH_FIRST_ENV = "CLAUDE_CODE_THRIFTY_SONIC"
 BASH_FIRST_VARIANT_ENV = "CLAUDE_CODE_COZY_TEAPOT"
@@ -54,7 +58,9 @@ def cache_ttl_env(cache_ttl: str) -> dict[str, str]:
     if cache_ttl == "cli":
         return {}
     if cache_ttl == "1h":
-        return {claude_cli.PROMPT_CACHE_1H_ENV_KEY: "1"}
+        # The 1h flag alone loses to the user's settings promptCacheTtl (#1187)
+        return {claude_cli.PROMPT_CACHE_1H_ENV_KEY: "1",
+                **{k: "1h" for k in claude_cli.PROMPT_CACHE_TTL_ENV_KEYS}}
     return dict(claude_cli.PROMPT_CACHE_5M_ENV)
 
 
@@ -77,11 +83,54 @@ def serena_allow_rules() -> list[str]:
             for prefix in SERENA_TOOL_PREFIXES for tool in SERENA_READ_TOOLS]
 
 
+def opened_by_harness(project: ProjectSpec) -> bool:
+    launcher = project.worker.launcher
+    return bool(launcher is not None and launcher.open)
+
+
+def worker_tree(project: ProjectSpec, wo: dict[str, Any]) -> Path | None:
+    """The worktree this order's worker edits in, or None while a harness has yet to choose it"""
+    from .session_dispatch import harness_worktree_ok
+
+    recorded = wo.get("worktree")
+    if recorded and Path(str(recorded)).is_absolute():
+        return Path(str(recorded)) if harness_worktree_ok(project.path, recorded) else None
+    if opened_by_harness(project):
+        return None
+    return project.path / ".claude" / "worktrees" / wo["id"]
+
+
+#: Routes EVERY MCP call to the hook (#852)
+MCP_MATCHER = "mcp__.*"
+
+
+def widen_mcp_matcher(settings: dict[str, Any]) -> dict[str, Any]:
+    """Hand every MCP call to the hook, for a kind whose no-write rule is an ALLOWLIST (#852, kn-78579bf3)"""
+    from .bootstrap import jarvis_hook_command
+
+    command = jarvis_hook_command()
+    reached = False
+    for entry in (settings.get("hooks") or {}).get("PreToolUse") or []:
+        # A foreign hook entry is not ours to widen, and does not count as reached
+        if not any(h.get("command") == command for h in entry.get("hooks") or []):
+            continue
+        matcher = entry.get("matcher")
+        if matcher and MCP_MATCHER not in matcher.split("|"):
+            entry["matcher"] = f"{matcher}|{MCP_MATCHER}"
+        reached = True  # a matcher-less entry already matches every tool
+    if not reached:
+        # Fail closed: no hook entry means the read-only guarantee has nowhere to run
+        raise RuntimeError(
+            f"no PreToolUse entry runs {command!r}: an investigator cannot be dispatched "
+            "without the hook that refuses its writes (#852)")
+    return settings
+
+
 def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """Merge the project's injected settings with per-work-order env and persist them for --settings"""
     import json as _json
 
-    from . import agent_usage, concision, hooks, wiring
+    from . import agent_usage, concision, hooks, wiring, worker_session
     from .bootstrap import build_settings, deep_merge
     from .paths import jarvis_home
 
@@ -94,15 +143,18 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
 
     # Declarative worker permissions: full edit rights inside its own worktree
     proj_abs = str(project.path).lstrip("/")
-    wt_abs = f"{proj_abs}/.claude/worktrees/{wo['id']}"
+    tree = worker_tree(project, wo)
+    wt_rules = ((f"Edit(//{str(tree).lstrip('/')}/**)",
+                 f"Write(//{str(tree).lstrip('/')}/**)",
+                 f"NotebookEdit(//{str(tree).lstrip('/')}/**)") if tree else ())
     allow = settings.setdefault("permissions", {}).setdefault("allow", [])
     for rule in (
-        f"Edit(//{wt_abs}/**)",
-        f"Write(//{wt_abs}/**)",
-        f"NotebookEdit(//{wt_abs}/**)",
+        *wt_rules,
         f"Read(//{proj_abs}/**)",
         # Read-only code navigation
         *(serena_allow_rules() if serena else ()),
+        # Release orders only: without it `auto` mode vetoes a GATE-APPROVED release (#1206)
+        *(RELEASE_ALLOW_RULES if release.is_release_order(wo) else ()),
     ):
         if rule not in allow:
             allow.append(rule)
@@ -112,14 +164,20 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         if tool not in deny:
             deny.append(tool)
 
+    # The hook refuses every MCP tool but Serena's read-only ones (#852)
+    if wo.get("kind") == "investigator":
+        widen_mcp_matcher(settings)
+
     # THE prefix-stability lever
     settings["includeGitInstructions"] = False
 
     # ONE COPY OF THE PROJECT'S CLAUDE.md reaches the worker
     resolved = project.path.resolve() if project.path.exists() else project.path
     excludes = [str(p) for p in (settings.get("claudeMdExcludes") or [])]
-    for path in hooks.claude_md_excludes(
-            resolved, resolved / ".claude" / "worktrees" / wo["id"]):
+    tree_resolved = (None if tree is None
+                     else Path(tree).resolve() if Path(tree).is_absolute() and Path(tree).exists()
+                     else resolved / ".claude" / "worktrees" / wo["id"])
+    for path in (hooks.claude_md_excludes(resolved, tree_resolved) if tree_resolved else []):
         rel = path.relative_to(resolved)
         for root in dict.fromkeys((resolved, project.path)):
             if str(root / rel) not in excludes:
@@ -151,15 +209,18 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         "JARVIS_DOC_READ_LIMIT_LINES": str(project.worker.doc_read_limit_lines),
         # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces (spec 2026-09-19 SS5.3)
         "JARVIS_SUMMARY_MAX_WORDS": str(project.concision.summary_max_words),
-        # The character cap on a `jarvis wo send` / `wo assume` body
+        # The character cap on a `jarvis wo send` body
         concision.MESSAGE_CAP_ENV: str(project.concision.message_max_chars),
+        # The per-kind caps the hook refuses an over-cap assumption or question at (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §3)
+        concision.ASSUME_CAP_ENV: str(project.concision.assume_max_chars),
+        concision.QUESTION_CAP_ENV: str(project.concision.question_max_chars),
         # The standing worker instructions
         concision.STANDING_PROMPT_ENV: (wo.get("append_system_prompt")
                                         or project.worker.append_system_prompt or ""),
         # WHICH PROMPT-CACHE TTL THIS WORKER'S WRITES ARE BILLED AT (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
         **cache_ttl_env(project.worker.cache_ttl),
         # WHAT A TURN IS, for every hook that would otherwise assume it
-        claude_cli.TURN_TRANSPORT_ENV: claude_cli.TRANSPORT_HEADLESS,
+        claude_cli.TURN_TRANSPORT_ENV: worker_session.transport_of(project, wo),
         # WHAT ONE MCP TOOL CALL MAY TAKE (#845)
         "MCP_TOOL_TIMEOUT": str(project.worker.mcp_tool_timeout_ms),
         # WHETHER `auto` MODE'S BASH-FIRST STEER REACHES THIS WORKER (spec §2, same file)
@@ -174,6 +235,8 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         hooks.TOOL_MANAGED_PATHS_ENV: _json.dumps(
             list(project.worktree.tool_managed_paths)),
     })
+    if opened_by_harness(project):
+        env[hooks.HARNESS_WORKTREE_ENV] = "1"
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -317,7 +380,22 @@ def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     if wo.get("kind") in ("analyst", "investigator"):
         # Neither has children: an improvement order and an investigation are one row plus one session
         return {"fo": fo, "children": []}
-    return {"fo": fo, "children": store.feature_children(fo["id"])}
+    return {"fo": fo, "children": store.feature_children(fo["id"], kinds=WORKER_CHILDREN)}
+
+
+def knowledge_for(central: CentralStore, project: ProjectSpec, wo: dict[str, Any],
+                  cfg: OsConfig) -> KnowledgeBrief:
+    """The knowledge brief a dispatch of `wo` carries — shared with the dashboard's prompt preview"""
+    return central.knowledge_brief(
+        project.name,
+        pinned_limit=cfg.knowledge_inject_limit,
+        digest_limit=cfg.knowledge_digest_limit,
+        digest_chars=cfg.knowledge_digest_chars,
+        title=wo["title"],
+        hint_limit=cfg.knowledge_hint_limit,
+        hint_chars=cfg.knowledge_hint_chars,
+        pinned_chars=cfg.knowledge_pinned_chars,
+    )
 
 
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
@@ -334,7 +412,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         return _analyst_prompt(wo, project, knowledge, feature)
     if wo.get("kind") == "investigator":
         return _investigator_prompt(wo, project, knowledge, feature)
-    from . import os_map, wiring, worker_brief
+    from . import os_map, wiring, worker_brief, worker_session
     from .gates import KINDS
 
     live_gates = tuple(k.name for k in KINDS
@@ -368,7 +446,9 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
                                     bool(knowledge), live_gates,
-                                    kind=str(wo.get("kind") or "worker")),
+                                    kind=str(wo.get("kind") or "worker"),
+                                    transport=worker_session.transport_of(project, wo),
+                                    require_crew=project.worker.require_crew),
         "",
         *worker_brief.section_index(wo["id"], gated=bool(project.gates),
                                     serena=wiring.serena_wired(project.wiring)),
@@ -429,6 +509,7 @@ def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
 def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None) -> str:
     """The briefing for a feature order's planner"""
+    from . import worker_brief
     from .plans import CHILD_CAP, MAX_DESCRIPTION_CHARS, MIN_DESCRIPTION_CHARS
 
     fo_id = wo.get("parent_id") or "?"
@@ -598,11 +679,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"document by section in-text (e.g. `from section 3 of design doc "
         f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it; the referenced section "
         f"is delivered to whoever answers automatically.",
-        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one, including the small ones. Cite a spec BY SECTION in-text, "
-        f"the same shape (e.g. `from section 3 of design doc "
-        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it and never by "
-        f"naming a whole document.",
+        worker_brief.assume_shape(wo["id"],
+                                  tail=" Record every one, including the small ones."),
         f"- Work only inside your worktree (you start in it).",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"` — including anything you decided was OUT of this "
@@ -669,7 +747,7 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None,
                     feature: dict[str, Any] | None = None) -> str:
     """The briefing for an improvement order's analyst (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
-    from . import db
+    from . import db, findings, worker_brief
     from .ops import EVIDENCE_REFS_KEY  # lazy: ops imports dispatch
 
     io_id = wo.get("parent_id") or "?"
@@ -765,6 +843,24 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "The validator names every problem at once, so one revision fixes all of them.",
         "",
+        "# Write it short",
+        # findings.MAX_FIELD_CHARS owns these numbers; the validator refuses a longer report
+        f"The user decides every finding by reading it, so a finding is dense, not long. "
+        f"Hard caps, enforced: `summary` {findings.MAX_SUMMARY_CHARS} characters, "
+        f"`symptom` {findings.MAX_FIELD_CHARS['symptom']}, `root_cause` "
+        f"{findings.MAX_FIELD_CHARS['root_cause']}, `why_insufficient` "
+        f"{findings.MAX_FIELD_CHARS['why_insufficient']}, `recommendation` "
+        f"{findings.MAX_FIELD_CHARS['recommendation']}; at most "
+        f"{findings.MAX_EVIDENCE} quotes per finding, each at most "
+        f"{findings.MAX_QUOTE_CHARS} characters.",
+        "- Rich means specific: the mechanism, the file:line, the measured number. "
+        "Not the story of how you found it, not what you ruled out, not the brief "
+        "restated back.",
+        "- One quote per claim, the single line that proves it. Long logs stay in "
+        "their source; name the command that prints them.",
+        "- Detail a worker needs goes in the proposed order's `description`, not in "
+        "the finding.",
+        "",
         "# Scope",
         # §4.3 of the improvement-orders spec owns this cap
         "- At most 6 findings, ranked worst first, unless your report carries a "
@@ -782,11 +878,8 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn, usually within a minute. The trigger is DOUBT, not importance.",
-        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one, including the small ones. Cite a spec BY SECTION in-text "
-        f"(e.g. `from section 3 of design doc "
-        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it and never by "
-        f"naming a whole document.",
+        worker_brief.assume_shape(wo["id"],
+                                  tail=" Record every one, including the small ones."),
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
@@ -814,7 +907,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
                          knowledge: KnowledgeBrief | None = None,
                          feature: dict[str, Any] | None = None) -> str:
     """The briefing for an investigation order's investigator (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
-    from . import db, gaps, verdicts
+    from . import db, gaps, verdicts, worker_brief
     from .ops import SUBJECT_KEY  # lazy: ops imports dispatch
 
     inv_id = wo.get("parent_id") or "?"
@@ -954,8 +1047,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "are faster than grep.",
         "Writes — EXACTLY four, and nothing else is permitted:",
         f"- `jarvis wo ask {wo['id']} \"<question>\"`",
-        f"- `jarvis wo assume {wo['id']} \"<call you made with no doubt, citing any "
-        f"spec by section in-text>\"`",
+        f"- `jarvis wo assume {wo['id']} \"<ONE decision you made with no doubt, citing "
+        f"any spec by section in-text>\"`",
         f"- `jarvis learn add \"...\" --project {project.name}`",
         f"- `jarvis investigate verdict {inv_id} --from-file verdict.json`",
         "**`jarvis bug report` and `jarvis issues start` are refused for this kind**, and "
@@ -970,11 +1063,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn, usually within a minute. The trigger is DOUBT, not importance.",
-        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one, including the small ones. Cite a spec BY SECTION in-text "
-        f"(e.g. `from section 3 of design doc "
-        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it and never by "
-        f"naming a whole document.",
+        worker_brief.assume_shape(wo["id"],
+                                  tail=" Record every one, including the small ones."),
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
@@ -1000,6 +1090,8 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None,
                     feature: dict[str, Any] | None = None) -> str:
     """The briefing for a feature order's project manager"""
+    from . import worker_brief
+
     fo = (feature or {}).get("fo") or {}
     children = (feature or {}).get("children") or []
     fo_id = wo.get("parent_id") or "?"
@@ -1078,11 +1170,9 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn. The trigger is DOUBT, not importance. A question is one "
         f"paragraph: the decision, the options, your recommendation.",
-        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one: this work order's record is the only account anyone gets of "
-        f"why the feature changed shape. Cite a spec BY SECTION in-text (e.g. `from "
-        f"section 3 of design doc \"docs/superpowers/specs/feature.md\": …`), never by "
-        f"pasting it and never by naming a whole document.",
+        worker_brief.assume_shape(
+            wo["id"], tail=" Record every one: this work order's record is the only "
+                           "account anyone gets of why the feature changed shape."),
         "- Do not run `jarvis wo finish` and do not open a pull request. Neither applies "
         "to you.",
         f"- Read what the fleet already knows before you decide anything: `jarvis learn "
@@ -1169,16 +1259,7 @@ def dispatch_work_order(
     from . import budget, context, worker_session
 
     cfg = os_config or OsConfig()
-    knowledge = central.knowledge_brief(
-        project.name,
-        pinned_limit=cfg.knowledge_inject_limit,
-        digest_limit=cfg.knowledge_digest_limit,
-        digest_chars=cfg.knowledge_digest_chars,
-        title=wo["title"],
-        hint_limit=cfg.knowledge_hint_limit,
-        hint_chars=cfg.knowledge_hint_chars,
-        pinned_chars=cfg.knowledge_pinned_chars,
-    )
+    knowledge = knowledge_for(central, project, wo, cfg)
     prompt = build_worker_prompt(wo, project, knowledge,
                                  design_doc=materialize_design_doc(store, project, wo),
                                  feature=feature_context(store, wo),
@@ -1225,6 +1306,7 @@ def dispatch_work_order(
                 level="warning",
                 wo_id=wo["id"],
                 source="jarvisd",
+                paired=True,
             )
         raise
 
@@ -1237,15 +1319,16 @@ def dispatch_work_order(
         central.touch_project(project.name)
         return store.get_work_order(wo["id"])
 
+    # `worktree` is written by `start` above, AFTER the row this `wo` was read from
+    tree = store.get_work_order(wo["id"]).get("worktree") or wo["id"]
     # THE CONTEXT LEDGER for the seq-1 dispatch turn
     if turn["seq"] == 1:
-        # `worktree` is written by `start` above, AFTER the row this `wo` was read from
-        context.record(store, project, {**wo, "worktree": wo["id"]}, turn, briefing,
+        context.record(store, project, {**wo, "worktree": tree}, turn, briefing,
                        knowledge=knowledge)
     store.clear_dispatch_attempts(wo["id"])
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {
-        "worktree": wo["id"],
+        "worktree": tree,
         "session_id": store.get_work_order(wo["id"])["session_id"],
         "turn": turn["seq"],
         "pid": turn["pid"],

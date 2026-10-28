@@ -1,5 +1,6 @@
 """The remedy: a closed vocabulary, a mandatory gate, and the daemon that applies it (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
 
+# clock-exempt: class 3 — spin-waits on daemon.remedy_applying while a real remedy thread applies the fix
 from __future__ import annotations
 
 import ast
@@ -1031,6 +1032,11 @@ def test_the_refusal_templates_render_verbatim():
     choices = remedies.get("raise_attention").params[0].choices
     for key in ("refusal_unanswered", "refusal_unanswered_document"):
         assert key in remedies.ATTENTION_TEMPLATES and key in choices
+
+
+def test_the_pushed_branch_blocker_is_not_a_template_key():
+    """A compare URL is derived state, never a template key (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §6)"""
+    assert "pr_pending" not in remedies.ATTENTION_TEMPLATES
 
 
 def test_attention_slots_interpolate_validated_ids_only(monkeypatch):
