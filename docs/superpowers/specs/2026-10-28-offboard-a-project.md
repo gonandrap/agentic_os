@@ -69,8 +69,14 @@ archived project still leaves `<project>/.jarvis/` on disk.
 - No automatic offboarding. Nothing in the OS decides on its own that a project is finished.
 - No un-archive verb. Putting the catalog entry back and running `jarvis start` is the
   documented path, and `upsert_project` already resets `status='active'` on conflict.
-- No `--keep-repo`. `--dry-run` already shows what the strip would remove, and an option
-  nobody asked for is an option to maintain forever.
+- No `--keep-repo`, and **no opt-out of the strip at all**. The strip runs on both modes.
+  The ask says to "offer to strip it", and in a non-interactive CLI the offer is `--dry-run`:
+  it lists every file the strip would touch and every refusal with its reason, and writes
+  nothing. That is what an operator needs to decide with. A flag that leaves the OS's hooks
+  and `OPERATION.md` in a repo the OS no longer manages produces a repo whose
+  `.claude/settings.json` points a `PreToolUse` hook at a project the OS has never heard of —
+  the one outcome offboarding exists to prevent. The strip already refuses every file the
+  repo owns, so there is nothing a `--keep-repo` would protect that is not protected anyway.
 - Deleting the project's git repository, or anything in it the OS did not put there.
 - Fixing `morpheus`'s fallback checkout resolver or `schedule.os_owner`'s fallback owner in
   general. Both are pre-existing and filed in the backlog; this feature only stops them
@@ -393,20 +399,43 @@ and each needs its own guard:
 and **not repairable**, for the same reason `check_config_drift` is not: the two repairs are
 opposites (finish the offboard, or put the project back) and only the user can choose.
 
-It yields a violation when anything the OS would still act on names a project that is
-offboarded or has no `projects` row at all: `morpheus_items` not in a terminal state,
-unanswered `questions` in `neo.db`, armed `detectors`, open `rule_fires`, unacked `inbox`
-rows, open `backlog` rows. The detail names the project, the table and the row count, and
-tells the user which way out they have. It is the same enumeration 6.2 needs, which is why it
-lives here and not in a separate order.
+**It fires only for a project with no `projects` row** — purged, or never registered. An
+archived project's rows are never a violation. Getting this boundary wrong is the difference
+between a useful check and one that is permanently red on a correctly offboarded fleet, so it
+is the first thing to write and the first thing to test.
 
-Two exclusions, from the provenance distinction section 3 draws, and getting either wrong
-makes this check cry wolf on every clean fleet. A `detectors` row at `project=''` is
-fleet-wide, names no project and is never a violation. A `gate_rules` row is never a
-violation at all, whatever its `project` holds: provenance is a record of where a rule came
-from, not activity the OS would still take. Only an **armed** detector whose `project` names
-the offboarded project counts — which is also why section 3 retracts exactly those rather
-than blanking them, so an archive shows the violation and a purge does not.
+The reason is that an archive deliberately leaves things behind. Section 6.2 items 1 and 2
+say the daemon *ignores* an archived project's queued `morpheus_items` and unanswered Neo
+questions rather than settling them, because `morpheus.act()` on a failure files an
+investigation or a Neo question and answering a question costs a model call — spend on a
+project the user just removed. Section 3 retracts armed `detectors` only on purge. Those are
+design decisions, not leaks: archive is reversible, and settling that state would make the
+reversible mode quietly destructive, which is the opposite of why it is the default. An
+invariant that flagged them would be flagging the spec.
+
+What is genuinely wrong is a **purge that left rows behind**: a row naming a project the OS
+has no record of, which the OS would still act on if the name ever came back. That is exactly
+the leak section 3's schema-derived table list exists to catch — a `project`-column table
+added after this feature and never classified. The invariant is the backstop for that
+derivation, and it is worth having for that alone.
+
+So it yields a violation when a row the OS would still act on names a project with no
+`projects` row: `morpheus_items` not in a terminal state, unanswered `questions` in `neo.db`,
+**armed** `detectors`, open `rule_fires`, unacked `inbox` rows, open `backlog` rows. The
+detail names the project, the table and the row count, and says the two ways out: finish the
+purge, or re-register the project.
+
+Three exclusions, each of which would otherwise cry wolf. A `detectors` row at `project=''`
+is fleet-wide, names no project, and is never a violation. A `gate_rules` row is never a
+violation whatever its `project` holds: provenance records where a rule came from, not
+activity the OS would still take. And every row belonging to an archived project is excluded
+by the rule above, whatever table it sits in.
+
+The accepted consequence, stated so nobody treats it as an oversight: an archived project can
+accumulate unanswered Neo questions and queued Morpheus items indefinitely and nothing
+reports it. They cost nothing — the daemon skips them — and they are what makes a re-adopt
+pick up where it left off. The archived project's own page already says `archived` (section
+2); if the counts ever need surfacing, that page is where they belong, not `jarvis doctor`.
 
 Finally, `ops.start_os` must not `bootstrap_project` or `upsert_project` an offboarded
 project. With section 7 removing the catalog entry this should already hold by construction —
@@ -565,9 +594,17 @@ the restatement below is the criterion and the obvious phrasing is not.
   precondition — without it the test passes because `os_project` returned `None` and the
   refusal never ran.
 - `INV-OFFBOARDED-ACTIVITY` yields exactly one violation for each of its six sources seeded
-  alone — non-terminal `morpheus_items`, unanswered `questions`, armed `detectors`, open
-  `rule_fires`, unacked `inbox`, open `backlog` — each detail naming the project, the table
-  and the count, each with `repaired` falsy, and none at all on a clean fleet.
+  alone **for a project with no `projects` row** — non-terminal `morpheus_items`, unanswered
+  `questions`, armed `detectors`, open `rule_fires`, unacked `inbox`, open `backlog` — each
+  detail naming the project, the table and the count, each with `repaired` falsy.
+- **A clean archive yields zero violations.** Offboard a project with no `--purge`, after
+  quiesce, with a non-terminal `morpheus_items` row, an unanswered Neo question and an armed
+  detector naming it still in place — all three left by design — and
+  `ops.run_doctor()["os"]` contains no `INV-OFFBOARDED-ACTIVITY`. Seed the same three rows
+  against an archived project one at a time and assert zero each time. This is the criterion
+  that stops the invariant contradicting sections 3 and 6.2; without it the default mode
+  leaves `jarvis doctor` permanently red. Zero on a clean fleet with no offboarded project
+  at all, too.
 
 Two things cannot be criteria here, and should not be smuggled in as tests. Whether
 `hooks.preflight_decision`'s classifier fires with no `JARVIS_WO_ID` is a **finding** section
