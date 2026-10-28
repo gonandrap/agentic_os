@@ -426,14 +426,35 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
         decision.stamp["decision_id"] = decision.decision_id
         if outcome == "ask" and mode == "enforce" and self_dispatch:
             central.add_inbox(c.project, f"steward: {c.subject[:120]}",
-                              f"{reason}. Decide it yourself, or raise "
-                              f"os.evolution.critical_weekly_usd.", level="critical")
+                              ask_body(c, reason, decision.decision_id, catalog),
+                              level="critical", wo_id=c.parent_wo_id or None)
         log.info("steward[%s] %s %s -> %s (%s): %s", mode, c.origin_kind, c.subject[:80],
                  outcome, rule, reason)
         return decision
     finally:
         if own_central:
             central.close()
+
+
+def ask_body(c: Candidate, reason: str, decision_id: int, catalog: Catalog) -> str:
+    """An `ask`'s inbox body: the one command that acts on it, and where it is listed"""
+    from .notify import ui_base_url
+
+    item = str(c.payload.get("morpheus_item") or "")
+    if c.origin_kind == "morpheus" and item:
+        act = (f"`jarvis morpheus confirm {item} --fix \"<what to fix>\"` files the fix; "
+               f"`jarvis morpheus waive|requeue {item}` if it is not broken. "
+               f"{ui_base_url(catalog)}/morpheus#{item}")
+    elif c.origin_kind == "morpheus":
+        act = "`jarvis morpheus status` names the item; then `jarvis morpheus confirm <mv-id>`"
+    elif c.parent_wo_id:
+        act = f"`jarvis investigate {c.parent_wo_id} --why \"<what you saw>\"`"
+    else:
+        act = f"`jarvis wo create {c.project} \"<title>\"` to file it by hand"
+    # An `ask` is never re-offered (`_queue_fields`), so the cap is no answer for THIS one
+    return (f"{reason}. Act: {act}. Raising os.evolution.critical_weekly_usd lets later "
+            f"ones through; it does not re-run this one.\n"
+            f"{ui_base_url(catalog)}/steward#decision-{decision_id}")
 
 
 #: How long an identical decision is not recorded again
