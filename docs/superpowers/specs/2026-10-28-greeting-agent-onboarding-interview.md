@@ -232,17 +232,18 @@ dict- or list-valued path in a resolved map. **This file asserts nothing about p
 presets** — those are §4's and asserting them here would make this section's suite red
 until §4 merges, which is a false dependency in the wrong direction.
 
-## 2. The interview: questions, postures, the two scopes, and the draft
+## 2. The interview: questions, postures, the two scopes, and the re-run
 
 **New module `src/jarvis/interview.py`** — pure: no model, no process, no write outside
 the draft file. Everything done to an answer happens here, which is how the flow is
 testable without a live model.
 
-- `load(path)` / `save(draft, path)` over the §0.3 schema. `save` is atomic (temp +
-  `os.replace`); `load` refuses an unknown `schema`. The draft lives under
-  `paths.onboarding_dir()` (new, `$JARVIS_HOME/onboarding/`), NOT inside the project, so an
-  abandoned interview leaves nothing in the user's repository.
-- `new_draft(path, name=None, current=None)`. On a **re-run** of an adopted project,
+**What this section does NOT own: the draft file itself.** `onboard_draft.load` / `save` /
+`candidate_document` / `validate` ship with §3, because the draft's schema and the
+document it becomes are the write path's contract. This section consumes them.
+
+- `new_draft(path, name=None, current=None)` builds a `onboard_draft.Draft` and saves it.
+  On a **re-run** of an adopted project,
   `current` is `ops.config_show(project)["resolved"]`: `answers` carries, per area, the
   posture whose preset matches the live values exactly (`match_posture`, else `"custom"`),
   and `values` carries what the document actually sets, so the interview revises rather
@@ -280,40 +281,54 @@ testable without a live model.
   `supervisor.enabled` or `supervisor.health_enabled` off for the OS-owning project
   (`schedule.os_project`). The interview must not OFFER that choice when onboarding or
   re-onboarding that project; §3 raises anyway as the backstop.
-- `validate(draft, document) -> list[str]`: build the candidate document
-  (`candidate_document(draft, document)`, which mutates nothing — §3 is the only writer),
-  run it through `catalog.parse_catalog`, and return the `CatalogError` text as problems.
-  A posture that produces an unparseable document is a bug in §4's presets, and this is
-  where it is caught rather than at the user. This is also the type check: the catalog's
-  own parser is the type system, and the interview needs none of its own.
+- Every answer is checked through `onboard_draft.validate(draft, document)` before it is
+  saved, so a posture that produces an unparseable document is caught here — it is a bug
+  in §4's presets — rather than at the user or at apply time. The catalog's own parser is
+  the type system; the interview needs none of its own.
 - `summary(draft, document) -> list[dict]` is `config_version.diff(resolved_before,
   resolved_after)` over the real resolved maps, each change annotated with
   `ops.apply_class(path)`, `ops.safety_key(path)` and the knob's own line from §4. A real
   resolved diff cannot drift from what the fleet will read; a hand-rolled one can.
 
-**Tests — `tests/test_interview.py`.** A draft round-trips and an unknown `schema` is
-refused; `accept_defaults` writes no values and leaves the document silent; `set_value`
-with a value the catalog rejects is refused by `validate` with the parser's own message;
-`summary` on a default-accepting draft for a fresh project reports only the project's
+**Tests — `tests/test_interview.py`.** `accept_defaults` writes no values and leaves the
+document silent; `set_value` with a value the catalog rejects is refused by
+`onboard_draft.validate` with the parser's own message; `summary` on a default-accepting draft for a fresh project reports only the project's
 creation; a re-run draft built from a live resolved map pre-fills the matching posture and
 `"custom"` where nothing matches; with another project already in the catalog, an `os.`-
 scoped area starts at "leave as is" and its question carries the fleet warning naming that
 project. **Preset fixtures in this file are the test's own**, not §4's corpus, so this
 section is not blocked on it.
 
-## 3. `jarvis onboard apply`: one config version, then bootstrap, then the restart
+## 3. The draft file and `jarvis onboard apply`: one config version, then bootstrap, then the restart
+
+**New module `src/jarvis/onboard_draft.py`** — pure, stdlib plus `catalog`, and the
+contract both halves of the feature read:
+
+- `Draft` over the §0.3 schema, with `load(path)` / `save(draft, path)`. `save` is atomic
+  (temp + `os.replace`); `load` refuses an unknown `schema`. Drafts live under
+  `paths.onboarding_dir()` (new, `$JARVIS_HOME/onboarding/`) and NOT inside the project, so
+  an abandoned interview leaves nothing in the user's repository.
+- `candidate_document(draft, document)` returns what the catalog document would become —
+  the `projects[]` entry created or updated from `draft.project`, plus every path in
+  `values` placed through `ops._document_slot`. It **mutates nothing**.
+- `validate(draft, document) -> list[str]` runs the candidate through
+  `catalog.parse_catalog` and returns the `CatalogError` text as problems.
+
+This module is here rather than in §2 because the draft's schema and the document it
+becomes are the write path's contract, and because it lets this section land without
+waiting for the interview. It knows nothing about questions, postures or areas.
 
 **`ops.onboard_apply(draft_path, *, catalog_path=None, dry_run=False)`** is the only thing
 in this feature that writes configuration, and the persona reaches it only through
 `jarvis onboard apply --from <draft.json>`. The order of operations IS the decision:
 
 1. `_refuse_worker_write("onboard apply")` first, exactly as `set_config` does.
-2. `interview.load(draft_path)`. Refuse a draft whose `project.path` is not a directory or
-   not a git repository (name `git init` in the message, as `bootstrap_project` does), or
-   whose `project.name` already names a DIFFERENT path in the document.
+2. `onboard_draft.load(draft_path)`. Refuse a draft whose `project.path` is not a directory
+   or not a git repository (name `git init` in the message, as `bootstrap_project` does),
+   or whose `project.name` already names a DIFFERENT path in the document.
 3. `document = _read_document(_catalog_file(catalog_path))`, `before = _resolved_of(...)`,
-   `candidate = interview.candidate_document(draft, document)`.
-4. `problems = interview.validate(draft, document)` — refuse with every problem at once.
+   `candidate = onboard_draft.candidate_document(draft, document)`.
+4. `problems = onboard_draft.validate(draft, document)` — refuse with every problem at once.
 5. `after = _resolved_of(candidate, file)`; `_refuse_os_sweep_off` for each changed key;
    `_require_reason(changes, draft.reason, retry)` so the safety-key rule is the console's
    and not a second implementation; then **`_commit_document(candidate, path=file,
@@ -351,6 +366,12 @@ out of `_commit_document` rather than needing a check — and a test pins it.
 sense that gate kind exists for. This binds dispatched workers only; an interactive session
 is unaffected (§0). The two refusals are deliberately asymmetric and belong in the same
 change: the ops lockout cannot be bypassed, the gate explains itself.
+
+**Tests — `tests/test_onboard_draft.py`.** A draft round-trips through `save`/`load`; an
+unknown `schema` is refused; `candidate_document` leaves its input document untouched and
+places both an `os.`-scoped and a `projects.<name>.`-scoped value where
+`config_version.resolve` reads them back equal; `validate` returns the parser's own message
+for a value the catalog rejects, and `[]` for a document that parses.
 
 **Tests — `tests/test_onboard_apply.py`** (with the §0.4 autouse fixture). A draft for a
 fresh git project creates the `projects[]` entry and exactly one version row whose
