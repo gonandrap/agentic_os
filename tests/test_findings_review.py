@@ -234,7 +234,7 @@ def test_accept_all_takes_every_pending_finding(reviewable, store):
 # -- rejecting
 
 def test_a_rejection_teaches_neo_and_writes_no_knowledge_entry(reviewable, store):
-    io, _ = reviewable
+    io, analyst = reviewable
     reason = "the brief already names the entry point; the workers read past it"
 
     out = ops.review_findings(io["id"], reject={"first-turn-reads": reason})
@@ -244,6 +244,9 @@ def test_a_rejection_teaches_neo_and_writes_no_knowledge_entry(reviewable, store
     assert reason in rows[0]["content"]
     assert "The dispatch brief names no entry point" in rows[0]["content"]
     assert rows[0]["project"] == "proj_a"
+    assert rows[0]["wo_id"] == analyst["id"]
+    assert rows[0]["origin_kind"] == "finding"
+    assert rows[0]["origin_id"] == f"{io['id']}:first-turn-reads"
     assert not knowledge_entries()
     assert out["rejected"] == ["first-turn-reads"]
 

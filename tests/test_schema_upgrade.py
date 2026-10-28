@@ -82,6 +82,8 @@ def test_neos_database_from_the_live_release_upgrades_in_full(tmp_path, current_
     path = tmp_path / "legacy-neo.db"
     old = sqlite3.connect(path)
     old.executescript(SHIPPED_NEO_SCHEMA.read_text())
+    old.execute("INSERT INTO learnings (ts, project, content, source) VALUES (1.0,?,?,?)",
+                ("proj_a", "a ruling from before provenance", "review"))
     old.commit()
     before = schema_of(old)
     old.close()
@@ -96,8 +98,13 @@ def test_neos_database_from_the_live_release_upgrades_in_full(tmp_path, current_
         # and the upgraded database actually works: the new columns are readable
         q = store.ask("proj_a", "wo-1", "which delimiter?")
         assert q["attempts"] == 0 and q["claimed_at"] is None
+        assert {"wo_id", "origin_kind", "origin_id"} <= after["learnings"]
         assert store.add_learning("global", project="proj_a")["seat"] == ""
-        assert [r["content"] for r in store.learnings("proj_a")] == ["global"]
+        assert [r["content"] for r in store.learnings("proj_a")] == [
+            "a ruling from before provenance", "global"]
+        # A row that predates provenance stays blank: '' is the honest record, never a guess
+        legacy = store.learnings("proj_a")[0]
+        assert (legacy["wo_id"], legacy["origin_kind"], legacy["origin_id"]) == ("", "", "")
     finally:
         store.close()
 

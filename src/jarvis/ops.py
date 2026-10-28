@@ -6326,11 +6326,14 @@ def _teach_assumption_rules(project: str, wo: dict[str, Any], rows: list[dict[st
     neo = NeoStore()
     try:
         ids = []
-        for rule in rules:
+        for rule, assumption_ids in rules:
             # A reasonless rule is the same sentence every time: writing it twice would crowd real rules out
             if not (feedback or "").strip() and neo.has_active_learning(rule, project):
                 continue
-            ids.append(int(neo.add_learning(rule, project=project, source="review")["id"]))
+            ids.append(int(neo.add_learning(
+                rule, project=project, source="review",
+                wo_id=str(wo.get("id") or ""), origin_kind="assumption",
+                origin_id=",".join(str(i) for i in assumption_ids))["id"]))
         return ids
     finally:
         neo.close()
@@ -7168,7 +7171,9 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
             for key, reason in rejections.items():
                 neo.add_learning(
                     findings.rejection_learning(fo, by_key[key], reason, decided_by),
-                    project=name, source="review")
+                    project=name, source="review",
+                    wo_id=fo.get("plan_wo_id") or "", origin_kind="finding",
+                    origin_id=f"{io_id}:{key}")
         finally:
             neo.close()
     if decided_by == "user":
@@ -9044,7 +9049,8 @@ def neo_review(question_id: int, approved: bool, feedback: str = "",
             learning = neo.add_learning(
                 neo_mod.learning_from_review(q, feedback),
                 project=q["project"], source="review", question_id=question_id,
-                seat=seat,
+                seat=seat, wo_id=q["wo_id"] or "", origin_kind="question",
+                origin_id=str(question_id),
             )
     finally:
         neo.close()
@@ -12588,7 +12594,9 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
             if not approved:
                 neo.add_learning(
                     supervisor.learning_from_review(row, feedback.strip()),
-                    project=name, source="review", seat=SUPERVISOR_SEAT)
+                    project=name, source="review", seat=SUPERVISOR_SEAT,
+                    wo_id=row["wo_id"] or "", origin_kind="alarm",
+                    origin_id=alarm_id)
 
             # THE CLOSE SITE NOBODY ELSE OWNS
             if row["neo_question_id"]:

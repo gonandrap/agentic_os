@@ -359,11 +359,25 @@ def learning_from_review(q: dict[str, Any], feedback: str) -> str:
 NO_REASON_RULING = "no reason given — the user decided it as the worker recorded it"
 
 
+def learning_origin(row: dict[str, Any]) -> str:
+    """Where a learning came from, as one phrase — '' when the row predates the columns"""
+    parts = [str(row.get("wo_id") or "")]
+    kind, ref = str(row.get("origin_kind") or ""), str(row.get("origin_id") or "")
+    if kind:
+        parts.append(f"{kind} {ref}" if ref else kind)
+    return " ".join(p for p in parts if p)
+
+
 def learnings_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[str, Any]],
                                      accepted: bool, feedback: str, *,
                                      false_alarms: frozenset[int] = frozenset(),
-                                     tightened: bool = False) -> list[str]:
-    """The user's ruling as RULES Neo applies to the next assumption of the class (io-51469add)"""
+                                     tightened: bool = False
+                                     ) -> list[tuple[str, list[int]]]:
+    """The user's ruling as RULES Neo applies to the next assumption of the class (io-51469add)
+
+    Each rule comes back with the assumption ids that produced it: one rule covers a whole
+    class, so its provenance is every row in that class (Neo 2246).
+    """
     from .autoreview import assumption_class
 
     by_class: dict[str, list[dict[str, Any]]] = {}
@@ -373,17 +387,18 @@ def learnings_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[
     feedback = (feedback or "").strip()
     rules = []
     for cls, rows in by_class.items():
+        ids = [int(a.get("id") or 0) for a in rows if a.get("id")]
         if not feedback:
             # Deterministic text, so the caller can dedupe it: one rule per class, not one per order
             verdict = "accepted it unchanged" if accepted else "rejected it"
-            rules.append(f"RULE (from the user's assumption reviews): for {cls}, the user "
-                         f"{verdict} — {NO_REASON_RULING}.")
+            rules.append((f"RULE (from the user's assumption reviews): for {cls}, the user "
+                          f"{verdict} — {NO_REASON_RULING}.", ids))
             continue
         verdict = "accepted" if accepted else "rejected"
         alarm = (" The user called the high-stakes net's match on it a FALSE ALARM."
                  if any(int(a.get("id") or 0) in false_alarms for a in rows) else "")
         example = "; ".join(f"\"{str(a.get('content') or '')[:200]}\"" for a in rows[:3])
-        rules.append(f"RULE (from the user's review of {wo.get('id') or 'a work order'}): "
-                     f"for {cls}, the user {verdict} it. Reason: {feedback}.{alarm} "
-                     f"Example, on \"{str(wo.get('title') or '')[:120]}\": {example}")
+        rules.append((f"RULE (from the user's review of {wo.get('id') or 'a work order'}): "
+                      f"for {cls}, the user {verdict} it. Reason: {feedback}.{alarm} "
+                      f"Example, on \"{str(wo.get('title') or '')[:120]}\": {example}", ids))
     return rules

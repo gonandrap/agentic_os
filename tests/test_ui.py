@@ -1112,6 +1112,23 @@ def test_neo_tab_labels_a_seat_scoped_learning(client):
     assert "Prefer uv over pip" in page
 
 
+def test_neo_tab_shows_where_a_learning_came_from(client):
+    """A ruling with no visible origin cannot be judged stale before it is retracted"""
+    from jarvis.neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        neo.add_learning("RULE: squash merges only", project="proj_a", source="review",
+                         wo_id="wo-1234abcd", origin_kind="assumption", origin_id="7")
+        neo.add_learning("Prefer uv over pip")
+    finally:
+        neo.close()
+    page = client.get("/neo").text
+    assert "from wo-1234abcd assumption 7" in page
+    # the control: a row with no origin shows no 'from' label
+    assert page.count("from wo-") == 1
+
+
 def test_neo_teach_directly(client):
     r = client.post("/neo/learn", data={"content": "prefer uv over pip", "project": ""})
     assert r.status_code == 303
