@@ -433,6 +433,23 @@ def _bg_worker():
 def _bg_find(short):
     return next((e for e in load_sessions() if e.get("id") == short), None)
 
+def _git_out(cwd, *args):
+    import subprocess
+    p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else None
+
+def _dirty_worktree(cwd):
+    """Is the session's cwd a LINKED worktree holding uncommitted changes? (as `rm` checks)"""
+    if not cwd or not os.path.isdir(cwd):
+        return False
+    own = _git_out(cwd, "rev-parse", "--absolute-git-dir")
+    common = _git_out(cwd, "rev-parse", "--git-common-dir")
+    if own is None or common is None or os.path.realpath(own) == os.path.realpath(
+            os.path.join(cwd, common) if not os.path.isabs(common) else common):
+        return False  # the main checkout: `rm` owns no worktree here
+    return bool(_git_out(cwd, "--no-optional-locks", "status", "--porcelain",
+                         "--untracked-files=normal"))
+
 if "--version" in argv:
     print("9.9.9 (fake claude)")
 elif "--bg" in argv and "--name" not in argv:
@@ -455,8 +472,18 @@ elif argv[:1] == ["respawn"]:
     _set(entry["sessionId"], pid=900000 + len(load_sessions()), status="idle")
     print(f"respawned {argv[1]}")
 elif argv[:1] == ["rm"]:
-    if _bg_find(argv[1]) is None:
+    entry = _bg_find(argv[1])
+    if entry is None:
         sys.stderr.write(f"no such session {argv[1]}\n"); sys.exit(1)
+    # Measured on 2.1.312: ANY uncommitted change in the session's own worktree —
+    # an untracked file included — keeps the session, reported on STDOUT at exit 1.
+    kept = _dirty_worktree(entry.get("cwd") or "")
+    if kept:
+        print(f"kept {argv[1]} — its worktree is still at {entry['cwd']}\n"
+              f"  The worktree has uncommitted changes. Deleting it would lose them. "
+              f"commit or stash them and run 'claude rm {argv[1]}' again, or delete the "
+              f"session from 'claude agents' (ctrl+x twice) to discard them")
+        sys.exit(1)
     _locked_sessions(lambda ss: ss.__setitem__(slice(None), [e for e in ss if e.get("id") != argv[1]]))
     print(f"removed {argv[1]}")
 elif argv[:1] == ["agents"]:

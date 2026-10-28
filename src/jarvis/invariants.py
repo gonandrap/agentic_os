@@ -31,6 +31,7 @@ from .project_store import (
     OPEN_STATUSES,
     RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
+    SESSION_KEPT_EVENT,
     SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
     VALIDATION_AUTH_CAUSE,
@@ -2812,6 +2813,24 @@ def check_pull_request_recorded(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+def check_closed_session_removed(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SESSION-KEPT — a closed order's background session must not outlive it (#1257)"""
+    for wo in store.closed_background_sessions():
+        kept = store.last_event_of_kind(wo["id"], SESSION_KEPT_EVENT)
+        if kept is None:
+            continue  # the next poll is its first attempt, not a leak
+        refusal = str((db.from_json(kept["payload"], {}) or {}).get("refusal") or "")
+        yield Violation(
+            invariant="INV-SESSION-KEPT",
+            wo_id=wo["id"],
+            detail=(f"{wo['status']}, and `claude rm {wo['bg_id']}` has been refusing to "
+                    f"take its session since {_stamp(float(kept['ts']))}: "
+                    f"{' '.join(refusal.split())[:200]}"),
+            repaired=False,
+            context={"bg_id": wo["bg_id"], "refusal": refusal[:500]},
+        )
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot (#134)"""
     counted = store.count_active()
@@ -3843,6 +3862,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # no flag and writes no status, so nothing else in the tuple reads its output
     check_pull_request_recorded,   # order-free: a pure timeline read that repairs
                                    # nothing and touches no flag
+    check_closed_session_removed,  # ditto: a pure read of what the poll could not remove
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
     check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger

@@ -10,11 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import (background, budget, claude_cli, context, session_dispatch, systemd_units,
-               usage)
+from . import (background, budget, claude_cli, context, db, session_dispatch,
+               systemd_units, usage)
 from .catalog import ProjectSpec
-from .project_store import (COMPACT_TURN, COST_FROM_TRANSCRIPT, TERMINAL_STATUSES,
-                            ProjectStore)
+from .project_store import (COMPACT_TURN, COST_FROM_TRANSCRIPT, SESSION_KEPT_EVENT,
+                            TERMINAL_STATUSES, ProjectStore)
 
 log = logging.getLogger("jarvisd")
 
@@ -674,8 +674,10 @@ def remove_closed_sessions(store: ProjectStore) -> list[str]:
         if entry is not None:
             if entry.alive and not claude_cli.stop_bg(short):
                 continue  # the next poll tries again
-            report = claude_cli.remove_bg(short)
+            _prune_worktree_caches(store, wo)
+            report, refusal = claude_cli.remove_bg_report(short)
             if report is None:
+                _record_session_kept(store, wo, short, refusal)
                 continue
         # Gone from the roster already counts: someone ran `claude rm` by hand
         store.forget_background_session(wo["id"])
@@ -685,6 +687,33 @@ def remove_closed_sessions(store: ProjectStore) -> list[str]:
         })
         removed.append(wo["id"])
     return removed
+
+
+def _prune_worktree_caches(store: ProjectStore, wo: dict[str, Any]) -> None:
+    """A build cache `pytest` left untracked is not work, and `claude rm` keeps a worktree for it (#1257)"""
+    from . import disk
+    from .evidence import ProjectRef
+
+    tree = worktree_path(ProjectRef(store.project_path), wo)  # type: ignore[arg-type]
+    if tree is None:
+        return
+    pruned = disk.prune_build_caches(tree)
+    if pruned:
+        log.info("pruned %d regenerable cache(s) from %s's worktree", len(pruned),
+                 wo["id"])
+
+
+def _record_session_kept(store: ProjectStore, wo: dict[str, Any], short: str,
+                         refusal: str) -> None:
+    """Say ONCE why `claude rm` kept the session, however many polls retry it (#1257)"""
+    said = refusal[:500]
+    last = store.last_event_of_kind(wo["id"], SESSION_KEPT_EVENT)
+    if last is not None and str(
+            (db.from_json(last["payload"], {}) or {}).get("refusal") or "") == said:
+        return
+    log.warning("`claude rm %s` kept %s's session: %s", short, wo["id"], said)
+    store.add_event(wo["id"], SESSION_KEPT_EVENT,
+                    {"bg_id": short, "status": wo["status"], "refusal": said})
 
 
 def _unit_still_running(turn: dict[str, Any]) -> bool:

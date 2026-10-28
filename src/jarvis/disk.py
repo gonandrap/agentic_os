@@ -26,6 +26,62 @@ MAX_PER_SWEEP = 20
 SECONDS_PER_HOUR = 3600
 BYTES_PER_GB = 1024 ** 3
 
+#: Untracked directories a worker's own tooling regenerates — never its work (#1257)
+REGENERABLE_NAMES = frozenset({
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+    ".ipynb_checkpoints", ".hypothesis", "htmlcov", ".coverage", ".DS_Store",
+    "node_modules",
+})
+
+#: …and the files those tools drop beside the sources
+REGENERABLE_SUFFIXES = (".pyc", ".pyo", ".egg-info")
+
+
+def prune_build_caches(worktree: Path) -> list[str]:
+    """Delete the worktree's UNTRACKED regenerable caches, which otherwise read as work (#1257)"""
+    # `=all` so an untracked DIRECTORY cannot hide what it holds behind its own name
+    status = branchproof.run(worktree, "--no-optional-locks", "status", "--porcelain",
+                             "-z", "--untracked-files=all")
+    if not status:
+        return []
+    pruned: list[str] = []
+    for entry in status.split("\0"):
+        if not entry.startswith("??"):
+            continue
+        rel = _regenerable_root(entry[3:])
+        if rel is None or rel in pruned:
+            continue
+        target = worktree / rel
+        if not _inside(worktree, target):
+            continue
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
+        except OSError as exc:
+            log.debug("could not prune %s: %s", target, exc)
+            continue
+        pruned.append(rel)
+    return pruned
+
+
+def _regenerable_root(rel: str) -> str | None:
+    """The cache this untracked path belongs to — the directory, not the file inside it"""
+    parts = [p for p in rel.rstrip("/").split("/") if p]
+    for i, part in enumerate(parts):
+        if part in REGENERABLE_NAMES:
+            return "/".join(parts[:i + 1])
+    return rel.rstrip("/") if parts and parts[-1].endswith(REGENERABLE_SUFFIXES) else None
+
+
+def _inside(worktree: Path, target: Path) -> bool:
+    """git never reports a path outside the worktree; a symlinked one must not be followed"""
+    try:
+        return target.resolve().is_relative_to(worktree.resolve())
+    except OSError:
+        return False
+
 
 def sweep(store: Any, project: Any, *, skip: Iterable[str] = (),
           now: float | None = None,
