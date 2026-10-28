@@ -1735,6 +1735,16 @@ def create_app() -> FastAPI:
                                     status_code=303)
         return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
 
+    @app.post("/morpheus/{item_id}/confirm")
+    def morpheus_confirm(item_id: str, fix: str = Form(""), next: str = Form("")):
+        """The user rules a failed check real and files its fix order"""
+        try:
+            ops.morpheus_confirm(item_id, fix)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/morpheus", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
+
     @app.get("/steward", response_class=HTMLResponse)
     def steward_page(request: Request):
         """Self-work the steward queued: what still waits, what was re-offered, what expired (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)"""

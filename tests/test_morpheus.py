@@ -267,6 +267,24 @@ def test_waive_and_requeue(central, cfg, clock):
         ("monitoring", "", TEST_EPOCH + DAY + 3 * DAY)
 
 
+def test_confirm_files_one_fix_and_records_it(central):
+    item = monitoring(central)
+    filed = []
+    with pytest.raises(ValueError, match="only a failed"):
+        morpheus.confirm(central, item["id"], "slow", lambda i: "wo-x")
+    central.update_morpheus_item(item["id"], state="failed", action="neo:4")
+    with pytest.raises(ValueError, match="what needs fixing"):
+        morpheus.confirm(central, item["id"], " ", lambda i: "wo-x")
+    done, order = morpheus.confirm(central, item["id"], "/cost takes 6.8s",
+                                   lambda i: filed.append(i["id"]) or "wo-fix1")
+    assert (order, filed, done["state"], done["action"]) == ("wo-fix1", [item["id"]],
+                                                             "failed", "neo:4")
+    assert done["resolution"].startswith(morpheus.CONFIRMED) and "wo-fix1" in done["resolution"]
+    with pytest.raises(ValueError, match="already"):
+        morpheus.confirm(central, item["id"], "again", lambda i: "wo-fix2")
+    assert "/cost takes 6.8s" in morpheus.fix_description(done, "/cost takes 6.8s")
+
+
 # -- 4. the mechanical half: the exit code and nothing else
 
 

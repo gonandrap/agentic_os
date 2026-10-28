@@ -90,7 +90,14 @@
       <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
       <td class="mono" style="white-space:nowrap">{{ fmt_ts(i.deadline_ts) }}</td>
       <td class="mono">{% if i.last_output %}{{ peek(i.id ~ "-tail", "tail", "output · " ~ i.id ~ " · #" ~ i.pr_number, i.last_output) }}{% else %}—{% endif %}</td>
-      <td class="mono" style="word-break:break-all">{{ i.action or "—" }}</td>
+      <td class="mono" style="word-break:break-all">{{ i.action or "—" }}
+        {%- if i.state in ("failed", "timedout") and not (i.resolution or "").startswith("confirmed failed") %}
+        <form method="post" action="/morpheus/{{ i.id }}/confirm" style="display:flex; gap:6px; margin-top:6px">
+          <input type="hidden" name="next" value="/morpheus#{{ i.id }}">
+          <input type="text" name="fix" required placeholder="broken: what to fix">
+          <button title="files a work order that fixes it">file fix</button>
+        </form>
+        {%- elif i.resolution %}<div class="sub">{{ i.resolution }}</div>{% endif %}</td>
     </tr>
     {% else %}
     <tr><td colspan="9" class="empty">nothing queued — a release or a merge fills this</td></tr>
@@ -102,6 +109,7 @@
   <span class="mono">jarvis morpheus show &lt;id&gt;</span> ·
   <span class="mono">jarvis morpheus waive &lt;id&gt; --reason "…"</span> ·
   <span class="mono">jarvis morpheus requeue &lt;id&gt;</span> ·
+  <span class="mono">jarvis morpheus confirm &lt;id&gt; --fix "…"</span> ·
   <span class="mono">jarvis morpheus pause|unpause --reason "…"</span> ·
   <span class="mono">jarvis morpheus follow-fleet</span></p>
 
