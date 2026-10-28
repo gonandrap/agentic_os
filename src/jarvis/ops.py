@@ -6036,6 +6036,26 @@ def ack_inbox(inbox_id: int | None = None) -> dict[str, Any]:
     return {"acked": n, "attention_lowered": lowered, "attention_kept": kept}
 
 
+INBOX_LEVELS = ("critical", "warning", "info")
+INBOX_SORTS = ("priority", "newest", "oldest")
+
+
+def select_inbox(items: list[dict[str, Any]], *, level: str = "", project: str = "",
+                 q: str = "", sort: str = "priority") -> list[dict[str, Any]]:
+    """Filter and order unacked inbox rows; `priority` is critical first, newest first within a level"""
+    words = q.lower().split()
+    out = [it for it in items
+           if (not level or it["level"] == level)
+           and (not project or it["project"] == project)
+           and all(w in f"{it['title']} {it.get('body') or ''} {it.get('wo_id') or ''}".lower()
+                   for w in words)]
+    out.sort(key=lambda it: it["ts"], reverse=sort != "oldest")
+    if sort == "priority":
+        rank = {lv: i for i, lv in enumerate(INBOX_LEVELS)}
+        out.sort(key=lambda it: rank.get(it["level"], len(rank)))
+    return out
+
+
 def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Put down an attention flag the OS raised for ITSELF, acknowledging nothing"""
     from .invariants import true_blockers
