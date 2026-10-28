@@ -267,6 +267,25 @@ def test_the_steward_page_shows_counts_then_each_queued_decision(enforcing, stor
     assert 'class="flow"' in html
 
 
+def test_the_steward_page_lists_an_ask_with_where_to_act(jarvis_home, catalog_file):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    ops.start_os(str(catalog_file), foreground=True)
+    central = CentralStore()
+    try:
+        ask = _legacy(central, origin_kind="morpheus", outcome="ask", severity="critical",
+                      rule="critical-ceiling", subject="PR #1241 failed production validation",
+                      ts=db.now(), candidate_json=json.dumps({"payload": {"morpheus_item": "mv-1"}}))
+    finally:
+        central.close()
+    html = TestClient(create_app()).get("/steward").text
+    asks = html.split('id="steward-asks"', 1)[1].split('id="steward-waiting"', 1)[0]
+    assert f'id="decision-{ask}"' in asks and 'href="/morpheus#mv-1"' in asks
+
+
 def test_the_steward_page_renders_with_nothing_queued(jarvis_home, catalog_file):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
