@@ -118,6 +118,41 @@ def graph_search(store: Any, term: str, limit: int = 20, project: str | None = N
     return hits[:keep] + extra
 
 
+# -- the review tool's payload --------------------------------------------------------
+
+
+def review_payload(store: Any, include_retired: bool = False) -> dict[str, Any]:
+    """Everything the knowledge-review page draws, as one JSON-ready dict.
+
+    `nodes` are knowledge entries (`domain_id` '' = unassigned, `assigned_by` the actor
+    of the current assignment, so a page can tell a proposal from a decision); `domains`
+    the live tree; `edges` the derived ones (`manual: false`, no id) plus live `kb_links`
+    (`manual: true`, with the id a removal needs).
+    """
+    rows = store.search_knowledge("", limit=1_000_000)
+    assigned = store.domain_assignments(with_by=True)
+    reads = store.knowledge_hit_counts()
+    nodes = []
+    for r in rows:
+        if r["retired_at"] is not None and not include_retired:
+            continue
+        domain_id, by = assigned.get(r["id"], ("", ""))
+        nodes.append({"id": r["id"], "headline": headline(r["content"]),
+                      "topic": r["topic"], "project": r["project"] or "global",
+                      "retired": r["retired_at"] is not None, "reads": reads.get(r["id"], 0),
+                      "chars": len(r["content"] or ""), "domain_id": domain_id,
+                      "assigned_by": by, "wo_id": r["wo_id"]})
+    shown = {n["id"] for n in nodes}
+    edges = [{"src": e.src, "rel": e.rel, "dst": e.dst, "manual": False}
+             for e in knowledge_edges(rows) if e.src in shown and e.dst in shown]
+    edges += [{"id": lk["id"], "src": lk["src"], "rel": lk["rel"], "dst": lk["dst"],
+               "manual": True, "by": lk["by"]}
+              for lk in store.list_kb_links() if lk["src"] in shown and lk["dst"] in shown]
+    domains = [{k: d[k] for k in ("id", "name", "description", "parent_id", "by")}
+               for d in store.list_domains()]
+    return {"nodes": nodes, "domains": domains, "edges": edges}
+
+
 # -- the picture ----------------------------------------------------------------------
 
 
