@@ -1737,6 +1737,49 @@ def check_no_orphan_gate_requests(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+#: Why a gate becomes the user's when the reviewer it was handed to never judged it (issue #1261)
+GATE_UNJUDGED_ESCALATION = (
+    "Neo question {question_id} failed without a verdict ({cause}) and nothing re-asks "
+    "it — NOBODY HAS JUDGED THIS request"
+)
+
+
+def check_gate_requests_have_a_reviewer(store: ProjectStore) -> Iterator[Violation]:
+    """INV-GATE-UNJUDGED — a pending gate whose Neo question died must come to the user"""
+    from .neo_store import NeoStore
+
+    waiting = [a for a in store.pending_approvals()
+               if not a["escalated"] and a["neo_question_id"]]
+    if not waiting:
+        return
+    readonly = getattr(store, "readonly", False)
+    neo = NeoStore()
+    try:
+        for approval in waiting:
+            q = neo.get(int(approval["neo_question_id"]))
+            # Every `failed` cause means the same thing here: the call never produced a verdict
+            if q is None or q["status"] != "failed":
+                continue
+            reason = GATE_UNJUDGED_ESCALATION.format(
+                question_id=q["id"],
+                cause=q["escalation_cause"] or "no cause recorded")
+            if not readonly:
+                store.mark_approval_escalated(approval["id"], reason)
+            yield Violation(
+                invariant="INV-GATE-UNJUDGED",
+                wo_id=approval["wo_id"],
+                detail=f"gate request {approval['id']} ({approval['kind']}) was pending "
+                       f"with Neo, but question {q['id']} failed without a verdict",
+                repaired=True,
+                repair=("would escalate" if readonly else "escalated") + " to the user",
+                context={"approval_id": approval["id"], "kind": approval["kind"],
+                         "question_id": q["id"],
+                         "escalation_cause": q["escalation_cause"] or ""},
+            )
+    finally:
+        neo.close()
+
+
 def check_no_phantom_attention(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-PHANTOM — a work order with nothing pending must not ask for you (docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §5)"""
     for wo in store.list_work_orders(statuses=TERMINAL_STATUSES, include_hidden=True):
@@ -3825,6 +3868,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
                                     # request is a blocker they would otherwise believe
+    check_gate_requests_have_a_reviewer,  # ...and beside it, for the mirror reason: it
+                                    # RAISES the blocker the flag checks then surface
     check_repaired_work_rejoins_the_merge_queue,  # BEFORE the reason checks: it moves
                                    # the status they derive a reason from
     check_a_working_worker_is_not_waiting,  # BEFORE the reason checks: it moves the status
@@ -3912,6 +3957,8 @@ class _ReadOnly:
                 "clear_attention",
                 "add_assumption", "add_event",
                 "set_status", "update_work_order", "supersede_approval",
+                # INV-GATE-UNJUDGED's repair
+                "mark_approval_escalated",
                 # The bus
                 "mark_envelope", "bump_envelope_attempt", "deliver_envelope",
                 "queue_message", "flag_feature_attention",
