@@ -41,6 +41,10 @@ worker prompts carry an INDEX of the knowledge base (headline + id, bounded); wo
 
 what memory COSTS and whether anyone reads it: the index's share of a dispatch prompt, entries nobody has ever opened, searches that came back empty, and orders that completed without one read. Reach for it when the base feels bloated — the entries themselves never reach a prompt, so the number that matters is retrieval, not size.
 
+## `jarvis learn review [--port N] [--no-browser]`
+
+the knowledge base's STRUCTURE, reviewed by hand: domains (a tree above the free-text topic), which entry sits in which, and links between entries, drawn as a graph you drag things around in. Amber entries are a machine's proposed placement, green ones a person's decision; re-assigning an entry to the domain it already sits in is how a proposal is accepted. It is the dashboard's `/knowledge/review` page (the "Validate knowledge graph" button on /knowledge) served on its own port against whatever `JARVIS_HOME` names, so it runs whether or not the OS is up. Every change is append-only and carries who made it; retiring a domain or removing a link asks why.
+
 ## `jarvis learn retract <id> --reason "…"`
 
 same for the knowledge base: retire a superseded entry so it stops reaching workers — it leaves the index too, not just the payload — without erasing that it was true
