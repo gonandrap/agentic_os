@@ -189,7 +189,11 @@
 - `cli.py` (676 L) — argparse surface + output formatting. `build_parser()`:72, `main()`:631,
   `cmd_start()`:254, `cmd_wo()`:342, `cmd_status()`:281. Every jarvis import is lazy, inside handlers.
 - `ui/app.py` — FastAPI/Jinja dashboard. `create_app()`:50, routes at :75/:103/:154,
-  POST actions :181-263 (all delegate to `ops`).
+  POST actions :181-263 (all delegate to `ops`). `/knowledge/review` is a Cytoscape graph
+  editor over `ops.kb_review_payload` with JSON POSTs to `ops.kb_*` (template
+  `knowledge_review.html`); its JS libraries are vendored in `ui/vendor/` (README lists
+  versions/licenses) and served by `/vendor/<file>` — the dashboard loads no CDN.
+  `jarvis learn review` serves the same app on its own port (`cli._serve_dashboard`).
 
 ## Layering
 

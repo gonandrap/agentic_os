@@ -1,0 +1,1046 @@
+{% extends "base.html" %}
+{% block title %}Knowledge review — Jarvis{% endblock %}
+{% block head %}
+<style>
+  /* THE KNOWLEDGE REVIEW — the base drawn as a graph the user edits by hand. Domains are
+     compound nodes, entries their children; every gesture is one `ops.kb_*` call. */
+  .kr { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 0;
+        height: calc(100vh - 190px); min-height: 520px; margin-top: 12px; border: 1px solid var(--line);
+        border-radius: 8px; overflow: hidden; background: var(--surface); position: relative; }
+  .kr.with-panel { grid-template-columns: 250px minmax(0, 1fr) 360px; }
+  .kr-side { border-right: 1px solid var(--line); overflow-y: auto; padding: 10px 0;
+             display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+  .kr-side .grp { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.16em;
+                  text-transform: uppercase; color: var(--ink-3); padding: 10px 12px 4px; }
+  .kr-side .pad { padding: 0 12px; }
+  .kr-side input[type=text] { padding: 5px 8px; font-size: 13px; }
+  .kr-side label { display: flex; gap: 6px; align-items: center; color: var(--ink-2);
+                   font-size: 12.5px; padding: 1px 12px; cursor: pointer; }
+  .kr-side .btns { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 12px; }
+  .kr-side button, .kr-panel button, .kr-dialog button, .kr-menu button { padding: 4px 10px; font-size: 12.5px; }
+  button.on { border-color: var(--amber); color: var(--amber-ink); }
+  #kr-domains { display: flex; flex-direction: column; }
+  .kr-dom { display: flex; align-items: center; gap: 6px; padding: 3px 12px; cursor: pointer;
+            border-left: 2px solid transparent; color: var(--ink-2); white-space: nowrap; }
+  .kr-dom:hover { background: var(--raised); color: var(--ink); }
+  .kr-dom .nm { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; }
+  .kr-dom .ct { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+  .kr-dom.machine .nm { font-style: italic; }
+  .kr-dom.drop { border-left-color: var(--amber); background: color-mix(in srgb, var(--amber) 14%, transparent); color: var(--ink); }
+  .kr-dom.here { border-left-color: var(--cyan); color: var(--ink); }
+  .kr-legend { padding: 4px 12px; color: var(--ink-3); font-size: 12px; line-height: 1.7; }
+  .kr-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+                   margin-right: 5px; vertical-align: -1px; }
+  .kr-canvas { position: relative; min-width: 0; }
+  #cy { position: absolute; inset: 0; }
+  .kr-status { position: absolute; left: 10px; bottom: 8px; font-family: var(--mono);
+               font-size: 11.5px; color: var(--ink-3); pointer-events: none; }
+  .kr-selbar { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 5;
+               display: flex; gap: 6px; align-items: center; padding: 6px 10px;
+               background: var(--raised); border: 1px solid var(--line); border-radius: 8px;
+               font-size: 12.5px; box-shadow: 0 4px 18px rgba(0,0,0,.35); }
+  .kr-selbar select { width: auto; padding: 3px 6px; font-size: 12.5px; }
+  .kr-mode { position: absolute; top: 8px; right: 10px; z-index: 5; font-family: var(--mono);
+             font-size: 11.5px; padding: 3px 8px; border-radius: 99px; color: var(--amber-ink);
+             border: 1px solid color-mix(in srgb, var(--amber) 55%, transparent);
+             background: color-mix(in srgb, var(--amber) 14%, var(--surface)); }
+  .kr-panel { border-left: 1px solid var(--line); overflow-y: auto; padding: 12px 14px; font-size: 13.5px; }
+  .kr-panel h3 { margin: 0 0 6px; font-size: 15px; line-height: 1.35; }
+  .kr-panel .meta { font-family: var(--mono); font-size: 12px; color: var(--ink-2); line-height: 1.7; }
+  .kr-panel .body { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line);
+                    border-radius: 6px; padding: 8px 10px; font-size: 13px; max-height: 42vh; overflow-y: auto; }
+  .kr-panel .row2 { display: flex; gap: 6px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+  .kr-panel select { width: auto; max-width: 100%; padding: 4px 6px; font-size: 12.5px; }
+  .kr-panel textarea { min-height: 60px; font: 13px var(--sans); }
+  .kr-panel .x { float: right; }
+  .kr-panel ul { padding-left: 18px; margin: 4px 0; }
+  .kr-panel li { margin: 2px 0; }
+  .st-human { color: var(--green); } .st-machine { color: var(--amber); } .st-none { color: var(--ink-3); }
+  .kr-menu { position: fixed; z-index: 60; display: flex; flex-direction: column; min-width: 190px;
+             background: var(--raised); border: 1px solid var(--line); border-radius: 8px;
+             padding: 4px; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+  .kr-menu button { text-align: left; border: 0; background: transparent; }
+  .kr-menu button:hover { background: var(--surface); }
+  .kr-menu .t { font-family: var(--mono); font-size: 11px; color: var(--ink-3); padding: 2px 10px; }
+  .kr-dialog-wrap { position: fixed; inset: 0; z-index: 70; background: rgba(5,8,14,.55);
+                    display: flex; align-items: flex-start; justify-content: center; padding-top: 14vh; }
+  .kr-dialog { width: min(440px, 92vw); background: var(--surface); border: 1px solid var(--line);
+               border-radius: 10px; padding: 14px 16px; box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+  .kr-dialog h3 { margin: 0 0 10px; font-size: 15px; }
+  .kr-dialog label { display: block; font-size: 12px; color: var(--ink-2); margin: 8px 0 3px; }
+  .kr-dialog .acts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  /* `hidden` must win over the flex boxes above */
+  .kr [hidden] { display: none !important; }
+  .kr-toast { position: fixed; right: 18px; bottom: 18px; z-index: 80; max-width: 460px; margin: 0; }
+</style>
+{% endblock %}
+{% block content %}
+
+<h2 style="margin-top: 18px">Knowledge review
+  <span class="sub" id="kr-summary" style="text-transform: none; letter-spacing: 0"></span></h2>
+<p class="sub" style="margin: 0">
+  Drag an entry (or a <kbd class="kbd">shift</kbd>-drag box selection) onto a domain to assign
+  it, or into empty space to unassign it; drag a domain into another to nest it. Click
+  anything to open it; right-click for more. <b>Link mode</b> (<kbd class="kbd">l</kbd>):
+  drag from one entry to another to link them. Amber entries are the machine's proposals —
+  accept or move them; green ones a person has decided. Every change is kept with who made it.
+</p>
+
+<div class="kr" id="kr" data-rels="{{ link_rels|join(',') }}">
+  <aside class="kr-side" aria-label="filters and domains">
+    <div class="pad"><input type="text" id="kr-q" placeholder="find: id, headline, topic" aria-label="find entries"></div>
+    <div class="btns">
+      <button type="button" id="kr-new" class="primary" title="a new top-level domain">+ domain</button>
+      <button type="button" id="kr-link" title="drag from one entry to another to link them (l)">link mode</button>
+      <button type="button" id="kr-fit" title="fit the graph to the screen">fit</button>
+      <button type="button" id="kr-relayout" title="lay the whole graph out again">re-layout</button>
+    </div>
+    <div class="grp">show</div>
+    <label><input type="checkbox" id="kr-retired"> retired entries</label>
+    <label><input type="checkbox" data-edge="manual" checked> manual links</label>
+    <label><input type="checkbox" data-edge="cites" checked> derived: cites</label>
+    <label><input type="checkbox" data-edge="supersedes" checked> derived: supersedes</label>
+    <label><input type="checkbox" data-edge="same_wo"> derived: same work order</label>
+    <label><input type="checkbox" id="kr-labels"> all labels</label>
+    <div class="grp">domains <span id="kr-dcount"></span></div>
+    <div id="kr-domains" aria-label="domains — drop entries here"></div>
+    <div class="grp">legend</div>
+    <div class="kr-legend">
+      <span class="sw" style="background:#46d69a"></span>human-reviewed<br>
+      <span class="sw" style="background:#f2a33c"></span>machine proposal<br>
+      <span class="sw" style="background:#6b7a93"></span>unassigned<br>
+      size = reads · <i>italic</i> domain = machine-made<br>
+      dashed edge = derived (read-only) · solid = a link someone made
+    </div>
+  </aside>
+  <div class="kr-canvas">
+    <div id="cy" aria-label="knowledge graph"></div>
+    <div class="kr-selbar" id="kr-selbar" hidden></div>
+    <div class="kr-mode" id="kr-mode" hidden></div>
+    <div class="kr-status" id="kr-status">loading…</div>
+  </div>
+  <aside class="kr-panel" id="kr-panel" hidden></aside>
+</div>
+
+<script>
+// cytoscape-edgehandles reads lodash's memoize and throttle off `window._`; these two are
+// all of lodash it uses (vendor/README.md).
+window._ = window._ || {
+  memoize: function (fn, resolver) {
+    var cache = new Map();
+    var m = function () {
+      var k = resolver ? resolver.apply(this, arguments) : arguments[0];
+      if (!cache.has(k)) cache.set(k, fn.apply(this, arguments));
+      return cache.get(k);
+    };
+    m.cache = cache;
+    return m;
+  },
+  throttle: function (fn, wait) {
+    var last = 0, timer = null, args, ctx;
+    function run() { last = Date.now(); timer = null; fn.apply(ctx, args); }
+    var t = function () {
+      args = arguments; ctx = this;
+      var rem = wait - (Date.now() - last);
+      if (rem <= 0) { clearTimeout(timer); timer = null; run(); }
+      else if (!timer) timer = setTimeout(run, rem);
+    };
+    t.cancel = function () { clearTimeout(timer); timer = null; };
+    return t;
+  }
+};
+</script>
+<script src="/vendor/cytoscape.min.js"></script>
+<script src="/vendor/layout-base.js"></script>
+<script src="/vendor/cose-base.js"></script>
+<script src="/vendor/cytoscape-fcose.js"></script>
+<script src="/vendor/cytoscape-edgehandles.js"></script>
+{% raw %}
+<script>
+(function () {
+  'use strict';
+  // Each UMD build registers itself when it finds `cytoscape` on window; register only
+  // what did not, so a second registration does not warn
+  if (!cytoscape('layout', 'fcose')) cytoscape.use(cytoscapeFcose);
+  if (!cytoscape('core', 'edgehandles')) cytoscape.use(cytoscapeEdgehandles);
+
+  var root = document.getElementById('kr');
+  var RELS = root.dataset.rels.split(',');
+  var POS_KEY = 'kb-review-positions-v1';
+  var C = { human: '#46d69a', machine: '#f2a33c', none: '#6b7a93', ink: '#d9e0ec',
+            ink2: '#93a3ba', line: '#253049', cyan: '#56c8e8', amber: '#f2a33c', red: '#e85d5d' };
+  var REL_COLOR = { relates_to: C.cyan, supersedes: C.amber, depends_on: C.human, duplicates: C.red };
+
+  var state = { payload: null, nodes: {}, domains: {}, retired: false, open: null, pickFrom: null };
+
+  // -- small helpers
+
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function status(n) {
+    if (n.assigned_by.indexOf('human:') === 0) return n.domain_id ? 'human' : 'none';
+    return n.domain_id ? 'machine' : 'none';
+  }
+  function statusWords(n) {
+    var s = status(n);
+    if (s === 'human') return '<span class="st-human">● human-reviewed</span> <span class="sub">(' + esc(n.assigned_by) + ')</span>';
+    if (s === 'machine') return '<span class="st-machine">● machine proposal</span> <span class="sub">(' + esc(n.assigned_by || 'no actor recorded') + ')</span>';
+    if (n.assigned_by) return '<span class="st-none">● left unassigned</span> <span class="sub">by ' + esc(n.assigned_by) + '</span>';
+    return '<span class="st-none">● unassigned</span>';
+  }
+  function domainPath(id) {
+    var parts = [], d = state.domains[id], guard = 0;
+    while (d && guard++ < 50) { parts.unshift(d.name); d = state.domains[d.parent_id]; }
+    return parts.join(' › ');
+  }
+  function toast(msg, kind) {
+    var t = document.createElement('div');
+    t.className = 'kr-toast ' + (kind === 'error' ? 'error-flash' : 'note-flash');
+    t.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, kind === 'error' ? 7000 : 2600);
+  }
+  function post(url, body) {
+    return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body || {}) })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (j) {
+          if (!r.ok) {
+            var why = j.error || (j.detail && (j.detail[0] && j.detail[0].msg || JSON.stringify(j.detail)));
+            throw new Error(why || (r.status + ' ' + r.statusText));
+          }
+          return j.result;
+        });
+      });
+  }
+  // Every write: POST, then re-read the payload and fold it into the drawn graph.
+  function write(url, body, done) {
+    return post(url, body).then(function (res) {
+      if (done) toast(done);
+      return refresh().then(function () { return res; });
+    }).catch(function (e) { toast(e.message, 'error'); return refresh(); });
+  }
+
+  // -- positions survive a reload: the layout is the reviewer's mental map
+
+  function loadPositions() {
+    try { return JSON.parse(localStorage.getItem(POS_KEY) || '{}'); } catch (e) { return {}; }
+  }
+  var saveTimer = null;
+  function savePositions() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () {
+      var out = {};
+      cy.nodes().forEach(function (n) {
+        if (n.isParent()) return;  // a compound's position is its children's
+        var p = n.position(); out[n.id()] = [Math.round(p.x), Math.round(p.y)];
+      });
+      try { localStorage.setItem(POS_KEY, JSON.stringify(out)); } catch (e) { /* private window */ }
+    }, 400);
+  }
+
+  // -- the graph
+
+  var cy = cytoscape({
+    container: $('cy'),
+    boxSelectionEnabled: true,
+    textureOnViewport: true,
+    hideEdgesOnViewport: true,
+    minZoom: 0.05, maxZoom: 4,
+    style: [
+      { selector: 'node.entry', style: {
+        'width': 'data(size)', 'height': 'data(size)', 'background-color': C.none,
+        'border-width': 0, 'label': 'data(label)', 'font-size': 7, 'color': C.ink2,
+        'text-valign': 'bottom', 'text-margin-y': 2, 'text-wrap': 'ellipsis',
+        'text-max-width': 70, 'min-zoomed-font-size': 9 } },
+      { selector: 'node.entry.human', style: { 'background-color': C.human } },
+      { selector: 'node.entry.machine', style: { 'background-color': C.machine } },
+      { selector: 'node.entry.retired', style: { 'opacity': 0.45, 'border-width': 1.5,
+        'border-style': 'dashed', 'border-color': C.ink2, 'background-color': '#2a3348' } },
+      { selector: 'node.domain', style: {
+        'shape': 'round-rectangle', 'background-color': '#1b2437', 'background-opacity': 0.55,
+        'border-width': 1.5, 'border-color': '#3a4a6b', 'label': 'data(label)',
+        'font-size': 13, 'font-weight': 600, 'color': C.ink, 'text-valign': 'top',
+        'text-halign': 'center', 'text-margin-y': -4, 'padding': 14,
+        'min-zoomed-font-size': 5, 'min-width': 60, 'min-height': 30 } },
+      { selector: 'node.domain.machine', style: { 'border-style': 'dashed' } },
+      { selector: 'node.domain.drop', style: { 'border-color': C.amber, 'border-width': 3,
+        'background-color': '#3a2f1c' } },
+      { selector: 'node:selected', style: { 'border-width': 3, 'border-color': C.cyan,
+        'border-style': 'solid' } },
+      { selector: 'node.hit', style: { 'border-width': 3, 'border-color': '#ffffff', 'z-index': 9 } },
+      { selector: '.dim', style: { 'opacity': 0.12 } },
+      { selector: '.labels node.entry', style: { 'min-zoomed-font-size': 0 } },
+      { selector: 'edge', style: { 'width': 0.8, 'line-color': '#3b4760', 'curve-style': 'straight',
+        'opacity': 0.75 } },
+      { selector: 'edge.derived', style: { 'line-style': 'dashed', 'line-dash-pattern': [4, 3] } },
+      { selector: 'edge.derived.cites', style: { 'line-color': '#4b5a78', 'target-arrow-shape': 'vee',
+        'target-arrow-color': '#4b5a78', 'arrow-scale': 0.6 } },
+      { selector: 'edge.derived.same_wo', style: { 'line-style': 'dotted', 'line-color': '#34405a' } },
+      { selector: 'edge.derived.supersedes', style: { 'line-color': '#7a6440',
+        'target-arrow-shape': 'vee', 'target-arrow-color': '#7a6440', 'arrow-scale': 0.6 } },
+      { selector: 'edge.manual', style: { 'width': 2.2, 'curve-style': 'bezier', 'opacity': 1,
+        'line-color': 'data(color)', 'target-arrow-color': 'data(color)',
+        'target-arrow-shape': 'triangle', 'label': 'data(rel)', 'font-size': 7, 'color': C.ink2,
+        'text-rotation': 'autorotate', 'min-zoomed-font-size': 8, 'text-background-color': '#151d2c',
+        'text-background-opacity': 1, 'text-background-padding': 1 } },
+      { selector: 'edge:selected', style: { 'width': 3.5, 'line-color': C.cyan,
+        'target-arrow-color': C.cyan } },
+      { selector: 'edge.off', style: { 'display': 'none' } },
+      // edgehandles' own pieces while a link is being drawn
+      { selector: '.eh-ghost-edge, edge.eh-preview', style: { 'width': 2, 'line-color': C.amber,
+        'target-arrow-color': C.amber, 'target-arrow-shape': 'triangle', 'curve-style': 'bezier' } },
+      { selector: '.eh-ghost-edge.eh-preview-active', style: { 'opacity': 0 } },
+      { selector: '.eh-source, .eh-target', style: { 'border-width': 3, 'border-color': C.amber } },
+      { selector: '.eh-ghost-node', style: { 'width': 1, 'height': 1, 'opacity': 0, 'label': '' } }
+    ]
+  });
+
+  var eh = cy.edgehandles({
+    canConnect: function (s, t) { return s.hasClass('entry') && t.hasClass('entry') && !s.same(t); },
+    edgeParams: function () { return { data: { rel: 'pending' } }; },
+    hoverDelay: 120, snap: true, snapThreshold: 20, noEdgeEventsInDraw: true,
+    disableBrowserGestures: true
+  });
+
+  function entrySize(reads) { return Math.min(44, 9 + 5 * Math.sqrt(reads || 0)); }
+
+  function desired(p) {
+    var els = { domains: [], entries: [], edges: [] };
+    p.domains.forEach(function (d) {
+      els.domains.push({ group: 'nodes', data: { id: d.id, label: d.name, kind: 'domain',
+        parent: state.domains[d.parent_id] ? d.parent_id : undefined },
+        classes: 'domain' + (d.by.indexOf('human:') === 0 ? '' : ' machine') });
+    });
+    p.nodes.forEach(function (n) {
+      els.entries.push({ group: 'nodes', data: { id: n.id, kind: 'entry',
+        label: n.headline.length > 90 ? n.headline.slice(0, 88) + '…' : n.headline,
+        parent: state.domains[n.domain_id] ? n.domain_id : undefined, size: entrySize(n.reads) },
+        classes: 'entry ' + status(n) + (n.retired ? ' retired' : '') });
+    });
+    p.edges.forEach(function (e) {
+      var id = e.manual ? e.id : 'd:' + e.rel + ':' + e.src + ':' + e.dst;
+      els.edges.push({ group: 'edges', data: { id: id, source: e.src, target: e.dst, rel: e.rel,
+        manual: e.manual, color: REL_COLOR[e.rel] || C.cyan },
+        classes: (e.manual ? 'manual ' : 'derived ') + e.rel });
+    });
+    return els;
+  }
+
+  function depth(id) { var n = 0, d = state.domains[id]; while (d && d.parent_id && n < 50) { n++; d = state.domains[d.parent_id]; } return n; }
+
+  function placeNear(parentId) {
+    var par = parentId && cy.getElementById(parentId);
+    var c = par && par.length && par.children().length ? par.boundingBox() : null;
+    if (!c) { var e = cy.extent(); c = { x1: e.x1, y1: e.y1, w: e.w, h: e.h }; }
+    var cx = c.x1 + c.w / 2, cy0 = c.y1 + c.h / 2;
+    return { x: cx + (Math.random() - 0.5) * Math.min(c.w, 200),
+             y: cy0 + (Math.random() - 0.5) * Math.min(c.h, 200) };
+  }
+
+  // Fold a fresh payload into the drawn graph: add what is new, re-parent what moved,
+  // drop what is gone — and leave every position alone (no relayout after an edit).
+  function sync(p) {
+    state.payload = p;
+    state.nodes = {}; state.domains = {};
+    p.nodes.forEach(function (n) { state.nodes[n.id] = n; });
+    p.domains.forEach(function (d) { state.domains[d.id] = d; });
+    var want = desired(p), keep = {}, moved = [];
+    var saved = cy.nodes().length ? {} : loadPositions();
+    cy.batch(function () {
+      // 1. domains, parents first so a child always has somewhere to go
+      want.domains.sort(function (a, b) { return depth(a.data.id) - depth(b.data.id); });
+      want.domains.forEach(function (el) {
+        keep[el.data.id] = 1;
+        var cur = cy.getElementById(el.data.id);
+        if (!cur.length) {
+          var pos = saved[el.data.id];
+          el.position = pos ? { x: pos[0], y: pos[1] } : placeNear(el.data.parent);
+          cy.add(el);
+          return;
+        }
+        cur.data('label', el.data.label);
+        cur.classes(el.classes + (cur.hasClass('drop') ? ' drop' : ''));
+        var curParent = cur.parent().length ? cur.parent().id() : undefined;
+        if (curParent !== el.data.parent) { cur.move({ parent: el.data.parent || null }); moved.push(el.data.id); }
+      });
+      // 2. entries
+      want.entries.forEach(function (el) {
+        keep[el.data.id] = 1;
+        var cur = cy.getElementById(el.data.id);
+        if (!cur.length) {
+          var pos = saved[el.data.id];
+          el.position = pos ? { x: pos[0], y: pos[1] } : placeNear(el.data.parent);
+          cy.add(el);
+          return;
+        }
+        var sel = cur.selected();
+        cur.data({ label: el.data.label, size: el.data.size });
+        cur.classes(el.classes);
+        var curParent = cur.parent().length ? cur.parent().id() : undefined;
+        if (curParent !== el.data.parent) {
+          cur = cur.move({ parent: el.data.parent || null });
+          moved.push(el.data.id);
+          if (sel) cur.select();
+        }
+      });
+      // 3. what is gone: edges first, then childless nodes (removing a compound would
+      // take its children with it, so anything still inside is let out first)
+      want.edges.forEach(function (el) { keep[el.data.id] = 1; });
+      cy.edges().forEach(function (e) { if (!keep[e.id()] && !e.hasClass('eh-ghost-edge')) e.remove(); });
+      cy.nodes().forEach(function (n) {
+        if (keep[n.id()] || n.removed() || n.hasClass('eh-ghost-node')) return;
+        n.children().move({ parent: null });
+        n.remove();
+      });
+      // 4. new edges
+      want.edges.forEach(function (el) { if (!cy.getElementById(el.data.id).length) cy.add(el); });
+    });
+    var stay = state.dropped || {};
+    state.dropped = null;
+    moved = moved.filter(function (id) { return !stay[id]; });
+    if (moved.length) { relocate(moved); savePositions(); }
+    applyEdgeToggles();
+    drawDomainList();
+    applySearch();
+    $('kr-summary').textContent = '(' + p.nodes.length + ' entries · ' + p.domains.length +
+      ' domains · ' + p.edges.filter(function (e) { return e.manual; }).length + ' manual links)';
+    if (state.open) reopen();
+    if (!/laying out/.test($('kr-status').textContent)) statusLine();
+    drawSelbar();
+    return Object.keys(saved).length;
+  }
+
+  function refresh() {
+    return fetch('/knowledge/review.json' + (state.retired ? '?retired=1' : ''))
+      .then(function (r) { return r.json(); })
+      .then(sync);
+  }
+
+  // The layout. fcose alone lets compound boxes overlap once edges cross between domains
+  // (most of this graph's edges do), and an overlapped domain is one nobody can drop into.
+  // So the domains are PACKED — each one's entries in a grid sorted by topic, subdomains
+  // as blocks beside them, recursively — and fcose lays out only the loose entries, whose
+  // clusters are the point, in their own region to the right.
+  var CELL = 50, GAP = 48, PAD = 14, LABEL = 24;
+
+  function shelf(parts) {
+    if (!parts.length) return { w: 0, h: 0, place: function () {} };
+    var area = 0, widest = 0;
+    parts.forEach(function (p) { area += (p.w + GAP) * (p.h + GAP); widest = Math.max(widest, p.w); });
+    var maxW = Math.max(Math.sqrt(area) * 1.5, widest);
+    parts.sort(function (a, b) { return b.h - a.h; });
+    var x = 0, y = 0, rowH = 0, W = 0, at = [];
+    parts.forEach(function (p) {
+      if (x > 0 && x + p.w > maxW) { x = 0; y += rowH + GAP; rowH = 0; }
+      at.push([p, x, y]); x += p.w + GAP; rowH = Math.max(rowH, p.h); W = Math.max(W, x - GAP);
+    });
+    return { w: W, h: y + rowH, place: function (ox, oy) { at.forEach(function (a) { a[0].place(ox + a[1], oy + a[2]); }); } };
+  }
+  function grid(entries) {
+    var arr = entries.toArray().sort(function (a, b) {
+      var ta = (state.nodes[a.id()] || {}).topic || '', tb = (state.nodes[b.id()] || {}).topic || '';
+      return ta < tb ? -1 : ta > tb ? 1 : b.data('size') - a.data('size');
+    });
+    var cols = Math.max(1, Math.ceil(Math.sqrt(arr.length * 1.6)));
+    return { w: cols * CELL, h: Math.ceil(arr.length / cols) * CELL, place: function (x, y) {
+      arr.forEach(function (e, i) { e.position({ x: x + (i % cols) * CELL + CELL / 2, y: y + Math.floor(i / cols) * CELL + CELL / 2 }); });
+    } };
+  }
+  function leavesOf(eles) { return eles.union(eles.descendants()).filter(function (n) { return !n.isParent(); }); }
+  function block(dom) {
+    var parts = [], ents = dom.children('.entry');
+    if (ents.length) parts.push(grid(ents));
+    dom.children('.domain').forEach(function (c) { parts.push(block(c)); });
+    if (!parts.length) return { w: 90, h: 36, place: function (x, y) { dom.position({ x: x + 45, y: y + 18 }); } };
+    var inner = shelf(parts);
+    // the compound's padding around its children, and room above for its label
+    return { w: inner.w + 2 * PAD, h: inner.h + 2 * PAD + LABEL,
+             place: function (x, y) { inner.place(x + PAD, y + PAD + LABEL); } };
+  }
+  function relayout(fit) {
+    $('kr-status').textContent = 'laying out ' + cy.nodes().length + ' nodes…';
+    setTimeout(function () {
+      var tops = cy.nodes('.domain').filter(function (d) { return !d.parent().length; });
+      var packed = shelf(tops.map(block));
+      packed.place(0, 0);
+      var loose = cy.nodes('.entry').filter(function (n) { return !n.parent().length; });
+      if (loose.length) {
+        loose.union(loose.edgesWith(loose)).layout({ name: 'fcose', quality: 'default',
+          randomize: true, animate: false, fit: false, nodeRepulsion: 6500,
+          idealEdgeLength: 55, packComponents: true, tile: true }).run();
+        var bb = loose.boundingBox({ includeLabels: false });
+        loose.shift({ x: (packed.w ? packed.w + GAP * 3 : 0) - bb.x1, y: -bb.y1 });
+      }
+      if (fit !== false) cy.fit(undefined, 30);
+      savePositions(); statusLine();
+    }, 30);
+  }
+
+  // A node moved by the list, the panel or the selection bar (not dropped on the canvas)
+  // is put INSIDE its new domain, below what is already there, rather than left where it
+  // was, which would stretch the domain's box across the screen.
+  function relocate(moved) {
+    var byParent = {};
+    moved.forEach(function (id) {
+      var n = cy.getElementById(id); if (!n.length) return;
+      var par = n.parent().length ? n.parent().id() : '';
+      if (!par) return;  // let out of a domain: where it stands is as good as anywhere
+      (byParent[par] = byParent[par] || []).push(n);
+    });
+    Object.keys(byParent).forEach(function (par) {
+      var group = cy.collection(byParent[par]), leaves = leavesOf(group);
+      var others = leavesOf(cy.getElementById(par).children()).difference(leaves);
+      var bb = (others.length ? others : leaves).boundingBox({ includeLabels: false });
+      var at = others.length ? { x: bb.x1, y: bb.y2 + GAP } : { x: bb.x1, y: bb.y1 };
+      var parts = group.filter('.domain').map(function (d) {
+        var inner = leavesOf(d), b = inner.boundingBox({ includeLabels: false });
+        return { w: b.w + 2 * PAD, h: b.h + 2 * PAD + LABEL, place: function (x, y) {
+          inner.shift({ x: x + PAD - b.x1, y: y + PAD + LABEL - b.y1 }); } };
+      });
+      var ents = group.filter('.entry');
+      if (ents.length) parts.push(grid(ents));
+      shelf(parts).place(at.x, at.y);
+    });
+  }
+
+  function statusLine() {
+    var p = state.payload || { nodes: [] };
+    var c = { human: 0, machine: 0, none: 0 };
+    p.nodes.forEach(function (n) { c[status(n)]++; });
+    $('kr-status').textContent = c.human + ' reviewed · ' + c.machine + ' proposed · ' +
+      c.none + ' unassigned' + (state.retired ? ' · retired shown' : '');
+  }
+
+  // -- filters
+
+  function applyEdgeToggles() {
+    var on = {};
+    document.querySelectorAll('[data-edge]').forEach(function (b) { on[b.dataset.edge] = b.checked; });
+    cy.batch(function () {
+      cy.edges().forEach(function (e) {
+        if (e.hasClass('eh-ghost-edge') || e.hasClass('eh-preview')) return;
+        var shown = e.data('manual') ? on.manual : on[e.data('rel')];
+        e.toggleClass('off', shown === false);
+      });
+    });
+  }
+  document.querySelectorAll('[data-edge]').forEach(function (b) { b.addEventListener('change', applyEdgeToggles); });
+  $('kr-labels').addEventListener('change', function () { root.classList.toggle('labels', this.checked);
+    cy.style().selector('node.entry').style('min-zoomed-font-size', this.checked ? 0 : 9).update(); });
+  $('kr-retired').addEventListener('change', function () { state.retired = this.checked; refresh().then(statusLine); });
+
+  var searchTimer = null;
+  function applySearch() {
+    var q = $('kr-q').value.trim().toLowerCase();
+    cy.batch(function () {
+      cy.elements().removeClass('dim hit');
+      if (!q) return;
+      var hits = cy.nodes().filter(function (n) {
+        if (n.hasClass('domain')) return (state.domains[n.id()] || {}).name.toLowerCase().indexOf(q) >= 0;
+        var e = state.nodes[n.id()];
+        return e && (e.id.indexOf(q) >= 0 || e.headline.toLowerCase().indexOf(q) >= 0 ||
+                     (e.topic || '').toLowerCase().indexOf(q) >= 0);
+      });
+      cy.elements().not(hits).not(hits.ancestors()).addClass('dim');
+      hits.addClass('hit');
+    });
+  }
+  $('kr-q').addEventListener('input', function () { clearTimeout(searchTimer); searchTimer = setTimeout(applySearch, 150); });
+  $('kr-q').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { var h = cy.nodes('.hit'); if (h.length) cy.animate({ fit: { eles: h, padding: 60 } }, { duration: 300 }); }
+    if (e.key === 'Escape') { this.value = ''; applySearch(); }
+  });
+
+  // -- the domain list: counts, a way to jump, and a drop target
+
+  function drawDomainList() {
+    var p = state.payload, kids = {}, direct = {}, total = {};
+    p.domains.forEach(function (d) { (kids[d.parent_id && state.domains[d.parent_id] ? d.parent_id : ''] =
+      kids[d.parent_id && state.domains[d.parent_id] ? d.parent_id : ''] || []).push(d); });
+    var unassigned = 0;
+    p.nodes.forEach(function (n) {
+      if (state.domains[n.domain_id]) direct[n.domain_id] = (direct[n.domain_id] || 0) + 1; else unassigned++;
+    });
+    function sum(id) { var t = direct[id] || 0; (kids[id] || []).forEach(function (c) { t += sum(c.id); }); total[id] = t; return t; }
+    (kids[''] || []).forEach(function (d) { sum(d.id); });
+    var html = '<div class="kr-dom" data-dom="" title="drop here to unassign"><span class="nm">— unassigned</span><span class="ct">' + unassigned + '</span></div>';
+    function walk(parent, lvl) {
+      (kids[parent] || []).forEach(function (d) {
+        var own = direct[d.id] || 0, all = total[d.id] || 0;
+        html += '<div class="kr-dom' + (d.by.indexOf('human:') === 0 ? '' : ' machine') +
+          (state.open && state.open.id === d.id ? ' here' : '') + '" data-dom="' + esc(d.id) +
+          '" style="padding-left:' + (12 + lvl * 14) + 'px" title="' + esc(d.description || d.name) + '">' +
+          '<span class="nm">' + esc(d.name) + '</span><span class="ct">' + own +
+          (all !== own ? '/' + all : '') + '</span></div>';
+        walk(d.id, lvl + 1);
+      });
+    }
+    walk('', 0);
+    $('kr-domains').innerHTML = html;
+    $('kr-dcount').textContent = '(' + p.domains.length + ')';
+  }
+  $('kr-domains').addEventListener('click', function (e) {
+    var row = e.target.closest('.kr-dom'); if (!row) return;
+    var id = row.dataset.dom;
+    if (!id) { var loose = cy.nodes('.entry').filter(function (n) { return !n.parent().length; });
+      if (loose.length) cy.animate({ fit: { eles: loose, padding: 40 } }, { duration: 300 }); return; }
+    var n = cy.getElementById(id);
+    if (n.length) cy.animate({ fit: { eles: n, padding: 60 } }, { duration: 300 });
+    openDomain(id);
+  });
+
+  // -- drag & drop: entries and domains into domains, out of them, or onto the list
+
+  var drag = null, pointer = { x: 0, y: 0 };
+  window.addEventListener('pointermove', function (e) { pointer.x = e.clientX; pointer.y = e.clientY; markListDrop(); }, true);
+  cy.on('drag', 'node', function () { markCanvasDrop(); });
+  // Where the pointer is, in graph coordinates (a node's `drag` event carries no position)
+  function pointerModel() {
+    var r = $('cy').getBoundingClientRect(), pan = cy.pan(), z = cy.zoom();
+    return { x: (pointer.x - r.left - pan.x) / z, y: (pointer.y - r.top - pan.y) / z };
+  }
+
+  function rowUnderPointer() {
+    var el = document.elementFromPoint(pointer.x, pointer.y);
+    return el && el.closest ? el.closest('.kr-dom') : null;
+  }
+  function markListDrop() {
+    if (!drag) return;
+    var row = rowUnderPointer();
+    document.querySelectorAll('.kr-dom.drop').forEach(function (r) { if (r !== row) r.classList.remove('drop'); });
+    if (row) row.classList.add('drop');
+  }
+
+  cy.on('grab', 'node', function (e) {
+    if (drag) return;
+    var n = e.target;
+    var moving = n.selected() ? cy.$('node:selected') : n;
+    moving = moving.union(moving.descendants());
+    // The domain boxes BEFORE the drag stretches them: a child dragged out of its
+    // domain drags the domain's edge along, so the live boxes would always say "inside".
+    var boxes = [];
+    cy.nodes('.domain').forEach(function (d) {
+      if (moving.contains(d)) return;
+      boxes.push({ id: d.id(), depth: depth(d.id()), bb: d.boundingBox({ includeLabels: true }) });
+    });
+    var prev = {};
+    moving.forEach(function (m) { if (!m.isParent()) prev[m.id()] = Object.assign({}, m.position()); });
+    drag = { moving: moving, boxes: boxes, prev: prev, moved: false };
+  });
+  cy.on('drag', 'node', function () { if (drag) drag.moved = true; });
+
+  function targetAt(boxes, pos) {
+    var best = null;
+    boxes.forEach(function (b) {
+      var bb = b.bb;
+      if (pos.x < bb.x1 || pos.x > bb.x2 || pos.y < bb.y1 || pos.y > bb.y2) return;
+      if (!best || b.depth > best.depth || (b.depth === best.depth && bb.w * bb.h < best.bb.w * best.bb.h)) best = b;
+    });
+    return best ? best.id : '';
+  }
+  var lastDropMark = null;
+  function markCanvasDrop() {
+    if (!drag) return;
+    var t = targetAt(drag.boxes, pointerModel());
+    if (t === lastDropMark) return;
+    if (lastDropMark) cy.getElementById(lastDropMark).removeClass('drop');
+    if (t) cy.getElementById(t).addClass('drop');
+    lastDropMark = t;
+  }
+
+  cy.on('free', 'node', function () {
+    // `free` fires once per grabbed node; settle the gesture once, after the last
+    if (!drag || drag.settling) return;
+    drag.settling = true;
+    setTimeout(settle, 0);
+  });
+
+  function settle() {
+    var d = drag; drag = null;
+    if (lastDropMark) cy.getElementById(lastDropMark).removeClass('drop');
+    lastDropMark = null;
+    var row = rowUnderPointer();
+    document.querySelectorAll('.kr-dom.drop').forEach(function (r) { r.classList.remove('drop'); });
+    if (!d || !d.moved) return;
+    var target;
+    if (row) {
+      target = row.dataset.dom;
+      // dropped on the list, not the canvas: put the nodes back where they were
+      d.moving.forEach(function (m) { if (d.prev[m.id()]) m.position(d.prev[m.id()]); });
+    } else {
+      target = targetAt(d.boxes, pointerModel());
+    }
+    savePositions();
+    // Only the outermost moved nodes change home; their descendants come with them
+    var tops = d.moving.filter(function (m) { var par = m.parent(); return !par.length || !d.moving.contains(par); });
+    var entries = [], domains = [];
+    tops.forEach(function (m) {
+      var cur = m.parent().length ? m.parent().id() : '';
+      if (cur === target) return;
+      if (m.hasClass('entry')) entries.push(m.id());
+      else if (m.hasClass('domain') && m.id() !== target) domains.push(m.id());
+    });
+    if (!entries.length && !domains.length) return;
+    // dropped on the canvas: they stay where the hand put them
+    if (!row) { state.dropped = {}; entries.concat(domains).forEach(function (id) { state.dropped[id] = 1; }); }
+    var name = target ? '“' + domainPath(target) + '”' : 'unassigned';
+    var jobs = [];
+    if (entries.length) jobs.push(post('/knowledge/review/assign', { kn_ids: entries, domain_id: target }));
+    domains.forEach(function (id) { jobs.push(post('/knowledge/review/domain/' + id, { parent_id: target })); });
+    Promise.all(jobs).then(function () {
+      toast((entries.length ? entries.length + ' entr' + (entries.length === 1 ? 'y' : 'ies') : '') +
+        (entries.length && domains.length ? ' and ' : '') +
+        (domains.length ? domains.length + ' domain' + (domains.length === 1 ? '' : 's') : '') + ' → ' + name);
+    }).catch(function (e) { toast(e.message, 'error'); }).then(refresh);
+  }
+
+  // -- links: link mode drags one; "link from here" picks the target with a click
+
+  function setLinkMode(on) {
+    if (on) { eh.enableDrawMode(); } else { eh.disableDrawMode(); }
+    $('kr-link').classList.toggle('on', on);
+    mode(on ? 'link mode — drag from an entry to another (l or Esc to leave)' : '');
+    state.linkMode = on;
+  }
+  function mode(text) { $('kr-mode').hidden = !text; $('kr-mode').textContent = text; }
+  $('kr-link').addEventListener('click', function () { setLinkMode(!state.linkMode); });
+  cy.on('ehcomplete', function (e, src, dst, added) {
+    added.remove();
+    chooseRel(src.id(), dst.id());
+  });
+  function chooseRel(src, dst) {
+    var items = RELS.map(function (r) { return { label: r.replace('_', ' '), run: function () {
+      write('/knowledge/review/link', { src: src, rel: r, dst: dst }, 'linked: ' + r.replace('_', ' '));
+    } }; });
+    var a = cy.getElementById(src).renderedPosition(), b = cy.getElementById(dst).renderedPosition();
+    var box = $('cy').getBoundingClientRect();
+    menu(box.left + (a.x + b.x) / 2, box.top + (a.y + b.y) / 2, 'link ' + src + ' →', items);
+  }
+
+  // -- dialogs and menus (no window.prompt: it cannot hold a description or a choice)
+
+  function dialog(title, fields, okLabel) {
+    return new Promise(function (resolve) {
+      var wrap = document.createElement('div');
+      wrap.className = 'kr-dialog-wrap';
+      var html = '<form class="kr-dialog"><h3>' + esc(title) + '</h3>';
+      fields.forEach(function (f) {
+        html += '<label for="kr-f-' + f.name + '">' + esc(f.label) + '</label>';
+        if (f.type === 'textarea') html += '<textarea id="kr-f-' + f.name + '" name="' + f.name + '">' + esc(f.value || '') + '</textarea>';
+        else if (f.type === 'select') html += '<select id="kr-f-' + f.name + '" name="' + f.name + '">' +
+          f.options.map(function (o) { return '<option value="' + esc(o[0]) + '"' + (o[0] === f.value ? ' selected' : '') + '>' + esc(o[1]) + '</option>'; }).join('') + '</select>';
+        else html += '<input type="text" id="kr-f-' + f.name + '" name="' + f.name + '" value="' + esc(f.value || '') + '" autocomplete="off">';
+      });
+      html += '<div class="acts"><button type="button" data-x>cancel</button><button class="primary">' + esc(okLabel || 'save') + '</button></div></form>';
+      wrap.innerHTML = html;
+      document.body.appendChild(wrap);
+      var form = wrap.querySelector('form');
+      function close(v) { wrap.remove(); resolve(v); }
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        var v = {}; fields.forEach(function (f) { v[f.name] = form.elements[f.name].value; });
+        var missing = fields.filter(function (f) { return f.required && !v[f.name].trim(); });
+        if (missing.length) { form.elements[missing[0].name].focus(); return; }
+        close(v);
+      });
+      wrap.querySelector('[data-x]').addEventListener('click', function () { close(null); });
+      wrap.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(null); });
+      wrap.addEventListener('mousedown', function (e) { if (e.target === wrap) close(null); });
+      var first = form.querySelector('input, textarea, select'); if (first) first.focus();
+    });
+  }
+  function domainOptions(exclude) {
+    var out = [['', '(top level)']], skip = {};
+    if (exclude) { skip[exclude] = 1; var n = cy.getElementById(exclude); n.descendants('.domain').forEach(function (d) { skip[d.id()] = 1; }); }
+    Object.keys(state.domains).map(function (id) { return [id, domainPath(id)]; })
+      .sort(function (a, b) { return a[1].localeCompare(b[1]); })
+      .forEach(function (o) { if (!skip[o[0]]) out.push(o); });
+    return out;
+  }
+
+  var menuEl = null;
+  function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; } }
+  function menu(x, y, title, items) {
+    closeMenu();
+    menuEl = document.createElement('div');
+    menuEl.className = 'kr-menu';
+    menuEl.innerHTML = (title ? '<div class="t">' + esc(title) + '</div>' : '') +
+      items.map(function (it, i) { return '<button type="button" data-i="' + i + '"' + (it.danger ? ' class="danger"' : '') + '>' + esc(it.label) + '</button>'; }).join('');
+    document.body.appendChild(menuEl);
+    var w = menuEl.offsetWidth, h = menuEl.offsetHeight;
+    menuEl.style.left = Math.min(x, window.innerWidth - w - 8) + 'px';
+    menuEl.style.top = Math.min(y, window.innerHeight - h - 8) + 'px';
+    menuEl.addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      var it = items[+b.dataset.i]; closeMenu(); it.run();
+    });
+  }
+  document.addEventListener('mousedown', function (e) { if (menuEl && !menuEl.contains(e.target)) closeMenu(); });
+
+  function newDomain(parentId, knIds, at) {
+    var title = knIds && knIds.length ? 'New domain from ' + knIds.length + ' selected entr' + (knIds.length === 1 ? 'y' : 'ies') : 'New domain';
+    return dialog(title, [
+      { name: 'name', label: 'name', required: true },
+      { name: 'description', label: 'what belongs here (optional)', type: 'textarea' },
+      { name: 'parent_id', label: 'inside', type: 'select', value: parentId || '', options: domainOptions() }
+    ], 'create').then(function (v) {
+      if (!v) return;
+      return post('/knowledge/review/domain', { name: v.name, description: v.description,
+        parent_id: v.parent_id, kn_ids: knIds || [] }).then(function (d) {
+        toast('domain “' + d.name + '” created');
+        return refresh().then(function () {
+          var n = cy.getElementById(d.id);
+          if (at && n.length && !n.isParent()) n.position(at);
+          savePositions();
+          openDomain(d.id);
+        });
+      }).catch(function (e) { toast(e.message, 'error'); });
+    });
+  }
+  function retireDomain(id) {
+    var d = state.domains[id];
+    dialog('Retire “' + d.name + '”', [{ name: 'reason', label: 'why (kept with the record; its entries and subdomains move up a level)', type: 'textarea', required: true }], 'retire')
+      .then(function (v) { if (v) write('/knowledge/review/domain/' + id + '/retire', { reason: v.reason }, 'retired “' + d.name + '”').then(closePanel); });
+  }
+  function removeLink(linkId) {
+    dialog('Remove this link', [{ name: 'reason', label: 'why (kept with the record)', type: 'textarea', required: true }], 'remove')
+      .then(function (v) { if (v) write('/knowledge/review/link/' + linkId + '/retire', { reason: v.reason }, 'link removed').then(closePanel); });
+  }
+  function assign(ids, domainId, words) { return write('/knowledge/review/assign', { kn_ids: ids, domain_id: domainId }, words); }
+  function proposalsIn(domainId) {
+    return state.payload.nodes.filter(function (n) { return n.domain_id === domainId && status(n) === 'machine'; }).map(function (n) { return n.id; });
+  }
+  function startPick(src) {
+    state.pickFrom = src;
+    mode('click the entry to link ' + src + ' to (Esc to cancel)');
+  }
+
+  cy.on('cxttap', function (e) {
+    var t = e.target, o = e.originalEvent, x = o.clientX, y = o.clientY;
+    if (t === cy) {
+      var at = e.position;
+      menu(x, y, '', [
+        { label: '+ new domain here', run: function () { newDomain('', null, at); } },
+        { label: 'fit to screen', run: function () { cy.fit(undefined, 30); } },
+        { label: 're-layout everything', run: function () { relayout(); } }
+      ]);
+    } else if (t.isNode() && t.hasClass('domain')) {
+      var id = t.id(), props = proposalsIn(id);
+      menu(x, y, state.domains[id].name, [
+        { label: 'open / rename', run: function () { openDomain(id); } },
+        { label: '+ subdomain', run: function () { newDomain(id); } },
+        { label: 'select its entries', run: function () { cy.$(':selected').unselect(); t.children('.entry').select(); } }
+      ].concat(props.length ? [{ label: 'accept ' + props.length + ' proposal' + (props.length === 1 ? '' : 's'), run: function () { assign(props, id, props.length + ' accepted'); } }] : [])
+       .concat([{ label: 'retire…', danger: true, run: function () { retireDomain(id); } }]));
+    } else if (t.isNode()) {
+      var n = state.nodes[t.id()];
+      var its = [{ label: 'open', run: function () { openEntry(n.id); } },
+                 { label: 'link from here…', run: function () { startPick(n.id); } }];
+      if (status(n) === 'machine') its.push({ label: 'accept proposal', run: function () { assign([n.id], n.domain_id, 'accepted'); } });
+      if (n.domain_id) its.push({ label: 'unassign', run: function () { assign([n.id], '', 'unassigned'); } });
+      menu(x, y, n.id, its);
+    } else if (t.isEdge()) {
+      openEdge(t);
+    }
+  });
+  $('cy').addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  // -- taps: open what was clicked
+
+  cy.on('tap', 'node', function (e) {
+    var n = e.target;
+    if (state.pickFrom) {
+      if (n.hasClass('entry') && n.id() !== state.pickFrom) { var src = state.pickFrom; state.pickFrom = null; mode(''); chooseRel(src, n.id()); }
+      return;
+    }
+    if (n.hasClass('domain')) openDomain(n.id()); else openEntry(n.id());
+  });
+  cy.on('tap', 'edge', function (e) { openEdge(e.target); });
+  cy.on('dbltap', 'node.domain', function (e) { openDomain(e.target.id(), true); });
+  cy.on('select unselect', 'node', function () { clearTimeout(state.selT); state.selT = setTimeout(drawSelbar, 30); });
+
+  // -- the selection bar: group, move, accept
+
+  function drawSelbar() {
+    var sel = cy.$('node.entry:selected'), bar = $('kr-selbar');
+    if (sel.length < 2) { bar.hidden = true; return; }
+    var ids = sel.map(function (n) { return n.id(); });
+    var props = ids.filter(function (id) { return state.nodes[id] && status(state.nodes[id]) === 'machine'; });
+    bar.innerHTML = '<b>' + ids.length + ' selected</b>' +
+      '<button type="button" class="primary" data-a="group">new domain from selection</button>' +
+      '<select data-a="to" aria-label="move the selection to"><option value="">move to…</option>' +
+      domainOptions().slice(1).map(function (o) { return '<option value="' + esc(o[0]) + '">' + esc(o[1]) + '</option>'; }).join('') +
+      '<option value="-">(unassign)</option></select>' +
+      (props.length ? '<button type="button" class="accept" data-a="accept">accept ' + props.length + ' proposal' + (props.length === 1 ? '' : 's') + '</button>' : '') +
+      '<button type="button" data-a="clear">clear</button>';
+    bar.hidden = false;
+    bar.onclick = function (e) {
+      var a = e.target.dataset.a;
+      if (a === 'group') newDomain('', ids);
+      else if (a === 'accept') {
+        // each to its OWN proposed domain: one call per domain
+        var by = {}; props.forEach(function (id) { var d = state.nodes[id].domain_id; (by[d] = by[d] || []).push(id); });
+        Promise.all(Object.keys(by).map(function (d) { return post('/knowledge/review/assign', { kn_ids: by[d], domain_id: d }); }))
+          .then(function () { toast(props.length + ' accepted'); }).catch(function (e) { toast(e.message, 'error'); }).then(refresh);
+      } else if (a === 'clear') cy.$(':selected').unselect();
+    };
+    bar.querySelector('select').onchange = function () {
+      if (!this.value) return;
+      var to = this.value === '-' ? '' : this.value;
+      assign(ids, to, ids.length + ' moved');
+    };
+  }
+
+  // -- the side panel
+
+  function panel(html) {
+    var p = $('kr-panel');
+    p.innerHTML = '<button type="button" class="x" data-close title="close (Esc)">✕</button>' + html;
+    p.hidden = false; root.classList.add('with-panel');
+    p.querySelector('[data-close]').onclick = closePanel;
+    cy.resize();
+    return p;
+  }
+  function closePanel() {
+    state.open = null;
+    $('kr-panel').hidden = true; root.classList.remove('with-panel'); cy.resize();
+    document.querySelectorAll('.kr-dom.here').forEach(function (r) { r.classList.remove('here'); });
+  }
+  function reopen() {
+    var o = state.open;
+    if (o.kind === 'entry' && state.nodes[o.id]) openEntry(o.id);
+    else if (o.kind === 'domain' && state.domains[o.id]) openDomain(o.id);
+    else closePanel();
+  }
+  function moveSelect(current) {
+    return '<select data-move aria-label="move to"><option value="">move to…</option>' +
+      domainOptions().slice(1).filter(function (o) { return o[0] !== current; }).map(function (o) {
+        return '<option value="' + esc(o[0]) + '">' + esc(o[1]) + '</option>'; }).join('') + '</select>';
+  }
+
+  function openEntry(id) {
+    var n = state.nodes[id]; if (!n) return;
+    state.open = { kind: 'entry', id: id };
+    var edges = cy.getElementById(id).connectedEdges().filter(function (e) { return !e.hasClass('eh-ghost-edge'); });
+    var links = edges.map(function (e) {
+      var out = e.source().id() === id, other = out ? e.target().id() : e.source().id();
+      var o = state.nodes[other] || { headline: other };
+      return '<li><span class="mono sub">' + (out ? '' : '← ') + esc(e.data('rel')) + (out ? ' →' : '') + '</span> ' +
+        '<a href="#" data-goto="' + esc(other) + '">' + esc(o.headline.slice(0, 80)) + '</a>' +
+        (e.data('manual') ? ' <button type="button" data-unlink="' + esc(e.id()) + '" title="remove this link">✕</button>' : ' <span class="sub">(derived)</span>') + '</li>';
+    }).join('');
+    var p = panel('<h3>' + esc(n.headline) + '</h3>' +
+      '<div class="meta"><span class="sid">' + esc(n.id) + '</span> · ' + esc(n.project) +
+      (n.topic ? ' · topic ' + esc(n.topic) : '') + '<br>' + n.reads + ' read' + (n.reads === 1 ? '' : 's') + ' · ' + n.chars + ' chars' +
+      (n.wo_id ? ' · from <a href="/go/' + esc(n.wo_id) + '">' + esc(n.wo_id) + '</a>' : '') +
+      (n.retired ? ' · <span class="tone-bad">retired</span>' : '') + '</div>' +
+      '<div style="margin-top:8px"><b>domain</b> ' + (n.domain_id ? esc(domainPath(n.domain_id) || n.domain_id) : '—') + '<br>' + statusWords(n) + '</div>' +
+      '<div class="row2">' + (status(n) === 'machine' ? '<button type="button" class="accept" data-accept>accept proposal</button>' : '') +
+      moveSelect(n.domain_id) + (n.domain_id ? '<button type="button" data-unassign>unassign</button>' : '') +
+      '<button type="button" data-link>link to…</button></div>' +
+      (links ? '<b>links</b><ul>' + links + '</ul>' : '') +
+      '<b>full text</b><div class="body" id="kr-body">loading…</div>');
+    var a = p.querySelector('[data-accept]'); if (a) a.onclick = function () { assign([id], n.domain_id, 'accepted'); };
+    var u = p.querySelector('[data-unassign]'); if (u) u.onclick = function () { assign([id], '', 'unassigned'); };
+    p.querySelector('[data-link]').onclick = function () { startPick(id); };
+    p.querySelector('[data-move]').onchange = function () { if (this.value) assign([id], this.value, 'moved to “' + domainPath(this.value) + '”'); };
+    p.querySelectorAll('[data-goto]').forEach(function (l) { l.onclick = function (e) { e.preventDefault(); focusNode(l.dataset.goto); openEntry(l.dataset.goto); }; });
+    p.querySelectorAll('[data-unlink]').forEach(function (b) { b.onclick = function () { removeLink(b.dataset.unlink); }; });
+    fetch('/knowledge/review/entry/' + encodeURIComponent(id)).then(function (r) { return r.json(); }).then(function (j) {
+      var body = $('kr-body'); if (!body || !state.open || state.open.id !== id) return;
+      body.textContent = j.content || j.error || '';
+      if (j.retired_reason) body.textContent += '\n\n— retired: ' + j.retired_reason;
+    });
+  }
+
+  function openDomain(id, focusName) {
+    var d = state.domains[id]; if (!d) return;
+    state.open = { kind: 'domain', id: id };
+    var members = state.payload.nodes.filter(function (n) { return n.domain_id === id; });
+    var props = members.filter(function (n) { return status(n) === 'machine'; }).length;
+    var subs = state.payload.domains.filter(function (x) { return x.parent_id === id; });
+    var p = panel('<h3>' + esc(d.name) + '</h3>' +
+      '<div class="meta"><span class="sid">' + esc(d.id) + '</span> · made by ' + esc(d.by || 'unknown') + '<br>' +
+      members.length + ' entr' + (members.length === 1 ? 'y' : 'ies') + ' (' + props + ' proposed, ' + (members.length - props) + ' reviewed)' +
+      (subs.length ? ' · ' + subs.length + ' subdomain' + (subs.length === 1 ? '' : 's') : '') + '</div>' +
+      '<form data-edit><label class="sub">name</label><input type="text" name="name" value="' + esc(d.name) + '">' +
+      '<label class="sub">description</label><textarea name="description">' + esc(d.description) + '</textarea>' +
+      '<label class="sub">inside</label><select name="parent_id">' + domainOptions(id).map(function (o) {
+        return '<option value="' + esc(o[0]) + '"' + (o[0] === d.parent_id ? ' selected' : '') + '>' + esc(o[1]) + '</option>'; }).join('') + '</select>' +
+      '<div class="row2"><button class="primary">save</button></div></form>' +
+      '<div class="row2">' + (props ? '<button type="button" class="accept" data-accept>accept ' + props + ' proposal' + (props === 1 ? '' : 's') + '</button>' : '') +
+      '<button type="button" data-select>select entries</button><button type="button" data-sub>+ subdomain</button>' +
+      '<button type="button" class="danger" data-retire>retire…</button></div>' +
+      (members.length ? '<b>entries</b><ul>' + members.slice(0, 200).map(function (n) {
+        return '<li><span class="st-' + status(n) + '">●</span> <a href="#" data-goto="' + esc(n.id) + '">' + esc(n.headline.slice(0, 90)) + '</a></li>'; }).join('') +
+        (members.length > 200 ? '<li class="sub">… ' + (members.length - 200) + ' more</li>' : '') + '</ul>' : ''));
+    var f = p.querySelector('[data-edit]');
+    f.onsubmit = function (e) {
+      e.preventDefault();
+      write('/knowledge/review/domain/' + id, { name: f.elements.name.value, description: f.elements.description.value,
+        parent_id: f.elements.parent_id.value }, 'saved');
+    };
+    var a = p.querySelector('[data-accept]'); if (a) a.onclick = function () { assign(proposalsIn(id), id, props + ' accepted'); };
+    p.querySelector('[data-select]').onclick = function () { cy.$(':selected').unselect(); cy.getElementById(id).children('.entry').select(); };
+    p.querySelector('[data-sub]').onclick = function () { newDomain(id); };
+    p.querySelector('[data-retire]').onclick = function () { retireDomain(id); };
+    p.querySelectorAll('[data-goto]').forEach(function (l) { l.onclick = function (e) { e.preventDefault(); focusNode(l.dataset.goto); openEntry(l.dataset.goto); }; });
+    document.querySelectorAll('.kr-dom').forEach(function (r) { r.classList.toggle('here', r.dataset.dom === id); });
+    if (focusName) f.elements.name.focus();
+  }
+
+  function openEdge(e) {
+    var s = state.nodes[e.source().id()] || { headline: e.source().id() }, t = state.nodes[e.target().id()] || { headline: e.target().id() };
+    state.open = null;
+    var p = panel('<h3>' + esc(e.data('rel').replace('_', ' ')) + '</h3>' +
+      '<div class="meta">' + (e.data('manual') ? 'a link someone made · <span class="sid">' + esc(e.id()) + '</span>' :
+        'derived from the entries themselves — read-only (' + ({ cites: 'one entry names the other’s id', supersedes: 'the retired entry names its successor', same_wo: 'written by the same work order' }[e.data('rel')] || 'mechanical') + ')') + '</div>' +
+      '<p><a href="#" data-goto="' + esc(e.source().id()) + '">' + esc(s.headline) + '</a><br><span class="sub">→ ' + esc(e.data('rel')) + ' →</span><br>' +
+      '<a href="#" data-goto="' + esc(e.target().id()) + '">' + esc(t.headline) + '</a></p>' +
+      (e.data('manual') ? '<button type="button" class="danger" data-unlink>remove link…</button>' : ''));
+    p.querySelectorAll('[data-goto]').forEach(function (l) { l.onclick = function (ev) { ev.preventDefault(); focusNode(l.dataset.goto); openEntry(l.dataset.goto); }; });
+    var u = p.querySelector('[data-unlink]'); if (u) u.onclick = function () { removeLink(e.id()); };
+  }
+
+  function focusNode(id) {
+    var n = cy.getElementById(id); if (!n.length) return;
+    cy.animate({ center: { eles: n }, zoom: Math.max(cy.zoom(), 1.2) }, { duration: 250 });
+  }
+
+  // -- toolbar and keys
+
+  $('kr-new').addEventListener('click', function () { newDomain(''); });
+  $('kr-fit').addEventListener('click', function () { cy.fit(undefined, 30); });
+  $('kr-relayout').addEventListener('click', function () { relayout(); });
+  document.addEventListener('keydown', function (e) {
+    var el = document.activeElement, typing = el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
+    if (e.key === 'Escape') {
+      if (state.pickFrom) { state.pickFrom = null; mode(''); return; }
+      if (state.linkMode) { setLinkMode(false); return; }
+      if (menuEl) { closeMenu(); return; }
+      if (!typing) closePanel();
+      return;
+    }
+    if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === 'l') setLinkMode(!state.linkMode);
+  });
+
+  // -- first draw: saved positions when there are enough of them, else a full layout
+
+  refresh().then(function (restored) {
+    var total = cy.nodes().filter(function (n) { return !n.isParent(); }).length;
+    if (!total) { $('kr-status').textContent = 'the knowledge base is empty — workers add entries with `jarvis learn add`'; return; }
+    if (restored >= total * 0.8) { cy.fit(undefined, 30); statusLine(); }
+    else relayout();
+  }).catch(function (e) { $('kr-status').textContent = 'could not load the graph: ' + e.message; });
+  window.krCy = cy;  // for the screenshot script and the browser console
+})();
+</script>
+{% endraw %}
+{% endblock %}

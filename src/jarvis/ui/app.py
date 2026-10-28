@@ -13,12 +13,13 @@ from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from .. import bill, db, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
 from ..bill import OWN_LABEL
-from ..central_store import CentralStore
+from ..central_store import KB_LINK_RELS, CentralStore
 from ..daemon import daemon_running
 from ..inspection import ALARM_KINDS, PARTS
 from ..paths import PRODUCTION, deployment_env
@@ -41,6 +42,39 @@ from ..timeline import build_conversation, build_timeline, count_debug
 from . import markdown
 
 TEMPLATES = Path(__file__).parent / "templates"
+# Third-party browser code, shipped in the package so no page loads a CDN (vendor/README.md)
+VENDOR = Path(__file__).parent / "vendor"
+VENDORED = frozenset(p.name for p in VENDOR.glob("*.js"))
+
+
+# -- the knowledge review's JSON bodies (`/knowledge/review/*`)
+
+class DomainIn(BaseModel):
+    name: str
+    description: str = ""
+    parent_id: str = ""
+    kn_ids: list[str] = []
+
+
+class DomainEdit(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    parent_id: str | None = None
+
+
+class Reason(BaseModel):
+    reason: str = ""
+
+
+class AssignIn(BaseModel):
+    kn_ids: list[str]
+    domain_id: str = ""
+
+
+class LinkIn(BaseModel):
+    src: str
+    rel: str
+    dst: str
 
 
 def _fleet_if_held(wos: list[dict]) -> "fleet.Fleet | None":
@@ -891,7 +925,9 @@ def create_app() -> FastAPI:
     async def no_store(request: Request, call_next):
         # Every page reflects live OS state (inbox acks, work order status)
         response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
+        # Except the vendored libraries: they change only with a release
+        response.headers["Cache-Control"] = ("max-age=3600" if request.url.path.startswith("/vendor/")
+                                             else "no-store")
         return response
 
     # Inside the factory, like every other same-tier import in this file: `cli` and `ui` are one tier and...
@@ -1472,6 +1508,81 @@ def create_app() -> FastAPI:
         finally:
             central.close()
         return RedirectResponse("/knowledge", status_code=303)
+
+    # -- the knowledge review: domains, assignments and links over the base, drawn as a
+    # graph the user edits by hand. Reads come from `ops.kb_review_payload`; every write
+    # is one `ops.kb_*` call, and its refusal comes back as JSON the page prints.
+
+    @app.get("/knowledge/review", response_class=HTMLResponse)
+    def knowledge_review(request: Request):
+        """The graph editor; it draws from `/knowledge/review.json`"""
+        return render(request, "knowledge_review.html", active="knowledge",
+                      link_rels=KB_LINK_RELS)
+
+    @app.get("/knowledge/review.json")
+    def knowledge_review_json(retired: str = "") -> JSONResponse:
+        return JSONResponse(ops.kb_review_payload(include_retired=retired == "1"))
+
+    @app.get("/knowledge/review/entry/{kn_id}")
+    def knowledge_review_entry(kn_id: str) -> JSONResponse:
+        """One entry's full text — fetched when the side panel opens, not with the graph"""
+        central = CentralStore()
+        try:
+            row = central.get_knowledge(kn_id)
+        finally:
+            central.close()
+        if row is None:
+            return JSONResponse({"error": f"no knowledge entry {kn_id}"}, status_code=404)
+        return JSONResponse({k: row.get(k) for k in (
+            "id", "content", "topic", "project", "tags", "wo_id", "ts", "retired_at",
+            "retired_reason")})
+
+    def kb_write(fn, *args, **kwargs) -> JSONResponse:
+        """One `ops.kb_*` call; an OpsError is the user's to read, so it comes back as a 400"""
+        try:
+            return JSONResponse({"ok": True, "result": fn(*args, **kwargs)})
+        except ops.OpsError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    @app.post("/knowledge/review/domain")
+    def kb_domain_create(body: DomainIn) -> JSONResponse:
+        """A new domain; with `kn_ids` it is "new domain from selection" (`ops.kb_group`)"""
+        if body.kn_ids:
+            return kb_write(ops.kb_group, body.name, body.kn_ids,
+                            description=body.description, parent_id=body.parent_id)
+        return kb_write(ops.kb_domain_add, body.name, description=body.description,
+                        parent_id=body.parent_id)
+
+    @app.post("/knowledge/review/domain/{domain_id}")
+    def kb_domain_edit(domain_id: str, body: DomainEdit) -> JSONResponse:
+        """Rename, describe or re-parent — a field left out is left as it is"""
+        return kb_write(ops.kb_domain_update, domain_id, name=body.name,
+                        description=body.description, parent_id=body.parent_id)
+
+    @app.post("/knowledge/review/domain/{domain_id}/retire")
+    def kb_domain_retire(domain_id: str, body: Reason) -> JSONResponse:
+        return kb_write(ops.kb_domain_retire, domain_id, body.reason)
+
+    @app.post("/knowledge/review/assign")
+    def kb_assign(body: AssignIn) -> JSONResponse:
+        """Entries into a domain ('' = unassigned); re-assigning to the same domain is how
+        a machine proposal becomes a human-reviewed one"""
+        return kb_write(ops.kb_assign, body.kn_ids, body.domain_id)
+
+    @app.post("/knowledge/review/link")
+    def kb_link_create(body: LinkIn) -> JSONResponse:
+        return kb_write(ops.kb_link_add, body.src, body.rel, body.dst)
+
+    @app.post("/knowledge/review/link/{link_id}/retire")
+    def kb_link_remove(link_id: str, body: Reason) -> JSONResponse:
+        return kb_write(ops.kb_link_retire, link_id, body.reason)
+
+    @app.get("/vendor/{name}")
+    def vendor(name: str):
+        """The page's vendored libraries — listed, never a path walk (see vendor/README.md)"""
+        if name not in VENDORED:
+            return JSONResponse({"error": f"no vendored file {name}"}, status_code=404)
+        return FileResponse(VENDOR / name, media_type="text/javascript")
 
     @app.get("/neo", response_class=HTMLResponse)
     def neo_page(request: Request):
