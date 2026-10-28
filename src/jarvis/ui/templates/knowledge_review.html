@@ -306,6 +306,22 @@ window._ = window._ || {
       { selector: 'edge:selected', style: { 'width': 3.5, 'line-color': C.cyan,
         'target-arrow-color': C.cyan } },
       { selector: 'edge.off', style: { 'display': 'none' } },
+      // FOCUS, Obsidian's way: the clicked entry, its neighbours and its links stay lit
+      // (out = amber, in = cyan, undirected = ink), everything else fades. A focused
+      // entry's links show even when their kind is toggled off.
+      { selector: '.fdim', style: { 'opacity': 0.08 } },
+      { selector: 'node.entry.f-nb', style: { 'min-zoomed-font-size': 0, 'z-index': 15,
+        'color': C.ink } },
+      { selector: 'node.entry.f-me', style: { 'border-width': 3, 'border-color': '#ffffff',
+        'min-zoomed-font-size': 0, 'z-index': 16, 'color': '#ffffff', 'font-weight': 600 } },
+      { selector: 'edge.f-out, edge.f-in, edge.f-und', style: { 'display': 'element',
+        'width': 2.4, 'opacity': 1, 'z-index': 14, 'curve-style': 'bezier',
+        'arrow-scale': 1 } },
+      { selector: 'edge.f-out', style: { 'line-color': C.amber, 'target-arrow-color': C.amber,
+        'target-arrow-shape': 'triangle' } },
+      { selector: 'edge.f-in', style: { 'line-color': C.cyan, 'target-arrow-color': C.cyan,
+        'target-arrow-shape': 'triangle' } },
+      { selector: 'edge.f-und', style: { 'line-color': C.ink2, 'target-arrow-shape': 'none' } },
       // edgehandles' own pieces while a link is being drawn
       { selector: '.eh-ghost-edge, edge.eh-preview', style: { 'width': 2, 'line-color': C.amber,
         'target-arrow-color': C.amber, 'target-arrow-shape': 'triangle', 'curve-style': 'bezier' } },
@@ -995,7 +1011,31 @@ window._ = window._ || {
     cy.resize();
     return p;
   }
+  // `same_wo` is stored once per pair, so its direction means nothing
+  function isUndirected(e) { return e.data('rel') === 'same_wo'; }
+  function unfocus() {
+    cy.elements('.fdim, .f-nb, .f-me, .f-out, .f-in, .f-und')
+      .removeClass('fdim f-nb f-me f-out f-in f-und');
+  }
+  function focus(id) {
+    var me = cy.getElementById(id); if (!me.length) return;
+    cy.batch(function () {
+      unfocus();
+      var edges = me.connectedEdges().filter(function (e) { return !e.hasClass('eh-ghost-edge'); });
+      edges.forEach(function (e) {
+        e.addClass(isUndirected(e) ? 'f-und' : e.source().id() === id ? 'f-out' : 'f-in');
+      });
+      var near = edges.connectedNodes().add(me);
+      near.difference(me).addClass('f-nb');
+      me.addClass('f-me');
+      cy.nodes('.entry').difference(near).addClass('fdim');
+      cy.edges().difference(edges).addClass('fdim');
+    });
+  }
+  cy.on('tap', function (e) { if (e.target === cy && !state.pickFrom) closePanel(); });
+
   function closePanel() {
+    unfocus();
     state.open = null;
     $('kr-panel').hidden = true; root.classList.remove('with-panel'); cy.resize();
     document.querySelectorAll('.kr-dom.here').forEach(function (r) { r.classList.remove('here'); });
@@ -1015,14 +1055,23 @@ window._ = window._ || {
   function openEntry(id) {
     var n = state.nodes[id]; if (!n) return;
     state.open = { kind: 'entry', id: id };
+    focus(id);
     var edges = cy.getElementById(id).connectedEdges().filter(function (e) { return !e.hasClass('eh-ghost-edge'); });
-    var links = edges.map(function (e) {
+    var groups = { out: [], in: [], und: [] };
+    edges.forEach(function (e) {
       var out = e.source().id() === id, other = out ? e.target().id() : e.source().id();
       var o = state.nodes[other] || { headline: other };
-      return '<li><span class="mono sub">' + (out ? '' : '← ') + esc(e.data('rel')) + (out ? ' →' : '') + '</span> ' +
+      groups[isUndirected(e) ? 'und' : out ? 'out' : 'in'].push(
+        '<li><span class="mono sub">' + esc(e.data('rel').replace('_', ' ')) + '</span> ' +
         '<a href="#" data-goto="' + esc(other) + '">' + esc(o.headline.slice(0, 80)) + '</a>' +
-        (e.data('manual') ? ' <button type="button" data-unlink="' + esc(e.id()) + '" title="remove this link">✕</button>' : ' <span class="sub">(derived)</span>') + '</li>';
-    }).join('');
+        (e.data('manual') ? ' <button type="button" data-unlink="' + esc(e.id()) + '" title="remove this link">✕</button>' : ' <span class="sub">(derived)</span>') + '</li>');
+    });
+    function section(key, title, color) {
+      return groups[key].length ? '<b style="color:' + color + '">' + title + ' (' + groups[key].length +
+        ')</b><ul>' + groups[key].join('') + '</ul>' : '';
+    }
+    var links = section('out', 'outgoing →', C.amber) + section('in', '← incoming', C.cyan) +
+      section('und', 'same work order', C.ink2);
     var p = panel('<h3>' + esc(n.headline) + '</h3>' +
       '<div class="meta"><span class="sid">' + esc(n.id) + '</span> · ' + esc(n.project) +
       (n.topic ? ' · topic ' + esc(n.topic) : '') + '<br>' + n.reads + ' read' + (n.reads === 1 ? '' : 's') + ' · ' + n.chars + ' chars' +
@@ -1032,7 +1081,7 @@ window._ = window._ || {
       '<div class="row2">' + (status(n) === 'machine' ? '<button type="button" class="accept" data-accept>accept proposal</button>' : '') +
       moveSelect(n.domain_id) + (n.domain_id ? '<button type="button" data-unassign>unassign</button>' : '') +
       '<button type="button" data-link>link to…</button></div>' +
-      (links ? '<b>links</b><ul>' + links + '</ul>' : '') +
+      (links || '<div class="sub" style="margin:6px 0">no links</div>') +
       '<b>full text</b><div class="body" id="kr-body">loading…</div>');
     var a = p.querySelector('[data-accept]'); if (a) a.onclick = function () { assign([id], n.domain_id, 'accepted'); };
     var u = p.querySelector('[data-unassign]'); if (u) u.onclick = function () { assign([id], '', 'unassigned'); };
@@ -1049,6 +1098,7 @@ window._ = window._ || {
 
   function openDomain(id, focusName) {
     var d = state.domains[id]; if (!d) return;
+    unfocus();
     state.open = { kind: 'domain', id: id };
     var members = state.payload.nodes.filter(function (n) { return n.domain_id === id; });
     var props = members.filter(function (n) { return status(n) === 'machine'; }).length;
