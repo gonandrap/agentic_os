@@ -41,6 +41,32 @@
   <span class="mono">jarvis steward digest</span> ·
   <span class="mono">jarvis steward ledger</span></p>
 
+<h2 id="asks">Waiting on you</h2>
+<div class="panel" id="steward-asks">
+  <p class="sub">Critical self-work held at the ceiling this week. It is never re-offered:
+    act on it, or raising <span class="mono">os.evolution.critical_weekly_usd</span> only
+    lets later ones through.</p>
+  <table>
+    <tr><th>decision</th><th>severity</th><th>origin</th><th>subject</th><th>act</th><th>age</th></tr>
+    {% for i in report.asks %}
+    <tr id="decision-{{ i.id }}">
+      <td class="mono" style="white-space:nowrap;user-select:all">#{{ i.id }}</td>
+      <td class="mono">{{ i.severity }}</td>
+      <td class="mono">{{ i.origin_kind }}</td>
+      <td title="{{ i.rule }}: {{ i.reason }}">{{ i.subject }}</td>
+      <td class="mono">
+        {%- if i.origin_kind == "morpheus" %}<a href="/morpheus{% if i.morpheus_item %}#{{ i.morpheus_item }}{% endif %}">{{ i.morpheus_item or "morpheus" }}</a> · confirm, waive or requeue
+        {%- elif i.parent_wo_id %}<a href="/wo/{{ i.project }}/{{ i.parent_wo_id }}">{{ i.parent_wo_id }}</a>
+          · jarvis investigate {{ i.parent_wo_id }}
+        {%- else %}jarvis wo create {{ i.project }} "…"{% endif %}</td>
+      <td class="mono" style="white-space:nowrap" title="{{ fmt_ts(i.ts) }}">{{ fmt_age(i.ts) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6" class="empty">nothing held at the critical ceiling</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
 <h2 id="waiting">Waiting</h2>
 <div class="panel" id="steward-waiting">
   {{ rows(report.waiting, "nothing queued — the steward is holding no self-work back") }}
