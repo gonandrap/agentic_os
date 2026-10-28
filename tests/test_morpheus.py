@@ -279,7 +279,7 @@ def _run(exit_code, seen=None):
 
 
 @pytest.mark.parametrize("code,state,resolution", [
-    (0, "validated", "script exited 0"), (1, "failed", "script exited 1"),
+    (0, "validated", "script exited 0"), (1, "monitoring", ""),
     (75, "monitoring", ""), (None, "monitoring", "")])
 def test_the_exit_code_is_the_verdict(central, cfg, tmp_path, code, state, resolution):
     item = monitoring(central)
@@ -289,6 +289,32 @@ def test_the_exit_code_is_the_verdict(central, cfg, tmp_path, code, state, resol
     assert after["checks"] == 1 and after["last_output"] == f"said {code}"
     if state == "monitoring":
         assert after["next_check_ts"] == TEST_EPOCH + cfg.check_every_minutes * 60
+
+
+def test_failed_needs_two_exit_1_in_a_row(central, cfg, tmp_path):
+    item = monitoring(central)
+    later = TEST_EPOCH + cfg.check_every_minutes * 60
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH, run=_run(1))
+    morpheus.sweep(central, cfg, tmp_path, now=later, run=_run(1))
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["resolution"]) == ("failed", "script exited 1 twice in a row")
+    assert after["checks"] == 2
+
+
+def test_an_exit_1_the_next_check_does_not_repeat_is_not_a_failure(central, cfg, tmp_path):
+    item = monitoring(central)
+    for n, code in enumerate((1, 75, 1)):
+        morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + n * cfg.check_every_minutes * 60,
+                       run=_run(code))
+    assert central.morpheus_item(item["id"])["state"] == "monitoring"
+
+
+def test_an_unconfirmed_exit_1_times_out_saying_so(central, cfg, tmp_path):
+    item = monitoring(central)
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 3 * DAY + 1, run=_run(1))
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["resolution"]) == \
+        ("timedout", "one exit 1 within 3 day(s), never confirmed by a second")
 
 
 def test_each_script_runs_in_its_own_project(central, cfg, tmp_path):
@@ -866,6 +892,7 @@ def test_the_daemon_pass_runs_each_check_in_its_project_and_hands_off(
     daemon = Daemon(load_catalog(catalog_file))
     good = monitoring(central, n=1, script="pwd > ran-here; exit 0")
     bad = monitoring(central, n=2, script="exit 1", title="no wo")
+    central.update_morpheus_item(bad["id"], last_exit=1)  # its first exit 1 is behind it
     monkeypatch.setattr(morpheus, "_ask_neo", lambda c, i, note="": 42)
     daemon._morpheus_pass()
     assert central.morpheus_item(good["id"])["state"] == "validated"

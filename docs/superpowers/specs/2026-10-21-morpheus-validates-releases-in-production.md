@@ -42,9 +42,11 @@ Each item has a state:
    * Each `monitoring` item's check runs every `check_every_minutes` (default 15), with
      a timeout. It runs from its project's production directory: the deployed checkout
      for the OS, and the catalog path for every other project.
-   * **Exit 0 = validated, exit 1 = failed, anything else = not yet.** "Not yet" is the
-     normal answer for a change whose code path production has not exercised; the
-     deadline is what turns it into `timedout`.
+   * **Exit 0 = validated, two exit 1 in a row = failed, anything else = not yet.**
+     "Not yet" is the normal answer for a change whose code path production has not
+     exercised; the deadline is what turns it into `timedout`. A script exits 1 only on
+     the PR's own failure signature and 75 when the environment is what it cannot read,
+     and one exit 1 that the next check does not repeat is a blip, not a verdict (#1255).
 3. **Morpheus's session writes the checks (the only LLM).**
    * PRs give hints, never scripts. One long-lived Claude session, resumed turn after
      turn, is woken by the daemon only when items are `queued`.

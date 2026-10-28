@@ -382,7 +382,7 @@ def _cwd(cwd: CwdFor, item: dict[str, Any]) -> Path:
 def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd: CwdFor,
           *, now: float | None = None,
           run: Callable[[str, Path, int], CheckResult] = run_script) -> str:
-    """Run an item's script once and move it by the exit code alone; returns its state"""
+    """Run an item's script once and move it by the exit codes alone; returns its state"""
     now = db.now() if now is None else now
     result = run(item["script"], _cwd(cwd, item), cfg.script_timeout_seconds)
     fields: dict[str, Any] = {"last_check_ts": now, "checks": int(item["checks"]) + 1,
@@ -390,18 +390,24 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
                               "next_check_ts": now + cfg.check_every_minutes * 60}
     if result.exit == EXIT_VALIDATED:
         fields.update(state="validated", next_check_ts=None, resolution="script exited 0")
-    elif result.exit == EXIT_FAILED:
-        fields.update(state="failed", next_check_ts=None, resolution="script exited 1")
+    # One exit 1 may be the environment, not the PR, so `failed` needs a second in a row (#1255)
+    elif result.exit == EXIT_FAILED and item.get("last_exit") == EXIT_FAILED:
+        fields.update(state="failed", next_check_ts=None,
+                      resolution="script exited 1 twice in a row")
     elif now >= float(item["deadline_ts"]):
         fields.update(state="timedout", next_check_ts=None,
-                      resolution=_timeout_reason(item, cfg))
+                      resolution=_timeout_reason(item, cfg, result.exit))
     central.update_morpheus_item(item["id"], **fields)
     return str(fields.get("state", item["state"]))
 
 
-def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig) -> str:
+def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig,
+                    last_exit: int | None = None) -> str:
     if not item.get("script"):
         return f"no script was registered within {cfg.timeout_days:g} day(s)"
+    if last_exit == EXIT_FAILED:
+        return (f"one exit 1 within {cfg.timeout_days:g} day(s), "
+                "never confirmed by a second")
     return (f"no exit 0 or 1 within {cfg.timeout_days:g} day(s) "
             f"(last exit {item.get('last_exit')})")
 
@@ -571,8 +577,14 @@ For each item you are given, spawn ONE subagent (Task tool), in parallel. Each s
      - runs from the project's production directory, the one given with the item;
      - is READ-ONLY: it inspects production (CLIs with --json, logs, `systemctl --user
        status`, `gh` reads, HTTP GETs) and never changes anything;
-     - exits 0 when production shows the change working, 1 when it shows it not working,
-       and any other code (use 75) when production has not exercised it yet;
+     - exits 0 when production shows the change working;
+     - exits 1 ONLY when production shows THIS PR's own failure signature — the exact
+       symptom the PR fixed, happening again. Anything the PR does not own is NOT a
+       failure: a command that errored, an endpoint that was unreachable, a missing
+       file, a reading stale for its own reason. Those exit 75, and so does every
+       check that could not read what it needed to judge;
+     - exits 75 for everything else, including production not having exercised the
+       change yet;
      - finishes in well under a minute;
   3. registers it: `jarvis morpheus script <item id> --file /tmp/morpheus-<item id>.sh`.
 If the hints cannot be made mechanical, the subagent registers a script that exits 75 and
