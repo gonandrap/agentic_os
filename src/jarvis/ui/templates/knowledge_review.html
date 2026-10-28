@@ -87,7 +87,7 @@
 </p>
 <p class="sub" style="margin: 4px 0 0">
   Move around like Figma: <kbd class="kbd">scroll</kbd> pans (<kbd class="kbd">shift</kbd> sideways),
-  <kbd class="kbd">ctrl</kbd>/<kbd class="kbd">⌘</kbd>+scroll or pinch zooms, hold
+  <kbd class="kbd">ctrl</kbd>/<kbd class="kbd">alt</kbd>/<kbd class="kbd">⌘</kbd>+scroll or pinch zooms, hold
   <kbd class="kbd">space</kbd> or the middle button and drag to pan, drag on empty canvas to
   box-select (<kbd class="kbd">shift</kbd> adds). <kbd class="kbd">shift 1</kbd> fit all ·
   <kbd class="kbd">shift 2</kbd> zoom to selection · <kbd class="kbd">shift 0</kbd> 100% ·
@@ -174,7 +174,9 @@ window._ = window._ || {
 
   var root = document.getElementById('kr');
   var RELS = root.dataset.rels.split(',');
-  var POS_KEY = 'kb-review-positions-v1';
+  // v2: cells grew to fit wrapped labels; v1 positions would put them back on top of each other
+  var POS_KEY = 'kb-review-positions-v2';
+  var LABEL_W = 110, LABEL_CHARS = 60;  // ~3 wrapped lines at the entry font size
   var C = { human: '#46d69a', machine: '#f2a33c', none: '#6b7a93', ink: '#d9e0ec',
             ink2: '#93a3ba', line: '#253049', cyan: '#56c8e8', amber: '#f2a33c', red: '#e85d5d' };
   var REL_COLOR = { relates_to: C.cyan, supersedes: C.amber, depends_on: C.human, duplicates: C.red };
@@ -268,8 +270,8 @@ window._ = window._ || {
       { selector: 'node.entry', style: {
         'width': 'data(size)', 'height': 'data(size)', 'background-color': C.none,
         'border-width': 0, 'label': 'data(label)', 'font-size': 7, 'color': C.ink2,
-        'text-valign': 'bottom', 'text-margin-y': 2, 'text-wrap': 'ellipsis',
-        'text-max-width': 70, 'min-zoomed-font-size': 9 } },
+        'text-valign': 'bottom', 'text-margin-y': 2, 'text-wrap': 'wrap',
+        'text-max-width': LABEL_W, 'min-zoomed-font-size': 9 } },
       { selector: 'node.entry.human', style: { 'background-color': C.human } },
       { selector: 'node.entry.machine', style: { 'background-color': C.machine } },
       { selector: 'node.entry.retired', style: { 'opacity': 0.45, 'border-width': 1.5,
@@ -331,7 +333,7 @@ window._ = window._ || {
     });
     p.nodes.forEach(function (n) {
       els.entries.push({ group: 'nodes', data: { id: n.id, kind: 'entry',
-        label: n.headline.length > 90 ? n.headline.slice(0, 88) + '…' : n.headline,
+        label: n.headline.length > LABEL_CHARS ? n.headline.slice(0, LABEL_CHARS - 1) + '…' : n.headline,
         parent: state.domains[n.domain_id] ? n.domain_id : undefined, size: entrySize(n.reads) },
         classes: 'entry ' + status(n) + (n.retired ? ' retired' : '') });
     });
@@ -439,7 +441,9 @@ window._ = window._ || {
   // So the domains are PACKED — each one's entries in a grid sorted by topic, subdomains
   // as blocks beside them, recursively — and fcose lays out only the loose entries, whose
   // clusters are the point, in their own region to the right.
-  var CELL = 50, GAP = 48, PAD = 14, LABEL = 24;
+  // A grid cell is sized for its LABEL, not its dot: a headline wraps to at most three
+  // lines of LABEL_W, under a dot of at most 44px, so neighbours' labels never touch.
+  var CELL_W = LABEL_W + 14, CELL_H = 84, GAP = 48, PAD = 14, LABEL = 24;
 
   function shelf(parts) {
     if (!parts.length) return { w: 0, h: 0, place: function () {} };
@@ -459,9 +463,14 @@ window._ = window._ || {
       var ta = (state.nodes[a.id()] || {}).topic || '', tb = (state.nodes[b.id()] || {}).topic || '';
       return ta < tb ? -1 : ta > tb ? 1 : b.data('size') - a.data('size');
     });
-    var cols = Math.max(1, Math.ceil(Math.sqrt(arr.length * 1.6)));
-    return { w: cols * CELL, h: Math.ceil(arr.length / cols) * CELL, place: function (x, y) {
-      arr.forEach(function (e, i) { e.position({ x: x + (i % cols) * CELL + CELL / 2, y: y + Math.floor(i / cols) * CELL + CELL / 2 }); });
+    // Columns for a block about 1.4x wider than tall, given cells wider than tall
+    var cols = Math.max(1, Math.ceil(Math.sqrt(arr.length * 1.4 * CELL_H / CELL_W)));
+    return { w: cols * CELL_W, h: Math.ceil(arr.length / cols) * CELL_H, place: function (x, y) {
+      arr.forEach(function (e, i) {
+        // the dot sits near the top of its cell; its label hangs below it
+        e.position({ x: x + (i % cols) * CELL_W + CELL_W / 2,
+                     y: y + Math.floor(i / cols) * CELL_H + 24 });
+      });
     } };
   }
   function leavesOf(eles) { return eles.union(eles.descendants()).filter(function (n) { return !n.isParent(); }); }
@@ -484,8 +493,9 @@ window._ = window._ || {
       var loose = cy.nodes('.entry').filter(function (n) { return !n.parent().length; });
       if (loose.length) {
         loose.union(loose.edgesWith(loose)).layout({ name: 'fcose', quality: 'default',
-          randomize: true, animate: false, fit: false, nodeRepulsion: 6500,
-          idealEdgeLength: 55, packComponents: true, tile: true }).run();
+          randomize: true, animate: false, fit: false, nodeRepulsion: 45000,
+          idealEdgeLength: 140, nodeSeparation: 120, tilingPaddingVertical: 70,
+          tilingPaddingHorizontal: CELL_W, packComponents: true, tile: true }).run();
         var bb = loose.boundingBox({ includeLabels: false });
         loose.shift({ x: (packed.w ? packed.w + GAP * 3 : 0) - bb.x1, y: -bb.y1 });
       }
@@ -888,8 +898,9 @@ window._ = window._ || {
     e.preventDefault();
     var unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? view.clientHeight : 1;
     var dx = e.deltaX * unit, dy = e.deltaY * unit;
-    // One notch of a mouse wheel (~100px) zooms ~18%; a pinch sends many small deltas
-    if (e.ctrlKey || e.metaKey) { zoomAt(Math.exp(-dy * 0.002), e.clientX, e.clientY); return; }
+    // One notch of a mouse wheel (~100px) zooms ~18%; a pinch sends many small deltas.
+    // Alt too: GNOME grabs Super+mouse for window moves, so ⌘/Super+scroll never arrives.
+    if (e.ctrlKey || e.metaKey || e.altKey) { zoomAt(Math.exp(-dy * 0.002), e.clientX, e.clientY); return; }
     if (e.shiftKey && !dx) { dx = dy; dy = 0; }
     cy.panBy({ x: -dx, y: -dy });
   }, { passive: false });
