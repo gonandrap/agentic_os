@@ -62,6 +62,11 @@ def daemon_pidfile() -> Path:
     return run_dir() / "jarvisd.pid"
 
 
+def onboarding_dir() -> Path:
+    """Interview drafts live here, NOT in the project: an abandoned interview leaves the user's repository clean (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §3)"""
+    return jarvis_home() / "onboarding"
+
+
 def ensure_home() -> Path:
     home = jarvis_home()
     for d in (home, logs_dir(), run_dir()):

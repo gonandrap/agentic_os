@@ -802,6 +802,7 @@ SEED_MATCHES: tuple[tuple[str, str], ...] = (
     ("push_protected", r"\bgit\s+push\b[^\n]*\b(origin\s+)?(main|master)\b"),
     ("push_protected", r"\bgit\s+push\b[^\n]*\bHEAD:(refs/heads/)?(main|master)\b"),
     ("config_write", r"\bjarvis\s+config\s+(set|unset|restore|adopt)\b"),
+    ("config_write", r"\bjarvis\s+onboard\s+apply\b"),
 )
 
 # Commands that must gate, forever, whatever anyone learns
@@ -839,6 +840,7 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("config_write", "jarvis config unset os.validation.enabled --reason \"noisy\""),
     ("config_write", "jarvis config restore cfg-0123456789abcdef --reason \"revert\""),
     ("config_write", "jarvis config adopt --reason \"hand edit\""),
+    ("config_write", "jarvis onboard apply --from /tmp/draft.json"),
     # One per kind: a reader, a newline, and the canonical gated command
     ("release", "echo hi\n./scripts/shipit.sh"),
     ("pr_merge", "cat README.md\ngh pr merge 31 --squash"),
@@ -868,7 +870,8 @@ def seed_rows() -> list[dict[str, Any]]:
 
 
 # 2: the `config_write` kind, its recogniser and its canaries (the config console). 3: the... (#194)
-SEED_VERSION = "5"
+# 6: `jarvis onboard apply` writes configuration too, so it joins `config_write`
+SEED_VERSION = "6"
 
 
 # -- the live rule base
