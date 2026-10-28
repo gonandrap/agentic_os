@@ -99,6 +99,14 @@ gains one line of help text pointing at `onboard` (§5). The draft file is the o
 the interview carries between turns, and the CLI is the only thing that writes
 configuration — the persona never edits JSON (prime directive 1).
 
+**Three sections add a subcommand to the same `onboard` group, so the rule is: whichever
+lands first CREATES the group in `cli.build_parser`, the rest ADD to the existing one.**
+§3 lands first and creates it; §4 adds `questions` and `explain`; §5 adds the bare
+`jarvis onboard <path>`. Without that rule the last two pull requests conflict in
+`build_parser` over a group they both think they own. When the group is complete its
+subcommands are exactly `questions`, `explain`, `apply` — §5 pins that set, so a sixth
+command cannot appear without this section being updated first.
+
 ### 0.3 The draft file, frozen here because two children read and write it and never speak
 
 ```json
@@ -134,13 +142,29 @@ configuration — the persona never edits JSON (prime directive 1).
   interview asks the user for it in their own words (§2) rather than synthesising
   "onboarding interview".
 
+**Both sections that touch the draft test against the block above, not against each
+other.** §2 and §3 never speak, so each extracts this section's fenced JSON at test time —
+`spec_index.section(Path("docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md").read_text(), "0.3")`,
+take the fenced block, `json.loads` it — and asserts against that literal. §2 writes it to
+disk byte for byte and loads it back, and round-trips it so the top-level keys are exactly
+`schema`, `project`, `values`, `answers`, `reason` with `project` exactly `name`, `path`,
+`description`, `model`. §3 writes the SAME literal with a plain `json.dump` — deliberately
+not through this feature's own `save` — and asserts `ops.onboard_apply` accepts it, which
+is what proves it reads the on-disk shape rather than an object a sibling handed it. Both
+assert that `"schema": 2` is refused with a message containing the word `schema`. Coupling
+both suites to this text is the point: whichever half drifts goes red against a file
+neither section owns.
+
 ### 0.4 The test trap every section inherits
 
 `tests/` is routinely run BY a worker, which inherits `JARVIS_WO_ID`, and
 `ops._refuse_worker_write` reads exactly that — so every config write in every test fails
 with the worker lockout unless the file carries the autouse fixture that deletes the
-variable. `tests/test_config_console.py` has the one to copy (learning `kn-650b6f24`).
-Do not scrub the variable globally; `testing._bills_real_tokens` needs it.
+variable. `tests/test_config_console.py:23` (`not_a_worker`) has the one to copy (learning
+`kn-650b6f24`). Do not scrub the variable globally; `testing._bills_real_tokens` needs it.
+Every test file in §2, §3 and §4 carries that fixture **plus one line asserting
+`os.environ.get("JARVIS_WO_ID") is None` during the run**, so a missing fixture fails as
+itself rather than as a confusing worker-lockout refusal thirty assertions later.
 
 Run only the tests covering what you changed. CI runs the suite on three Python versions,
 which is strictly more than a local full run (`kn-356c724b`).
@@ -152,6 +176,7 @@ three other sections import. It classifies; it holds no prose and no recommended
 
 ```python
 AREA_KEYS: tuple[str, ...]            # the interview's order: must-haves first
+MUST_HAVE: frozenset[str]             # the areas the user named; every one precedes the rest
 AREA_PREFIXES: dict[str, tuple[str, ...]]   # area key -> the resolved-path tails it owns
 AREA_SCOPE: dict[str, str]            # "os" | "project" | "both"
 UNASKABLE: frozenset[str]             # identity/plumbing tails, never asked
@@ -222,15 +247,43 @@ def coverage(resolved: dict[str, Any]) -> list[str]  # every path it cannot clas
   still classified into an area. **There is no exemption from classification** — that is
   the whole guarantee of this section.
 
-**Tests — `tests/test_onboard_knobs.py`.**
-`coverage(config_version.resolve(parse_catalog(<minimal one-project document>)))` is empty:
-a knob added to `catalog.py` without a registry entry fails here, which is the point.
-Every area key in `AREA_KEYS` has prefixes and a scope; no tail is claimed by two areas;
-every `UNASKABLE` tail classifies and is not asked; `area_of` returns the same area for
-`os.defaults.model` and `projects.p.model` (the rename trap); `asked` is false for every
-dict- or list-valued path in a resolved map. **This file asserts nothing about prose or
-presets** — those are §4's and asserting them here would make this section's suite red
-until §4 merges, which is a false dependency in the wrong direction.
+- **`MUST_HAVE`** is the areas the user named by name, and it is a symbol rather than
+  prose because §2's `accept_remaining` and §5's persona both need to know when the
+  must-haves are done; left to prose, each would invent its own list. Every must-have key
+  precedes every other key in `AREA_KEYS`.
+
+**Tests — `tests/test_onboard_knobs.py`.** Build the catalog document as a literal dict in
+the test file, `catalog.parse_catalog` it, `config_version.resolve` it, and then:
+
+1. **Pin the fixture to the real schema** before asserting anything about coverage:
+   `len(resolved) == 374`, 202 paths under `os.`, 172 under `projects.`. Without this,
+   an empty `coverage()` proves nothing — and the counts are also the guard that stops a
+   worker making coverage easier by editing the resolver, which is read-only here.
+2. `coverage(resolved)` is empty: a knob added to `catalog.py` without a registry entry
+   fails here, which is the point.
+3. **The classification is not one bucket.** `len(AREA_KEYS) >= 25`; every key in
+   `AREA_KEYS` is returned by `area_of` for at least one path in the resolved map, so no
+   area is decorative; no single area claims more than a quarter of the tails. One area
+   with the prefix `""` would otherwise satisfy everything above it.
+4. **`asked` says yes to something.** The tails for which `asked` is true number between
+   40 and 80, and `asked` is true for `projects.p.validation.enabled`, `os.neo.enabled`
+   and `projects.p.worker.budget_usd`. `def asked(path): return False` passes every other
+   assertion in this section and leaves §2 and §4 with nothing to ask about.
+5. `asked` is false for every dict- or list-valued path in the resolved map, and for every
+   `UNASKABLE` tail — which still classifies.
+6. `area_of` returns the same area for `os.defaults.model` and `projects.p.model` (the
+   rename trap).
+7. **The `Area` contract, with dummy content built in the test file** so §4 is not
+   imported: its field names and their order are exactly `key`, `title`, `scope`,
+   `summary`, `on_costs`, `off_costs`, `refs`, `presets`; assigning to one raises
+   `dataclasses.FrozenInstanceError`. `AREA_SCOPE`'s keys equal `set(AREA_KEYS)` and its
+   values are all in `{"os", "project", "both"}`.
+8. `MUST_HAVE` is non-empty, a proper subset of `AREA_KEYS`, and ordered ahead of the rest.
+
+**This file asserts nothing about prose or presets** — those are §4's, and asserting them
+here would make this section's suite red until §4 merges, which is a false dependency in
+the wrong direction. `catalog.py` and `config_version.py` are read-only for this section;
+run `tests/test_config_console.py` unchanged and green and say so in the pull request.
 
 ## 2. The interview: questions, postures, the two scopes, and the re-run
 
@@ -275,8 +328,10 @@ document it becomes are the write path's contract. This section consumes them.
   paths exist, but the real choice space is the user's actual MCP servers, skills and
   plugins, discovered at runtime. The interview special-cases it by calling
   `ops.wiring_config(project=…)` / `ops.wiring_show(…)` (ops.py:11054) and emitting
-  `wiring.*` values through `wiring.lever_setting`, rather than pretending four booleans
-  are the question.
+  `wiring.*` values through `wiring.lever_setting(lever, wired, cfg)`, which returns the
+  `(path, value)` pair to put in the draft. **Do not call `ops.set_wiring`**: it routes
+  through `ops.set_config`, which refuses a project that is not in the document yet —
+  which, during onboarding, is every project.
 - **`ops._refuse_os_sweep_off`** (ops.py:10770) raises when a write would leave
   `supervisor.enabled` or `supervisor.health_enabled` off for the OS-owning project
   (`schedule.os_project`). The interview must not OFFER that choice when onboarding or
@@ -290,14 +345,34 @@ document it becomes are the write path's contract. This section consumes them.
   `ops.apply_class(path)`, `ops.safety_key(path)` and the knob's own line from §4. A real
   resolved diff cannot drift from what the fleet will read; a hand-rolled one can.
 
-**Tests — `tests/test_interview.py`.** `accept_defaults` writes no values and leaves the
-document silent; `set_value` with a value the catalog rejects is refused by
-`onboard_draft.validate` with the parser's own message; `summary` on a default-accepting draft for a fresh project reports only the project's
-creation; a re-run draft built from a live resolved map pre-fills the matching posture and
-`"custom"` where nothing matches; with another project already in the catalog, an `os.`-
-scoped area starts at "leave as is" and its question carries the fleet warning naming that
-project. **Preset fixtures in this file are the test's own**, not §4's corpus, so this
-section is not blocked on it.
+**Tests — `tests/test_interview.py`** (with the §0.4 fixture and its guard line).
+**Preset fixtures in this file are the test's own**, not §4's corpus, so this section is
+not blocked on it — and they deliberately include a posture that would turn the supervisor
+sweep off, so assertion 3 exercises filtering code rather than an empty loop.
+
+1. `accept_defaults` writes no values and leaves the document silent.
+2. **The fleet warning is enforced, not displayed.** With a second project in the catalog,
+   `answer(draft, <an os-scoped area>, "preset:balanced")` before any `fleet_warning` call
+   either raises or writes zero `os.` keys into `values`; after `fleet_warning(draft)` the
+   same call writes them. Without the negative half the rule is decorative.
+3. **The OS project's sweep is never offered.** With a catalog whose `schedule.os_project`
+   is the project being onboarded, no posture in any `Question` from `questions()` sets
+   `supervisor.enabled` or `supervisor.health_enabled` false.
+4. **`summary` equals the real diff.** Its rows equal `config_version.diff(before, after)`
+   computed independently in the test from `resolve(parse_catalog(...))`, and for each row
+   `row["apply"] == ops.apply_class(row["path"])` and
+   `row["safety"] == ops.safety_key(row["path"])`. "Reports only the project's creation"
+   would pass on a stub returning one hard-coded row.
+5. **The parser is the type system.** `set_value` with a value `catalog.parse_catalog`
+   rejects comes back from `onboard_draft.validate` carrying the real `CatalogError` text —
+   assert a substring the test obtains by calling `parse_catalog` on the same bad document.
+   A worker who writes a second type check passes a looser assertion and fails this one.
+6. A re-run draft built from a live resolved map pre-fills the matching posture, and
+   `"custom"` where nothing matches.
+7. **The repository stays clean.** After `new_draft` and a save, the project directory's
+   file list is exactly what it was, the draft path is under `paths.jarvis_home()`, and no
+   temporary sibling is left beside it.
+8. The §0.3 round-trip and the `"schema": 2` refusal that section describes.
 
 ## 3. The draft file and `jarvis onboard apply`: one config version, then bootstrap, then the restart
 
@@ -373,15 +448,45 @@ places both an `os.`-scoped and a `projects.<name>.`-scoped value where
 `config_version.resolve` reads them back equal; `validate` returns the parser's own message
 for a value the catalog rejects, and `[]` for a document that parses.
 
-**Tests — `tests/test_onboard_apply.py`** (with the §0.4 autouse fixture). A draft for a
-fresh git project creates the `projects[]` entry and exactly one version row whose
-`changes` name the project's paths; `bootstrap_project` ran (OPERATION.md and
-`.claude/settings.json` exist); the project is in `os.db`; `restart_needed` is true and
-the payload says why; re-apply writes no second row; a draft naming a non-git path is
-refused naming `git init`; a draft with safety-key changes and an empty `reason` is refused
-by `_require_reason`; `--dry-run` writes neither file nor row; a worker session
-(`JARVIS_WO_ID` set) is refused; the `config_write` canary for `jarvis onboard apply`
-classifies, asserted the way the existing canaries are.
+**Tests — `tests/test_onboard_apply.py`** (with the §0.4 fixture and its guard line).
+
+1. A draft for a fresh git project creates the `projects[]` entry; `bootstrap_project` ran
+   (OPERATION.md and `.claude/settings.json` exist); a draft naming a non-git path is
+   refused naming `git init`; a draft whose safety keys move with an empty `reason` is
+   refused by `_require_reason`; a worker session (`JARVIS_WO_ID` set) is refused.
+2. **One row, and it is the head.** `CentralStore.config_versions()` grows by exactly one,
+   and `head_config_version()["id"]` equals the returned row's id. Reading head off
+   `config_versions()[0]` is the §0 ban and this is what catches it.
+3. **The spec is read back, not hand-built.** With a non-default `model` and `description`
+   in the draft, the committed `projects[]` entry carries both AND the bootstrapped files
+   reflect the committed value. A hand-built `ProjectSpec` passes "bootstrap ran" and fails
+   this.
+4. **`upsert_project` mirrors `ops.start_os`.** The `os.db` row's `catalog_json` parses and
+   its `name` is the draft's project. "The project is in os.db" passes with a null
+   `catalog_json`, which is the bug step 7 exists to prevent.
+5. **Order of operations.** With `bootstrap.bootstrap_project` monkeypatched to raise,
+   `onboard_apply` propagates BUT the version row exists and the catalog file is the
+   candidate document. That pins commit-before-bootstrap, which is this section's decision.
+6. **The dry run tells the truth.** For one draft, the `changes` of a `dry_run=True` call
+   equal those of the real call; the dry run leaves `config_versions()` the same length and
+   the catalog file byte-identical. The persona shows the dry run as the confirmation diff,
+   so a divergence there is a lie to the user.
+7. **`restart_needed` both ways.** True with a `restart_why` naming the new project, for a
+   new project; **false** for a draft against an already-present project that changes only
+   a path whose `ops.apply_class` is `hot`. A constant passes the "true" half alone.
+   Separately, the CLI success output contains the literal `jarvis start --catalog ` and
+   the catalog path.
+8. Re-applying the unchanged draft writes no second row.
+9. **The gate canary in the existing idiom** (`tests/test_config_console.py:495`):
+   `gate_rules.RuleSet.from_seeds().check_canaries()` is empty, and
+   `jarvis onboard apply` classifies as `config_write`.
+
+**Must not change.** `ops._commit_document`, `_require_reason`, `_refuse_os_sweep_off`,
+`_refuse_worker_write`, `set_config` and `unset_config` keep their behaviour:
+`tests/test_config_console.py` passes untouched and is named in the pull request body.
+After an apply, `INV-CONFIG-DRIFT` reports nothing. Re-proving `Daemon.reload_catalog`'s
+refusal end to end is NOT this section's job — it is covered where it lives; assert only
+`restart_needed`, `restart_why` and the printed command.
 
 ## 4. The corpus and `explain`: what each behaviour costs, in words, grounded
 
@@ -432,23 +537,56 @@ otherwise, because `explain` has to work before the project exists.
 prose, postures and knobs by tier. `jarvis onboard questions --json` is how a test, the
 user or a future UI reads the interview without starting one.
 
-**Tests — `tests/test_onboard_prose.py`.** Every key in `onboard_knobs.AREA_KEYS` has
-exactly one `Area`, with non-empty `summary`, `on_costs` and `off_costs`; every asked tail
-in the registry has a `LINES` entry and an `EXAMPLES` entry; **every ref resolves** —
-the file exists and `spec_index.section` returns something non-empty for its section
-(this is the strongest test in the feature: it is what keeps the explanations honest as the
-specs move); every preset, for every area and posture, survives being written into a
-document and parsed by `catalog.parse_catalog`, with the resolved value read back equal;
-`onboard_explain` answers for every area key and every asked tail, with `apply` and
-`safety` equal to `ops.apply_class` / `ops.safety_key` for the same path; an unknown target
-is refused with a message listing the areas; `explain` with no project still answers.
+**Tests — `tests/test_onboard_prose.py`** (with the §0.4 fixture and its guard line).
+
+1. **Every ref resolves** — the file exists and `spec_index.section` returns something
+   non-empty for its section. This is the strongest test in the feature: it is what keeps
+   the explanations honest as the specs move. On top of it, every ref also parses as the
+   command the persona actually runs: `cli.build_parser().parse_args(["spec", "section",
+   <file>, <section>])`.
+2. Every key in `onboard_knobs.AREA_KEYS` has exactly one `Area`; every asked tail in the
+   registry has a `LINES` entry and an `EXAMPLES` entry.
+3. **Prose has a floor.** `summary`, `on_costs` and `off_costs` are each at least 80
+   characters, each distinct from the other two within the same area, and each ends in a
+   full stop — the repo already has this idiom as `specs.MIN_PROFILE_CHARS`. "Non-empty"
+   passes on `"x"` and is this section's weakest assertion without the floor.
+4. **A preset only moves knobs its own area owns.** For every area, every posture and every
+   tail in that posture, `onboard_knobs.area_of` of that tail spelled at the area's scope
+   returns this area, and `asked` is true for it. Without this, a `validation` posture that
+   quietly sets `os.neo.enabled` passes — this is this section's half of the registry seam.
+5. Every preset survives being written into a document and parsed by
+   `catalog.parse_catalog`, with the resolved value read back equal.
+6. `onboard_explain` answers for every area key and every asked tail, with `apply` and
+   `safety` equal to `ops.apply_class` / `ops.safety_key` for the same path; an unknown
+   target is refused with a message listing the areas; `explain` with no project still
+   answers.
+7. **The command it hands the user is a command.** The `jarvis config set …` string in the
+   path-target payload parses through `cli.build_parser()` once the leading `jarvis` is
+   stripped, and for a project-scoped tail it carries the project positional. It is the one
+   string a user is most likely to copy.
+8. **Payload shapes are pinned**: the exact key set of the area-target payload and of the
+   path-target payload, so a half-filled dict fails.
+9. **Numbers come from defaults, mechanically as far as is honest**: for each asked tail
+   whose shipped default is numeric, if its `EXAMPLES` string contains any number, at least
+   one of those numbers equals that default. The spec-sourced half of the rule — that a
+   dollar figure in prose is traceable to a spec — is review, not test, and the brief says
+   so rather than faking a test for it.
+10. **The wiring wording cannot fork.** The wiring area's text contains a substring read at
+    test time from `jarvis.ui.app.WIRING_GROUPS`, which this section quotes and never edits.
+
+`src/jarvis/onboard_knobs.py` is read-only here: `AREA_KEYS` is the input, not something to
+extend when a key is awkward. No new `docs/os/` pages.
 
 ## 5. The greeting_agent session, and the operator doc
 
-**The persona asset: `src/jarvis/assets/greeting-agent/.claude/agents/greeting_agent.md`** —
+**The persona asset: `src/jarvis/assets/greeting-agent/greeting_agent.md`** —
 frontmatter (`name: greeting_agent`, `description`, `tools`) plus prose, the shape every
-other persona in `assets/` has. It is materialised into
-`paths.onboarding_dir()/agent/.claude/agents/greeting_agent.md` and the session is launched
+other persona in `assets/` has. **The asset directory is flat**: no asset dir in this repo
+carries a dot-directory, and a `.claude/` inside `src/jarvis/assets/` raises a packaging
+question the shipped idiom avoids. It is materialised by the shipped, already-tested
+`bootstrap._rebuild(ASSETS / "greeting-agent", paths.onboarding_dir() / "agent", "agents")`
+— the same copytree `install_agent_assets` uses to give a worker its crew — which produces
+`paths.onboarding_dir()/agent/.claude/agents/greeting_agent.md`, and the session is launched
 with `--add-dir <that root> --agent greeting_agent`, which is how the OS gives a LEAD
 session its persona (§0). **Verify that combination in an interactive (non-`-p`) session
 first**: the repo only exercises `--agent` for dispatched and headless sessions. If it does
@@ -512,15 +650,50 @@ gains one clause pointing at `jarvis onboard`.
 `tests/test_persona.py` puts structural guards on that file and
 `tests/test_worker_start_budget.py:85` caps it at 5000 tokens.
 
-**Tests — `tests/test_onboard_session.py`.** `onboard_session` on a fresh git project
-returns a draft with every area unanswered, a persona file whose frontmatter
-`panel.parse_definition` parses with `name == "greeting_agent"`, and an argv carrying
-`--agent greeting_agent` and an `--add-dir` for the persona root; the cwd it reports is
-`paths.jarvis_home()` and not the project; on an already-adopted project the draft is
-pre-filled from the live resolved config and the payload says so; `--print-prompt` writes
-the files and returns no argv; a path that is not a git repository is refused before
-anything is written; the persona prose names all four `jarvis onboard` commands, so the
-asset and §0.2's surface cannot drift apart.
+**Tests — `tests/test_onboard_session.py`**, plus two existing files.
+
+1. **Every backticked `jarvis …` command in the persona body PARSES.** Copy
+   `tests/test_worker_brief.py:116` (`test_every_core_command_string_parses`) including its
+   `re.findall(r"`(jarvis [^`\n]+)`", text)` and its `<...>` placeholder substitution, and
+   run `cli.build_parser().parse_args` on each, failing with the offending command. This is
+   the assertion that keeps the persona honest: a substring check survives a sibling
+   renaming `--from` to `--draft`, and `parse_args` does not. It is the house idiom, not an
+   invention.
+2. **The reverse guard on the surface.** The `onboard` subparser's choices are exactly
+   `{questions, explain, apply}` — idiom at `tests/test_rules_cli.py:221`,
+   `parser._subparsers._group_actions[0].choices["onboard"]` — so a sibling ADDING a fifth
+   command also goes red until the persona and §0.2 are updated.
+3. `onboard_session` on a fresh git project returns a draft with every area unanswered and
+   an argv carrying `--agent greeting_agent` and an `--add-dir` for the persona root; on an
+   already-adopted project the draft is pre-filled from the live resolved config and the
+   payload says so; a path that is not a git repository is refused before anything is
+   written.
+4. **Asset identity.** The materialised `<root>/.claude/agents/greeting_agent.md` is
+   byte-identical to the packaged asset, and `seats.parse_definition` of it gives
+   `name == "greeting_agent"` with a non-empty body. Import **`seats`**, whose
+   `parse_definition` this is; `panel` only re-exports it, and importing `panel` here would
+   read as a panel dependency this section does not have. `parse_definition` does NOT check
+   `name` against the filename, so the test asserts the name itself.
+5. **cwd.** The reported cwd equals `paths.jarvis_home()` and is not inside the project
+   path; `--print-prompt` created the persona root and the draft and returned no argv.
+6. **The crib line, in `tests/test_persona.py`** (its own idiom,
+   `test_crib_sheet_documents_every_improvement_order_verb`): `jarvis onboard <path>` is in
+   `CLAUDE.md`, and at most ONE line of it starts with `jarvis onboard`. Nothing else in
+   this list asserts `CLAUDE.md` changed at all, so without it a worker can finish believing
+   it is done with the crib entry missing. `tests/test_worker_start_budget.py:85`'s
+   5000-token cap stays green.
+7. **The doc is reachable**: `docs/os/operator/onboarding.md` exists AND `docs/os/index.md`
+   contains `operator/onboarding.md`. An unlinked page is invisible.
+8. The `adopt` subparser's help string contains `jarvis onboard`.
+
+`project_store.WO_KINDS`, `dispatch.py`, `hooks.py` and `daemon.py` take a zero diff.
+Nothing in the suite execs `claude`.
+
+**One manual check, reported in the finish summary**, standing in for the eval this feature
+deliberately does not ship: run `jarvis onboard <scratch git repo>` by hand, confirm
+`--add-dir <root> --agent greeting_agent` takes in an interactive (non-`-p`) session,
+answer two areas, confirm `apply --from … --dry-run` prints the diff, and state whether
+`--agent` or the `--append-system-prompt-file` fallback shipped.
 
 ## Agent profile
 
