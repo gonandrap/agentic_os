@@ -529,7 +529,7 @@ CREATE TABLE IF NOT EXISTS morpheus_items (
     last_exit INTEGER,
     last_output TEXT NOT NULL DEFAULT '',
     resolution TEXT NOT NULL DEFAULT '',
-    action TEXT NOT NULL DEFAULT '',        -- neo:<qid> | investigation:<id> | none:<why>
+    action TEXT NOT NULL DEFAULT '',        -- neo:<qid> | investigation:<id> | improvement:<io-id> | none:<why>
     action_ts REAL,
     UNIQUE (repo, pr_number)
 );

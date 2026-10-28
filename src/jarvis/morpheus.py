@@ -449,7 +449,7 @@ def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
     if route == "investigate":
         inv_id, note = investigate(catalog, item)
         if inv_id:
-            action = f"investigation:{inv_id}"
+            action = f"{_action_kind(inv_id)}:{inv_id}"
             if central.claim_morpheus_action(item["id"], action):
                 central.add_inbox(
                     project=item.get("project") or _os_project(catalog), level="warning",
@@ -463,6 +463,11 @@ def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
     return action
 
 
+def _action_kind(order_id: str) -> str:
+    """An `io-` id is the improvement order a PR with no work order gets (#1253)"""
+    return "improvement" if order_id.startswith("io-") else "investigation"
+
+
 def _os_project(catalog: Catalog) -> str:
     from . import schedule
 
@@ -470,12 +475,12 @@ def _os_project(catalog: Catalog) -> str:
 
 
 def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
-    """(investigation id, '') or ('', why not) — through the steward, like every OS-filed order"""
+    """(order id, '') or ('', why not) — through the steward, like every OS-filed order"""
     from . import ops, steward
 
     wo_id = item.get("wo_id") or ""
     if not wo_id:
-        return "", "the PR names no work order to investigate"
+        return _improve(catalog, item)
     try:
         project, _path, _wo = ops.find_work_order(wo_id, item.get("project") or None)
     except Exception as e:  # noqa: BLE001
@@ -493,6 +498,26 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
         return live, ""
     inv = ops.create_investigation_order(project, wo_id, why=_why(item), origin="jarvis")
     return str(inv["id"]), ""
+
+
+def _improve(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
+    """An investigation needs an order to investigate; a hand-opened PR is its own evidence (#1253)"""
+    from . import ops, steward
+
+    project = item.get("project") or _os_project(catalog)
+    title = f"PR #{item['pr_number']} {item['state']} production validation"
+    decision = steward.gate(
+        steward.Candidate("morpheus", "critical", project, title,
+                          evidence=(item.get("last_output") or item["resolution"],)),
+        catalog=catalog)
+    if not decision.allowed:
+        return "", f"the steward did not dispatch it ({decision.outcome}: {decision.reason})"
+    try:
+        io = ops.create_improvement_order(project, title, description=_why(item),
+                                          refs=(item["pr_url"],), origin="morpheus")
+    except Exception as e:  # noqa: BLE001 — Neo still gets the item
+        return "", f"the improvement order could not be filed ({e})"
+    return str(io["id"]), ""
 
 
 def _why(item: dict[str, Any]) -> str:
