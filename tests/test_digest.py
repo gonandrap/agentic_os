@@ -323,7 +323,8 @@ def test_a_digest_never_reaches_neo_or_the_worker(daemon, store, project):
     view = digest.decode(store.get(digested["id"])["digest"])
     assert view is not None                     # the control: there WAS one to leak
 
-    store.ask("proj_a", "wo-1", LONG)
+    asked_text = LONG[:1900]  # under the question cap, else Neo refines it unread
+    store.ask("proj_a", "wo-1", asked_text)
     daemon._neo_drain()
 
     asked = [json.loads(p.read_text()) for p in _calls_dir().glob("*.json")]
@@ -331,7 +332,7 @@ def test_a_digest_never_reaches_neo_or_the_worker(daemon, store, project):
                    if "-p" in c["argv"]
                    and digest.DIGEST_HEADER not in " ".join(c["argv"])]
     assert neo_prompts, "Neo was never called"
-    assert any(LONG in p for p in neo_prompts)              # it read the whole thing
+    assert any(asked_text in p for p in neo_prompts)        # it read the whole thing
     assert not any(view["headline"] in p for p in neo_prompts)
 
 
