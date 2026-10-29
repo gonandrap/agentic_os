@@ -102,6 +102,7 @@ jarvis inspect <wo-id|fo-id>               # where the TIME went, and why each c
 jarvis alarms [project]                    # turns the OS flagged while they burned
 jarvis steward ledger|decisions|why <wo-id>|digest   # what the OS may spend on ITSELF, and each decision's rule
 jarvis adopt <path>                        # migrate a project into the OS
+jarvis onboard start <path>                # interview: user picks its settings, one config version
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```
 

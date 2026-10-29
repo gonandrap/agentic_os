@@ -52,3 +52,4 @@ them. Links are bundle-relative (`/` = `docs/os/`).
 - [Reviews, gates and Neo](/operator/reviews.md) — assumptions, validation, gates, Neo's ledgers.
 - [Spend and time](/operator/spend.md) — pause/resume, budgets, cost, inspect, alarms.
 - [Records, bugs and knowledge](/operator/records.md) — search, issues, bug reports, learnings, wiring.
+- [Onboarding](/operator/onboarding.md) — the interview that picks a project's settings, applied as one config version.
