@@ -703,7 +703,7 @@ def timeline(samples: Sequence[Sample], *, points: int = TIMELINE_POINTS
 
 def timeline_between(*, since: float, until: float,
                      home: Path | str | None = None) -> list[dict[str, Any]]:
-    """`timeline` for any span, one read of `usage_samples` — what the /cost chart fetches when it zooms or overlays"""
+    """`timeline` for any span — what the /cost chart fetches on zoom and overlay"""
     return timeline(samples_between(_home_path(home), since=since, until=until))
 
 
