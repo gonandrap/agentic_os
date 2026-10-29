@@ -39,7 +39,7 @@ WINDOW_SECONDS = 7 * 86400
 PRECISION_WINDOW_SECONDS = 28 * 86400
 #: A detector is judged on at least this many dispatched orders before it can be throttled
 PRECISION_MIN_SAMPLES = 5
-#: Below this much evolution room an order is queued, not dispatched with scraps: measured floor for a one-pass order (#1305)
+#: Measured floor for a one-pass order: less room queues, never dispatches scraps (#1305)
 MIN_ORDER_USD = 5.0
 
 #: Events on a work order that mean the USER engaged with it (§3.2 decision 2)
