@@ -11430,6 +11430,67 @@ def onboard_questions(area: str | None = None) -> dict[str, Any]:
     return {"areas": out}
 
 
+#: The persona `jarvis onboard start` runs as (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §5)
+GREETING_AGENT = "greeting_agent"
+
+
+def launch_argv(persona_root: Path, project_path: Path, prompt: str) -> list[str]:
+    """The interactive greeting session's argv — pure, so a test never execs `claude`"""
+    from . import claude_cli
+
+    return [claude_cli.claude_bin(), "--add-dir", str(persona_root),
+            "--add-dir", str(project_path), "--agent", GREETING_AGENT, prompt]
+
+
+def _onboard_prompt(name: str, project_path: Path, draft: Path, adopted: bool,
+                    unanswered: list[str]) -> str:
+    rerun = (f"{name} is already in the catalog: the draft is pre-filled from its live "
+             f"settings, so this interview revises them.\n" if adopted else "")
+    return (
+        f"Onboard {name} at {project_path}.\n{rerun}"
+        f"Draft: {draft}\n"
+        f"Areas still unanswered: {', '.join(unanswered) or 'none'}\n"
+        f"Commands:\n"
+        f"  jarvis onboard questions [--area a] [--json]\n"
+        f"  jarvis onboard explain <area|path> [--project p]\n"
+        f"  jarvis onboard apply --from {draft} --dry-run\n"
+        f"  jarvis onboard apply --from {draft}\n"
+        f"Start with the first unanswered area.")
+
+
+def onboard_session(path: str | Path, name: str | None = None, *,
+                    catalog_path: str | None = None) -> dict[str, Any]:
+    """Everything `jarvis onboard start` launches with; runs nothing (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §5)"""
+    from . import bootstrap, interview, onboard_knobs, onboard_prose, paths
+
+    project_path = Path(path).expanduser().resolve()
+    if not (project_path / ".git").exists():
+        raise OpsError(f"not a git repository: {project_path} — run `git init` there "
+                       f"first, then onboard it")
+    name = name or project_path.name
+    document = _read_document(_catalog_file(catalog_path))
+    adopted = any(isinstance(p, dict) and p.get("name") == name
+                  for p in document.get("projects", []))
+    if adopted:
+        current = config_show(name, catalog_path=catalog_path)["resolved"]
+        draft = interview.new_draft(project_path, name, current,
+                                    areas=onboard_prose.AREAS, document=document)
+    else:
+        draft = interview.new_draft(project_path, name)
+    draft_path = interview.draft_file(name)
+    answered = {a.get("area") for a in draft.answers}
+    unanswered = [k for k in onboard_knobs.AREA_KEYS if k not in answered]
+    persona_root = bootstrap._rebuild(bootstrap.ASSETS / "greeting-agent",
+                                      paths.onboarding_dir() / "agent", "agents")
+    prompt = _onboard_prompt(name, project_path, draft_path, adopted, unanswered)
+    return {"project": name, "path": str(project_path), "adopted": adopted,
+            "draft": str(draft_path), "unanswered": unanswered,
+            "persona_root": str(persona_root),
+            # Not the project: its workspace trust is written only by the bootstrap, after
+            "cwd": str(paths.jarvis_home()),
+            "prompt": prompt, "argv": launch_argv(persona_root, project_path, prompt)}
+
+
 def wiring_config(project: str | None = None,
                   catalog_path: str | None = None) -> Any:
     """The `WiringConfig` a scope runs under — a project's, or the fleet's base"""
