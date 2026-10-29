@@ -1478,19 +1478,32 @@ def test_an_unstamped_turn_is_dispatched_because_unknown_is_not_a_licence(
     assert elsewhere.dispatched == 900_000 and elsewhere.deliberate == 0
 
 
-def test_a_foreign_write_is_untouched_by_any_arm(write_transcript):
-    """A person's own `claude` is not an arm"""
+@pytest.mark.parametrize(("arm", "split"), [
+    ("1h", (0, 900_000, 0)), ("5m", (0, 0, 900_000))])
+def test_a_typed_prompt_inside_a_stamped_turn_is_jarvis_s(write_transcript, arm, split):
+    """A `claude --bg` worker's prompts read "typed": the record decides, not promptSource (wo-10a5f151)"""
+    write_transcript("bg-worker", [
+        prompt_row(0, "Your full instructions for this turn are in …", sdk=False),
+        assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
+    ])
+
+    (entry,) = inspection.one_hour_writes(ALL_OF_IT, arms=_arms("bg-worker", arm))
+
+    assert (entry.foreign, entry.deliberate, entry.dispatched) == split
+
+
+def test_a_foreign_write_raises_nothing(write_transcript):
+    """A person's own `claude`, outside every stamped turn, is counted and never alarmed on"""
     write_transcript("typed", [
         prompt_row(0, "have a look", sdk=False),
         assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
     ])
 
-    (entry,) = inspection.one_hour_writes(ALL_OF_IT, arms=_arms("typed", "1h"))
+    (entry,) = inspection.one_hour_writes(
+        ALL_OF_IT, arms=_arms("typed", "1h", start=5_000, end=6_000))
 
     assert (entry.foreign, entry.deliberate, entry.dispatched) == (900_000, 0, 0)
-    (alarm,) = inspection.hour_alarms([entry], InspectConfig(), days=7)
-    assert alarm.kind == inspection.CACHE_1H_FOREIGN_ALARM
-    assert inspection.REMEDY_LINE in alarm.reason
+    assert inspection.hour_alarms([entry], InspectConfig(), days=7) == []
 
 
 def test_the_breach_alarm_names_the_arm_it_is_about_and_the_hour_bought_on_purpose():

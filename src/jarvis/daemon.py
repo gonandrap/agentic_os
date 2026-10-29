@@ -565,8 +565,6 @@ REWRITE_INBOX_TITLE = {
 CACHE_1H_INBOX_TITLE = {
     inspection.CACHE_1H_DISPATCHED_ALARM:
         "Jarvis's OWN turns are buying the one-hour cache write — a transport defect",
-    inspection.CACHE_1H_FOREIGN_ALARM:
-        "Hand-opened Claude sessions are buying the one-hour cache write",
     inspection.CACHE_ARM_MISSED_ALARM:
         "A cache-TTL arm is not reaching the CLI — stamped turns paid the other rate",
 }
