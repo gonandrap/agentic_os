@@ -16,7 +16,16 @@ from typing import Any, Sequence
 
 import pytest
 
-from . import agent_usage, keychain, paths, release, service_manager, systemd_units, usage
+from . import (
+    agent_usage,
+    keychain,
+    paths,
+    release,
+    service_manager,
+    systemd_units,
+    transcript_cache,
+    usage,
+)
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -2273,6 +2282,8 @@ def jarvis_home(tmp_path, monkeypatch):
     transcripts = tmp_path / "claude-projects"
     transcripts.mkdir(exist_ok=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(transcripts))
+    # The parsed-transcript cache follows the home too, and it is process-global
+    transcript_cache.reset()
     # Host libsqlite3 must not decide whether doctor is green (INV-SQLITE-VERSION)
     import sqlite3
     monkeypatch.setattr(sqlite3, "sqlite_version", "3.51.2")
@@ -2548,6 +2559,21 @@ def commit(repo: Path, message: str, *paths: str) -> None:
     subprocess.run(["git", "-C", str(repo), "add", "--", *paths], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
                     "commit", "-qm", message], check=True)
+
+
+#: `CostCache.start` names its threads this; kept as text because importing the UI needs fastapi
+COST_THREAD_NAME = "jarvis-ui-cost"
+
+
+@pytest.fixture(autouse=True)
+def no_stray_cost_threads():
+    """A detached /cost compute outliving its test would scan the REAL transcripts"""
+    import threading
+
+    yield
+    for thread in threading.enumerate():
+        if thread.name == COST_THREAD_NAME:
+            thread.join(30)
 
 
 @pytest.fixture(autouse=True)

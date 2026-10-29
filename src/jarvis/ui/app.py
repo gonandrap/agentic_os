@@ -17,7 +17,19 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, db, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
+from .. import (
+    bill,
+    db,
+    fleet,
+    fleetcost,
+    github,
+    invariants,
+    ops,
+    specs,
+    transcript_cache,
+    uilog,
+    wiring,
+)
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -484,8 +496,8 @@ def _cost_payloads(picked: dict, project: str) -> dict:
 
 REFRESH_SECONDS = 60
 
-#: How long a request waits for an on-demand compute before it renders `computing.html`
-WAIT_SECONDS = 5
+#: How long startup may spend on round one before it gives up and serves anyway (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)
+FIRST_ROUND_SECONDS = 30
 
 #: On-demand entries kept, and computes allowed to run at once
 MAX_ON_DEMAND = 8
@@ -502,6 +514,7 @@ class CostCache:
         self.computing: dict[tuple, threading.Event] = {}
         self.failures: dict[tuple, str] = {}
         self._lock = threading.Lock()
+        self._threads: set[threading.Thread] = set()
 
     def compute(self, name: str) -> dict:
         picked = ops.cost_window(window=name)
@@ -516,8 +529,11 @@ class CostCache:
 
     @staticmethod
     def key(picked: dict, project: str) -> tuple:
-        """The bounds and the scope: the only inputs the payloads depend on"""
-        return (project, picked["since"], picked["until"])
+        """The scope and the bounds, an open-ended `until` bucketed because it IS now (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)"""
+        until = picked["until"]
+        if picked.get("open_ended"):
+            until = ("now", int(until // REFRESH_SECONDS))
+        return (project, picked["since"], until)
 
     def _compute_on_demand(self, key: tuple, picked: dict, project: str) -> None:
         try:
@@ -537,22 +553,34 @@ class CostCache:
         finally:
             with self._lock:
                 event = self.computing.pop(key, None)
+                self._threads.discard(threading.current_thread())
             if event is not None:
                 event.set()
 
-    def start(self, key: tuple, picked: dict, project: str) -> threading.Event | None:
-        """The compute for one window, in its own thread; None when too many run already"""
+    def start(self, key: tuple, picked: dict, project: str) -> None:
+        """The compute for one window, in its own thread; nothing when too many run already"""
         with self._lock:
-            running = self.computing.get(key)
-            if running is not None:
-                return running
-            if len(self.computing) >= MAX_COMPUTING:
-                return None
-            event = self.computing[key] = threading.Event()
+            if key in self.computing or len(self.computing) >= MAX_COMPUTING:
+                return
+            self.computing[key] = threading.Event()
         # A plain thread, NOT the anyio pool: it must not borrow the token a page needs
-        threading.Thread(target=self._compute_on_demand, args=(key, picked, project),
-                         name="jarvis-ui-cost", daemon=True).start()
-        return event
+        thread = threading.Thread(target=self._compute_on_demand,
+                                  args=(key, picked, project),
+                                  name="jarvis-ui-cost", daemon=True)
+        with self._lock:
+            self._threads.add(thread)
+        thread.start()
+
+    def quiesce(self, timeout: float = 10.0) -> None:
+        """Wait out the detached computes, so shutdown cannot strand one mid-query"""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                alive = [t for t in self._threads if t.is_alive()]
+            left = deadline - time.monotonic()
+            if not alive or left <= 0:
+                return
+            alive[0].join(left)
 
     def serve(self, picked: dict, project: str) -> dict | None:
         """One window's payloads, or None while they are still being computed"""
@@ -560,18 +588,16 @@ class CostCache:
         entry = self.on_demand.get(key)
         if entry is not None and time.time() - entry["computed_at"] < REFRESH_SECONDS:
             return entry
-        event = self.start(key, picked, project)
+        self.start(key, picked, project)
         if entry is not None:
             # Stale, and served as it is: the page already says how old it is
             return entry
-        if event is not None:
-            event.wait(WAIT_SECONDS)
-        entry = self.on_demand.get(key)
-        if entry is None and self.failures.get(key):
+        # No wait at all: the request path never holds for an aggregation (docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md)
+        if self.failures.get(key):
             raise ops.OpsError(f"the cost report for {picked['label']} could not be "
                                f"computed — {self.failures[key]}. The traceback is in "
                                f"{uilog.ui_log_path()}.")
-        return entry
+        return None
 
     async def refresh(self) -> None:
         """One round over every named window; a failure keeps the last good entry"""
@@ -582,13 +608,19 @@ class CostCache:
                 self.entries[name] = await anyio.to_thread.run_sync(self.compute, name)
             except Exception as e:                      # noqa: BLE001
                 uilog.record_error("TASK", f"cost/cache/{name}", e)
+        try:
+            # The ONLY writer of the file, so a `jarvis cost` run can never lose entries
+            await anyio.to_thread.run_sync(transcript_cache.save)
+        except Exception as e:                          # noqa: BLE001
+            uilog.record_error("TASK", "cost/cache/save", e)
 
     async def run(self) -> None:
         import anyio
 
         while True:
-            await self.refresh()
+            # Round one is `lifespan`'s, before it yields; this loop only keeps it fresh
             await anyio.sleep(REFRESH_SECONDS)
+            await self.refresh()
 
 
 def _stale_link_hint(name: str, wo_id: str) -> str:
@@ -995,11 +1027,16 @@ def create_app() -> FastAPI:
         watchdog.start()
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
+            # Round one before the first request, bounded (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)
+            with anyio.move_on_after(FIRST_ROUND_SECONDS):
+                await cost_cache.refresh()
             tg.start_soon(cost_cache.run)
             try:
                 yield
             finally:
                 watchdog.stop()
+                # Before the loop goes: a strand holds a SQLite read nobody will close
+                cost_cache.quiesce()
                 tg.cancel_scope.cancel()
 
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -1573,6 +1610,11 @@ def create_app() -> FastAPI:
                                      offset=_offset_param(offset), tz=tz or None,
                                      since=_in_zone(since, zone) if since else None,
                                      until=_in_zone(until, zone) if until else None)
+            # Checked here because the aggregation that refuses a typo no longer runs on the request path
+            known = ops.registered_project_paths()
+            if project and project not in known:
+                raise ops.OpsError(
+                    f"project {project!r} not registered (known: {sorted(known)})")
             # docs/superpowers/specs/2026-10-22-cost-tab-precompute.md §Matching rule
             entry = None
             if (not project and offset in ("", "0") and not since and not until
@@ -1585,7 +1627,8 @@ def create_app() -> FastAPI:
                 entry = cost_cache.serve(picked, project)
                 if entry is None:
                     return render(request, "computing.html", active="cost",
-                                  window=picked)
+                                  window=picked,
+                                  parsed=transcript_cache.stats()["files"])
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
         report, fleet, meter = entry["report"], entry["fleet"], entry["meter"]

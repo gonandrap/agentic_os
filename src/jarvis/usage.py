@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
+
+from jarvis import transcript_cache
 
 TRANSCRIPT_ROOT_ENV = "JARVIS_TRANSCRIPT_ROOT"
 
@@ -393,6 +395,12 @@ def parse_stamp(stamp: Any) -> float:
 
 def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
     """The assistant messages in one transcript, deduped by message id"""
+    return transcript_cache.product(path, "messages",
+                                    lambda: _read_assistant_messages(path))
+
+
+def _read_assistant_messages(path: Path | str) -> list[dict[str, Any]]:
+    """The uncached walk; every caller goes through `_assistant_messages`"""
     by_id: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     # The pre-filter: a row with no `usage` key cannot carry token counts
@@ -616,6 +624,12 @@ def window_envelope(session_id: str, since: float, until: float, *, schema: int,
 
 def compactions_in(path: Path | str) -> list[dict[str, Any]]:
     """Every compaction in one transcript, oldest first, with what it did"""
+    return transcript_cache.product(path, "compactions",
+                                    lambda: _read_compactions(path))
+
+
+def _read_compactions(path: Path | str) -> list[dict[str, Any]]:
+    """The uncached walk; every caller goes through `compactions_in`"""
     found = []
     for row in rows(path, '"compact_boundary"'):
         if row.get("type") != "system" or row.get("subtype") != "compact_boundary":
@@ -840,6 +854,17 @@ def tool_results(path: Path | str, *, chars_per_token: float = 4.0,
     """Every tool call in one transcript, paired with its result and sized"""
     if chars_per_token <= 0:
         raise ValueError("chars_per_token must be > 0")
+    saved = transcript_cache.product(
+        path, f"tools@{chars_per_token:g}",
+        lambda: [asdict(r) for r in _read_tool_results(
+            path, chars_per_token=chars_per_token)])
+    # Rebuilt per call: `_size_group` mutates these, and the cache must not see it
+    return [ToolResult(**row) for row in saved]
+
+
+def _read_tool_results(path: Path | str, *, chars_per_token: float,
+                       ) -> list[ToolResult]:
+    """The uncached walk; every caller goes through `tool_results`"""
     path = Path(path)
     caller = CALLER_SUBAGENT if path.parent.name == "subagents" else CALLER_MAIN
     found: list[ToolResult] = []
