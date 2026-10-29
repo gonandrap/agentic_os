@@ -1,9 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Steward — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 760px;">
 
 {# docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md, "The queue drains".
    Read-only: the counts and rows are `ops.steward_queue_report`'s, the same the CLI prints. #}
@@ -75,7 +72,5 @@
 <h2 id="settled">Re-offered and expired</h2>
 <div class="panel" id="steward-settled">
   {{ rows(report.settled, "nothing re-offered or expired yet") }}
-</div>
-
 </div>
 {% endblock %}
