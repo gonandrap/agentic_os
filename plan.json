@@ -1,72 +1,50 @@
 {
-  "summary": "Every convertible test runs on a controlled clock via db.now(), and the hygiene guard's exemption set holds only the reviewed class-3 spin-waits and class-4 kernel/subprocess stamps, each with its reason recorded beside the code.",
-  "design_doc": "docs/superpowers/specs/2026-10-15-burn-down-the-clock-hygiene-allowlist.md",
+  "summary": "`jarvis offboard <name>` takes a project out of the OS: archive by default (history kept and searchable, re-adoptable) or `--purge --yes`, cancelling its orders, rewriting the catalog, stripping the OS's files from its repo, and dropping it from the running daemon without a restart.",
+  "design_doc": "docs/superpowers/specs/2026-10-28-offboard-a-project.md",
   "children": [
     {
-      "key": "clock-fixture",
-      "title": "One shared clock fixture for tests, seeded from a constant epoch",
-      "spec_section": "1 — The shared clock fixture",
-      "description": "Four later work orders wait on your merge, so stay small. Do NOT migrate the four other ad-hoc patchers — _Clock and _MovedNow in tests/test_health_sweep.py, _rewind in tests/test_parked_work.py, the clock fixture in tests/test_evolution_report.py. A sibling owns those three files. tests/test_scheduler.py is your end-to-end proof, not a migration project: one site, one fixture. You are the only work order permitted to edit src/jarvis/testing.py, and every sibling is told to report an insufficient fixture rather than extend it — so the four modes have to be right here.",
-      "acceptance": "tests/test_clock_fixture.py asserts all six properties in section 1 against literals and passes; tests/test_scheduler.py passes with its local _Clock deleted; tests/test_isolation_gate.py still passes. Mutation check quoted in the PR: seeding the fixture from time.time() makes the constant-epoch test fail. No file under src/jarvis/ except testing.py is modified, and the knowledge entry's kn-id is in the PR body.",
-      "needs": []
+      "key": "registry",
+      "title": "Make every active-only surface archived-aware",
+      "spec_section": "2",
+      "description": "You add the readers; nobody else may. Write no deletes to central_store or neo_store — sibling `purge` owns those, and you both edit central_store.py around the projects registry, so keep your diff to the new ARCHIVED constant. Do not touch bootstrap.py (`strip`), daemon.py (`daemon`) or add any CLI verb or doc (`offboard`). Nothing yet sets status='archived'; stage it in your tests with set_project_status. Done when an archived project is gone from every active-only surface and still readable through jarvis search and the dashboard, with no existing caller's meaning changed.",
+      "acceptance": "New file tests/test_offboard_registry.py plus additions to tests/test_search.py and tests/test_ui.py. inspect.signature pins the keyword-only `include_archived` default False, and the call writes nothing. With the project active, both call forms return the same dict. project_name_for_path still resolves after archiving. GET /project/proj_a and GET /fo/proj_a/<id> return 200 after archiving and say `archived`; nav_projects omits it; one POST is refused; run_doctor()['os'] shows no INV-UI-HEALTHY violation."
     },
     {
-      "key": "exemptions",
-      "title": "Record class 3 and class 4 on the guard's exemption surface",
-      "spec_section": "2 — The exemption mechanism, and the two exempt classes",
-      "description": "You change no production code under src/jarvis/ and convert nothing that is exempt. You do NOT own tests/test_health_sweep.py or tests/test_feature_validation.py even though both carry class-3 spin-waits: two siblings own those files and mark their own sites, because no test file belongs to two work orders. You ARE the only work order that may touch the mechanism, including widening the reason regex to admit class 4 — a sibling waits on that spelling and must not coin a second. Six siblings delete entries from the shape you settle, in parallel, so never end a turn with it half-converted.",
-      "acceptance": "Every exempt site carries a file-specific reason, and the PR quotes the time.monotonic() or time.sleep( line each class-3 mark sits on — a mark with no spin-wait on the quoted line is wrong. `rg -o -N 'clock-exempt:.*' tests/ | sort | uniq -d` prints nothing. The ten pure class-3 files show a comment-only diff. The reason check accepts class 4 and still refuses class 2, with a test for each. Non-exempt sites in your files are converted. Targeted tests for all 15 files pass.",
-      "needs": []
+      "key": "purge",
+      "title": "Delete every trace of a project from os.db and neo.db",
+      "spec_section": "3",
+      "description": "Two functions and their tests, nothing else. No caller exists yet and you do not add one — sibling `offboard` calls you. Do not add the archived status or change any reader (sibling `registry`, which edits the same region of central_store.py: keep your diff to the new methods). Do not touch the per-project database at <project>/.jarvis/jarvis.db or anything in the repo — `strip` removes that directory. A `project` column does NOT mean the row belongs to the project: never DELETE from gate_rules or detectors, which are fleet-wide. Read the section before writing any DELETE.",
+      "acceptance": "A `purge_project` block in tests/test_stores.py. Never deletes from gate_rules or detectors: a gate rule recorded with proj_a provenance still blocks the same command for proj_b after purge_project('proj_a'), with its project now ''; a detector at project='' is untouched and still fires; one naming proj_a is retracted via retract_detector with a reason, never blanked. The pinning test names BOTH lists — nine scope tables, two provenance tables — and their union equals the eleven carrying a project column today, failing with a message saying a new table must be classified before purge touches it; PROVENANCE_TABLES is an explicit constant, not an omission. Seed one row per table through the stores' own writers for proj_a AND proj_b, purge proj_a, assert every proj_b row survives — no hand-written SQL. After purging a knowledge row, search finds nothing and raises nothing. inspect.signature shows no dry_run parameter. An unknown name returns all zeros. tests/test_wo_hide_delete.py stays green."
     },
     {
-      "key": "hand-rolled-clocks",
-      "title": "Migrate the four hand-rolled clocks onto the shared fixture",
-      "spec_section": "3 — The files that already hand-rolled a clock",
-      "description": "Your files: tests/test_health_sweep.py, tests/test_parked_work.py, tests/test_evolution_report.py. The shared fixture already exists in src/jarvis/testing.py — a sibling landed it and you must not edit that file; if the fixture cannot do what a test needs, say so in your PR rather than extending it. Its advance() takes SECONDS, which is why every minutes= caller in tests/test_health_sweep.py is yours to rewrite. You also mark the class-3 spin-waits at tests/test_health_sweep.py:120-122: the work order that defines class 3 does not own this file, you do.",
-      "acceptance": "_Clock, the clock fixture, _MovedNow and _rewind are gone and nothing re-implements them; no `jarvis.db.now =` direct assignment survives; no advance() caller passes minutes. Both mutations in section 3 are quoted in the PR: frozen-instead-of-ticking makes a STALE_FINISH_BLOCKER test fail, and advance(1) makes the first-look tests fail. Targeted tests for all three files pass with the collected count unchanged.",
-      "needs": [
-        "clock-fixture"
-      ]
+      "key": "strip",
+      "title": "Take the OS's files back out of a project's repo",
+      "spec_section": "4",
+      "description": "bootstrap.py only. No caller exists yet and you do not add one — sibling `offboard` calls you. Do not touch central_store, neo_store (siblings `registry` and `purge`), daemon.py (`daemon`) or the CLI. Reuse settings_drift, _tree_matches, tracked_in_vcs and ensure_trust's temp-file write rather than reimplementing any of them, and return BootstrapReport with the same dry_run note convention bootstrap_project already has. Done when a repo offboarded twice reports 'already absent' and still holds every file its owner edited.",
+      "acceptance": "Added to tests/test_bootstrap.py, reusing its spec() helper and _commit_all(); invert test_settings_backup_and_drift and test_a_committed_operation_md_is_never_overwritten. Restores .pre-jarvis and deletes the backup. For a hand-edited settings.json, a committed OPERATION.md and a modified skill tree: bytes unchanged AND report.warnings names it. README.md never removed. The trust entry goes while sibling and top-level keys in ~/.claude.json survive; a malformed one warns and raises nothing. purge=True also removes .jarvis/ and the .gitignore line. dry_run=True with purge=True leaves every st_mtime_ns unchanged — assert this here, nobody else can."
     },
     {
-      "key": "backdating-bulk",
-      "title": "Convert bulk fixture stamp construction to db.now()",
-      "spec_section": "4 — Bulk stamp construction: no production change",
-      "description": "The cheapest group in the feature: the production code behind every one of your sites already reads db.now(), so you change NO file under src/jarvis/. If you find yourself needing to, the site belongs to a sibling — report it instead of reaching across. tests/test_uncollected_task_block.py looks like it belongs to you and does not: its sites are class 4 and another work order owns that file. You have no dependency and start at once: a sibling lands a shared clock fixture in src/jarvis/testing.py, and you must neither use it nor edit that file.",
-      "acceptance": "The token-only diff command in section 4.1 prints nothing — every changed line differs from main only in the clock call. `git diff --name-only origin/main | rg '^src/'` prints nothing, and so does `git diff origin/main -- tests/ | rg '^\\+.*clock'`. The residual-site scan over all ten files prints nothing. Targeted tests pass with per-file collected counts unchanged.",
-      "needs": []
+      "key": "quiesce",
+      "title": "Stop every order and session a project has in flight",
+      "spec_section": "5",
+      "description": "One ops function plus the central_store methods it needs, which belong beside the backlog and inbox methods, nowhere near the projects registry siblings `registry` and `purge` edit in the same file. No caller exists yet and you add none, and no CLI flag — sibling `offboard` owns the --force deciding whether you write. Reuse ops.cancel and the three cancel_*_order functions; never kill a process. Do not touch bootstrap.py (`strip`) or daemon.py (`daemon`). Queued Morpheus items and unanswered Neo questions are deliberately NOT yours — `daemon` ignores those rather than cancelling them.",
+      "acceptance": "New file tests/test_quiesce.py. Reporting and writing are one function behind a parameter, so section 7's refusal and its --force path cannot disagree: the read-only form leaves a pending order still `pending`. Assert the open set against project_store.OPEN_STATUSES itself, never a literal list, and include a waiting_pr_merge case. A work order, feature order, improvement order and investigation each appear with the right kind and id; cancelling settles all four, children before parents, each with the reason on its record. A seeded queued morpheus_items row and an unanswered neo.db question are still there, untouched."
     },
     {
-      "key": "usage-limits",
-      "title": "Convert the usage-window group and its rate-limit fallback",
-      "spec_section": "5 — Usage limits, rate-limit holds, the fleet brake",
-      "description": "src/jarvis/daemon.py:3416 and :4111 are yours rather than a sibling's only so that two parallel work orders never edit that file near each other — they are the same RATE_LIMIT_FALLBACK_DELAY expression as your other two production sites, so the subject still fits. Do not touch src/jarvis/fleet.py, claude_cli.parse_limit or worker_session.Pause.due: all three already take an instant and are correct. The holds module's wall-clock defaults look like yours and belong to a sibling. Do not edit src/jarvis/testing.py; a sibling owns the shared clock fixture.",
-      "acceptance": "All four production fallbacks read db.now(). Reset times are asserted as exact values against TEST_EPOCH plus the named constant, not as inequalities — the mutation in section 5 (dropping the delay) must make a test go red, quoted in the PR. Targeted tests pass three times: as-is, under TZ=UTC, and under TZ=America/Los_Angeles. tests/test_neo.py and tests/test_supervisor.py reported green.",
-      "needs": [
-        "clock-fixture"
-      ]
+      "key": "daemon",
+      "title": "Evict an offboarded project from the running fleet",
+      "spec_section": "6",
+      "needs": ["registry"],
+      "description": "The hardest piece and the one the feature fails without. You consume ops.registered_project_paths's include_archived parameter, which `registry` ships; you do not change its signature. Do not add ops.offboard_project or the CLI verb (sibling `offboard`), the store deletes (`purge`) or the repo strip (`strip`). Catalog.without_projects lives in catalog.py, which is a stdlib-only leaf and may not read a database — the daemon passes the names in. Daemon.catalog stays a plain attribute; a re-reading property breaks Fleet.reconfigure and the tests that assign it in memory.",
+      "acceptance": "New file tests/test_offboard_live.py. Build the Daemon BEFORE the offboard and prove the precondition with a tick that dispatches — built after, the stamp seeded in __init__ short-circuits the reload and the test passes having reloaded nothing. Then one tick, asserting together: the project gone from daemon.catalog.projects, an unrelated setting from the same catalog write landed, and no `a catalog change was NOT applied` inbox row. A genuinely new project still refuses, word for word. The five uncovered paths each get their own test. INV-OFFBOARDED-ACTIVITY fires for each of its six sources ONLY for a project with no projects row, repairing nothing — and a clean archive (offboard with no --purge, after quiesce) yields ZERO violations even with a non-terminal morpheus_items row, an unanswered Neo question and an armed detector naming it still in place, all three left by design. Without that case the default mode leaves jarvis doctor permanently red. `jarvis start --catalog` re-bootstraps nothing — and not under live_daemon."
     },
     {
-      "key": "one-instant-per-answer",
-      "title": "One instant per answer: the two signatures and the nine wall-clock defaults",
-      "spec_section": "6 — One instant per answer: the two signatures and the nine defaults",
-      "description": "The only work order in this feature that changes a signature, and neither new parameter may be required. You are the sole owner of src/jarvis/invariants.py and src/jarvis/ops.py here; your only line in src/jarvis/daemon.py is :2271, and siblings hold that file's other clusters. Those two are the files most likely to be under concurrent edit on another branch, so re-derive waiting_on's call sites when you start rather than trusting your section's list. tests/test_feature_validation.py is yours including its class-3 spin-waits: the work order defining class 3 does not own that file.",
-      "acceptance": "Both signatures print `now: float | None = None`, and check_messages_are_delivered is still callable as fn(store). The nine defaults and invariants.py:1996 read db.now(); health.py:177-181 is rewritten in the same PR. The mutation in section 6.5 — reverting the forwarding at invariants.py:1617 — must make tests/test_message_stuck.py go red, quoted in the PR. The five regression files are run and reported green, not edited.",
-      "needs": [
-        "clock-fixture"
-      ]
-    },
-    {
-      "key": "display-and-release",
-      "title": "Convert display ages, log windows and the release staging marker",
-      "spec_section": "7 — Display ages, logs, and release staging",
-      "description": "src/jarvis/uilog.py's five lines are one unit and so are src/jarvis/wiring.py's four: converting a subset of either is worse than converting none, and your section says why. Leave src/jarvis/release.py:264 and ui/app.py:348/:470 alone and add the comment saying why — they are exempt, not overlooked. Your src/jarvis/daemon.py lines (:5209 and the base-health sites near :7051) are thousands of lines from any sibling's, so do not range outside them. Two siblings have already merged: do not edit src/jarvis/testing.py, and reuse the merged class-4 reason spelling rather than coining one.",
-      "acceptance": "rg over src/jarvis/uilog.py and src/jarvis/wiring.py for time.time() and time.localtime() prints nothing — both files move as a unit. A new frozen-clock boundary test proves a row at cutoff-1s is excluded and cutoff+1s included, and the section 7.1 mutation (writer reverted, reader converted) makes it go red, quoted in the PR. release.py:264 and ui/app.py:348/:470 unchanged with comments. tests/test_release_staging.py:593 and :606 carry a class-4 mark quoting the shell `date +%s` they compare against, and its 13 other sites are converted. Targeted tests pass under all three TZ settings.",
-      "needs": [
-        "clock-fixture",
-        "exemptions"
-      ]
+      "key": "offboard",
+      "title": "Ship the jarvis offboard command",
+      "spec_section": "7",
+      "needs": ["registry", "purge", "strip", "quiesce"],
+      "description": "The join: you call what your four dependencies shipped — ops.quiesce_project, CentralStore/NeoStore.purge_project, bootstrap.unbootstrap_project, registered_project_paths(include_archived=True) — and you are the only child that writes the catalog file or adds a CLI verb. Do not reimplement any of them, do not change their signatures, and do not touch daemon.py (sibling `daemon` owns the live fleet; your catalog rewrite is what its reload_catalog change is for). The nine steps are ordered for safety: quiesce before strip, strip before purge. You ship the documentation too.",
+      "acceptance": "New file tests/test_offboard.py; clear JARVIS_WO_ID or every test fails on the worker refusal. The nine steps run in the section's order, asserted: make the strip fail and the registry and catalog must still have moved together; monkeypatch both and the strip must follow quiesce. --dry-run proven by recorders on all five writers, every one empty — not by a filesystem snapshot, which passes when a dependency ignores its own dry_run. Refusal names the order's id, its status and --force, and nothing moved. After purge, search finds nothing. INV-CONFIG-DRIFT clean afterwards. OS-owning project refused for all four flag combinations, with schedule.os_project asserted as a precondition. Two documentation artifacts ship here too, both specified in the same section 7: a new operator doc docs/os/operator/projects.md covering adopt, offboard, archive versus purge and what each leaves behind, listed in the 'Operating the OS' list of docs/os/index.md; and ONE line in the CLAUDE.md crib sheet directly under `jarvis adopt <path>` — one line, never a section, or the 14 routing scenarios in evals/llm/test_jarvis_judgment.py regress. Tests assert all three exist."
     }
-  ],
-  "justification": "Seven children, under the cap of eight. Six were possible but would have put the shared clock fixture in the same work order as the 2300-line test file whose every clock.advance() caller it rewrites — and four children wait on that fixture's merge, so the gating child had to be the smallest, not the largest. The remaining six are cut by production surface so that no two touch one file: invariants.py and ops.py have a single owner, and daemon.py's three clusters are thousands of lines apart. Fewer children would mean one worker owning both src/jarvis/invariants.py and src/jarvis/uilog.py, which are unrelated subjects with unrelated false-green risks."
+  ]
 }
