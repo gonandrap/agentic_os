@@ -770,6 +770,13 @@ class CentralStore:
             (limit,))
         return [dict(r) for r in rows.fetchall()]
 
+    def steward_asks(self, since: float, limit: int = 50) -> list[dict[str, Any]]:
+        """The `ask` decisions since `since` that led to no order, newest first"""
+        rows = self.conn.execute(
+            "SELECT * FROM steward_decisions WHERE outcome='ask' AND wo_id='' AND applied=0 "
+            "AND duplicate_of=0 AND ts>=? ORDER BY ts DESC, id DESC LIMIT ?", (since, limit))
+        return [dict(r) for r in rows.fetchall()]
+
     def steward_queue_counts(self) -> dict[str, int]:
         """{queue_state: n} over every decision that was ever queued for a re-offer"""
         rows = self.conn.execute(

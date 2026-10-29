@@ -136,6 +136,13 @@
       <button title="after fixing what made it fail">↻ Check again</button>
     </form>
   </div>
+  <form method="post" action="/morpheus/{{ q.morpheus_item }}/confirm"
+        style="display:flex; gap:8px; margin-top:8px">
+    <input type="hidden" name="next" value="{{ back }}">
+    <input type="text" name="fix" required
+           placeholder="It is broken: what needs fixing… (files a work order)">
+    <button class="reject">✗ Broken — file fix</button>
+  </form>
   {% elif q.kind == 'findings' %}
   {# An improvement-order finding: the analyst has settled, and the decision is taken on
      the io. Same refusal in `ops.neo_answer_escalated`, same reason for this branch. #}
