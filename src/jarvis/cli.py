@@ -4108,7 +4108,8 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             print(_morpheus_line(item))
         return 0
     if args.morpheus_cmd == "show":
-        item = ops.morpheus_item(args.item_id)
+        detail = ops.morpheus_detail(args.item_id)
+        item = detail["item"]
         if args.json:
             _print(item, True)
             return 0
@@ -4125,6 +4126,17 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
         print(f"\nscript ({item['script_source'] or 'none yet'}):\n{item['script'] or '—'}")
         if item["last_output"]:
             print(f"\nlast output:\n{item['last_output']}")
+        print("\nruns:")
+        for r in detail["runs"][:10]:
+            print(f"  {_stamp(r['ts'])}  {r['kind']:<5}  exit {r['exit']}  {r['state_after']}")
+        if not detail["runs"]:
+            print("  (none recorded" + (" yet — history starts with this release)"
+                                        if item["checks"] else ")"))
+        if detail["questions"]:
+            print("\nquestions:")
+            for q in detail["questions"]:
+                print(f"  Q{q['id']} [{q['status']}] {q['question']}"
+                      + (f" — {q['answer']}" if q["answer"] else ""))
         return 0
     if args.morpheus_cmd == "enqueue-release":
         _print(ops.morpheus_enqueue_release(args.tag, args.from_ref, args.to_ref,

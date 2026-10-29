@@ -319,6 +319,19 @@ def test_failed_needs_two_exit_1_in_a_row(central, cfg, tmp_path):
     assert after["checks"] == 2
 
 
+def test_each_check_is_recorded_as_a_run_and_only_the_last_50_are_kept(central, cfg, tmp_path):
+    item = monitoring(central)
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH, run=_run(75))
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 3600, run=_run(0))
+    runs = central.morpheus_runs(item["id"])
+    assert [(r["exit"], r["kind"], r["state_after"], r["output"]) for r in runs] == [
+        (0, "check", "validated", "said 0"), (75, "check", "monitoring", "said 75")]
+    for n in range(60):
+        central.add_morpheus_run(item["id"], exit=75, output="", now=TEST_EPOCH + 7200 + n)
+    runs = central.morpheus_runs(item["id"], limit=1000)
+    assert len(runs) == 50 and runs[0]["ts"] == TEST_EPOCH + 7259
+
+
 def test_an_exit_1_the_next_check_does_not_repeat_is_not_a_failure(central, cfg, tmp_path):
     item = monitoring(central)
     for n, code in enumerate((1, 75, 1)):
@@ -493,6 +506,30 @@ def test_the_neo_question_is_a_validation_question_naming_the_item(central):
     assert morpheus.item_of_question(q) == item["id"]
     assert f"jarvis morpheus waive {item['id']}" in q["question"]
     assert '"action": "requeue"' in q["question"]
+
+
+def test_morpheus_detail_gathers_runs_questions_retries_and_handoff(central):
+    from jarvis import ops
+
+    item = queued(central)
+    other = queued(central, 8)
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
+    qid = morpheus._ask_neo(catalog(), central.morpheus_item(item["id"]), "")
+    morpheus._ask_neo(catalog(), central.morpheus_item(other["id"]), "")
+    central.claim_morpheus_action(item["id"], f"neo:{qid}")
+    detail = ops.morpheus_detail(item["id"])
+    assert set(detail) == {"item", "runs", "questions", "next_check_ts", "retries", "handoff"}
+    assert detail["runs"] == [] and detail["item"]["id"] == item["id"]
+    assert [(q["id"], q["kind"]) for q in detail["questions"]] == [(qid, "validation")]
+    assert set(detail["questions"][0]) == {"id", "status", "kind", "question", "answer", "ts"}
+    assert detail["retries"] == {"checks": 0, "auto_requeues": 0,
+                                 "max_auto_requeues": morpheus.MAX_AUTO_REQUEUES}
+    assert detail["handoff"] == {"kind": "neo", "ref": str(qid), "why": ""}
+    central.update_morpheus_item(other["id"], action="none:waived by the user")
+    assert ops.morpheus_detail(other["id"])["handoff"] == {
+        "kind": "none", "ref": "", "why": "waived by the user"}
+    with pytest.raises(ops.OpsError):
+        ops.morpheus_detail("mv-nope")
 
 
 def test_an_item_that_spent_its_requeue_is_not_offered_one(central):
@@ -1109,6 +1146,20 @@ def test_cli_status_and_script(central, tmp_path, capsys):
     rep = json.loads(capsys.readouterr().out)
     assert rep["counts"]["monitoring"] == 1 and rep["items"][0]["script"] == "exit 75"
     assert main(["morpheus", "show", "mv-nope"]) == 1
+
+
+def test_cli_show_lists_the_recorded_runs(central, capsys):
+    from jarvis.cli import main
+
+    item = queued(central)
+    central.update_morpheus_item(item["id"], checks=1)
+    assert main(["morpheus", "show", item["id"]]) == 0
+    assert "history starts with this release" in capsys.readouterr().out
+    central.add_morpheus_run(item["id"], exit=1, output="boom", kind="probe",
+                             state_after="failed")
+    assert main(["morpheus", "show", item["id"]]) == 0
+    out = capsys.readouterr().out.split("runs:")[1]
+    assert "probe" in out and "exit 1" in out and "failed" in out
 
 
 def test_the_dashboard_shows_a_link_not_the_pr_s_text(central):

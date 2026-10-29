@@ -14468,6 +14468,41 @@ def morpheus_item(item_id: str) -> dict[str, Any]:
     return item
 
 
+def morpheus_detail(item_id: str) -> dict[str, Any]:
+    """One item with its run history, Neo questions, retries and handoff (spec 2026-10-29 §3)"""
+    from . import morpheus
+    from .central_store import headline
+    from .neo_store import NeoStore
+
+    item = morpheus_item(item_id)
+    central = CentralStore()
+    try:
+        runs = central.morpheus_runs(item_id)
+    finally:
+        central.close()
+    neo = NeoStore()
+    try:
+        # No context filter in the store; questions about one item are few, the scan is cheap
+        asked = [q for q in neo.list_questions(limit=100_000)
+                 if morpheus.item_of_question(q) == item_id]
+    finally:
+        neo.close()
+    kind, _, rest = str(item.get("action") or "").partition(":")
+    return {
+        "item": item,
+        "runs": runs,
+        "questions": [{"id": q["id"], "status": q["status"], "kind": q["kind"],
+                       "question": headline(q["question"] or ""),
+                       "answer": headline(q["answer"] or ""), "ts": q["ts"]} for q in asked],
+        "next_check_ts": item.get("next_check_ts"),
+        "retries": {"checks": int(item.get("checks") or 0),
+                    "auto_requeues": int(item.get("auto_requeues") or 0),
+                    "max_auto_requeues": morpheus.MAX_AUTO_REQUEUES},
+        "handoff": {"kind": kind, "ref": "" if kind == "none" else rest,
+                    "why": rest if kind == "none" else ""},
+    }
+
+
 def morpheus_enqueue_release(tag: str, from_ref: str | None = None,
                              to_ref: str | None = None,
                              repo: str | None = None,
@@ -14548,6 +14583,8 @@ def morpheus_check(item_id: str) -> dict[str, Any]:
             return central.morpheus_item(item_id) or {}
         # A settled item is only probed: its state is the record and stays put
         result = morpheus.run_script(item["script"], cwd, cfg.script_timeout_seconds)
+        central.add_morpheus_run(item_id, exit=result.exit, output=result.output,
+                                 kind="probe", state_after=item["state"])
         return {**item, "probe_exit": result.exit, "probe_output": result.output}
     finally:
         central.close()
