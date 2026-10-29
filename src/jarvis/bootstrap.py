@@ -443,8 +443,8 @@ def bootstrap_project(project: ProjectSpec, force_config: bool = False,
 
 
 def _empty_after(d: Path, gone: set[Path]) -> bool:
-    """Whether `d` holds nothing once every path in `gone` is removed"""
-    return d.is_dir() and all(c in gone or _empty_after(c, gone) for c in d.iterdir())
+    """Whether `d` holds nothing but paths in `gone`; a kept empty child counts (issue 1330)"""
+    return d.is_dir() and all(c in gone for c in d.iterdir())
 
 
 def unbootstrap_project(project: ProjectSpec, *, purge: bool,

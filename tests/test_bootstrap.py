@@ -452,6 +452,21 @@ def test_unbootstrap_keeps_user_edits_and_is_idempotent(tmp_path, monkeypatch):
     assert any("OPERATION.md left in place" in w for w in second.warnings)
 
 
+def test_unbootstrap_keeps_claude_dir_holding_an_empty_user_dir(tmp_path, monkeypatch):
+    """Issue 1330: an empty .claude/worktrees/ the OS never wrote must not abort the strip"""
+    from jarvis.bootstrap import unbootstrap_project, workspace_trusted
+    from jarvis.testing import make_git_project
+    p = make_git_project(tmp_path, "worktrees")
+    monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(tmp_path / "claude.json"))
+    bootstrap_project(spec(p))
+    (p / ".claude" / "worktrees").mkdir()
+
+    report = unbootstrap_project(spec(p), purge=False, dry_run=False)
+    assert [x.name for x in (p / ".claude").iterdir()] == ["worktrees"]
+    assert "removed OPERATION.md" in report.actions
+    assert not (p / "OPERATION.md").exists() and workspace_trusted(p) is False
+
+
 def test_unbootstrap_purge_restores_backup_and_dry_run_writes_nothing(tmp_path, monkeypatch):
     from jarvis.bootstrap import unbootstrap_project
     from jarvis.testing import make_git_project
