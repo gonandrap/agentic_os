@@ -2732,7 +2732,8 @@ def cmd_search(args: argparse.Namespace) -> int:
     print("  ".join(f"{kind} {n}" for kind, n in search_mod.counts(hits)))
     for hit in hits:
         status = f" [{hit['status']}]" if hit["status"] else ""
-        print(f"\n{hit['kind']}  {hit['id']}  ({hit['project']}){status}  "
+        archived = ", archived" if hit["archived"] else ""
+        print(f"\n{hit['kind']}  {hit['id']}  ({hit['project']}{archived}){status}  "
               f"{_age(hit['ts'])}")
         print(f"  {hit['title']}")
         if hit["snippet"]:

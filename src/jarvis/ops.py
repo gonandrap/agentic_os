@@ -45,7 +45,8 @@ from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
-from .central_store import MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES, CentralStore
+from .central_store import (ARCHIVED, MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES,
+                            CentralStore)
 from .daemon import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
@@ -812,11 +813,13 @@ def _child_note(wo: dict[str, Any], parked: dict[str, str]) -> str:
     return f"{note} — {extra}" if extra and extra != wo["attention_reason"] else note
 
 
-def registered_project_paths() -> dict[str, Path]:
+def registered_project_paths(*, include_archived: bool = False) -> dict[str, Path]:
+    """Active projects; archived ones too only when asked — readable, never operable"""
+    wanted = ("active", ARCHIVED) if include_archived else ("active",)
     central = CentralStore()
     try:
         return {p["name"]: Path(p["path"]) for p in central.list_projects()
-                if p["status"] == "active"}
+                if p["status"] in wanted}
     finally:
         central.close()
 
@@ -969,10 +972,11 @@ def fleet_if_held(wos: Iterable[dict[str, Any]]) -> "fleet.Fleet | None":
         return None
 
 
-def find_work_order(wo_id: str, project_name: str | None = None
+def find_work_order(wo_id: str, project_name: str | None = None, *,
+                    include_archived: bool = False
                     ) -> tuple[str, Path, dict[str, Any]]:
     """Locate a work order across all registered projects"""
-    paths = registered_project_paths()
+    paths = registered_project_paths(include_archived=include_archived)
     # Guard before the lookup, not after: callers (the CLI
     if project_name and project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
@@ -6551,9 +6555,11 @@ def _spec_or_none(project_name: str) -> Any:
         return None
 
 
-def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
+def feature_order_budget(fo_id: str, project_name: str | None = None, *,
+                         include_archived: bool = False) -> dict[str, Any]:
     """A feature's family budget, what the family has spent, and what is unreserved"""
-    name, path, fo = find_feature_order(fo_id, project_name)
+    name, path, fo = find_feature_order(fo_id, project_name,
+                                        include_archived=include_archived)
     store = ProjectStore(path)
     central = CentralStore()
     try:
@@ -6581,10 +6587,11 @@ def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[st
             "children": children}
 
 
-def find_feature_order(fo_id: str, project_name: str | None = None
+def find_feature_order(fo_id: str, project_name: str | None = None, *,
+                       include_archived: bool = False
                        ) -> tuple[str, Path, dict[str, Any]]:
     """Locate a feature order across all registered projects"""
-    paths = registered_project_paths()
+    paths = registered_project_paths(include_archived=include_archived)
     if project_name and project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
                        f"(known: {sorted(paths)})")
@@ -8355,11 +8362,13 @@ def _verdict_filing_failed(name: str, path: Path, fo: dict[str, Any], inv_id: st
             "filing_error": error, "note": reason}
 
 
-def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
+def show_feature_order(fo_id: str, project_name: str | None = None, *,
+                       include_archived: bool = False) -> dict[str, Any]:
     """The feature order, its plan and its children — the tree, in one call"""
     from . import plans
 
-    name, path, fo = find_feature_order(fo_id, project_name)
+    name, path, fo = find_feature_order(fo_id, project_name,
+                                        include_archived=include_archived)
     # The verb for the kind the row ACTUALLY is: this is the surface an id of another kind reaches by... (#997)
     _require_kind(fo, "feature", show_verb(fo.get("kind")))
     store = ProjectStore(path)
@@ -8851,6 +8860,65 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
         cancel(wo_id)
     return {"project": name, "fo_id": fo_id, "title": fo["title"],
             "status": "cancelled", "cancelled_work_orders": stop_ids}
+
+
+OFFBOARDED_EVENT = "offboarded"
+
+
+def quiesce_project(name: str, apply: bool = False,
+                    reason: str = "project offboarded") -> dict[str, Any]:
+    """Report a project's open orders; `apply` cancels them (docs/superpowers/specs/2026-10-28-offboard-a-project.md §5)"""
+    paths = registered_project_paths()
+    if name not in paths:
+        raise OpsError(f"project {name!r} not registered (known: {sorted(paths)})")
+    store = ProjectStore(paths[name])
+    try:
+        wos = store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True, limit=-1)
+        fos = store.list_feature_orders(statuses=FO_OPEN_STATUSES, kind=None, limit=-1)
+    finally:
+        store.close()
+    open_ = [{"id": w["id"], "kind": "work_order", "status": w["status"],
+              "title": w["title"]} for w in wos]
+    open_ += [{"id": f["id"], "kind": f["kind"] or "feature", "status": f["status"],
+               "title": f["title"]} for f in fos]
+    out: dict[str, Any] = {"open": open_, "cancelled": [], "sessions_stopped": 0,
+                           "backlog_dropped": 0, "inbox_acked": 0, "reason": reason}
+    if not apply:
+        return out
+    cancellers = {"improvement": cancel_improvement_order,
+                  "investigation": cancel_investigation_order}
+    store = ProjectStore(paths[name])
+    try:
+        # Work orders first: a feature's manager and children stopped before the feature cannot re-dispatch
+        for w in wos:
+            try:
+                if store.get_work_order(w["id"])["status"] not in OPEN_STATUSES:
+                    continue  # settled since the listing
+            except KeyError:
+                continue
+            out["sessions_stopped"] += int(cancel(w["id"])["session_stopped"])
+            store.add_event(w["id"], OFFBOARDED_EVENT, {"reason": reason})
+            out["cancelled"].append(w["id"])
+        for f in fos:
+            try:
+                cancellers.get(f["kind"], cancel_feature_order)(f["id"], name)
+            except OpsError:
+                # Only a feature that settled once its children were cancelled is skipped
+                if store.get_feature_order(f["id"])["status"] not in FO_TERMINAL_STATUSES:
+                    raise
+                continue
+            out["cancelled"].append(f["id"])
+    finally:
+        store.close()
+    central = CentralStore()
+    try:
+        for item in central.list_backlog(name, "open"):
+            central.mark_backlog(item["id"], "dropped")
+            out["backlog_dropped"] += 1
+        out["inbox_acked"] = central.ack_project_inbox(name)
+    finally:
+        central.close()
+    return out
 
 
 #: The most of a `--fix` that becomes the corrective child's title
@@ -13777,9 +13845,11 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
 # -- budgets
 
 
-def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+def work_order_budget(wo_id: str, project_name: str | None = None, *,
+                      include_archived: bool = False) -> dict[str, Any]:
     """What this work order's ceiling is and what it has spent"""
-    name, path, wo = find_work_order(wo_id, project_name)
+    name, path, wo = find_work_order(wo_id, project_name,
+                                     include_archived=include_archived)
     store = ProjectStore(path)
     central = CentralStore()
     try:

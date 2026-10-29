@@ -14,6 +14,9 @@ from .paths import central_db_path, ensure_home
 #: How old a base-health reading may be before the merge pause stops acting on it (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2)
 BASE_HEALTH_FRESH_SECONDS = 900
 
+#: `projects.status` of an offboarded project whose history is kept (docs/superpowers/specs/2026-10-28-offboard-a-project.md §1.1)
+ARCHIVED = "archived"
+
 
 def base_health_key(project: str) -> str:
     """The `os_state` key holding one project's default-branch health"""
@@ -630,6 +633,9 @@ CREATE INDEX IF NOT EXISTS idx_steward_decisions_dedupe
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_queue ON steward_decisions(queue_state);
 """
 
+#: Tables whose `project` is provenance, not scope: purge clears or retracts, never deletes (docs/superpowers/specs/2026-10-28-offboard-a-project.md §3)
+PROVENANCE_TABLES = ("detectors", "gate_rules")
+
 
 class CentralStore:
     def __init__(self, path: Path | None = None):
@@ -838,6 +844,21 @@ class CentralStore:
         return {"inbox": inbox, "agent_calls": calls, "knowledge_reads": reads,
                 "backlog_reopened": backlog}
 
+    def purge_project(self, name: str) -> dict[str, int]:
+        """Delete every row scoped to `name`; provenance rows keep guarding the fleet"""
+        scope = [t for t in db.tables_with_column(self.conn, "project")
+                 if t not in PROVENANCE_TABLES]
+        with db.write_transaction(self.conn):
+            counts = db.delete_where(self.conn, scope, "project", name)
+            counts["gate_rules_provenance_cleared"] = self.conn.execute(
+                "UPDATE gate_rules SET project='' WHERE project=?", (name,)).rowcount
+            live = [r["id"] for r in self.conn.execute(
+                "SELECT id FROM detectors WHERE project=? AND retired_at IS NULL", (name,))]
+            for detector_id in live:
+                self.retract_detector(detector_id, f"project {name} purged from the OS")
+            counts["detectors_retracted"] = len(live)
+        return counts
+
     def inbox_titled_since(self, project: str, title: str, since: float) -> bool:
         """Has this exact item been raised for this project since `since`, acked or not?"""
         return self.conn.execute(
@@ -873,6 +894,12 @@ class CentralStore:
         else:
             cur = self.conn.execute("UPDATE inbox SET status='acked' WHERE id=?", (inbox_id,))
         return cur.rowcount
+
+    def ack_project_inbox(self, project: str) -> int:
+        """Ack every unacked item one project raised"""
+        return self.conn.execute(
+            "UPDATE inbox SET status='acked' WHERE project=? AND status != 'acked'",
+            (project,)).rowcount
 
     # -- backlog
 

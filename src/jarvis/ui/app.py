@@ -116,9 +116,9 @@ def gate_display(g: dict) -> str:
 # How often the dashboard re-reads OS state
 REFRESH_SECONDS = 15
 
-# The open statuses worth a row of their own
+# The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
-                     "waiting_pr_merge")
+                     "validating", "waiting_pr_merge")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
@@ -1091,6 +1091,9 @@ def create_app() -> FastAPI:
         ctx["nav_projects"] = nav_projects()
         here = ctx.get("project") or ctx.get("project_name")
         ctx["project_here"] = here if isinstance(here, str) else ""
+        ctx["project_archived"] = bool(
+            ctx["project_here"] and ctx["project_here"] not in ctx["nav_projects"]
+            and ctx["project_here"] in ops.registered_project_paths(include_archived=True))
         return templates.TemplateResponse(request, template, ctx,
                                           status_code=status_code)
 
@@ -1173,7 +1176,7 @@ def create_app() -> FastAPI:
     def project(request: Request, name: str, hidden: str = "", show: str = "",
                 fo: str = ""):
         """A project's work orders — the ones that want the user, by default"""
-        paths = ops.registered_project_paths()
+        paths = ops.registered_project_paths(include_archived=True)
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
         show_hidden = hidden not in ("", "0", "false")
@@ -1256,11 +1259,15 @@ def create_app() -> FastAPI:
         if target != f"/fo/{name}/{fo_id}":
             return RedirectResponse(target, status_code=303)
         try:
-            detail = ops.show_feature_order(fo_id, name)
+            detail = ops.show_feature_order(fo_id, name, include_archived=True)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
         # The deliberation, for the fold
-        store = ProjectStore(ops.registered_project_paths()[detail["project"]])
+        paths = ops.registered_project_paths(include_archived=True)
+        if detail["project"] not in paths:
+            return render(request, "error.html",
+                          message=f"no project named {detail['project']!r} is registered")
+        store = ProjectStore(paths[detail["project"]])
         try:
             validation = ops.validation_detail(store, fo_id=fo_id)
             # Taken in the same block, for the same reason: one connection per page (spec §7)
@@ -1276,7 +1283,8 @@ def create_app() -> FastAPI:
         }
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
                       states=states, child_anchors=child_anchors,
-                      cap=ops.feature_order_budget(fo_id, detail["project"]),
+                      cap=ops.feature_order_budget(fo_id, detail["project"],
+                                                   include_archived=True),
                       # Already on `detail` for `jarvis fo show`
                       issues=detail["issues"],
                       validation=validation, error=error)
@@ -1284,7 +1292,7 @@ def create_app() -> FastAPI:
     @app.get("/spec/{name}/{fo_id}", response_class=HTMLResponse)
     def spec_page(request: Request, name: str, fo_id: str):
         """THE FEATURE'S SPEC, RENDERED — §1 of... (docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md)"""
-        paths = ops.registered_project_paths()
+        paths = ops.registered_project_paths(include_archived=True)
         if name not in paths:
             return render(request, "error.html",
                           message=f"no project named {name!r} is registered")
@@ -1358,7 +1366,7 @@ def create_app() -> FastAPI:
     def work_order(request: Request, name: str, wo_id: str, debug: str = "",
                    forced: str = "", retried: str = "", events: str = ""):
         try:
-            pname, path, wo = ops.find_work_order(wo_id, name)
+            pname, path, wo = ops.find_work_order(wo_id, name, include_archived=True)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e),
                           hint=_stale_link_hint(name, wo_id), status_code=404)
@@ -1422,7 +1430,7 @@ def create_app() -> FastAPI:
         show_debug = debug not in ("", "0", "false")
         bill = wo_bill(wo_id, pname)
         # The ceiling, what has gone against it
-        cap = ops.work_order_budget(wo_id, pname)
+        cap = ops.work_order_budget(wo_id, pname, include_archived=True)
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
                       # What has already been dismissed here
                       seen=invariants.acknowledged(wo),
