@@ -164,6 +164,59 @@ def test_os_owning_project_is_refused(started, catalog_file, project, monkeypatc
     assert status() == "active" and in_catalog(catalog_file)
 
 
+@pytest.mark.parametrize("purge", [False, True])
+def test_undecidable_owner_fails_closed(started, catalog_file, project, monkeypatch,
+                                        purge):
+    def broken(*a, **k):
+        raise OSError("origin unreadable")
+
+    monkeypatch.setattr(schedule, "os_project", broken)
+
+    with pytest.raises(ops.OpsError, match="origin unreadable"):
+        ops.offboard_project("proj_a", purge=purge, force=True,
+                             catalog_path=str(catalog_file), reason="done")
+
+    assert status() == "active" and in_catalog(catalog_file)
+    assert (project / ".claude" / "settings.json").exists()
+
+
+def test_missing_reason_refuses_before_any_write(started, catalog_file, project):
+    before = catalog_file.read_text()
+
+    with pytest.raises(ops.OpsError, match="--reason"):
+        ops.offboard_project("proj_a", catalog_path=str(catalog_file))
+
+    assert status() == "active" and catalog_file.read_text() == before
+    assert (project / ".claude" / "settings.json").exists()
+
+
+def test_moved_project_dir_still_cleans_registry(started, catalog_file, project):
+    project.rename(project.with_name("moved"))
+
+    out = ops.offboard_project("proj_a", catalog_path=str(catalog_file), reason="done")
+
+    assert status() == ARCHIVED and not in_catalog(catalog_file)
+    assert any("path does not exist" in w for w in out["strip"]["warnings"])
+    assert not project.exists()
+
+
+def test_failed_strip_still_moves_registry_and_catalog(started, catalog_file, project,
+                                                       monkeypatch):
+    real_strip = bootstrap.unbootstrap_project
+
+    def strip(spec, *, purge, dry_run):
+        if not dry_run:
+            raise PermissionError("read-only repo")
+        return real_strip(spec, purge=purge, dry_run=dry_run)
+
+    monkeypatch.setattr(bootstrap, "unbootstrap_project", strip)
+
+    out = ops.offboard_project("proj_a", catalog_path=str(catalog_file), reason="done")
+
+    assert status() == ARCHIVED and not in_catalog(catalog_file)
+    assert out["strip"] == {"actions": [], "warnings": ["strip failed: read-only repo"]}
+
+
 def test_worker_may_not_offboard(started, catalog_file, monkeypatch):
     monkeypatch.setenv("JARVIS_WO_ID", "wo-12345678")
 

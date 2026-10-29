@@ -11282,8 +11282,10 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
     # The OS-owning project carries Morpheus, the steward and the OS health sweep
     try:
         owner = schedule.os_project(paths.items())
-    except (OSError, ValueError):
-        owner = None
+    except Exception as e:  # fail closed: an undecided owner may be this project
+        raise OpsError(
+            f"cannot tell whether {name} runs the OS itself ({type(e).__name__}: {e}), "
+            f"so it is not offboarded. Fix that, then run it again.") from e
     if owner == name:
         raise OpsError(
             f"{name} runs the OS itself — Morpheus's release queue, the steward and the "
@@ -11310,8 +11312,14 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
         _require_reason(changes, reason,
                         f"jarvis offboard {name}{' --purge --yes' if purge else ''}"
                         f'{" --force" if force else ""} --reason "…"')
-    open_ = quiesce_project(name)["open"] if status != ARCHIVED else []
-    strip = bootstrap.unbootstrap_project(spec, purge=purge, dry_run=True)
+    # Opening a ProjectStore recreates a moved project's directory, so a missing one is not read
+    live = status != ARCHIVED and paths[name].is_dir()
+    open_ = quiesce_project(name)["open"] if live else []
+    try:
+        strip = bootstrap.unbootstrap_project(spec, purge=purge, dry_run=True)
+    except OSError as e:
+        strip = BootstrapReport(project=name)
+        strip.warn(f"strip dry run failed: {e}")
     plan: dict[str, Any] = {
         "project": name, "mode": "purge" if purge else "archive", "dry_run": dry_run,
         "status": status, "open": open_, "cancelled": [], "sessions_stopped": 0,
@@ -11332,7 +11340,7 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
     if dry_run:
         return plan
 
-    if status != ARCHIVED:
+    if live:
         q = quiesce_project(name, apply=True, reason=reason or "project offboarded")
         plan.update({k: q[k] for k in ("cancelled", "sessions_stopped",
                                        "backlog_dropped", "inbox_acked")})
@@ -11342,7 +11350,7 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
         plan["strip"] = {"actions": strip.actions, "warnings": strip.warnings}
     except OSError as e:
         # A stale repo is inert and a second offboard fixes it; registry and catalog still move
-        plan["strip"]["warnings"] = [*strip.warnings, f"strip failed: {e}"]
+        plan["strip"] = {"actions": [], "warnings": [f"strip failed: {e}"]}
     # Registry, then catalog: these two move together
     central = CentralStore()
     try:
