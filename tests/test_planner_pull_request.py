@@ -85,8 +85,8 @@ def _events(fleet, wo_id: str, kind: str) -> list[dict]:  # noqa: F811
 # -- the record it now writes
 
 
-def test_a_planner_with_an_open_pull_request_submits_and_completes(fleet, planner,  # noqa: F811
-                                                                  monkeypatch):
+def test_a_planner_with_an_open_pull_request_submits_and_parks(fleet, planner,  # noqa: F811
+                                                              monkeypatch):
     """The whole defect, from the other side: this submission used to raise"""
     _no_panel(fleet)
     found = _lookup(monkeypatch, PR)
@@ -95,7 +95,8 @@ def test_a_planner_with_an_open_pull_request_submits_and_completes(fleet, planne
 
     assert out["status"] == "plan_review"
     assert found.branches == [planner["branch"]]
-    assert _row(fleet, planner["wo_id"])["status"] == "completed"
+    # docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §1
+    assert _row(fleet, planner["wo_id"])["status"] == "waiting_pr_merge"
     assert _row(fleet, planner["wo_id"])["pr_url"] == PR
     recorded = _events(fleet, planner["wo_id"], "pr_url_recorded")
     assert len(recorded) == 1
@@ -105,28 +106,44 @@ def test_a_planner_with_an_open_pull_request_submits_and_completes(fleet, planne
     assert recorded[0]["source"] == "plan_submit"
 
 
-def test_a_recorded_planner_pull_request_does_not_route(fleet, planner, monkeypatch):  # noqa: F811
-    """Ruling 877's reason for rejecting fix (A), as a test"""
+def test_a_spec_pull_request_routes_and_is_judged(fleet, planner, monkeypatch):  # noqa: F811
+    """kn-663d59b5 reverses ruling 877: the spec PR is a delivery, judged and merged by the OS"""
     seen = Validator()
     fleet.daemon.validator = seen
     _lookup(monkeypatch, PR)
 
     ops.submit_plan(planner["fo_id"], a_plan(child("schema")))
-    fleet.drain()
 
     store = fleet.store()
     try:
         row = store.get_work_order(planner["wo_id"])
         assert row["pr_url"] == PR
-        assert row["status"] != "waiting_pr_merge"
-        assert store.list_work_orders(statuses=("waiting_pr_merge",)) == []
-        assert ops.routes_on_pull_request(store, row) is False
-        assert ops.declared_pull_request(store, row) == ""
-        assert row["status"] == "completed"
-        # The poller only ever looks at a routing pull request
-        assert store.events_of_kind(planner["wo_id"], "pr_merged") == []
+        assert ops.routes_on_pull_request(store, row) is True
+        assert ops.declared_pull_request(store, row) == PR
+        assert store.latest_validation_round(wo_id=planner["wo_id"]) is not None
     finally:
         store.close()
+
+
+def test_a_completed_planner_is_reparked_behind_its_spec(fleet, planner,  # noqa: F811
+                                                        monkeypatch):
+    """§4: a planner settled under the old route goes back behind its open spec PR"""
+    _no_panel(fleet)
+    store = fleet.store()
+    try:
+        store.update_work_order(planner["wo_id"], pr_url=PR, result_summary="planned")
+        store.add_event(planner["wo_id"], "pr_url_recorded",
+                        {"pr_url": PR, "source": "plan_submit"})
+        store.set_status(planner["wo_id"], "completed", trigger="landed")
+    finally:
+        store.close()
+
+    assert ops.repark_spec_pull_request(planner["wo_id"]) == "waiting_pr_merge"
+    assert _row(fleet, planner["wo_id"])["status"] == "waiting_pr_merge"
+    assert len(_events(fleet, planner["wo_id"], ops.SPEC_PR_REPARKED_EVENT)) == 1
+    # Idempotent: a planner already parked is left alone
+    assert ops.repark_spec_pull_request(planner["wo_id"]) == "waiting_pr_merge"
+    assert len(_events(fleet, planner["wo_id"], ops.SPEC_PR_REPARKED_EVENT)) == 1
 
 
 # -- the refusals
@@ -312,7 +329,7 @@ def test_a_planner_that_settles_reports_no_warning(fleet, planner, monkeypatch):
     out = ops.submit_plan(planner["fo_id"], a_plan(child("schema")))
 
     assert "warning" not in out
-    assert out["planner"]["status"] == "completed"
+    assert out["planner"]["status"] == "waiting_pr_merge"
 
 
 def test_a_non_ops_failure_from_the_planner_settle_still_propagates(fleet, planner,  # noqa: F811

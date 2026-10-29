@@ -3994,8 +3994,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     return status
 
 
-#: The `pr_url_recorded` sources that route the merge queue; `gate` and `plan_submit` stay inert
-DECLARING_SOURCES = ("user", "auto")
+#: The `pr_url_recorded` sources that route the merge queue; `gate` stays inert (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §1)
+DECLARING_SOURCES = ("user", "auto", "plan_submit")
 
 
 def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
@@ -8292,7 +8292,8 @@ def submit_verdict(inv_id: str, doc: Any,
 
 
 def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
-                      payload: dict[str, Any]) -> dict[str, Any] | None:
+                      payload: dict[str, Any],
+                      pr_url: str | None = None) -> dict[str, Any] | None:
     """Settle the work order whose submission was just stored, BY ITS KIND'S ROUTE"""
     store = ProjectStore(path)
     try:
@@ -8308,7 +8309,7 @@ def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
     finally:
         store.close()
     if route == SETTLE_BY_FINISH:
-        return finish(wo_id, summary)
+        return finish(wo_id, summary, pr_url=pr_url)
     raise OpsError(f"{wo_id} is a {wo.get('kind') or 'worker'}, whose kind settles by "
                    f"{route!r} and never by a submission")
 
@@ -8488,6 +8489,47 @@ def _record_spec_pull_request(path: Path, fo_id: str,
         store.close()
 
 
+def _spec_pull_request(path: Path, planner_id: str) -> str | None:
+    """The planner's `pr_url` when `plan_submit` recorded it; a gate-recorded URL stays inert (#742)"""
+    store = ProjectStore(path)
+    try:
+        pr_url = str(store.get_work_order(planner_id).get("pr_url") or "")
+        recorded = {str(db.from_json(e["payload"], {}).get("pr_url") or "")
+                    for e in store.events_of_kind(planner_id, "pr_url_recorded")
+                    if db.from_json(e["payload"], {}).get("source") == "plan_submit"}
+    finally:
+        store.close()
+    return pr_url if pr_url and pr_url in recorded else None
+
+
+#: A completed planner put back behind its unmerged spec pull request
+SPEC_PR_REPARKED_EVENT = "spec_pr_reparked"
+
+
+def repark_spec_pull_request(wo_id: str) -> str:
+    """A COMPLETED planner whose spec PR never merged goes back behind it, as `finish` parks it (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §4)"""
+    name, path, _wo = find_work_order(wo_id)
+    cfg = validation_config(name)
+    store = ProjectStore(path)
+    try:
+        wo = store.get_work_order(wo_id)
+        pr_url = str(wo.get("pr_url") or "")
+        if wo["status"] != "completed" or not pr_url:
+            return str(wo["status"])
+        store.add_event(wo_id, SPEC_PR_REPARKED_EVENT, {"pr_url": pr_url})
+        submits = validation_applies(cfg, wo, store)
+        opened = (submit_for_validation(store, path, wo,
+                                        declared=declared_evidence(store, wo_id), cfg=cfg)
+                  if submits else None)
+        if str((opened or {}).get("outcome") or "") == "escalated":
+            return str(store.get_work_order(wo_id)["status"])
+        return land_when_cleared(store, store.get_work_order(wo_id), pr_url,
+                                 panel_open=submits and opened is None,
+                                 panel_cleared=not submits)
+    finally:
+        store.close()
+
+
 def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
                      planner_id: str, source: str, why: str) -> dict[str, Any]:
     """Ask for a review of this plan, closing whichever review it replaces"""
@@ -8580,10 +8622,13 @@ def submit_plan(fo_id: str, doc: Any,
     if fo.get("plan_wo_id"):
         # The planner has no more to say until the review lands
         summary = f"submitted a plan for {fo_id}: {len(plan['children'])} work orders"
+        # The spec PR is DELIVERED, so it parks and the OS merges it (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §1)
+        spec_pr = _spec_pull_request(path, fo["plan_wo_id"])
         try:
             out["planner"] = _settle_submitter(path, fo["plan_wo_id"], summary,
                                                "plan_submitted_settled",
-                                               {"feature_order": fo_id})
+                                               {"feature_order": fo_id},
+                                               pr_url=spec_pr)
         except OpsError as e:
             # docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md
             out["warning"] = _planner_unsettled(path, fo_id, fo["plan_wo_id"],

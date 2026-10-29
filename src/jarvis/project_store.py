@@ -1211,6 +1211,9 @@ MESSAGE_AUTHOR_USER = "user"
 # A dependency is satisfied only when it reaches `completed`
 DEPENDENCY_SATISFIED_STATUS = "completed"
 
+#: A planner parked here behind its `pr_url` has a spec not yet on the default branch
+SPEC_PR_OPEN_STATUSES = ("validating", "waiting_pr_merge", "needs_review")
+
 # ...and these are the statuses from which it can never get there
 DEPENDENCY_DEAD_STATUSES = ("cancelled", "failed")
 
@@ -1297,6 +1300,19 @@ CLAIM_RULES: tuple[_ClaimRule, ...] = (
                ))""",
         delayed=True,
         params=lambda: (),
+    ),
+    # Its feature's SPEC pull request has not merged (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2)
+    _ClaimRule(
+        code="spec_unmerged",
+        why="its feature's spec pull request has not merged yet",
+        sql=f"""NOT (w.kind = 'worker' AND EXISTS (
+                   SELECT 1 FROM feature_orders f
+                   JOIN work_orders p ON p.id = f.plan_wo_id
+                   WHERE f.id = w.parent_id AND COALESCE(p.pr_url, '') != ''
+                     AND p.status IN ({",".join("?" for _ in SPEC_PR_OPEN_STATUSES)})
+               ))""",
+        delayed=True,
+        params=lambda: tuple(SPEC_PR_OPEN_STATUSES),
     ),
 )
 
@@ -1927,6 +1943,21 @@ class ProjectStore:
         if row is None or not row["n"]:
             return None
         return {"fo_id": parent, "planner_id": row["planner"], "n": int(row["n"])}
+
+    def spec_hold(self, wo: dict[str, Any]) -> dict[str, Any] | None:
+        """`{"fo_id", "planner_id", "pr_url"}` while this child's spec PR is unmerged, else None (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2)"""
+        parent = wo.get("parent_id")
+        if not parent or wo.get("kind") != "worker":
+            return None
+        row = self.conn.execute(
+            f"""SELECT p.id planner, p.pr_url pr_url
+               FROM feature_orders f JOIN work_orders p ON p.id = f.plan_wo_id
+               WHERE f.id = ? AND COALESCE(p.pr_url, '') != ''
+                 AND p.status IN ({",".join("?" for _ in SPEC_PR_OPEN_STATUSES)})""",
+            (parent, *SPEC_PR_OPEN_STATUSES)).fetchone()
+        if row is None:
+            return None
+        return {"fo_id": parent, "planner_id": row["planner"], "pr_url": row["pr_url"]}
 
     def claim_next_pending(self, only: Collection[str] | None = None
                            ) -> dict[str, Any] | None:
