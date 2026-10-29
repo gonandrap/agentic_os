@@ -1,4 +1,4 @@
-"""An offboarded project leaves the running fleet: what the catalog filter does not cover (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.2, §6.3)"""
+"""What the catalog filter does not cover (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.2)"""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ def test_a_fleet_wide_detector_and_a_gate_rule_are_never_reported(central):
 @pytest.mark.parametrize("archived", [True, False], ids=["archived", "no-row"])
 @pytest.mark.parametrize("seed", ["morpheus", "question", "detector"])
 def test_a_clean_archive_is_never_a_violation(central, neo, seed, archived):
-    """Archive leaves these behind on purpose (§6.2 items 1 and 2, §3); the same row with no `projects` row is the leak"""
+    """Archive leaves these on purpose (§6.3); with no `projects` row they are a leak"""
     if archived:
         central.upsert_project("proj_b", "/tmp/proj_b")
         central.set_project_status("proj_b", ARCHIVED)

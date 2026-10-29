@@ -199,7 +199,7 @@ def test_a_removed_project_is_refused_too(jarvis_home, tmp_path):
     project = tmp_path / "proj_a"
     project.mkdir()
     write_catalog(path, project, projects=["proj_a", "proj_b"])
-    # Registered and active, as `start_os` leaves every project a live daemon runs (§6.1 of the offboard spec)
+    # Registered, as `start_os` leaves every project a live daemon runs (offboard spec §6.1)
     register("proj_a", "proj_b", project=project)
     daemon = Daemon(load_catalog(path))
 
