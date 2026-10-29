@@ -1766,9 +1766,33 @@ def create_app() -> FastAPI:
 
     @app.get("/morpheus", response_class=HTMLResponse)
     def morpheus_page(request: Request):
-        """Shipped PRs watched in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)"""
-        return render(request, "morpheus.html", active="morpheus",
-                      report=ops.morpheus_report())
+        """Shipped PRs watched in production, failures first (spec 2026-10-29 dashboard §4.1)"""
+        report = ops.morpheus_report()
+        every = report["items"]
+        options = {"state": list(report["counts"]), "project": filter_options(every, "project")}
+        filters = query_filters(request, options)
+
+        def needs_you(i: dict) -> bool:
+            return (i["state"] in ("failed", "timedout")
+                    and not (i.get("resolution") or "").startswith("confirmed failed"))
+
+        newest = sorted(filter_rows(every, filters),
+                        key=lambda i: i.get("updated_ts") or 0, reverse=True)
+        rows = attention_first(newest, needs_you)
+        return render(request, "morpheus.html", active="morpheus", report=report,
+                      rows=rows, attention=[i for i in rows if needs_you(i)],
+                      filters=filters, options=options, total=len(every))
+
+    @app.get("/morpheus/{item_id}", response_class=HTMLResponse)
+    def morpheus_item_page(request: Request, item_id: str):
+        """One watched PR: its runs, retries, Neo questions and handoff (spec 2026-10-29 dashboard §4.2)"""
+        try:
+            detail = ops.morpheus_detail(item_id)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="morpheus", message=str(e),
+                          status_code=404)
+        return render(request, "morpheus_item.html", active="morpheus", d=detail,
+                      item=detail["item"], back=f"/morpheus/{item_id}")
 
     @app.post("/morpheus/{item_id}/waive")
     def morpheus_waive(item_id: str, reason: str = Form(""), next: str = Form("")):

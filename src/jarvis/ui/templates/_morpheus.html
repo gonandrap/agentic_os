@@ -1,0 +1,12 @@
+{# Shared by morpheus.html and morpheus_item.html — spec 2026-10-29 dashboard §4 #}
+{% set tone = {"queued": "tone-active", "monitoring": "tone-active", "validated": "tone-ok",
+               "failed": "tone-bad", "timedout": "tone-warn"} %}
+
+{# `item.action` is `neo:<qid>` / `investigation:<id>` / `improvement:<io-id>` / `none:<why>` #}
+{% macro handoff(action) -%}
+{%- set kind, _, ref = (action or "").partition(":") -%}
+{%- if not kind %}—
+{%- elif kind == "none" %}none: {{ ref }}
+{%- elif kind == "neo" %}Neo <a href="/neo/question/{{ ref }}">q{{ ref }}</a>
+{%- else %}{{ kind }} <a href="/go/{{ ref }}">{{ ref }}</a>{% endif -%}
+{%- endmacro %}
