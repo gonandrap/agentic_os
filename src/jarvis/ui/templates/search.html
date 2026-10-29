@@ -45,7 +45,7 @@
         <a href="{{ h.url }}"><strong>{{ h.title }}</strong></a>
         <div class="sub">
           <span class="mono">{{ h.id }}</span>
-          {% if h.project %}· <a href="/project/{{ h.project }}">{{ h.project }}</a>{% endif %}
+          {% if h.project %}· <a href="/project/{{ h.project }}">{{ h.project }}</a>{% if h.archived %} (archived){% endif %}{% endif %}
           {% if h.status %}· {{ h.status }}{% endif %}
           {% if h.ts %}· {{ fmt_age(h.ts) }} ago{% endif %}
         </div>

@@ -56,7 +56,8 @@ def _hit(kind: str, *, id: str, project: str, title: str, status: str, ts: float
 
 def _project_paths(project: str | None) -> dict[str, Path]:
     from . import ops  # ops imports the stores; the cycle is only ever this way round
-    paths = ops.registered_project_paths()
+    # Archived history stays findable (docs/superpowers/specs/2026-10-28-offboard-a-project.md §2)
+    paths = ops.registered_project_paths(include_archived=True)
     if project:
         if project not in paths:
             raise ops.OpsError(f"project {project!r} not registered "
@@ -123,6 +124,10 @@ def search(query: str, *, project: str | None = None,
     if unknown:
         raise ValueError(f"unknown kind(s): {sorted(unknown)} (known: {list(KINDS)})")
 
+    from . import ops
+    archived = (set(ops.registered_project_paths(include_archived=True))
+                - set(ops.registered_project_paths()))
+
     hits: list[dict[str, Any]] = []
     if wanted & {"work_order", "feature_order", "alarm", "gate"}:
         for name, path in _project_paths(project).items():
@@ -174,6 +179,8 @@ def search(query: str, *, project: str | None = None,
 
     exact = query.strip().lower()
     for hit in hits:
+        # Readable record, project not running
+        hit["archived"] = hit["project"] in archived
         if hit["id"].lower() == exact:
             hit["score"] += EXACT_ID_BONUS
     hits.sort(key=lambda h: (-h["score"], KINDS.index(h["kind"]), -h["ts"]))
