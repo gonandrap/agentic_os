@@ -888,6 +888,12 @@ class CentralStore:
             cur = self.conn.execute("UPDATE inbox SET status='acked' WHERE id=?", (inbox_id,))
         return cur.rowcount
 
+    def ack_project_inbox(self, project: str) -> int:
+        """Ack every unacked item one project raised"""
+        return self.conn.execute(
+            "UPDATE inbox SET status='acked' WHERE project=? AND status != 'acked'",
+            (project,)).rowcount
+
     # -- backlog
 
     def add_backlog(self, project: str, title: str, description: str = "",
