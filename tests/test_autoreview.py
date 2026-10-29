@@ -2570,3 +2570,20 @@ def test_an_ask_dropped_on_a_cancelled_order_is_not_re_armed(started):
     assert questions()[0]["status"] == "escalated"
     (escalated,) = events(store, wo["id"], "autoreview_escalated")
     assert escalated["re_asked"] is False
+
+
+def test_an_unseen_reference_is_asked_for_not_ruled_on():
+    """Neo Q2290: assumption #2 argued from a withheld #1; Neo must ask for the data, not guess"""
+    persona = autoreview.ASSUMPTION_REVIEWER_PERSONA
+    assert "NEVER RULE ON PARTIAL DATA" in persona
+    # Running order: object so the worker restates it; finished: escalate as evidence-insufficient
+    rule = persona[persona.index("NEVER RULE ON PARTIAL DATA"):]
+    rule = rule[:rule.index("\n\n")]
+    assert "OBJECTION" in rule and "self-contained" in rule
+    assert "evidence-insufficient" in rule
+    assert "never\naccept" in rule or "never accept" in " ".join(rule.split())
+
+
+def test_neo_answers_an_unseen_reference_by_asking_for_it():
+    """The question-side twin of the rule above"""
+    assert "NEVER DECIDE ON PARTIAL DATA" in neo.PERSONA
