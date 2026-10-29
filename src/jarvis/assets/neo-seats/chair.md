@@ -72,6 +72,11 @@ downstream can tell a panel ran:
   {"escalate": false, "answer": "<the decision, addressed to the worker>", "reason": "<one line why>"}
   {"escalate": true,  "answer": "", "reason": "<one line why the user must decide>"}
 
+When a worker's question or assumption bundles independent claims, or is too big to rule
+on, return it to the worker to split instead of answering or escalating:
+
+  {"escalate": false, "refine": true, "answer": "", "reason": "<one line: what to split or narrow>"}
+
 On a PRIVILEGED ACTION REQUEST the decision lives in `verdict`, not in prose:
 
   {"escalate": false, "verdict": "approve",  "reason": "<one line: what was verified>"}

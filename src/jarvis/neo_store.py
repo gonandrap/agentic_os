@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ Q_STATUSES = (
     "answered",   # Neo answered; answer delivered to the worker
     "escalated",  # Neo declined — the user must answer
     "failed",     # answering errored; surfaced as attention
+    "refined",    # returned to the asker to split or narrow; nobody ruled (wo-ea3c6f0c)
 )
 # Review lifecycle of an answered question
 REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
@@ -203,6 +204,12 @@ class NeoStore:
         self.conn.executescript(SCHEMA)
         self._migrate()
 
+    def purge_project(self, name: str) -> dict[str, int]:
+        """Delete every question and learning scoped to `name`, with the questions' panel opinions"""
+        with db.write_transaction(self.conn):
+            return db.delete_where(self.conn, db.tables_with_column(self.conn, "project"),
+                                   "project", name)
+
     def _migrate(self) -> None:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
 
@@ -248,16 +255,18 @@ class NeoStore:
                           (question, question_id))
         return True
 
-    def claim_next(self) -> dict[str, Any] | None:
-        """Atomically claim the OLDEST queued question (FIFO"""
+    def claim_next(self, skip: Collection[str] = ()) -> dict[str, Any] | None:
+        """Atomically claim the OLDEST queued question (FIFO), never one whose project is in `skip`"""
         now = db.now()
+        skip = sorted(skip)
         cur = self.conn.execute(
-            """UPDATE questions SET status='answering', claimed_at=?
+            f"""UPDATE questions SET status='answering', claimed_at=?
                WHERE id = (SELECT id FROM questions WHERE status='queued'
                              AND COALESCE(retry_after, 0) <= ?
+                             AND project NOT IN ({','.join('?' for _ in skip)})
                            ORDER BY ts LIMIT 1)
                RETURNING *""",
-            (now, now),
+            (now, now, *skip),
         )
         row = cur.fetchone()
         return dict(row) if row else None
@@ -503,6 +512,12 @@ class NeoStore:
             f"""SELECT project, wo_id, COUNT(*) AS n
                 FROM questions WHERE {' AND '.join(where)}
                 GROUP BY project, wo_id""", params).fetchall())
+
+    def refines(self, wo_id: str, kind: str) -> int:
+        """How many questions of `kind` this order has had returned to it — the loop cap's count"""
+        return int(self.conn.execute(
+            "SELECT COUNT(*) c FROM questions WHERE wo_id=? AND kind=? AND status='refined'",
+            (wo_id, kind)).fetchone()["c"])
 
     def counts(self) -> dict[str, int]:
         by_status = {

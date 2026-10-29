@@ -20,7 +20,7 @@ from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspect
 from . import budget as budget_mod
 from . import steward
 from .catalog import DEFAULT_STAKES_CLASSIFIER, Catalog, ProjectSpec, load_catalog
-from .central_store import SETTLED_BACKLOG_STATUSES, CentralStore
+from .central_store import ARCHIVED, SETTLED_BACKLOG_STATUSES, CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
@@ -269,6 +269,16 @@ def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
         return True
     from . import ops
     return bool(ops.routes_on_pull_request(store, wo))
+
+
+def _minutes_label(minutes: int) -> str:
+    """`120` -> `2h`, `90` -> `90m`"""
+    return f"{minutes // 60}h" if minutes % 60 == 0 else f"{minutes}m"
+
+
+def _seconds_label(seconds: int) -> str:
+    """`600` -> `10m`, `90` -> `90s`"""
+    return f"{seconds // 60}m" if seconds % 60 == 0 else f"{seconds}s"
 
 
 #: The timeline's record that GitHub has stopped recomputing one pull request
@@ -522,6 +532,13 @@ NO_VALIDATOR_REASON = (
     "settled exactly where it settles with validation switched off"
 )
 
+#: Why an abandonment with nothing produced closes its round unjudged and unescalated
+ABANDONED_VOID_REASON = (
+    "the worker abandoned this order and it produced nothing — no files, no pull "
+    "request, no other durable effect — so there is no work for a reviewer and no "
+    "decision owed to the user: {why}"
+)
+
 #: The pair that records a landing the round machine could not take because a worker turn was in... (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
 VALIDATION_LANDING_DEFERRED = "validation_landing_deferred"
 VALIDATION_LANDED = "validation_landed"
@@ -553,6 +570,11 @@ CACHE_1H_INBOX_TITLE = {
     inspection.CACHE_ARM_MISSED_ALARM:
         "A cache-TTL arm is not reaching the CLI — stamped turns paid the other rate",
 }
+
+
+def archived_projects(central: CentralStore) -> frozenset[str]:
+    """Projects the fleet must not act on (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6)"""
+    return frozenset(p["name"] for p in central.list_projects() if p["status"] == ARCHIVED)
 
 
 def _holds_not_recorded(early: bool) -> tuple[str, ...]:
@@ -660,6 +682,10 @@ class Daemon:
         self._catalog_stamp = self._catalog_file_stamp()
         # Reload refused (unreadable, unparseable
         self.catalog_reload_warned = False
+        #: Last archived set read; kept when a read fails, so nothing evicted comes back (§6.1)
+        self.offboarded: frozenset[str] = frozenset()
+        self.owner_move_warned = False
+        self.evict_offboarded()
 
     # -- lifecycle
 
@@ -667,6 +693,47 @@ class Daemon:
         if project.name not in self.stores:
             self.stores[project.name] = ProjectStore(project.path)
         return self.stores[project.name]
+
+    def _read_offboarded(self) -> frozenset[str]:
+        try:
+            self.offboarded = archived_projects(self.central)
+        except Exception:  # noqa: BLE001 — fail closed, like `fleet.load_pause`
+            log.exception("could not read archived projects; keeping %s", sorted(self.offboarded))
+        return self.offboarded
+
+    def evict_offboarded(self) -> None:
+        """Drop archived projects from the live catalog and close stores it no longer names (§6.1, §6.2.4)"""
+        gone = self._read_offboarded()
+        if any(p.name in gone for p in self.catalog.projects):
+            owner = self._os_owner()
+            self.catalog = self.catalog.without_projects(gone)
+            log.info("evicted offboarded project(s) %s", sorted(gone))
+            self._warn_owner_moved(owner)
+        self._close_orphan_stores()
+
+    def _warn_owner_moved(self, old: str | None) -> None:
+        """An offboard that moves fleet-wide OS job ownership says so, once per daemon run (§6.2.5)"""
+        new = self._os_owner()
+        if old is None or new == old or any(p.name == old for p in self.catalog.projects):
+            return
+        log.warning("OS job owner moved from %s to %s", old, new)
+        if self.owner_move_warned:
+            return
+        self.owner_move_warned = True
+        self.central.add_inbox(
+            project="os", level="warning",
+            title="fleet-wide OS jobs moved to another project",
+            body=(f"{old} owned the fleet-wide OS jobs by fallback (no project's checkout "
+                  f"holds the running code) and was offboarded. They now run under "
+                  f"{new or 'no project'}."))
+
+    def _close_orphan_stores(self) -> None:
+        live = {p.name for p in self.catalog.projects}
+        for name in [n for n in self.stores if n not in live]:
+            try:
+                self.stores.pop(name).close()
+            except Exception:  # noqa: BLE001 — a purged file may already be gone
+                log.warning("closing %s's store failed", name, exc_info=True)
 
     def _fleet_stores(self) -> dict[str, ProjectStore]:
         """Every live project's store, for a question about the account (`fleet.read`)"""
@@ -796,14 +863,26 @@ class Daemon:
                 f"{e}\n\nThe fleet is still running the configuration it started with. "
                 f"Fix {path} and it will be picked up on the next tick.")
             return False
-        if {p.name for p in fresh.projects} != {p.name for p in self.catalog.projects}:
+        # Removing an archived or purged (row-less) project is applicable; any other set change is not (§6.1)
+        before = {p.name for p in self.catalog.projects}
+        try:
+            registered = {p["name"] for p in self.central.list_projects()}
+        except Exception:  # noqa: BLE001 — unreadable registry: no removal counts as purged
+            registered = before
+        after = {p.name for p in fresh.projects}
+        gone = self._read_offboarded()
+        offboarded = {n for n in before - after if n in gone or n not in registered}
+        if after - gone != before - gone - offboarded:
             self._refuse_reload(
                 f"{path} added or removed a project, and that is not a setting: a new "
                 f"project has never been through `bootstrap_project`, and a removed one "
                 f"leaves an open store behind. Run `jarvis start` to apply it. Setting "
                 f"changes in the same file are not applied either until you do.")
             return False
-        self.catalog = fresh
+        owner = self._os_owner()
+        self.catalog = fresh.without_projects(gone)
+        self._warn_owner_moved(owner)
+        self._close_orphan_stores()
         self.catalog_reload_warned = False
         log.info("catalog reloaded from %s", path)
         return True
@@ -861,6 +940,10 @@ class Daemon:
         # Before the first tick: if the boot we are living through IS a staged release's restart
         self.verify_pending_release()
         try:
+            invariants_mod.report_at_startup("daemon")
+        except Exception:  # noqa: BLE001 — a startup check must not stop the daemon
+            log.exception("startup invariant check failed")
+        try:
             while not self.stop_requested:
                 started = time.monotonic()
                 try:
@@ -895,6 +978,7 @@ class Daemon:
     def tick(self) -> None:
         # First, so everything below runs under one configuration — and the same one
         self.reload_catalog()
+        self.evict_offboarded()
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
         poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
@@ -2089,6 +2173,14 @@ class Daemon:
 
             # A SUBMISSION WITH NOTHING FOR A REVIEWER never reaches the validator (docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §3)
             empty = evidence_mod.nothing_to_judge(packet)
+            # A DECLARED ABANDONMENT THAT PRODUCED NOTHING is a decision, not a delivery (wo-3fa65445)
+            if empty == "escalate" and store.work_abandoned(wo_id):
+                dropped = store.events_of_kind(wo_id, "abandoned")[-1]
+                why = str(db.from_json(dropped["payload"], {}).get("reason") or "")
+                self._void(store, wo, round_id, n, ABANDONED_VOID_REASON.format(why=why))
+                log.info("[%s] %s: round %d voided — abandoned with nothing produced",
+                         project.name, wo_id, n)
+                return
             if empty == "escalate":
                 self._escalate(store, wo, round_id, n,
                                "this submission changes no files and records no other "
@@ -2276,6 +2368,7 @@ class Daemon:
         wo_id = wo["id"]
         rework = uncounted_cause == ops.USER_REWORK_CAUSE
         red_ci = uncounted_cause == ops.RED_CI_CAUSE
+        note += ops.non_landing_review_note(store, wo)
         used, of = rebind or (0, max_rounds)
         pos = n if budget_round is None else budget_round
         # `of` is the bound this round was actually held by
@@ -3006,12 +3099,24 @@ class Daemon:
                     log.exception("[%s] morpheus: could not queue merged PRs", project.name)
                 finally:
                     store.close()
+            try:
+                from .ops import fix_carrier
+
+                for item_id in morpheus.requeue_fixed(central, cfg, fix_carrier):
+                    log.info("morpheus %s: its fix reached production, watching again", item_id)
+            except Exception:  # noqa: BLE001 — the rest of the pass still runs
+                log.exception("morpheus: could not requeue fixed items")
             fallback = next(iter(dirs.values()), Path.cwd())
+            # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
+            skip = archived_projects(central)
             moved = morpheus.sweep(central, cfg,
-                                   lambda item: dirs.get(item.get("project") or "", fallback))
+                                   lambda item: dirs.get(item.get("project") or "", fallback),
+                                   skip=skip)
             if any(moved.values()):
                 log.info("morpheus sweep: %s", {k: v for k, v in moved.items() if v})
             for item in morpheus.owed_actions(central):
+                if (item["project"] or "") in skip:
+                    continue
                 try:
                     log.info("morpheus %s (PR #%s) %s -> %s", item["id"], item["pr_number"],
                              item["state"], morpheus.act(central, self.catalog, item))
@@ -3020,7 +3125,7 @@ class Daemon:
             # The session lives in the OS project's checkout; each batch adds the projects it touches
             home = next((p.path for p in self.catalog.projects if p.name == os_name), fallback)
             morpheus.wake(central, self.catalog, home, dirs=dirs,
-                          paused=morpheus.pause_state(central)["paused"])
+                          paused=morpheus.pause_state(central)["paused"], skip=skip)
         except Exception:  # noqa: BLE001 — the loop must survive anything
             log.exception("morpheus pass failed")
         finally:
@@ -3195,6 +3300,16 @@ class Daemon:
                 elif q.get("kind") == "assumption":
                     # Above it for the alarm's reason
                     self._deliver_assumption_verdict(central, store, pstore, q, verdict)
+                elif verdict.get("refine"):
+                    if pstore:
+                        # Delivered like an answer, so the wait the question started ends
+                        pstore.queue_message(
+                            q["wo_id"], f"{neo_mod.REFINE_PREFIX} {verdict['reason']}",
+                            source="neo")
+                        pstore.add_event(q["wo_id"], "neo_refined",
+                                         {"neo_question_id": q["id"],
+                                          "reason": verdict["reason"]})
+                        invariants.end_wait_if_nothing_is_out(pstore, q["wo_id"])
                 elif verdict["escalate"]:
                     # A headline, never the verbatim question: this row's job is to get the user's attention (#67)
                     head = q["question"].strip().splitlines()[0][:200]
@@ -3260,6 +3375,8 @@ class Daemon:
                 unreachable=lambda q, detail: self._note_question_unreachable(
                     central, q, detail),
                 refused=refused,
+                # Answering an offboarded project's question is spend delivered to nothing (§6.2 of the offboard spec)
+                skip=archived_projects(central),
             )
             if results:
                 log.info("neo drained %d question(s)", len(results))
@@ -5459,6 +5576,8 @@ class Daemon:
         # ONE read, passed to both readers below (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.4)
         hold = store.plan_hold(wo)
         plan_assumptions = str((hold or {}).get("planner_id") or "")
+        # docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2
+        spec_unmerged = str((store.spec_hold(wo) or {}).get("pr_url") or "")
         # Spec 2026-09-28 §3.2
         base_behind = (automerge.BaseBehind(base=pr.base_ref, base_oid=pr.base_oid)
                        if ops.catch_up_needed(pr, repo=project.path) else None)
@@ -5468,6 +5587,7 @@ class Daemon:
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged,
             drift=drift, base_red=base_red, base_behind=base_behind)
         if not decision.armed:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec... (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.5)
@@ -5482,6 +5602,7 @@ class Daemon:
                     round_row, wo, pr, cfg,
                     validated_head=store.validated_head(round_row),
                     pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged,
                     drift=drift)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
@@ -5514,6 +5635,7 @@ class Daemon:
                         round_row, wo, pr, cfg,
                         validated_head=store.validated_head(round_row),
                         pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged,
                         drift=drift, base_red=base_red)
                     # #1141: the moved head the base hold was hiding gets the carry too
                     if not decision.armed and decision.code == automerge.HELD_SHA_MOVED:
@@ -5526,7 +5648,8 @@ class Daemon:
                                 round_row, wo, pr, cfg,
                                 validated_head=store.validated_head(round_row),
                                 pending_assumptions=pending,
-                                plan_assumptions=plan_assumptions, drift=drift,
+                                plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged, drift=drift,
                                 base_red=base_red)
                 else:
                     # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a base that has moved
@@ -5557,7 +5680,8 @@ class Daemon:
                                               automerge.HELD_SHA_UNRECORDED)
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
-                            plan_assumptions=plan_assumptions)):
+                            plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged)):
                     # `rebind` is the carry's reading of the two proofs
                     self._rejudge_moved_head(project, store, wo, decision,
                                              rebind=outcome.rebind)
@@ -5601,7 +5725,8 @@ class Daemon:
                 neo_store.close()
             return
         # AT THE CAP THE ATTEMPT CAN ONLY REFUSE (#1173)
-        if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
+        if (ops.catch_up_attempts(store, wo_id)
+                >= ops.catch_up_policy(store).catch_up_max):
             caught = self._catch_up_with_base(project, store, wo, pr)
             if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
                 self._note_automerge_held(
@@ -6011,6 +6136,15 @@ class Daemon:
         # `n` is a position in the work order's list and is derived
         numbered = next((a for a in pstore.all_assumptions(wo["id"])
                          if a["id"] == assumption["id"]), assumption)
+        if verdict.get("refine"):
+            if self._asked_early(pstore, wo["id"], int(q["id"])):
+                autoreview.return_to_worker(pstore, wo["id"], numbered,
+                                            verdict["reason"], int(q["id"]))
+                return
+            # A delivered worker cannot re-file: the user settles it
+            neo_store.mark(q["id"], "escalated", reason=verdict["reason"],
+                           cause="scope-too-large")
+            verdict = {**verdict, "refine": False, "escalate": True}
         if self._asked_early(pstore, wo["id"], int(q["id"])):
             # THE EARLY PASS ASKED THIS ONE, so its answer may only be RECORDED
             self._record_early_assumption_verdict(neo_store, pstore, wo, numbered, q,
@@ -6300,14 +6434,17 @@ class Daemon:
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
                                f"this branch has already been rebuilt against "
                                f"{base_oid[:10]} once", base_tip=base_oid)
-        if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
-            hours = ops.CATCH_UP_WINDOW_SECONDS // 3600
-            log.debug("[%s] %s has been caught up with %s %d times in %dh — leaving it "
-                      "held", project.name, wo_id, base, ops.CATCH_UP_MAX, hours)
+        policy = ops.catch_up_policy(store)
+        attempts = ops.catch_up_attempts(store, wo_id, policy=policy)
+        cap = policy.catch_up_max
+        if attempts >= cap:
+            window = _minutes_label(policy.catch_up_window_minutes)
+            log.debug("[%s] %s has been caught up with %s %d times in %s — leaving it "
+                      "held", project.name, wo_id, base, cap, window)
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
-                               f"it has already been caught up {ops.CATCH_UP_MAX} time(s)"
-                               f" in the last {hours}h, which is the cap "
-                               f"({ops.CATCH_UP_MAX}) — the OS chases it again once that "
+                               f"it has already been caught up {cap} time(s)"
+                               f" in the last {window}, which is the cap "
+                               f"({cap}) — the OS chases it again once that "
                                f"window clears",
                                base_tip=base_oid)
 
@@ -6328,6 +6465,16 @@ class Daemon:
                                "the push that moved the head off the judged commit",
                                base_tip=base_oid,
                                cause=ops.CATCH_UP_DEFER_HEAD_MOVED)
+        # EXPONENTIAL BACKOFF, after the head check so the OS's own merge commit is still carried (#1188)
+        if ops.catch_up_backoff(store, wo_id, policy=policy) > 0:
+            delay = ops.catch_up_delay(attempts, policy)
+            log.debug("[%s] %s was caught up %d time(s) — backing off %ds before the next",
+                      project.name, wo_id, attempts, delay)
+            # Worded from `attempts` and `delay` only, so the hold is recorded once per wait
+            return ops.CatchUp(fresh, ops.CATCH_UP_DEFERRED,
+                               f"the {_seconds_label(delay)} backoff after catch-up "
+                               f"{attempts} of {cap}",
+                               base_tip=base_oid, cause=ops.CATCH_UP_DEFER_BACKOFF)
         try:
             ci.update_branch(pr_url, cwd=project.path)
         except github.GitHubError as e:

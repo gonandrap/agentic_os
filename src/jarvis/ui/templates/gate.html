@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% block title %}Gate #{{ g.id }} — Jarvis{% endblock %}
+{% block style %}
+  .gate-form { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+  .gate-form input[type=text] { flex: 1 1 24ch; min-width: 0; }
+  .gate-pre { max-height: 60vh; overflow: auto; white-space: pre-wrap; margin: 6px 0 0; }
+{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6 #}
+{% set m = gate_meta.get(display, {'word': g.status, 'icon': '•', 'tone': 'muted'}) %}
+{% set state = 'waiting on you — Neo escalated' if g.status == 'pending' and g.escalated
+          else 'with Neo' if g.status == 'pending' else m.word %}
+{{ ui.page_head("Gate #" ~ g.id, g.kind ~ " · " ~ g.project ~ " · " ~ state) }}
+
+<p class="kv">
+  <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+  · work order {{ ui.row_id(g.wo_id, "/wo/" ~ g.project ~ "/" ~ g.wo_id) }}
+  · requested {{ fmt_ts(g.ts) }} ({{ fmt_age(g.ts) }} ago)
+</p>
+<pre class="gate-pre request-text">$ {{ g.command }}</pre>
+{% if g.matched %}<p class="sub">matched: <span class="mono">{{ g.matched }}</span></p>{% endif %}
+
+{% if g.contested %}
+<p class="kv tone-warn">CONTESTED — the worker says the recogniser matched this by mistake and
+  that the command performs no privileged action. Dismiss it if that is right; deny it if
+  it is wrong. Nothing here can be approved.</p>
+{% endif %}
+
+<h2>The case</h2>
+<div class="panel">
+  {% if g.justification %}<p class="kv">Why: {{ g.justification }}</p>{% endif %}
+  {% if g.evidence %}<p class="kv">Evidence:</p><pre class="gate-pre">{{ g.evidence }}</pre>{% endif %}
+  {% if g.status == 'awaiting_case' %}
+  <p class="kv tone-warn">no case yet — the worker ran the command instead of asking. It has
+    <span class="mono">jarvis gate request</span> or <span class="mono">jarvis gate contest</span>;
+    abandoned automatically in {{ fmt_left(g.case_deadline) }} if neither comes.</p>
+  {% elif not g.justification and not g.evidence %}
+  <p class="empty">no case was made</p>
+  {% endif %}
+</div>
+
+<h2>Neo's review</h2>
+<div class="panel">
+  {% if g.escalated %}<p class="kv">Why Neo escalated: {{ g.escalation_reason or '—' }}</p>{% endif %}
+  {% if g.neo_question %}
+  <p class="sub">{{ ui.row_id("q" ~ g.neo_question.id, "/neo/question/" ~ g.neo_question.id) }} ·
+    {{ g.neo_question.status }}</p>
+  {% if g.neo_question.answer %}<p class="kv">{{ g.neo_question.answer }}</p>{% endif %}
+  <details>
+    <summary class="sub">the request exactly as the reviewer saw it</summary>
+    <pre class="gate-pre request-text">{{ g.neo_question.question }}</pre>
+  </details>
+  {% else %}
+  <p class="empty">no review record — this request never reached Neo</p>
+  {% endif %}
+</div>
+
+<h2>Decision</h2>
+<div class="panel">
+  {% if g.status in ('pending',) %}
+  {# One form, three buttons; ops.decide_gate refuses a deny or dismiss without a reason #}
+  <form class="gate-form" method="post" action="/gates/{{ g.id }}/decide">
+    <input type="hidden" name="project" value="{{ g.project }}">
+    <input type="hidden" name="next" value="{{ back }}">
+    <input type="text" name="reason"
+           placeholder="reason — goes to the worker; required to deny or dismiss">
+    {# No Approve on a CONTEST — `ops.decide_gate` refuses it. Spec 2026-09-12 §2. #}
+    {% if not g.contested %}<button class="accept" name="decision" value="approve">✓ Approve</button>{% endif %}
+    <button class="danger" name="decision" value="deny">✗ Deny</button>
+    <button name="decision" value="dismiss"
+            title="The command performs no privileged action — the gate matched it by mistake. Unblocks it and records a classifier defect, not an approval."
+            >⊘ Not a gated action</button>
+  </form>
+  {% elif g.status == 'awaiting_case' %}
+  <p class="empty">nothing to decide yet — no reviewer sees it until the worker makes its case</p>
+  {% else %}
+  <p class="kv">{{ m.word }} by <span class="mono">{{ g.decided_by or '—' }}</span>
+    {% if g.decided_at %}· {{ fmt_ts(g.decided_at) }}{% endif %}
+    {% if g.status == 'approved' or display == 'spent' %}· {{ g.uses }}/{{ g.max_uses }} used{% endif %}</p>
+  {% if g.decision_reason %}<p class="kv">{{ g.decision_reason }}</p>{% endif %}
+  {% endif %}
+</div>
+
+<p class="sub"><a href="/gates">all gates</a> · from a terminal:
+  <span class="mono">jarvis gate show {{ g.id }}</span></p>
+{% endblock %}

@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% block title %}{{ rule.id }} — Evolution — Jarvis{% endblock %}
+{% block style %}.rule th { width: 18ch; white-space: nowrap; text-align: left; vertical-align: top; }
+@media (max-width: 600px) { .rule th, .rule td { display: block; width: auto; } }{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §5.
+   Every figure is `ops.evolution_report`'s; like evolution.html this page derives none
+   (§9 of docs/superpowers/specs/2026-09-27-self-evolution.md) and is read-only. #}
+{% set back = "/evolution" ~ ("/" ~ report.project if report.project else "") %}
+{{ ui.page_head(rule.id, rule.gap_class ~ " · " ~ rule.status ~ " · " ~ report.window.days ~ " days · "
+                ~ (report.project or "the whole fleet")) }}
+<p class="sub"><a href="{{ back }}">← every rule</a> · from a terminal:
+  <span class="mono">jarvis rules show {{ rule.id }}</span></p>
+
+<div class="panel table-wrap">
+  <table class="rule">
+    <tr><th>description</th><td>{{ rule.summary or "—" }}</td></tr>
+    {% if not rule.readable %}
+    {# A condition that would not parse is NAMED, never silently treated as false (house rule 2) #}
+    <tr><th>condition</th><td class="tone-warn">could not be read:
+      {% for problem in rule.condition_problems %}{{ problem }}{% if not loop.last %} · {% endif %}
+      {% else %}no reason was recorded{% endfor %}</td></tr>
+    {% endif %}
+    <tr><th>hits</th><td class="mono">{{ rule.hits }} · {{ rule.false_positives }} false positive(s) · {{ rule.recurrences }} recurrence(s)</td></tr>
+    <tr><th>hit rate</th><td>{% if rule.hit_rate is none %}<span class="empty">{{ rule.hit_rate_note }}</span>{% else %}<span class="mono">{{ '%.0f' % (rule.hit_rate * 100) }}%</span>{% endif %}</td></tr>
+    <tr><th>median to clear</th><td>{% if rule.median_cleared_seconds is none %}<span class="empty">{{ rule.median_cleared_seconds_note }}</span>{% else %}<span class="mono">{{ fmt_dur(rule.median_cleared_seconds) }}</span>{% endif %}</td></tr>
+    <tr><th>last fired</th><td class="mono">{{ fmt_ts(rule.last_fired) }} · cleared {{ fmt_ts(rule.last_cleared) }}</td></tr>
+  </table>
+</div>
+
+<h2>Firing history ({{ rule.gap_class }}, by week)</h2>
+{% if weeks %}
+<div class="panel table-wrap">
+  <table>
+    <tr><th>week of</th><th>fires</th></tr>
+    {% for w in weeks %}<tr><td class="when mono">{{ w.week }}</td><td class="num mono">{{ w.count }}</td></tr>{% endfor %}
+  </table>
+</div>
+{% else %}
+<p class="empty">no fire of this gap class in this window</p>
+{% endif %}
+
+<h2>What it filed</h2>
+{% if filed %}
+<ul class="timeline">
+  {% for event in filed %}
+  <li><span class="mono">{{ fmt_ts(event.ts) }}</span> · <span class="mono">{{ event.kind }}</span>
+    <span class="detail">{{ event.headline }}</span>
+    {% for name, target in event.links.items() %}
+    <a class="mono" href="{{ target if target.startswith('http') else '/go/' ~ target }}">{{ name }} {{ target if not target.startswith('http') }}</a>
+    {% endfor %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">nothing recorded for this detector in this window</p>
+{% endif %}
+
+<h2>Recurrences of its gap class</h2>
+{% if recurrences %}
+<div class="panel table-wrap">
+  <table>
+    <tr><th>when</th><th>verdict</th><th>order</th><th>what happened</th></tr>
+    {% for row in recurrences %}
+    <tr>
+      <td class="when mono">{{ fmt_ts(row.ts) }}</td>
+      <td class="mono">{{ row.verdict }}</td>
+      <td class="mono">{{ row.order_id }}</td>
+      <td>{{ row.note }}<div class="sub">{{ row.filed_note }}</div></td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% else %}
+<p class="empty">no recurrence of {{ rule.gap_class }} in this window</p>
+{% endif %}
+{% endblock %}

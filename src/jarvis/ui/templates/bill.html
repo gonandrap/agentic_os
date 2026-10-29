@@ -1,11 +1,9 @@
 {% extends "base.html" %}
 {% import "_bill.html" as bill_ui %}
 {% import "_order_nav.html" as nav %}
+{% import "_layout.html" as ui %}
 {% block title %}bill — {{ bill.id }} — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 760px;">
 
 <h2>What {{ bill.id }} cost</h2>
 
@@ -35,7 +33,7 @@
    arrives with; the same tokens re-grouped by turn follow, because "when" is the
    question they leave with. #}
 <h2>The bill — by who spent it</h2>
-{{ bill_ui.view(bill.actors, bill.total, 'total for ' ~ bill.id) }}
+<div class="table-wrap">{{ bill_ui.view(bill.actors, bill.total, 'total for ' ~ bill.id) }}</div>
 
 {# What is NOT here, said out loud. The question that prompted this page was "not a
    single token spent on the OS that wasn't jarvis?" — and the honest answer is a list
@@ -61,38 +59,39 @@
 
 {% if bill.kind == 'feature_order' %}
 <h2>The orders under it</h2>
-<div class="panel">
+{# Each id opens its order; the title opens its own bill. §8 of
+   docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md #}
+<div class="panel table-wrap">
+  <table class="bill-orders">
+  <tr><th>id</th><th>cost</th><th>order</th><th>state</th></tr>
   {% for order in bill.orders %}
-  <div class="row">
-    <span class="mono" style="width: 76px; text-align: right;">
-      {{ bill_ui.money(order.total.cost.list_usd) }}</span>
-    <div class="grow">
+  <tr>
+    <td>{{ ui.row_id(order.id, order_path(order.project, order.id)) }}</td>
+    <td class="mono num" style="text-align: right;">{{ bill_ui.money(order.total.cost.list_usd) }}</td>
+    <td class="prose">
       <a href="/cost/{{ order.project }}/{{ order.id }}">{{ order.title }}</a>
-      <div class="sub mono">{{ order.id }} ·
-        {{ fmt_tok(order.total.tokens.total) }} tokens ·
+      <div class="sub mono">{{ fmt_tok(order.total.tokens.total) }} tokens ·
         {{ order.turns|length }} turn{{ 's' if order.turns|length != 1 }} ·
         <a href="/cost/{{ order.project }}/{{ order.id }}">its own bill →</a></div>
-    </div>
+    </td>
     {% set m = status_meta.get(order.status, {'word': order.status, 'icon': '•', 'tone': 'muted'}) %}
-    <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
-  </div>
+    <td class="when"><span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span></td>
+  </tr>
   {% else %}
-  <div class="empty">this feature order has no work orders yet</div>
+  <tr><td colspan="4" class="empty">this feature order has no work orders yet</td></tr>
   {% endfor %}
-  {# Not a link and not an order: without it the rows above visibly sum to less than
-     the headline, with nothing on the page saying why. #}
+  {# Not an order: without it the rows above visibly sum to less than the headline. #}
   {% if bill.own %}
-  <div class="row">
-    <span class="mono" style="width: 76px; text-align: right;">
-      {{ bill_ui.money(bill.own.cost.list_usd) }}</span>
-    <div class="grow">
-      {{ own_label }}
-      <div class="sub mono">{{ bill.id }} ·
-        {{ fmt_tok(bill.own.tokens.total) }} tokens ·
-        {{ bill.own.calls }} call{{ 's' if bill.own.calls != 1 }}</div>
-    </div>
-  </div>
+  <tr>
+    <td class="mono">{{ bill.id }}</td>
+    <td class="mono num" style="text-align: right;">{{ bill_ui.money(bill.own.cost.list_usd) }}</td>
+    <td class="prose">{{ own_label }}
+      <div class="sub mono">{{ fmt_tok(bill.own.tokens.total) }} tokens ·
+        {{ bill.own.calls }} call{{ 's' if bill.own.calls != 1 }}</div></td>
+    <td></td>
+  </tr>
   {% endif %}
+  </table>
 </div>
 {% else %}
 
@@ -102,7 +101,7 @@
   turn's own tokens, plus whatever Jarvis and the worker's subprocesses spent while it
   ran or because of what it asked. Which is why the two totals are the same number.
 </p>
-{{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ bill.id) }}
+<div class="table-wrap">{{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ bill.id) }}</div>
 
 {% if turn_rows %}
 <h2>How the context grew</h2>
@@ -272,7 +271,7 @@
 <p class="sub" style="margin: 6px 0 0;">{{ placeholder_zero }}</p>
 {% endif %}
 {% endif %}
-{{ bill_ui.view(bill.agents, worker, 'every agent of ' ~ bill.id) }}
+<div class="table-wrap">{{ bill_ui.view(bill.agents, worker, 'every agent of ' ~ bill.id) }}</div>
 {% endif %}
 
 {% for note in bill.notes %}
@@ -288,6 +287,4 @@
 <p class="sub" style="margin-top: 6px;">
   Every figure on this page is {{ bill.floor_reason }}.
 </p>
-
-</div>
 {% endblock %}

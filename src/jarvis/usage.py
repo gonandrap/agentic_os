@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
+
+from jarvis import transcript_cache
 
 TRANSCRIPT_ROOT_ENV = "JARVIS_TRANSCRIPT_ROOT"
 
@@ -25,6 +27,13 @@ CACHE_WRITE_1H_RATE = 2.0  # x input price, at the 1-hour TTL
 CACHE_READ_RATE = 0.10  # x input price, under either TTL
 #: The TTL Jarvis buys (`claude_cli.PROMPT_CACHE_5M_ENV`)
 WRITE_TTL_SECONDS = 300.0
+#: The TTL the `worker.cache_ttl` = 1h arm buys
+WRITE_TTL_1H_SECONDS = 3600.0
+
+
+def ttl_seconds(arm: str) -> float:
+    """How long a prefix written on this `worker.cache_ttl` arm stays warm (#1291)"""
+    return WRITE_TTL_1H_SECONDS if arm == "1h" else WRITE_TTL_SECONDS
 
 #: The share of ALL cache writes that must be TTL expiry before buying the 1-hour write starts paying
 TTL_BREAK_EVEN = (CACHE_WRITE_1H_RATE - CACHE_WRITE_RATE) / (
@@ -332,6 +341,10 @@ def _subagent_detail(path: Path, sub_usage: Usage) -> Subagent:
     )
 
 
+# Untimed replays of a request's messages (Claude Code 2.1.312+), never events: issue 1309
+REPLAY_ROW_TYPES = frozenset({"api-request-blob"})
+
+
 def rows(path: Path | str, needle: str = "") -> Iterator[dict[str, Any]]:
     """Every JSON row of one transcript, in file order — the one line-reader"""
     try:
@@ -346,7 +359,7 @@ def rows(path: Path | str, needle: str = "") -> Iterator[dict[str, Any]]:
                 row = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(row, dict):
+            if isinstance(row, dict) and row.get("type") not in REPLAY_ROW_TYPES:
                 yield row
 
 
@@ -382,6 +395,12 @@ def parse_stamp(stamp: Any) -> float:
 
 def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
     """The assistant messages in one transcript, deduped by message id"""
+    return transcript_cache.product(path, "messages",
+                                    lambda: _read_assistant_messages(path))
+
+
+def _read_assistant_messages(path: Path | str) -> list[dict[str, Any]]:
+    """The uncached walk; every caller goes through `_assistant_messages`"""
     by_id: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     # The pre-filter: a row with no `usage` key cannot carry token counts
@@ -494,6 +513,8 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
     found: list[Boundary] = []
     previous_read: int | None = None
     previous_ts: float | None = None
+    # The TTL the prefix was last BOUGHT at, which a read-only call does not change (#1291)
+    ttl = WRITE_TTL_SECONDS
     for call in calls:
         read = call.cache_read
         ts = call.ts or None
@@ -501,7 +522,7 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
         if previous_read is not None and read < previous_read:
             # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
             gap = (ts - previous_ts) if (ts and previous_ts) else None
-            expired = (gap is not None and gap >= WRITE_TTL_SECONDS
+            expired = (gap is not None and gap >= ttl
                        and cold_prefix_floor is not None
                        and read <= cold_prefix_floor)
             # Tested FIRST: a compacted boundary reads the static head seconds after the summary landed
@@ -516,6 +537,8 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
             found.append(Boundary(ts=call.ts, cause=cause,
                                   cache_write=call.cache_write, cache_read=read,
                                   gap=gap or 0.0))
+        if call.cache_1h or call.cache_5m:
+            ttl = WRITE_TTL_1H_SECONDS if call.cache_1h else WRITE_TTL_SECONDS
         previous_read = read
         previous_ts = ts
     return found
@@ -601,6 +624,12 @@ def window_envelope(session_id: str, since: float, until: float, *, schema: int,
 
 def compactions_in(path: Path | str) -> list[dict[str, Any]]:
     """Every compaction in one transcript, oldest first, with what it did"""
+    return transcript_cache.product(path, "compactions",
+                                    lambda: _read_compactions(path))
+
+
+def _read_compactions(path: Path | str) -> list[dict[str, Any]]:
+    """The uncached walk; every caller goes through `compactions_in`"""
     found = []
     for row in rows(path, '"compact_boundary"'):
         if row.get("type") != "system" or row.get("subtype") != "compact_boundary":
@@ -825,6 +854,17 @@ def tool_results(path: Path | str, *, chars_per_token: float = 4.0,
     """Every tool call in one transcript, paired with its result and sized"""
     if chars_per_token <= 0:
         raise ValueError("chars_per_token must be > 0")
+    saved = transcript_cache.product(
+        path, f"tools@{chars_per_token:g}",
+        lambda: [asdict(r) for r in _read_tool_results(
+            path, chars_per_token=chars_per_token)])
+    # Rebuilt per call: `_size_group` mutates these, and the cache must not see it
+    return [ToolResult(**row) for row in saved]
+
+
+def _read_tool_results(path: Path | str, *, chars_per_token: float,
+                       ) -> list[ToolResult]:
+    """The uncached walk; every caller goes through `tool_results`"""
     path = Path(path)
     caller = CALLER_SUBAGENT if path.parent.name == "subagents" else CALLER_MAIN
     found: list[ToolResult] = []

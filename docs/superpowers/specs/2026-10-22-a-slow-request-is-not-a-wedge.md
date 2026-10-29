@@ -43,6 +43,9 @@ That is the intended reading — a restart then kills live work for a fault it m
 
 ## Fix 2: every cost payload is computed off the request path
 
+Amended by 2026-10-28-the-cost-page-never-waits.md: `WAIT_SECONDS` is gone, and a window
+with no entry renders `computing.html` at once rather than after 5s.
+
 `CostCache` gains on-demand entries for the windows no refresh covers (a project scope, an
 offset, a custom range, a non-default zone), keyed by `(project, since, until)` — the only
 inputs the payloads depend on. The zone and the labels come from the request's own resolved

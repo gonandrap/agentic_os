@@ -3,7 +3,7 @@ real forms, real navigation, headless Chromium."""
 
 from __future__ import annotations
 
-from jarvis import background, ops
+from jarvis import background, db, ops
 from jarvis.project_store import ProjectStore
 
 
@@ -395,6 +395,7 @@ def test_the_fleet_brake_from_the_dashboard(page, server):
     """Pause from the form, the banner appears (and on other pages), resume lifts it."""
     page.goto(server)
     assert page.locator(".brake").count() == 0
+    page.click("button[role=tab][data-panel='tab-brake']")  # §7: the brake lives in a tab
     page.fill("form[action='/fleet/pause'] input[name='reason']", "browser brake")
     page.click("form[action='/fleet/pause'] button")
     banner = page.locator(".brake")
@@ -1004,24 +1005,25 @@ def _backdate_spans(store, order_id, stamps):
     old — a shape no real order has — and the next store the server opens replays every
     one of them.
     """
-    ids = [r["id"] for r in store.conn.execute(
-        "SELECT id FROM wo_state_spans WHERE order_id=? ORDER BY id", (order_id,))]
-    assert len(ids) == len(stamps), (ids, stamps)
-    for span_id, ts in zip(ids, stamps):
-        store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE id=?", (ts, span_id))
-    # The first span is the creation, which no transition supplies and no event records,
-    # so the events line up with the stamps from the second on.
-    events = [r["id"] for r in store.conn.execute(
-        "SELECT id FROM wo_events WHERE wo_id=? AND kind='status' ORDER BY id",
-        (order_id,))]
-    assert len(events) <= len(stamps) - 1, (events, stamps)
-    for event_id, ts in zip(events, stamps[1:]):
-        store.conn.execute("UPDATE wo_events SET ts=? WHERE id=?", (ts, event_id))
-    store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
-                       (stamps[0], order_id))
-    store.conn.execute("UPDATE feature_orders SET created_at=? WHERE id=?",
-                       (stamps[0], order_id))
-    store.conn.commit()
+    # ONE TRANSACTION: the server's CostCache opens this store concurrently, and its backfill between autocommitted UPDATEs replays the events not yet moved (issue 1279)
+    with db.write_transaction(store.conn):
+        ids = [r["id"] for r in store.conn.execute(
+            "SELECT id FROM wo_state_spans WHERE order_id=? ORDER BY id", (order_id,))]
+        assert len(ids) == len(stamps), (ids, stamps)
+        for span_id, ts in zip(ids, stamps):
+            store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE id=?", (ts, span_id))
+        # The first span is the creation, which no transition supplies and no event records,
+        # so the events line up with the stamps from the second on.
+        events = [r["id"] for r in store.conn.execute(
+            "SELECT id FROM wo_events WHERE wo_id=? AND kind='status' ORDER BY id",
+            (order_id,))]
+        assert len(events) <= len(stamps) - 1, (events, stamps)
+        for event_id, ts in zip(events, stamps[1:]):
+            store.conn.execute("UPDATE wo_events SET ts=? WHERE id=?", (ts, event_id))
+        store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
+                           (stamps[0], order_id))
+        store.conn.execute("UPDATE feature_orders SET created_at=? WHERE id=?",
+                           (stamps[0], order_id))
 
 
 def _event_at(store, wo_id, kind, ts):
@@ -1119,3 +1121,824 @@ def test_the_feature_page_labels_its_coarse_span_as_approximate(page, server, pr
     assert "nothing on the record for 4.0h" in section["text"]
     assert "executing" in section["text"]
     _shot_clip(page, section["clip"], "fo-time-in-state")
+
+
+# §2 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+_WIDTHS = ({"width": 1440, "height": 900}, {"width": 390, "height": 844})
+_LONG = "a sentence long enough to need several words on every line of the cell it sits in"
+
+
+def test_the_readable_check_fails_a_squeezed_cell_and_passes_a_wide_one(page, readable):
+    import pytest
+
+    page.set_content(f"<main><table><tr><td style='width:40px;max-width:40px'>{_LONG}</td>"
+                     f"</tr></table></main>")
+    with pytest.raises(AssertionError, match="squeezed"):
+        readable(page)
+    page.set_content(f"<main><table><tr><td>{_LONG}</td></tr></table>"
+                     f"<details><summary>why</summary><p style='width:40px'>{_LONG}</p></details>"
+                     f"<pre><p style='width:40px'>{_LONG}</p></pre></main>")
+    readable(page)  # hidden in a closed <details>, or inside <pre>: skipped
+
+
+def _inbox_rows(project_wo=None):
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        central.add_inbox("proj_a", "routine deploy finished", body=_LONG, level="info")
+        central.add_inbox("proj_a", "quota nearly used up", level="warning")
+        central.add_inbox("proj_a", "worker crashed twice", level="critical", wo_id=project_wo)
+    finally:
+        central.close()
+
+
+def test_the_inbox_reads_at_desktop_and_phone_width(page, server, readable):
+    _inbox_rows()
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/inbox")
+        assert "worker crashed twice" in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"inbox-{size['width']}")
+
+
+def test_an_inbox_filter_in_the_url_narrows_the_rows(page, server):
+    _inbox_rows()
+    page.goto(f"{server}/inbox?level=warning")
+    body = page.locator("main").inner_text()
+    assert "quota nearly used up" in body
+    assert "routine deploy finished" not in body and "worker crashed twice" not in body
+    assert "1 of 3 shown" in body and "level: warning" in body
+    page.goto(f"{server}/inbox?project=nope")
+    assert "nothing matches these filters" in page.locator("main").inner_text()
+
+
+def test_a_critical_inbox_row_sits_above_the_others(page, server):
+    _inbox_rows()
+    page.goto(f"{server}/inbox?sort=newest")
+    crit = page.locator(".needs-you :text('worker crashed twice')").bounding_box()
+    for other in ("quota nearly used up", "routine deploy finished"):
+        assert crit["y"] < page.locator(f"main .panel :text('{other}')").bounding_box()["y"]
+
+
+def test_clicking_an_inbox_row_id_opens_its_order(page, server, daemon):
+    wo = ops.create_work_order("proj_a", "the order the alert is about")
+    _inbox_rows(project_wo=wo["id"])
+    page.goto(f"{server}/inbox")
+    page.click(f"a.rowid:has-text('{wo['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
+    assert "the order the alert is about" in page.locator("main").inner_text()
+
+
+# §4 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _morpheus_rows() -> tuple[str, str]:
+    """One failed item and one newer monitoring one; returns (failed id, monitoring id)"""
+    import time
+
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        ids = []
+        for n in (7, 8):
+            item = central.add_morpheus_item(
+                project="proj_a", repo="o/r", pr_number=n,
+                pr_url=f"https://github.com/o/r/pull/{n}", pr_title=f"[wo-1234abcd] {_LONG}",
+                wo_id="wo-1234abcd", release_tag="jarvis-0.1.0", hints=_LONG, script="exit 1",
+                script_source="agent", state="monitoring", deadline_ts=time.time() + 86400)
+            ids.append(item["id"])
+        central.update_morpheus_item(ids[0], state="failed", last_exit=1, checks=2,
+                                     resolution="script exited 1", last_output="boom")
+        central.add_morpheus_run(ids[0], exit=1, output="boom", kind="check",
+                                 state_after="failed")
+        central.update_morpheus_item(ids[1], checks=1, last_exit=75)
+    finally:
+        central.close()
+    return ids[0], ids[1]
+
+
+def test_morpheus_reads_at_desktop_and_phone_width(page, server, readable):
+    failed, _ = _morpheus_rows()
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/morpheus")
+        assert failed in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"morpheus-{size['width']}")
+        page.goto(f"{server}/morpheus/{failed}")
+        assert "boom" in page.locator("#tab-runs").inner_html()
+        readable(page)
+        _shot(page, f"morpheus-item-{size['width']}")
+
+
+def test_a_morpheus_filter_in_the_url_narrows_the_rows(page, server):
+    failed, watching = _morpheus_rows()
+    page.goto(f"{server}/morpheus?state=monitoring")
+    table = page.locator("table.mv-list").inner_text()
+    assert watching in table and failed not in table
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+
+
+# §9 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def test_debug_prompt_spec_and_sessions_pages_read_at_desktop_and_phone_width(
+        page, server, readable):
+    wo = ops.create_work_order("proj_a", "an order to read the debug page of",
+                               description=_LONG)
+    pages = {"debug": f"/wo/proj_a/{wo['id']}/debug", "wo-prompt": f"/wo/proj_a/{wo['id']}/prompt",
+             "project-prompt": "/project/proj_a/prompt", "spec": "/spec/proj_a/fo-00000000",
+             "sessions": "/project/proj_a/sessions"}
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        for name, path in pages.items():
+            page.goto(f"{server}{path}")
+            assert not page.locator("main .grid").count(), path
+            readable(page, "main td, main th, main p, main .row > span")
+            _shot(page, f"{name}-{size['width']}")
+
+
+def test_the_operation_jump_opens_its_tab_on_the_worker_prompt_page(page, server):
+    page.goto(f"{server}/project/proj_a/prompt#operation")
+    assert page.locator("#operation").is_visible()
+    assert not page.locator("#prompt").is_visible()
+
+
+def test_a_failed_morpheus_row_sits_above_the_others(page, server):
+    failed, watching = _morpheus_rows()
+    page.goto(f"{server}/morpheus")
+    rows = page.locator("table.mv-list a.rowid")
+    first = rows.filter(has_text=failed).bounding_box()
+    assert first["y"] < rows.filter(has_text=watching).bounding_box()["y"]
+
+
+def test_clicking_a_morpheus_row_id_opens_its_detail(page, server):
+    failed, _ = _morpheus_rows()
+    page.goto(f"{server}/morpheus")
+    page.click(f"table.mv-list a.rowid:has-text('{failed}')")
+    page.wait_for_url(f"**/morpheus/{failed}")
+    assert "confirm failed" in page.locator("main").inner_text()
+    page.goto(f"{server}/go/{failed}")
+    page.wait_for_url(f"**/morpheus/{failed}")
+
+
+# §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _alarm_rows(project) -> dict[str, str]:
+    """One live long-turn alarm and two settled ones of different kinds; returns ids"""
+    burning = ops.create_work_order("proj_a", "the order still burning")
+    settled = ops.create_work_order("proj_a", "the order that settled")
+    store = ProjectStore(project)
+    try:
+        live = store.add_alarm(burning["id"], "long-turn", 2, f"turn 2 is still being billed: {_LONG}")
+        store.flag_attention(burning["id"], "a turn is still being billed")
+        old = store.add_alarm(settled["id"], "cache-write", 4, f"turn 4 re-sent the conversation: {_LONG}")
+        store.update_alarm(old["id"], status="acked", verdict="ack")
+        slow = store.add_alarm(settled["id"], "long-turn", 5, "turn 5 ran long and finished")
+        store.update_alarm(slow["id"], status="acked", verdict="ack")
+    finally:
+        store.close()
+    return {"live": live["id"], "old": old["id"], "slow": slow["id"]}
+
+
+def test_alarms_read_at_desktop_and_phone_width(page, server, project, readable):
+    ids = _alarm_rows(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/alarms")
+        assert ids["live"] in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"alarms-{size['width']}")
+        page.goto(f"{server}/alarms/proj_a/{ids['old']}")
+        readable(page)
+
+
+def test_an_alarm_filter_in_the_url_narrows_the_record(page, server, project):
+    ids = _alarm_rows(project)
+    page.goto(f"{server}/alarms?kind=cache-write")
+    record = page.locator("table.alarm-list").inner_text()
+    assert ids["old"] in record and ids["slow"] not in record
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+
+
+def test_a_burning_alarm_sits_above_the_record(page, server, project):
+    ids = _alarm_rows(project)
+    page.goto(f"{server}/alarms")
+    live = page.locator(f".needs-you a.rowid:has-text('{ids['live']}')").bounding_box()
+    assert live["y"] < page.locator("table.alarm-list").bounding_box()["y"]
+
+
+def test_clicking_an_alarm_row_id_opens_the_alarm(page, server, project):
+    ids = _alarm_rows(project)
+    page.goto(f"{server}/alarms")
+    page.click(f"table.alarm-list a.rowid:has-text('{ids['old']}')")
+    page.wait_for_url(f"**/alarms/proj_a/{ids['old']}")
+    assert "re-sent the conversation" in page.locator("main").inner_text()
+
+
+def _neo_rows(daemon) -> dict[str, int]:
+    """An escalation, an approved answer and a corrected one; returns ids"""
+    wo = ops.create_work_order("proj_a", "neo history task")
+    daemon.tick()
+    approved = ops.ask_question(wo["id"], f"CSV or JSON? {_LONG}")["question_id"]
+    daemon._neo_drain()
+    ops.neo_review(approved, approved=True)
+    yours = ops.ask_question(wo["id"], "Which bucket for the staging export?")["question_id"]
+    daemon._neo_drain()
+    ops.neo_review(yours, approved=False, feedback=f"the staging bucket, {_LONG}")
+    escalated = ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the key?")["question_id"]
+    daemon._neo_drain()
+    return {"approved": approved, "yours": yours, "escalated": escalated}
+
+
+def test_neo_reads_at_desktop_and_phone_width(page, server, daemon, project, readable):
+    ids = _neo_rows(daemon)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/neo")
+        assert "rotate the key" in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"neo-{size['width']}")
+        page.click(".tabs button:has-text('History')")
+        readable(page)
+        page.goto(f"{server}/neo/question/{ids['approved']}")
+        readable(page)
+        _shot(page, f"neo-question-{size['width']}")
+        page.goto(f"{server}/neo/stats")
+        readable(page)
+        _shot(page, f"neo-stats-{size['width']}")
+
+
+def test_a_neo_filter_in_the_url_narrows_the_history(page, server, daemon, project):
+    ids = _neo_rows(daemon)
+    page.goto(f"{server}/neo?review=approved")
+    assert page.locator("#tab-history").is_visible()      # a filter opens the tab it filters
+    rows = page.locator("table.neo-history a.rowid").all_inner_texts()
+    assert rows == [str(ids["approved"])]
+    assert "1 of 2 shown" in page.locator("#tab-history").inner_text()
+
+
+def test_an_escalated_question_sits_above_the_tabs(page, server, daemon, project):
+    ids = _neo_rows(daemon)
+    page.goto(f"{server}/neo")
+    strip = page.locator(f".needs-you a.rowid:has-text('#{ids['escalated']}')").bounding_box()
+    assert strip["y"] < page.locator("#neo-tabs").bounding_box()["y"]
+
+
+def test_clicking_a_neo_row_id_opens_the_question(page, server, daemon, project):
+    ids = _neo_rows(daemon)
+    page.goto(f"{server}/neo")
+    page.click(".tabs button:has-text('History')")
+    page.click(f"table.neo-history a.rowid:text-is('{ids['yours']}')")
+    page.wait_for_url(f"**/neo/question/{ids['yours']}")
+    assert "Which bucket for the staging export?" in page.locator("main").inner_text()
+
+
+def _cost_rows(project) -> dict:
+    """A work order with one recorded turn, the shape the cost listing reads"""
+    import json
+
+    wo = ops.create_work_order("proj_a", f"a costed order: {_LONG}")
+    store = ProjectStore(project)
+    try:
+        turn = store.create_turn(wo["id"], kind="dispatch", prompt="p")
+        store.finish_turn(turn["id"], "done", result="r", cost_usd=0.5, num_turns=1,
+                          usage_json=json.dumps({"total_cost_usd": 0.5, "input": 2,
+                                                 "cache_write": 2558, "cache_read": 45689,
+                                                 "output": 941, "api_calls": 1,
+                                                 "context_peak": 1000,
+                                                 "context_window": 1_000_000}))
+    finally:
+        store.close()
+    return wo
+
+
+def test_cost_and_bill_read_at_desktop_and_phone_width(page, server, project, readable):
+    wo = _cost_rows(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/cost?project=proj_a")   # scoped: the fleet entry is cached across tests
+        page.wait_for_selector(f"table.cost-list a.rowid:has-text('{wo['id']}')")
+        _shot(page, f"cost-{size['width']}")
+        readable(page)
+        page.goto(f"{server}/cost/proj_a/{wo['id']}")
+        _shot(page, f"bill-{size['width']}")
+        readable(page)
+
+
+def test_a_cost_project_filter_in_the_url_scopes_the_listing(page, server, project):
+    wo = _cost_rows(project)
+    page.goto(f"{server}/cost?project=proj_a")
+    page.wait_for_selector("table.cost-list")
+    assert "project: proj_a" in page.locator(".filter-bar").inner_text()
+    assert wo["id"] in page.locator("table.cost-list").inner_text()
+    page.goto(f"{server}/cost?project=nope")
+    assert "not registered" in page.locator("main").inner_text()
+
+
+def test_clicking_a_cost_row_id_opens_its_order(page, server, project):
+    wo = _cost_rows(project)
+    page.goto(f"{server}/cost?project=proj_a")   # scoped: never a fleet entry cached by another test
+    page.wait_for_selector("table.cost-list")
+    page.click(f"table.cost-list a.rowid:has-text('{wo['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
+
+
+def test_config_reads_and_stacks_history_over_diff(page, server, readable):
+    ops.adopt_config(reason="the file as it shipped")
+    ops.set_config("os.ui.port", 9999)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/config")
+        _shot(page, f"config-{size['width']}")
+        # A settings row is as tall as its edit form, so a cfg-table cell's height says
+        # nothing about its text: measure the prose blocks inside those cells instead.
+        readable(page, "main p, main th, main td:not(.cfg-table td), .cfg-table td > div")
+        history = page.locator("#cfg-history").bounding_box()
+        diff = page.locator("h2:text-is('Diff')").bounding_box()
+        assert diff["y"] > history["y"] and diff["x"] == history["x"]  # stacked, not beside
+    assert page.locator(".cfg-tree").is_visible()                       # the tree stays
+# §5 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _stuck_rows(monkeypatch) -> tuple[str, str]:
+    """Two real orders, one judged past its threshold; returns (stuck id, fine id)"""
+    stuck = ops.create_work_order("proj_a", f"stuck: {_LONG}")["id"]
+    fine = ops.create_work_order("proj_a", "inside its threshold")["id"]
+
+    def row(wo_id, title, over):
+        return {"id": wo_id, "project": "proj_a", "title": title,
+                "status": "waiting_pr_merge" if over else "running",
+                "status_label": "waiting on a PR merge" if over else "running",
+                "seconds_in_status": 18000 if over else 60, "seconds_since_activity": 60,
+                "discounted_seconds": 0, "active_seconds": 60, "threshold_seconds": 3600,
+                "clock": "in status", "stuck": over, "excluded": "",
+                "reason": _LONG if over else "", "blocker": "the PR has not merged",
+                "fingerprint": "f", "investigation": None}
+    # Fine row first, so the page's attention ordering is what lifts the stuck one
+    monkeypatch.setattr(ops, "stuck_report", lambda *a, **k: [
+        row(fine, "inside its threshold", False), row(stuck, f"stuck: {_LONG}", True)])
+    return stuck, fine
+
+
+def test_stuck_reads_at_desktop_and_phone_width(page, server, readable, monkeypatch):
+    stuck, _ = _stuck_rows(monkeypatch)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/stuck")
+        assert stuck in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"stuck-{size['width']}")
+
+
+def test_a_stuck_filter_in_the_url_narrows_the_rows(page, server, monkeypatch):
+    stuck, fine = _stuck_rows(monkeypatch)
+    page.goto(f"{server}/stuck?status=running")
+    table = page.locator("main .panel table").inner_text()
+    assert fine in table and stuck not in table
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+    page.goto(f"{server}/stuck?kind=fo")
+    assert "nothing matches these filters" in page.locator("main").inner_text()
+
+
+def test_a_stuck_row_sits_above_the_others(page, server, monkeypatch):
+    stuck, fine = _stuck_rows(monkeypatch)
+    page.goto(f"{server}/stuck")
+    rows = page.locator("main .panel table a.rowid")
+    assert rows.filter(has_text=stuck).bounding_box()["y"] < \
+        rows.filter(has_text=fine).bounding_box()["y"]
+
+
+def test_clicking_a_stuck_row_id_opens_its_order(page, server, monkeypatch):
+    stuck, _ = _stuck_rows(monkeypatch)
+    page.goto(f"{server}/stuck")
+    page.click(f"main .panel table a.rowid:has-text('{stuck}')")
+    page.wait_for_url(f"**/wo/proj_a/{stuck}")
+
+
+def _steward_rows() -> tuple[int, int]:
+    """One critical ask and one expired queued decision; returns (ask id, expired id)"""
+    import json
+
+    from jarvis import db, steward
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        base = {"project": "proj_a", "severity": "medium", "outcome": "queue",
+                "rule": "recurrence", "mode": "enforce", "origin_kind": "panel"}
+        expired = central.record_steward_decision({**base, "subject": f"old: {_LONG}",
+                                                   "reason": _LONG})
+        steward.settle_unrecoverable(central)
+        ask = central.record_steward_decision({
+            **base, "origin_kind": "morpheus", "outcome": "ask", "severity": "critical",
+            "rule": "critical-ceiling", "subject": f"PR failed in production: {_LONG}",
+            "ts": db.now(), "candidate_json": json.dumps({"payload": {"morpheus_item": "mv-1"}})})
+    finally:
+        central.close()
+    return ask, expired
+
+
+def test_steward_reads_at_desktop_and_phone_width(page, server, readable):
+    ask, expired = _steward_rows()
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/steward")
+        assert f"#{ask}" in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"steward-{size['width']}")
+        page.goto(f"{server}/steward/{expired}")
+        readable(page)
+        _shot(page, f"steward-item-{size['width']}")
+
+
+def test_a_steward_filter_in_the_url_narrows_the_rows(page, server):
+    ask, expired = _steward_rows()
+    page.goto(f"{server}/steward?tab=settled")
+    main = page.locator("main").inner_text()
+    assert f"#{expired}" in main and f"#{ask}" not in main
+    assert "1 of 2 shown" in main
+    page.goto(f"{server}/steward?project=nope")
+    assert "nothing matches these filters" in page.locator("main").inner_text()
+
+
+def test_a_steward_ask_sits_above_the_others(page, server):
+    ask, expired = _steward_rows()
+    page.goto(f"{server}/steward")
+    assert page.locator("#steward-asks").is_visible()
+    assert not page.locator("#steward-settled").is_visible()
+    assert page.locator(".needs-you").bounding_box()["y"] < \
+        page.locator("#steward-tabs").bounding_box()["y"]
+
+
+def test_clicking_a_steward_row_id_opens_its_decision(page, server):
+    _, expired = _steward_rows()
+    page.goto(f"{server}/steward?tab=settled")
+    page.click(f"#steward-settled a.rowid:has-text('#{expired}')")
+    page.wait_for_url(f"**/steward/{expired}")
+    assert "critical" not in page.locator("main h2").inner_text()
+    assert "re-offer" in page.locator("main").inner_text()
+
+
+def _evolution_rules(monkeypatch) -> None:
+    """A firing rule, a quiet one and an unreadable one, newest-first in that order"""
+    real = ops.evolution_report
+
+    def fake(project=None, *, days=90):
+        report = real(project, days=days)
+        base = {"gap_class": "stuck_order", "summary": _LONG, "status": "dry_run",
+                "hits": 0, "false_positives": 0, "recurrences": 0, "last_fired": None,
+                "last_cleared": None, "hit_rate": None, "hit_rate_note": "never fired",
+                "readable": True, "condition_problems": [], "median_cleared_seconds": None,
+                "median_cleared_seconds_note": "not a median yet"}
+        report["per_rule"] = [
+            {**base, "id": "det-firing", "hits": 4, "last_fired": 1.0, "hit_rate": 0.5},
+            {**base, "id": "det-quiet"},
+            {**base, "id": "det-broken", "hits": 1, "last_fired": 1.0, "readable": False,
+             "condition_problems": ["field `nope` is not known"]}]
+        report["by_gap_class"] = [{"gap_class": "stuck_order", "total": 5,
+                                   "weeks": [{"week": "2026-10-19", "count": 5}]}]
+        return report
+    monkeypatch.setattr(ops, "evolution_report", fake)
+
+
+def test_evolution_reads_at_desktop_and_phone_width(page, server, readable, monkeypatch):
+    _evolution_rules(monkeypatch)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/evolution")
+        assert "det-broken" in page.locator(".needs-you").inner_text()
+        assert not page.locator("#quiet-detectors table").is_visible()
+        readable(page)
+        _shot(page, f"evolution-{size['width']}")
+        page.goto(f"{server}/evolution/rule/det-firing")
+        readable(page)
+        _shot(page, f"evolution-rule-{size['width']}")
+
+
+def test_an_evolution_filter_in_the_url_narrows_the_rows(page, server, monkeypatch):
+    _evolution_rules(monkeypatch)
+    page.goto(f"{server}/evolution?firing=quiet")
+    main = page.locator("main").inner_text()
+    assert "det-quiet" in main and "det-firing" not in main
+    assert "1 of 3 shown" in main
+
+
+def test_an_unreadable_rule_sits_above_the_others(page, server, monkeypatch):
+    _evolution_rules(monkeypatch)
+    page.goto(f"{server}/evolution")
+    rows = page.locator("main .panel table a.rowid")
+    assert rows.filter(has_text="det-broken").bounding_box()["y"] < \
+        rows.filter(has_text="det-firing").bounding_box()["y"]
+
+
+def test_clicking_an_evolution_rule_id_opens_its_page(page, server, monkeypatch):
+    _evolution_rules(monkeypatch)
+    page.goto(f"{server}/evolution")
+    page.click("main .panel table a.rowid:has-text('det-firing')")
+    page.wait_for_url("**/evolution/rule/det-firing")
+    assert "2026-10-19" in page.locator("main").inner_text()
+
+
+# §6 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _records() -> dict:
+    """An escalated gate and a decided one; a blocked backlog item and a done one; a pinned
+    and an unpinned knowledge entry. Returns their ids."""
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "ship the gates page")
+    store = ProjectStore(ops.registered_project_paths()["proj_a"])
+    try:
+        decided = store.add_approval(wo["id"], "pr_merge", "gh pr merge 41 --squash",
+                                     justification=_LONG)
+        store.decide_approval(decided["id"], "approved", _LONG, "neo")
+        hot = store.add_approval(wo["id"], "release", "./scripts/shipit.sh 1.2.3",
+                                 justification=_LONG, evidence=_LONG)
+        store.mark_approval_escalated(hot["id"], _LONG)
+    finally:
+        store.close()
+    central = CentralStore()
+    try:
+        done = central.add_backlog("proj_a", "the foundation, finished", description=_LONG)
+        central.mark_backlog(done["id"], "done")
+        dep = central.add_backlog("proj_a", "the scaffolding", description=_LONG)
+        tower = central.add_backlog("proj_a", "the tower on top", description=_LONG,
+                                    depends_on=[dep["id"]])
+        pinned = central.add_knowledge(f"PINNED RULE: {_LONG}", project="", topic="gates")
+        central.pin_knowledge(pinned["id"])
+        plain = central.add_knowledge(f"A PROJECT NOTE: {_LONG}", project="proj_a",
+                                      topic="ui")
+    finally:
+        central.close()
+    return {"hot": hot["id"], "decided": decided["id"], "done": done["id"],
+            "dep": dep["id"], "tower": tower["id"], "pinned": pinned["id"],
+            "plain": plain["id"], "wo": wo["id"]}
+
+
+def test_record_lists_and_their_details_read_at_desktop_and_phone_width(page, server,
+                                                                       readable):
+    r = _records()
+    paths = {"gates": "/gates", "gate": f"/gates/{r['hot']}",
+             "backlog": "/backlog", "backlog-item": f"/backlog/{r['tower']}",
+             "knowledge": "/knowledge", "knowledge-item": f"/knowledge/{r['pinned']}",
+             "search": "/search?q=tower"}
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        for name, path in paths.items():
+            page.goto(f"{server}{path}")
+            readable(page)
+            _shot(page, f"{name}-{size['width']}")
+
+
+def test_a_filter_in_the_url_narrows_gates_backlog_knowledge_and_search(page, server):
+    r = _records()
+    page.goto(f"{server}/gates?state=approved")
+    table = page.locator("table.gate-list").inner_text()
+    assert "gh pr merge 41" in table and "shipit" not in table
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+
+    page.goto(f"{server}/backlog?status=done")
+    table = page.locator("table.backlog-list").inner_text()
+    assert r["done"] in table and r["tower"] not in table
+
+    page.goto(f"{server}/knowledge?pinned=pinned")
+    table = page.locator("table.kn-list").inner_text()
+    assert r["pinned"] in table and r["plain"] not in table
+    page.goto(f"{server}/knowledge?project=proj_a")
+    table = page.locator("table.kn-list").inner_text()
+    assert r["plain"] in table and r["pinned"] not in table
+
+    page.goto(f"{server}/search?q=tower&kind=knowledge")
+    assert r["tower"] not in page.locator("main").inner_text()
+    page.goto(f"{server}/search?q=tower&kind=backlog")
+    assert r["tower"] in page.locator("table.search-list").inner_text()
+
+
+def test_a_needing_you_gate_and_a_blocked_backlog_item_sit_above_the_others(page, server):
+    r = _records()
+    page.goto(f"{server}/gates")
+    assert f"#{r['hot']}" in page.locator(".needs-you").inner_text()
+    rows = page.locator("table.gate-list a.rowid")
+    hot = rows.filter(has_text=f"#{r['hot']}").bounding_box()
+    assert hot["y"] < rows.filter(has_text=f"#{r['decided']}").bounding_box()["y"]
+
+    page.goto(f"{server}/backlog")
+    assert r["tower"] in page.locator(".needs-you").inner_text()
+    rows = page.locator("table.backlog-list a.rowid")
+    tower = rows.filter(has_text=r["tower"]).first.bounding_box()
+    assert tower["y"] < rows.filter(has_text=r["done"]).first.bounding_box()["y"]
+
+
+def test_clicking_a_record_row_id_opens_its_detail(page, server):
+    r = _records()
+    page.goto(f"{server}/gates")
+    page.click(f"table.gate-list a.rowid:has-text('#{r['hot']}')")
+    page.wait_for_url(f"**/gates/{r['hot']}?project=proj_a")
+    assert "Approve" in page.locator("main").inner_text()
+
+    page.goto(f"{server}/backlog")
+    page.click(f"table.backlog-list a.rowid:has-text('{r['tower']}')")
+    page.wait_for_url(f"**/backlog/{r['tower']}")
+    page.click(f"main a.rowid:has-text('{r['dep']}')")  # a dependency opens its own record
+    page.wait_for_url(f"**/backlog/{r['dep']}")
+
+    page.goto(f"{server}/knowledge")
+    page.click(f"table.kn-list a.rowid:has-text('{r['pinned']}')")
+    page.wait_for_url(f"**/knowledge/{r['pinned']}")
+    page.click("button:has-text('unpin')")  # the toggle returns to the entry it changed
+    page.wait_for_url(f"**/knowledge/{r['pinned']}")
+    assert "reaches workers through the index" in page.locator("main").inner_text()
+
+    page.goto(f"{server}/search?q=tower")
+    page.click(f"table.search-list a.rowid:has-text('{r['tower']}')")
+    page.wait_for_url(f"**/backlog/{r['tower']}")
+    page.goto(f"{server}/go/gate-{r['hot']}")
+    page.wait_for_url(f"**/gates/{r['hot']}")
+# §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+_ROWS = "main .panel .row .grow, main td, main th, main p"
+
+
+def _open_orders(project, parent_id=None):
+    """Three open orders, the one owed a review created FIRST so newest-first puts it last"""
+    store = ProjectStore(project)
+    try:
+        made = {}
+        for title, status in (("an order owed a review", "needs_review"),
+                              ("a pull request waiting to merge", "waiting_pr_merge"),
+                              ("a worker busy on it", "validating")):
+            wo = store.create_work_order(title, description=_LONG, parent_id=parent_id)
+            store.set_status(wo["id"], status)
+            made[status] = wo
+    finally:
+        store.close()
+    ops.assume(made["needs_review"]["id"], "went with sqlite over postgres")  # what it owes
+    return made
+
+
+def _first_row_text(page, panel):
+    return page.locator(f"{panel} > .row").first.inner_text()
+
+
+def test_the_dashboard_reads_at_desktop_and_phone_width(page, server, project, readable):
+    _open_orders(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(server)
+        assert "an order owed a review" in page.locator(".needs-you").inner_text()
+        assert page.locator("#live-top .open-work").is_visible()
+        readable(page, _ROWS)
+        _shot(page, f"dashboard-{size['width']}")
+
+
+def test_a_dashboard_filter_in_the_url_narrows_the_rows(page, server, project):
+    _open_orders(project)
+    page.goto(f"{server}/?status=waiting_pr_merge")
+    work = page.locator(".open-work").inner_text()
+    assert "a pull request waiting to merge" in work
+    assert "a worker busy on it" not in work and "an order owed a review" not in work
+    assert "1 of 3 shown" in page.locator("main").inner_text()
+    page.goto(f"{server}/?project=nope")
+    assert "nothing matches these filters" in page.locator(".open-work").inner_text()
+
+
+def test_a_dashboard_row_needing_you_sits_above_the_others(page, server, project):
+    _open_orders(project)
+    page.goto(server)
+    assert "an order owed a review" in _first_row_text(page, ".open-work")
+
+
+def test_a_flagged_dashboard_row_outside_the_needs_you_statuses_sits_on_top(page, server,
+                                                                            project):
+    store = ProjectStore(project)
+    try:
+        quiet = store.create_work_order("an unflagged order")
+        store.set_status(quiet["id"], "validating")
+        flagged = store.create_work_order("a flagged order under review")
+        store.set_status(flagged["id"], "validating")
+        store.flag_attention(flagged["id"], "its reviewer gave up")
+        newest = store.create_work_order("the newest unflagged order")
+        store.set_status(newest["id"], "validating")
+    finally:
+        store.close()
+    page.goto(server)
+    assert "a flagged order under review" in _first_row_text(page, ".open-work")
+
+
+def test_a_dashboard_filter_survives_a_live_poll(page, server, project):
+    made = _open_orders(project)
+    page.goto(f"{server}/?status=waiting_pr_merge")
+    page.evaluate("window.jarvisLiveSync()")
+    store = ProjectStore(project)
+    try:
+        store.create_work_order("landed after the page loaded", status="waiting_pr_merge")
+    finally:
+        store.close()
+    page.evaluate("window.jarvisLiveSync()")
+    work = page.locator("#live-top .open-work").inner_text()
+    assert "landed after the page loaded" in work, "the poll swapped the region"
+    assert made["waiting_pr_merge"]["title"] in work
+    assert "a worker busy on it" not in work and "an order owed a review" not in work
+    assert page.locator("select[name=status]").input_value() == "waiting_pr_merge"
+
+
+def test_clicking_a_dashboard_row_id_opens_its_order(page, server, project):
+    wo = _open_orders(project)["validating"]
+    page.goto(server)
+    page.click(f".open-work a.rowid:has-text('{wo['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
+    assert "a worker busy on it" in page.locator("main").inner_text()
+
+
+def test_the_project_page_reads_at_desktop_and_phone_width(page, server, project, readable):
+    _open_orders(project)
+    ops.create_feature_order("proj_a", "a feature in the tabs", description=_LONG)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/project/proj_a")
+        assert page.locator(".proj-orders").is_visible()
+        assert "a feature in the tabs" in page.locator("#tab-features").inner_text()
+        assert not page.locator("#tab-improvements").is_visible()
+        readable(page, _ROWS)
+        _shot(page, f"project-{size['width']}")
+
+
+def test_a_project_status_filter_in_the_url_narrows_the_rows(page, server, project):
+    _open_orders(project)
+    page.goto(f"{server}/project/proj_a?status=needs_review")
+    rows = page.locator(".proj-orders").inner_text()
+    assert "an order owed a review" in rows
+    assert "a pull request waiting to merge" not in rows and "a worker busy on it" not in rows
+    page.goto(f"{server}/project/proj_a?status=nope")
+    assert "nothing matches these filters" in page.locator(".proj-orders").inner_text()
+
+
+def test_a_project_row_needing_you_sits_above_the_others(page, server, project):
+    _open_orders(project)
+    page.goto(f"{server}/project/proj_a")
+    assert "an order owed a review" in _first_row_text(page, ".proj-orders")
+
+
+def test_clicking_a_project_row_id_opens_its_order(page, server, project):
+    fo = ops.create_feature_order("proj_a", "a feature in the tabs", description=_LONG)
+    wo = _open_orders(project)["waiting_pr_merge"]
+    page.goto(f"{server}/project/proj_a")
+    page.click(f".proj-orders a.rowid:has-text('{wo['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
+    page.goto(f"{server}/project/proj_a")
+    page.click(f"#tab-features a.rowid:has-text('{fo['id']}')")
+    page.wait_for_url(f"**/fo/proj_a/{fo['id']}")
+
+
+def _executing_feature(project):
+    fo = ops.create_feature_order("proj_a", "a feature with children", description=_LONG)
+    store = ProjectStore(project)
+    try:
+        store.set_feature_status(fo["id"], "executing")
+    finally:
+        store.close()
+    return fo, _open_orders(project, parent_id=fo["id"])
+
+
+def test_the_feature_page_reads_at_desktop_and_phone_width(page, server, project, readable):
+    fo, _ = _executing_feature(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/fo/proj_a/{fo['id']}")
+        assert page.locator(".page-head").inner_text().startswith(fo["id"])
+        assert not page.locator("details.explain > div.panel").is_visible()  # the ask folds
+        readable(page, _ROWS)
+        _shot(page, f"feature-{size['width']}")
+
+
+def test_a_feature_child_needing_you_sits_above_the_others(page, server, project):
+    fo, _ = _executing_feature(project)
+    page.goto(f"{server}/fo/proj_a/{fo['id']}")
+    assert "an order owed a review" in _first_row_text(page, ".fo-children")
+
+
+def test_clicking_a_feature_child_id_opens_its_order(page, server, project):
+    fo, kids = _executing_feature(project)
+    page.goto(f"{server}/fo/proj_a/{fo['id']}")
+    page.click(f".fo-children a.rowid:has-text('{kids['validating']['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{kids['validating']['id']}")
+
+
+def test_the_improvement_and_investigation_pages_read_at_both_widths(page, server, project,
+                                                                     readable):
+    stuck = _open_orders(project)["validating"]
+    io = ops.create_improvement_order("proj_a", "workers keep stalling", description=_LONG,
+                                      refs=[stuck["id"]])
+    inv = ops.create_investigation_order("proj_a", stuck["id"], _LONG)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        for kind, rec in (("io", io), ("inv", inv)):
+            page.goto(f"{server}/{kind}/proj_a/{rec['id']}")
+            assert page.locator(".page-head").inner_text().startswith(rec["id"])
+            readable(page, _ROWS)
+            _shot(page, f"{kind}-{size['width']}")
+
+
+def test_the_work_order_card_and_asks_stack_full_width(page, server, project, readable):
+    wo = _open_orders(project)["needs_review"]
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/wo/proj_a/{wo['id']}")
+        card = page.locator(".wo-card").bounding_box()
+        asks = page.locator(".asks").bounding_box()
+        assert asks["y"] >= card["y"] + card["height"] - 1, "asks sit below the card"
+        assert abs(asks["width"] - card["width"]) < 2, "both span the same full width"
+        readable(page, _ROWS)
+        _shot(page, f"work-order-{size['width']}")

@@ -46,6 +46,8 @@ HELD_STATUS = "status"
 HELD_ASSUMPTIONS = "assumptions"
 #: ITS OWN CODE, never folded into `HELD_ASSUMPTIONS`: the dedupe key above would drop the second of... (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.4)
 HELD_PLAN_ASSUMPTIONS = "plan_assumptions"
+#: A feature child waits for its feature's spec pull request to merge (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2)
+HELD_SPEC_UNMERGED = "spec_unmerged"
 #: An open 'drifted from the ask' finding on the delivery this merge would land (#1063)
 HELD_DRIFT_ALARM = "drift_alarm"
 HELD_NOT_PASSED = "not_passed"
@@ -251,6 +253,8 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
         f"catch this branch up. Merge it by hand, re-judge it "
         f"(`jarvis validation force`), or `jarvis wo send` the worker"
         if cause == ops.CATCH_UP_DEFER_CARRY_UNPROVEN else
+        f"{moved}; the branch is caught up again once {catch_up.reason} runs out"
+        if cause == ops.CATCH_UP_DEFER_BACKOFF else
         f"{moved}; the branch is being caught up as soon as "
         f"{catch_up.reason or 'the work in flight'} finishes — the OS retries every "
         f"tick")
@@ -276,6 +280,7 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
            *, validated_head: str | None,
            pending_assumptions: bool = False,
            plan_assumptions: str = "",
+           spec_unmerged: str = "",
            drift: DriftAlarm | None = None,
            base_red: BaseRed | None = None,
            base_behind: BaseBehind | None = None) -> Decision:
@@ -299,6 +304,10 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"the plan this work order implements is still waiting on you — "
                      f"assumptions on {plan_assumptions}, and the machine does not "
                      f"merge over a decision a person owes")
+    if spec_unmerged:
+        return _held(HELD_SPEC_UNMERGED,
+                     f"the feature's spec pull request {spec_unmerged} has not merged, and "
+                     f"a child never lands on the default branch ahead of its spec")
     # Beside the two above and before every environmental fact: a finding about THIS artifact (#1063)
     if drift is not None:
         return _held(HELD_DRIFT_ALARM, drift_reason(drift))
@@ -400,14 +409,14 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
 
 def only_the_head_moved(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any,
                         cfg: Any, *, pending_assumptions: bool = False,
-                        plan_assumptions: str = "") -> bool:
+                        plan_assumptions: str = "", spec_unmerged: str = "") -> bool:
     """Would this pull request merge right now if a round had judged the head it has? (docs/superpowers/specs/2026-10-16-a-verdict-bound-to-no-commit-re-judges-itself.md §2)"""
     head = str(pr.head_oid or "")
     if not head:
         return False
     return decide(round_row, wo, pr, cfg, validated_head=head,
                   pending_assumptions=pending_assumptions,
-                  plan_assumptions=plan_assumptions).armed
+                  plan_assumptions=plan_assumptions, spec_unmerged=spec_unmerged).armed
 
 
 def merge_command(pr_url: str, sha: str) -> str:

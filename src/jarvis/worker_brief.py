@@ -19,10 +19,12 @@ def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
         f"chars; a second decision is a second `jarvis wo assume` citing it "
         f"(`per Q1234`/`per assumption #2`)."
         # Dropped in the CORE only: `CORE_BUDGET_CHARS` leaves no room for it there
-        + (f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), never by "
-           f"pasting it and never by naming a whole document. A citation points, it "
-           f"does not argue: still state the fact the decision rests on, since Neo "
-           f"may not be shown what you cite." if cite_spec else "")
+        + (f" No `Also:`: Neo returns a bundle unruled."
+           f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), down to the "
+           f"item you rely on (`6.2 item 5`), never by pasting it and never by naming a "
+           f"whole document. A citation points, it does not argue: still state the fact "
+           f"the decision rests on, since Neo may not be shown what you cite."
+           if cite_spec else "")
         + tail)
 
 #: Budget for the rendered core contract block (between "# Operating contract" and "# Full... (docs/superpowers/specs/2026-08-22-agent-concision.md)
@@ -499,6 +501,15 @@ def record_section(wo_id: str = WO_PLACEHOLDER,
         f"A spike that proved an approach wrong has produced something worth "
         f"recording and nothing worth merging. What the OS will not accept is "
         f"silence, because silence is indistinguishable from work that was lost.",
+        "",
+        "Nobody executes a list of next steps written into a summary: this OS runs "
+        "itself, and the user does not keep a to-do list for it. When you abandon "
+        "because another order or pull request already covers the work, name that "
+        "order's id in the reason so the record points at it, and do not hand the "
+        "user steps the OS takes by itself (merging, releasing, re-watching a "
+        "check). If something truly still needs doing that no running order "
+        "covers, file it — `jarvis backlog add` or ask Neo — rather than writing it "
+        "into prose that ends with your session.",
         "",
         "# Evidence",
         f"Pass `--evidence \"<what you ran and what it showed>\"` to `jarvis wo "

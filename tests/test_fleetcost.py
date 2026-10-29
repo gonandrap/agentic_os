@@ -532,8 +532,9 @@ def test_payload_keys_stable(fleet_fixture):
 
     assert set(fleet) == FLEET_KEYS
     assert set(fleet["metrics"]) == METRIC_KEYS
+    # `open_ended` is ADDITIVE, and `version` stays 1: §10.6's rule
     assert set(fleet["window"]) == {"since", "until", "label", "local_label", "source",
-                                    "window", "offset", "zone"}
+                                    "window", "offset", "zone", "open_ended"}
     assert set(fleet["orders"]) == {"n", "live", "truncated", "excluded_no_turns"}
     one = fleet["metrics"]["cost_per_turn_usd"]
     assert set(one) == {"n", "avg", "p90", "max", "unit", "provenance", "cost_basis",

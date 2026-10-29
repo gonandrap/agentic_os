@@ -670,6 +670,31 @@ def test_a_hold_is_recorded_once_per_reason_and_is_not_an_attention_item(started
     assert "held" in ops.autoreview_state(store, wo)["line"]
 
 
+def test_every_pending_hold_is_named_not_only_the_newest(started):
+    """Holds land one assumption at a time; the summary must not show only the last one"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=("reused the production api key",
+                                  "reused the production db password", ROUTINE,
+                                  "pointed the production cron at the new host"))
+
+    ask(started, store)
+
+    held = events(store, wo["id"], "autoreview_held")
+    assert len(held) == 3
+    line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert line.startswith("held — the OS would not decide 3 assumptions: ")
+    for h in held:
+        assert f"#{h['n']}" in line
+    assert "#3" not in line
+
+    # A decided assumption stops being owed, and one left reads as it always did
+    first, second, *_ = store.pending_assumptions(wo["id"])
+    store.review_assumption(first["id"], "accepted")
+    store.review_assumption(second["id"], "accepted")
+    line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "would not decide" not in line and "#4" in line
+
+
 def settled_round(store, wo_id: str, outcome: str, reason: str = "") -> None:
     """A fresh settled round on the judged commit, `park`'s way"""
     row = store.open_validation_round(wo_id=wo_id, fingerprint="fp1")
