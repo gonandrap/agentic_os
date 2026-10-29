@@ -50,7 +50,7 @@ def test_no_html_page_answers_a_blank_param_with_a_422(jarvis_home, fake_claude,
 
 
 def test_html_get_query_params_are_str():
-    """A non-str query param 422s on the blank 'every X' option: declare str, parse with query_int (kn-34d78a6e)"""
+    """Blank 'every X' option fails a non-str param: declare str, parse with query_int (kn-34d78a6e)"""
     offenders = []
     for route in _html_get_routes(create_app()):
         for q in route.dependant.query_params:
@@ -117,7 +117,7 @@ class _Links(HTMLParser):
 
 
 def _form_urls(page_url: str, form: dict) -> set[str]:
-    """Each select at its blank option and at each listed value, the others left at their first"""
+    """Each select at blank and at each option, the others at their first"""
     action = urljoin(page_url, form["action"] or page_url).split("?")[0]
     base = dict(form["fixed"])
     base.update({n: (vals[0] if vals else "") for n, vals in form["selects"].items()})
@@ -136,7 +136,7 @@ def _same_origin(url: str) -> bool:
 
 def test_every_url_the_templates_produce_answers_with_a_page(
         jarvis_home, fake_claude, catalog_file, live_daemon):
-    """Users click filter selects, chips and clear links: fetch exactly those, depth 1 (wo-0fbceffa)"""
+    """Fetch the links and filter forms users click, depth 1 (wo-0fbceffa)"""
     app = create_app()
     ops.start_os(str(catalog_file), foreground=True)
     daemon = Daemon(load_catalog(catalog_file))
