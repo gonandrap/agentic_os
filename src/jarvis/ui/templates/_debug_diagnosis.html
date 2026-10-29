@@ -75,7 +75,7 @@
   {% for episode in d.holds.episodes %}
   {% set k = episode.key %}
   {% set held_href = ('/neo/question/' ~ k) if episode.cause == 'neo_question'
-     else ('/gates#gate-' ~ k) if episode.cause == 'gate'
+     else ('/gates/' ~ k) if episode.cause == 'gate'
      else (wo_base ~ '#round-' ~ k) if episode.cause == 'validation'
      else (wo_base ~ '#msg-' ~ k) if episode.cause == 'message'
      else '' %}
