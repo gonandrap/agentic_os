@@ -7,9 +7,13 @@ import dataclasses
 import pytest
 
 from jarvis import branchproof, db, gates, github, invariants, ops
-from jarvis.catalog import load_catalog
+from jarvis.catalog import PullRequestsConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
+from jarvis.catalog import DEFAULT_PULL_REQUESTS_CATCH_UP_MAX as CATCH_UP_MAX
+from jarvis.catalog import DEFAULT_PULL_REQUESTS_CATCH_UP_WINDOW_MINUTES
+
+CATCH_UP_WINDOW_SECONDS = DEFAULT_PULL_REQUESTS_CATCH_UP_WINDOW_MINUTES * 60
 
 PR = "https://github.com/acme/proj/pull/7"
 
@@ -234,7 +238,7 @@ def test_the_cap_stops_the_os_chasing_a_fast_moving_base(started, project, fake_
     """GUARD 5, and the per-base-sha key cannot do this job: every commit on `main` is a new key and would..."""
     opt_in(started)
     store, wo = parked(project)
-    for i in range(ops.CATCH_UP_MAX):
+    for i in range(CATCH_UP_MAX):
         ops.record_base_update(store, wo, base="main", base_sha=f"{i}" * 40,
                                head_before=JUDGED, head_after=JUDGED, checks=(),
                                cause=ops.BASE_UPDATE_BEHIND)
@@ -243,7 +247,7 @@ def test_the_cap_stops_the_os_chasing_a_fast_moving_base(started, project, fake_
     poll(started, store)
 
     assert fake_gh.updates == []
-    assert len(updates(store, wo)) == ops.CATCH_UP_MAX
+    assert len(updates(store, wo)) == CATCH_UP_MAX
 
 
 def test_catch_ups_older_than_the_window_do_not_hold_a_mergeable_branch(
@@ -251,8 +255,8 @@ def test_catch_ups_older_than_the_window_do_not_hold_a_mergeable_branch(
     """#1215: the cap is a RATE — three green catch-ups must not retire the chase for ever"""
     opt_in(started)
     store, wo = parked(project)
-    stale = db.now() - ops.CATCH_UP_WINDOW_SECONDS - 60
-    for i in range(ops.CATCH_UP_MAX):
+    stale = db.now() - CATCH_UP_WINDOW_SECONDS - 60
+    for i in range(CATCH_UP_MAX):
         store.add_event(wo["id"], invariants.PR_BASE_UPDATED_EVENT,
                         {"base": "main", "base_sha": f"{i}" * 40,
                          "cause": ops.BASE_UPDATE_BEHIND}, ts=stale)
@@ -263,6 +267,49 @@ def test_catch_ups_older_than_the_window_do_not_hold_a_mergeable_branch(
 
     assert fake_gh.updates == [PR]
     assert ops.catch_up_attempts(store, wo["id"]) == 1
+
+
+def test_the_backoff_doubles_from_its_base_up_to_its_ceiling():
+    policy = PullRequestsConfig()
+    assert [ops.catch_up_delay(n, policy) for n in range(7)] \
+        == [0, 60, 120, 240, 480, 600, 600]
+
+
+def test_a_catch_up_inside_its_backoff_is_deferred_and_says_how_long(
+        started, project, fake_gh, local_proof):
+    """The base moved again a moment after the last catch-up: the OS waits before chasing it"""
+    opt_in(started)
+    store, wo = parked(project)
+    ops.record_base_update(store, wo, base="main", base_sha=BASE_OID,
+                           head_before=JUDGED, head_after=JUDGED, checks=(),
+                           cause=ops.BASE_UPDATE_BEHIND)
+    behind_pr(fake_gh, base_oid=BASE_OID2)
+    local_proof["tip"] = BASE_OID2
+
+    poll(started, store)
+
+    assert fake_gh.updates == []
+    [row] = held(store, wo)
+    assert row["catch_up_cause"] == ops.CATCH_UP_DEFER_BACKOFF
+    assert "1m backoff after catch-up 1 of 10" in row["reason"]
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+    assert state["catch_ups"]["attempts"] == 1
+    assert "catch-up retries: 1/10 in the last 2h, next allowed in 1m" in state["line"]
+
+
+def test_a_catch_up_past_its_backoff_runs(started, project, fake_gh, local_proof):
+    opt_in(started)
+    store, wo = parked(project)
+    store.add_event(wo["id"], invariants.PR_BASE_UPDATED_EVENT,
+                    {"base": "main", "base_sha": BASE_OID,
+                     "cause": ops.BASE_UPDATE_BEHIND}, ts=db.now() - 61)
+    behind_pr(fake_gh, base_oid=BASE_OID2)
+    local_proof["tip"] = BASE_OID2
+
+    poll(started, store)
+
+    assert fake_gh.updates == [PR]
+    assert ops.catch_up_attempts(store, wo["id"]) == 2
 
 
 def test_a_head_that_moved_between_the_re_read_and_the_update_is_not_updated(
@@ -434,7 +481,7 @@ def test_an_exhausted_catch_up_names_the_cap_and_proposes_nothing(started, proje
     """§3.4 `EXHAUSTED`, AND THE REGRESSION THIS SPEC TURNS ON"""
     opt_in(started)
     store, wo = parked(project)
-    for i in range(ops.CATCH_UP_MAX):
+    for i in range(CATCH_UP_MAX):
         ops.record_base_update(store, wo, base="main", base_sha=f"{i}" * 40,
                                head_before=JUDGED, head_after=JUDGED, checks=(),
                                cause=ops.BASE_UPDATE_BEHIND)
@@ -445,7 +492,7 @@ def test_an_exhausted_catch_up_names_the_cap_and_proposes_nothing(started, proje
 
     [row] = held(store, wo)
     assert row["code"] == "base_moved"
-    assert f"the cap ({ops.CATCH_UP_MAX})" in row["reason"]
+    assert f"the cap ({CATCH_UP_MAX})" in row["reason"]
     assert "once that window clears" in row["reason"]
     assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []
 
@@ -515,7 +562,7 @@ def at_the_cap(started, project, fake_gh, local_proof):
     gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
                          project="proj_a")
 
-    for i in range(ops.CATCH_UP_MAX):
+    for i in range(CATCH_UP_MAX):
         ops.record_base_update(store, wo, base="main", base_sha=f"{i}" * 40,
                                head_before=JUDGED, head_after=JUDGED, checks=(),
                                cause=ops.BASE_UPDATE_BEHIND)
@@ -537,7 +584,7 @@ def test_a_base_that_outran_the_cached_reading_holds_at_the_cap(started, project
     assert store.events_of_kind(wo["id"], ops.MERGE_BASE_STALE_EVENT) == []
     [row] = held(store, wo)
     assert row["code"] == "base_moved" and row["catch_up"] == ops.CATCH_UP_EXHAUSTED
-    assert f"the cap ({ops.CATCH_UP_MAX})" in row["reason"]
+    assert f"the cap ({CATCH_UP_MAX})" in row["reason"]
     # ...and the order asks the user, instead of sitting on a hold nobody owns
     assert invariants.CATCH_UP_EXHAUSTED_BLOCKER in invariants.true_blockers(
         store, store.get_work_order(wo["id"]))

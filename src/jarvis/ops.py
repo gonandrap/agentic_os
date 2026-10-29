@@ -3164,7 +3164,30 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
             # `rejudging` REWORDS ONLY and never sets `stale`: `force_validation_state` blanks its diagnosis on...
             if why != "rejudging":
                 newest["stale"] = True
-    return {**newest, "line": _automerge_line(newest)}
+    line = _automerge_line(newest)
+    # HOW MANY TIMES THE OS HAS CAUGHT THIS BRANCH UP, against the cap, while it is still open
+    if newest["kind"] != "automerge_merged" and (catch_ups := catch_up_state(store, wo["id"])):
+        newest = {**newest, "catch_ups": catch_ups}
+        line = f"{line} · {catch_ups['line']}"
+    return {**newest, "line": line}
+
+
+def catch_up_state(store: ProjectStore, wo_id: str, *,
+                   now: float = 0.0) -> dict[str, Any] | None:
+    """The catch-up retries inside the current window, or None when there were none"""
+    policy = catch_up_policy(store)
+    now = now or db.now()
+    attempts = catch_up_attempts(store, wo_id, now=now, policy=policy)
+    if not attempts:
+        return None
+    wait = catch_up_backoff(store, wo_id, now=now, policy=policy)
+    window = policy.catch_up_window_minutes
+    line = (f"catch-up retries: {attempts}/{policy.catch_up_max} in the last "
+            f"{f'{window // 60}h' if window % 60 == 0 else f'{window}m'}")
+    if attempts < policy.catch_up_max and wait > 0:
+        line += f", next allowed in {max(1, round(wait / 60))}m"
+    return {"attempts": attempts, "cap": policy.catch_up_max,
+            "window_minutes": window, "backoff_seconds": round(wait), "line": line}
 
 
 #: Every event the automatic assumption review writes
@@ -5562,11 +5585,6 @@ CARRY_BASE_MERGE_CHAIN = "base_merge_chain"
 BASE_UPDATE_BEHIND = "behind"
 BASE_UPDATE_BASE_RED = "base_red"
 
-#: How many times the OS may catch one pull request up with a MOVING base
-CATCH_UP_MAX = 3
-#: ...WITHIN THIS WINDOW: a RATE, not a lifetime budget (#1215, Neo 2191)
-CATCH_UP_WINDOW_SECONDS = 2 * 3600
-
 #: A merge the OS refused because the base moved under the judged commit — spec 2026-09-28 §3.1
 MERGE_BASE_STALE_EVENT = "automerge_base_stale"
 
@@ -5582,6 +5600,8 @@ CATCH_UP_DEFER_IN_FLIGHT = "in_flight"
 CATCH_UP_DEFER_HEAD_MOVED = "head_moved"
 #: The head moved off the judged commit AND no carry could be proven onto it
 CATCH_UP_DEFER_CARRY_UNPROVEN = "carry_unproven"
+#: The last catch-up was too recent: `catch_up_backoff` has not run out
+CATCH_UP_DEFER_BACKOFF = "backoff"
 
 
 @dataclass(frozen=True)
@@ -5740,17 +5760,51 @@ def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: 
                      "reason": reason, "cause": cause})
 
 
-def catch_up_attempts(store: ProjectStore, wo_id: str, *, now: float = 0.0) -> int:
-    """How often the OS has caught this pull request up within `CATCH_UP_WINDOW_SECONDS`"""
+def catch_up_policy(store: ProjectStore) -> Any:
+    """The `pull_requests.catch_up_*` knobs for this store's project"""
+    return pull_requests_config_at(store.project_path)
+
+
+def _catch_up_times(store: ProjectStore, wo_id: str, *, now: float = 0.0,
+                    policy: Any = None) -> list[float]:
+    """When the OS caught this pull request up, oldest first, inside the policy's window"""
     from . import invariants as invariants_mod
 
-    since = (now or db.now()) - CATCH_UP_WINDOW_SECONDS
-    n = 0
+    policy = policy or catch_up_policy(store)
+    since = (now or db.now()) - policy.catch_up_window_minutes * 60
+    times = []
     for row in store.events_of_kind(wo_id, invariants_mod.PR_BASE_UPDATED_EVENT):
         payload = db.from_json(row.get("payload"), {}) or {}
-        if payload.get("cause") == BASE_UPDATE_BEHIND and float(row["ts"] or 0.0) >= since:
-            n += 1
-    return n
+        ts = float(row["ts"] or 0.0)
+        if payload.get("cause") == BASE_UPDATE_BEHIND and ts >= since:
+            times.append(ts)
+    return sorted(times)
+
+
+def catch_up_attempts(store: ProjectStore, wo_id: str, *, now: float = 0.0,
+                      policy: Any = None) -> int:
+    """How often the OS has caught this pull request up within `pull_requests.catch_up_window_minutes`"""
+    return len(_catch_up_times(store, wo_id, now=now, policy=policy))
+
+
+def catch_up_delay(attempts: int, policy: Any) -> int:
+    """The wait after the `attempts`-th catch-up: base, doubled each time, capped at the max"""
+    if attempts <= 0:
+        return 0
+    # The exponent is bounded so a large cap cannot build an enormous integer
+    return min(policy.catch_up_backoff_base_seconds * 2 ** min(attempts - 1, 32),
+               policy.catch_up_backoff_max_seconds)
+
+
+def catch_up_backoff(store: ProjectStore, wo_id: str, *, now: float = 0.0,
+                     policy: Any = None) -> float:
+    """Seconds still to wait before the next catch-up of this pull request, 0 when it may run"""
+    policy = policy or catch_up_policy(store)
+    now = now or db.now()
+    times = _catch_up_times(store, wo_id, now=now, policy=policy)
+    if not times:
+        return 0.0
+    return max(0.0, times[-1] + catch_up_delay(len(times), policy) - now)
 
 
 def catch_up_needed(pr: Any, *, repo: Path, base_tip: str = "") -> bool:

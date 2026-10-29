@@ -9,6 +9,7 @@ from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
+from jarvis.catalog import DEFAULT_PULL_REQUESTS_CATCH_UP_MAX as CATCH_UP_MAX
 
 PR = "https://github.com/acme/proj/pull/7"
 
@@ -236,13 +237,15 @@ def test_an_already_approved_request_is_left_exactly_as_it_was(started, project,
 
 
 def test_the_propose_supersede_loop_is_bounded_and_ends_in_one_exhausted_hold(
-        started, project, fake_gh, local):
+        started, project, fake_gh, local, monkeypatch):
     """§3.6's three bounds, driven on a base that moves on every tick"""
+    # The ticks here are instants apart: the backoff between them is not what this bounds
+    monkeypatch.setattr(ops, "catch_up_backoff", lambda *a, **k: 0.0)
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
 
-    for i in range(ops.CATCH_UP_MAX + 2):
+    for i in range(CATCH_UP_MAX + 2):
         tip = f"{i}" * 40
         fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
                        base_oid=tip)
@@ -251,10 +254,10 @@ def test_the_propose_supersede_loop_is_bounded_and_ends_in_one_exhausted_hold(
         local.update({"tip": tip, "contains": set()})
         poll(started, store)
 
-    assert len(fake_gh.updates) <= ops.CATCH_UP_MAX
+    assert len(fake_gh.updates) <= CATCH_UP_MAX
     held = [db.from_json(e["payload"], {})
             for e in store.events_of_kind(wo["id"], "automerge_held")]
-    assert held and f"the cap ({ops.CATCH_UP_MAX})" in held[-1]["reason"]
+    assert held and f"the cap ({CATCH_UP_MAX})" in held[-1]["reason"]
     assert merges(fake_gh) == []
 
 
