@@ -497,6 +497,15 @@ def record_section(wo_id: str = WO_PLACEHOLDER,
         f"recording and nothing worth merging. What the OS will not accept is "
         f"silence, because silence is indistinguishable from work that was lost.",
         "",
+        "Nobody executes a list of next steps written into a summary: this OS runs "
+        "itself, and the user does not keep a to-do list for it. When you abandon "
+        "because another order or pull request already covers the work, name that "
+        "order's id in the reason so the record points at it, and do not hand the "
+        "user steps the OS takes by itself (merging, releasing, re-watching a "
+        "check). If something truly still needs doing that no running order "
+        "covers, file it — `jarvis backlog add` or ask Neo — rather than writing it "
+        "into prose that ends with your session.",
+        "",
         "# Evidence",
         f"Pass `--evidence \"<what you ran and what it showed>\"` to `jarvis wo "
         f"finish` as well: the tests, evals and manual checks you actually "

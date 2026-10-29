@@ -532,6 +532,13 @@ NO_VALIDATOR_REASON = (
     "settled exactly where it settles with validation switched off"
 )
 
+#: Why an abandonment with nothing produced closes its round unjudged and unescalated
+ABANDONED_VOID_REASON = (
+    "the worker abandoned this order and it produced nothing — no files, no pull "
+    "request, no other durable effect — so there is no work for a reviewer and no "
+    "decision owed to the user: {why}"
+)
+
 #: The pair that records a landing the round machine could not take because a worker turn was in... (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
 VALIDATION_LANDING_DEFERRED = "validation_landing_deferred"
 VALIDATION_LANDED = "validation_landed"
@@ -2099,6 +2106,14 @@ class Daemon:
 
             # A SUBMISSION WITH NOTHING FOR A REVIEWER never reaches the validator (docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §3)
             empty = evidence_mod.nothing_to_judge(packet)
+            # A DECLARED ABANDONMENT THAT PRODUCED NOTHING is a decision, not a delivery (wo-3fa65445)
+            if empty == "escalate" and store.work_abandoned(wo_id):
+                dropped = store.events_of_kind(wo_id, "abandoned")[-1]
+                why = str(db.from_json(dropped["payload"], {}).get("reason") or "")
+                self._void(store, wo, round_id, n, ABANDONED_VOID_REASON.format(why=why))
+                log.info("[%s] %s: round %d voided — abandoned with nothing produced",
+                         project.name, wo_id, n)
+                return
             if empty == "escalate":
                 self._escalate(store, wo, round_id, n,
                                "this submission changes no files and records no other "
