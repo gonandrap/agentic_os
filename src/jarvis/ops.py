@@ -6622,7 +6622,7 @@ def resolve_ref(ref: str) -> str:
     if numbered:
         kind, n = numbered.groups()
         if kind == "gate-":
-            return f"/gates#gate-{n}"
+            return f"/gates/{n}"
         if kind in ("issue-", "#"):
             return "/search?q=" + quote(f"#{n}")
         # a bare number is the one id a reader is shown without a prefix: a Neo question's
@@ -6645,8 +6645,7 @@ def resolve_ref(ref: str) -> str:
         return search
     if prefix == "mv":
         return f"/morpheus/{rid}"
-    # Listed on one fleet-wide page each, and addressed there by their own id
-    return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"#{rid}"
+    return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"/{rid}"
 
 
 def worker_prompts(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -10829,7 +10828,15 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
     """One approval request in full, including the text the reviewer saw"""
     from .neo_store import NeoStore
 
-    name, _path, approval = _find_approval(approval_id, project_name)
+    from . import gates
+
+    name, path, approval = _find_approval(approval_id, project_name)
+    store = ProjectStore(path)
+    try:  # sweep as list_gates does, so the record and the list agree
+        store.expire_approvals()
+        approval = store.get_approval(approval_id) or approval
+    finally:
+        store.close()
     question = None
     if approval["neo_question_id"]:
         neo = NeoStore()
@@ -10837,7 +10844,11 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
             question = neo.get(approval["neo_question_id"])
         finally:
             neo.close()
-    return {**approval, "project": name, "neo_question": question}
+    out = {**approval, "project": name, "neo_question": question}
+    if approval["status"] == gates.AWAITING_CASE:  # its next event is a clock, as in list_gates
+        ttl = _case_ttl_seconds().get(name, gates.DEFAULT_CASE_TTL_SECONDS)
+        out["case_ttl_seconds"], out["case_deadline"] = ttl, approval["ts"] + ttl
+    return out
 
 
 # -- the config console
@@ -11893,6 +11904,37 @@ def defer(wo_id: str, title: str, why: str, description: str = "",
 
 
 # -- backlog
+
+def list_backlog(project: str | None = None, status: str | None = "open"
+                 ) -> list[dict[str, Any]]:
+    """Backlog items, oldest first, each open one with its blockers"""
+    central = CentralStore()
+    try:
+        items = central.list_backlog(project=project, status=status)
+        for it in items:
+            it["blockers"] = (central.unfinished_dependencies(it["id"])
+                              if it["status"] == "open" else [])
+    finally:
+        central.close()
+    return items
+
+
+def show_backlog(item_id: str) -> dict[str, Any]:
+    """One backlog item with its dependencies and blockers"""
+    central = CentralStore()
+    try:
+        item = central.get_backlog(item_id)
+        if not item:
+            raise OpsError(f"backlog item {item_id!r} not found")
+        item["dependencies"] = [
+            central.get_backlog(d) or {"id": d, "status": "missing", "title": "?"}
+            for d in item["depends_on"]]
+        item["blockers"] = [d for d in item["dependencies"] if d["status"] != "done"] \
+            if item["status"] == "open" else []
+    finally:
+        central.close()
+    return item
+
 
 def promote_backlog(item_id: str, force: bool = False,
                     as_feature: bool = False,
@@ -13586,6 +13628,70 @@ def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]
         for effect in side_effects_of(store, str(child["id"])):
             effects.append({**effect, "wo_id": str(child["id"])})
     return effects
+
+
+def list_knowledge(q: str = "", topic: str | None = None, limit: int = 5000
+                   ) -> dict[str, Any]:
+    """Entries matching words/topic, each with its headline and read count"""
+    from .central_store import PINNED_TAG, has_tag, headline
+
+    central = CentralStore()
+    try:
+        rows = central.search_knowledge(q.strip(), limit=limit, topic=topic)
+        topics = central.knowledge_topics()
+        hits = central.knowledge_hit_counts()
+    finally:
+        central.close()
+    if not q.strip():  # a word search keeps its rank order
+        rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
+    for r in rows:
+        r["pinned"] = has_tag(r["tags"], PINNED_TAG)
+        r["headline"] = headline(r["content"])
+        r["reads"] = hits.get(r["id"], 0)
+    return {"rows": rows, "topics": topics}
+
+
+def show_knowledge(ids: Sequence[str], project: str | None = None,
+                   wo_id: str | None = None, record: bool = True) -> list[dict[str, Any]]:
+    """Entries in full — `jarvis learn show`; `record` logs the read an agent made"""
+    central = CentralStore()
+    try:
+        rows = [r for r in (central.get_knowledge(i) for i in ids) if r]
+        if record:
+            central.record_knowledge_read("show", rows, term=" ".join(ids),
+                                          project=project, wo_id=wo_id)
+    finally:
+        central.close()
+    missing = set(ids) - {r["id"] for r in rows}
+    if missing:
+        raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
+    return rows
+
+
+def knowledge_detail(kn_id: str) -> dict[str, Any]:
+    """One entry for the dashboard, not logged as a read"""
+    from .central_store import PINNED_TAG, has_tag, headline
+
+    [row] = show_knowledge([kn_id], record=False)
+    central = CentralStore()
+    try:
+        reads = central.knowledge_hit_counts().get(kn_id, 0)
+    finally:
+        central.close()
+    return {**row, "pinned": has_tag(row["tags"], PINNED_TAG),
+            "headline": headline(row["content"]), "reads": reads}
+
+
+def pin_knowledge(kn_id: str, pinned: bool = True) -> dict[str, Any]:
+    """Pin or unpin an entry: pinned ones ride verbatim in every worker prompt"""
+    central = CentralStore()
+    try:
+        row = central.pin_knowledge(kn_id, pinned=pinned)
+    finally:
+        central.close()
+    if row is None:
+        raise OpsError(f"unknown knowledge id {kn_id!r}")
+    return row
 
 
 def knowledge_usage_report(project: str | None = None, days: int | None = None,

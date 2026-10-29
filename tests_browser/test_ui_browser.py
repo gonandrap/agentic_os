@@ -1253,3 +1253,119 @@ def test_clicking_a_morpheus_row_id_opens_its_detail(page, server):
     assert "confirm failed" in page.locator("main").inner_text()
     page.goto(f"{server}/go/{failed}")
     page.wait_for_url(f"**/morpheus/{failed}")
+
+
+# §6 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _records() -> dict:
+    """An escalated gate and a decided one; a blocked backlog item and a done one; a pinned
+    and an unpinned knowledge entry. Returns their ids."""
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "ship the gates page")
+    store = ProjectStore(ops.registered_project_paths()["proj_a"])
+    try:
+        decided = store.add_approval(wo["id"], "pr_merge", "gh pr merge 41 --squash",
+                                     justification=_LONG)
+        store.decide_approval(decided["id"], "approved", _LONG, "neo")
+        hot = store.add_approval(wo["id"], "release", "./scripts/shipit.sh 1.2.3",
+                                 justification=_LONG, evidence=_LONG)
+        store.mark_approval_escalated(hot["id"], _LONG)
+    finally:
+        store.close()
+    central = CentralStore()
+    try:
+        done = central.add_backlog("proj_a", "the foundation, finished", description=_LONG)
+        central.mark_backlog(done["id"], "done")
+        dep = central.add_backlog("proj_a", "the scaffolding", description=_LONG)
+        tower = central.add_backlog("proj_a", "the tower on top", description=_LONG,
+                                    depends_on=[dep["id"]])
+        pinned = central.add_knowledge(f"PINNED RULE: {_LONG}", project="", topic="gates")
+        central.pin_knowledge(pinned["id"])
+        plain = central.add_knowledge(f"A PROJECT NOTE: {_LONG}", project="proj_a",
+                                      topic="ui")
+    finally:
+        central.close()
+    return {"hot": hot["id"], "decided": decided["id"], "done": done["id"],
+            "dep": dep["id"], "tower": tower["id"], "pinned": pinned["id"],
+            "plain": plain["id"], "wo": wo["id"]}
+
+
+def test_record_lists_and_their_details_read_at_desktop_and_phone_width(page, server,
+                                                                       readable):
+    r = _records()
+    paths = {"gates": "/gates", "gate": f"/gates/{r['hot']}",
+             "backlog": "/backlog", "backlog-item": f"/backlog/{r['tower']}",
+             "knowledge": "/knowledge", "knowledge-item": f"/knowledge/{r['pinned']}",
+             "search": "/search?q=tower"}
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        for name, path in paths.items():
+            page.goto(f"{server}{path}")
+            readable(page)
+            _shot(page, f"{name}-{size['width']}")
+
+
+def test_a_filter_in_the_url_narrows_gates_backlog_knowledge_and_search(page, server):
+    r = _records()
+    page.goto(f"{server}/gates?state=approved")
+    table = page.locator("table.gate-list").inner_text()
+    assert "gh pr merge 41" in table and "shipit" not in table
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+
+    page.goto(f"{server}/backlog?status=done")
+    table = page.locator("table.backlog-list").inner_text()
+    assert r["done"] in table and r["tower"] not in table
+
+    page.goto(f"{server}/knowledge?pinned=pinned")
+    table = page.locator("table.kn-list").inner_text()
+    assert r["pinned"] in table and r["plain"] not in table
+    page.goto(f"{server}/knowledge?project=proj_a")
+    table = page.locator("table.kn-list").inner_text()
+    assert r["plain"] in table and r["pinned"] not in table
+
+    page.goto(f"{server}/search?q=tower&kind=knowledge")
+    assert r["tower"] not in page.locator("main").inner_text()
+    page.goto(f"{server}/search?q=tower&kind=backlog")
+    assert r["tower"] in page.locator("table.search-list").inner_text()
+
+
+def test_a_needing_you_gate_and_a_blocked_backlog_item_sit_above_the_others(page, server):
+    r = _records()
+    page.goto(f"{server}/gates")
+    assert f"#{r['hot']}" in page.locator(".needs-you").inner_text()
+    rows = page.locator("table.gate-list a.rowid")
+    hot = rows.filter(has_text=f"#{r['hot']}").bounding_box()
+    assert hot["y"] < rows.filter(has_text=f"#{r['decided']}").bounding_box()["y"]
+
+    page.goto(f"{server}/backlog")
+    assert r["tower"] in page.locator(".needs-you").inner_text()
+    rows = page.locator("table.backlog-list a.rowid")
+    tower = rows.filter(has_text=r["tower"]).first.bounding_box()
+    assert tower["y"] < rows.filter(has_text=r["done"]).first.bounding_box()["y"]
+
+
+def test_clicking_a_record_row_id_opens_its_detail(page, server):
+    r = _records()
+    page.goto(f"{server}/gates")
+    page.click(f"table.gate-list a.rowid:has-text('#{r['hot']}')")
+    page.wait_for_url(f"**/gates/{r['hot']}?project=proj_a")
+    assert "Approve" in page.locator("main").inner_text()
+
+    page.goto(f"{server}/backlog")
+    page.click(f"table.backlog-list a.rowid:has-text('{r['tower']}')")
+    page.wait_for_url(f"**/backlog/{r['tower']}")
+    page.click(f"main a.rowid:has-text('{r['dep']}')")  # a dependency opens its own record
+    page.wait_for_url(f"**/backlog/{r['dep']}")
+
+    page.goto(f"{server}/knowledge")
+    page.click(f"table.kn-list a.rowid:has-text('{r['pinned']}')")
+    page.wait_for_url(f"**/knowledge/{r['pinned']}")
+    page.click("button:has-text('unpin')")  # the toggle returns to the entry it changed
+    page.wait_for_url(f"**/knowledge/{r['pinned']}")
+    assert "reaches workers through the index" in page.locator("main").inner_text()
+
+    page.goto(f"{server}/search?q=tower")
+    page.click(f"table.search-list a.rowid:has-text('{r['tower']}')")
+    page.wait_for_url(f"**/backlog/{r['tower']}")
+    page.goto(f"{server}/go/gate-{r['hot']}")
+    page.wait_for_url(f"**/gates/{r['hot']}")

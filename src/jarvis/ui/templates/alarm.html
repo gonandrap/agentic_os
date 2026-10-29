@@ -35,7 +35,7 @@
   <p class="kv" style="margin-bottom:0">The supervisor is asking permission to
     <span class="mono">{{ a.remedy }}</span>, and nothing has been done. Answer it on
     {% if a.remedy_approval_id %}
-    <a href="/gates#gate-{{ a.remedy_approval_id }}">gate request
+    <a href="/gates/{{ a.remedy_approval_id }}">gate request
       #{{ a.remedy_approval_id }}</a>, or with
     <span class="mono">jarvis gate approve {{ a.remedy_approval_id }}</span> /
     <span class="mono">jarvis gate deny {{ a.remedy_approval_id }} --reason "…"</span>.
