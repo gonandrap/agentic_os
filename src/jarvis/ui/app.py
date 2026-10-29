@@ -476,13 +476,7 @@ class CostCache:
 
     @staticmethod
     def key(picked: dict, project: str) -> tuple:
-        """The bounds and the scope: the only inputs the payloads depend on.
-
-        `until` is bucketed by `REFRESH_SECONDS`, which is the staleness every entry is
-        already served with: `since=…` with no `until` ends at NOW, so an exact key would
-        miss on every visit and the self-refreshing page would never stop computing
-        (docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md).
-        """
+        """The scope and the bounds, `until` bucketed because an open-ended window ends at NOW (docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md)"""
         return (project, picked["since"], int(picked["until"] // REFRESH_SECONDS))
 
     def _compute_on_demand(self, key: tuple, picked: dict, project: str) -> None:
