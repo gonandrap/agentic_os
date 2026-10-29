@@ -8844,6 +8844,65 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
             "status": "cancelled", "cancelled_work_orders": stop_ids}
 
 
+OFFBOARDED_EVENT = "offboarded"
+
+
+def quiesce_project(name: str, apply: bool = False,
+                    reason: str = "project offboarded") -> dict[str, Any]:
+    """Report a project's open orders; `apply` cancels them (docs/superpowers/specs/2026-10-28-offboard-a-project.md §5)"""
+    paths = registered_project_paths()
+    if name not in paths:
+        raise OpsError(f"project {name!r} not registered (known: {sorted(paths)})")
+    store = ProjectStore(paths[name])
+    try:
+        wos = store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True, limit=-1)
+        fos = store.list_feature_orders(statuses=FO_OPEN_STATUSES, kind=None, limit=-1)
+    finally:
+        store.close()
+    open_ = [{"id": w["id"], "kind": "work_order", "status": w["status"],
+              "title": w["title"]} for w in wos]
+    open_ += [{"id": f["id"], "kind": f["kind"] or "feature", "status": f["status"],
+               "title": f["title"]} for f in fos]
+    out: dict[str, Any] = {"open": open_, "cancelled": [], "sessions_stopped": 0,
+                           "backlog_dropped": 0, "inbox_acked": 0, "reason": reason}
+    if not apply:
+        return out
+    cancellers = {"improvement": cancel_improvement_order,
+                  "investigation": cancel_investigation_order}
+    store = ProjectStore(paths[name])
+    try:
+        # Work orders first: a feature's manager and children stopped before the feature cannot re-dispatch
+        for w in wos:
+            try:
+                if store.get_work_order(w["id"])["status"] not in OPEN_STATUSES:
+                    continue  # settled since the listing
+            except KeyError:
+                continue
+            out["sessions_stopped"] += int(cancel(w["id"])["session_stopped"])
+            store.add_event(w["id"], OFFBOARDED_EVENT, {"reason": reason})
+            out["cancelled"].append(w["id"])
+        for f in fos:
+            try:
+                cancellers.get(f["kind"], cancel_feature_order)(f["id"], name)
+            except OpsError:
+                # Only a feature that settled once its children were cancelled is skipped
+                if store.get_feature_order(f["id"])["status"] not in FO_TERMINAL_STATUSES:
+                    raise
+                continue
+            out["cancelled"].append(f["id"])
+    finally:
+        store.close()
+    central = CentralStore()
+    try:
+        for item in central.list_backlog(name, "open"):
+            central.mark_backlog(item["id"], "dropped")
+            out["backlog_dropped"] += 1
+        out["inbox_acked"] = central.ack_project_inbox(name)
+    finally:
+        central.close()
+    return out
+
+
 #: The most of a `--fix` that becomes the corrective child's title
 FIX_TITLE_CHARS = 120
 
