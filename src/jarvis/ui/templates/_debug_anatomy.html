@@ -31,9 +31,6 @@
    one (issue #227). #}
 {{ ui.note("no transcript — nothing to measure. Session: " ~ (u.session_id or "none recorded")) }}
 {% else %}
-{# `dense`: the short tables (tools, joins, writes) pack in beside the summary, and the
-   long turn list takes the full width under them — 2026-10-22 spec §3. #}
-<div class="grid" style="--col: 520px;">
 <div class="sec">
 <h3 id="dbg-session{{ sfx }}" style="margin: 18px 0 8px; font: 600 12px var(--mono); color: var(--ink-3); letter-spacing: .14em; text-transform: uppercase;">The session</h3>
 <div class="panel">
@@ -83,7 +80,7 @@
 {# §3: the sentence travels WITH the reading, so `jarvis inspect` prints these words too. #}
 <div class="panel"><span class="mono">{{ u.nav_line }}</span></div>
 {% endif %}
-<div class="panel"><table>
+<div class="panel table-wrap"><table>
   <tr><th>tool</th><th>calls</th><th>total</th><th>mean</th><th>never returned</th></tr>
   {% for row in u.tools %}
   <tr><td class="mono">{{ row.name }}</td><td>{{ row.calls }}</td>
@@ -127,10 +124,7 @@
 </div>
 </div>
 
-</div>
-
-
-<div class="span-all">
+<div>
 <h2 id="dbg-turns{{ sfx }}">Turn by turn</h2>
 {{ ui.bar_legend() }}
 {# FOLDED: each turn is its own address (`#turn-<seq>`) and opens on arrival; the last
