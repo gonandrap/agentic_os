@@ -2353,6 +2353,7 @@ class Daemon:
         wo_id = wo["id"]
         rework = uncounted_cause == ops.USER_REWORK_CAUSE
         red_ci = uncounted_cause == ops.RED_CI_CAUSE
+        note += ops.non_landing_review_note(store, wo)
         used, of = rebind or (0, max_rounds)
         pos = n if budget_round is None else budget_round
         # `of` is the bound this round was actually held by

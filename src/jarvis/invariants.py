@@ -2521,6 +2521,46 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+INV_DOCUMENT_CONSUMED = "INV-DOCUMENT-CONSUMED"
+
+
+def check_consumed_documents_settle(store: ProjectStore) -> Iterator[Violation]:
+    """INV-DOCUMENT-CONSUMED — a document kind `validating` under a completed parent (issue 1322)"""
+    readonly = getattr(store, "readonly", False)
+    marks = ",".join("?" * len(DOCUMENT_DELIVERY_KINDS))
+    for row in store.conn.execute(
+            f"""SELECT w.id AS id, f.id AS fo_id FROM work_orders w
+                  JOIN feature_orders f ON f.id = w.parent_id
+                 WHERE w.status='validating' AND f.status='completed'
+                   AND w.kind IN ({marks})""", DOCUMENT_DELIVERY_KINDS).fetchall():
+        wo_id, fo_id = row["id"], row["fo_id"]
+        latest = store.latest_validation_round(wo_id=wo_id)
+        if latest is not None and latest["outcome"] == "pending":
+            continue  # a round is judging it: let that settle first
+        if worker_session.busy(store, wo_id) is not None:
+            continue  # a worker turn in flight finishes on its own
+        detail = (f"work order {wo_id} is `validating` but its parent {fo_id} is "
+                  f"`completed`: the document it delivered was consumed, so no further "
+                  f"round can change anything and nothing would ever settle it.")
+        context = {"fo_id": fo_id}
+        if readonly:
+            yield Violation(invariant=INV_DOCUMENT_CONSUMED, wo_id=wo_id, detail=detail,
+                            repaired=True, repair="would set the status to `completed`",
+                            context=context)
+            continue
+
+        def settle(wo_id: str = wo_id, fo_id: str = fo_id) -> None:
+            store.set_status(wo_id, "completed", trigger=INV_DOCUMENT_CONSUMED)
+            store.clear_attention(wo_id)
+            store.add_event(wo_id, "document_consumed_settled", {"parent": fo_id})
+
+        if not store.repair_while(wo_id, "validating", settle):
+            continue  # it moved under the sweep: the writer that moved it owns the status
+        yield Violation(invariant=INV_DOCUMENT_CONSUMED, wo_id=wo_id, detail=detail,
+                        repaired=True, repair="status set to `completed`",
+                        context=context)
+
+
 INV_FEATURE_ORPHAN_CHILD = "INV-FEATURE-ORPHAN-CHILD"
 
 #: The marker that says a parent's flag was raised by INV-FEATURE-ORPHAN-CHILD
@@ -4088,6 +4128,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # and a `validating` row is invisible to all of them
     check_feature_failures_are_real,  # order-free: it reads and writes feature orders
                                    # only, which no work-order check looks at
+    check_consumed_documents_settle,  # before the orphan check: a settled child is no
+                                   # orphan to raise on its parent
     check_settled_parents_have_no_orphans,  # after it: a reopened feature is no longer
                                    # settled; it reads child flags and writes only the parent's
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
