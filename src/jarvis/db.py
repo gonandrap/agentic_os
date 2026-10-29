@@ -11,6 +11,20 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+# WAL close vs open deadlocks across threads on these (kn-8e43df8e)
+DEADLOCKING_SQLITE = ("3.51.0", "3.51.1")
+
+
+def refuse_deadlocking_sqlite(version: str = sqlite3.sqlite_version) -> None:
+    if version in DEADLOCKING_SQLITE:
+        raise RuntimeError(
+            f"SQLite {version} deadlocks WAL close vs open across threads (kn-8e43df8e); "
+            "run `uv sync` to rebuild the venv on the pinned uv-managed CPython"
+        )
+
+
+refuse_deadlocking_sqlite()
+
 
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -1279,6 +1279,360 @@ def test_clicking_a_morpheus_row_id_opens_its_detail(page, server):
     page.wait_for_url(f"**/morpheus/{failed}")
 
 
+# §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _alarm_rows(project) -> dict[str, str]:
+    """One live long-turn alarm and two settled ones of different kinds; returns ids"""
+    burning = ops.create_work_order("proj_a", "the order still burning")
+    settled = ops.create_work_order("proj_a", "the order that settled")
+    store = ProjectStore(project)
+    try:
+        live = store.add_alarm(burning["id"], "long-turn", 2, f"turn 2 is still being billed: {_LONG}")
+        store.flag_attention(burning["id"], "a turn is still being billed")
+        old = store.add_alarm(settled["id"], "cache-write", 4, f"turn 4 re-sent the conversation: {_LONG}")
+        store.update_alarm(old["id"], status="acked", verdict="ack")
+        slow = store.add_alarm(settled["id"], "long-turn", 5, "turn 5 ran long and finished")
+        store.update_alarm(slow["id"], status="acked", verdict="ack")
+    finally:
+        store.close()
+    return {"live": live["id"], "old": old["id"], "slow": slow["id"]}
+
+
+def test_alarms_read_at_desktop_and_phone_width(page, server, project, readable):
+    ids = _alarm_rows(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/alarms")
+        assert ids["live"] in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"alarms-{size['width']}")
+        page.goto(f"{server}/alarms/proj_a/{ids['old']}")
+        readable(page)
+
+
+def test_an_alarm_filter_in_the_url_narrows_the_record(page, server, project):
+    ids = _alarm_rows(project)
+    page.goto(f"{server}/alarms?kind=cache-write")
+    record = page.locator("table.alarm-list").inner_text()
+    assert ids["old"] in record and ids["slow"] not in record
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+
+
+def test_a_burning_alarm_sits_above_the_record(page, server, project):
+    ids = _alarm_rows(project)
+    page.goto(f"{server}/alarms")
+    live = page.locator(f".needs-you a.rowid:has-text('{ids['live']}')").bounding_box()
+    assert live["y"] < page.locator("table.alarm-list").bounding_box()["y"]
+
+
+def test_clicking_an_alarm_row_id_opens_the_alarm(page, server, project):
+    ids = _alarm_rows(project)
+    page.goto(f"{server}/alarms")
+    page.click(f"table.alarm-list a.rowid:has-text('{ids['old']}')")
+    page.wait_for_url(f"**/alarms/proj_a/{ids['old']}")
+    assert "re-sent the conversation" in page.locator("main").inner_text()
+
+
+def _neo_rows(daemon) -> dict[str, int]:
+    """An escalation, an approved answer and a corrected one; returns ids"""
+    wo = ops.create_work_order("proj_a", "neo history task")
+    daemon.tick()
+    approved = ops.ask_question(wo["id"], f"CSV or JSON? {_LONG}")["question_id"]
+    daemon._neo_drain()
+    ops.neo_review(approved, approved=True)
+    yours = ops.ask_question(wo["id"], "Which bucket for the staging export?")["question_id"]
+    daemon._neo_drain()
+    ops.neo_review(yours, approved=False, feedback=f"the staging bucket, {_LONG}")
+    escalated = ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the key?")["question_id"]
+    daemon._neo_drain()
+    return {"approved": approved, "yours": yours, "escalated": escalated}
+
+
+def test_neo_reads_at_desktop_and_phone_width(page, server, daemon, project, readable):
+    ids = _neo_rows(daemon)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/neo")
+        assert "rotate the key" in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"neo-{size['width']}")
+        page.click(".tabs button:has-text('History')")
+        readable(page)
+        page.goto(f"{server}/neo/question/{ids['approved']}")
+        readable(page)
+        _shot(page, f"neo-question-{size['width']}")
+        page.goto(f"{server}/neo/stats")
+        readable(page)
+        _shot(page, f"neo-stats-{size['width']}")
+
+
+def test_a_neo_filter_in_the_url_narrows_the_history(page, server, daemon, project):
+    ids = _neo_rows(daemon)
+    page.goto(f"{server}/neo?review=approved")
+    assert page.locator("#tab-history").is_visible()      # a filter opens the tab it filters
+    rows = page.locator("table.neo-history a.rowid").all_inner_texts()
+    assert rows == [str(ids["approved"])]
+    assert "1 of 2 shown" in page.locator("#tab-history").inner_text()
+
+
+def test_an_escalated_question_sits_above_the_tabs(page, server, daemon, project):
+    ids = _neo_rows(daemon)
+    page.goto(f"{server}/neo")
+    strip = page.locator(f".needs-you a.rowid:has-text('#{ids['escalated']}')").bounding_box()
+    assert strip["y"] < page.locator("#neo-tabs").bounding_box()["y"]
+
+
+def test_clicking_a_neo_row_id_opens_the_question(page, server, daemon, project):
+    ids = _neo_rows(daemon)
+    page.goto(f"{server}/neo")
+    page.click(".tabs button:has-text('History')")
+    page.click(f"table.neo-history a.rowid:text-is('{ids['yours']}')")
+    page.wait_for_url(f"**/neo/question/{ids['yours']}")
+    assert "Which bucket for the staging export?" in page.locator("main").inner_text()
+
+
+def _cost_rows(project) -> dict:
+    """A work order with one recorded turn, the shape the cost listing reads"""
+    import json
+
+    wo = ops.create_work_order("proj_a", f"a costed order: {_LONG}")
+    store = ProjectStore(project)
+    try:
+        turn = store.create_turn(wo["id"], kind="dispatch", prompt="p")
+        store.finish_turn(turn["id"], "done", result="r", cost_usd=0.5, num_turns=1,
+                          usage_json=json.dumps({"total_cost_usd": 0.5, "input": 2,
+                                                 "cache_write": 2558, "cache_read": 45689,
+                                                 "output": 941, "api_calls": 1,
+                                                 "context_peak": 1000,
+                                                 "context_window": 1_000_000}))
+    finally:
+        store.close()
+    return wo
+
+
+def test_cost_and_bill_read_at_desktop_and_phone_width(page, server, project, readable):
+    wo = _cost_rows(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/cost?project=proj_a")   # scoped: the fleet entry is cached across tests
+        page.wait_for_selector(f"table.cost-list a.rowid:has-text('{wo['id']}')")
+        _shot(page, f"cost-{size['width']}")
+        readable(page)
+        page.goto(f"{server}/cost/proj_a/{wo['id']}")
+        _shot(page, f"bill-{size['width']}")
+        readable(page)
+
+
+def test_a_cost_project_filter_in_the_url_scopes_the_listing(page, server, project):
+    wo = _cost_rows(project)
+    page.goto(f"{server}/cost?project=proj_a")
+    page.wait_for_selector("table.cost-list")
+    assert "project: proj_a" in page.locator(".filter-bar").inner_text()
+    assert wo["id"] in page.locator("table.cost-list").inner_text()
+    page.goto(f"{server}/cost?project=nope")
+    assert "not registered" in page.locator("main").inner_text()
+
+
+def test_clicking_a_cost_row_id_opens_its_order(page, server, project):
+    wo = _cost_rows(project)
+    page.goto(f"{server}/cost?project=proj_a")   # scoped: never a fleet entry cached by another test
+    page.wait_for_selector("table.cost-list")
+    page.click(f"table.cost-list a.rowid:has-text('{wo['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
+
+
+def test_config_reads_and_stacks_history_over_diff(page, server, readable):
+    ops.adopt_config(reason="the file as it shipped")
+    ops.set_config("os.ui.port", 9999)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/config")
+        _shot(page, f"config-{size['width']}")
+        # A settings row is as tall as its edit form, so a cfg-table cell's height says
+        # nothing about its text: measure the prose blocks inside those cells instead.
+        readable(page, "main p, main th, main td:not(.cfg-table td), .cfg-table td > div")
+        history = page.locator("#cfg-history").bounding_box()
+        diff = page.locator("h2:text-is('Diff')").bounding_box()
+        assert diff["y"] > history["y"] and diff["x"] == history["x"]  # stacked, not beside
+    assert page.locator(".cfg-tree").is_visible()                       # the tree stays
+# §5 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _stuck_rows(monkeypatch) -> tuple[str, str]:
+    """Two real orders, one judged past its threshold; returns (stuck id, fine id)"""
+    stuck = ops.create_work_order("proj_a", f"stuck: {_LONG}")["id"]
+    fine = ops.create_work_order("proj_a", "inside its threshold")["id"]
+
+    def row(wo_id, title, over):
+        return {"id": wo_id, "project": "proj_a", "title": title,
+                "status": "waiting_pr_merge" if over else "running",
+                "status_label": "waiting on a PR merge" if over else "running",
+                "seconds_in_status": 18000 if over else 60, "seconds_since_activity": 60,
+                "discounted_seconds": 0, "active_seconds": 60, "threshold_seconds": 3600,
+                "clock": "in status", "stuck": over, "excluded": "",
+                "reason": _LONG if over else "", "blocker": "the PR has not merged",
+                "fingerprint": "f", "investigation": None}
+    # Fine row first, so the page's attention ordering is what lifts the stuck one
+    monkeypatch.setattr(ops, "stuck_report", lambda *a, **k: [
+        row(fine, "inside its threshold", False), row(stuck, f"stuck: {_LONG}", True)])
+    return stuck, fine
+
+
+def test_stuck_reads_at_desktop_and_phone_width(page, server, readable, monkeypatch):
+    stuck, _ = _stuck_rows(monkeypatch)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/stuck")
+        assert stuck in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"stuck-{size['width']}")
+
+
+def test_a_stuck_filter_in_the_url_narrows_the_rows(page, server, monkeypatch):
+    stuck, fine = _stuck_rows(monkeypatch)
+    page.goto(f"{server}/stuck?status=running")
+    table = page.locator("main .panel table").inner_text()
+    assert fine in table and stuck not in table
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+    page.goto(f"{server}/stuck?kind=fo")
+    assert "nothing matches these filters" in page.locator("main").inner_text()
+
+
+def test_a_stuck_row_sits_above_the_others(page, server, monkeypatch):
+    stuck, fine = _stuck_rows(monkeypatch)
+    page.goto(f"{server}/stuck")
+    rows = page.locator("main .panel table a.rowid")
+    assert rows.filter(has_text=stuck).bounding_box()["y"] < \
+        rows.filter(has_text=fine).bounding_box()["y"]
+
+
+def test_clicking_a_stuck_row_id_opens_its_order(page, server, monkeypatch):
+    stuck, _ = _stuck_rows(monkeypatch)
+    page.goto(f"{server}/stuck")
+    page.click(f"main .panel table a.rowid:has-text('{stuck}')")
+    page.wait_for_url(f"**/wo/proj_a/{stuck}")
+
+
+def _steward_rows() -> tuple[int, int]:
+    """One critical ask and one expired queued decision; returns (ask id, expired id)"""
+    import json
+
+    from jarvis import db, steward
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        base = {"project": "proj_a", "severity": "medium", "outcome": "queue",
+                "rule": "recurrence", "mode": "enforce", "origin_kind": "panel"}
+        expired = central.record_steward_decision({**base, "subject": f"old: {_LONG}",
+                                                   "reason": _LONG})
+        steward.settle_unrecoverable(central)
+        ask = central.record_steward_decision({
+            **base, "origin_kind": "morpheus", "outcome": "ask", "severity": "critical",
+            "rule": "critical-ceiling", "subject": f"PR failed in production: {_LONG}",
+            "ts": db.now(), "candidate_json": json.dumps({"payload": {"morpheus_item": "mv-1"}})})
+    finally:
+        central.close()
+    return ask, expired
+
+
+def test_steward_reads_at_desktop_and_phone_width(page, server, readable):
+    ask, expired = _steward_rows()
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/steward")
+        assert f"#{ask}" in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"steward-{size['width']}")
+        page.goto(f"{server}/steward/{expired}")
+        readable(page)
+        _shot(page, f"steward-item-{size['width']}")
+
+
+def test_a_steward_filter_in_the_url_narrows_the_rows(page, server):
+    ask, expired = _steward_rows()
+    page.goto(f"{server}/steward?tab=settled")
+    main = page.locator("main").inner_text()
+    assert f"#{expired}" in main and f"#{ask}" not in main
+    assert "1 of 2 shown" in main
+    page.goto(f"{server}/steward?project=nope")
+    assert "nothing matches these filters" in page.locator("main").inner_text()
+
+
+def test_a_steward_ask_sits_above_the_others(page, server):
+    ask, expired = _steward_rows()
+    page.goto(f"{server}/steward")
+    assert page.locator("#steward-asks").is_visible()
+    assert not page.locator("#steward-settled").is_visible()
+    assert page.locator(".needs-you").bounding_box()["y"] < \
+        page.locator("#steward-tabs").bounding_box()["y"]
+
+
+def test_clicking_a_steward_row_id_opens_its_decision(page, server):
+    _, expired = _steward_rows()
+    page.goto(f"{server}/steward?tab=settled")
+    page.click(f"#steward-settled a.rowid:has-text('#{expired}')")
+    page.wait_for_url(f"**/steward/{expired}")
+    assert "critical" not in page.locator("main h2").inner_text()
+    assert "re-offer" in page.locator("main").inner_text()
+
+
+def _evolution_rules(monkeypatch) -> None:
+    """A firing rule, a quiet one and an unreadable one, newest-first in that order"""
+    real = ops.evolution_report
+
+    def fake(project=None, *, days=90):
+        report = real(project, days=days)
+        base = {"gap_class": "stuck_order", "summary": _LONG, "status": "dry_run",
+                "hits": 0, "false_positives": 0, "recurrences": 0, "last_fired": None,
+                "last_cleared": None, "hit_rate": None, "hit_rate_note": "never fired",
+                "readable": True, "condition_problems": [], "median_cleared_seconds": None,
+                "median_cleared_seconds_note": "not a median yet"}
+        report["per_rule"] = [
+            {**base, "id": "det-firing", "hits": 4, "last_fired": 1.0, "hit_rate": 0.5},
+            {**base, "id": "det-quiet"},
+            {**base, "id": "det-broken", "hits": 1, "last_fired": 1.0, "readable": False,
+             "condition_problems": ["field `nope` is not known"]}]
+        report["by_gap_class"] = [{"gap_class": "stuck_order", "total": 5,
+                                   "weeks": [{"week": "2026-10-19", "count": 5}]}]
+        return report
+    monkeypatch.setattr(ops, "evolution_report", fake)
+
+
+def test_evolution_reads_at_desktop_and_phone_width(page, server, readable, monkeypatch):
+    _evolution_rules(monkeypatch)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/evolution")
+        assert "det-broken" in page.locator(".needs-you").inner_text()
+        assert not page.locator("#quiet-detectors table").is_visible()
+        readable(page)
+        _shot(page, f"evolution-{size['width']}")
+        page.goto(f"{server}/evolution/rule/det-firing")
+        readable(page)
+        _shot(page, f"evolution-rule-{size['width']}")
+
+
+def test_an_evolution_filter_in_the_url_narrows_the_rows(page, server, monkeypatch):
+    _evolution_rules(monkeypatch)
+    page.goto(f"{server}/evolution?firing=quiet")
+    main = page.locator("main").inner_text()
+    assert "det-quiet" in main and "det-firing" not in main
+    assert "1 of 3 shown" in main
+
+
+def test_an_unreadable_rule_sits_above_the_others(page, server, monkeypatch):
+    _evolution_rules(monkeypatch)
+    page.goto(f"{server}/evolution")
+    rows = page.locator("main .panel table a.rowid")
+    assert rows.filter(has_text="det-broken").bounding_box()["y"] < \
+        rows.filter(has_text="det-firing").bounding_box()["y"]
+
+
+def test_clicking_an_evolution_rule_id_opens_its_page(page, server, monkeypatch):
+    _evolution_rules(monkeypatch)
+    page.goto(f"{server}/evolution")
+    page.click("main .panel table a.rowid:has-text('det-firing')")
+    page.wait_for_url("**/evolution/rule/det-firing")
+    assert "2026-10-19" in page.locator("main").inner_text()
+
+
 # §6 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
 def _records() -> dict:
     """An escalated gate and a decided one; a blocked backlog item and a done one; a pinned
