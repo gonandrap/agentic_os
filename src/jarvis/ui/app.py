@@ -28,6 +28,7 @@ from .. import (
     github,
     invariants,
     ops,
+    rules,
     specs,
     transcript_cache,
     uilog,
@@ -2086,13 +2087,52 @@ def create_app() -> FastAPI:
         if rule is None:
             return render(request, "error.html", active="evolution", status_code=404,
                           message=f"no detector {key!r} in this scope")
+        try:
+            detail = ops.rules_show(key)
+        except ops.OpsError:
+            detail = None  # the report named it but the registry no longer does: no actions
+        cfg = ops.rules_config((detail["detector"]["project"] or None) if detail else None)
         return render(request, "evolution_rule.html", active="evolution", report=report,
-                      rule=rule,
+                      rule=rule, detail=detail,
+                      rules_enabled=None if cfg is None else cfg.enabled,
+                      undecided=(rules.UNREADABLE, rules.CLEARED),
+                      here=request.url.path + (f"?project={project}" if project else ""),
                       weeks=next((g["weeks"] for g in report["by_gap_class"]
                                   if g["gap_class"] == rule["gap_class"]), []),
                       recurrences=[r for r in report["recurrences"]["rows"]
                                    if r["gap_class"] == rule["gap_class"]],
                       filed=[e for e in report["timeline"] if e["id"] == str(key)])
+
+    # The `jarvis rules arm|retract|false-positive` verbs, through the same ops calls
+    @app.post("/evolution/rule/{key}/arm")
+    def evolution_rule_arm(key: str, reason: str = Form(""), next: str = Form("")):
+        fallback = f"/evolution/rule/{key}"
+        try:
+            ops.rules_arm(key, reason)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, fallback, str(e)), status_code=303)
+        return RedirectResponse(_same_site_back(next, fallback), status_code=303)
+
+    @app.post("/evolution/rule/{key}/retract")
+    def evolution_rule_retract(key: str, rule_id: str = Form(""), reason: str = Form(""),
+                               next: str = Form("")):
+        """`rule_id` is the detector itself or one of its remedy rules"""
+        fallback = f"/evolution/rule/{key}"
+        try:
+            ops.rules_retract(rule_id or key, reason)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, fallback, str(e)), status_code=303)
+        return RedirectResponse(_same_site_back(next, fallback), status_code=303)
+
+    @app.post("/evolution/rule/{key}/fires/{fire_id}/false-positive")
+    def evolution_fire_false_positive(key: str, fire_id: int, reason: str = Form(""),
+                                      next: str = Form("")):
+        fallback = f"/evolution/rule/{key}"
+        try:
+            ops.rules_false_positive(fire_id, reason)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, fallback, str(e)), status_code=303)
+        return RedirectResponse(_same_site_back(next, fallback), status_code=303)
 
     @app.get("/evolution/{project}", response_class=HTMLResponse)
     def evolution_project_page(request: Request, project: str, days: str = ""):
