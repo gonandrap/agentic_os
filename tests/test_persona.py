@@ -80,7 +80,7 @@ def test_crib_sheet_documents_every_improvement_order_verb(persona: str, verb: s
 
 
 def test_crib_sheet_documents_onboard_start_in_one_line(persona: str) -> None:
-    """docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §5: one line, the cap is tight"""
+    """One line only: the file is capped at 5000 tokens"""
     assert "jarvis onboard start <path>" in persona
     assert sum(line.startswith("jarvis onboard") for line in persona.splitlines()) <= 1
 
