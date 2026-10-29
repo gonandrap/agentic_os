@@ -362,9 +362,36 @@ def fix_description(item: dict[str, Any], fix: str) -> str:
     """A confirmed failure's fix order: the user's words, then what Morpheus saw"""
     return (f"{fix.strip()}\n\nPR {item['pr_url']} {item['state']} its production "
             f"validation ({item['resolution']}); the user confirmed the failure is real.\n"
-            f"The check: `jarvis morpheus show {item['id']}`. Once the fix ships, "
-            f"`jarvis morpheus requeue {item['id']}` watches it again.\n\n"
+            f"The check: `jarvis morpheus show {item['id']}`. The OS watches it again "
+            f"once this order's fix reaches production.\n\n"
             f"Last check output:\n{(item.get('last_output') or '—')[-1500:]}")
+
+
+_FIX_ORDER = re.compile(r"fix filed as (wo-[0-9a-f]{8})")
+
+
+def requeue_fixed(central: CentralStore, cfg: MorpheusConfig,
+                  carrier: Callable[[str], str]) -> list[str]:
+    """Re-watch each confirmed item whose fix order (via `carrier`) has a PR in production (#1307)"""
+    # An item exists for an order only once its PR reached production: released (the OS) or merged
+    shipped: dict[str, dict[str, Any]] = {}
+    for i in central.morpheus_items():
+        if i["wo_id"]:
+            shipped.setdefault(i["wo_id"], i)
+    requeued = []
+    for item in central.morpheus_items(ACTION_STATES):
+        m = _FIX_ORDER.search(item["resolution"] or "")
+        if not (item["resolution"] or "").startswith(CONFIRMED) or not m:
+            continue
+        fix = carrier(m.group(1))
+        landed = shipped.get(fix)
+        if not landed or landed["id"] == item["id"]:
+            continue
+        requeue(central, cfg, item["id"],
+                resolution=f"re-watched: its fix {fix} reached production in PR "
+                           f"#{landed['pr_number']}")
+        requeued.append(item["id"])
+    return requeued
 
 
 def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str, *,

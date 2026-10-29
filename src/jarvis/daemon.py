@@ -3084,6 +3084,13 @@ class Daemon:
                     log.exception("[%s] morpheus: could not queue merged PRs", project.name)
                 finally:
                     store.close()
+            try:
+                from .ops import fix_carrier
+
+                for item_id in morpheus.requeue_fixed(central, cfg, fix_carrier):
+                    log.info("morpheus %s: its fix reached production, watching again", item_id)
+            except Exception:  # noqa: BLE001 — the rest of the pass still runs
+                log.exception("morpheus: could not requeue fixed items")
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
             skip = archived_projects(central)

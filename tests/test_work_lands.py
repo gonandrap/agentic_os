@@ -193,6 +193,21 @@ def test_the_remedy_the_sweep_prints_works_on_an_order_already_completed(started
     assert _violations(project) == []
 
 
+def test_superseded_by_links_a_duplicate_to_the_order_carrying_its_work(started, project):
+    """Issue #1307: Morpheus follows the link from a confirmed failure's fix order"""
+    dup, real, third = _order(project), _order(project), _order(project)
+    with pytest.raises(ops.OpsError):
+        ops.finish(dup["id"], "duplicate", superseded_by=dup["id"])
+    with pytest.raises(ops.OpsError):
+        ops.finish(dup["id"], "duplicate", superseded_by="wo-00000000")
+    ops.finish(dup["id"], "duplicate", superseded_by=real["id"])
+    ops.finish(real["id"], "duplicate too", superseded_by=third["id"])
+    ops.finish(third["id"], "loops back", superseded_by=dup["id"])
+
+    assert ops.fix_carrier(dup["id"]) == third["id"]  # the cycle stops at the first repeat
+    assert ops.fix_carrier("wo-00000000") == "wo-00000000"
+
+
 def test_an_abandonment_is_superseded_by_a_later_ordinary_finish(started, project):
     """The newest of the two events wins, or an order excused once is excused for ever"""
     wo = _order(project, code="spike")

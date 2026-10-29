@@ -996,6 +996,31 @@ def find_work_order(wo_id: str, project_name: str | None = None, *,
     raise OpsError(f"work order {wo_id!r} not found in any registered project")
 
 
+#: Bounds a `superseded` chain; a cycle stops at the first repeat anyway
+SUPERSEDE_HOPS = 10
+
+
+def fix_carrier(wo_id: str) -> str:
+    """The order that actually carries `wo_id`'s work: follows `wo finish --superseded-by` (#1307)"""
+    seen = {wo_id}
+    for _ in range(SUPERSEDE_HOPS):
+        try:
+            _name, path, _wo = find_work_order(wo_id)
+        except OpsError:
+            return wo_id
+        store = ProjectStore(path)
+        try:
+            links = store.events_of_kind(wo_id, "superseded")
+        finally:
+            store.close()
+        by = str(db.from_json(links[-1]["payload"], {}).get("by") or "") if links else ""
+        if not by or by in seen:
+            return wo_id
+        seen.add(by)
+        wo_id = by
+    return wo_id
+
+
 def _project_for_cwd(cwd: str, paths: dict[str, Path]) -> str | None:
     """Which registered project owns this directory, if any"""
     best: tuple[int, str] | None = None
@@ -5158,9 +5183,15 @@ def unlanded_refusal(wo: dict[str, Any], summary: str, work: landing.Authored) -
 
 
 def finish(wo_id: str, summary: str, pr_url: str | None = None,
-           evidence: str = "", abandon: str = "") -> dict[str, Any]:
+           evidence: str = "", abandon: str = "", superseded_by: str = ""
+           ) -> dict[str, Any]:
     """The worker reporting its own result (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §1)"""
     name, path, _wo = find_work_order(wo_id)
+    superseded_by = (superseded_by or "").strip()
+    if superseded_by:
+        if superseded_by == wo_id:
+            raise OpsError("an order cannot supersede itself")
+        find_work_order(superseded_by)  # refuses an unknown id before anything is written
     cfg = validation_config(name)
     store = ProjectStore(path)
     try:
@@ -5191,6 +5222,9 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                          **({"pr_url": pr_url} if pr_url else {}),
                          **({"evidence": evidence} if evidence else {}),
                          **({"authored": work.record()} if work.base else {})})
+        if superseded_by:
+            # Morpheus follows it to the order that carries a confirmed failure's fix (#1307)
+            store.add_event(wo_id, "superseded", {"by": superseded_by})
         if abandon:
             # AFTER `finished` and never before: `_abandoned` reads the newer of the two
             store.add_event(wo_id, "abandoned",
