@@ -871,6 +871,10 @@ class Daemon:
         # Before the first tick: if the boot we are living through IS a staged release's restart
         self.verify_pending_release()
         try:
+            invariants_mod.report_at_startup("daemon")
+        except Exception:  # noqa: BLE001 — a startup check must not stop the daemon
+            log.exception("startup invariant check failed")
+        try:
             while not self.stop_requested:
                 started = time.monotonic()
                 try:
