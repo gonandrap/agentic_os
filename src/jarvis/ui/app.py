@@ -115,9 +115,9 @@ def gate_display(g: dict) -> str:
 # How often the dashboard re-reads OS state
 REFRESH_SECONDS = 15
 
-# The open statuses worth a row of their own
+# The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
-                     "waiting_pr_merge")
+                     "validating", "waiting_pr_merge")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
