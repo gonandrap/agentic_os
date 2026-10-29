@@ -1376,6 +1376,31 @@ def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
     assert "changes no files" in rows[0]["body"]
 
 
+def test_an_abandonment_that_produced_nothing_is_voided_not_escalated(fleet):
+    """wo-3fa65445: a duplicate, dropped on Neo's ruling, still paged the user"""
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    wo = fleet.dispatch("duplicate")
+    fleet.worktree(wo["id"])  # a worktree, and not one byte changed in it
+    ops.finish(wo["id"], "duplicate of wo-0d358979; its PR already fixes this",
+               abandon="duplicate of wo-0d358979")
+    fleet.drain()
+
+    assert _outbox(fleet) == [], "nothing to page the user about"
+    assert validator.calls == [], "no seat is asked to judge a decision to drop"
+    store = fleet.store()
+    try:
+        row = store.get_work_order(wo["id"])
+        assert (row["status"], row["needs_attention"]) == ("completed", 0)
+        latest = store.latest_validation_round(wo_id=wo["id"])
+        assert latest["outcome"] == "void"
+        assert "duplicate of wo-0d358979" in str(latest["reason"])
+        assert [e for e in store.list_events(wo["id"])
+                if e["kind"] == "validation_escalated"] == []
+    finally:
+        store.close()
+
+
 def test_three_outages_ping_the_user_once_not_once_per_attempt(fleet):
     """The outage path writes a `validation_failed` event per attempt and escalates on the third"""
     fleet.daemon.validator = Validator(claude_cli.ClaudeCliError("connection reset"))
