@@ -987,6 +987,11 @@ def create_app() -> FastAPI:
         """Owns the liveness probe task (spec §2) and the watchdog thread (issue #1221)"""
         import anyio
 
+        try:
+            invariants.report_at_startup("ui")
+        except Exception:  # noqa: BLE001 — a startup check must not stop the dashboard
+            import logging
+            logging.getLogger(__name__).exception("startup invariant check failed")
         watchdog.start()
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
