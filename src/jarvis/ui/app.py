@@ -191,6 +191,14 @@ def query_filters(request: Request, allowed: Mapping[str, Sequence[str]]) -> dic
     return out
 
 
+def query_int(text: str, default: int | None) -> int | None:
+    """Blank or junk is the default, never a 422: filter_bar submits blanks (wo-522ea53a)"""
+    try:
+        return int(text.strip())
+    except ValueError:
+        return default
+
+
 def filter_rows(rows: Iterable[dict], filters: Mapping[str, str],
                 text_keys: Sequence[str] = ()) -> list[dict]:
     """Rows equal on every non-empty filter; `q` is a case-insensitive substring over `text_keys`"""
@@ -1792,8 +1800,9 @@ def create_app() -> FastAPI:
                       opinions=opinions, digest_credit=_digest_credit())
 
     @app.get("/neo/stats", response_class=HTMLResponse)
-    def neo_stats_page(request: Request, project: str = "", days: int | None = None):
+    def neo_stats_page(request: Request, project: str = "", days: str = ""):
         """Neo's own report — §6 of docs/superpowers/specs/2026-10-01-neo-observability.md"""
+        days = query_int(days, None)
         try:
             report = ops.neo_stats_report(project=project or None, days=days)
         except ops.OpsError as e:
@@ -2044,15 +2053,15 @@ def create_app() -> FastAPI:
                       filters=filters, options=options, shown=len(shown), total=len(every))
 
     @app.get("/evolution", response_class=HTMLResponse)
-    def evolution_page(request: Request, days: int = 90, project: str = ""):
+    def evolution_page(request: Request, days: str = "", project: str = ""):
         """Is the OS getting better at running itself — and where is it still weak? (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
-        return _evolution(request, project.strip() or None, days)
+        return _evolution(request, project.strip() or None, query_int(days, 90))
 
     @app.get("/evolution/rule/{key}", response_class=HTMLResponse)
-    def evolution_rule_page(request: Request, key: str, project: str = "", days: int = 90):
+    def evolution_rule_page(request: Request, key: str, project: str = "", days: str = ""):
         """One detector's history and what it filed (spec 2026-10-29 dashboard §5)"""
         try:
-            report = ops.evolution_report(project.strip() or None, days=days)
+            report = ops.evolution_report(project.strip() or None, days=query_int(days, 90))
         except ops.OpsError as e:
             return render(request, "error.html", active="evolution",
                           message=str(e), status_code=404)
@@ -2069,9 +2078,9 @@ def create_app() -> FastAPI:
                       filed=[e for e in report["timeline"] if e["id"] == str(key)])
 
     @app.get("/evolution/{project}", response_class=HTMLResponse)
-    def evolution_project_page(request: Request, project: str, days: int = 90):
+    def evolution_project_page(request: Request, project: str, days: str = ""):
         """The same report scoped to one project — where each project page links"""
-        return _evolution(request, project, days)
+        return _evolution(request, project, query_int(days, 90))
 
     @app.get("/alarms/{project}/{alarm_id}", response_class=HTMLResponse)
     def alarm_page(request: Request, project: str, alarm_id: str):
