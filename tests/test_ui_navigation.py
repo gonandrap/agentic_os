@@ -27,10 +27,10 @@ def test_go_sends_a_feature_order_through_order_path(client):  # noqa: F811
 @pytest.mark.parametrize("ref, where", [
     ("q12", "/neo/question/12"),
     ("12", "/neo/question/12"),
-    ("gate-7", "/gates#gate-7"),
-    ("kn-0123abcd", "/knowledge#kn-0123abcd"),
-    ("mv-0123abcd", "/morpheus#mv-0123abcd"),
-    ("bl-0123abcd", "/backlog#bl-0123abcd"),
+    ("gate-7", "/gates/7"),
+    ("kn-0123abcd", "/knowledge/kn-0123abcd"),
+    ("mv-0123abcd", "/morpheus/mv-0123abcd"),
+    ("bl-0123abcd", "/backlog/bl-0123abcd"),
 ])
 def test_go_resolves_the_numbered_and_fleet_wide_ids(client, ref, where):  # noqa: F811
     assert client.get(f"/go/{ref}").headers["location"] == where
@@ -76,7 +76,7 @@ def test_a_hold_carries_the_key_it_was_paired_on_through_every_cut():
 
 @pytest.mark.parametrize("cause, key, href", [
     (holds.NEO_QUESTION, 41, "/neo/question/41"),
-    (holds.GATE, 7, "/gates#gate-7"),
+    (holds.GATE, 7, "/gates/7"),
     (holds.VALIDATION, 2, "#round-2"),
     (holds.MESSAGE, 9, "#msg-9"),
 ])

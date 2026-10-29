@@ -325,7 +325,8 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
     if not ended:
         return None
     age = (time.time() if now is None else now) - ended
-    if age < usage.WRITE_TTL_SECONDS:
+    # The arm the last turn bought its writes at: an hour-arm prefix is still warm at 5 min (#1291)
+    if age < usage.ttl_seconds(str(turn.get("cache_ttl") or "")):
         return None
     context = measured_context(store, wo["id"])
     # An UNKNOWN size skips the floor rather than failing it: the floor exists to stop a small... (#885)

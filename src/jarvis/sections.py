@@ -75,6 +75,68 @@ def labelled_sections(text: str) -> list[tuple[str, str]]:
     return [(m.group(1), m.group(2)) for m in SECTION_LABEL_RE.finditer(text)]
 
 
+#: `6.2 item 5`, `§6.2`, `section 7 step 2`: a numbered heading, optionally one list item under it
+CITE_RE = re.compile(
+    r"(?:(?:§\s*|\bsection\s+)(\d+(?:\.\d+)*)|\b(\d+(?:\.\d+)+))"
+    r"(?:\s*,?\s*(?:item|step|point)\s+(\d+))?", re.IGNORECASE)
+_ITEM_RE = re.compile(r"^([ \t]*)(\d+)[.)]\s", re.MULTILINE)
+_LIST_LINE_RE = re.compile(r"^([ \t]*)(?:\d+[.)]|[-*+])\s")
+
+
+def _numbered_heading(markdown: str, num: str) -> int | None:
+    want = re.compile(rf"§?\s*{re.escape(num)}(?:[.):\s]|$)")
+    for i, m in enumerate(HEADING_RE.finditer(markdown)):
+        if want.match(m.group(2)):
+            return i
+    return None
+
+
+def _section_at(markdown: str, index: int) -> str:
+    heads = list(HEADING_RE.finditer(markdown))
+    start, level = heads[index].start(), len(heads[index].group(1))
+    end = next((h.start() for h in heads[index + 1:] if len(h.group(1)) <= level),
+               len(markdown))
+    return markdown[start:end].rstrip()
+
+
+def list_item(markdown: str, n: str) -> str | None:
+    """Numbered item `n` of the outermost numbered list in `markdown`, continuation lines included"""
+    found = [m for m in _ITEM_RE.finditer(markdown) if m.group(2) == n]
+    if not found:
+        return None
+    m = min(found, key=lambda x: len(x.group(1)))
+    indent = len(m.group(1))
+    lines = markdown[m.start():].splitlines()
+    out, blank = [lines[0]], False
+    for line in lines[1:]:
+        if not line.strip():
+            blank = True
+            out.append(line)
+            continue
+        own = len(line) - len(line.lstrip())
+        if HEADING_RE.match(line) or (own <= indent and (blank or _LIST_LINE_RE.match(line))):
+            break
+        blank = False
+        out.append(line)
+    return "\n".join(out).rstrip()
+
+
+def cited_excerpts(markdown: str, text: str) -> list[str]:
+    """The smallest pieces of `markdown` that `text` cites by number"""
+    out: list[str] = []
+    for m in CITE_RE.finditer(text):
+        num, item = m.group(1) or m.group(2), m.group(3)
+        index = _numbered_heading(markdown, num)
+        if index is None or (index == 0 and not item):
+            continue  # not here, or the whole section the caller already has
+        piece = _section_at(markdown, index)
+        if item:
+            piece = list_item(piece, item) or piece
+        if not any(piece in kept for kept in out):
+            out = [kept for kept in out if kept not in piece] + [piece]
+    return out
+
+
 def extract_section(markdown: str, which: str) -> str | None:
     """One section of a markdown document, heading included, or None"""
     heads = [(m.start(), len(m.group(1)), m.group(2)) for m in HEADING_RE.finditer(markdown)]

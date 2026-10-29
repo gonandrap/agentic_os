@@ -27,6 +27,13 @@ CACHE_WRITE_1H_RATE = 2.0  # x input price, at the 1-hour TTL
 CACHE_READ_RATE = 0.10  # x input price, under either TTL
 #: The TTL Jarvis buys (`claude_cli.PROMPT_CACHE_5M_ENV`)
 WRITE_TTL_SECONDS = 300.0
+#: The TTL the `worker.cache_ttl` = 1h arm buys
+WRITE_TTL_1H_SECONDS = 3600.0
+
+
+def ttl_seconds(arm: str) -> float:
+    """How long a prefix written on this `worker.cache_ttl` arm stays warm (#1291)"""
+    return WRITE_TTL_1H_SECONDS if arm == "1h" else WRITE_TTL_SECONDS
 
 #: The share of ALL cache writes that must be TTL expiry before buying the 1-hour write starts paying
 TTL_BREAK_EVEN = (CACHE_WRITE_1H_RATE - CACHE_WRITE_RATE) / (
@@ -502,6 +509,8 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
     found: list[Boundary] = []
     previous_read: int | None = None
     previous_ts: float | None = None
+    # The TTL the prefix was last BOUGHT at, which a read-only call does not change (#1291)
+    ttl = WRITE_TTL_SECONDS
     for call in calls:
         read = call.cache_read
         ts = call.ts or None
@@ -509,7 +518,7 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
         if previous_read is not None and read < previous_read:
             # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
             gap = (ts - previous_ts) if (ts and previous_ts) else None
-            expired = (gap is not None and gap >= WRITE_TTL_SECONDS
+            expired = (gap is not None and gap >= ttl
                        and cold_prefix_floor is not None
                        and read <= cold_prefix_floor)
             # Tested FIRST: a compacted boundary reads the static head seconds after the summary landed
@@ -524,6 +533,8 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
             found.append(Boundary(ts=call.ts, cause=cause,
                                   cache_write=call.cache_write, cache_read=read,
                                   gap=gap or 0.0))
+        if call.cache_1h or call.cache_5m:
+            ttl = WRITE_TTL_1H_SECONDS if call.cache_1h else WRITE_TTL_SECONDS
         previous_read = read
         previous_ts = ts
     return found

@@ -2468,6 +2468,70 @@ def test_a_design_doc_on_the_planners_branch_and_not_on_main_is_silent(project):
     assert _pointer_violations(store) == []
 
 
+SPEC_PR = "https://github.com/x/y/pull/1289"
+
+
+def _unmerged_spec_feature(store: ProjectStore, project: Path, *, planner_status: str,
+                           fo_status: str = "executing") -> tuple[dict, str]:
+    """Issue 1308's shape, the spec on the planner's branch and its worktree removed (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §3)"""
+    from jarvis.testing import commit
+
+    fo = _feature_with_pointer(store, "docs/superpowers/specs/unmerged.md")
+    worktree = _planner_branch(store, project, fo["id"], branch="worktree-plan")
+    doc = worktree / "docs" / "superpowers" / "specs" / "unmerged.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text("# the spec\n")
+    commit(worktree, "the spec", "docs/superpowers/specs/unmerged.md")
+    subprocess.run(["git", "-C", str(project), "worktree", "remove", "--force",
+                    str(worktree)], check=True, capture_output=True)
+    planner = store.get_feature_order(fo["id"])["plan_wo_id"]
+    store.add_event(planner, "finished", {"summary": "planned", "authored": {
+        "branch": "worktree-plan", "base": "main", "commits": 1, "dirty": []}})
+    store.update_work_order(planner, pr_url=SPEC_PR)
+    store.set_status(planner, planner_status)
+    store.update_feature_order(fo["id"], status=fo_status)
+    return fo, planner
+
+
+def test_an_unmerged_spec_on_a_completed_planner_reparks_it(project, monkeypatch):
+    """Issue 1308 gaps 1 and 3: the cause is the unmerged spec PR, and the OS takes it back"""
+    store = ProjectStore(project)
+    fo, planner = _unmerged_spec_feature(store, Path(project), planner_status="completed")
+    reparked: list[str] = []
+    monkeypatch.setattr(ops, "repark_spec_pull_request",
+                        lambda wo_id: reparked.append(wo_id) or "waiting_pr_merge")
+
+    (found,) = _pointer_violations(store)
+
+    assert reparked == [planner]
+    assert found.repaired is True
+    assert SPEC_PR in found.detail and "worktree-plan" in found.detail
+    assert "no tracked file" not in found.detail and "fo cancel" not in found.detail
+    assert found.subject_id == fo["id"]
+
+
+def test_a_spec_pr_the_os_is_parked_behind_is_silent(project):
+    store = ProjectStore(project)
+    _unmerged_spec_feature(store, Path(project), planner_status="waiting_pr_merge")
+
+    assert _pointer_violations(store) == []
+
+
+def test_an_unmerged_spec_on_a_settled_feature_names_the_pr_not_a_cancel(project,
+                                                                         monkeypatch):
+    store = ProjectStore(project)
+    _unmerged_spec_feature(store, Path(project), planner_status="completed",
+                           fo_status="completed")
+    monkeypatch.setattr(ops, "repark_spec_pull_request",
+                        lambda wo_id: pytest.fail("a settled feature is not re-parked"))
+
+    (found,) = _pointer_violations(store)
+
+    assert found.repaired is False
+    assert f"merge {SPEC_PR}" in found.owed
+    assert "fo cancel" not in found.owed
+
+
 def test_the_repair_only_considers_candidates_that_exist_on_the_ref(project):
     """§3.4 and §2.3: the single-match branch WRITES"""
     store = ProjectStore(project)

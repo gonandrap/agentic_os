@@ -2,18 +2,21 @@
 {% import "_validation.html" as validation_ui %}
 {% import "_issues.html" as issues_ui %}
 {% import "_states.html" as states_ui %}
+{% import "_layout.html" as ui %}
 {% block title %}{{ fo.id }} — Jarvis{% endblock %}
+{% block style %}
+  @media (max-width: 640px) { main .row { flex-wrap: wrap; } main .row > .grow { flex-basis: 100%; } }
+{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 600px;">
 {# The one page where the whole feature is visible at once: the ask the user wrote, the
    decomposition the planner submitted against it, and each child's live status. That
    ordering is the point — a plan is only judgeable next to the ask it answers, and this
    is also where an escalated plan gets decided for exactly that reason. #}
 {% set m = fo_status_meta.get(fo.status, {'word': fo.status, 'icon': '•', 'tone': 'muted'}) %}
 
-<h2><span class="mono">{{ fo.id }}</span> {{ fo.title }}</h2>
+{# §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md:
+   summary head, then the asks, then the children full width; the long brief folds. #}
+{{ ui.page_head(fo.id ~ " " ~ fo.title) }}
 <p class="sub">
   <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
   · <a href="/project/{{ project }}">{{ project }}</a>
@@ -35,6 +38,65 @@
 {% if fo.needs_attention %}
 <div class="panel"><div class="row tone-warn">◭ {{ fo.attention_reason }}</div></div>
 {% endif %}
+
+{% if fo.status == 'failed' %}
+{# The user's own way past a dead child. Without it, reviving a feature needed somebody
+   with database access — `settle_features` never looks at a settled feature again.
+   See docs/superpowers/specs/2026-08-29-feature-order-resume.md. #}
+<h3>Resume this feature</h3>
+<div class="panel">
+  <form method="post" action="/fo/{{ project }}/{{ fo.id }}/resume">
+    <p class="sub">Every child that is still failed or cancelled is marked superseded —
+      it stops holding the feature back, and stays on the list saying so. Describe what
+      still needs doing and it is filed as a new child work order, which is all that
+      worker will see. Leave it empty when the failure was spurious and the work is
+      already done.</p>
+    <textarea name="fix" rows="3"
+              placeholder="what still needs doing (optional)"></textarea>
+    <button>Resume it</button>
+  </form>
+</div>
+{% endif %}
+
+<h3>Children</h3>
+<div class="panel fo-children">
+  {% for c in fo.children %}
+    {% set cm = status_meta.get(c.status, {'word': c.status, 'icon': '•', 'tone': 'muted'}) %}
+    <div class="row" data-status="{{ c.status }}">
+      <span class="st tone-{{ cm.tone }}"><span class="i">{{ cm.icon }}</span>{{ cm.word }}</span>
+      <div class="grow">
+        {{ ui.row_id(c.id, '/wo/' ~ project ~ '/' ~ c.id) }} {{ c.title }}
+        {% if c.superseded %}
+          {# Superseded, not hidden: the row IS the feature's history, and dropping it
+             would make a child the user answered for look like one that never ran. #}
+          <div class="sub">⊘ superseded — you answered for this one; it no longer
+            settles the feature either way</div>
+        {% endif %}
+        {% if c.depends_on %}
+          <div class="sub">⊘ after
+            {% for d in c.depends_on %}{{ ui.row_id(d, '/wo/' ~ project ~ '/' ~ d) }}{{ ', ' if not loop.last }}{% endfor %}
+          </div>
+        {% endif %}
+        {% if not c.depends_on and c.status_label != c.status %}
+          {# Everything status_label says that the icon does not — today that is the
+             per-feature slot cap. Suppressed when there are dependencies, because the
+             line above already gave the stronger reason. #}
+          <div class="sub">⊘ {{ c.status_label }}</div>
+        {% endif %}
+        {% if c.status == 'waiting_pr_merge' and c.pr_url %}
+          <div class="sub">⑃ <a href="{{ c.pr_url }}" rel="noopener">{{ c.pr_url }}</a></div>
+        {% endif %}
+        {% if c.needs_attention %}<div class="sub tone-warn">◭ {{ c.attention_reason }}</div>{% endif %}
+      </div>
+    </div>
+  {% else %}
+    <div class="empty">
+      {% if fo.status in ('pending', 'planning', 'plan_review') %}
+        nothing created yet — a plan is a proposal until it is released
+      {% else %}no children{% endif %}
+    </div>
+  {% endfor %}
+</div>
 
 {# THE FAMILY BUDGET. `unreserved` is the number a reader needs when a CHILD has stopped
    and they are deciding whether to top the child up or the feature: it is what this
@@ -67,8 +129,9 @@
   </form>
 </div></div>
 
-<h3>The ask</h3>
-<div class="panel"><div class="row"><div class="grow">{{ fo.description }}</div></div></div>
+{% call ui.explain("The ask") %}
+<div class="panel"><div class="row"><div class="grow" style="white-space: pre-wrap;">{{ fo.description }}</div></div></div>
+{% endcall %}
 
 {% if fo.planner %}
 <p class="sub">planner:
@@ -147,72 +210,10 @@
 
 {{ issues_ui.unit(issues, 'h3') }}
 
-{% if fo.status == 'failed' %}
-{# The user's own way past a dead child. Without it, reviving a feature needed somebody
-   with database access — `settle_features` never looks at a settled feature again.
-   See docs/superpowers/specs/2026-08-29-feature-order-resume.md. #}
-<h3>Resume this feature</h3>
-<div class="panel">
-  <form method="post" action="/fo/{{ project }}/{{ fo.id }}/resume">
-    <p class="sub">Every child that is still failed or cancelled is marked superseded —
-      it stops holding the feature back, and stays on the list saying so. Describe what
-      still needs doing and it is filed as a new child work order, which is all that
-      worker will see. Leave it empty when the failure was spurious and the work is
-      already done.</p>
-    <textarea name="fix" rows="3"
-              placeholder="what still needs doing (optional)"></textarea>
-    <button>Resume it</button>
-  </form>
-</div>
-{% endif %}
-
-<h3>Children</h3>
-<div class="panel">
-  {% for c in fo.children %}
-    {% set cm = status_meta.get(c.status, {'word': c.status, 'icon': '•', 'tone': 'muted'}) %}
-    <div class="row">
-      <span class="st tone-{{ cm.tone }}"><span class="i">{{ cm.icon }}</span>{{ cm.word }}</span>
-      <div class="grow">
-        <a href="/wo/{{ project }}/{{ c.id }}" class="mono">{{ c.id }}</a> {{ c.title }}
-        {% if c.superseded %}
-          {# Superseded, not hidden: the row IS the feature's history, and dropping it
-             would make a child the user answered for look like one that never ran. #}
-          <div class="sub">⊘ superseded — you answered for this one; it no longer
-            settles the feature either way</div>
-        {% endif %}
-        {% if c.depends_on %}
-          <div class="sub">⊘ after
-            {% for d in c.depends_on %}<a class="mono"
-              href="/wo/{{ project }}/{{ d }}">{{ d }}</a>{{ ', ' if not loop.last }}{% endfor %}
-          </div>
-        {% endif %}
-        {% if not c.depends_on and c.status_label != c.status %}
-          {# Everything status_label says that the icon does not — today that is the
-             per-feature slot cap. Suppressed when there are dependencies, because the
-             line above already gave the stronger reason. #}
-          <div class="sub">⊘ {{ c.status_label }}</div>
-        {% endif %}
-        {% if c.status == 'waiting_pr_merge' and c.pr_url %}
-          <div class="sub">⑃ <a href="{{ c.pr_url }}" rel="noopener">{{ c.pr_url }}</a></div>
-        {% endif %}
-        {% if c.needs_attention %}<div class="sub tone-warn">◭ {{ c.attention_reason }}</div>{% endif %}
-      </div>
-    </div>
-  {% else %}
-    <div class="empty">
-      {% if fo.status in ('pending', 'planning', 'plan_review') %}
-        nothing created yet — a plan is a proposal until it is released
-      {% else %}no children{% endif %}
-    </div>
-  {% endfor %}
-</div>
-
 {% if fo.status in ('pending', 'planning', 'plan_review', 'executing') %}
 <form class="inline" method="post" action="/fo/{{ project }}/{{ fo.id }}/cancel">
   <button>Cancel this feature order</button>
   <span class="sub">stops the planner and every child still running</span>
 </form>
 {% endif %}
-
-</div>
 {% endblock %}

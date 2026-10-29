@@ -395,7 +395,42 @@ def test_the_break_is_announced_once_across_repeated_reconcile_passes(
 
     rows = [n for n in store.unrouted_notifications()
             if invariants.INV_BASE_RED in n["title"]]
-    assert len(rows) == 1 and rows[0]["level"] == "warning"
+    # No fix order is producing the commit, so it is the user's (issue #1280)
+    assert len(rows) == 1 and rows[0]["level"] == "critical"
+
+
+def _red_main_attention(daemon) -> list:
+    return [i for i in ops.os_status(daemon.catalog)["attention"]
+            if i.get("invariant") == invariants.INV_BASE_RED]
+
+
+def test_a_red_main_nobody_is_fixing_is_under_needs_you_until_green(
+        started, spec, project, fake_gh):
+    """Issue #1280: NEEDS YOU carries the run and the command that orders the fix"""
+    red_fleet(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    started.check_invariants(spec, store)
+
+    [item] = _red_main_attention(started)
+    assert "36273250195" in item["reason"]
+    assert "jarvis bug report" in item["reason"] and "--expedite" in item["reason"]
+
+    fake_gh.set_runs("main", [MAIN_GREEN])
+    poll(started, store)
+    started.check_invariants(spec, store)
+    assert _red_main_attention(started) == []
+
+
+def test_a_red_main_with_a_fix_order_in_flight_is_not_under_needs_you(
+        tracker, project, fake_gh):
+    store = ProjectStore(project)
+    poll(tracker, store)
+    sweep(tracker, store)
+    assert fact()["fix_wo_id"]
+    tracker.check_invariants(tracker.catalog.project("proj_a"), store)
+
+    assert _red_main_attention(tracker) == []
 
 
 def test_the_green_transition_announces_recovery_and_re_arms_the_report(

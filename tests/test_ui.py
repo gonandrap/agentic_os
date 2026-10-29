@@ -866,6 +866,23 @@ def test_inbox_filters_sort_and_ack_shown(client, daemon, project):
     assert "disk almost full" not in text and "low news" in text
 
 
+def test_the_list_page_primitives_filter_and_order_rows():
+    from starlette.requests import Request
+
+    from jarvis.ui.app import attention_first, filter_options, filter_rows, query_filters
+    q = "level=bogus&q=%20" + "x" * 300 + "&project=&other=1"
+    req = Request({"type": "http", "query_string": q.encode()})
+    got = query_filters(req, {"level": ["info"], "q": [], "project": ["a"]})
+    # an unknown value is kept so it matches nothing; free text is capped; empty is absent
+    assert got == {"level": "bogus", "q": "x" * 100}
+    rows = [{"id": 1, "level": "info", "t": "Disk full"}, {"id": 2, "level": "crit", "t": "ok"},
+            {"id": 3, "level": "info", "t": None}, {"id": 4, "level": "crit", "t": "disk"}]
+    assert filter_rows(rows, {"level": "bogus"}) == []
+    assert [r["id"] for r in filter_rows(rows, {"level": "info", "q": "DISK"}, ("t",))] == [1]
+    assert filter_options(rows + [{"level": ""}], "level") == ["crit", "info"]
+    assert [r["id"] for r in attention_first(rows, lambda r: r["level"] == "crit")] == [2, 4, 1, 3]
+
+
 def test_dashboard_clears_unacked_banner_after_ack(client, daemon, project):
     """Acking every inbox item must clear the "unacked notification" banner on the main dashboard"""
     store = ProjectStore(project)
@@ -919,7 +936,8 @@ def test_knowledge_page_filters_by_topic_and_words(client):
     central.add_knowledge("untopicked lesson", project="")
 
     page = client.get("/knowledge").text
-    assert 'href="/knowledge?topic=tooling"' in page and "<datalist" in page
+    assert 'href="/knowledge?topic=tooling"' in page
+    assert '<select name="topic"' in page and '<option value="tooling"' in page
 
     page = client.get("/knowledge?topic=tooling").text
     assert "prefer uv" in page and "gates block" not in page
@@ -939,7 +957,7 @@ def test_knowledge_page_reports_what_the_base_costs_and_who_reads_it(client):
     central.record_knowledge_read("show", [row], project="proj_a", wo_id="wo-x")
 
     page = client.get("/knowledge").text
-    assert "what it costs a prompt" in page and "who reads it" in page
+    assert "what it costs a prompt" in page.lower() and "who reads it" in page.lower()
     assert "…" in page                       # the index line, truncated as a worker sees it
     assert "1 reads" in page or ">1<" in page  # the read just recorded is counted
 
@@ -1164,8 +1182,8 @@ def test_neo_teach_directly(client):
 def test_gates_tab_is_empty_and_unbadged_when_nothing_is_gated(client):
     r = client.get("/gates")
     assert r.status_code == 200
-    assert "nothing under review" in r.text
-    assert "no gate has been decided yet" in r.text
+    assert "no privileged action has been gated yet" in r.text
+    assert 'class="attention hot needs-you"' not in r.text
     # an ungated fleet must not grow a nav badge asking for attention it doesn't need
     assert 'href="/gates"' in r.text
     assert '<span class="nav-badge">' not in r.text  # the CSS rule always matches
@@ -1178,14 +1196,17 @@ def test_gates_tab_shows_the_request_the_reviewer_saw(gated):
 
     r = gated.client.get("/gates")
     assert r.status_code == 200
-    assert "Waiting on you" in r.text
+    assert "waiting on you — Neo escalated" in r.text
     assert "./scripts/shipit.sh" in r.text
-    assert "all tests pass, PR is merged" in r.text
-    assert "the request exactly as the reviewer saw it" in r.text
-    # the full request text Neo was given, verbatim
-    assert "PRIVILEGED ACTION REQUEST" in r.text or "cut a release" in r.text
-    assert f'id="gate-{approval["id"]}"' in r.text
+    assert f'href="/gates/{approval["id"]}?project=proj_a"' in r.text
     assert '<span class="nav-badge">1</span>' in r.text  # escalated ⇒ the tab is badged
+
+    # the case and the request as Neo read it live on the gate's own page
+    detail = gated.client.get(f"/gates/{approval['id']}").text
+    assert "all tests pass, PR is merged" in detail
+    assert "the request exactly as the reviewer saw it" in detail
+    assert "PRIVILEGED ACTION REQUEST" in detail or "cut a release" in detail
+    assert 'value="approve"' in detail
 
 
 def test_gates_tab_explains_a_request_held_for_the_worker_s_case(gated):
@@ -1207,25 +1228,28 @@ def test_gates_tab_explains_a_request_held_for_the_worker_s_case(gated):
     assert "jarvis gate request" in page
     # BOTH exits, here as everywhere a blocked worker's row is explained (spec §3)
     assert "jarvis gate contest" in page
-    assert "No reviewer sees it yet" in page
     assert "gates.case_ttl_seconds" in page
-    # Not "Refused": the TTL abandons, and saying refused would promise a reviewer who never looked
-    assert "Abandoned automatically in" in page
-    assert "Refused automatically" not in page
-    assert f'id="gate-{gated.approval()["id"]}"' in page
-    # not filed among the verdicts, where nothing explains it and the heading is a lie
-    assert "no gate has been decided yet" in page
+    assert "awaiting case" in page and "abandoned in" in page
+    # not filed among the verdicts
+    assert ">approved<" not in page and ">denied<" not in page
     # and it asks the user for nothing
     assert '<span class="nav-badge">' not in page
+
+    detail = gated.client.get(f"/gates/{gated.approval()['id']}").text
+    assert "no reviewer sees it until the worker makes its case" in detail
+    # Not "Refused": the TTL abandons, and saying refused would promise a reviewer who never looked
+    assert "abandoned automatically in" in detail
+    assert "efused automatically" not in detail
+    assert 'name="decision"' not in detail
 
 
 def test_gate_pending_with_neo_costs_no_badge(gated):
     """A request Neo is still reviewing is free by design"""
     gated.request()
     r = gated.client.get("/gates")
-    assert "With Neo" in r.text
+    assert "with neo" in r.text
     assert "./scripts/shipit.sh" in r.text
-    assert "Waiting on you" not in r.text
+    assert 'class="attention hot needs-you"' not in r.text
     assert '<span class="nav-badge">' not in r.text
 
 
@@ -1255,8 +1279,9 @@ def test_approve_from_the_dashboard_opens_the_gate(gated):
          "cwd": str(gated.project)}, settings["env"])
     assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
 
-    page = gated.client.get("/gates").text
-    assert "Decided" in page and "approved" in page and "I checked it myself" in page
+    assert "approved" in gated.client.get("/gates").text
+    page = gated.client.get(f"/gates/{approval['id']}").text
+    assert "approved by" in page and "I checked it myself" in page
 
 
 def test_deny_from_the_dashboard_needs_a_reason(gated):
@@ -1330,7 +1355,7 @@ def test_dismiss_from_the_dashboard_clears_the_command_without_approving_it(gate
     # Listed apart from the verdicts, with the rate, and NOT counted as approved
     assert "Not gated actions — the OS got these wrong" in page
     assert "false-positive rate: 1 of 1 (100%)" in page
-    assert "no gate has been decided yet" in page
+    assert "not a gate" in page and ">approved<" not in page
 
 
 def test_dismiss_from_the_dashboard_needs_a_reason(gated):
@@ -1372,7 +1397,7 @@ def test_dashboard_attention_deep_links_an_escalated_gate(gated):
     gated.daemon._neo_drain()
     r = gated.client.get("/")
     assert "NEEDS YOU" in r.text
-    assert f'href="/gates#gate-{approval["id"]}"' in r.text
+    assert f'href="/gates/{approval["id"]}"' in r.text
 
 
 def test_timeline_hides_plumbing_until_debug_is_requested(client, daemon, project):
@@ -2603,7 +2628,8 @@ def test_a_contested_gate_offers_no_approve_button(gated):
                            why="the literal is inside a message body")
     gated.daemon._neo_drain()          # the fake escalates by default
 
-    page = gated.client.get("/gates").text
+    [approval] = [g for g in ops.list_gates() if g["wo_id"] == gated.wo_id]
+    page = gated.client.get(f"/gates/{approval['id']}").text
     assert "CONTESTED" in page
     assert "the literal is inside a message body" in page
     assert 'value="dismiss"' in page and 'value="deny"' in page
@@ -2839,6 +2865,16 @@ def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
     featured, _ = group_open([{"status": "needs_review", "id": "wo-1"},
                               {"status": "budget_exhausted", "id": "wo-2"}])
     assert [w["id"] for w in featured] == ["wo-2", "wo-1"]
+
+
+def test_a_validating_order_has_a_row_of_its_own():
+    """A pending row's "blocked by" can name it, so it must not hide in a collapsed count"""
+    from jarvis.ui.app import group_open
+
+    featured, rest = group_open([{"status": "pending", "id": "wo-1"},
+                                 {"status": "validating", "id": "wo-2"}], revealed="pending")
+    assert [w["id"] for w in featured] == ["wo-2"]
+    assert [w["id"] for w in rest] == ["wo-1"]
 
 
 # -- a budget at CREATION time
@@ -3305,3 +3341,112 @@ def test_order_path_maps_every_prefix_and_falls_back_to_the_feature_page():
     assert order_path("proj_a", "inv-1234") == "/inv/proj_a/inv-1234"
     # Unknown prefix: the feature page, never `/wo/`
     assert order_path("proj_a", "zz-1234") == "/fo/proj_a/zz-1234"
+
+
+# -- record detail pages (spec 2026-10-29 dashboard §6)
+
+
+def test_a_backlog_item_page_links_its_dependencies_and_promotes(client, project):
+    central = CentralStore()
+    dep = central.add_backlog("proj_a", "foundation")
+    item = central.add_backlog("proj_a", "tower", description="build it tall",
+                               depends_on=[dep["id"]])
+    central.close()
+
+    page = client.get(f"/backlog/{item['id']}").text
+    assert "build it tall" in page
+    assert f'href="/backlog/{dep["id"]}"' in page
+    assert f'action="/backlog/promote/{item["id"]}"' in page and 'name="force"' in page
+    assert client.get("/backlog/bl-nope").status_code == 404
+
+    shown = ops.show_backlog(item["id"])
+    assert [b["id"] for b in shown["blockers"]] == [dep["id"]]
+
+
+def test_a_knowledge_entry_page_shows_the_body_and_pins_back_to_itself(client):
+    central = CentralStore()
+    row = central.add_knowledge("FIRST LINE\nthe whole body, past the headline",
+                                project="", topic="tooling", wo_id="wo-1234abcd")
+    central.close()
+
+    page = client.get(f"/knowledge/{row['id']}").text
+    assert "the whole body, past the headline" in page
+    assert 'href="/go/wo-1234abcd"' in page
+    assert "0 reads" in page
+
+    r = client.post("/knowledge/pin", data={"kn_id": row["id"], "pinned": "1",
+                                            "next": f"/knowledge/{row['id']}"})
+    assert r.headers["location"] == f"/knowledge/{row['id']}"
+    assert ops.knowledge_detail(row["id"])["pinned"]
+    # a dashboard view is not an agent read: the read log stays empty
+    assert ops.knowledge_detail(row["id"])["reads"] == 0
+    assert client.get("/knowledge/kn-nope").status_code == 404
+    r = client.post("/knowledge/pin", data={"kn_id": "kn-nope", "pinned": "1"})
+    from urllib.parse import unquote
+    assert "unknown knowledge id" in unquote(r.headers["location"])
+
+
+def test_a_gate_page_404s_on_an_unknown_id(client):
+    assert client.get("/gates/999").status_code == 404
+
+
+def test_a_gate_number_in_two_projects_lists_both_candidates(client, project, tmp_path):
+    """Approval ids are per project: a bare /gates/<n> must not dead-end"""
+    other = tmp_path / "proj_b"
+    other.mkdir()
+    central = CentralStore()
+    central.upsert_project("proj_b", str(other))
+    central.close()
+    ids = {}
+    for name, path in (("proj_a", project), ("proj_b", other)):
+        store = ProjectStore(path)
+        try:
+            wo = store.create_work_order(f"ship {name}")
+            ids[name] = store.add_approval(wo["id"], "release", f"./ship-{name}.sh")["id"]
+        finally:
+            store.close()
+    n = ids["proj_a"]
+    assert ids["proj_b"] == n
+
+    r = client.get(f"/gates/{n}", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == f"/gates?id={n}"
+
+    page = client.get(f"/gates?id={n}").text
+    assert f'href="/gates/{n}?project=proj_a"' in page
+    assert f'href="/gates/{n}?project=proj_b"' in page
+    assert "nothing matches these filters" not in page
+
+    r = client.get(f"/gates/{n}?project=proj_b")
+    assert r.status_code == 200
+    assert "./ship-proj_b.sh" in r.text and "./ship-proj_a.sh" not in r.text
+# -- §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+
+
+def test_a_dashboard_status_filter_reveals_a_collapsed_status(client):
+    ops.create_work_order("proj_a", "not started yet")
+    assert "not started yet" not in client.get("/").text  # pending collapses into a count
+    page = client.get("/?status=pending").text
+    assert "not started yet" in page and "1 of 1 shown" in page
+
+
+def test_the_project_filter_counts_only_what_the_view_draws_from(client, project):
+    open_wo = ops.create_work_order("proj_a", "still going")
+    done = ops.create_work_order("proj_a", "old and finished")
+    ops.mark_done(done["id"])
+    store = ProjectStore(project)
+    try:
+        store.set_status(open_wo["id"], "running")
+    finally:
+        store.close()
+    assert "1 of 1 shown" in client.get("/project/proj_a").text  # the settled one is not in M
+    assert "1 of 2 shown" in client.get("/project/proj_a?status=completed").text
+
+
+def test_a_finding_owed_a_decision_sorts_above_a_decided_one(improvement):
+    client, io, _ = improvement
+    first, second = (f["key"] for f in io["report"]["findings"][:2])
+    before = client.get(f"/io/proj_a/{io['id']}").text
+    assert before.index(f'id="finding-{first}"') < before.index(f'id="finding-{second}"')
+    ops.review_findings(io["id"], accept=(first,), project_name="proj_a")
+    page = client.get(f"/io/proj_a/{io['id']}").text
+    assert page.index(f'id="finding-{second}"') < page.index(f'id="finding-{first}"')

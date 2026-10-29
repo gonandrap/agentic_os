@@ -2284,6 +2284,9 @@ def jarvis_home(tmp_path, monkeypatch):
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(transcripts))
     # The parsed-transcript cache follows the home too, and it is process-global
     transcript_cache.reset()
+    # Host libsqlite3 must not decide whether doctor is green (INV-SQLITE-VERSION)
+    import sqlite3
+    monkeypatch.setattr(sqlite3, "sqlite_version", "3.51.2")
     return home
 
 

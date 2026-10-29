@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
-from . import claude_cli, db, structured
+from . import claude_cli, concision, db, structured
 from .neo_store import ESCALATION_CAUSES_CHOSEN, NeoStore
 
 log = logging.getLogger("neo")
@@ -62,12 +63,23 @@ Output STRICT JSON, nothing else:
   {"escalate": false, "answer": "<the decision, addressed to the worker — 1 line of explanation if you agree with its recommendation, 50 words max if you override it>", "reason": "<one line why>"}
   or
   {"escalate": true, "answer": "", "reason": "<one line why the user must decide>"}
+  or, when the question bundles independent claims or is too big to rule on:
+  {"escalate": false, "refine": true, "answer": "", "reason": "<one line: what to split or narrow>"}
 An escalation may carry one optional label, which is grouped and reported:
   "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
 high-stakes | no-learning-applies>"
 Either may carry one optional cleanup dispatch:
   "dispatch": {"title": "<short: which record is wrong>", "description": "<the full brief>"}
 `dispatch` is a FIELD of that one JSON object, never a second object after it (issue #1098)."""
+
+
+#: What a worker reads when Neo returns its question or assumption unruled
+REFINE_PREFIX = ("[Neo returned this unanswered — split or narrow it, then file each "
+                 "claim as its own question or assumption]")
+
+#: The third outcome, in the words every packet that offers it uses (wo-ea3c6f0c)
+REFINE_INSTRUCTION = ("Bundles independent claims, or too big to rule on? Set `refine` "
+                      "true; `reason` says what to split or narrow, and goes to the asker.")
 
 
 # The learnings block is the one part of Neo's prompt that grows without limit
@@ -184,6 +196,8 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
     verdict = _gate_verdict(data)
     return {
         "escalate": bool(data.get("escalate")),
+        # Escalation wins over a bounce: only the user can lift one
+        "refine": bool(data.get("refine")) and not bool(data.get("escalate")),
         "answer": str(data.get("answer") or ""),
         "reason": str(data.get("reason") or ""),
         "verdict": verdict,
@@ -272,20 +286,57 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
     return {**verdict, "model": result.model or model}
 
 
+#: Kinds whose asker is a worker that can re-file what a refine returns
+REFINABLE_KINDS = ("question", "assumption")
+
+#: Refines per (work order, kind) before a refine becomes an escalation, so a bounce cannot loop
+MAX_REFINES = 2
+
+#: A sentence that opens a second, independent claim, or a second numbered item
+_COMPOUND_RE = re.compile(
+    r"(?:^|[.;!?]\s+)(?:also|additionally|separately|in addition|secondly)\b"
+    r"|^\s*(?:\(?[2-9][.)]|Q[2-9]\b)", re.IGNORECASE | re.MULTILINE)
+
+
+def refine_note(text: str, max_chars: int) -> str:
+    """Why `text` goes back to its asker before any model call, or `''` (wo-ea3c6f0c)"""
+    if max_chars and len(text) > max_chars:
+        return (f"{len(text)} chars, over {max_chars}: keep the one decision you need and "
+                f"point at the rest (path § n, PR, commit)")
+    m = _COMPOUND_RE.search(text)
+    if m:
+        return (f"bundles independent claims (from {m.group(0).strip()!r}): "
+                f"file one per claim")
+    return ""
+
+
+def _refine_verdict(note: str) -> dict[str, Any]:
+    return {"escalate": False, "refine": True, "answer": "", "reason": note,
+            "verdict": "denied", "approve": False, "verdict_stated": False,
+            "dispatch": None, "cause": "", "stakes": ""}
+
+
 def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
                 deliver: Any = None, max_questions: int = 50,
                 answer: Any = None, unreachable: Any = None,
-                refused: Any = None) -> list[dict[str, Any]]:
+                refused: Any = None, skip: Any = ()) -> list[dict[str, Any]]:
     """Answer every queued question in FIFO order, back-to-back (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)"""
     answer = answer or answer_question
     results = []
     reached = False
     for _ in range(max_questions):
-        q = store.claim_next()
+        q = store.claim_next(skip)
         if q is None:
             break
+        kind = q.get("kind") or "question"
+        refinable = (kind in REFINABLE_KINDS
+                     and store.refines(q["wo_id"], kind) < MAX_REFINES)
+        # Assumptions are pre-checked where they are asked, which knows the pass
+        note = (refine_note(q["question"], concision.DEFAULT_QUESTION_MAX_CHARS)
+                if refinable and kind == "question" else "")
         try:
-            verdict = answer(store, q, model, learnings_limit)
+            verdict = (_refine_verdict(note) if note
+                       else answer(store, q, model, learnings_limit))
         except claude_cli.UsageLimitError as e:
             # BEFORE the generic outage below (#235)
             from .worker_session import RATE_LIMIT_FALLBACK_DELAY
@@ -328,7 +379,15 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             revived = store.revive_unreachable()
             if revived:
                 log.info("neo answered again: re-queued unreachable question(s) %s", revived)
-        if verdict["escalate"]:
+        if verdict.get("refine") and not refinable:
+            # The loop cap: a bounce past it is the user's to settle
+            verdict = {**verdict, "refine": False, "escalate": True,
+                       "cause": "scope-too-large",
+                       "reason": f"refine cap ({MAX_REFINES}) spent: {verdict['reason']}"}
+        if verdict.get("refine"):
+            store.mark(q["id"], "refined", reason=verdict["reason"])
+            log.info("neo returned question %s to its asker: %s", q["id"], verdict["reason"])
+        elif verdict["escalate"]:
             # Spec §2 of docs/superpowers/specs/2026-10-01-neo-observability.md
             store.mark(q["id"], "escalated", reason=verdict["reason"],
                        cause=verdict.get("cause") or "")
@@ -345,7 +404,8 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
         if deliver:
             deliver(q, verdict)
         results.append({"question": q, "verdict": verdict,
-                        "outcome": "escalated" if verdict["escalate"] else "answered"})
+                        "outcome": "refined" if verdict.get("refine")
+                        else "escalated" if verdict["escalate"] else "answered"})
     return results
 
 

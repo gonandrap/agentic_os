@@ -1,65 +1,39 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}{{ ('Search: ' + q) if q else 'Search' }} — Jarvis{% endblock %}
 {% block content %}
 
-<h2>Search{% if project %} <span class="kv mono">{{ project }}</span>{% endif %}</h2>
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6 #}
+{% set meta -%}
+  {% for k, n in counts %}{{ n }} {{ k.replace('_', ' ') }}{{ ' · ' if not loop.last }}{% endfor %}
+{%- endset %}
+{{ ui.page_head("Search", meta if q else "") }}
 
-<form class="panel search-form" method="get" action="/search">
-  <input type="text" name="q" value="{{ q }}" autofocus
-         placeholder="words, or an id like wo-1234abcd">
-  <select name="project" aria-label="project">
-    <option value="">every project</option>
-    {% for p in projects %}
-    <option value="{{ p }}" {{ 'selected' if p == project }}>{{ p }}</option>
-    {% endfor %}
-  </select>
-  <select name="kind" aria-label="kind">
-    <option value="">every kind</option>
-    {% for k in kinds %}
-    <option value="{{ k }}" {{ 'selected' if k == kind }}>{{ k.replace('_', ' ') }}</option>
-    {% endfor %}
-  </select>
-  <button class="primary">Search</button>
-</form>
+{{ ui.filter_bar("/search", filters, options, hits | length, total,
+                 labels={"q": "words, or an id like wo-1234abcd"}) }}
 
 {% if q %}
-  {% if hits %}
-  <p class="sub">
-    {% for k, n in counts %}
-      {%- if k == kind -%}
-        <strong>{{ n }} {{ k.replace('_', ' ') }}</strong>
-      {%- else -%}
-        <a href="/search?q={{ q|urlencode }}{% if project %}&project={{ project|urlencode }}{% endif %}&kind={{ k }}"
-           title="Only the {{ k.replace('_', ' ') }} hits">{{ n }} {{ k.replace('_', ' ') }}</a>
-      {%- endif -%}
-      {{ ' · ' if not loop.last }}
-    {% endfor %}
-    {% if kind %} · <a href="/search?q={{ q|urlencode }}{% if project %}&project={{ project|urlencode }}{% endif %}">every kind</a>{% endif %}
-    {% if project %} · <a href="/search?q={{ q|urlencode }}{% if kind %}&kind={{ kind }}{% endif %}">search every project</a>{% endif %}
-  </p>
-  <div class="panel">
+<div class="panel table-wrap">
+  <table class="search-list">
+    <tr><th>id</th><th>kind</th><th>what</th><th>project</th><th>status</th><th>age</th></tr>
     {% for h in hits %}
-    <div class="row search-hit">
-      <span class="st tone-muted" style="width: 8.5em">{{ h.kind.replace('_', ' ') }}</span>
-      <div class="grow">
-        <a href="{{ h.url }}"><strong>{{ h.title }}</strong></a>
-        <div class="sub">
-          <span class="mono">{{ h.id }}</span>
-          {% if h.project %}· <a href="/project/{{ h.project }}">{{ h.project }}</a>{% endif %}
-          {% if h.status %}· {{ h.status }}{% endif %}
-          {% if h.ts %}· {{ fmt_age(h.ts) }} ago{% endif %}
-        </div>
-        {% if h.snippet %}<div class="sub">{{ h.snippet }}</div>{% endif %}
-        <div class="sub mono">{{ h.ref }}</div>
-      </div>
-    </div>
+    <tr class="search-hit">
+      <td>{{ ui.row_id(h.id, h.url) }}</td>
+      <td class="mono">{{ h.kind.replace('_', ' ') }}</td>
+      <td class="prose"><a href="{{ h.url }}"><strong>{{ h.title }}</strong></a>
+        {% if h.snippet %}<div class="sub clamp">{{ h.snippet }}</div>{% endif %}
+        <div class="sub mono">{{ h.ref }}</div></td>
+      <td class="mono">{% if h.project %}<a href="/project/{{ h.project }}">{{ h.project }}</a>{% if h.archived %} (archived){% endif %}{% else %}—{% endif %}</td>
+      <td class="mono">{{ h.status or '—' }}</td>
+      <td class="when mono">{{ fmt_age(h.ts) if h.ts else '—' }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6" class="empty">nothing matches “{{ q }}”{% if project %} in {{ project }}{% endif %}{% if kind %} among {{ kind.replace('_', ' ') }}s{% endif %}</td></tr>
     {% endfor %}
-  </div>
-  {% else %}
-  <div class="panel"><div class="empty">nothing matches “{{ q }}”{% if project %} in {{ project }}{% endif %}</div></div>
-  {% endif %}
+  </table>
+</div>
 {% else %}
-<p class="sub">
+<p class="empty">
   Work orders, feature orders, Neo questions, alarms, gates, backlog items and knowledge
   entries — settled ones included. Same verb in the terminal:
   <code>jarvis search "&lt;words&gt;" [--project &lt;p&gt;]</code>.
