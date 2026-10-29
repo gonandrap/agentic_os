@@ -348,6 +348,20 @@ def test_an_unconfirmed_exit_1_times_out_saying_so(central, cfg, tmp_path):
         ("timedout", "one exit 1 within 3 day(s), never confirmed by a second")
 
 
+def test_show_says_when_the_last_check_ran_and_on_which_version(central, cfg, tmp_path,
+                                                                 capsys):
+    from jarvis.cli import main
+
+    item = monitoring(central)
+    morpheus.check(central, cfg, item, tmp_path, now=TEST_EPOCH, run=_run(1),
+                   version=lambda where: "jarvis-0.12.31")
+    assert central.morpheus_item(item["id"])["last_check_version"] == "jarvis-0.12.31"
+    capsys.readouterr()
+    assert main(["morpheus", "show", item["id"]]) == 0
+    out = capsys.readouterr().out
+    assert "first release with this PR" in out and " on jarvis-0.12.31" in out
+
+
 def test_each_script_runs_in_its_own_project(central, cfg, tmp_path):
     monitoring(central, n=1, project="a")
     monitoring(central, n=2, project="b")

@@ -1,76 +1,83 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}Steward — Jarvis{% endblock %}
+{% block style %}td.act { white-space: nowrap; }{% endblock %}
 {% block content %}
 
-{# docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md, "The queue drains".
-   Read-only: the counts and rows are `ops.steward_queue_report`'s, the same the CLI prints. #}
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §5;
+   the queue is docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md, "The queue drains".
+   Read-only: rows are `ops.steward_queue_report`'s, the same the CLI prints. #}
 {% set tone = {"waiting": "tone-active", "reoffered": "tone-ok", "expired": "tone-warn"} %}
+{% macro href(i) %}/steward/{{ i.wo_id or i.parent_wo_id or i.id }}{% endmacro %}
 
-{% macro rows(items, empty) -%}
-  <table>
+{{ ui.page_head("Steward", report.counts.waiting ~ " waiting · " ~ report.counts.reoffered
+                ~ " re-offered · " ~ report.counts.expired ~ " expired") }}
+
+{% call(i) ui.needs_you(attention, "held at the critical ceiling — waiting on you") %}
+  {{ ui.row_id("#" ~ i.id, href(i)) }}
+  <span class="mono">{{ i.severity }} · {{ i.origin_kind }}</span>
+  <span class="sub">{{ i.subject }}</span>
+{% endcall %}
+
+{% call ui.explain("what the steward queues") %}
+<p class="kv">Self-work the steward queued rather than dispatched. A waiting decision is
+  re-offered against the current ledger by the daemon; it is never forced through.</p>
+<p class="kv">Waiting on you: critical self-work held at the ceiling this week. It is never
+  re-offered: act on it, or raising <span class="mono">os.evolution.critical_weekly_usd</span>
+  only lets later ones through.</p>
+<p class="sub">{{ report.line }}</p>
+<p class="sub">from a terminal: <span class="mono">jarvis steward decisions</span> ·
+  <span class="mono">jarvis steward why &lt;wo-id&gt;</span> ·
+  <span class="mono">jarvis steward digest</span> ·
+  <span class="mono">jarvis steward ledger</span></p>
+{% endcall %}
+
+{{ ui.filter_bar("/steward", filters, options, shown, total) }}
+
+{% macro table(items, empty, asks=false) -%}
+  {% if items %}
+  <div class="table-wrap"><table>
     <tr><th>decision</th><th>state</th><th>severity</th><th>origin</th><th>project</th>
-      <th>subject</th><th>age</th><th>note</th></tr>
+      <th>subject</th><th>{{ "act" if asks else "order" }}</th><th>age</th></tr>
     {% for i in items %}
     <tr id="decision-{{ i.id }}">
-      <td class="mono" style="white-space:nowrap;user-select:all">#{{ i.id }}</td>
-      <td class="mono {{ tone.get(i.queue_state, '') }}">{{ i.queue_state }}</td>
+      <td>{{ ui.row_id("#" ~ i.id, href(i)) }}</td>
+      <td class="mono {{ tone.get(i.queue_state, '') }}">{{ i.queue_state or "ask" }}</td>
       <td class="mono">{{ i.severity }}</td>
       <td class="mono">{{ i.origin_kind }}</td>
       <td class="mono">{% if i.project %}<a href="/project/{{ i.project }}">{{ i.project }}</a>{% else %}—{% endif %}</td>
-      <td title="{{ i.rule }}: {{ i.reason }}">{{ i.subject }}{% if i.wo_id %} <span class="mono">→ {{ i.wo_id }}</span>{% endif %}</td>
-      <td class="mono" style="white-space:nowrap" title="{{ fmt_ts(i.ts) }}">{{ fmt_age(i.ts) }}</td>
-      <td class="mono">{{ i.queue_note or "—" }}</td>
+      <td class="prose"><span class="clamp" title="{{ i.subject }} — {{ i.rule }}: {{ i.reason }}">{{ i.subject }}</span></td>
+      <td class="mono act">
+        {%- if asks and i.origin_kind == "morpheus" %}<a href="/morpheus{{ '/' ~ i.morpheus_item if i.morpheus_item }}" title="confirm, waive or requeue">{{ i.morpheus_item or "morpheus" }}</a>
+        {%- elif asks and i.parent_wo_id %}<span title="jarvis investigate {{ i.parent_wo_id }}">{{ i.parent_wo_id }}</span>
+        {%- elif asks %}jarvis wo create {{ i.project }} "…"
+        {%- else %}{{ i.wo_id or "—" }}{% endif %}</td>
+      <td class="when mono" title="{{ fmt_ts(i.ts) }}">{{ fmt_age(i.ts) }}</td>
     </tr>
-    {% else %}
-    <tr><td colspan="8" class="empty">{{ empty }}</td></tr>
     {% endfor %}
-  </table>
+  </table></div>
+  {% else %}
+  <p class="empty">{{ 'nothing matches these filters' if filters else empty }}</p>
+  {% endif %}
 {%- endmacro %}
 
-<p class="kv" style="margin-top:18px">
-  Self-work the steward queued rather than dispatched. A waiting decision is re-offered
-  against the current ledger by the daemon; it is never forced through.
-  <span class="counts">({{ report.counts.waiting }} waiting ·
-    {{ report.counts.reoffered }} re-offered · {{ report.counts.expired }} expired)</span>
-</p>
-<p class="sub">{{ report.line }}</p>
-<p class="sub">from a terminal: <span class="mono">jarvis steward decisions</span> ·
-  <span class="mono">jarvis steward digest</span> ·
-  <span class="mono">jarvis steward ledger</span></p>
-
-<h2 id="asks">Waiting on you</h2>
-<div class="panel" id="steward-asks">
-  <p class="sub">Critical self-work held at the ceiling this week. It is never re-offered:
-    act on it, or raising <span class="mono">os.evolution.critical_weekly_usd</span> only
-    lets later ones through.</p>
-  <table>
-    <tr><th>decision</th><th>severity</th><th>origin</th><th>subject</th><th>act</th><th>age</th></tr>
-    {% for i in report.asks %}
-    <tr id="decision-{{ i.id }}">
-      <td class="mono" style="white-space:nowrap;user-select:all">#{{ i.id }}</td>
-      <td class="mono">{{ i.severity }}</td>
-      <td class="mono">{{ i.origin_kind }}</td>
-      <td title="{{ i.rule }}: {{ i.reason }}">{{ i.subject }}</td>
-      <td class="mono">
-        {%- if i.origin_kind == "morpheus" %}<a href="/morpheus{% if i.morpheus_item %}#{{ i.morpheus_item }}{% endif %}">{{ i.morpheus_item or "morpheus" }}</a> · confirm, waive or requeue
-        {%- elif i.parent_wo_id %}<a href="/wo/{{ i.project }}/{{ i.parent_wo_id }}">{{ i.parent_wo_id }}</a>
-          · jarvis investigate {{ i.parent_wo_id }}
-        {%- else %}jarvis wo create {{ i.project }} "…"{% endif %}</td>
-      <td class="mono" style="white-space:nowrap" title="{{ fmt_ts(i.ts) }}">{{ fmt_age(i.ts) }}</td>
-    </tr>
-    {% else %}
-    <tr><td colspan="6" class="empty">nothing held at the critical ceiling</td></tr>
+<div class="tabbed" id="steward-tabs">
+  <div class="tabs" role="tablist">
+    {% for key, label in [("asks", "waiting on you"), ("waiting", "waiting"), ("settled", "re-offered and expired")] %}
+    <button role="tab" data-panel="steward-{{ key }}" aria-selected="{{ 'true' if open_tab == key else 'false' }}">{{ label }}<span class="n {{ 'hot' if key == 'asks' and tabs[key] }}">{{ tabs[key] | length }}</span></button>
     {% endfor %}
-  </table>
-</div>
-
-<h2 id="waiting">Waiting</h2>
-<div class="panel" id="steward-waiting">
-  {{ rows(report.waiting, "nothing queued — the steward is holding no self-work back") }}
-</div>
-
-<h2 id="settled">Re-offered and expired</h2>
-<div class="panel" id="steward-settled">
-  {{ rows(report.settled, "nothing re-offered or expired yet") }}
+  </div>
+  <section class="tabpanel {{ 'on' if open_tab == 'asks' }}" id="steward-asks" role="tabpanel">
+    <h2>Waiting on you</h2>
+    {{ table(tabs.asks, "nothing held at the critical ceiling", asks=true) }}
+  </section>
+  <section class="tabpanel {{ 'on' if open_tab == 'waiting' }}" id="steward-waiting" role="tabpanel">
+    <h2>Waiting</h2>
+    {{ table(tabs.waiting, "nothing queued — the steward is holding no self-work back") }}
+  </section>
+  <section class="tabpanel {{ 'on' if open_tab == 'settled' }}" id="steward-settled" role="tabpanel">
+    <h2>Re-offered and expired</h2>
+    {{ table(tabs.settled, "nothing re-offered or expired yet") }}
+  </section>
 </div>
 {% endblock %}

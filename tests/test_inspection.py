@@ -370,7 +370,8 @@ def burning(*, wall: float = 0.0, write: int = 0, join: float = 0.0,
     turn.calls = [api_call(1.0 + n) for n in range(calls)]
     if join:
         turn.spans.append(inspection.ToolSpan(name="TaskOutput", tool_id="t1",
-                                              started=0.0, detail="a subagent"))
+                                              # 1.0, not 0.0: a zero start is a missing stamp (issue 1309)
+                                              started=1.0, detail="a subagent"))
     anatomy = inspection.Anatomy(session_id="s", found=True, turns=[turn])
     if write:
         anatomy.writes.append(inspection.Write(ts=1.0, written=write, read=0, gap=5.0,
@@ -703,6 +704,30 @@ def test_a_subagent_tool_call_under_the_threshold_is_not_a_hang(write_transcript
                                     sub_rows=hung_sub_rows())
 
     assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=190,
+                                  dispatched=0.0) == []
+
+
+def _blob(role: str, content: list[dict]) -> dict:
+    """Claude Code's untimed copy of a request's messages (issue 1309)"""
+    return {"type": "api-request-blob", "hash": "h", "sessionId": "s",
+            "message": {"role": role, "content": content}}
+
+
+def test_an_untimed_replay_of_a_tool_call_is_not_a_span_from_1970(write_transcript):
+    """Issue 1309: replayed tool_use rows became open spans started at 0 and a 498127.9h join alarm"""
+    agent = {"type": "tool_use", "id": "t1", "name": "Agent",
+             "input": {"description": "write the spec", "prompt": "go"}}
+    read = {"type": "tool_use", "id": "s1", "name": "Read",
+            "input": {"file_path": "/x.py"}}
+    session = write_transcript("replayed", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m2", content=[agent]),
+        _blob("assistant", [agent]),
+    ], subagents={"agent-a7b62083": [*healthy_sub_rows(), _blob("assistant", [read])]})
+    anatomy = inspection.read_session(session)
+
+    assert [s.started for s in anatomy.turns[0].spans] == [10.0]
+    assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=311,
                                   dispatched=0.0) == []
 
 
