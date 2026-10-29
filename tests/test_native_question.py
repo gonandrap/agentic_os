@@ -1,4 +1,4 @@
-"""A worker's `AskUserQuestion` is filed as Neo questions, never left as a dialog nobody answers (wo-0d358979)"""
+"""A worker's `AskUserQuestion` is filed as Neo questions"""
 
 from __future__ import annotations
 

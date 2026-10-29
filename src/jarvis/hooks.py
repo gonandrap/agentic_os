@@ -1760,14 +1760,7 @@ def native_question_text(entry: dict[str, Any], with_descriptions: bool = True) 
 
 def native_question_decision(payload: dict[str, Any],
                              env: dict[str, str]) -> dict[str, Any] | None:
-    """A worker's `AskUserQuestion` becomes Neo questions, never a dialog nobody is attached to answer
-
-    The dialog lives only in the worker's terminal: nothing reached the OS but a generic
-    "needs your permission", and a user who attached and detached rejected the tool call, which
-    the worker read as "the user declined" (wo-0d358979). Each entry is filed through the same
-    `ops.ask_question` as `jarvis wo ask` — Neo answers as the user or escalates — and the dialog
-    is denied with the ids, so the questions survive in the record whoever is attached.
-    """
+    """A worker's `AskUserQuestion` becomes Neo questions, never a dialog nobody is attached to answer (docs/superpowers/specs/2026-10-29-a-worker-question-is-a-neo-question.md)"""
     wo_id = env.get("JARVIS_WO_ID")
     if payload.get("tool_name") != NATIVE_QUESTION_TOOL or not wo_id:
         return None
