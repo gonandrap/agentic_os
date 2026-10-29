@@ -111,14 +111,14 @@
 
 <div class="tabbed" id="evolution-tabs">
   <div class="tabs" role="tablist">
-    <button role="tab" data-panel="evo-share" aria-selected="true">resolved mechanically</button>
+    <button role="tab" data-panel="evo-learned" aria-selected="true">what the OS learned</button>
+    <button role="tab" data-panel="evo-share" aria-selected="false">resolved mechanically</button>
     <button role="tab" data-panel="evo-gaps" aria-selected="false">fires by gap class</button>
     <button role="tab" data-panel="evo-arming" aria-selected="false">arming</button>
     <button role="tab" data-panel="evo-recurrences" aria-selected="false">recurrences</button>
-    <button role="tab" data-panel="evo-learned" aria-selected="false">what the OS learned</button>
   </div>
 
-  <section class="tabpanel on" id="evo-share" role="tabpanel">
+  <section class="tabpanel" id="evo-share" role="tabpanel">
     <h2>Resolved mechanically</h2>
     {% if report.mechanical_share.value is none %}
     {# The sentence IS the figure. Printing "0%" here would report a measurement nobody
@@ -242,8 +242,32 @@
     {% endif %}
   </section>
 
-  <section class="tabpanel" id="evo-learned" role="tabpanel">
-    <h2>What the OS learned</h2>
+  <section class="tabpanel on" id="evo-learned" role="tabpanel">
+    <h2>What the OS learned from its own work</h2>
+    <p class="sub">Knowledge only work the OS induced itself produced — a health sweep, a
+      steward dispatch, a detector, a validation seat's issue — each traced hop by hop to
+      what first caused it. What work the user asked for learned is on
+      <a href="/knowledge">/knowledge</a>: {{ report.lineage.user_asked }} such entries in
+      this window, and {{ report.lineage.untraced }} name no work order to trace.</p>
+    {% for row in report.lineage.rows %}
+    <div class="panel lineage" id="lineage-{{ row.id }}">
+      <p class="kv"><span class="mono">{{ fmt_ts(row.ts) }}</span> ·
+        <a class="mono" href="/search?q={{ row.id }}">{{ row.id }}</a>
+        {% if row.retired_at %}<span class="tone-warn">retracted</span>{% endif %}
+        <span class="detail">{{ row.content }}</span></p>
+      <ol class="timeline lineage-chain">
+        {% for hop in row.chain %}
+        <li><span class="mono">{{ hop.kind }}</span> ·
+          {% if hop.link %}<a class="mono" href="{{ hop.link }}">{{ hop.id }}</a>{% else %}<span class="mono">{{ hop.id }}</span>{% endif %}
+          <span class="detail">{{ hop.headline }}</span>
+          {% if hop.self_induced %}<span class="sub">self-induced</span>{% endif %}</li>
+        {% endfor %}
+      </ol>
+    </div>
+    {% else %}
+    <p class="empty">{{ report.lineage.note }}</p>
+    {% endfor %}
+    <h2>Timeline</h2>
     <ul class="timeline" id="evolution-timeline">
       {% for event in report.timeline %}
       <li>

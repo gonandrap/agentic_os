@@ -577,7 +577,8 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
     live = ops.live_investigation(project, wo_id)
     if live:
         return live, ""
-    inv = ops.create_investigation_order(project, wo_id, why=_why(item), origin="jarvis")
+    inv = ops.create_investigation_order(project, wo_id, why=_why(item), origin="jarvis",
+                                         stamp=decision.stamp)
     return str(inv["id"]), ""
 
 

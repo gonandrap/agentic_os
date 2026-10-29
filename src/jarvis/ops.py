@@ -7897,8 +7897,10 @@ STUCK_FINGERPRINT_KEY = "stuck_fingerprint"
 def create_investigation_order(project_name: str | None, subject: str, why: str,
                                budget_usd: float | None = None,
                                origin: str = "jarvis",
-                               fingerprint: str = "") -> dict[str, Any]:
-    """Open an investigation into one stuck order"""
+                               fingerprint: str = "",
+                               stamp: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Open an investigation into one stuck order; `stamp` is the steward's provenance, when it decided"""
+    from . import steward
     paths = registered_project_paths()
     if project_name is not None and project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
@@ -7932,7 +7934,8 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
             title=f"investigate {subject}: {title}"[:200], description=why,
             origin=origin, kind="investigation",
             metadata={SUBJECT_KEY: subject,
-                      **({STUCK_FINGERPRINT_KEY: fingerprint} if fingerprint else {})},
+                      **({STUCK_FINGERPRINT_KEY: fingerprint} if fingerprint else {}),
+                      **({steward.STAMP_KEY: dict(stamp)} if stamp else {})},
             # The family is this order plus its one investigator, so the family arithmetic is already correct
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.investigation_default_for(
@@ -10589,6 +10592,133 @@ def _evolution_knowledge(central: CentralStore, scope: str) -> list[dict[str, An
                                     project=scope or None)
 
 
+#: Origins of an order the OS opened for itself, with no user asking (Neo q2514)
+_SELF_ORIGINS = ("fleet_health", "morpheus", "neo", "schedule")
+
+#: A chain longer than this is cut, never looped: `seen` stops cycles, this stops depth
+_LINEAGE_MAX_HOPS = 12
+
+
+def _lineage_hop(kind: str, ident: Any, headline: str, self_induced: bool,
+                 link: str = "") -> dict[str, Any]:
+    return {"kind": kind, "id": str(ident), "headline": headline,
+            "self_induced": self_induced, "link": link}
+
+
+def _evolution_chain(store: ProjectStore, central: CentralStore,
+                     unit_id: str) -> list[dict[str, Any]]:
+    """The hops from `unit_id` back to what first caused it, nearest first (Neo q2514)"""
+    from . import steward
+
+    hops: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    while unit_id and unit_id not in seen and len(hops) < _LINEAGE_MAX_HOPS:
+        seen.add(unit_id)
+        is_fo = is_feature_order_id(unit_id)
+        try:
+            row = (store.get_feature_order(unit_id) if is_fo
+                   else store.get_work_order(unit_id))
+        except KeyError:
+            hops.append(_lineage_hop("missing", unit_id,
+                                     "not in this project's records — the trail ends here",
+                                     False))
+            break
+        origin = str(row.get("origin") or "")
+        hops.append(_lineage_hop(
+            "feature_order" if is_fo else "work_order", unit_id,
+            f"{row.get('kind') or ('feature' if is_fo else 'worker')} · origin {origin} · "
+            f"{row.get('title') or ''}"[:200],
+            origin in _SELF_ORIGINS, f"/search?q={unit_id}"))
+        unit_id = ""
+        stamp = steward.stamp_of(row)
+        if stamp:
+            decision_id = int(stamp.get("decision_id") or 0)
+            decision = central.steward_decision(decision_id) if decision_id else None
+            hops.append(_lineage_hop(
+                "steward_decision", f"#{decision_id}" if decision_id else "unrecorded",
+                f"the steward dispatched {stamp.get('origin_kind') or 'self-work'} "
+                f"({stamp.get('severity') or '?'}, generation {stamp.get('generation') or 1})"
+                + (f": {str(decision['subject'])[:160]}" if decision else ""),
+                True, f"/steward/{decision_id}" if decision_id else ""))
+            unit_id = str((decision or {}).get("parent_wo_id") or "")
+        elif row.get("detector_id"):
+            hops.append(_lineage_hop(
+                "detector", row["detector_id"],
+                f"a detector for {row.get('gap_class') or '?'} fired",
+                True, f"/evolution/rule/{row['detector_id']}"))
+            unit_id = str(row.get("trigger_wo_id") or "")
+        elif row.get("parent_id"):
+            unit_id = str(row["parent_id"])
+        elif row.get("issue_url"):
+            url = str(row["issue_url"])
+            raised = store.issue_raiser(url)
+            if raised is None:
+                hops.append(_lineage_hop("issue", url,
+                                         "filed outside any order the OS recorded", False,
+                                         url))
+                break
+            seat = str(raised.get("seat") or "")
+            hops.append(_lineage_hop(
+                "issue", url,
+                f"raised by {raised['unit_id']}"
+                + (f", validation seat {seat} round {raised.get('round')}" if seat else ""),
+                True, url))
+            unit_id = str(raised["unit_id"])
+    return hops
+
+
+def _evolution_lineage(knowledge: Sequence[Mapping[str, Any]], scope: str,
+                       since: float, until: float, central: CentralStore,
+                       unreadable: list[str]) -> dict[str, Any]:
+    """Knowledge learned by work the OS induced itself, each with its full chain (Neo q2514)"""
+    try:
+        paths = registered_project_paths()
+    except Exception:  # noqa: BLE001 - the project registry itself is unreadable
+        paths = {}
+    stores: dict[str, ProjectStore] = {}
+    rows: list[dict[str, Any]] = []
+    user_asked = untraced = 0
+    try:
+        for k in knowledge:
+            if not since <= float(k["ts"]) <= until:
+                continue
+            wo_id = str(k.get("wo_id") or "")
+            if not wo_id:
+                untraced += 1
+                continue
+            # A global entry names no project, so its order is looked for in every one
+            names = [str(k["project"])] if k.get("project") else sorted(paths)
+            chain: list[dict[str, Any]] = []
+            for name in names:
+                if name not in paths or name in unreadable:
+                    continue
+                try:
+                    store = stores.get(name) or stores.setdefault(
+                        name, ProjectStore(paths[name]))
+                    found = _evolution_chain(store, central, wo_id)
+                except Exception:  # noqa: BLE001 - named, never a default answer
+                    unreadable.append(name)
+                    continue
+                if found and found[0]["kind"] != "missing":
+                    chain = found
+                    break
+            if not any(h["self_induced"] for h in chain):
+                user_asked += 1
+                continue
+            rows.append({"id": k["id"], "ts": float(k["ts"]),
+                         "project": k.get("project") or "", "topic": k.get("topic") or "",
+                         "content": str(k["content"])[:300], "wo_id": wo_id,
+                         "retired_at": k.get("retired_at"), "chain": chain})
+    finally:
+        for store in stores.values():
+            store.close()
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return {"rows": rows, "user_asked": user_asked, "untraced": untraced,
+            "note": None if rows else (
+                "no knowledge in this window traces back to work the OS induced itself — "
+                "everything learned here came from work the user asked for")}
+
+
 def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
     """Is the OS getting better at running itself — and where is it still weak? §9"""
     scope = (project or "").strip()
@@ -10616,6 +10746,10 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
         knowledge = _evolution_knowledge(central, scope)
         # Exemptions only: §9's claim is about what the OS LEARNED is not privileged
         gate_exemptions = central.gate_rules(role="exempt", include_retired=True)
+        lineage = _evolution_lineage(knowledge, scope, since, until, central,
+                                     unreadable["projects"])
+        self_dispatched = [d for d in central.steward_decisions(since)
+                           if d["applied"] and (not scope or d["project"] == scope)]
     finally:
         central.close()
 
@@ -10824,7 +10958,9 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
              f"the {d['gap_class']} detector was retracted"
              + (f": {d['retired_reason']}" if d["retired_reason"] else ""), links)
 
-    for k in knowledge:
+    # Only what self-induced work learned: the rest is the knowledge base (Neo q2514)
+    evolved = {r["id"] for r in lineage["rows"]}
+    for k in (k for k in knowledge if k["id"] in evolved):
         # `fix_wo` names the work order responsible
         _add(k["ts"], "knowledge_added", k["id"],
              f"learned: {str(k['content'])[:120]}",
@@ -10832,6 +10968,12 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
         _add(k["retired_at"], "knowledge_retracted", k["id"],
              f"retracted: {str(k.get('retired_reason') or '')[:120]}",
              _evolution_links(fix_wo=k.get("retired_by_wo_id")))
+
+    for d in self_dispatched:
+        _add(d["ts"], "self_dispatched", f"#{d['id']}",
+             f"the OS dispatched {d['origin_kind']} work on itself "
+             f"({d['severity']}): {str(d['subject'])[:160]}",
+             _evolution_links(fix_wo=d.get("wo_id"), parent=d.get("parent_wo_id")))
 
     for g in gate_exemptions:
         _add(g["ts"], "gate_exemption_learned", g["id"],
@@ -10873,6 +11015,7 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
         "recurrences": recurrences,
         "stuck_resolution": stuck_resolution,
         "timeline": timeline,
+        "lineage": lineage,
         "unreadable": unreadable,
     }
 

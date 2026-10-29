@@ -1729,6 +1729,13 @@ class ProjectStore:
             "WHERE l.unit_id=? ORDER BY l.round, i.number", (unit_id,)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def issue_raiser(self, issue_url: str) -> dict[str, Any] | None:
+        """The `raised` link of this issue — the unit, and panel seat, that filed it"""
+        row = self.conn.execute(
+            "SELECT * FROM issue_links WHERE issue_url=? AND kind='raised' "
+            "ORDER BY created_at LIMIT 1", (issue_url,)).fetchone()
+        return dict(row) if row else None
+
     def issue_board(self) -> list[dict[str, Any]]:
         """Every tracked issue with its reference count, most-referenced first"""
         rows = self.conn.execute(
