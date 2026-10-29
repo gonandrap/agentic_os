@@ -415,10 +415,7 @@ DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD = 10.0
 #: The window, in days
 DEFAULT_INSPECT_ALARM_CACHE_1H_WINDOW_DAYS = 7
 
-#: One-hour tokens written in the window by sessions JARVIS DID NOT DISPATCH
-DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS = 500_000
-
-#: The same, for turns JARVIS ITSELF dispatched
+#: One-hour tokens written in the window by 5m-armed turns JARVIS ITSELF dispatched
 DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS = 50_000
 
 #: Tokens a STAMPED turn paid at the TTL it was NOT armed for (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
@@ -453,7 +450,6 @@ class InspectConfig:
     alarm_rewrite_min_orders: int = DEFAULT_INSPECT_ALARM_REWRITE_MIN_ORDERS
     alarm_rewrite_min_usd: float = DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD
     alarm_cache_1h_window_days: int = DEFAULT_INSPECT_ALARM_CACHE_1H_WINDOW_DAYS
-    alarm_cache_1h_tokens: int = DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS
     alarm_cache_1h_dispatched_tokens: int = \
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
     alarm_cache_arm_missed_tokens: int = \
@@ -1512,8 +1508,6 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                             base.alarm_rewrite_min_usd)),
         alarm_cache_1h_window_days=int(raw.get("alarm_cache_1h_window_days",
                                                base.alarm_cache_1h_window_days)),
-        alarm_cache_1h_tokens=int(raw.get("alarm_cache_1h_tokens",
-                                          base.alarm_cache_1h_tokens)),
         alarm_cache_1h_dispatched_tokens=int(
             raw.get("alarm_cache_1h_dispatched_tokens",
                     base.alarm_cache_1h_dispatched_tokens)),

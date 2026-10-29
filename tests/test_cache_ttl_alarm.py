@@ -80,10 +80,8 @@ def _both_halves(transcripts, now, *, dispatched: int, foreign: int) -> None:
 
 
 def _hour_titles(daemon_mod) -> set[str]:
-    """The inbox titles of the 1h PAIR — the dict also carries the arm-miss kind"""
-    return {daemon_mod.CACHE_1H_INBOX_TITLE[k]
-            for k in (inspection.CACHE_1H_DISPATCHED_ALARM,
-                      inspection.CACHE_1H_FOREIGN_ALARM)}
+    """The inbox title of the 1h breach — the dict also carries the arm-miss kind"""
+    return {daemon_mod.CACHE_1H_INBOX_TITLE[inspection.CACHE_1H_DISPATCHED_ALARM]}
 
 
 def _found(now, *, dispatched=0, foreign=0):
@@ -96,46 +94,18 @@ def _found(now, *, dispatched=0, foreign=0):
 # -- 1. the arithmetic and the two thresholds
 
 
-def test_each_kind_answers_to_its_own_threshold(transcripts):
-    """Paired in both directions, because one threshold serving both would satisfy any single-sided..."""
+def test_only_the_dispatched_half_raises(transcripts):
+    """A person's own sessions are never alarmed on: the 1h default can win at human pace (wo-10a5f151)"""
     now = 1_789_000_000.0
-    cfg = InspectConfig(alarm_cache_1h_dispatched_tokens=50_000,
-                        alarm_cache_1h_tokens=500_000)
+    cfg = InspectConfig(alarm_cache_1h_dispatched_tokens=50_000)
 
-    over_both = inspection.hour_alarms(_found(now, dispatched=60_000, foreign=600_000),
-                                       cfg, days=7)
-    between = inspection.hour_alarms(_found(now, dispatched=60_000, foreign=100_000),
-                                     cfg, days=7)
-    under_both = inspection.hour_alarms(_found(now, dispatched=10_000, foreign=100_000),
-                                        cfg, days=7)
+    over = inspection.hour_alarms(_found(now, dispatched=60_000, foreign=9_000_000),
+                                  cfg, days=7)
+    under = inspection.hour_alarms(_found(now, dispatched=10_000, foreign=9_000_000),
+                                   cfg, days=7)
 
-    assert [a.kind for a in over_both] == [inspection.CACHE_1H_DISPATCHED_ALARM,
-                                           inspection.CACHE_1H_FOREIGN_ALARM]
-    assert [a.kind for a in between] == [inspection.CACHE_1H_DISPATCHED_ALARM]
-    assert under_both == []
-
-
-def test_the_dispatched_alarm_comes_first_because_it_is_the_worse_finding(transcripts):
-    """`alarms`' ordering contract is most-actionable-first"""
-    now = 1_789_000_000.0
-    raised = inspection.hour_alarms(_found(now, dispatched=9_000_000, foreign=10_000_000),
-                                    InspectConfig(), days=7)
-
-    assert raised[0].kind == inspection.CACHE_1H_DISPATCHED_ALARM
-
-
-def test_the_foreign_reason_carries_the_remedy_and_says_it_is_not_ours_to_apply():
-    """THE HONEST CON, in the alarm rather than in a comment"""
-    now = 1_789_000_000.0
-    (alarm,) = inspection.hour_alarms(_found(now, foreign=900_000), InspectConfig(),
-                                      days=7)
-
-    assert "FORCE_PROMPT_CACHING_5M" in alarm.reason
-    assert "~/.claude/settings.json" in alarm.reason
-    assert "MUST NOT TRY" in alarm.reason
-    assert "s-mixed in -somewhere" in alarm.reason, "the session, which finding 3 turns on"
-    assert "900,000 tokens" in alarm.reason
-    assert "last 7 days" in alarm.reason
+    assert [a.kind for a in over] == [inspection.CACHE_1H_DISPATCHED_ALARM]
+    assert under == []
 
 
 def test_the_dispatched_reason_blames_the_os_and_never_the_users_config():
@@ -156,7 +126,7 @@ def test_the_premium_is_the_rate_difference_and_not_the_price():
     assert inspection._hour_premium_usd(1_000_000) == pytest.approx(3.75)
 
     now = 1_789_000_000.0
-    (alarm,) = inspection.hour_alarms(_found(now, foreign=1_000_000), InspectConfig(),
+    (alarm,) = inspection.hour_alarms(_found(now, dispatched=1_000_000), InspectConfig(),
                                       days=7)
     assert "$3.75" in alarm.reason and "Opus list" in alarm.reason
 
@@ -180,8 +150,7 @@ def test_the_daemon_raises_one_alarm_per_fault_on_the_latest_settled_order(
 
     rows = _raise(started, store, transcripts, dispatched=90_000, foreign=900_000)
 
-    assert {r["kind"] for r in rows} == {inspection.CACHE_1H_DISPATCHED_ALARM,
-                                         inspection.CACHE_1H_FOREIGN_ALARM}
+    assert {r["kind"] for r in rows} == {inspection.CACHE_1H_DISPATCHED_ALARM}
     for row in rows:
         assert row["wo_id"] == carrier["id"]
         assert row["seq"] == NO_TURN          # it judged no turn
@@ -191,7 +160,7 @@ def test_the_daemon_raises_one_alarm_per_fault_on_the_latest_settled_order(
     assert not store.get_work_order(carrier["id"])["needs_attention"]
 
 
-def test_the_inbox_says_which_of_the_two_faults_it_is(started, store, transcripts):
+def test_the_inbox_says_it_is_a_transport_defect(started, store, transcripts):
     """The inbox row is the DURABLE half — it is what reaches `jarvis status` and Telegram"""
     store.create_work_order("carrier", status="completed")
     _raise(started, store, transcripts, dispatched=90_000, foreign=900_000)
@@ -201,7 +170,7 @@ def test_the_inbox_says_which_of_the_two_faults_it_is(started, store, transcript
     titles = {r["title"] for r in started.central.unacked_inbox()}
 
     assert _hour_titles(daemon_mod) <= titles
-    assert len({t for t in titles if "one-hour cache" in t}) == 2
+    assert len({t for t in titles if "one-hour cache" in t}) == 1
 
 
 def test_only_the_os_owning_project_scans(started, store, transcripts, tmp_path,
@@ -216,7 +185,7 @@ def test_only_the_os_owning_project_scans(started, store, transcripts, tmp_path,
 
     # Same project, now NOT the owner
     monkeypatch.setattr(Daemon, "_os_owner", lambda self: "somebody-else")
-    assert _raise(started, store, transcripts, foreign=9_000_000) == []
+    assert _raise(started, store, transcripts, dispatched=9_000_000) == []
 
 
 def test_it_is_raised_once_per_window_and_again_after_it(started, store, transcripts):
@@ -224,7 +193,7 @@ def test_it_is_raised_once_per_window_and_again_after_it(started, store, transcr
     from jarvis import db
 
     store.create_work_order("carrier", status="completed")
-    first = _raise(started, store, transcripts, foreign=900_000)
+    first = _raise(started, store, transcripts, dispatched=900_000)
     assert len(first) == 1
 
     started.check_cache_ttl(started.catalog.projects[0], store)
@@ -239,7 +208,7 @@ def test_it_is_raised_once_per_window_and_again_after_it(started, store, transcr
 def test_the_off_switch_covers_this_too(started, store, transcripts):
     """`inspect.enabled` is one switch for "raise nothing here\""""
     store.create_work_order("carrier", status="completed")
-    assert _raise(started, store, transcripts, foreign=9_000_000, enabled=False) == []
+    assert _raise(started, store, transcripts, dispatched=9_000_000, enabled=False) == []
 
 
 def test_with_no_settled_order_nothing_is_raised_and_nothing_breaks(started, store,
@@ -247,7 +216,7 @@ def test_with_no_settled_order_nothing_is_raised_and_nothing_breaks(started, sto
     """`wo_alarms.wo_id` is a real foreign key and a young project has nothing to hang one on"""
     store.create_work_order("still running", status="running")
 
-    assert _raise(started, store, transcripts, foreign=9_000_000) == []
+    assert _raise(started, store, transcripts, dispatched=9_000_000) == []
 
 
 def test_a_quiet_fleet_raises_nothing(started, store, transcripts):
@@ -281,16 +250,16 @@ def test_a_write_outside_the_window_is_not_in_it(started, store, transcripts):
     project = started.catalog.projects[0]
     project.inspect = InspectConfig()
 
-    transcripts("s-old", [prompt(now - 60 * DAY, sdk=False),
+    transcripts("s-old", [prompt(now - 60 * DAY, sdk=True),
                           wrote_1h(now - 60 * DAY + 1, "m1", 9_000_000)])
     started.check_cache_ttl(project, store)
     assert store.alarms_across() == []
 
-    transcripts("s-new", [prompt(now - DAY, sdk=False),
+    transcripts("s-new", [prompt(now - DAY, sdk=True),
                           wrote_1h(now - DAY + 1, "m2", 9_000_000)])
     started.check_cache_ttl(project, store)
     assert [r["kind"] for r in store.alarms_across()] == \
-        [inspection.CACHE_1H_FOREIGN_ALARM]
+        [inspection.CACHE_1H_DISPATCHED_ALARM]
 
 
 def test_the_real_loop_raises_these_on_the_offset_tick(started, store, transcripts):
@@ -305,8 +274,7 @@ def test_the_real_loop_raises_these_on_the_offset_tick(started, store, transcrip
 
     assert started.tick_count == daemon_mod.CACHE_TTL_TICK_OFFSET
     rows = store.alarms_across()
-    assert {r["kind"] for r in rows} == {inspection.CACHE_1H_DISPATCHED_ALARM,
-                                         inspection.CACHE_1H_FOREIGN_ALARM}
+    assert {r["kind"] for r in rows} == {inspection.CACHE_1H_DISPATCHED_ALARM}
     assert all(r["wo_id"] == carrier["id"] for r in rows)
     titles = {r["title"] for r in started.central.unacked_inbox()}
     assert _hour_titles(daemon_mod) <= titles
@@ -383,7 +351,7 @@ def test_the_offset_is_a_real_offset(started):
 
 def _raised(started, store, transcripts):
     store.create_work_order("carrier", status="completed")
-    rows = _raise(started, store, transcripts, foreign=900_000)
+    rows = _raise(started, store, transcripts, dispatched=900_000)
     return rows[0]
 
 
@@ -412,11 +380,11 @@ def test_the_drain_hands_it_to_the_judge(started, store, transcripts):
 
     judged = {row[0]: row for row in seen}
     assert alarm["id"] in judged, "the drain never handed this alarm to the judge"
-    assert judged[alarm["id"]][1:] == (inspection.CACHE_1H_FOREIGN_ALARM, "completed")
+    assert judged[alarm["id"]][1:] == (inspection.CACHE_1H_DISPATCHED_ALARM, "completed")
     assert not [r for r in store.alarms_across() if r["alarm_status"] == "skipped"]
 
 
-def test_the_evidence_packet_carries_the_remedy_and_no_turn_number(started, store,
+def test_the_evidence_packet_carries_the_kind_and_no_turn_number(started, store,
                                                                    transcripts):
     """The judge sees the packet and never the alarm row"""
     from jarvis import supervisor
@@ -431,8 +399,8 @@ def test_the_evidence_packet_carries_the_remedy_and_no_turn_number(started, stor
 
     assert "raised on no particular turn" in packet
     assert "turn -1" not in packet
-    assert inspection.CACHE_1H_FOREIGN_ALARM in packet
-    assert "FORCE_PROMPT_CACHING_5M" in packet
+    assert inspection.CACHE_1H_DISPATCHED_ALARM in packet
+    assert "dispatch.cache_ttl_env" in packet
 
 
 def test_the_supervisor_is_told_these_two_are_not_this_projects_fault(started):
@@ -454,8 +422,7 @@ def test_each_alarm_family_owns_its_own_inbox_titles():
     from jarvis import daemon as daemon_mod
 
     assert set(daemon_mod.CACHE_1H_INBOX_TITLE) == {
-        inspection.CACHE_1H_DISPATCHED_ALARM, inspection.CACHE_1H_FOREIGN_ALARM,
-        inspection.CACHE_ARM_MISSED_ALARM}
+        inspection.CACHE_1H_DISPATCHED_ALARM, inspection.CACHE_ARM_MISSED_ALARM}
     assert not (set(daemon_mod.CACHE_1H_INBOX_TITLE)
                 & set(daemon_mod.REWRITE_INBOX_TITLE))
 
@@ -471,12 +438,11 @@ def test_the_thresholds_are_settings_and_a_zero_is_refused_where_it_was_typed(tm
         return {"os": {"defaults": {"model": "sonnet"}, "inspect": inspect},
                 "projects": [{"name": "p", "path": str(tmp_path)}]}
 
-    cfg = parse_catalog(_catalog(alarm_cache_1h_tokens=1_000)).os.inspect
-    assert cfg.alarm_cache_1h_tokens == 1_000
+    cfg = parse_catalog(_catalog(alarm_cache_1h_dispatched_tokens=1_000)).os.inspect
+    assert cfg.alarm_cache_1h_dispatched_tokens == 1_000
     assert cfg.alarm_cache_1h_window_days == 7, "the others still fall through"
 
-    for key in ("alarm_cache_1h_window_days", "alarm_cache_1h_tokens",
-                "alarm_cache_1h_dispatched_tokens", "alarm_cache_arm_missed_tokens"):
+    for key in ("alarm_cache_1h_window_days", "alarm_cache_1h_dispatched_tokens", "alarm_cache_arm_missed_tokens"):
         with pytest.raises(CatalogError, match=key):
             parse_catalog(_catalog(**{key: 0}))
 

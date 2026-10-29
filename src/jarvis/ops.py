@@ -13600,11 +13600,15 @@ def alarm_feed(project_name: str | None = None, limit: int = 200,
 
 def alarm_review_queue(project_name: str | None = None, limit: int = 200
                        ) -> list[dict[str, Any]]:
-    """Alarms the supervisor answered and the user has not yet looked at, newest first"""
+    """Alarms the supervisor answered and the user has not yet looked at: escalated first, then newest"""
     out = _enriched_alarms(project_name, limit, lambda store: [
-        r for r in store.alarms_across(limit=limit, statuses=("acked",))
+        r for r in store.alarms_across(limit=limit, statuses=("acked", "escalated"))
         if r["review_status"] == "unreviewed"])
+    # An escalation no flag or Neo question carries asks nowhere else (al-429dd161, wo-10a5f151)
+    out = [r for r in out if r["alarm_status"] != "escalated"
+           or not (r["live"] or r["neo_question_id"])]
     out.sort(key=lambda r: r["decided_at"] or r["ts"], reverse=True)
+    out.sort(key=lambda r: r["alarm_status"] != "escalated")
     return out[:limit]
 
 

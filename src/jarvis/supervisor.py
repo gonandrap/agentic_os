@@ -37,17 +37,14 @@ fix at the wrong one. Never propose changing a cache TTL off a `rewrite-tax-ttl`
 alone: its threshold is a share of the BILL and the TTL decision is taken against a
 different ratio, which the alarm's own text names along with the command that measures it.
 
-AND TWO MORE ARE NOT ABOUT THIS PROJECT AT ALL. `cache-1h-dispatched` and
-`cache-1h-foreign` are the FLEET's remaining one-hour cache writes — every transcript on
-the machine, including sessions no project owns. The work order they hang off carries the
-foreign key and NOTHING else: it is not the exemplar of the number, it did not cause it,
-and it may have nothing to do with it. The two are opposite faults. `cache-1h-dispatched`
-says Jarvis's own transport bought the expensive write, which is a DEFECT IN THIS
-CODEBASE and a work order anyone can act on. `cache-1h-foreign` says a person's own
-`claude` did — the remedy is one line in THEIR `~/.claude/settings.json`, which Jarvis
-must never write, so the only honest outcome is a work order asking a PERSON to add it.
-Never propose a remedy that has the OS edit a user's personal configuration, and never
-answer a `cache-1h-foreign` alarm as though the OS were at fault.
+AND ONE MORE IS NOT ABOUT THIS PROJECT AT ALL. `cache-1h-dispatched` is the FLEET's
+one-hour cache writes by turns Jarvis armed for five minutes — every transcript on the
+machine. The work order it hangs off carries the foreign key and NOTHING else: it is not
+the exemplar of the number, it did not cause it, and it may have nothing to do with it.
+It says Jarvis's own transport bought the expensive write, which is a DEFECT IN THIS
+CODEBASE and a work order anyone can act on. A person's own `claude` sessions are not
+alarmed on: Jarvis must never write a user's `~/.claude/settings.json`, so never propose
+a remedy that edits it. An old `cache-1h-foreign` row is historical — ack it.
 
 `cache-arm-missed` is fleet-wide in the same way, and it is always the OS's own defect.
 It compares the arm a turn was STAMPED with against the TTL its calls paid: an arm the CLI
@@ -132,12 +129,11 @@ whole project's re-write tax over a window of already-settled orders; the work o
 hang off is the biggest single contributor, shown as the EXEMPLAR and not as the culprit.
 Judge the project's figure, not that order's, and keep the two causes apart — the prefix
 moving and the entry expiring have opposite cures, and one answer covering both is the
-misreading these two kinds were split to prevent. `cache-1h-dispatched` and
-`cache-1h-foreign` go further still: they are about the whole FLEET's one-hour cache
-writes, the order under them carries only the foreign key, and the second of the two
-reports a condition the OS cannot fix — the remedy is a line in a person's own
-`~/.claude/settings.json`, which Jarvis must never write. Never escalate a
-`cache-1h-foreign` alarm as an OS fault, and never propose a remedy that edits that file.
+misreading these two kinds were split to prevent. `cache-1h-dispatched` goes further
+still: it is about the whole FLEET's one-hour cache writes by 5m-armed Jarvis turns, and
+the order under it carries only the foreign key. Jarvis must never write a person's own
+`~/.claude/settings.json`; never propose a remedy that edits that file. An old
+`cache-1h-foreign` row is historical (nothing raises it now) — ack it.
 `cache-arm-missed` is fleet-wide too and is always an OS fault: the arm a turn was STAMPED
 with is not the TTL its calls paid, so the stamp recorded intent only. Its cure is the OS
 setting a variable that OUTRANKS the user-owned key for the same behaviour, never a change
