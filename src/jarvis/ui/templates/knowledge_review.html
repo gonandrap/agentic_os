@@ -56,6 +56,8 @@
   .kr-panel ul { padding-left: 18px; margin: 4px 0; }
   .kr-panel li { margin: 2px 0; }
   .st-human { color: var(--green); } .st-machine { color: var(--amber); } .st-none { color: var(--ink-3); }
+  .kr-marquee { position: fixed; z-index: 55; display: none; pointer-events: none;
+                border: 1px solid var(--cyan, #56c8e8); background: rgba(86, 200, 232, .12); }
   .kr-menu { position: fixed; z-index: 60; display: flex; flex-direction: column; min-width: 190px;
              background: var(--raised); border: 1px solid var(--line); border-radius: 8px;
              padding: 4px; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
@@ -80,7 +82,8 @@
   <span class="sub" id="kr-summary" style="text-transform: none; letter-spacing: 0"></span></h2>
 <p class="sub" style="margin: 0">
   Drag an entry (or a box selection) onto a domain to assign it, or into empty space to
-  unassign it; drag a domain into another to nest it. Click anything to open it; right-click
+  unassign it; drag a domain <b>by its name</b> to move it or nest it in
+  another. Click anything to open it; right-click
   for more. <b>Link mode</b> (<kbd class="kbd">l</kbd>): drag from one entry to another to
   link them. Amber entries are the machine's proposals — accept or move them; green ones a
   person has decided. Every change is kept with who made it.
@@ -88,8 +91,8 @@
 <p class="sub" style="margin: 4px 0 0">
   Move around like Figma: <kbd class="kbd">scroll</kbd> pans (<kbd class="kbd">shift</kbd> sideways),
   <kbd class="kbd">ctrl</kbd>/<kbd class="kbd">alt</kbd>/<kbd class="kbd">⌘</kbd>+scroll or pinch zooms, hold
-  <kbd class="kbd">space</kbd> or the middle button and drag to pan, drag on empty canvas to
-  box-select (<kbd class="kbd">shift</kbd> adds). <kbd class="kbd">shift 1</kbd> fit all ·
+  <kbd class="kbd">space</kbd> or the middle button and drag to pan, drag on any empty space —
+  inside a domain too — to box-select (<kbd class="kbd">shift</kbd> adds). <kbd class="kbd">shift 1</kbd> fit all ·
   <kbd class="kbd">shift 2</kbd> zoom to selection · <kbd class="kbd">shift 0</kbd> 100% ·
   <kbd class="kbd">+</kbd>/<kbd class="kbd">-</kbd> zoom.
 </p>
@@ -256,11 +259,11 @@ window._ = window._ || {
 
   var cy = cytoscape({
     container: $('cy'),
-    // Figma-style navigation is ours (see "-- navigation"): with cytoscape's own panning
-    // and zooming off, a drag on empty canvas box-selects with no modifier.
+    // Figma-style navigation and marquee are ours (see "-- navigation"): cytoscape's own
+    // panning, zooming and box selection are off.
     userPanningEnabled: false,
     userZoomingEnabled: false,
-    boxSelectionEnabled: true,
+    boxSelectionEnabled: false,
     // WebGL draws ~800 entries a frame on the GPU; the 2D canvas took ~250ms a zoom step.
     // `?webgl=0` falls back to the canvas renderer.
     renderer: { name: 'canvas', webgl: !/[?&]webgl=0/.test(location.search) },
@@ -281,6 +284,8 @@ window._ = window._ || {
         'border-width': 1.5, 'border-color': '#3a4a6b', 'label': 'data(label)',
         'font-size': 13, 'font-weight': 600, 'color': C.ink, 'text-valign': 'top',
         'text-halign': 'center', 'text-margin-y': -4, 'padding': 14,
+        // the name is the handle a domain is moved by, so it must be hittable
+        'text-events': 'yes',
         'min-zoomed-font-size': 5, 'min-width': 60, 'min-height': 30 } },
       { selector: 'node.domain.machine', style: { 'border-style': 'dashed' } },
       { selector: 'node.domain.drop', style: { 'border-color': C.amber, 'border-width': 3,
@@ -861,14 +866,11 @@ window._ = window._ || {
 
   // The context menu rides the browser's own `contextmenu` event, not cytoscape's
   // `cxttap`: on Linux the native event fires on mouse DOWN, and the two orders fought.
-  // What is under the pointer is whatever cytoscape last reported hovering.
-  var hovered = null;
-  cy.on('mouseover', 'node, edge', function (e) { hovered = e.target; });
-  cy.on('mouseout', 'node, edge', function (e) { if (hovered === e.target) hovered = null; });
+  // What is under the pointer comes from `hitAt` (see "-- marquee").
   $('cy').addEventListener('contextmenu', function (e) {
     e.preventDefault();
     var r = $('cy').getBoundingClientRect(), pan = cy.pan(), z = cy.zoom();
-    contextMenu(hovered && hovered.inside() ? hovered : cy, e.clientX, e.clientY,
+    contextMenu(hitAt(e) || cy, e.clientX, e.clientY,
                 { x: (e.clientX - r.left - pan.x) / z, y: (e.clientY - r.top - pan.y) / z });
   });
 
@@ -939,6 +941,96 @@ window._ = window._ || {
     view.style.cursor = nav.space ? 'grab' : '';
   }, true);
   view.addEventListener('auxclick', function (e) { if (e.button === 1) e.preventDefault(); });
+
+  // -- marquee, Figma's frames: a left-drag on empty canvas OR on a domain's empty body
+  // draws a selection box; a domain is MOVED by its name (and its top border line).
+  // So selecting entries inside a domain needs no modifier and never drags the domain.
+
+  function rendered(e) {
+    var r = view.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  // What is under the pointer, by cytoscape's own hit test (the renderer method its
+  // event system uses; hover events are not enough — a compound's empty body under a
+  // crossing edge reports the edge, and compounds are entered without a mouseover)
+  function hitAt(e) {
+    var p = rendered(e), pan = cy.pan(), z = cy.zoom();
+    var hit = cy.renderer().findNearestElement((p.x - pan.x) / z, (p.y - pan.y) / z, true, false);
+    return hit && hit.inside() ? hit : null;
+  }
+  function onHeader(dom, p) {
+    var box = dom.renderedBoundingBox({ includeLabels: false });
+    var top = dom.renderedBoundingBox({ includeLabels: true }).y1;
+    // the name row above the box, and the border line itself — never inside the box,
+    // where a box selection over the first row of entries starts
+    return p.x >= box.x1 && p.x <= box.x2 && p.y >= top - 2 && p.y <= box.y1 + 3;
+  }
+  var marq = null, lastClick = { id: null, t: 0 };
+  view.addEventListener('mousedown', function (e) {
+    if (e.button !== 0 || nav.space || nav.pan) return;
+    var t = hitAt(e), p = rendered(e);
+    // entries, and a domain's name/top band, are cytoscape's: grab and drag
+    if (t && t.isNode() && (t.hasClass('entry') || onHeader(t, p))) return;
+    // in link mode or while picking a link target, leave everything to cytoscape
+    if (state.linkMode || state.pickFrom) return;
+    e.preventDefault(); e.stopPropagation();
+    var el = document.createElement('div');
+    el.className = 'kr-marquee';
+    document.body.appendChild(el);
+    marq = { x0: e.clientX, y0: e.clientY, p0: p, hit: t, add: e.shiftKey, el: el, moved: false,
+             base: e.shiftKey ? cy.$('node.entry:selected') : cy.collection(), raf: 0, last: e };
+  }, true);
+  function marqueeSelect() {
+    marq.raf = 0;
+    var e = marq.last, p = rendered(e), pan = cy.pan(), z = cy.zoom();
+    var x1 = (Math.min(p.x, marq.p0.x) - pan.x) / z, x2 = (Math.max(p.x, marq.p0.x) - pan.x) / z;
+    var y1 = (Math.min(p.y, marq.p0.y) - pan.y) / z, y2 = (Math.max(p.y, marq.p0.y) - pan.y) / z;
+    var inside = cy.nodes('.entry:visible').filter(function (n) {
+      var q = n.position(), h = n.data('size') / 2;
+      return q.x + h >= x1 && q.x - h <= x2 && q.y + h >= y1 && q.y - h <= y2;
+    });
+    var want = marq.base.union(inside);
+    cy.batch(function () {
+      cy.$('node:selected').difference(want).unselect();
+      want.not(':selected').select();
+    });
+  }
+  window.addEventListener('mousemove', function (e) {
+    if (!marq) {
+      // a move cursor over a domain's handle, so the two gestures are discoverable
+      if (!nav.pan && !nav.space && view.contains(e.target)) {
+        var h = hitAt(e);
+        view.style.cursor = h && h.isNode() && h.hasClass('domain') && onHeader(h, rendered(e)) ? 'move' : '';
+      }
+      return;
+    }
+    marq.last = e;
+    if (!marq.moved && Math.abs(e.clientX - marq.x0) + Math.abs(e.clientY - marq.y0) < 4) return;
+    marq.moved = true;
+    var s = marq.el.style;
+    s.left = Math.min(e.clientX, marq.x0) + 'px'; s.top = Math.min(e.clientY, marq.y0) + 'px';
+    s.width = Math.abs(e.clientX - marq.x0) + 'px'; s.height = Math.abs(e.clientY - marq.y0) + 'px';
+    s.display = 'block';
+    if (!marq.raf) marq.raf = requestAnimationFrame(marqueeSelect);
+  }, true);
+  window.addEventListener('mouseup', function (e) {
+    if (!marq) return;
+    var m = marq; marq = null;
+    if (m.raf) cancelAnimationFrame(m.raf);
+    m.el.remove();
+    if (m.moved) { m.last = e; marq = m; marqueeSelect(); marq = null; return; }
+    // a click, not a drag: what cytoscape's tap used to do there
+    if (m.hit && m.hit.isEdge()) {
+      openEdge(m.hit);
+    } else if (m.hit) {
+      var now = Date.now(), dbl = lastClick.id === m.hit.id() && now - lastClick.t < 350;
+      lastClick = { id: m.hit.id(), t: now };
+      openDomain(m.hit.id(), dbl);
+    } else {
+      if (!m.add) cy.$(':selected').unselect();
+      closePanel();
+    }
+  }, true);
   function typingNow() {
     var el = document.activeElement;
     return el && (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || el.isContentEditable);
