@@ -115,8 +115,7 @@ def gate_display(g: dict) -> str:
 # How often the dashboard re-reads OS state
 REFRESH_SECONDS = 15
 
-# The open statuses worth a row of their own. `validating` is the OS judging the work, as live as
-# `running`, and a visible row's "blocked by" can name it: folded into a count, the blocker vanished
+# The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
                      "validating", "waiting_pr_merge")
 

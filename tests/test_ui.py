@@ -2842,7 +2842,7 @@ def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
 
 
 def test_a_validating_order_has_a_row_of_its_own():
-    """A pending row's "blocked by" names it; folded into "under review", the blocker was nowhere to be seen"""
+    """A pending row's "blocked by" can name it, so it must not hide in a collapsed count"""
     from jarvis.ui.app import group_open
 
     featured, rest = group_open([{"status": "pending", "id": "wo-1"},
