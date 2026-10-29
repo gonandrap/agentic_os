@@ -1446,6 +1446,40 @@ def test_a_dashboard_row_needing_you_sits_above_the_others(page, server, project
     assert "an order owed a review" in _first_row_text(page, ".open-work")
 
 
+def test_a_flagged_dashboard_row_outside_the_needs_you_statuses_sits_on_top(page, server,
+                                                                            project):
+    store = ProjectStore(project)
+    try:
+        quiet = store.create_work_order("an unflagged order")
+        store.set_status(quiet["id"], "validating")
+        flagged = store.create_work_order("a flagged order under review")
+        store.set_status(flagged["id"], "validating")
+        store.flag_attention(flagged["id"], "its reviewer gave up")
+        newest = store.create_work_order("the newest unflagged order")
+        store.set_status(newest["id"], "validating")
+    finally:
+        store.close()
+    page.goto(server)
+    assert "a flagged order under review" in _first_row_text(page, ".open-work")
+
+
+def test_a_dashboard_filter_survives_a_live_poll(page, server, project):
+    made = _open_orders(project)
+    page.goto(f"{server}/?status=waiting_pr_merge")
+    page.evaluate("window.jarvisLiveSync()")
+    store = ProjectStore(project)
+    try:
+        store.create_work_order("landed after the page loaded", status="waiting_pr_merge")
+    finally:
+        store.close()
+    page.evaluate("window.jarvisLiveSync()")
+    work = page.locator("#live-top .open-work").inner_text()
+    assert "landed after the page loaded" in work, "the poll swapped the region"
+    assert made["waiting_pr_merge"]["title"] in work
+    assert "a worker busy on it" not in work and "an order owed a review" not in work
+    assert page.locator("select[name=status]").input_value() == "waiting_pr_merge"
+
+
 def test_clicking_a_dashboard_row_id_opens_its_order(page, server, project):
     wo = _open_orders(project)["validating"]
     page.goto(server)

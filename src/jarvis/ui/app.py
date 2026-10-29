@@ -1160,8 +1160,10 @@ def create_app() -> FastAPI:
         revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
             else ""
         featured, rest = group_open(rows, revealed)
+        # Same predicate as project(): a status that waits on the user, or a raised flag
         shown = attention_first(featured + rest,
-                                lambda wo: wo["status"] in NEEDS_YOU_STATUSES)
+                                lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                                or bool(wo.get("needs_attention")))
         rest_counts = _counts_by_status(
             wo["status"] for wo in rows if wo["status"] not in FEATURED_STATUSES)
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
@@ -1271,7 +1273,11 @@ def create_app() -> FastAPI:
         improvements = attention_first(improvements, flagged)
         investigations = attention_first(investigations, flagged)
         return render(request, "project.html", project_name=name, path=paths[name],
-                      rows=rows, total=sum(counts.values()), filters=filters,
+                      # "of M": the open orders plus whatever the URL revealed, never every settled one
+                      total=sum(n for s, n in counts.items()
+                                if revealed == "all" or s in OPEN_STATUSES
+                                or s in (status, revealed)),
+                      rows=rows, filters=filters,
                       # Parsed against every status, offered only where a row has it
                       options={"status": [s for s in WO_STATUSES if counts.get(s)]},
                       open_counts=open_counts,
