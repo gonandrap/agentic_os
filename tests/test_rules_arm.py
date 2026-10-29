@@ -303,7 +303,10 @@ def test_the_armed_pass_makes_no_network_call_and_spawns_no_subprocess(
     monkeypatch.setattr(socket.socket, "connect", boom)
     det, _rm, _wo, _counts = _armed_fire(daemon, central, store)
 
-    assert _fires(central, det)[0]["outcome"] == rules.PROPOSED
+    fire = _fires(central, det)[0]
+    assert fire["outcome"] == rules.PROPOSED
+    # The gate's Neo question is on the fire, so its review cost is the rule's (wo-85906675)
+    assert fire["question_id"] is not None
 
 
 # -- (c2) armed detector, no armed remedy: the alarm alone (wo-2877145f, Neo 1649)

@@ -9991,8 +9991,101 @@ def _remedy_entry(row: dict[str, Any]) -> dict[str, Any]:
     return {**row, "params": db.from_json(row.get("params"), {})}
 
 
+#: Default window of a rule's cost line on `rules list` / `rules show`
+RULE_COST_DAYS = 30
+
+#: Said wherever a rule's cost is shown: what the number cannot see (Neo q2519)
+RULE_COST_UNATTRIBUTED = (
+    "not counted: `nudge` and `force_rejudge` spend lands in the subject order's own "
+    "turns and panel rounds, which no rule can be told apart from")
+
+
+def rule_costs(central: CentralStore, *, days: int = RULE_COST_DAYS,
+               detector_id: str = "", project: str = "") -> dict[str, dict[str, Any]]:
+    """What each detector's armed fires CAUSED, by detector (wo-85906675)"""
+    from . import budget
+
+    since = db.now() - days * 86400 if days else None
+    fires = central.rule_fires_since(since, detector_id=detector_id, project=project)
+    neo = central.question_call_costs(
+        sorted({int(f["question_id"]) for f in fires if f["question_id"] is not None}))
+    orders: dict[str, set[str]] = {}
+    for f in fires:
+        for wo_id in db.from_json(f["filed_orders"], []) or []:
+            orders.setdefault(f["project"], set()).add(str(wo_id))
+    order_usd: dict[str, float] = {}
+    paths = registered_project_paths(include_archived=True)
+    for name, ids in orders.items():
+        path = paths.get(name)
+        if path is None or not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            for wo_id in ids:
+                # A retry runs under the same id, so its turns are in this sum
+                order_usd[wo_id] = budget.spent(store, central, wo_id).total_usd
+        finally:
+            store.close()
+
+    out: dict[str, dict[str, Any]] = {}
+    charged: set[tuple[str, str]] = set()
+    for f in fires:
+        row = out.setdefault(f["detector_id"], {
+            "days": days, "total_usd": 0.0, "neo_usd": 0.0, "orders_usd": 0.0,
+            "by_remedy": {}, "orders": [], "questions": 0, "unread_orders": []})
+        rm = f["remedy_rule_id"] or ""
+        usd = 0.0
+        if f["question_id"] is not None:
+            q_usd = neo.get(int(f["question_id"]), 0.0)
+            row["neo_usd"] += q_usd
+            row["questions"] += 1
+            usd += q_usd
+        for wo_id in db.from_json(f["filed_orders"], []) or []:
+            # One order charged once per detector, however many fires name it
+            if (f["detector_id"], wo_id) in charged:
+                continue
+            charged.add((f["detector_id"], wo_id))
+            row["orders"].append({"id": wo_id, "project": f["project"]})
+            if wo_id not in order_usd:
+                row["unread_orders"].append(wo_id)
+                continue
+            row["orders_usd"] += order_usd[wo_id]
+            usd += order_usd[wo_id]
+        row["total_usd"] += usd
+        row["by_remedy"][rm] = row["by_remedy"].get(rm, 0.0) + usd
+    return out
+
+
+def rule_cost_entry(costs: dict[str, dict[str, Any]], detector_id: str, *,
+                    days: int = RULE_COST_DAYS) -> dict[str, Any]:
+    """One detector's cost as surfaces render it — a sentence when nothing was spent"""
+
+    def usd(value: float) -> str:
+        # A MEASURED zero prints as $0.00; `budget.format_usd` writes it as a dash
+        return f"${value:,.2f}"
+
+    row = costs.get(detector_id)
+    window = f"the last {days} days" if days else "all time"
+    if row is None:
+        return {"days": days, "total_usd": None, "by_remedy": {}, "orders": [],
+                "questions": 0, "neo_usd": None, "orders_usd": None,
+                "unread_orders": [],
+                "note": (f"no armed fire of this rule asked Neo or filed an order in "
+                         f"{window}, so it caused no attributable spend — which is not "
+                         f"a measured $0")}
+    note = (f"{usd(row['total_usd'])} in {window}: "
+            f"{usd(row['neo_usd'])} on {row['questions']} gate "
+            f"{'review' if row['questions'] == 1 else 'reviews'} by Neo, "
+            f"{usd(row['orders_usd'])} on {len(row['orders'])} filed "
+            f"{'order' if len(row['orders']) == 1 else 'orders'}")
+    if row["unread_orders"]:
+        note += (f" — {', '.join(row['unread_orders'])} could not be read and is in no "
+                 f"number here")
+    return {**row, "note": note}
+
+
 def rules_list(*, project: str = "", status: str = "",
-               gap_class: str = "") -> dict[str, Any]:
+               gap_class: str = "", days: int = RULE_COST_DAYS) -> dict[str, Any]:
     """The registry: what the OS has learned to recognise about itself"""
     central = CentralStore()
     try:
@@ -10007,7 +10100,9 @@ def rules_list(*, project: str = "", status: str = "",
         shown = [d for d in every if not status or d["status"] == status]
         if not status:
             shown = [d for d in shown if d["retired_at"] is None]
-        entries = [_rule_entry(central, d) for d in shown]
+        costs = rule_costs(central, days=days)
+        entries = [{**_rule_entry(central, d),
+                    "cost": rule_cost_entry(costs, d["id"], days=days)} for d in shown]
     finally:
         central.close()
     enabled = rules_enabled(project or None)
@@ -10026,10 +10121,11 @@ def rules_list(*, project: str = "", status: str = "",
         if counts["armed"]:
             note = (f"{counts['armed']} armed, the rest in dry run. An armed rule "
                     f"proposes; the gate still decides whether anything runs")
-    return {"counts": counts, "rules": entries, "enabled": enabled, "note": note}
+    return {"counts": counts, "rules": entries, "enabled": enabled, "note": note,
+            "cost_unattributed": RULE_COST_UNATTRIBUTED}
 
 
-def rules_show(detector_id: str) -> dict[str, Any]:
+def rules_show(detector_id: str, *, days: int = RULE_COST_DAYS) -> dict[str, Any]:
     """One detector in full: the condition as prose"""
     central = CentralStore()
     try:
@@ -10044,9 +10140,12 @@ def rules_show(detector_id: str) -> dict[str, Any]:
         fires = central.list_rule_fires(detector_id=detector_id, limit=20)
         # The reader §8's verdict owes (Neo question 974): a recurrence is the record that THIS rule did not...
         recurrences = central.list_recurrences(detector_id=detector_id, limit=20)
+        cost = rule_cost_entry(rule_costs(central, days=days, detector_id=detector_id),
+                               detector_id, days=days)
     finally:
         central.close()
     return {
+        "cost": cost, "cost_unattributed": RULE_COST_UNATTRIBUTED,
         "detector": detector,
         "condition_prose": entry["condition_prose"],
         "condition_problems": entry["condition_problems"],
@@ -10513,6 +10612,7 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
                                                 limit=_EVOLUTION_RECURRENCE_LIMIT)
             if since <= float(r["ts"]) <= until]
         entries = [_rule_entry(central, d) for d in detectors]
+        costs = rule_costs(central, days=days, project=scope)
         knowledge = _evolution_knowledge(central, scope)
         # Exemptions only: §9's claim is about what the OS LEARNED is not privileged
         gate_exemptions = central.gate_rules(role="exempt", include_retired=True)
@@ -10610,6 +10710,7 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
                    if f["cleared_seconds"] is not None]
         enough = len(cleared) >= min_samples
         per_rule.append({
+            "cost": rule_cost_entry(costs, str(detector["id"]), days=days),
             "id": detector["id"], "gap_class": detector["gap_class"],
             "summary": detector["summary"], "status": status,
             "hits": detector["hits"], "false_positives": detector["false_positives"],
@@ -10768,6 +10869,7 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
         "mechanical_share": mechanical_share,
         "by_gap_class": by_gap_class,
         "per_rule": per_rule,
+        "cost_unattributed": RULE_COST_UNATTRIBUTED,
         "recurrences": recurrences,
         "stuck_resolution": stuck_resolution,
         "timeline": timeline,

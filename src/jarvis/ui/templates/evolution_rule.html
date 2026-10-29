@@ -27,6 +27,10 @@
     <tr><th>hit rate</th><td>{% if rule.hit_rate is none %}<span class="empty">{{ rule.hit_rate_note }}</span>{% else %}<span class="mono">{{ '%.0f' % (rule.hit_rate * 100) }}%</span>{% endif %}</td></tr>
     <tr><th>median to clear</th><td>{% if rule.median_cleared_seconds is none %}<span class="empty">{{ rule.median_cleared_seconds_note }}</span>{% else %}<span class="mono">{{ fmt_dur(rule.median_cleared_seconds) }}</span>{% endif %}</td></tr>
     <tr><th>last fired</th><td class="mono">{{ fmt_ts(rule.last_fired) }} · cleared {{ fmt_ts(rule.last_cleared) }}</td></tr>
+    <tr><th>cost</th><td>{% if rule.cost.total_usd is none %}<span class="empty">{{ rule.cost.note }}</span>{% else %}<span class="mono">{{ rule.cost.note }}</span>
+      {% for rm, usd in rule.cost.by_remedy | dictsort %}<br><span class="mono">{{ rm or 'no remedy rule' }}: ${{ '%.2f' % usd }}</span>{% endfor %}
+      {% for wo in rule.cost.orders %}{% if loop.first %}<br>filed: {% endif %}<a class="mono" href="/wo/{{ wo.project }}/{{ wo.id }}">{{ wo.id }}</a>{% if not loop.last %} · {% endif %}{% endfor %}{% endif %}
+      <br><span class="empty">{{ report.cost_unattributed }}</span></td></tr>
   </table>
 </div>
 

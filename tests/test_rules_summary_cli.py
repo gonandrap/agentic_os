@@ -28,6 +28,7 @@ def _report(**overrides) -> dict:
         "stuck_resolution": [],
         "timeline": [],
         "unreadable": {"projects": [], "detectors": [], "fires": []},
+        "cost_unattributed": ops.RULE_COST_UNATTRIBUTED,
     }
     data.update(overrides)
     return data
@@ -39,9 +40,17 @@ def _rule(**overrides) -> dict:
            "last_fired": 1_050_000.0, "last_cleared": 1_060_000.0,
            "hit_rate": 0.8, "hit_rate_note": None, "readable": True,
            "condition_problems": [], "median_cleared_seconds": 7200.0,
-           "median_cleared_seconds_note": None}
+           "median_cleared_seconds_note": None,
+           "cost": ops.rule_cost_entry({}, "dt-1")}
     row.update(overrides)
     return row
+
+
+def test_a_rule_that_never_spent_says_so_in_words(capsys):
+    cli._print_rules_summary(_report(per_rule=[_rule()]))
+    out = capsys.readouterr().out
+    assert "caused no attributable spend" in out
+    assert ops.RULE_COST_UNATTRIBUTED in out
 
 
 # -- the renderer computes nothing

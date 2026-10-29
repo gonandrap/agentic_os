@@ -65,7 +65,7 @@
   <table>
     <tr><th>detector</th><th>gap class</th><th>status</th><th>hits</th>
       <th>weekly fires (gap class)</th><th>hit rate</th><th>median to clear</th>
-      <th>last fired</th></tr>
+      <th>cost</th><th>last fired</th></tr>
     {% for r in rows %}
     <tr id="rule-{{ r.id }}">
       <td>{{ ui.row_id(r.id, rule_href(r)) }}{% if not r.readable %} <span class="tone-warn">unreadable</span>{% endif %}</td>
@@ -76,11 +76,14 @@
       <td class="num mono">{% for w in (weeks_of.get(r.gap_class) or [])[-4:] %}<span title="week of {{ w.week }}">{{ w.count }}</span>{% if not loop.last %} · {% endif %}{% else %}—{% endfor %}</td>
       <td class="num mono">{% if r.hit_rate is none %}—{% else %}{{ '%.0f' % (r.hit_rate * 100) }}%{% endif %}</td>
       <td class="num mono">{% if r.median_cleared_seconds is none %}—{% else %}{{ fmt_dur(r.median_cleared_seconds) }}{% endif %}</td>
+      {# No attributable spend is a sentence in the title, never a $0 that reads as measured #}
+      <td class="num mono" title="{{ r.cost.note }}">{% if r.cost.total_usd is none %}<span class="empty">none</span>{% else %}${{ '%.2f' % r.cost.total_usd }}{% endif %}</td>
       <td class="when mono">{{ fmt_ts(r.last_fired) }}</td>
     </tr>
     {% endfor %}
   </table>
 </div>
+<p class="empty">cost: what each rule's armed fires caused — Neo's gate reviews and the orders it filed. {{ report.cost_unattributed }}</p>
 {% elif filters.get("firing") == "quiet" %}
 {% elif total %}
 <p class="empty">no detector in this scope has fired yet</p>

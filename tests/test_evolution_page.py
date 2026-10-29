@@ -45,6 +45,7 @@ def report(**over) -> dict:
         "stuck_resolution": [],
         "timeline": [],
         "unreadable": {"projects": [], "detectors": [], "fires": []},
+        "cost_unattributed": ops.RULE_COST_UNATTRIBUTED,
     }
     base.update(over)
     return base
@@ -146,7 +147,26 @@ def _rule(**over) -> dict:
             "hit_rate_note": "this detector has never fired, so it has no hit rate",
             "readable": True, "condition_problems": [],
             "median_cleared_seconds": None,
-            "median_cleared_seconds_note": "0 cleared fires, not a median yet", **over}
+            "median_cleared_seconds_note": "0 cleared fires, not a median yet",
+            "cost": ops.rule_cost_entry({}, "det-1"), **over}
+
+
+def test_rule_cost_shows_on_the_list_and_the_rule_page(client, monkeypatch):
+    costs = {"det-1": {"days": 30, "total_usd": 1.25, "neo_usd": 0.25, "orders_usd": 1.0,
+                       "by_remedy": {"rm-1": 1.25}, "questions": 1,
+                       "orders": [{"id": "wo-7", "project": "proj_a"}],
+                       "unread_orders": []}}
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(per_rule=[
+        _rule(hits=1, last_fired=1.0, cost=ops.rule_cost_entry(costs, "det-1")),
+        _rule(id="det-2", hits=1, last_fired=1.0)]))
+    listing = body_of(client.get("/evolution").text)
+    assert "$1.25" in listing
+    assert "none" in listing.split('id="rule-det-2"', 1)[1].split("</tr>", 1)[0]
+    assert "`force_rejudge` spend lands in the subject order" in listing
+    detail = body_of(client.get("/evolution/rule/det-1").text)
+    assert "rm-1: $1.25" in detail and 'href="/wo/proj_a/wo-7"' in detail
+    quiet = body_of(client.get("/evolution/rule/det-2").text)
+    assert "which is not a measured $0" in quiet
 
 
 def test_a_rule_with_no_hit_rate_shows_the_note(client, monkeypatch):

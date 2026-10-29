@@ -451,6 +451,7 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
             steward.linked(decision, fix["id"])
     except ops.OpsError as exc:
         raise RemedyRefused(str(exc)) from exc
+    _attribute(central, intent, fix["id"])
     try:
         ship = ops.create_work_order(
             project, ship_title,
@@ -462,8 +463,20 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
         return (f"filed {fix['id']} to fix the root cause; its ship order could NOT be "
                 f"filed ({exc}) — file one by hand with `jarvis wo create {project} "
                 f"\"…\" --depends-on {fix['id']}`")
+    _attribute(central, intent, ship["id"])
     return (f"filed {fix['id']} to fix the root cause, and {ship['id']} to ship it "
             f"(blocked until {fix['id']} completes; the release itself is still gated)")
+
+
+def _attribute(central: Any, intent: Intent, wo_id: str) -> None:
+    """Charge a filed order to the rule fire behind the alarm, if a rule raised it"""
+    if intent.alarm_id is None or central is None:
+        return
+    try:
+        central.note_fire_orders(intent.alarm_id, [wo_id])
+    except Exception:  # noqa: BLE001 — the order is filed; losing its attribution must not undo that
+        log.warning("could not attribute %s to the fire behind %s", wo_id,
+                    intent.alarm_id, exc_info=True)
 
 
 def reoffer_file_work_order(row: Mapping[str, Any], candidate: Any,
