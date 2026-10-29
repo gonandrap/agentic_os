@@ -293,7 +293,7 @@ class Reader:
                 row = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(row, dict):
+            if isinstance(row, dict) and row.get("type") not in usage_mod.REPLAY_ROW_TYPES:
                 self._row(row)
 
     def _row(self, row: dict[str, Any]) -> None:

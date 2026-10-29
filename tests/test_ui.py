@@ -3419,3 +3419,34 @@ def test_a_gate_number_in_two_projects_lists_both_candidates(client, project, tm
     r = client.get(f"/gates/{n}?project=proj_b")
     assert r.status_code == 200
     assert "./ship-proj_b.sh" in r.text and "./ship-proj_a.sh" not in r.text
+# -- §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+
+
+def test_a_dashboard_status_filter_reveals_a_collapsed_status(client):
+    ops.create_work_order("proj_a", "not started yet")
+    assert "not started yet" not in client.get("/").text  # pending collapses into a count
+    page = client.get("/?status=pending").text
+    assert "not started yet" in page and "1 of 1 shown" in page
+
+
+def test_the_project_filter_counts_only_what_the_view_draws_from(client, project):
+    open_wo = ops.create_work_order("proj_a", "still going")
+    done = ops.create_work_order("proj_a", "old and finished")
+    ops.mark_done(done["id"])
+    store = ProjectStore(project)
+    try:
+        store.set_status(open_wo["id"], "running")
+    finally:
+        store.close()
+    assert "1 of 1 shown" in client.get("/project/proj_a").text  # the settled one is not in M
+    assert "1 of 2 shown" in client.get("/project/proj_a?status=completed").text
+
+
+def test_a_finding_owed_a_decision_sorts_above_a_decided_one(improvement):
+    client, io, _ = improvement
+    first, second = (f["key"] for f in io["report"]["findings"][:2])
+    before = client.get(f"/io/proj_a/{io['id']}").text
+    assert before.index(f'id="finding-{first}"') < before.index(f'id="finding-{second}"')
+    ops.review_findings(io["id"], accept=(first,), project_name="proj_a")
+    page = client.get(f"/io/proj_a/{io['id']}").text
+    assert page.index(f'id="finding-{second}"') < page.index(f'id="finding-{first}"')

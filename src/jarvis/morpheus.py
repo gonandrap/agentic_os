@@ -410,17 +410,28 @@ def run_script(script: str, cwd: Path, timeout: int) -> CheckResult:
     return CheckResult(proc.returncode, out[-OUTPUT_TAIL:])
 
 
+def checked_version(repo: Path) -> str:
+    """What production ran at a check: its tag, else tag-distance or commit; '' outside git"""
+    try:
+        return _git(repo, "describe", "--tags", "--always", "HEAD").strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
 def _cwd(cwd: CwdFor, item: dict[str, Any]) -> Path:
     return cwd(item) if callable(cwd) else cwd
 
 
 def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd: CwdFor,
           *, now: float | None = None,
-          run: Callable[[str, Path, int], CheckResult] = run_script) -> str:
+          run: Callable[[str, Path, int], CheckResult] = run_script,
+          version: Callable[[Path], str] | None = None) -> str:
     """Run an item's script once and move it by the exit codes alone; returns its state"""
     now = db.now() if now is None else now
-    result = run(item["script"], _cwd(cwd, item), cfg.script_timeout_seconds)
+    where = _cwd(cwd, item)
+    result = run(item["script"], where, cfg.script_timeout_seconds)
     fields: dict[str, Any] = {"last_check_ts": now, "checks": int(item["checks"]) + 1,
+                              "last_check_version": (version or checked_version)(where),
                               "last_exit": result.exit, "last_output": result.output,
                               "next_check_ts": now + cfg.check_every_minutes * 60}
     if result.exit == EXIT_VALIDATED:
@@ -701,6 +712,11 @@ For each item you are given, spawn ONE subagent (Task tool), in parallel. Each s
      - exits 75 for everything else, including production not having exercised the
        change yet;
      - finishes in well under a minute;
+     - prints ONE line per hint it checks, starting `PASS`, `FAIL` or `UNKNOWN` (the
+       last for a check that exits 75), naming the hint in plain words a human reads
+       without the script — never a bare internal field name like `wedged=false`;
+     - never prints the release that first carried the PR on its own: the OS already
+       records that, and the check's own version, beside the output;
   3. registers it: `jarvis morpheus script <item id> --file /tmp/morpheus-<item id>.sh`.
 If the hints cannot be made mechanical, the subagent registers a script that exits 75 and
 prints why — the item then times out and a human decides.
