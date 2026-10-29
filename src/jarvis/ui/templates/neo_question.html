@@ -24,8 +24,7 @@
 </div>
 {% endif %}
 
-<div class="grid" style="--col: 640px;">
-<div class="sec">
+{# One full-width column: §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md #}
 <h2 id="question">Question</h2>
 <div class="panel" style="padding: 14px 16px;">
   <div class="who">
@@ -39,9 +38,7 @@
   </div>
   {{ question_body(q) }}
 </div>
-</div>
 
-<div class="sec">
 <h2 id="answer">Answer</h2>
 <div class="panel" style="padding: 14px 16px;">
   {% if q.answer %}
@@ -79,7 +76,5 @@
 <h2 id="deliberation">How it was decided</h2>
 <div class="panel" style="padding: 14px 16px;">{{ deliberation(opinions) }}</div>
 {% endif %}
-</div>
-</div>
 
 {% endblock %}

@@ -1253,3 +1253,180 @@ def test_clicking_a_morpheus_row_id_opens_its_detail(page, server):
     assert "confirm failed" in page.locator("main").inner_text()
     page.goto(f"{server}/go/{failed}")
     page.wait_for_url(f"**/morpheus/{failed}")
+
+
+# §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _alarm_rows(project) -> dict[str, str]:
+    """One live long-turn alarm and two settled ones of different kinds; returns ids"""
+    burning = ops.create_work_order("proj_a", "the order still burning")
+    settled = ops.create_work_order("proj_a", "the order that settled")
+    store = ProjectStore(project)
+    try:
+        live = store.add_alarm(burning["id"], "long-turn", 2, f"turn 2 is still being billed: {_LONG}")
+        store.flag_attention(burning["id"], "a turn is still being billed")
+        old = store.add_alarm(settled["id"], "cache-write", 4, f"turn 4 re-sent the conversation: {_LONG}")
+        store.update_alarm(old["id"], status="acked", verdict="ack")
+        slow = store.add_alarm(settled["id"], "long-turn", 5, "turn 5 ran long and finished")
+        store.update_alarm(slow["id"], status="acked", verdict="ack")
+    finally:
+        store.close()
+    return {"live": live["id"], "old": old["id"], "slow": slow["id"]}
+
+
+def test_alarms_read_at_desktop_and_phone_width(page, server, project, readable):
+    ids = _alarm_rows(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/alarms")
+        assert ids["live"] in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"alarms-{size['width']}")
+        page.goto(f"{server}/alarms/proj_a/{ids['old']}")
+        readable(page)
+
+
+def test_an_alarm_filter_in_the_url_narrows_the_record(page, server, project):
+    ids = _alarm_rows(project)
+    page.goto(f"{server}/alarms?kind=cache-write")
+    record = page.locator("table.alarm-list").inner_text()
+    assert ids["old"] in record and ids["slow"] not in record
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+
+
+def test_a_burning_alarm_sits_above_the_record(page, server, project):
+    ids = _alarm_rows(project)
+    page.goto(f"{server}/alarms")
+    live = page.locator(f".needs-you a.rowid:has-text('{ids['live']}')").bounding_box()
+    assert live["y"] < page.locator("table.alarm-list").bounding_box()["y"]
+
+
+def test_clicking_an_alarm_row_id_opens_the_alarm(page, server, project):
+    ids = _alarm_rows(project)
+    page.goto(f"{server}/alarms")
+    page.click(f"table.alarm-list a.rowid:has-text('{ids['old']}')")
+    page.wait_for_url(f"**/alarms/proj_a/{ids['old']}")
+    assert "re-sent the conversation" in page.locator("main").inner_text()
+
+
+def _neo_rows(daemon) -> dict[str, int]:
+    """An escalation, an approved answer and a corrected one; returns ids"""
+    wo = ops.create_work_order("proj_a", "neo history task")
+    daemon.tick()
+    approved = ops.ask_question(wo["id"], f"CSV or JSON? {_LONG}")["question_id"]
+    daemon._neo_drain()
+    ops.neo_review(approved, approved=True)
+    yours = ops.ask_question(wo["id"], "Which bucket for the staging export?")["question_id"]
+    daemon._neo_drain()
+    ops.neo_review(yours, approved=False, feedback=f"the staging bucket, {_LONG}")
+    escalated = ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the key?")["question_id"]
+    daemon._neo_drain()
+    return {"approved": approved, "yours": yours, "escalated": escalated}
+
+
+def test_neo_reads_at_desktop_and_phone_width(page, server, daemon, project, readable):
+    ids = _neo_rows(daemon)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/neo")
+        assert "rotate the key" in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"neo-{size['width']}")
+        page.click(".tabs button:has-text('History')")
+        readable(page)
+        page.goto(f"{server}/neo/question/{ids['approved']}")
+        readable(page)
+        _shot(page, f"neo-question-{size['width']}")
+        page.goto(f"{server}/neo/stats")
+        readable(page)
+        _shot(page, f"neo-stats-{size['width']}")
+
+
+def test_a_neo_filter_in_the_url_narrows_the_history(page, server, daemon, project):
+    ids = _neo_rows(daemon)
+    page.goto(f"{server}/neo?review=approved")
+    assert page.locator("#tab-history").is_visible()      # a filter opens the tab it filters
+    rows = page.locator("table.neo-history a.rowid").all_inner_texts()
+    assert rows == [str(ids["approved"])]
+    assert "1 of 2 shown" in page.locator("#tab-history").inner_text()
+
+
+def test_an_escalated_question_sits_above_the_tabs(page, server, daemon, project):
+    ids = _neo_rows(daemon)
+    page.goto(f"{server}/neo")
+    strip = page.locator(f".needs-you a.rowid:has-text('#{ids['escalated']}')").bounding_box()
+    assert strip["y"] < page.locator("#neo-tabs").bounding_box()["y"]
+
+
+def test_clicking_a_neo_row_id_opens_the_question(page, server, daemon, project):
+    ids = _neo_rows(daemon)
+    page.goto(f"{server}/neo")
+    page.click(".tabs button:has-text('History')")
+    page.click(f"table.neo-history a.rowid:text-is('{ids['yours']}')")
+    page.wait_for_url(f"**/neo/question/{ids['yours']}")
+    assert "Which bucket for the staging export?" in page.locator("main").inner_text()
+
+
+def _cost_rows(project) -> dict:
+    """A work order with one recorded turn, the shape the cost listing reads"""
+    import json
+
+    wo = ops.create_work_order("proj_a", f"a costed order: {_LONG}")
+    store = ProjectStore(project)
+    try:
+        turn = store.create_turn(wo["id"], kind="dispatch", prompt="p")
+        store.finish_turn(turn["id"], "done", result="r", cost_usd=0.5, num_turns=1,
+                          usage_json=json.dumps({"total_cost_usd": 0.5, "input": 2,
+                                                 "cache_write": 2558, "cache_read": 45689,
+                                                 "output": 941, "api_calls": 1,
+                                                 "context_peak": 1000,
+                                                 "context_window": 1_000_000}))
+    finally:
+        store.close()
+    return wo
+
+
+def test_cost_and_bill_read_at_desktop_and_phone_width(page, server, project, readable):
+    wo = _cost_rows(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/cost?project=proj_a")   # scoped: the fleet entry is cached across tests
+        page.wait_for_selector(f"table.cost-list a.rowid:has-text('{wo['id']}')")
+        _shot(page, f"cost-{size['width']}")
+        readable(page)
+        page.goto(f"{server}/cost/proj_a/{wo['id']}")
+        _shot(page, f"bill-{size['width']}")
+        readable(page)
+
+
+def test_a_cost_project_filter_in_the_url_scopes_the_listing(page, server, project):
+    wo = _cost_rows(project)
+    page.goto(f"{server}/cost?project=proj_a")
+    page.wait_for_selector("table.cost-list")
+    assert "project: proj_a" in page.locator(".filter-bar").inner_text()
+    assert wo["id"] in page.locator("table.cost-list").inner_text()
+    page.goto(f"{server}/cost?project=nope")
+    assert "not registered" in page.locator("main").inner_text()
+
+
+def test_clicking_a_cost_row_id_opens_its_order(page, server, project):
+    wo = _cost_rows(project)
+    page.goto(f"{server}/cost?project=proj_a")   # scoped: never a fleet entry cached by another test
+    page.wait_for_selector("table.cost-list")
+    page.click(f"table.cost-list a.rowid:has-text('{wo['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
+
+
+def test_config_reads_and_stacks_history_over_diff(page, server, readable):
+    ops.adopt_config(reason="the file as it shipped")
+    ops.set_config("os.ui.port", 9999)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/config")
+        _shot(page, f"config-{size['width']}")
+        # A settings row is as tall as its edit form, so a cfg-table cell's height says
+        # nothing about its text: measure the prose blocks inside those cells instead.
+        readable(page, "main p, main th, main td:not(.cfg-table td), .cfg-table td > div")
+        history = page.locator("#cfg-history").bounding_box()
+        diff = page.locator("h2:text-is('Diff')").bounding_box()
+        assert diff["y"] > history["y"] and diff["x"] == history["x"]  # stacked, not beside
+    assert page.locator(".cfg-tree").is_visible()                       # the tree stays

@@ -15,7 +15,8 @@
    total explains nothing, and the four classes are priced 20x apart. #}
 {% macro breakdown(line) %}
 {% set t = line.tokens %}{% set c = line.cost.by_class %}
-<table style="margin: 4px 0 0; font-size: 13px;">
+{# Scrolls sideways on a phone rather than squeezing its notes (spec 2026-10-29 dashboard §8) #}
+<div class="table-wrap"><table style="margin: 4px 0 0; font-size: 13px;">
   <tr><th style="text-align:left">what</th><th style="text-align:right">tokens</th>
       <th style="text-align:right">rate</th><th style="text-align:right">at list</th>
       <th style="text-align:left"></th></tr>
@@ -31,7 +32,7 @@
       <td class="mono" style="text-align:right">{{ fmt_tok(t.cache_write) }}</td>
       <td class="mono sub" style="text-align:right">{{ '%.2f'|format(write_rate_of(line)) }}×</td>
       <td class="mono" style="text-align:right">${{ '%.3f'|format(c.cache_write) }}</td>
-      <td class="sub">stored in the prompt cache — {{ rate_note(line, fmt_tok) }}</td></tr>
+      <td class="sub prose">stored in the prompt cache — {{ rate_note(line, fmt_tok) }}</td></tr>
   <tr><td>cache read</td>
       <td class="mono" style="text-align:right">{{ fmt_tok(t.cache_read) }}</td>
       <td class="mono sub" style="text-align:right">0.1×</td>
@@ -48,14 +49,14 @@
       <td></td>
       <td class="mono" style="text-align:right">
         <strong>${{ '%.3f'|format(line.cost.list_usd) }}</strong></td>
-      <td class="sub">
+      <td class="sub prose">
         {%- if line.exact_missing == 0 %}the CLI billed
           ${{ '%.3f'|format(line.cost.exact_usd) }} for it
         {%- elif line.cost.exact_usd %}the CLI's own figure covers
           ${{ '%.3f'|format(line.cost.exact_usd) }} of this; the rest is priced at list
         {%- else %}priced at list — no billed figure for this line{% endif -%}
       </td></tr>
-</table>
+</table></div>
 {% if line.models %}
 <p class="sub mono" style="margin: 4px 0 0;">
   {{ line.models|join(' · ') }}
