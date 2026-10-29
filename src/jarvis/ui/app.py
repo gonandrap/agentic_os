@@ -447,9 +447,6 @@ def _cost_payloads(picked: dict, project: str) -> dict:
 
 REFRESH_SECONDS = 60
 
-#: How long a request waits for an on-demand compute before it renders `computing.html`
-WAIT_SECONDS = 5
-
 #: On-demand entries kept, and computes allowed to run at once
 MAX_ON_DEMAND = 8
 MAX_COMPUTING = 4
@@ -479,8 +476,14 @@ class CostCache:
 
     @staticmethod
     def key(picked: dict, project: str) -> tuple:
-        """The bounds and the scope: the only inputs the payloads depend on"""
-        return (project, picked["since"], picked["until"])
+        """The bounds and the scope: the only inputs the payloads depend on.
+
+        `until` is bucketed by `REFRESH_SECONDS`, which is the staleness every entry is
+        already served with: `since=…` with no `until` ends at NOW, so an exact key would
+        miss on every visit and the self-refreshing page would never stop computing
+        (docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md).
+        """
+        return (project, picked["since"], int(picked["until"] // REFRESH_SECONDS))
 
     def _compute_on_demand(self, key: tuple, picked: dict, project: str) -> None:
         try:
@@ -503,19 +506,15 @@ class CostCache:
             if event is not None:
                 event.set()
 
-    def start(self, key: tuple, picked: dict, project: str) -> threading.Event | None:
-        """The compute for one window, in its own thread; None when too many run already"""
+    def start(self, key: tuple, picked: dict, project: str) -> None:
+        """The compute for one window, in its own thread; nothing when too many run already"""
         with self._lock:
-            running = self.computing.get(key)
-            if running is not None:
-                return running
-            if len(self.computing) >= MAX_COMPUTING:
-                return None
-            event = self.computing[key] = threading.Event()
+            if key in self.computing or len(self.computing) >= MAX_COMPUTING:
+                return
+            self.computing[key] = threading.Event()
         # A plain thread, NOT the anyio pool: it must not borrow the token a page needs
         threading.Thread(target=self._compute_on_demand, args=(key, picked, project),
                          name="jarvis-ui-cost", daemon=True).start()
-        return event
 
     def serve(self, picked: dict, project: str) -> dict | None:
         """One window's payloads, or None while they are still being computed"""
@@ -523,18 +522,16 @@ class CostCache:
         entry = self.on_demand.get(key)
         if entry is not None and time.time() - entry["computed_at"] < REFRESH_SECONDS:
             return entry
-        event = self.start(key, picked, project)
+        self.start(key, picked, project)
         if entry is not None:
             # Stale, and served as it is: the page already says how old it is
             return entry
-        if event is not None:
-            event.wait(WAIT_SECONDS)
-        entry = self.on_demand.get(key)
-        if entry is None and self.failures.get(key):
+        # No wait at all: the request path never holds for an aggregation (docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md)
+        if self.failures.get(key):
             raise ops.OpsError(f"the cost report for {picked['label']} could not be "
                                f"computed — {self.failures[key]}. The traceback is in "
                                f"{uilog.ui_log_path()}.")
-        return entry
+        return None
 
     async def refresh(self) -> None:
         """One round over every named window; a failure keeps the last good entry"""

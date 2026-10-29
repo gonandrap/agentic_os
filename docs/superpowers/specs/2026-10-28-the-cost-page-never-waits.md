@@ -1,0 +1,60 @@
+# The cost page never waits (mv-d58a1b67, wo-0d358979)
+
+Follows 2026-10-22-a-slow-request-is-not-a-wedge.md, which this amends.
+
+## The problem
+
+PR #1241 (release jarvis-0.12.27) failed production validation mv-d58a1b67: `/cost`
+returned 200 with the `computing` state, but took **6.8s on two consecutive checks**. The
+user's ruling: "6s is too much, current window limit (5h and 7d) should be instantaneous."
+
+`CostCache.serve` did `event.wait(WAIT_SECONDS)` (5s) whenever a window had no entry at
+all, and only then rendered `computing.html`. So the cheapest possible response — "it is
+being computed, the page refreshes itself" — cost 5s plus the window resolution. The
+aggregation no longer ran *on* the request path, but the request still blocked *for* it.
+
+Morpheus checks right after the release restarted `jarvis-ui.service`, so `CostCache.run`'s
+first round had not landed yet: the current week window missed `entries`, fell through to
+`serve`, and ate the full 5s. Twice, because each check was inside that same first round.
+
+## The fix
+
+`WAIT_SECONDS` is deleted. `serve` starts the compute thread and returns what it has:
+
+- entry younger than `REFRESH_SECONDS`: served as it is;
+- entry older: a recompute starts, the stale entry is served at once (`computed Ns ago`);
+- **no entry: a compute starts and `None` comes back immediately**, so `cost_page` renders
+  `computing.html` — the 2s meta-refresh page — in the time a template render takes.
+
+`CostCache.start` no longer returns the `threading.Event`: nothing waits on it, and the
+`computing` dict is what dedupes concurrent requests for one window (including each 2s
+refresh of `computing.html`, so a reader cannot spawn threads by waiting).
+
+`CostCache.key` buckets its `until` by `REFRESH_SECONDS`. Without the wait, the 2s
+meta refresh is now what drives an uncached window to completion, and a `since=…` window
+with no `until` ends at NOW: an exact key missed on every visit, so each refresh started
+another compute and the page could never resolve. The bucket is the same staleness every
+entry is already served with.
+
+The current 5h and week windows stay instantaneous the way #1241 made them: the
+`CostCache.run` precompute, served through `lookup`, no aggregation on the path.
+
+### What is NOT changed
+
+- A cold `jarvis-ui` serves `computing.html` for the current window until the first
+  precompute round lands (8-22s per window, measured 2026-10-22). Persisting the cache
+  across restarts was rejected by Neo 2094 as option B (new schema, cross-process writer,
+  staleness the UI cannot see) and is not reopened here. The response is instant either way.
+- The two windows are still computed serially in one round, and a cold request computes
+  its window a second time off the path. Both spend CPU, neither delays a response.
+
+## Tests (tests/test_ui_cost.py)
+
+- `test_the_request_path_never_waits_for_the_aggregation`: `ops.cost_report` held open on a
+  gate; the request returns `computing.html` in under 1s, and the next visit is the page.
+- `test_a_current_window_renders_with_the_aggregation_blocked` (week and 5h): a precomputed
+  window renders under 1s while `ops.cost_report` cannot return at all.
+- `test_an_open_ended_window_is_computed_once_however_often_it_is_visited`: three visits to
+  `/cost?since=…`, one `ops.cost_report` call, no thread left running.
+- The helper `cost_page` is what every pre-existing `/cost` test now visits through: a
+  window nothing has computed yet takes two visits, which is the behaviour, not a wart.
