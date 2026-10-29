@@ -30,27 +30,40 @@ first round had not landed yet: the current week window missed `entries`, fell t
 `computing` dict is what dedupes concurrent requests for one window (including each 2s
 refresh of `computing.html`, so a reader cannot spawn threads by waiting).
 
-`CostCache.key` buckets its `until` by `REFRESH_SECONDS`. Without the wait, the 2s
-meta refresh is now what drives an uncached window to completion, and a `since=…` window
-with no `until` ends at NOW: an exact key missed on every visit, so each refresh started
-another compute and the page could never resolve. The bucket is the same staleness every
-entry is already served with.
+`CostCache.key` buckets its `until` by `REFRESH_SECONDS` **when the window is open-ended**.
+Without the wait, the 2s meta refresh is now what drives an uncached window to completion,
+and a `since=…` window with no `until` ends at NOW: an exact key missed on every visit, so
+each refresh started another compute and the page could never resolve. The bucket is the
+same staleness every entry is already served with. A window with both bounds given keeps
+its exact `until`, so two distinct bounded ranges inside one bucket cannot share an entry —
+`resolve_window` marks the difference with `open_ended`.
 
 The current 5h and week windows stay instantaneous the way #1241 made them: the
 `CostCache.run` precompute, served through `lookup`, no aggregation on the path.
 
-#> Amended by [2026-10-29-the-cost-page-reuses-what-it-parsed.md](2026-10-29-the-cost-page-reuses-what-it-parsed.md),
-> which caches each transcript's parse so the cold window costs ~0.35s rather than
-> 3.47s. The "8-22s" figure quoted below was an estimate; measured it is 3.47s.
+> Deleting the wait also stopped accidentally serialising the request thread against the
+> compute thread, which exposed a deadlock in SQLite 3.51.0/3.51.1 itself (`kn-8e43df8e`,
+> `io-6fdf5c66`). Not this repository's bug and not fixed here: `#1306` pins an
+> unaffected interpreter.
+>
+> Amended by [2026-10-29-the-cost-page-reuses-what-it-parsed.md](2026-10-29-the-cost-page-reuses-what-it-parsed.md),
+> which caches each transcript's parse and moves round one of the precompute into
+> `lifespan`, so the first request after a restart renders the report. Where this spec
+> estimated 8-22s for a cold window, the measured figure for one `fleetcost.report` is
+> 3.47s, and 0.37s warm; a whole precompute round is 4.49s cold and 2.24s after a restart
+> that follows a save.
 
 ## What is NOT changed
 
-- A cold `jarvis-ui` serves `computing.html` for the current window until the first
-  precompute round lands (8-22s per window, measured 2026-10-22). Persisting the cache
-  across restarts was rejected by Neo 2094 as option B (new schema, cross-process writer,
-  staleness the UI cannot see) and is not reopened here. The response is instant either way.
 - The two windows are still computed serially in one round, and a cold request computes
   its window a second time off the path. Both spend CPU, neither delays a response.
+
+Superseded by the 10-29 spec: this spec left a cold `jarvis-ui` serving `computing.html`
+for the current window until the first precompute round landed, and declined to persist
+anything across restarts (Neo 2094 rejected option B: new schema, cross-process writer,
+staleness the UI cannot see). The user refused that, and kn-79da1c34 is the standing rule.
+The 10-29 spec persists the parsed transcripts — not a window snapshot, so option B's
+objections do not apply — and awaits round one before `lifespan` yields.
 
 ## Tests (tests/test_ui_cost.py)
 

@@ -459,6 +459,9 @@ def _cost_payloads(picked: dict, project: str) -> dict:
 
 REFRESH_SECONDS = 60
 
+#: How long startup may spend on round one before it gives up and serves anyway (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)
+FIRST_ROUND_SECONDS = 30
+
 #: On-demand entries kept, and computes allowed to run at once
 MAX_ON_DEMAND = 8
 MAX_COMPUTING = 4
@@ -489,8 +492,11 @@ class CostCache:
 
     @staticmethod
     def key(picked: dict, project: str) -> tuple:
-        """The scope and the bounds, `until` bucketed because an open-ended window ends at NOW (docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md)"""
-        return (project, picked["since"], int(picked["until"] // REFRESH_SECONDS))
+        """The scope and the bounds, an open-ended `until` bucketed because it IS now (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)"""
+        until = picked["until"]
+        if picked.get("open_ended"):
+            until = ("now", int(until // REFRESH_SECONDS))
+        return (project, picked["since"], until)
 
     def _compute_on_demand(self, key: tuple, picked: dict, project: str) -> None:
         try:
@@ -575,8 +581,9 @@ class CostCache:
         import anyio
 
         while True:
-            await self.refresh()
+            # Round one is `lifespan`'s, before it yields; this loop only keeps it fresh
             await anyio.sleep(REFRESH_SECONDS)
+            await self.refresh()
 
 
 def _stale_link_hint(name: str, wo_id: str) -> str:
@@ -978,6 +985,9 @@ def create_app() -> FastAPI:
         watchdog.start()
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
+            # Round one before the first request, bounded (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)
+            with anyio.move_on_after(FIRST_ROUND_SECONDS):
+                await cost_cache.refresh()
             tg.start_soon(cost_cache.run)
             try:
                 yield

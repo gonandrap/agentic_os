@@ -39,7 +39,7 @@ custom window fast rather than only the precomputed ones.
 
 Measured after the change, same data:
 
-| | cold | warm | after a restart (loaded from disk) |
+| one `fleetcost.report` call | cold | warm | after a reload from disk |
 |---|---|---|---|
 | week | 1.75s | 0.37s | 0.35s |
 | 5h | 0.17s | 0.16s | — |
@@ -67,6 +67,41 @@ it. `jarvis cost` and any other process read it and benefit, but never save, so 
 run cannot drop entries the UI had. The write is a tmp file plus `os.replace`, so a
 reader never sees half a file.
 
+## Round one happens before the first request
+
+`lifespan` put `CostCache.run` in the task group and yielded at once, so `entries` was
+empty for the whole first round: the current-window request fell through `lookup` to
+`serve`, got `None`, and rendered `computing.html`. That is exactly what mv-d58a1b67
+measures, because Morpheus checks right after the release restarts `jarvis-ui.service`.
+kn-79da1c34 is the standing rule: the current 5h and week windows render instantly.
+
+Round one, measured on the live production state, both windows:
+
+| | round one |
+|---|---|
+| no cache file at all (first ever boot) | 4.49s |
+| restarted right after a save — the Morpheus case | 2.24s |
+
+The *request* that follows is then a dict lookup: `CostCache.lookup` returns a hit in
+**0.01ms** for week and 0.006ms for 5h. That is what kn-79da1c34 asks for; startup pays
+~2-4s once instead.
+
+Note what these numbers are not. The 0.37s/0.35s figures in the table above are one
+`fleetcost.report` call. Round one is two windows through `_cost_payloads`, which also
+calls `ops.cost_meter` → `usage_meter.reconciliation`, and *that* scans transcripts
+through its own path, which this cache does not cover. Most of the remaining 2.24s is
+there, not in `fleetcost`.
+
+`lifespan` now awaits one `cost_cache.refresh()` before it yields, and `CostCache.run`
+sleeps before its first round rather than after, so the round is not done twice.
+
+The wait is bounded by `FIRST_ROUND_SECONDS = 30`, well inside the daemon's
+`boot_grace_seconds` of 60, so a fleet too large to aggregate cannot keep the dashboard
+from starting; it simply serves `computing.html` as before. The bound is soft, not hard:
+`refresh` awaits `anyio.to_thread.run_sync`, which on cancellation waits for the running
+thread rather than abandoning it, so `move_on_after` stops the *next* window, not the one
+in flight.
+
 ## The computing page
 
 `computing.html` gains a pure-CSS sweeping bar (no JavaScript, per
@@ -84,35 +119,40 @@ thread survived its test's `monkeypatch` teardown and went on to scan the real
 thread servicing the next request blocked on the same lock, and the request's blocking
 portal could then never shut down. Three threads, no progress, 120s.
 
-This drain is worth having, but it did **not** fix the hang. A second, deeper deadlock
-sits underneath it and is filed as `io-6fdf5c66`: the compute thread at
-`fleetcost.py:884` (`conn.close()` on a `mode=ro` connection to `os.db`) against an anyio
-worker at `db.py:17` (the raw `sqlite3.connect` on the same file, reached through
-`render` → `gate_badge` → `list_gates` → `resolve_catalog`). It happens mid-request,
-before any drain runs, in 2 of 5 runs of one six-file combination, and 0 of 3 on
-`origin/main`. Deleting the wait is what makes those two concurrent; the code they
-deadlock on is older and untouched here. The mechanism is not established — `connect_ro`
-sets no `busy_timeout` at all, so it should fail fast rather than block.
+This drain is worth having, but it did **not** fix the hang. A deeper one sits underneath
+it, `io-6fdf5c66`, and **it is not this repository's bug**. `kn-8e43df8e` settled it:
+SQLite 3.51.0 and 3.51.1 have an ABBA mutex inversion in the unix VFS.
+`sqlite3WalClose` calls `unixLock`, which holds the inode mutex and waits on a static VFS
+mutex; `unixOpen` calls `findReusableFd`, which holds that static mutex and waits on the
+inode mutex. Upstream 3.51.2 fixed it as an "obscure deadlock in the new
+broken-posix-lock detection logic". It is a pthread mutex, not `SQLITE_BUSY`, so
+`busy_timeout` and pragma order are both irrelevant. Two plain Python threads looping
+connect, SELECT, close over **one** WAL file hang the same way with no application code
+involved.
 
-Two places, because the two scopes cannot see each other:
+What this PR did was make a close and an open overlap: before, `serve`'s 5s wait parked
+the request thread while the compute ran, so they almost never did. Dumps caught two
+different pairs, the second with the threads on different database files, which is what
+ruled out per-file lock contention.
 
-- `CostCache.quiesce(timeout=10.0)` joins the detached threads, and `lifespan` calls it
-  before cancelling the task group. A `jarvis-ui` restart therefore no longer strands a
-  compute mid-query. It gives up at the timeout rather than blocking shutdown forever.
-- An autouse `no_stray_cost_threads` fixture joins any thread named `jarvis-ui-cost` at
-  the end of every test, before `monkeypatch` restores the environment. It matches on the
-  thread name rather than the cache object because `jarvis.testing` cannot import the UI
-  module (fastapi is optional there).
+Nothing is fixed here, deliberately. A lock pairing every open against every close was
+written and then **reverted** on Neo's ruling (question 2446): it does not reach the
+cause, and any two threads in `jarvis-ui` or the daemon opening or closing a WAL database
+can still deadlock behind it. The fix is to get off those two SQLite versions — `#1306`
+pins a uv-managed CPython (3.13.13 bundles SQLite 3.50.4, unaffected) and `wo-da240136`
+adds an import-time refusal of 3.51.0 and 3.51.1.
+
+One measurement of mine was wrong and is worth recording: a two-thread open/close probe
+over **two** files did not stall (12,600 cycles in 60s), which I read as the mechanism
+being something else. The repro needs one shared WAL file.
 
 ## What is NOT changed
 
 - The two named windows are still computed serially, one after the other, in
   `CostCache.refresh`.
-- Nothing caches the *window* payload across a restart. The user's bar is response
-  time, and `2026-10-22-cost-tab-precompute.md` rejected `os.db` snapshots; what
-  survives a restart here is the parse, not the aggregate. A cold `jarvis-ui` still
-  shows `computing` for the current window — but for ~0.35s of background work, not
-  ~3.5s.
+- Nothing caches the *window* payload across a restart. The user's bar is response time,
+  and `2026-10-22-cost-tab-precompute.md` rejected `os.db` snapshots; what survives a
+  restart here is the parse, not the aggregate.
 - Window-level additive accumulation (persist a total plus a timestamp, add the delta)
   was rejected as incorrect, not merely awkward. The payload does not sum:
   `context_peak` is a max, `rewrite_excess` derives from it, `classify_boundaries` is
@@ -120,6 +160,19 @@ Two places, because the two scopes cannot see each other:
   counterfactual over the whole session, and the tool table is shares. Merging two time
   slices would return wrong numbers with no sign that anything was wrong.
 - `MAX_FILES = 400` bounds the cache; the least recently used entry goes first.
+- `usage_meter`'s own transcript walk (`owned_session_ids` through `ops.cost_meter`) does
+  not go through this cache, and is most of round one's remaining 2.24s. Out of scope:
+  the requirement is the request, which is now a dict lookup.
+- `io-6fdf5c66` is NOT fixed here, and no lock is added for it: the cause is SQLite
+  3.51.0/3.51.1 itself (`kn-8e43df8e`), handled by `#1306` and `wo-da240136`.
+
+## `CostCache.key` and bounded ranges
+
+The 10-28 spec bucketed every `until` by `REFRESH_SECONDS`, which also collapsed two
+distinct *bounded* ranges that happened to fall in one bucket onto a single entry.
+`resolve_window` now sets `open_ended` on a window whose `until` was read off the clock
+(`since=` with no `until`), and only that case is bucketed. A window with both bounds
+given keeps its exact `until`.
 
 ## Tests
 
@@ -139,5 +192,7 @@ Two places, because the two scopes cannot see each other:
 
 `tests/test_ui_cost.py`
 
+- a fresh app renders both current windows without the computing state — the test opens
+  the client as a context manager, which is what runs the `lifespan` the service runs
 - shutdown waits out a detached cost compute
 - `quiesce` gives up rather than blocking a shutdown forever

@@ -150,7 +150,8 @@ def resolve_window(*, window: str | None = None, offset: int = 0,
         if start >= end:
             raise OpsError(f"since must be before until — {_stamp(start)} is at or "
                            f"after {_stamp(end)}, which is an empty window")
-        return _window(start, end, zone, source="flags", window=None, offset=None)
+        return _window(start, end, zone, source="flags", window=None, offset=None,
+                       open_ended=until is None)
     if window == SESSION:
         start, end = meter_window(_now(now), cfg, offset)
         source = "session-meter" if start is not None else "session-window"
@@ -173,10 +174,13 @@ def window_of(since: float | str | None, until: float | str | None, cfg: CostCon
 
 
 def _window(since: float, until: float, zone: str, *, source: str,
-            window: str | None, offset: int | None) -> dict[str, Any]:
+            window: str | None, offset: int | None,
+            open_ended: bool = False) -> dict[str, Any]:
     return {"since": since, "until": until, "label": _label(since, until),
             "local_label": _local_label(since, until, zone), "source": source,
-            "window": window, "offset": offset, "zone": zone}
+            "window": window, "offset": offset, "zone": zone,
+            # `until` was read off the clock, so it moves on every request
+            "open_ended": open_ended}
 
 
 def _now(now: float | None) -> float:

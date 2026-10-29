@@ -83,6 +83,23 @@ def give_session(project, wo_id: str, session_id: str) -> None:
         store.close()
 
 
+def test_a_fresh_app_renders_both_current_windows_without_the_computing_state(
+        client, project, transcript):
+    """Round one is `lifespan`'s, so the FIRST request after a restart has it (kn-79da1c34)"""
+    wo = ops.create_work_order("proj_a", "an ask")
+    transcript("sess-fresh", write_tok=1_000, out=100)
+    give_session(project, wo["id"], "sess-fresh")
+    add_recorded_turn(project, wo["id"], 0.0, 1_000)
+
+    # `with` is what runs the lifespan, which is what the released service does
+    with TestClient(create_app(), follow_redirects=False) as fresh:
+        for url in ("/cost", "/cost?window=5h"):
+            page = fresh.get(url)
+            assert page.status_code == 200, url
+            assert "What the work cost — computing" not in page.text, url
+            assert "not a bill" in page.text, url
+
+
 def test_shutdown_waits_out_a_detached_cost_compute(monkeypatch):
     """A strand would read transcripts and a DB nobody is holding open any more"""
     import threading
