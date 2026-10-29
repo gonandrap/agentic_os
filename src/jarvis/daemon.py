@@ -677,6 +677,7 @@ class Daemon:
         self.catalog_reload_warned = False
         #: Last archived set read; kept when a read fails, so nothing evicted comes back (§6.1)
         self.offboarded: frozenset[str] = frozenset()
+        self.owner_move_warned = False
         self.evict_offboarded()
 
     # -- lifecycle
@@ -697,9 +698,27 @@ class Daemon:
         """Drop archived projects from the live catalog and close stores it no longer names (§6.1, §6.2.4)"""
         gone = self._read_offboarded()
         if any(p.name in gone for p in self.catalog.projects):
+            owner = self._os_owner()
             self.catalog = self.catalog.without_projects(gone)
             log.info("evicted offboarded project(s) %s", sorted(gone))
+            self._warn_owner_moved(owner)
         self._close_orphan_stores()
+
+    def _warn_owner_moved(self, old: str | None) -> None:
+        """An offboard that moves fleet-wide OS job ownership says so, once per daemon run (§6.2.5)"""
+        new = self._os_owner()
+        if old is None or new == old or any(p.name == old for p in self.catalog.projects):
+            return
+        log.warning("OS job owner moved from %s to %s", old, new)
+        if self.owner_move_warned:
+            return
+        self.owner_move_warned = True
+        self.central.add_inbox(
+            project="os", level="warning",
+            title="fleet-wide OS jobs moved to another project",
+            body=(f"{old} owned the fleet-wide OS jobs by fallback (no project's checkout "
+                  f"holds the running code) and was offboarded. They now run under "
+                  f"{new or 'no project'}."))
 
     def _close_orphan_stores(self) -> None:
         live = {p.name for p in self.catalog.projects}
@@ -853,7 +872,9 @@ class Daemon:
                 f"leaves an open store behind. Run `jarvis start` to apply it. Setting "
                 f"changes in the same file are not applied either until you do.")
             return False
+        owner = self._os_owner()
         self.catalog = fresh.without_projects(gone)
+        self._warn_owner_moved(owner)
         self._close_orphan_stores()
         self.catalog_reload_warned = False
         log.info("catalog reloaded from %s", path)

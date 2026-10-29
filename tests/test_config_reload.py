@@ -276,6 +276,26 @@ def test_an_archived_project_is_evicted_before_the_catalog_changes(jarvis_home, 
     assert not inbox()
 
 
+def test_evicting_the_fallback_os_owner_says_where_its_jobs_went(jarvis_home, tmp_path):
+    """The fallback still moves, but never silently, and once per run (§6.2.5)"""
+    path = tmp_path / "catalog.json"
+    project = tmp_path / "proj_a"
+    project.mkdir()
+    write_catalog(path, project, projects=["proj_a", "proj_b"])
+    register("proj_a", "proj_b", project=project)
+    daemon = Daemon(load_catalog(path))
+    assert daemon._os_owner() == "proj_a", "no checkout holds the code: first project, by fallback"
+
+    register(project=project, archived=("proj_a",))
+    daemon.tick()
+    daemon.tick()
+
+    assert daemon._os_owner() == "proj_b"
+    rows = inbox()
+    assert [r["title"] for r in rows] == ["fleet-wide OS jobs moved to another project"]
+    assert "proj_a" in rows[0]["body"] and "proj_b" in rows[0]["body"]
+
+
 # -- INV-CONFIG-DRIFT
 
 
