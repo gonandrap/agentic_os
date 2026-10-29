@@ -1493,6 +1493,8 @@ def create_app() -> FastAPI:
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec, spec_link=spec_link,
+                      # An analyst's sibling fix orders (issue 1323)
+                      siblings=ops.analyst_dispatched(wo),
                       auto_merge=auto_merge,
                       merge_state=merge_state,
                       issues=issue_index,

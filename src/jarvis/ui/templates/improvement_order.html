@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import "_layout.html" as ui %}
+{% import "_dispatched.html" as dispatched_ui %}
 {% block title %}{{ io.id }} — Jarvis{% endblock %}
 {% block style %}
   @media (max-width: 640px) { main .row { flex-wrap: wrap; } main .row > .grow { flex-basis: 100%; } }
@@ -24,6 +25,7 @@
   {% if io.with_neo %}· {{ io.with_neo }} with Neo{% endif %}
   · {{ io.by_decision.accepted }} accepted
   · {{ io.by_decision.rejected }} rejected
+  {% if io.dispatched.count %}· <a href="#dispatched">{{ io.dispatched.count }} dispatched, {{ io.dispatched.merged }} merged</a>{% endif %}
   · {{ fmt_age(io.created_at) }}
   · <a href="/cost/{{ project }}/{{ io.id }}">its bill →</a>
 </p>
@@ -44,6 +46,8 @@
 {% if io.needs_attention %}
 <div class="panel" style="margin-top: 12px;"><div class="row tone-warn">◭ {{ io.attention_reason }}</div></div>
 {% endif %}
+
+{{ dispatched_ui.dispatched(io.dispatched, project) }}
 
 {% if io.report.summary %}
 <h2 id="findings">Findings — {{ io.report.summary }}</h2>
