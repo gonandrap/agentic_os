@@ -39,6 +39,8 @@ WINDOW_SECONDS = 7 * 86400
 PRECISION_WINDOW_SECONDS = 28 * 86400
 #: A detector is judged on at least this many dispatched orders before it can be throttled
 PRECISION_MIN_SAMPLES = 5
+#: Below this much evolution room an order is queued, not dispatched with scraps: measured floor for a one-pass order (#1305)
+MIN_ORDER_USD = 5.0
 
 #: Events on a work order that mean the USER engaged with it (§3.2 decision 2)
 USER_TOUCH_EVENTS = ("reviewed", "retry_requested", "budget_set", "budget_resumed",
@@ -161,7 +163,7 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
                 severity)
     if severity in URGENT:
         spent = ledger.critical_usd
-        if spent >= cfg.critical_weekly_usd or room <= 0:
+        if spent >= cfg.critical_weekly_usd or room < MIN_ORDER_USD:
             return ("ask", "critical-ceiling",
                     f"`{severity}`, but the critical ceiling is spent "
                     f"(${spent:.2f} of ${cfg.critical_weekly_usd:.2f}, "
@@ -174,10 +176,10 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
         return ("queue", "yield",
                 f"fleet spend ${ledger.fleet_usd:.2f} this week is above "
                 f"${cfg.yield_above_usd:.2f}: feature work comes first", severity)
-    if room <= 0:
+    if room < MIN_ORDER_USD:
         return ("queue", "ledger",
                 f"the evolution ledger is spent (${ledger.evolution_usd:.2f} of "
-                f"${cfg.weekly_usd:.2f})", severity)
+                f"${cfg.weekly_usd:.2f}; an order needs ${MIN_ORDER_USD:.2f})", severity)
     threshold = cfg.min_refs_by_kind.get(
         c.origin_kind, cfg.major_min_refs if severity == "major" else cfg.medium_min_refs)
     if c.refs < threshold:
