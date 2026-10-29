@@ -1,22 +1,32 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}Neo — Jarvis{% endblock %}
 
 {% from "_question.html" import question_body, deliberation, answer_form, review_form %}
 
 {% block content %}
 
-{# Counts live in the tab strip below, not here. #}
-<p class="kv" style="margin-top:18px">
+{# §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md.
+   Counts live in the tab strip below; the aggregate is /neo/stats (§6 of
+   docs/superpowers/specs/2026-10-01-neo-observability.md). #}
+{% call ui.page_head("Neo") %}<a href="/neo/stats">what Neo is doing →</a>{% endcall %}
+{% call ui.explain("what Neo does") %}
+<p class="kv">
   Neo answers worker questions on your behalf. Review every answer it gives — approvals
   confirm its instincts, corrections become learnings it applies next time.
-  {# §6 of docs/superpowers/specs/2026-10-01-neo-observability.md: the aggregate is its own page, so
-     no statistics block sits among these review forms. #}
-  <a href="/neo/stats">what Neo is doing →</a>
 </p>
+{% endcall %}
+
+{% call(q) ui.needs_you(escalated, "escalated — Neo wants you to decide") %}
+  {{ ui.row_id("#" ~ q.id, "/neo/question/" ~ q.id) }}
+  <span class="mono">{{ q.project }} · <a href="/wo/{{ q.project }}/{{ q.wo_id }}">{{ q.wo_id }}</a></span>
+  {% if q.status == 'failed' %}<span class="tone-bad">✗ neo call failed</span>{% endif %}
+  <span class="sub">{{ q.question[:140] }}</span>
+{% endcall %}
 
 {% set digested = (escalated + unreviewed) | selectattr('digest_view') | list %}
 {% if digested %}
-<p class="sub" style="margin:-10px 0 0">
+<p class="sub">
   {{ digested|length }} over-long question{{ '' if digested|length == 1 else 's' }} below
   {{ 'has' if digested|length == 1 else 'have' }} been cut down to the decision —
   {{ digest_credit }}. Neo read the full text; so can you, from the button under each.
@@ -31,7 +41,7 @@
     <span class="st {{ 'tone-warn' if q.status == 'answering' else 'tone-muted' }}">
       <span class="i">{{ '◍' if q.status == 'answering' else '◌' }}</span>{{ q.status }}</span>
     <span class="grow">{{ q.question[:160] }}</span>
-    <span class="sub mono">{{ q.project }} ·
+    <span class="sub mono">{{ ui.row_id("#" ~ q.id, "/neo/question/" ~ q.id) }} · {{ q.project }} ·
       <a href="/wo/{{ q.project }}/{{ q.wo_id }}">{{ q.wo_id }}</a> ·
       waiting {{ fmt_age(q.ts) }}</span>
   </div>
@@ -42,7 +52,7 @@
   the daemon isn't draining the queue — check <span class="mono">jarvis status</span>.</p>
 {% endif %}
 
-{% if not history and not unreviewed and not escalated and not in_flight %}
+{% if not history and not history_total and not unreviewed and not escalated and not in_flight %}
 <div class="panel" style="margin-top:14px">
   <div class="row"><div class="grow">
     <strong>No worker has asked Neo anything yet.</strong>
@@ -58,13 +68,13 @@
 </div>
 {% endif %}
 
-{# The four readings of Neo's queue. Anything still in flight stays above the strip;
-   the two ASKS are tabs, and their counts ride in the strip in amber, so an ask is
-   announced above the fold instead of two screens down. §6 of
-   docs/superpowers/specs/2026-08-23-the-work-order-record.md. #}
-{% set open_tab = 'tab-escalated' if escalated
+{# The four readings of Neo's queue; the asks' counts ride in the strip in amber. §6 of
+   docs/superpowers/specs/2026-08-23-the-work-order-record.md. A filter in the URL is
+   about History, so it opens that tab. #}
+{% set open_tab = 'tab-history' if filters
+     else ('tab-escalated' if escalated
      else ('tab-review' if unreviewed
-     else ('tab-history' if history else 'tab-learnings')) %}
+     else ('tab-history' if history else 'tab-learnings'))) %}
 <div class="tabbed" id="neo-tabs">
   <div class="tabs" role="tablist">
     <button role="tab" data-panel="tab-escalated"
@@ -78,7 +88,7 @@
     <button role="tab" data-panel="tab-history"
             aria-selected="{{ 'true' if open_tab == 'tab-history' else 'false' }}"
             aria-controls="tab-history">History
-      <span class="n">{{ history|length }}</span></button>
+      <span class="n">{{ history_total }}</span></button>
     <button role="tab" data-panel="tab-learnings"
             aria-selected="{{ 'true' if open_tab == 'tab-learnings' else 'false' }}"
             aria-controls="tab-learnings">Learnings
@@ -91,7 +101,7 @@
 <div class="panel">
   {% for q in escalated %}
   <div class="msg">
-    <div class="who tone-warn">#{{ q.id }} · {{ q.project }} ·
+    <div class="who tone-warn">{{ ui.row_id("#" ~ q.id, "/neo/question/" ~ q.id) }} · {{ q.project }} ·
       <a href="/wo/{{ q.project }}/{{ q.wo_id }}" class="mono">{{ q.wo_id }}</a> ·
       {{ fmt_age(q.ts) }} ago
       {% if q.status == 'failed' %} · <span class="tone-bad">✗ neo call failed</span>{% endif %}
@@ -113,7 +123,7 @@
 <div class="panel">
   {% for q in unreviewed %}
   <div class="msg">
-    <div class="who">#{{ q.id }} · {{ q.project }} ·
+    <div class="who">{{ ui.row_id("#" ~ q.id, "/neo/question/" ~ q.id) }} · {{ q.project }} ·
       <a href="/wo/{{ q.project }}/{{ q.wo_id }}" class="mono">{{ q.wo_id }}</a> ·
       answered {{ fmt_age(q.answered_at) }} ago</div>
     {{ question_body(q) }}
@@ -131,28 +141,30 @@
 <section class="tabpanel {{ 'on' if open_tab == 'tab-history' }}" id="tab-history"
          role="tabpanel">
 <h2>History</h2>
-<div class="panel">
-  <table>
+{{ ui.filter_bar("/neo", filters, options, history|length, history_total,
+                 labels={"review": "any review"}) }}
+<div class="panel table-wrap">
+  <table class="neo-history">
     <tr><th>#</th><th>project / wo</th><th>question</th><th>answer</th><th>by</th><th>review</th><th>age</th></tr>
     {% for q in history %}
     <tr>
-      <td class="mono">{{ q.id }}</td>
-      <td class="mono">{{ q.project }}<br><a href="/wo/{{ q.project }}/{{ q.wo_id }}">{{ q.wo_id }}</a></td>
-      <td>{{ q.question[:120] }}</td>
-      <td>{{ (q.answer or '—')[:120] }}</td>
-      <td class="mono">{{ q.answered_by or '—' }}</td>
-      <td>
+      <td>{{ ui.row_id(q.id, "/neo/question/" ~ q.id) }}</td>
+      <td class="mono when">{{ q.project }}<br><a href="/wo/{{ q.project }}/{{ q.wo_id }}">{{ q.wo_id }}</a></td>
+      <td class="prose clamp" title="{{ q.question }}">{{ q.question }}</td>
+      <td class="prose clamp" title="{{ q.answer or '' }}">{{ q.answer or '—' }}</td>
+      <td class="mono when">{{ q.answered_by or '—' }}</td>
+      <td class="when">
         {% if q.review_status == 'approved' %}<span class="st tone-ok"><span class="i">✓</span>approved</span>
         {% elif q.review_status == 'corrected' %}<span class="st tone-warn"><span class="i">✎</span>corrected</span>
         {% else %}<span class="st tone-muted">—</span>{% endif %}
       </td>
-      <td class="mono">{{ fmt_age(q.ts) }}</td>
+      <td class="mono when">{{ fmt_age(q.ts) }}</td>
     </tr>
     {% if opinions.get(q.id) %}
     <tr><td colspan="7">{{ deliberation(opinions.get(q.id)) }}</td></tr>
     {% endif %}
     {% else %}
-    <tr><td colspan="7" class="empty">Neo hasn't handled anything yet</td></tr>
+    <tr><td colspan="7" class="empty">{{ 'nothing matches these filters' if filters else "Neo hasn't handled anything yet" }}</td></tr>
     {% endfor %}
   </table>
 </div>
@@ -166,8 +178,7 @@
   <div class="row">
     <span class="badge {{ 'framework' if l.source == 'review' else '' }}">{{ l.source }}</span>
     <span class="grow">{{ l.content }}</span>
-    {# A seat-scoped learning is read by that seat alone. Unlabelled it would read as a
-       rule the whole of Neo follows, which is the opposite of what it is. #}
+    {# A seat-scoped learning is read by that seat alone. #}
     {% if l.seat %}<span class="badge outside">{{ l.seat }} seat</span>{% endif %}
     {# Blank on rows written before provenance existed — judge a ruling before retracting it #}
     {% if l.origin %}<span class="sub mono">from {{ l.origin }}</span>{% endif %}
@@ -177,7 +188,7 @@
   <div class="empty">no learnings yet — correct an answer on the review tab to teach Neo</div>
   {% endfor %}
 </div>
-<form method="post" action="/neo/learn" style="margin-top:10px; display:flex; gap:8px">
+<form method="post" action="/neo/learn" style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap">
   <input type="text" name="content" placeholder="Teach Neo directly: a preference, a rule, how you decide things…" required>
   <input type="text" name="project" placeholder="project (blank = global)" style="max-width:220px">
   <button class="primary">Teach</button>
