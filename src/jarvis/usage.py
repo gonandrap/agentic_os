@@ -339,7 +339,7 @@ def _subagent_detail(path: Path, sub_usage: Usage) -> Subagent:
     )
 
 
-# Untimed copies of an API request's messages (Claude Code 2.1.312+): a replay, never an event (issue 1309)
+# Untimed replays of a request's messages (Claude Code 2.1.312+), never events: issue 1309
 REPLAY_ROW_TYPES = frozenset({"api-request-blob"})
 
 
