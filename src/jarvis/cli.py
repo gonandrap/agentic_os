@@ -1522,6 +1522,23 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--reason", default="")
     c.add_argument("--catalog")
 
+    # onboard: `questions` and `explain` are added to THIS group (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §0.2)
+    ob = sub.add_parser(
+        "onboard",
+        help="onboard a project: decide what the OS does for it automatically, then "
+             "apply that as one configuration version plus a bootstrap",
+    ).add_subparsers(dest="ob_cmd", required=True)
+
+    c = ob.add_parser(
+        "apply",
+        help="apply an interview's draft: ONE configuration version, then the bootstrap")
+    c.add_argument("--from", dest="draft", required=True, metavar="PATH",
+                   help="the draft file the interview wrote")
+    c.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="what it WOULD change, writing nothing — the confirmation diff")
+    c.add_argument("--catalog")
+    c.add_argument("--json", action="store_true", help="machine-readable output")
+
     # backlog
     bl = sub.add_parser("backlog", help="unified deferred-work backlog").add_subparsers(
         dest="bl_cmd", required=True)
@@ -4854,6 +4871,38 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"  {data['version']['id']}")
         for change in data["changes"][:20]:
             print(f"  {_cfg_change(change)}")
+    return 0
+
+
+def cmd_onboard(args: argparse.Namespace) -> int:
+    from . import ops
+
+    # The group handler, so a sibling adding `start` branches here as `cmd_config` does
+    if args.ob_cmd != "apply":
+        return 0
+    data = ops.onboard_apply(args.draft, catalog_path=args.catalog,
+                             dry_run=args.dry_run)
+    if args.json:
+        _print(data, True)
+        return 0
+
+    head = "would onboard" if args.dry_run else "✓ onboarded"
+    print(f"{head} {data['project']}: {len(data['changes'])} setting(s)")
+    for change in data["changes"]:
+        print(f"  {_cfg_change(change)}")
+    if not data["changes"]:
+        print("  (every answer was the shipped default — the document stays silent)")
+    if args.dry_run:
+        print("\n(dry run — nothing was written)")
+        return 0
+    print(f"  {data['version']['id']}"
+          + ("" if data["changed"] else "  (the document was already this — "
+                                        "no new version)"))
+    for warning in data["bootstrap"]["warnings"]:
+        print(f"  ⚠ {warning}")
+    if data["restart_needed"]:
+        print(f"\nnext: jarvis start --catalog {data['catalog']}")
+        print(f"  {data['restart_why']}")
     return 0
 
 
