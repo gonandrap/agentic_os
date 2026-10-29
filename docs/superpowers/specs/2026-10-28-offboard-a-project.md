@@ -179,6 +179,14 @@ columns are named alike and do not mean the same thing:
   again and are **retracted** through the table's own documented mechanism,
   `CentralStore.retract_detector(detector_id, reason)` (`central_store.py:1518`), which
   retires the detector and every live remedy rule under it. Pass a reason naming the purge.
+  A retracted row **keeps** its `project` name: that is the evidence of what was scoped
+  where, and blanking it after retraction would read as a fleet-wide rule retired. A row
+  already retired is left as it is — `retract_detector` refuses it, and it cannot fire.
+
+**"Leaves no row behind" means no scope row.** After a purge, no row in the nine scope tables
+or in `neo.db` names the project. `gate_rules` names it nowhere. `detectors` still names it
+on retired rows only, by the rule above. Section 6's invariant must read it the same way:
+a retired detector naming an offboarded project is not a leak.
 
 Report both sets in the returned dict, under keys that say which happened — a count of rows
 deleted and a count of rows whose provenance was cleared or retracted are different facts and
