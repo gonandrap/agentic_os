@@ -3704,7 +3704,8 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
     central = None
     try:
         central = CentralStore()
-        fact = central.base_health(central.project_name_for_path(store.project_path))
+        name = central.project_name_for_path(store.project_path)
+        fact = central.base_health(name)
     except Exception:  # noqa: BLE001 — an unreadable central database is not a red base
         return
     finally:
@@ -3733,11 +3734,13 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
         remedy = f"The remedy is a commit on `{base}`, and {fix_wo_id} is producing it."
     else:
         remedy = (f"The remedy is a commit on `{base}`, and no work order is producing "
-                  f"it yet.")
+                  f"it yet — {_base_fix_order_command(name, base, url, issue_url)}")
     yield Violation(
         invariant=INV_BASE_RED,
         wo_id=None,
         repaired=False,
+        # Issue #1280: nobody producing the fix makes it the user's, so NEEDS YOU carries it
+        level="warning" if fix_wo_id else "critical",
         detail=(f"`{base}` is red — workflow `{workflow}`, run {url}, at "
                 f"{sha[:10] or 'an unknown commit'}{blamed}. Nothing merges onto a "
                 f"broken default branch, and every pull request built against it "
@@ -3776,6 +3779,17 @@ def _base_fix_decision(dead: str, fix_wo_id: str, issue_url: str) -> str:
         return f"{gone} — a fix is a new order on the same issue: " \
                f"`jarvis issues start {issue_url}`."
     return f"{gone} — order a fix yourself."
+
+
+def _base_fix_order_command(project: str, base: str, run_url: str,
+                            issue_url: str) -> str:
+    """The command that orders the red base's missing fix"""
+    if issue_url:
+        return f"order it with `jarvis issues start {issue_url}`."
+    run = run_url or "the failing run"
+    return (f"order it with `jarvis bug report \"{base} is red in {project}\" -d \"CI "
+            f"fails on {run}\" -e \"{base} is green\" -a \"CI fails on {run}\" -p "
+            f"critical --project {project} --expedite`.")
 
 
 def _dead_base_fix(store: ProjectStore, fix_wo_id: str) -> str:
