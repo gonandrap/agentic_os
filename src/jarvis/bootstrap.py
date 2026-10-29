@@ -247,6 +247,17 @@ def tracked_in_vcs(path: Path) -> bool:
     return proc.returncode == 0
 
 
+def _clean_in_vcs(path: Path) -> bool:
+    """Whether the working-tree bytes equal HEAD's, so deleting the file loses nothing"""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path.parent), "diff", "--quiet", "HEAD", "--", path.name],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def ensure_operation_md(project: ProjectSpec, report: BootstrapReport,
                         force: bool = False) -> None:
     """Generate/refresh OPERATION.md, preserving the 'Project specifics' section"""
@@ -492,15 +503,27 @@ def unbootstrap_project(project: ProjectSpec, *, purge: bool,
         if d.exists() and _empty_after(d, gone):
             do("remove", d, d.rmdir)
 
+    state, gi = root / ".jarvis", root / ".gitignore"
     op = root / "OPERATION.md"
     if not op.exists():
         report.note("OPERATION.md already absent")
-    elif tracked_in_vcs(op):
-        report.warn("OPERATION.md left in place: committed to the repository")
-    elif op.read_text() != render_operation_md(project):
-        report.warn("OPERATION.md left in place: edited since Jarvis generated it")
     else:
-        do("remove", op, op.unlink)
+        tracked = tracked_in_vcs(op)
+        if _clean_in_vcs(op) if tracked else op.read_text() == render_operation_md(project):
+            do("remove", op, op.unlink)
+        elif not purge:
+            keep = state / "OPERATION.md.offboarded"
+            def stash() -> None:
+                state.mkdir(exist_ok=True)
+                op.replace(keep)
+            do("move", op, stash)
+            report.note(f"  to {keep.relative_to(root)}, keeping its edits")
+        else:
+            report.warn("OPERATION.md left in place: it holds edits version control cannot restore; "
+                        f"delete it yourself: rm {op}")
+        if tracked and op in gone:
+            report.warn("OPERATION.md is committed; its deletion is left for you to commit: "
+                        "git rm --cached OPERATION.md && git commit")
 
     cfg = _claude_json_path()
     try:
@@ -519,7 +542,6 @@ def unbootstrap_project(project: ProjectSpec, *, purge: bool,
             do("remove", cfg, untrust)
             gone.discard(cfg)
 
-    state, gi = root / ".jarvis", root / ".gitignore"
     if not purge:
         report.note("kept .jarvis/ and its .gitignore line (archive keeps history)")
         return report

@@ -233,7 +233,7 @@ What it takes out, and the rule for each — **the rule is never to destroy a us
 |---|---|---|---|
 | `.claude/settings.json` | restore `.claude/settings.json.pre-jarvis` over it and delete the backup; with no backup, delete the file | same | `settings_drift()` (`bootstrap.py:76`) decides. `"manually edited since injection"` means leave it and warn, exactly as `inject_settings` (`bootstrap.py:180-186`) refuses without `--force-config` |
 | `.claude/skills/<name>` (from `assets/project-skills`) | remove each tree that still matches the asset | same | `_tree_matches` decides; a modified tree is the user's and stays |
-| `OPERATION.md` | remove if it is the generated file and untracked | same | `tracked_in_vcs` decides; committed, or edited past the `SPECIFICS_MARKER` block, means it stays |
+| `OPERATION.md` | remove when its bytes are recoverable (untracked and generated, or committed with no local change); otherwise move it to `.jarvis/OPERATION.md.offboarded` | remove when recoverable; otherwise leave it and warn with the exact `rm` | it must not linger (user ruling, Neo Q2500). A committed file's deletion is left unstaged, with a warning naming the command; the OS never commits it |
 | `README.md` | never removed | never | bootstrap only ever creates a stub for a project that had none; it is the project's file now |
 | trust entry in `~/.claude.json` | remove this path's `hasTrustDialogAccepted` | same | write through a temp file and `replace`, as `ensure_trust` (`bootstrap.py:373`) does. A malformed or unreadable `~/.claude.json` is a warning, never a crash |
 | `.jarvis/` | **kept** | removed | the archived order history lives in `.jarvis/jarvis.db`, and section 2 promises `jarvis search` still reaches it |
@@ -594,7 +594,7 @@ the restatement below is the criterion and the obvious phrasing is not.
   is the honest form of "without a restart", and "stops dispatching, sweeping, draining Neo
   and sweeping Morpheus" is four of them, not one.
 - `unbootstrap_project` restores `.claude/settings.json.pre-jarvis`; and for a hand-edited
-  `settings.json`, a committed `OPERATION.md` and a modified skill tree, the file's bytes are
+  `settings.json` and a modified skill tree, the file's bytes are
   unchanged **and** `report.warnings` names it. `BootstrapReport` has only `actions` and
   `warnings`, so the warning list is the only channel a refusal can be observed through.
 - Offboarding the OS-owning project raises `OpsError` for all four combinations of `--force`
