@@ -776,12 +776,26 @@ class MessagingConfig:
 #: Half an hour (#995)
 DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES = 30
 
+#: How many times the OS may catch one pull request up with a MOVING base...
+DEFAULT_PULL_REQUESTS_CATCH_UP_MAX = 10
+#: ...within this window: a RATE, not a lifetime budget (#1215, Neo 2191)
+DEFAULT_PULL_REQUESTS_CATCH_UP_WINDOW_MINUTES = 120
+#: The wait after the first catch-up of a window, doubled after each one since...
+DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_BASE_SECONDS = 60
+#: ...and never longer than this between two catch-ups
+DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_MAX_SECONDS = 600
+
 
 @dataclass
 class PullRequestsConfig:
     """When GitHub's silence about a pull request stops being a wait and becomes a stall"""
 
     recompute_stall_minutes: int = DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES
+    #: How often the OS catches one branch up with its base, and how far apart (`ops.catch_up_backoff`)
+    catch_up_max: int = DEFAULT_PULL_REQUESTS_CATCH_UP_MAX
+    catch_up_window_minutes: int = DEFAULT_PULL_REQUESTS_CATCH_UP_WINDOW_MINUTES
+    catch_up_backoff_base_seconds: int = DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_BASE_SECONDS
+    catch_up_backoff_max_seconds: int = DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_MAX_SECONDS
 
 
 # -- the scheduler: the OS filing a work order nobody typed
@@ -1897,13 +1911,20 @@ def _parse_pull_requests(raw: Any, base: PullRequestsConfig | None = None,
     base = base or PullRequestsConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
-    cfg = PullRequestsConfig(
-        recompute_stall_minutes=int(raw.get("recompute_stall_minutes",
-                                            base.recompute_stall_minutes)),
-    )
-    for name, value in vars(cfg).items():
+    values: dict[str, int] = {}
+    for name, default in vars(base).items():
+        value = raw.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _err(f"{where}.{name} must be a whole number, got {value!r}")
         if value < 1:
             raise _err(f"{where}.{name} must be >= 1")
+        values[name] = value
+    cfg = PullRequestsConfig(**values)
+    if cfg.catch_up_backoff_base_seconds > cfg.catch_up_backoff_max_seconds:
+        raise _err(f"{where}.catch_up_backoff_base_seconds "
+                   f"{cfg.catch_up_backoff_base_seconds} is above "
+                   f"{where}.catch_up_backoff_max_seconds "
+                   f"{cfg.catch_up_backoff_max_seconds}")
     return cfg
 
 

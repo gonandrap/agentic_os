@@ -271,6 +271,16 @@ def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
     return bool(ops.routes_on_pull_request(store, wo))
 
 
+def _minutes_label(minutes: int) -> str:
+    """`120` -> `2h`, `90` -> `90m`"""
+    return f"{minutes // 60}h" if minutes % 60 == 0 else f"{minutes}m"
+
+
+def _seconds_label(seconds: int) -> str:
+    """`600` -> `10m`, `90` -> `90s`"""
+    return f"{seconds // 60}m" if seconds % 60 == 0 else f"{seconds}s"
+
+
 #: The timeline's record that GitHub has stopped recomputing one pull request
 PR_RECOMPUTE_STALLED_EVENT = "pr_recompute_stalled"
 
@@ -5601,7 +5611,8 @@ class Daemon:
                 neo_store.close()
             return
         # AT THE CAP THE ATTEMPT CAN ONLY REFUSE (#1173)
-        if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
+        if (ops.catch_up_attempts(store, wo_id)
+                >= ops.catch_up_policy(store).catch_up_max):
             caught = self._catch_up_with_base(project, store, wo, pr)
             if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
                 self._note_automerge_held(
@@ -6300,14 +6311,17 @@ class Daemon:
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
                                f"this branch has already been rebuilt against "
                                f"{base_oid[:10]} once", base_tip=base_oid)
-        if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
-            hours = ops.CATCH_UP_WINDOW_SECONDS // 3600
-            log.debug("[%s] %s has been caught up with %s %d times in %dh — leaving it "
-                      "held", project.name, wo_id, base, ops.CATCH_UP_MAX, hours)
+        policy = ops.catch_up_policy(store)
+        attempts = ops.catch_up_attempts(store, wo_id, policy=policy)
+        cap = policy.catch_up_max
+        if attempts >= cap:
+            window = _minutes_label(policy.catch_up_window_minutes)
+            log.debug("[%s] %s has been caught up with %s %d times in %s — leaving it "
+                      "held", project.name, wo_id, base, cap, window)
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
-                               f"it has already been caught up {ops.CATCH_UP_MAX} time(s)"
-                               f" in the last {hours}h, which is the cap "
-                               f"({ops.CATCH_UP_MAX}) — the OS chases it again once that "
+                               f"it has already been caught up {cap} time(s)"
+                               f" in the last {window}, which is the cap "
+                               f"({cap}) — the OS chases it again once that "
                                f"window clears",
                                base_tip=base_oid)
 
@@ -6328,6 +6342,17 @@ class Daemon:
                                "the push that moved the head off the judged commit",
                                base_tip=base_oid,
                                cause=ops.CATCH_UP_DEFER_HEAD_MOVED)
+        # EXPONENTIAL BACKOFF between catch-ups: a base that keeps moving is chased ever more slowly.
+        # After the head check, so a head the OS's own catch-up moved is still carried (#1188)
+        if ops.catch_up_backoff(store, wo_id, policy=policy) > 0:
+            delay = ops.catch_up_delay(attempts, policy)
+            log.debug("[%s] %s was caught up %d time(s) — backing off %ds before the next",
+                      project.name, wo_id, attempts, delay)
+            # Worded from `attempts` and `delay` only, so the hold is recorded once per wait
+            return ops.CatchUp(fresh, ops.CATCH_UP_DEFERRED,
+                               f"the {_seconds_label(delay)} backoff after catch-up "
+                               f"{attempts} of {cap}",
+                               base_tip=base_oid, cause=ops.CATCH_UP_DEFER_BACKOFF)
         try:
             ci.update_branch(pr_url, cwd=project.path)
         except github.GitHubError as e:
