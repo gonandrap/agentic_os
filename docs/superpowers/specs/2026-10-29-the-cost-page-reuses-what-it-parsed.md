@@ -142,6 +142,10 @@ can still deadlock behind it. The fix is to get off those two SQLite versions â€
 pins a uv-managed CPython (3.13.13 bundles SQLite 3.50.4, unaffected) and `wo-da240136`
 adds an import-time refusal of 3.51.0 and 3.51.1.
 
+The pin is what the evidence says to do: the same nine test files, twice, under CPython
+3.13.13 with SQLite 3.50.4, gave 523 passed, no failures and no timeout dumps, where this
+branch on 3.51.1 hung 2 of 3 runs of `tests/test_ui_cost.py` alone.
+
 One measurement of mine was wrong and is worth recording: a two-thread open/close probe
 over **two** files did not stall (12,600 cycles in 60s), which I read as the mechanism
 being something else. The repro needs one shared WAL file.
