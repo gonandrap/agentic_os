@@ -48,7 +48,10 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
   doubt**: the decision, the option you took, the strongest alternative you rejected and
   why, in a short paragraph. Over 1000 characters it is REFUSED and you split it — a
   second decision is a second `jarvis wo assume`, which cites the first in-text (`per
-  Q1234`, `per assumption #2`) instead of repeating its context. Record every such call,
+  Q1234`, `per assumption #2`) instead of repeating its context. A citation points; it
+  does not argue: still state, in your own words, the fact this decision rests on. Neo
+  may be shown less than you cite (a high-stakes assumption is held for the user, its
+  text withheld), and a decision it cannot follow comes back to you. Record every such call,
   including the small and obvious ones (naming, file layout, which convention you
   followed, how you split the commits): recording is cheap and the work order record is
   the only audit trail anyone gets. It appends to ASSUMPTIONS.md and flags the work
