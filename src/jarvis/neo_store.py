@@ -16,6 +16,7 @@ Q_STATUSES = (
     "answered",   # Neo answered; answer delivered to the worker
     "escalated",  # Neo declined — the user must answer
     "failed",     # answering errored; surfaced as attention
+    "refined",    # returned to the asker to split or narrow; nobody ruled (wo-ea3c6f0c)
 )
 # Review lifecycle of an answered question
 REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
@@ -511,6 +512,12 @@ class NeoStore:
             f"""SELECT project, wo_id, COUNT(*) AS n
                 FROM questions WHERE {' AND '.join(where)}
                 GROUP BY project, wo_id""", params).fetchall())
+
+    def refines(self, wo_id: str, kind: str) -> int:
+        """How many questions of `kind` this order has had returned to it — the loop cap's count"""
+        return int(self.conn.execute(
+            "SELECT COUNT(*) c FROM questions WHERE wo_id=? AND kind=? AND status='refined'",
+            (wo_id, kind)).fetchone()["c"])
 
     def counts(self) -> dict[str, int]:
         by_status = {
