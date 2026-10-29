@@ -1440,6 +1440,65 @@ def test_clicking_a_cost_row_id_opens_its_order(page, server, project):
     page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
 
 
+def _meter_samples(n: int = 240) -> None:
+    """One meter reading a minute for the last `n` minutes, both windows rising"""
+    from jarvis import db, usage_meter
+    from jarvis.central_store import CentralStore
+
+    now = db.now()
+    central = CentralStore()
+    try:
+        for i in range(n):
+            usage_meter.record(central, usage_meter.Sample(
+                ts=now - (n - i) * 60, ok=True, five_hour_pct=10.0 + i / 10,
+                five_hour_resets_at=now + 3600, seven_day_pct=5.0 + i / 100,
+                seven_day_resets_at=now + 86_400))
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+def test_the_meter_chart_hovers_toggles_overlays_and_zooms(page, server, project):
+    _cost_rows(project)
+    _meter_samples(900)   # 15h: the previous 5h window has readings too
+    page.goto(f"{server}/cost?window=5h&project=proj_a")
+    chart = page.locator(".meter-chart svg")
+    chart.wait_for()
+    data = page.evaluate("JSON.parse(document.getElementById('meter-data').textContent)")
+    span = data["until"] - data["since"]
+    chart.scroll_into_view_if_needed()
+    box = chart.bounding_box()
+    inside = (box["x"] + box["width"] * 0.6, box["y"] + 80)
+
+    # Hover: the readout and one label on each axis
+    page.mouse.move(*inside)
+    assert page.locator(".meter-chart > div").is_visible()
+    assert "5h" in page.locator(".meter-chart > div").inner_text()
+    labels = page.locator(".meter-chart g.axis-label text").all_text_contents()
+    assert len(labels) == 2 and labels[1].endswith("%"), labels
+
+    # Series toggle
+    assert chart.locator("polyline[data-series=five_hour_pct]").count() == 1
+    page.uncheck("input[data-series=five_hour_pct]")
+    assert chart.locator("polyline[data-series=five_hour_pct]").count() == 0
+    assert chart.locator("polyline[data-series=seven_day_pct]").count() == 1
+
+    # Overlay: one fetch for the span shifted back by one window, one more curve
+    with page.expect_request("**/api/cost/meter?*") as asked:
+        page.check("input[data-shift=span]")
+    since = float(asked.value.url.split("since=")[1].split("&")[0])
+    assert abs(since - (data["since"] - span)) < 1
+    chart.locator("polyline[data-overlay=span]").first.wait_for(state="attached")
+
+    # Wheel: live fetch for the new view, and the custom-dates form follows it
+    before = page.input_value("form input[name=since]")
+    page.mouse.move(*inside)
+    with page.expect_request("**/api/cost/meter?*"):
+        page.mouse.wheel(0, -300)
+    assert page.input_value("form input[name=since]") != before
+    assert page.is_enabled("[data-act=apply]")
+
+
 def test_config_reads_and_stacks_history_over_diff(page, server, readable):
     ops.adopt_config(reason="the file as it shipped")
     ops.set_config("os.ui.port", 9999)

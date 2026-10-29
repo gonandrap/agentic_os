@@ -49,7 +49,7 @@
   </p>
   <script type="application/json" id="meter-data">{{ {
     "since": meter.window.since, "until": meter.window.until, "zone": window.zone,
-    "project": project or "", "timeline": tl} | tojson }}</script>
+    "project": project or "", "timeline": tl, "max_span": meter_max_span} | tojson }}</script>
   <script>
   // The interactive meter chart. Presentation only: every figure comes from
   // `usage_meter.timeline`, embedded above or fetched from /api/cost/meter.
@@ -62,7 +62,7 @@
     var SERIES = { five_hour_pct: { label: '5h', dash: '' },
                    seven_day_pct: { label: '7d', dash: '5 4' } };
     var OVERLAY_COLORS = ['#f2a33c', '#56c8e8', '#46d69a', '#e85d5d'];
-    var span = data.until - data.since;
+    var span = data.until - data.since, MAX_SPAN = data.max_span;
     var view = { a: data.since, b: data.until };
     var main = data.timeline;
     var shown = { five_hour_pct: true, seven_day_pct: true };
@@ -139,13 +139,14 @@
       return out;
     }
 
-    function line(parent, tl, key, shift, color, width, opacity) {
+    function line(parent, tl, key, shift, color, width, opacity, overlay) {
       var pts = [];
       tl.forEach(function (p) {
         if (p[key] != null) pts.push(x(p.ts + shift).toFixed(1) + ',' + y(p[key]).toFixed(1));
       });
       if (pts.length) el('polyline', { points: pts.join(' '), fill: 'none', stroke: color,
-        'stroke-width': width, 'stroke-dasharray': SERIES[key].dash, opacity: opacity }, parent);
+        'stroke-width': width, 'stroke-dasharray': SERIES[key].dash, opacity: opacity,
+        'data-series': key, 'data-overlay': overlay || '' }, parent);
     }
 
     function nearest(tl, t) {
@@ -157,7 +158,7 @@
     }
 
     function axisLabel(xp, yp, text, anchor) {
-      var g = el('g', {}, svg);
+      var g = el('g', { 'class': 'axis-label' }, svg);
       var txt = el('text', { x: xp, y: yp, 'font-size': 11, fill: 'var(--bg)',
                              'text-anchor': anchor, 'dominant-baseline': 'middle',
                              'font-family': 'var(--mono)' }, g);
@@ -194,7 +195,7 @@
       var plot = el('g', { 'clip-path': 'url(#meter-clip)' }, svg);
       overlays.forEach(function (o) {
         Object.keys(SERIES).forEach(function (k) {
-          if (shown[k] && o.tl) line(plot, o.tl, k, o.shift, o.color, 1.2, 0.8);
+          if (shown[k] && o.tl) line(plot, o.tl, k, o.shift, o.color, 1.2, 0.8, o.key);
         });
       });
       Object.keys(SERIES).forEach(function (k) {
@@ -239,10 +240,12 @@
       tip.style.top = Math.max(0, mouse.y - tip.offsetHeight - 8) + 'px';
     }
 
+    // null on any failure, so a refused span keeps the curve already drawn instead of blanking it.
     function get(a, b) {
       return fetch('/api/cost/meter?since=' + a + '&until=' + b)
-        .then(function (r) { return r.ok ? r.json() : { timeline: [] }; })
-        .then(function (j) { return j.timeline || []; });
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) { return j && j.timeline; })
+        .catch(function () { return null; });
     }
     // Wheel zoom is live: the series is re-read for the view, debounced, newest wins.
     function refetch() {
@@ -254,8 +257,8 @@
         }));
         Promise.all(jobs).then(function (res) {
           if (mine !== seq) return;
-          main = res[0];
-          list.forEach(function (o, i) { o.tl = res[i + 1]; });
+          if (res[0]) main = res[0];
+          list.forEach(function (o, i) { if (res[i + 1]) o.tl = res[i + 1]; });
           draw();
         });
       }, 250);
@@ -284,7 +287,8 @@
       var a = t - (t - view.a) * f, b = t + (view.b - t) * f;
       // A current window ends at its reset, ahead of now; zoom-out never runs past either.
       var now = Math.max(Date.now() / 1000, data.until);
-      if (b - a < 600) return;
+      // The endpoint's bounds (`ops.METER_TIMELINE_MAX_SECONDS`), enforced before asking.
+      if (b - a < 600 || b - a > MAX_SPAN) return;
       if (b > now) { a -= b - now; b = now; }
       view = { a: a, b: b };
       viewChanged();
@@ -332,7 +336,7 @@
                 name: box.parentNode.textContent.trim(),
                 color: OVERLAY_COLORS.filter(function (c) { return used.indexOf(c) < 0; })[0] };
       overlays.push(o);
-      get(view.a - shift, view.b - shift).then(function (tl) { o.tl = tl; draw(); });
+      get(view.a - shift, view.b - shift).then(function (tl) { o.tl = tl || []; draw(); });
     });
     controls.addEventListener('click', function (e) {
       var act = e.target.dataset && e.target.dataset.act;

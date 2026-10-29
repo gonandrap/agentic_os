@@ -1646,6 +1646,7 @@ def create_app() -> FastAPI:
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
                       project=project, fleet=fleet, meter=meter, window=picked,
+                      meter_max_span=ops.METER_TIMELINE_MAX_SECONDS,
                       cached_at=cached_at, now=time.time(),
                       window_inputs=_window_inputs(picked),
                       projects=sorted(ops.registered_project_paths()))
