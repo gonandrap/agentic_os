@@ -11271,7 +11271,6 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
             f"{os.environ['JARVIS_WO_ID']} is a worker session — a worker may not "
             "`jarvis offboard`. The fleet's project list is the user's. Ask on the work "
             "order record (`jarvis wo ask`).")
-    # 1. Resolve
     paths = registered_project_paths(include_archived=True)
     if name not in paths:
         raise OpsError(f"project {name!r} not registered (known: {sorted(paths)})")
@@ -11280,7 +11279,7 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
         status = central.get_project(name)["status"]
     finally:
         central.close()
-    # 2. The OS-owning project carries Morpheus, the steward and the OS health sweep
+    # The OS-owning project carries Morpheus, the steward and the OS health sweep
     try:
         owner = schedule.os_project(paths.items())
     except (OSError, ValueError):
@@ -11291,7 +11290,7 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
             f"OS health sweep all hang off it, so it cannot be offboarded. No flag "
             f"overrides this.")
 
-    # 3. The plan: a pure read, and the whole return value under --dry-run
+    # The plan: a pure read, and the whole return value under --dry-run
     file = _catalog_file(catalog_path)
     document = _read_document(file)
     in_catalog = name in _project_names(document)
@@ -11325,7 +11324,6 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
                     "removed": len(changes), "version": None},
         "inbox_id": None,
     }
-    # 4. Refuse on open orders
     if open_ and not force:
         listed = ", ".join(f"{o['id']} ({o['status']})" for o in open_)
         raise OpsError(
@@ -11334,19 +11332,18 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
     if dry_run:
         return plan
 
-    # 5. Quiesce
     if status != ARCHIVED:
         q = quiesce_project(name, apply=True, reason=reason or "project offboarded")
         plan.update({k: q[k] for k in ("cancelled", "sessions_stopped",
                                        "backlog_dropped", "inbox_acked")})
-    # 6. Strip, after quiescing: a live worker's gate runs through .claude/settings.json
+    # Strip only after quiescing: a live worker's gate runs through .claude/settings.json
     try:
         strip = bootstrap.unbootstrap_project(spec, purge=purge, dry_run=False)
         plan["strip"] = {"actions": strip.actions, "warnings": strip.warnings}
     except OSError as e:
         # A stale repo is inert and a second offboard fixes it; registry and catalog still move
         plan["strip"]["warnings"] = [*strip.warnings, f"strip failed: {e}"]
-    # 7. Registry, then 8. catalog: these two move together
+    # Registry, then catalog: these two move together
     central = CentralStore()
     try:
         if purge:
@@ -11367,7 +11364,6 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
         row = _commit_document(document, path=file, actor="user",
                                reason=reason or f"offboard {name}", changes=changes)
         plan["catalog"]["version"] = row["id"]
-    # 9. On the record the user reads
     central = CentralStore()
     try:
         plan["inbox_id"] = central.add_inbox(
