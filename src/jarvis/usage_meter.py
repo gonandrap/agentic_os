@@ -701,6 +701,12 @@ def timeline(samples: Sequence[Sample], *, points: int = TIMELINE_POINTS
     return found
 
 
+def timeline_between(*, since: float, until: float,
+                     home: Path | str | None = None) -> list[dict[str, Any]]:
+    """`timeline` for any span — what the /cost chart fetches on zoom and overlay"""
+    return timeline(samples_between(_home_path(home), since=since, until=until))
+
+
 def sample_rows(*, since: float, until: float,
                 home: Path | str | None = None) -> list[dict[str, Any]]:
     """The raw series for one span, as rows — what `ops.meter_samples` hands the page"""

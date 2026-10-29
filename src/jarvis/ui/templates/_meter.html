@@ -11,14 +11,27 @@
   <p style="margin: 0 0 10px;">{{ meter.sentence }}</p>
 
   {% if tl|length > 1 %}
-  {# An inline SVG and no JavaScript: utilisation against the span, 5h and 7d as two
-     lines, so a jump in the meter lines up against what spent in that span. #}
+  {# The static SVG is the no-JS fallback; the script below replaces it with the
+     interactive chart (crosshair, wheel zoom, drag-select, series toggles, overlays). #}
   {% set n = tl|length %}
   {% macro points(key) -%}
     {%- for p in tl -%}
       {%- if p[key] is not none %}{{ '%.2f'|format(loop.index0 * 600.0 / (n - 1)) }},{{ '%.2f'|format(100 - p[key]) }} {% endif -%}
     {%- endfor -%}
   {%- endmacro %}
+  <div class="meter-controls kv mono" style="display: none; gap: 14px; flex-wrap: wrap;
+                                             align-items: center; margin-bottom: 6px;">
+    <label><input type="checkbox" data-series="five_hour_pct" checked> 5h</label>
+    <label><input type="checkbox" data-series="seven_day_pct" checked> 7d</label>
+    <span class="sub">compare with:</span>
+    <label><input type="checkbox" data-shift="span"> previous window</label>
+    <label><input type="checkbox" data-shift="span2"> 2 windows back</label>
+    <label><input type="checkbox" data-shift="86400"> 1 day earlier</label>
+    <label><input type="checkbox" data-shift="604800"> 1 week earlier</label>
+    <button type="button" data-act="apply" disabled>apply range</button>
+    <button type="button" data-act="reset" disabled>reset zoom</button>
+  </div>
+  <div class="meter-chart" style="position: relative;">
   <svg viewBox="0 0 600 100" preserveAspectRatio="none" role="img"
        style="width: 100%; height: 90px; background: rgba(127,127,127,0.06);">
     <polyline fill="none" stroke="var(--ink)" stroke-width="1.5"
@@ -26,11 +39,321 @@
     <polyline fill="none" stroke="var(--ink)" stroke-width="1" stroke-dasharray="3 3"
               opacity="0.6" points="{{ points('seven_day_pct') }}"></polyline>
   </svg>
+  </div>
   <p class="kv sub mono" style="margin: 4px 0 0;">
     5h solid · 7d dashed · 0-100% of the window ·
     {{ tl|length }} point{{ 's' if tl|length != 1 }} ·
     {{ '%.0f'|format(100 * meter.coverage.share) }}% covered
+    <span class="meter-hint" style="display: none;"> · wheel zooms · drag selects a
+      range and opens it · overlays are aligned to this window</span>
   </p>
+  <script type="application/json" id="meter-data">{{ {
+    "since": meter.window.since, "until": meter.window.until, "zone": window.zone,
+    "project": project or "", "timeline": tl, "max_span": meter_max_span} | tojson }}</script>
+  <script>
+  // The interactive meter chart. Presentation only: every figure comes from
+  // `usage_meter.timeline`, embedded above or fetched from /api/cost/meter.
+  (function () {
+    var root = document.querySelector('.meter-chart');
+    var data = JSON.parse(document.getElementById('meter-data').textContent);
+    var controls = document.querySelector('.meter-controls');
+    var NS = 'http://www.w3.org/2000/svg';
+    var H = 240, PL = 44, PR = 12, PT = 10, PB = 26;
+    var SERIES = { five_hour_pct: { label: '5h', dash: '' },
+                   seven_day_pct: { label: '7d', dash: '5 4' } };
+    var OVERLAY_COLORS = ['#f2a33c', '#56c8e8', '#46d69a', '#e85d5d'];
+    var span = data.until - data.since, MAX_SPAN = data.max_span;
+    var view = { a: data.since, b: data.until };
+    var main = data.timeline;
+    var shown = { five_hour_pct: true, seven_day_pct: true };
+    var overlays = [];          // {key, shift, color, tl}
+    var mouse = null, drag = null, fetchTimer = null, seq = 0;
+
+    var fmtFull = new Intl.DateTimeFormat(undefined, { timeZone: data.zone,
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+    var fmtTime = new Intl.DateTimeFormat(undefined, { timeZone: data.zone,
+      hour: '2-digit', minute: '2-digit', hour12: false });
+    var fmtDay = new Intl.DateTimeFormat(undefined, { timeZone: data.zone,
+      month: 'short', day: 'numeric' });
+    var fmtParts = new Intl.DateTimeFormat('en-US', { timeZone: data.zone, hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+      second: '2-digit' });
+
+    function parts(t) {
+      var o = {};
+      fmtParts.formatToParts(new Date(t * 1000)).forEach(function (p) { o[p.type] = p.value; });
+      return o;
+    }
+    // Seconds the zone is ahead of UTC at `t`, so ticks fall on the reader's round hours.
+    function zoneOffset(t) {
+      var p = parts(t);
+      return (Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) / 1000)
+             - Math.floor(t);
+    }
+    // The `datetime-local` value the custom form takes (`_in_zone` reads it in data.zone).
+    function localInput(t) {
+      var p = parts(t);
+      return p.year + '-' + p.month + '-' + p.day + 'T' + p.hour + ':' + p.minute;
+    }
+
+    function el(name, attrs, parent) {
+      var e = document.createElementNS(NS, name);
+      for (var k in attrs) e.setAttribute(k, attrs[k]);
+      if (parent) parent.appendChild(e);
+      return e;
+    }
+
+    var svg = el('svg', { role: 'img', height: H });
+    svg.style.cssText = 'width:100%;display:block;cursor:crosshair;user-select:none;' +
+                        'background:rgba(127,127,127,0.06);';
+    root.innerHTML = '';
+    root.appendChild(svg);
+    var tip = document.createElement('div');
+    tip.className = 'mono';
+    tip.style.cssText = 'position:absolute;pointer-events:none;display:none;font-size:12px;' +
+      'background:var(--raised);border:1px solid var(--line);padding:4px 8px;' +
+      'border-radius:4px;white-space:nowrap;z-index:2;';
+    root.appendChild(tip);
+    controls.style.display = 'flex';
+    document.querySelector('.meter-hint').style.display = 'inline';
+
+    function W() { return svg.clientWidth || 600; }
+    function x(t) { return PL + (t - view.a) / (view.b - view.a) * (W() - PL - PR); }
+    function tAt(px) { return view.a + (px - PL) / (W() - PL - PR) * (view.b - view.a); }
+    function y(pct) { return PT + (100 - pct) / 100 * (H - PT - PB); }
+    function pctAt(py) { return 100 - (py - PT) / (H - PT - PB) * 100; }
+
+    var STEPS = [60, 300, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+    function ticks() {
+      var want = Math.max(2, Math.floor((W() - PL - PR) / 110));
+      var step = STEPS[STEPS.length - 1];
+      for (var i = 0; i < STEPS.length; i++) {
+        if ((view.b - view.a) / STEPS[i] <= want) { step = STEPS[i]; break; }
+      }
+      var off = zoneOffset(view.a), out = [];
+      for (var t = Math.ceil((view.a + off) / step) * step - off; t <= view.b; t += step) {
+        out.push({ t: t, label: step >= 86400 || (t + off) % 86400 === 0
+                                 ? fmtDay.format(new Date(t * 1000))
+                                 : fmtTime.format(new Date(t * 1000)) });
+      }
+      return out;
+    }
+
+    function line(parent, tl, key, shift, color, width, opacity, overlay) {
+      var pts = [];
+      tl.forEach(function (p) {
+        if (p[key] != null) pts.push(x(p.ts + shift).toFixed(1) + ',' + y(p[key]).toFixed(1));
+      });
+      if (pts.length) el('polyline', { points: pts.join(' '), fill: 'none', stroke: color,
+        'stroke-width': width, 'stroke-dasharray': SERIES[key].dash, opacity: opacity,
+        'data-series': key, 'data-overlay': overlay || '' }, parent);
+    }
+
+    function nearest(tl, t) {
+      var best = null;
+      tl.forEach(function (p) {
+        if (!best || Math.abs(p.ts - t) < Math.abs(best.ts - t)) best = p;
+      });
+      return best;
+    }
+
+    function axisLabel(xp, yp, text, anchor) {
+      var g = el('g', { 'class': 'axis-label' }, svg);
+      var txt = el('text', { x: xp, y: yp, 'font-size': 11, fill: 'var(--bg)',
+                             'text-anchor': anchor, 'dominant-baseline': 'middle',
+                             'font-family': 'var(--mono)' }, g);
+      txt.textContent = text;
+      var b = txt.getBBox();
+      g.insertBefore(el('rect', { x: b.x - 4, y: b.y - 2, width: b.width + 8,
+                                  height: b.height + 4, fill: 'var(--ink)', rx: 2 }), txt);
+    }
+
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var w = W();
+      [0, 25, 50, 75, 100].forEach(function (v) {
+        el('line', { x1: PL, x2: w - PR, y1: y(v), y2: y(v), stroke: 'var(--line)' }, svg);
+        el('text', { x: PL - 6, y: y(v), 'font-size': 11, fill: 'var(--ink-3)',
+                     'text-anchor': 'end', 'dominant-baseline': 'middle',
+                     'font-family': 'var(--mono)' }, svg).textContent = v + '%';
+      });
+      ticks().forEach(function (k) {
+        el('line', { x1: x(k.t), x2: x(k.t), y1: PT, y2: H - PB, stroke: 'var(--line)',
+                     opacity: 0.6 }, svg);
+        el('text', { x: x(k.t), y: H - PB + 14, 'font-size': 11, fill: 'var(--ink-3)',
+                     'text-anchor': 'middle', 'font-family': 'var(--mono)' }, svg)
+          .textContent = k.label;
+      });
+      // The page's own window, shaded when the view is zoomed past it.
+      if (view.a !== data.since || view.b !== data.until) {
+        var x0 = Math.max(PL, x(data.since)), x1 = Math.min(w - PR, x(data.until));
+        if (x1 > x0) el('rect', { x: x0, y: PT, width: x1 - x0, height: H - PT - PB,
+                                  fill: 'var(--cyan)', opacity: 0.05 }, svg);
+      }
+      var clip = el('clipPath', { id: 'meter-clip' }, el('defs', {}, svg));
+      el('rect', { x: PL, y: PT, width: w - PL - PR, height: H - PT - PB }, clip);
+      var plot = el('g', { 'clip-path': 'url(#meter-clip)' }, svg);
+      overlays.forEach(function (o) {
+        Object.keys(SERIES).forEach(function (k) {
+          if (shown[k] && o.tl) line(plot, o.tl, k, o.shift, o.color, 1.2, 0.8, o.key);
+        });
+      });
+      Object.keys(SERIES).forEach(function (k) {
+        if (shown[k]) line(plot, main, k, 0, 'var(--ink)', 1.6, 1);
+      });
+      if (drag && Math.abs(drag.x1 - drag.x0) > 2) {
+        el('rect', { x: Math.min(drag.x0, drag.x1), y: PT, width: Math.abs(drag.x1 - drag.x0),
+                     height: H - PT - PB, fill: 'var(--cyan)', opacity: 0.15 }, svg);
+      }
+      drawCrosshair();
+    }
+
+    function drawCrosshair() {
+      if (!mouse || mouse.x < PL || mouse.x > W() - PR || mouse.y < PT || mouse.y > H - PB) {
+        tip.style.display = 'none';
+        return;
+      }
+      var t = tAt(mouse.x), dash = { stroke: 'var(--ink-2)', 'stroke-dasharray': '3 3' };
+      el('line', Object.assign({ x1: mouse.x, x2: mouse.x, y1: PT, y2: H - PB }, dash), svg);
+      el('line', Object.assign({ x1: PL, x2: W() - PR, y1: mouse.y, y2: mouse.y }, dash), svg);
+      axisLabel(mouse.x, H - PB + 14, fmtFull.format(new Date(t * 1000)), 'middle');
+      axisLabel(PL - 4, mouse.y, pctAt(mouse.y).toFixed(1) + '%', 'end');
+      // The readings under the cursor, each overlay at its OWN time.
+      var rows = [];
+      function add(tl, shift, name, color) {
+        var p = tl && nearest(tl, t - shift);
+        if (!p) return;
+        var vals = Object.keys(SERIES).filter(function (k) { return shown[k]; })
+          .map(function (k) {
+            return SERIES[k].label + ' ' + (p[k] == null ? '—' : p[k].toFixed(1) + '%');
+          });
+        rows.push('<span style="color:' + color + '">' + name + '</span> ' +
+                  fmtFull.format(new Date(p.ts * 1000)) + ' · ' + vals.join(' · '));
+      }
+      add(main, 0, 'this', 'var(--ink)');
+      overlays.forEach(function (o) { add(o.tl, o.shift, o.name, o.color); });
+      tip.innerHTML = rows.join('<br>');
+      tip.style.display = rows.length ? 'block' : 'none';
+      var left = mouse.x + 14;
+      if (left + tip.offsetWidth > W()) left = mouse.x - 14 - tip.offsetWidth;
+      tip.style.left = left + 'px';
+      tip.style.top = Math.max(0, mouse.y - tip.offsetHeight - 8) + 'px';
+    }
+
+    // null on any failure, so a refused span keeps the curve already drawn instead of blanking it.
+    function get(a, b) {
+      return fetch('/api/cost/meter?since=' + a + '&until=' + b)
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) { return j && j.timeline; })
+        .catch(function () { return null; });
+    }
+    // Wheel zoom is live: the series is re-read for the view, debounced, newest wins.
+    function refetch() {
+      clearTimeout(fetchTimer);
+      fetchTimer = setTimeout(function () {
+        var mine = ++seq, a = view.a, b = view.b, list = overlays.slice();
+        var jobs = [get(a, b)].concat(list.map(function (o) {
+          return get(a - o.shift, b - o.shift);
+        }));
+        Promise.all(jobs).then(function (res) {
+          if (mine !== seq) return;
+          if (res[0]) main = res[0];
+          list.forEach(function (o, i) { if (res[i + 1]) o.tl = res[i + 1]; });
+          draw();
+        });
+      }, 250);
+    }
+
+    function viewChanged() {
+      var zoomed = view.a !== data.since || view.b !== data.until;
+      controls.querySelector('[data-act=apply]').disabled = !zoomed;
+      controls.querySelector('[data-act=reset]').disabled = !zoomed;
+      // The custom-dates form follows the chart; `apply range` submits it.
+      var since = document.querySelector('form input[name=since]');
+      var until = document.querySelector('form input[name=until]');
+      if (since && until) { since.value = localInput(view.a); until.value = localInput(view.b); }
+    }
+
+    function open(a, b) {
+      var q = new URLSearchParams({ since: localInput(a), until: localInput(b),
+                                    project: data.project, tz: data.zone });
+      window.location.href = '/cost?' + q.toString();
+    }
+
+    svg.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      var rect = svg.getBoundingClientRect();
+      var t = tAt(e.clientX - rect.left), f = e.deltaY > 0 ? 1.25 : 0.8;
+      var a = t - (t - view.a) * f, b = t + (view.b - t) * f;
+      // A current window ends at its reset, ahead of now; zoom-out never runs past either.
+      var now = Math.max(Date.now() / 1000, data.until);
+      // The endpoint's bounds (`ops.METER_TIMELINE_MAX_SECONDS`), enforced before asking.
+      if (b - a < 600 || b - a > MAX_SPAN) return;
+      if (b > now) { a -= b - now; b = now; }
+      view = { a: a, b: b };
+      viewChanged();
+      draw();
+      refetch();
+    }, { passive: false });
+
+    svg.addEventListener('mousemove', function (e) {
+      var rect = svg.getBoundingClientRect();
+      mouse = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      if (drag) drag.x1 = Math.max(PL, Math.min(W() - PR, mouse.x));
+      draw();
+    });
+    svg.addEventListener('mouseleave', function () { mouse = null; drag = null; draw(); });
+    svg.addEventListener('mousedown', function (e) {
+      var rect = svg.getBoundingClientRect(), px = e.clientX - rect.left;
+      if (px >= PL && px <= W() - PR) drag = { x0: px, x1: px };
+    });
+    // Drag-select is one deliberate gesture, so it opens the page on that range at once.
+    svg.addEventListener('mouseup', function () {
+      var d = drag;
+      drag = null;
+      if (d && Math.abs(d.x1 - d.x0) > 5) {
+        var a = tAt(Math.min(d.x0, d.x1)), b = tAt(Math.max(d.x0, d.x1));
+        if (b - a >= 60) return open(a, b);
+      }
+      draw();
+    });
+
+    controls.addEventListener('change', function (e) {
+      var box = e.target;
+      if (box.dataset.series) {
+        shown[box.dataset.series] = box.checked;
+        return draw();
+      }
+      var key = box.dataset.shift;
+      if (!key) return;
+      if (!box.checked) {
+        overlays = overlays.filter(function (o) { return o.key !== key; });
+        return draw();
+      }
+      var shift = key === 'span' ? span : key === 'span2' ? 2 * span : +key;
+      var used = overlays.map(function (o) { return o.color; });
+      var o = { key: key, shift: shift, tl: null,
+                name: box.parentNode.textContent.trim(),
+                color: OVERLAY_COLORS.filter(function (c) { return used.indexOf(c) < 0; })[0] };
+      overlays.push(o);
+      get(view.a - shift, view.b - shift).then(function (tl) { o.tl = tl || []; draw(); });
+    });
+    controls.addEventListener('click', function (e) {
+      var act = e.target.dataset && e.target.dataset.act;
+      if (act === 'apply') open(view.a, view.b);
+      if (act === 'reset') {
+        view = { a: data.since, b: data.until };
+        main = data.timeline;
+        seq++;
+        viewChanged();
+        draw();
+        overlays.length && refetch();
+      }
+    });
+    window.addEventListener('resize', draw);
+    draw();
+  })();
+  </script>
   {% endif %}
 
   <p class="kv mono" style="margin: 8px 0 0;">

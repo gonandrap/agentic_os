@@ -865,6 +865,32 @@ def test_the_meter_sentence_and_the_sparkline_are_above_the_listing(client, proj
     assert "<svg" in page.text and "<polyline" in page.text
 
 
+def test_the_meter_chart_endpoint_serves_any_span_and_refuses_a_bad_one(client, project):
+    """What the interactive chart fetches on wheel zoom and on an overlay"""
+    import json
+
+    from jarvis import db
+
+    meter_samples_in_the_current_5h_window()
+    now = db.now()
+
+    got = client.get(f"/api/cost/meter?since={now - 3600}&until={now}").json()
+    assert 50 <= len(got["timeline"]) <= 60
+    assert all(now - 3600 <= p["ts"] < now for p in got["timeline"])
+    assert client.get(f"/api/cost/meter?since={now}&until={now - 1}").status_code == 400
+    cap = ops.METER_TIMELINE_MAX_SECONDS
+    assert client.get(f"/api/cost/meter?since={now - cap}&until={now}").status_code == 200
+    assert client.get(f"/api/cost/meter?since={now - cap - 1}&until={now}").status_code == 400
+
+    page = cost_page(client, "/cost?window=5h")
+    embedded = json.loads(
+        page.text.split('id="meter-data">', 1)[1].split("</script>", 1)[0])
+    assert embedded["timeline"]
+    # The wheel refuses a span past the endpoint's cap rather than blanking the chart on a 400
+    assert embedded["max_span"] == cap
+    assert 'data-shift="span"' in page.text and 'data-series="seven_day_pct"' in page.text
+
+
 def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, project):
     """12 readings in a 5h window: the page says so and prints no $/point figure"""
     wo = ops.create_work_order("proj_a", "an order in this window")

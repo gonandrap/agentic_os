@@ -1598,6 +1598,15 @@ def create_app() -> FastAPI:
         except ops.OpsError as e:
             return JSONResponse({"error": str(e)}, status_code=404)
 
+    @app.get("/api/cost/meter")
+    def cost_meter_timeline(since: float, until: float):
+        """`ops.cost_meter_timeline` as JSON — what the /cost chart fetches on zoom and overlay"""
+        try:
+            return JSONResponse({"since": since, "until": until,
+                                 "timeline": ops.cost_meter_timeline(since, until)})
+        except ops.OpsError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
     @app.get("/cost", response_class=HTMLResponse)
     def cost_page(request: Request, project: str = "", window: str = "",
                   offset: str = "", since: str = "", until: str = "",
@@ -1637,6 +1646,7 @@ def create_app() -> FastAPI:
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
                       project=project, fleet=fleet, meter=meter, window=picked,
+                      meter_max_span=ops.METER_TIMELINE_MAX_SECONDS,
                       cached_at=cached_at, now=time.time(),
                       window_inputs=_window_inputs(picked),
                       projects=sorted(ops.registered_project_paths()))
