@@ -1276,6 +1276,15 @@ def test_a_plan_assumption_holds_the_merge():
     assert PLANNER in decision.reason
 
 
+def test_an_unmerged_spec_holds_a_childs_merge():
+    """docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2"""
+    spec = "https://github.com/x/y/pull/1289"
+    decision = decide(rnd(), spec_unmerged=spec)
+    assert not decision.armed and decision.code == automerge.HELD_SPEC_UNMERGED
+    assert spec in decision.reason
+    assert decide(rnd()).armed
+
+
 def test_the_plan_hold_is_not_the_orders_own_assumption_hold():
     """`_note_automerge_held` dedupes on (head sha (#263)"""
     own = decide(rnd(), pending_assumptions=True)

@@ -5549,6 +5549,8 @@ class Daemon:
         # ONE read, passed to both readers below (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.4)
         hold = store.plan_hold(wo)
         plan_assumptions = str((hold or {}).get("planner_id") or "")
+        # docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2
+        spec_unmerged = str((store.spec_hold(wo) or {}).get("pr_url") or "")
         # Spec 2026-09-28 §3.2
         base_behind = (automerge.BaseBehind(base=pr.base_ref, base_oid=pr.base_oid)
                        if ops.catch_up_needed(pr, repo=project.path) else None)
@@ -5558,6 +5560,7 @@ class Daemon:
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged,
             drift=drift, base_red=base_red, base_behind=base_behind)
         if not decision.armed:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec... (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.5)
@@ -5572,6 +5575,7 @@ class Daemon:
                     round_row, wo, pr, cfg,
                     validated_head=store.validated_head(round_row),
                     pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged,
                     drift=drift)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
@@ -5604,6 +5608,7 @@ class Daemon:
                         round_row, wo, pr, cfg,
                         validated_head=store.validated_head(round_row),
                         pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged,
                         drift=drift, base_red=base_red)
                     # #1141: the moved head the base hold was hiding gets the carry too
                     if not decision.armed and decision.code == automerge.HELD_SHA_MOVED:
@@ -5616,7 +5621,8 @@ class Daemon:
                                 round_row, wo, pr, cfg,
                                 validated_head=store.validated_head(round_row),
                                 pending_assumptions=pending,
-                                plan_assumptions=plan_assumptions, drift=drift,
+                                plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged, drift=drift,
                                 base_red=base_red)
                 else:
                     # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a base that has moved
@@ -5647,7 +5653,8 @@ class Daemon:
                                               automerge.HELD_SHA_UNRECORDED)
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
-                            plan_assumptions=plan_assumptions)):
+                            plan_assumptions=plan_assumptions,
+                    spec_unmerged=spec_unmerged)):
                     # `rebind` is the carry's reading of the two proofs
                     self._rejudge_moved_head(project, store, wo, decision,
                                              rebind=outcome.rebind)
