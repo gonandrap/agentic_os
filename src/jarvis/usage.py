@@ -339,6 +339,10 @@ def _subagent_detail(path: Path, sub_usage: Usage) -> Subagent:
     )
 
 
+# Untimed replays of a request's messages (Claude Code 2.1.312+), never events: issue 1309
+REPLAY_ROW_TYPES = frozenset({"api-request-blob"})
+
+
 def rows(path: Path | str, needle: str = "") -> Iterator[dict[str, Any]]:
     """Every JSON row of one transcript, in file order — the one line-reader"""
     try:
@@ -353,7 +357,7 @@ def rows(path: Path | str, needle: str = "") -> Iterator[dict[str, Any]]:
                 row = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(row, dict):
+            if isinstance(row, dict) and row.get("type") not in REPLAY_ROW_TYPES:
                 yield row
 
 
