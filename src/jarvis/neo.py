@@ -275,13 +275,13 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
 def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
                 deliver: Any = None, max_questions: int = 50,
                 answer: Any = None, unreachable: Any = None,
-                refused: Any = None) -> list[dict[str, Any]]:
+                refused: Any = None, skip: Any = ()) -> list[dict[str, Any]]:
     """Answer every queued question in FIFO order, back-to-back (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)"""
     answer = answer or answer_question
     results = []
     reached = False
     for _ in range(max_questions):
-        q = store.claim_next()
+        q = store.claim_next(skip)
         if q is None:
             break
         try:

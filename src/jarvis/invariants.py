@@ -3163,6 +3163,36 @@ def check_config_drift() -> Iterator[Violation]:
     )
 
 
+def check_offboarded_activity() -> Iterator[Violation]:
+    """INV-OFFBOARDED-ACTIVITY — nothing the OS acts on names a project with no `projects` row (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
+    from .central_store import CentralStore
+    from .neo_store import OPEN_Q_STATUSES, NeoStore
+
+    central = CentralStore()
+    neo = NeoStore()
+    try:
+        # Archived projects keep their row, so their left-behind rows are by design, never a violation
+        known = {p["name"] for p in central.list_projects()} | {"", "os"}
+        found = central.live_rows_by_project()
+        asked: dict[str, int] = {}
+        for q in neo.list_questions(statuses=OPEN_Q_STATUSES, limit=-1):
+            asked[q["project"]] = asked.get(q["project"], 0) + 1
+        found += [("questions", name, n) for name, n in sorted(asked.items())]
+    finally:
+        neo.close()
+        central.close()
+    for table, project, count in found:
+        if project in known:
+            continue
+        yield Violation(
+            invariant="INV-OFFBOARDED-ACTIVITY",
+            detail=(f"{count} live {table} row(s) name project {project!r}, which the OS has "
+                    f"no record of. Finish the purge with `jarvis offboard {project} --purge "
+                    f"--yes`, or re-register it with `jarvis adopt <path>` and `jarvis start`."),
+            context={"project": project, "table": table, "rows": count},
+        )
+
+
 def check_service_path() -> Iterator[Violation]:
     """INV-SERVICE-PATH — the installed units' PATH must reach `gh` (#41)"""
     from . import bugreport, release
@@ -3605,6 +3635,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_wedged,
     check_gate_canaries,
     check_config_drift,
+    check_offboarded_activity,
     check_service_path,
     check_production_clean,
     check_prod_cli,
