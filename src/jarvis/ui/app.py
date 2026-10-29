@@ -119,6 +119,8 @@ REFRESH_SECONDS = 15
 # The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
                      "validating", "waiting_pr_merge")
+# The work-order statuses that sort to the top of a list: each waits on the user
+NEEDS_YOU_STATUSES = ("failed", "budget_exhausted", "needs_review", "waiting_input")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
@@ -985,6 +987,11 @@ def create_app() -> FastAPI:
         """Owns the liveness probe task (spec §2) and the watchdog thread (issue #1221)"""
         import anyio
 
+        try:
+            invariants.report_at_startup("ui")
+        except Exception:  # noqa: BLE001 — a startup check must not stop the dashboard
+            import logging
+            logging.getLogger(__name__).exception("startup invariant check failed")
         watchdog.start()
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
@@ -1146,31 +1153,47 @@ def create_app() -> FastAPI:
     def dashboard(request: Request, show: str = ""):
         """The pulse"""
         st = ops.os_status()
-        rows = [{**wo, "project": p["name"]}
-                for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        every = [{**wo, "project": p["name"]}
+                 for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        # §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+        options = {"project": filter_options(every, "project"),
+                   "status": filter_options(every, "status")}
+        filters = query_filters(request, options)
+        rows = filter_rows(every, filters)
+        # A status filter reveals that status even when it is one that collapses into a count
+        show = show or filters.get("status", "")
         revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
             else ""
         featured, rest = group_open(rows, revealed)
+        # Same predicate as project(): a status that waits on the user, or a raised flag
+        shown = attention_first(featured + rest,
+                                lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                                or bool(wo.get("needs_attention")))
         rest_counts = _counts_by_status(
             wo["status"] for wo in rows if wo["status"] not in FEATURED_STATUSES)
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
-                      featured=featured, rest=rest, rest_counts=rest_counts,
+                      shown=shown, total=len(every), rest_counts=rest_counts,
+                      filters=filters, options=options,
                       revealed=revealed, model_ids=ops.suggested_model_ids())
 
     @app.get("/search", response_class=HTMLResponse)
-    def search_page(request: Request, q: str = "", project: str = "", kind: str = ""):
+    def search_page(request: Request):
         """Find an artifact again — across the fleet, or inside one project"""
         from .. import search as search_mod
 
-        projects = sorted(ops.registered_project_paths())
-        if project and project not in projects:
-            project = ""
-        kind = kind if kind in search_mod.KINDS else ""
-        hits = search_mod.search(q, project=project or None,
-                                 kinds=(kind,) if kind else None, limit=60)
+        options = {"q": (), "project": sorted(ops.registered_project_paths()),
+                   "kind": list(search_mod.KINDS)}
+        filters = query_filters(request, options)
+        # a hand-edited deep link widens to the fleet rather than matching nothing
+        filters = {k: v for k, v in filters.items() if k == "q" or v in options[k]}
+        q, project, kind = (filters.get(k, "") for k in ("q", "project", "kind"))
+        every = search_mod.search(q, project=project or None, limit=60)
+        # a kind search runs its own query so the cap of 60 applies within the kind
+        hits = (search_mod.search(q, project=project or None, kinds=(kind,), limit=60)
+                if kind else every)
         return render(request, "search.html", active="search", q=q, project=project,
-                      kind=kind, hits=hits, counts=search_mod.counts(hits),
-                      projects=projects, kinds=search_mod.KINDS)
+                      kind=kind, hits=hits, counts=search_mod.counts(every),
+                      filters=filters, options=options, total=len(every))
 
     @app.get("/project/{name}", response_class=HTMLResponse)
     def project(request: Request, name: str, hidden: str = "", show: str = "",
@@ -1180,8 +1203,15 @@ def create_app() -> FastAPI:
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
         show_hidden = hidden not in ("", "0", "false")
+        options = {"status": list(WO_STATUSES)}
+        filters = query_filters(request, options)
+        status = filters.get("status", "")
+        # A status filter reveals that status; an unknown one matches nothing (Q2361)
+        show = status or show
         revealed = show if show in WO_STATUSES else ("all" if show == "all" else "")
-        if revealed == "all":
+        if status:
+            statuses = (status,)
+        elif revealed == "all":
             statuses = None
         else:
             statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
@@ -1235,13 +1265,27 @@ def create_app() -> FastAPI:
             central.close()
         settled = [(s, counts[s]) for s in TERMINAL_STATUSES if counts.get(s)]
         featured, rest = group_open(wos, revealed)
+        rows = attention_first(featured + rest,
+                               lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                               or bool(wo.get("needs_attention")))
         # Counted in SQL rather than from `wos`
         other_open = [s for s in OPEN_STATUSES if s not in FEATURED_STATUSES]
         open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
         fo_settled = [(s, fo_counts[s]) for s in FO_TERMINAL_STATUSES
                       if fo_counts.get(s)]
+        flagged = lambda r: bool(r.get("needs_attention"))  # noqa: E731
+        features = attention_first(features, flagged)
+        improvements = attention_first(improvements, flagged)
+        investigations = attention_first(investigations, flagged)
         return render(request, "project.html", project_name=name, path=paths[name],
-                      featured=featured, rest=rest, open_counts=open_counts,
+                      # "of M": the open orders plus whatever the URL revealed, never every settled one
+                      total=sum(n for s, n in counts.items()
+                                if revealed == "all" or s in OPEN_STATUSES
+                                or s in (status, revealed)),
+                      rows=rows, filters=filters,
+                      # Parsed against every status, offered only where a row has it
+                      options={"status": [s for s in WO_STATUSES if counts.get(s)]},
+                      open_counts=open_counts,
                       backlog=backlog, show_hidden=show_hidden, blocked=blocked,
                       pauses=pauses,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
@@ -1281,6 +1325,10 @@ def create_app() -> FastAPI:
             for c in (detail.get("plan") or {}).get("children", [])
             if c.get("spec_section")
         }
+        detail["children"] = attention_first(
+            detail.get("children") or [],
+            lambda c: not c.get("superseded") and (
+                c["status"] in NEEDS_YOU_STATUSES or bool(c.get("needs_attention"))))
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
                       states=states, child_anchors=child_anchors,
                       cap=ops.feature_order_budget(fo_id, detail["project"],
@@ -1325,6 +1373,14 @@ def create_app() -> FastAPI:
             detail = ops.show_improvement_order(io_id, name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        report = detail.get("report") or {}
+        if report.get("findings"):
+            # Owed a decision first: pending and not held by Neo, or a filing that failed
+            report["findings"] = attention_first(
+                report["findings"],
+                lambda f: bool(f.get("filing_error")) or (
+                    (f.get("status") or "pending") == "pending"
+                    and not (f.get("neo_question_id") and not f.get("neo_verdict"))))
         return render(request, "improvement_order.html", io=detail,
                       project=detail["project"], error=error)
 
@@ -1576,49 +1632,66 @@ def create_app() -> FastAPI:
 
     @app.get("/backlog", response_class=HTMLResponse)
     def backlog(request: Request):
-        central = CentralStore()
+        """Intake, blocked items first (spec 2026-10-29 dashboard §6)"""
+        every = ops.list_backlog(status=None)
+        options = {"status": filter_options(every, "status"),
+                   "project": filter_options(every, "project")}
+        filters = query_filters(request, options)
+        rows = attention_first(filter_rows(every, filters), lambda i: bool(i["blockers"]))
+        return render(request, "backlog.html", active="backlog", rows=rows,
+                      attention=[i for i in rows if i["blockers"]],
+                      filters=filters, options=options, total=len(every))
+
+    @app.get("/backlog/{item_id}", response_class=HTMLResponse)
+    def backlog_item(request: Request, item_id: str):
+        """One intake item: its description, dependencies and the promote form"""
         try:
-            items = central.list_backlog(status=None)
-            open_ids = {i["id"] for i in items if i["status"] == "open"}
-            blockers = {i["id"]: central.unfinished_dependencies(i["id"])
-                        for i in items if i["id"] in open_ids}
-        finally:
-            central.close()
-        return render(request, "backlog.html", active="backlog", items=items,
-                      blockers=blockers)
+            item = ops.show_backlog(item_id)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="backlog", message=str(e),
+                          status_code=404)
+        return render(request, "backlog_item.html", active="backlog", item=item)
 
     @app.get("/knowledge", response_class=HTMLResponse)
-    def knowledge(request: Request, topic: str = "", q: str = ""):
+    def knowledge(request: Request):
         """The base, and what it costs against what it is used for"""
-        from ..central_store import PINNED_TAG, has_tag, headline
-        # An empty form field means every topic; "(none)" is how the page names untopicked rows
-        topic_filter = None if not topic else "" if topic == "(none)" else topic
-        central = CentralStore()
-        try:
-            rows = central.search_knowledge(q.strip(), limit=200, topic=topic_filter)
-            topics = central.knowledge_topics()
-            hits = central.knowledge_hit_counts()
-        finally:
-            central.close()
-        if not q.strip():  # a word search keeps its rank order
-            rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
-        for r in rows:
-            r["pinned"] = has_tag(r["tags"], PINNED_TAG)
-            r["headline"] = headline(r["content"])
-            r["reads"] = hits.get(r["id"], 0)
+        options = {"q": (), "topic": (), "project": (), "pinned": ("pinned", "unpinned")}
+        filters = query_filters(request, options)
+        topic = filters.get("topic", "")
+        # "(none)" is how the page names untopicked rows
+        base = ops.list_knowledge(filters.get("q", ""),
+                                  topic=None if not topic else "" if topic == "(none)" else topic)
+        every = base["rows"]
+        for r in every:
+            r["scope"] = r["project"] or "global"
+            r["pin"] = "pinned" if r["pinned"] else "unpinned"
+        options["topic"] = [t or "(none)" for t, _ in base["topics"]]
+        options["project"] = filter_options(every, "scope")
+        rows = filter_rows(every, {"scope": filters.get("project", ""),
+                                   "pin": filters.get("pinned", "")})
         return render(request, "knowledge.html", active="knowledge", rows=rows,
-                      topics=topics, topic=topic, q=q,
-                      usage=ops.knowledge_usage_report(limit=8))
+                      topics=base["topics"], filters=filters, options=options,
+                      total=len(every), usage=ops.knowledge_usage_report(limit=8))
+
+    @app.get("/knowledge/{kn_id}", response_class=HTMLResponse)
+    def knowledge_item(request: Request, kn_id: str):
+        """One entry in full, as `jarvis learn show` prints it"""
+        try:
+            k = ops.knowledge_detail(kn_id)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="knowledge", message=str(e),
+                          status_code=404)
+        return render(request, "knowledge_item.html", active="knowledge", k=k)
 
     @app.post("/knowledge/pin")
-    def knowledge_pin(kn_id: str = Form(...), pinned: str = Form("")):
+    def knowledge_pin(kn_id: str = Form(...), pinned: str = Form(""), next: str = Form("")):
         """Pinned entries ride in every worker prompt verbatim"""
-        central = CentralStore()
         try:
-            central.pin_knowledge(kn_id, pinned=pinned == "1")
-        finally:
-            central.close()
-        return RedirectResponse("/knowledge", status_code=303)
+            ops.pin_knowledge(kn_id, pinned=pinned == "1")
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/knowledge", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/knowledge"), status_code=303)
 
     @app.get("/neo", response_class=HTMLResponse)
     def neo_page(request: Request):
@@ -1694,18 +1767,39 @@ def create_app() -> FastAPI:
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):
         """Privileged-action approvals"""
-        rows = ops.list_gates(include_request=True)
-        pending = [g for g in rows if g["status"] == "pending"]
-        held = [g for g in rows if g["status"] == "awaiting_case"]
-        dismissed = [g for g in rows if g["status"] == "dismissed"]
-        decided = [g for g in rows
-                   if g["status"] not in ("pending", "awaiting_case", "dismissed")]
-        return render(request, "gates.html", active="gates",
-                      escalated=[g for g in pending if g["escalated"]],
-                      with_neo=[g for g in pending if not g["escalated"]],
-                      held=held, decided=decided, dismissed=dismissed,
-                      false_positive_rate=_false_positive_rate(rows),
-                      abandoned=_abandoned(rows))
+        every = ops.list_gates()
+        for g in every:
+            g["state"] = (("escalated" if g["escalated"] else "with neo")
+                          if g["status"] == "pending" else gate_display(g))
+        # pending, then held for a case, then everything settled; newest first inside each
+        rank = {"escalated": 0, "with neo": 1, "awaiting_case": 2}
+        every.sort(key=lambda g: rank.get(g["state"], 3))
+        options = {"state": filter_options(every, "state"),
+                   "project": filter_options(every, "project"),
+                   "kind": filter_options(every, "kind")}
+        # `id` has no select: /gates/<n> lands here when n names a gate in several projects
+        filters = query_filters(request, {**options, "id": ()})
+        rows = filter_rows(every, filters)
+        return render(request, "gates.html", active="gates", rows=rows,
+                      attention=[g for g in rows if g["state"] == "escalated"],
+                      filters=filters, options=options, total=len(every),
+                      counts=Counter(g["state"] for g in every),
+                      false_positive_rate=_false_positive_rate(every),
+                      abandoned=_abandoned(every))
+
+    @app.get("/gates/{approval_id}", response_class=HTMLResponse)
+    def gate_page(request: Request, approval_id: int, project: str = ""):
+        """One privileged-action request: the case, Neo's review, the decision"""
+        try:
+            g = ops.show_gate(approval_id, project_name=project or None)
+        except ops.OpsError as e:
+            if not project and sum(g["id"] == approval_id for g in ops.list_gates()) > 1:
+                return RedirectResponse(f"/gates?id={approval_id}", status_code=303)
+            return render(request, "error.html", active="gates", message=str(e),
+                          status_code=404)
+        back = f"/gates/{approval_id}?project={g['project']}"
+        return render(request, "gate.html", active="gates", g=g, back=back,
+                      display=gate_display(g))
 
     @app.get("/config", response_class=HTMLResponse)
     def config_page(request: Request, a: str = "", b: str = "", scope: str = "",

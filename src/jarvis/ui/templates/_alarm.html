@@ -38,7 +38,7 @@
     The supervisor asked to <span class="mono">{{ a.remedy }}</span>:
     {{ a.remedy_argument }}
     {% if a.remedy_approval_id %}
-    <a href="/gates#gate-{{ a.remedy_approval_id }}">gate request
+    <a href="/gates/{{ a.remedy_approval_id }}">gate request
       #{{ a.remedy_approval_id }} →</a>
     {% endif %}
   </div>

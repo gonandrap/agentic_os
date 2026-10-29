@@ -3163,6 +3163,36 @@ def check_config_drift() -> Iterator[Violation]:
     )
 
 
+def check_offboarded_activity() -> Iterator[Violation]:
+    """INV-OFFBOARDED-ACTIVITY — nothing the OS acts on names a project with no `projects` row (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
+    from .central_store import CentralStore
+    from .neo_store import OPEN_Q_STATUSES, NeoStore
+
+    central = CentralStore()
+    neo = NeoStore()
+    try:
+        # Archived projects keep their row, so their left-behind rows are by design, never a violation
+        known = {p["name"] for p in central.list_projects()} | {"", "os"}
+        found = central.live_rows_by_project()
+        asked: dict[str, int] = {}
+        for q in neo.list_questions(statuses=OPEN_Q_STATUSES, limit=-1):
+            asked[q["project"]] = asked.get(q["project"], 0) + 1
+        found += [("questions", name, n) for name, n in sorted(asked.items())]
+    finally:
+        neo.close()
+        central.close()
+    for table, project, count in found:
+        if project in known:
+            continue
+        yield Violation(
+            invariant="INV-OFFBOARDED-ACTIVITY",
+            detail=(f"{count} live {table} row(s) name project {project!r}, which the OS has "
+                    f"no record of. Finish the purge with `jarvis offboard {project} --purge "
+                    f"--yes`, or re-register it with `jarvis adopt <path>` and `jarvis start`."),
+            context={"project": project, "table": table, "rows": count},
+        )
+
+
 def check_service_path() -> Iterator[Violation]:
     """INV-SERVICE-PATH — the installed units' PATH must reach `gh` (#41)"""
     from . import bugreport, release
@@ -3600,11 +3630,67 @@ def check_morpheus_moves() -> Iterator[Violation]:
             context={"item": item["id"], "pr": item["pr_number"], "state": item["state"]})
 
 
+#: libsqlite3 releases that deadlock in-process on WAL close vs open (io-6fdf5c66); fixed in 3.51.2
+KNOWN_BAD_SQLITE = frozenset({"3.51.0", "3.51.1"})
+
+
+def check_sqlite_version() -> Iterator[Violation]:
+    """INV-SQLITE-VERSION — the runtime's libsqlite3 is not a known-deadlocking release"""
+    import sqlite3
+    import sys
+
+    version = sqlite3.sqlite_version
+    if version not in KNOWN_BAD_SQLITE:
+        return
+    yield Violation(
+        invariant="INV-SQLITE-VERSION",
+        detail=(f"{sys.executable} runs libsqlite3 {version}, which deadlocks two threads "
+                f"opening and closing a WAL database (fixed in 3.51.2). Rebuild the venv "
+                f"on an interpreter with SQLite 3.51.2+ or older than 3.51.0 (e.g. "
+                f"`uv venv --python-preference only-managed`, then `uv sync`)."),
+        level="critical", context={"sqlite_version": version, "python": sys.executable},
+    )
+
+
+def report_at_startup(who: str) -> list[Violation]:
+    """Run the startup post-conditions once and inbox each, deduped across daemon and UI"""
+    import logging
+
+    from . import schedule
+    from .project_store import ProjectStore
+
+    log = logging.getLogger(__name__)
+    found = list(check_sqlite_version())
+    for v in found:
+        log.critical("[%s startup] %s", who, v)
+    catalog = _live_catalog() if found else None
+    if catalog is None:
+        return found
+    try:
+        owner = schedule.os_project((p.name, p.path) for p in catalog.projects)
+        if owner is None:
+            return found
+        store = ProjectStore(Path(catalog.project(owner).path))
+    except Exception:  # noqa: BLE001 — the log line above already carries it
+        log.exception("startup check: cannot reach the OS project's store")
+        return found
+    try:
+        for v in found:
+            if store.open_violation_report(v.invariant, None, level=v.level, detail=v.detail):
+                store.add_notification(title=f"OS invariant violated: {v.invariant}",
+                                       body=v.detail, level=v.level, source="invariants")
+    finally:
+        store.close()
+    return found
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
+    check_sqlite_version,
     check_ui_healthy,
     check_ui_wedged,
     check_gate_canaries,
     check_config_drift,
+    check_offboarded_activity,
     check_service_path,
     check_production_clean,
     check_prod_cli,

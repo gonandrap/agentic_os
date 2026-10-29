@@ -10,7 +10,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Union
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Union
 
 from . import db
 
@@ -453,11 +453,15 @@ def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig,
 
 def sweep(central: CentralStore, cfg: MorpheusConfig, cwd: CwdFor, *,
           now: float | None = None,
-          run: Callable[[str, Path, int], CheckResult] = run_script) -> dict[str, int]:
+          run: Callable[[str, Path, int], CheckResult] = run_script,
+          skip: Collection[str] = ()) -> dict[str, int]:
     """Run every due script and expire every overdue item — no model, ever"""
     now = db.now() if now is None else now
     moved = {s: 0 for s in STATES}
     for item in central.morpheus_items(OPEN_STATES):
+        if (item["project"] or "") in skip:
+            # Offboarded: left as it is, never failed (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.2)
+            continue
         if item["state"] == "monitoring" and item["script"]:
             due = item["next_check_ts"]
             if due is None or float(due) <= now:
@@ -724,12 +728,15 @@ def _forget_offer(central: CentralStore, item_id: str) -> None:
         _save_session(central, state)
 
 
-def wanting_scripts(central: CentralStore, *, now: float | None = None) -> list[dict]:
+def wanting_scripts(central: CentralStore, *, now: float | None = None,
+                    skip: Collection[str] = ()) -> list[dict]:
     """Queued items Morpheus should be asked about now"""
     now = db.now() if now is None else now
     offers = session_state(central).get("offers") or {}
     out = []
     for item in central.morpheus_items(("queued",)):
+        if (item["project"] or "") in skip:
+            continue
         seen = offers.get(item["id"]) or {}
         if int(seen.get("n") or 0) >= MAX_OFFERS:
             continue
@@ -770,7 +777,7 @@ def kill_hold(central: CentralStore, state: dict[str, Any], now: float) -> float
 
 def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = False,
          dirs: dict[str, Path] | None = None, now: float | None = None,
-         call: Callable[..., Any] | None = None) -> str:
+         call: Callable[..., Any] | None = None, skip: Collection[str] = ()) -> str:
     """One pass of Morpheus's session: compact if due, else write scripts if any are wanted"""
     from . import agent_usage, claude_cli
 
@@ -797,7 +804,7 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
         state.pop("kill_hold_until", None)
         state.pop("kill_hold_release", None)
         _save_session(central, state)
-    items = wanting_scripts(central, now=now)
+    items = wanting_scripts(central, now=now, skip=skip)
     if not state.get("compact_due") and not items:
         return "idle"
     session_id = state.get("session_id") or str(uuid.uuid4())

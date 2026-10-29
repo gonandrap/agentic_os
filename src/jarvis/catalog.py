@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import zoneinfo
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Collection
 
 from . import claude_cli
 from . import concision
@@ -1201,6 +1202,11 @@ class Catalog:
             if p.name == name:
                 return p
         raise CatalogError(f"unknown project {name!r} (known: {[p.name for p in self.projects]})")
+
+    def without_projects(self, names: Collection[str]) -> "Catalog":
+        """A copy with `names` dropped; the caller says which (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.1)"""
+        return dataclasses.replace(
+            self, projects=[p for p in self.projects if p.name not in names])
 
 
 def _err(msg: str) -> CatalogError:
