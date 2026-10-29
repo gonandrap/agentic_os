@@ -1013,7 +1013,7 @@ def _spec_block(spec: dict[str, str] | None, chars: int, cites: str = "") -> str
 
 
 def _focused(text: str, cites: str, chars: int, ref: str) -> str:
-    """Only the items `cites` names, verbatim and never cut; the whole section, bounded, when it names none (wo-ea3c6f0c)"""
+    """Only the items `cites` names, verbatim and never cut"""
     excerpts = sections.cited_excerpts(text, cites)
     if not excerpts:
         return _bounded(text, chars, ref)
@@ -1246,7 +1246,7 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
 
 def return_to_worker(store: Any, wo_id: str, assumption: dict[str, Any], note: str,
                      question_id: int) -> None:
-    """Neo's refine: the assumption leaves review as `refined` and the worker re-files it atomic (per Q2402)"""
+    """Neo's refine: the assumption leaves review as `refined` (per Q2402)"""
     store.review_assumption(assumption["id"], "refined", decided_by=DECIDER, reason=note)
     store.queue_message(wo_id, f"{REFINE_PREFIX} assumption #{assumption.get('n')}: {note}",
                         source="neo")

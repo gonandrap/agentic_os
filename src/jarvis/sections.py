@@ -122,7 +122,7 @@ def list_item(markdown: str, n: str) -> str | None:
 
 
 def cited_excerpts(markdown: str, text: str) -> list[str]:
-    """The smallest pieces of `markdown` that `text` cites by number; [] when it cites nothing found here (wo-ea3c6f0c)"""
+    """The smallest pieces of `markdown` that `text` cites by number"""
     out: list[str] = []
     for m in CITE_RE.finditer(text):
         num, item = m.group(1) or m.group(2), m.group(3)

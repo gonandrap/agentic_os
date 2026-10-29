@@ -286,7 +286,7 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
     return {**verdict, "model": result.model or model}
 
 
-#: Kinds whose asker is a worker that can re-file what a refine returns; an OS-built packet is fixed at its builder
+#: Kinds whose asker is a worker that can re-file what a refine returns
 REFINABLE_KINDS = ("question", "assumption")
 
 #: Refines per (work order, kind) before a refine becomes an escalation, so a bounce cannot loop

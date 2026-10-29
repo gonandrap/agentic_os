@@ -16,10 +16,11 @@ def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
     return (
         f"- `jarvis wo assume {wo_id} \"...\"`: ONE DECISION you made with NO doubt "
         f"— choice, rejected alternative, why; ≤{DEFAULT_ASSUME_MAX_CHARS} "
-        f"chars; a second decision (no `Also:` — Neo returns bundles) is a second "
-        f"`jarvis wo assume` citing it (`per Q1234`/`per assumption #2`)."
+        f"chars; a second decision is a second `jarvis wo assume` citing it "
+        f"(`per Q1234`/`per assumption #2`)."
         # Dropped in the CORE only: `CORE_BUDGET_CHARS` leaves no room for it there
-        + (f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), down to the "
+        + (f" No `Also:`: Neo returns a bundle unruled."
+           f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), down to the "
            f"item you rely on (`6.2 item 5`), never by pasting it and never by naming a "
            f"whole document." if cite_spec else "")
         + tail)
