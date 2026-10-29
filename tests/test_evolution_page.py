@@ -302,12 +302,124 @@ def test_the_project_page_links_to_its_own_evolution_report(client):
     assert 'href="/evolution/proj_a"' in body
 
 
-# -- read-only, by the work order's scope boundary
+# -- operating the registry: the `jarvis rules` verbs as forms (wo-ded7522d)
+
+COND = {"field": "status", "op": "eq", "value": "needs_review"}
 
 
-def test_nothing_under_evolution_accepts_a_post(app):
-    """The scope boundary says no arming and no rule editing from the page"""
-    offenders = [(r.path, sorted(r.methods)) for r in app.routes
-                 if getattr(r, "path", "").startswith("/evolution")
-                 and "POST" in getattr(r, "methods", set())]
-    assert offenders == []
+@pytest.fixture()
+def central(client):
+    from jarvis.central_store import CentralStore
+    c = CentralStore()
+    yield c
+    c.close()
+
+
+@pytest.fixture()
+def det(central):
+    d = central.add_detector("gap-under-test", COND, project="proj_a", source="user")
+    rm = central.add_remedy_rule(d["id"], "nudge", argument="ask where it got to")
+    return {**d, "remedy_id": rm["id"] if isinstance(rm, dict) else rm}
+
+
+def _fire(central, det, outcome="recorded"):
+    return central.record_rule_fire(detector_id=det["id"], project="proj_a",
+                                    order_id="wo-1", order_kind="wo", fingerprint="fp",
+                                    mode="dry_run", outcome=outcome)
+
+
+def _post(client, path, **form):
+    return client.post(path, data=form)
+
+
+def test_the_rule_page_offers_arm_and_retract_on_a_dry_run_detector(client, det):
+    body = body_of(client.get(f"/evolution/rule/{det['id']}").text)
+    assert f'action="/evolution/rule/{det["id"]}/arm"' in body
+    assert f'action="/evolution/rule/{det["id"]}/retract"' in body
+
+
+def test_arm_records_the_reason_and_the_page_shows_armed(client, central, det):
+    res = _post(client, f"/evolution/rule/{det['id']}/arm", reason="three clean hits")
+    assert res.status_code == 303 and "error=" not in res.headers["location"]
+    row = central.get_detector(det["id"])
+    assert row["status"] == "armed" and row["armed_reason"] == "three clean hits"
+    body = body_of(client.get(res.headers["location"]).text)
+    assert "three clean hits" in body
+    assert f'/evolution/rule/{det["id"]}/arm"' not in body
+
+
+def test_arm_without_a_reason_is_refused(client, central, det):
+    res = _post(client, f"/evolution/rule/{det['id']}/arm", reason="  ")
+    assert "error=" in res.headers["location"]
+    assert central.get_detector(det["id"])["status"] != "armed"
+
+
+def test_arming_an_armed_detector_is_refused(client, det):
+    _post(client, f"/evolution/rule/{det['id']}/arm", reason="first")
+    res = _post(client, f"/evolution/rule/{det['id']}/arm", reason="again")
+    assert "already+armed" in res.headers["location"] or "already%20armed" in res.headers["location"]
+
+
+def test_retract_a_detector_then_no_action_is_offered(client, central, det):
+    res = _post(client, f"/evolution/rule/{det['id']}/retract",
+                rule_id=det["id"], reason="it was wrong")
+    assert "error=" not in res.headers["location"]
+    assert central.get_detector(det["id"])["retired_at"] is not None
+    body = body_of(client.get(res.headers["location"]).text)
+    assert "/arm\"" not in body and "retract detector" not in body
+
+
+def test_retract_one_remedy_rule_leaves_the_detector(client, central, det):
+    res = _post(client, f"/evolution/rule/{det['id']}/retract",
+                rule_id=det["remedy_id"], reason="nudging never helped")
+    assert "error=" not in res.headers["location"]
+    assert central.get_remedy_rule(det["remedy_id"])["retired_at"] is not None
+    assert central.get_detector(det["id"])["retired_at"] is None
+
+
+def test_retract_without_a_reason_or_twice_is_refused(client, det):
+    path = f"/evolution/rule/{det['id']}/retract"
+    assert "error=" in _post(client, path, rule_id=det["id"], reason="").headers["location"]
+    _post(client, path, rule_id=det["id"], reason="gone")
+    assert "error=" in _post(client, path, rule_id=det["id"], reason="again").headers["location"]
+
+
+def test_flag_a_fire_false_positive(client, central, det):
+    fire = _fire(central, det)
+    page = body_of(client.get(f"/evolution/rule/{det['id']}").text)
+    action = f'/evolution/rule/{det["id"]}/fires/{fire["id"]}/false-positive'
+    assert action in page
+    res = _post(client, action, reason="the order was fine")
+    assert "error=" not in res.headers["location"]
+    assert central.get_rule_fire(fire["id"])["false_positive"]
+    body = body_of(client.get(res.headers["location"]).text)
+    assert "the order was fine" in body and action not in body
+
+
+def test_false_positive_without_a_reason_or_on_an_undecided_fire_is_refused(client, central, det):
+    fire = _fire(central, det)
+    action = f'/evolution/rule/{det["id"]}/fires/{fire["id"]}/false-positive'
+    assert "error=" in _post(client, action, reason="").headers["location"]
+    cleared = _fire(central, det, outcome="cleared")
+    page = body_of(client.get(f"/evolution/rule/{det['id']}").text)
+    cleared_action = f'/fires/{cleared["id"]}/false-positive'
+    assert cleared_action not in page
+    assert "error=" in _post(client, f"/evolution/rule/{det['id']}" + cleared_action,
+                             reason="x").headers["location"]
+
+
+def test_enough_false_positives_return_an_armed_detector_to_dry_run(client, central, det):
+    _post(client, f"/evolution/rule/{det['id']}/arm", reason="go")
+    for _ in range(2):  # RulesConfig.false_positive_disarm's default
+        fire = _fire(central, det)
+        _post(client, f'/evolution/rule/{det["id"]}/fires/{fire["id"]}/false-positive',
+              reason="wrong")
+    assert central.get_detector(det["id"])["status"] == "dry_run"
+
+
+def test_the_page_says_arming_does_nothing_while_the_pass_is_off(client, det, monkeypatch):
+    from jarvis.catalog import RulesConfig
+    monkeypatch.setattr(ops, "rules_config", lambda *a: RulesConfig(enabled=False))
+    assert 'id="rules-disabled"' in client.get(f"/evolution/rule/{det['id']}").text
+    monkeypatch.setattr(ops, "rules_config", lambda *a: RulesConfig(enabled=True))
+    assert 'id="rules-disabled"' not in client.get(f"/evolution/rule/{det['id']}").text

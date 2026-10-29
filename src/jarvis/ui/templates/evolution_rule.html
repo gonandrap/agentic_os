@@ -7,7 +7,8 @@
 
 {# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §5.
    Every figure is `ops.evolution_report`'s; like evolution.html this page derives none
-   (§9 of docs/superpowers/specs/2026-09-27-self-evolution.md) and is read-only. #}
+   (§9 of docs/superpowers/specs/2026-09-27-self-evolution.md). Its forms are the
+   `jarvis rules arm|retract|false-positive` verbs (wo-ded7522d); ops refuses what the CLI refuses. #}
 {% set back = "/evolution" ~ ("/" ~ report.project if report.project else "") %}
 {{ ui.page_head(rule.id, rule.gap_class ~ " · " ~ rule.status ~ " · " ~ report.window.days ~ " days · "
                 ~ (report.project or "the whole fleet")) }}
@@ -29,6 +30,85 @@
     <tr><th>last fired</th><td class="mono">{{ fmt_ts(rule.last_fired) }} · cleared {{ fmt_ts(rule.last_cleared) }}</td></tr>
   </table>
 </div>
+
+{% if detail %}
+{% set det = detail.detector %}
+<h2>Operate</h2>
+{% if rules_enabled is sameas false %}
+<p class="tone-warn" id="rules-disabled">the evaluation pass is off (<span class="mono">rules.enabled</span> is false):
+  arming has no effect until it is enabled on the config page or with <span class="mono">jarvis config set</span></p>
+{% endif %}
+<div class="panel table-wrap" id="rule-actions">
+  <table class="rule">
+    <tr><th>status</th><td class="mono">{{ det.status }}{% if det.armed_by and det.status == "armed" %} · by {{ det.armed_by }}: {{ det.armed_reason }}{% endif %}{% if det.retired_at %} · {{ det.retired_reason }}{% endif %}</td></tr>
+  </table>
+  {% if not det.retired_at and det.status != "retracted" %}
+  {% if det.status != "armed" %}
+  <form method="post" action="/evolution/rule/{{ det.id }}/arm">
+    <input type="hidden" name="next" value="{{ here }}">
+    <input type="text" name="reason" required placeholder="why this rule may act">
+    <button title="its fires raise an alarm and ask the self-heal gate; the gate still decides whether anything runs">arm</button>
+  </form>
+  {% endif %}
+  <form method="post" action="/evolution/rule/{{ det.id }}/retract">
+    <input type="hidden" name="next" value="{{ here }}">
+    <input type="hidden" name="rule_id" value="{{ det.id }}">
+    <input type="text" name="reason" required placeholder="why the OS should stop believing it">
+    <button title="retracts the detector and its live remedy rules; the record keeps that they applied">retract detector</button>
+  </form>
+  {% endif %}
+</div>
+
+{% if detail.remedies or detail.retired_remedies %}
+<h2>Remedy rules</h2>
+<div class="panel table-wrap" id="remedy-rules">
+  <table>
+    <tr><th>rule</th><th>primitive</th><th>state</th><th></th></tr>
+    {% for rem in detail.remedies + detail.retired_remedies %}
+    <tr>
+      <td class="mono">{{ rem.id }}</td>
+      <td class="mono">{{ rem.primitive }}</td>
+      <td>{% if rem.retired_at %}retracted — {{ rem.retired_reason }}{% else %}live{% endif %}</td>
+      <td>{% if not rem.retired_at %}
+        <form method="post" action="/evolution/rule/{{ det.id }}/retract">
+          <input type="hidden" name="next" value="{{ here }}">
+          <input type="hidden" name="rule_id" value="{{ rem.id }}">
+          <input type="text" name="reason" required placeholder="why">
+          <button>retract</button>
+        </form>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<h2>Newest fires</h2>
+{% if detail.fires %}
+<div class="panel table-wrap" id="rule-fires">
+  <table>
+    <tr><th>fire</th><th>when</th><th>outcome</th><th>order</th><th>mode</th><th>false positive?</th></tr>
+    {% for f in detail.fires %}
+    <tr>
+      <td class="mono">{{ f.id }}</td>
+      <td class="when mono">{{ fmt_ts(f.ts) }}</td>
+      <td class="mono">{{ f.outcome }}</td>
+      <td class="mono">{{ f.order_id }}</td>
+      <td class="mono">{{ f.mode }}</td>
+      <td>{% if f.false_positive %}yes — {{ f.false_positive_reason }}
+        {% elif f.outcome not in undecided %}
+        <form method="post" action="/evolution/rule/{{ det.id }}/fires/{{ f.id }}/false-positive">
+          <input type="hidden" name="next" value="{{ here }}">
+          <input type="text" name="reason" required placeholder="why it was wrong">
+          <button>flag false positive</button>
+        </form>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% else %}
+<p class="empty">this detector has not fired</p>
+{% endif %}
+{% endif %}
 
 <h2>Firing history ({{ rule.gap_class }}, by week)</h2>
 {% if weeks %}
