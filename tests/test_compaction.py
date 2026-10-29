@@ -141,6 +141,21 @@ def test_a_boundary_inside_the_ttl_does_not_compact(fleet, settle_turns):
     assert _turns(store, wo["id"])[-1] == ("message", "carry on")
 
 
+def test_an_hour_arm_turn_is_cold_only_after_the_hour(fleet, settle_turns):
+    """Issue #1291: the threshold is the TTL the last turn bought, not the 5-minute one"""
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    store.conn.execute("UPDATE wo_turns SET cache_ttl='1h' WHERE id=?",
+                       (store.latest_turn(wo["id"])["id"],))
+    ended = store.latest_turn(wo["id"])["ended_at"]
+    fresh = store.get_work_order(wo["id"])
+
+    assert worker_session.compaction_due(
+        store, fresh, BIG, now=ended + usage.WRITE_TTL_SECONDS + 600) is None
+    assert worker_session.compaction_due(
+        store, fresh, BIG, now=ended + usage.WRITE_TTL_1H_SECONDS + 1) is not None
+
+
 def test_a_small_conversation_past_the_ttl_does_not_compact(fleet, settle_turns):
     """The break-even floor: below it the summary costs more than the re-write"""
     store = fleet["store"]
