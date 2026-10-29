@@ -5087,6 +5087,37 @@ def gate_still_open(wo_id: str, request: dict[str, Any]) -> str:
             f"a privileged action nobody ruled on. {way_on}")
 
 
+#: How a kind that lands no code meets a reviewer's ask for evidence (issue 1322)
+NON_LANDING_EVIDENCE_RULE = (
+    "Evidence goes IN the artifact or in `--evidence`, never in a commit: paste the "
+    "decisive excerpt, or cite it by command, path or URL.")
+
+
+def non_landing_review_note(store: ProjectStore, wo: Mapping[str, Any]) -> str:
+    """The evidence rule and the parent's filed orders, read now (issue 1322)"""
+    if kind_contract(wo).lands_code:
+        return ""
+    note = f"\n\n{NON_LANDING_EVIDENCE_RULE}"
+    parent = wo.get("parent_id")
+    if not parent:
+        return note
+    try:
+        fo = store.get_feature_order(str(parent))
+    except KeyError:
+        return note
+    if fo.get("kind") == "improvement":
+        # An io's orders are filed per accepted finding, not as children
+        report = db.from_json(fo.get("plan"), None)
+        findings = report.get("findings") or [] if isinstance(report, dict) else []
+        ids = [str(o.get("id")) for f in findings if isinstance(f, dict)
+               for o in f.get("created_orders") or [] if isinstance(o, dict)]
+    else:
+        ids = [c["id"] for c in store.feature_children(str(parent), kinds=WORKER_CHILDREN)]
+    filed = ", ".join(ids[:10]) + (f", +{len(ids) - 10} more" if len(ids) > 10 else "")
+    return note + (f"\n\n{parent} has filed, as of this message: {filed or 'nothing'}. "
+                   f"A reviewer's claim about what it filed is read against this list.")
+
+
 def unlanded_refusal(wo: dict[str, Any], summary: str, work: landing.Authored) -> str:
     """Why this work order may not finish, and only the ways on its OWN kind may take (#232)"""
     from . import landing as landing_mod
@@ -5102,8 +5133,8 @@ def unlanded_refusal(wo: dict[str, Any], summary: str, work: landing.Authored) -
             f"nothing it leaves in its worktree can be delivered. Its artifact is "
             f"`{contract.artifact}` and its submission is `{submit}` — but the worktree "
             f"also holds {files}, which no submission consumes and no command of yours "
-            f"may land. End your turn naming those files: what happens to them is the "
-            f"user's call."
+            f"may land. {NON_LANDING_EVIDENCE_RULE} Then finish again with "
+            f"`--abandon \"<why>\"` naming those files."
         )
     named = landing_mod.pr_urls_in(summary)
     if named:
