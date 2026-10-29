@@ -108,6 +108,8 @@ def test_gate_rule_from_purged_project_still_blocks_others(central):
 def test_scoped_detector_is_retracted_never_widened(central):
     scoped = central.add_detector("purge-gap", COND, project="proj_a", source="user")
     fleet = central.add_detector("fleet-gap", COND, source="user")
+    retired = central.add_detector("old-gap", COND, project="proj_a", source="user")
+    central.retract_detector(retired["id"], "earlier")
     central.add_recurrence(gap_class="purge-gap", detector_id=scoped["id"],
                            project="proj_a", order_id="wo-1", verdict=rules.MISSED)
 
@@ -117,6 +119,7 @@ def test_scoped_detector_is_retracted_never_widened(central):
     after = central.get_detector(scoped["id"])
     assert after["project"] == "proj_a" and after["retired_at"] is not None
     assert central.get_detector(fleet["id"])["retired_at"] is None
+    assert central.get_detector(retired["id"])["retired_reason"] == "earlier"
     assert central.purge_project("proj_a")["detectors_retracted"] == 0
 
 

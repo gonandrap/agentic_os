@@ -630,7 +630,7 @@ CREATE INDEX IF NOT EXISTS idx_steward_decisions_dedupe
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_queue ON steward_decisions(queue_state);
 """
 
-#: Tables whose `project` is provenance, not scope: a purge rewrites them, never deletes (docs/superpowers/specs/2026-10-28-offboard-a-project.md §3)
+#: Tables whose `project` is provenance, not scope: purge clears or retracts, never deletes (docs/superpowers/specs/2026-10-28-offboard-a-project.md §3)
 PROVENANCE_TABLES = ("detectors", "gate_rules")
 
 
