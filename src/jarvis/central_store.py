@@ -876,6 +876,21 @@ class CentralStore:
             counts["detectors_retracted"] = len(live)
         return counts
 
+    def live_rows_by_project(self) -> list[tuple[str, str, int]]:
+        """(table, project, count) of rows the OS would still act on (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
+        live = {
+            "morpheus_items": "state IN ('queued', 'monitoring')",
+            # '' is fleet-wide and names no project
+            "detectors": "status = 'armed' AND retired_at IS NULL AND project != ''",
+            "rule_fires": "cleared_at IS NULL",
+            "inbox": "status != 'acked'",
+            "backlog": "status = 'open'",
+        }
+        return [(table, r["project"], r["n"]) for table, where in live.items()
+                for r in self.conn.execute(
+                    f"SELECT project, COUNT(*) AS n FROM {table} WHERE {where} "
+                    f"GROUP BY project ORDER BY project")]
+
     def inbox_titled_since(self, project: str, title: str, since: float) -> bool:
         """Has this exact item been raised for this project since `since`, acked or not?"""
         return self.conn.execute(
