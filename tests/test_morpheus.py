@@ -283,6 +283,23 @@ def test_confirm_files_one_fix_and_records_it(central):
     with pytest.raises(ValueError, match="already"):
         morpheus.confirm(central, item["id"], "again", lambda i: "wo-fix2")
     assert "/cost takes 6.8s" in morpheus.fix_description(done, "/cost takes 6.8s")
+    assert "morpheus requeue" not in morpheus.fix_description(done, "x")
+
+
+def test_a_confirmed_item_is_watched_again_once_its_superseding_fix_reaches_production(
+        central, cfg):
+    item = monitoring(central)
+    central.update_morpheus_item(item["id"], state="failed", action="neo:4")
+    morpheus.confirm(central, item["id"], "broken", lambda i: "wo-aaaa0001")
+    carrier = {"wo-aaaa0001": "wo-bbbb0002"}.get
+    follow = lambda wo: carrier(wo) or wo  # noqa: E731
+    assert morpheus.requeue_fixed(central, cfg, follow) == []
+    queued(central, 8, title="[wo-bbbb0002] the real fix")
+    assert morpheus.requeue_fixed(central, cfg, follow) == [item["id"]]
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "monitoring" and "wo-bbbb0002" in after["resolution"]
+    assert "PR #8" in after["resolution"]
+    assert morpheus.requeue_fixed(central, cfg, follow) == []
 
 
 # -- 4. the mechanical half: the exit code and nothing else

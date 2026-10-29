@@ -946,6 +946,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="this work order wrote code that is deliberately NOT being "
                         "landed, and this is why. Without it, finishing over commits "
                         "that no pull request covers is refused (GitHub issue #232)")
+    f.add_argument("--superseded-by", dest="superseded_by", default="", metavar="WO_ID",
+                   help="another order carries this one's work (a duplicate): links "
+                        "follow it, e.g. Morpheus re-watches a confirmed failure when "
+                        "THAT order's fix reaches production")
 
     r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
     r.add_argument("wo_id")
@@ -3644,7 +3648,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                          project_name=args.project), args.json)
     elif args.wo_cmd == "finish":
         _print(ops.finish(args.wo_id, args.summary, pr_url=args.pr or None,
-                          evidence=args.evidence, abandon=args.abandon), args.json)
+                          evidence=args.evidence, abandon=args.abandon,
+                          superseded_by=args.superseded_by), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
                                      feedback=args.feedback,
