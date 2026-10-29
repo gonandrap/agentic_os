@@ -740,6 +740,10 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--reason", required=True)
     m = mo.add_parser("requeue", help="watch a settled PR again with a fresh deadline")
     m.add_argument("item_id")
+    m = mo.add_parser("confirm", help="rule a failed check real and file the work order "
+                                      "that fixes it")
+    m.add_argument("item_id")
+    m.add_argument("--fix", required=True, help="what needs fixing: the order's description")
     m = mo.add_parser("pause", help="hold Morpheus's session turns, whatever the fleet does "
                                     "(checks still run; they spend nothing)")
     m.add_argument("--reason", required=True)
@@ -1662,9 +1666,20 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--level", default="info", choices=["info", "warning", "critical"])
     n.add_argument("--wo-id")
 
-    ib = sub.add_parser("inbox", help="central notification inbox").add_subparsers(
-        dest="ib_cmd", required=False)
-    ib.add_parser("list")
+    ibp = sub.add_parser("inbox", help="central notification inbox")
+    ib = ibp.add_subparsers(dest="ib_cmd", required=False)
+    ibl = ib.add_parser("list")
+    for ibx, sub_level in ((ibp, False), (ibl, True)):
+        # SUPPRESS on `list` so its defaults never overwrite flags given before it
+        d = (lambda v: argparse.SUPPRESS) if sub_level else (lambda v: v)
+        ibx.add_argument("--level", choices=["critical", "warning", "info"], default=d(""),
+                         help="only this criticality")
+        ibx.add_argument("--project", default=d(""), help="only this project")
+        ibx.add_argument("--search", "-s", default=d(""),
+                         help="words that must all appear in title, body or wo id")
+        ibx.add_argument("--sort", choices=["priority", "newest", "oldest"],
+                         default=d("priority"),
+                         help="priority (default) = critical first, newest first within a level")
     i = ib.add_parser("ack")
     i.add_argument("inbox_id", nargs="?", type=int, help="omit to ack everything")
 
@@ -4052,6 +4067,11 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
         item = ops.morpheus_requeue(args.item_id)
         _print({"id": item["id"], "state": item["state"]}, args.json)
         return 0
+    if args.morpheus_cmd == "confirm":
+        item = ops.morpheus_confirm(args.item_id, args.fix)
+        _print({"id": item["id"], "state": item["state"], "fix_order": item["fix_order"]},
+               args.json)
+        return 0
     if args.morpheus_cmd in ("pause", "unpause", "follow-fleet"):
         mode = {"pause": "paused", "unpause": "running"}.get(args.morpheus_cmd)
         state = ops.morpheus_pause(mode, getattr(args, "reason", ""))
@@ -5472,7 +5492,8 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         if args.ib_cmd == "ack":
             _print(ops.ack_inbox(args.inbox_id), args.json)
         else:
-            items = central.unacked_inbox()
+            items = ops.select_inbox(central.unacked_inbox(), level=args.level,
+                                     project=args.project, q=args.search, sort=args.sort)
             if args.json:
                 _print(items, True)
             else:
@@ -5481,7 +5502,8 @@ def cmd_inbox(args: argparse.Namespace) -> int:
                           f"{it['title']} ({_age(it['ts'])})"
                           + (f" — {it['body']}" if it["body"] else ""))
                 if not items:
-                    print("inbox empty ✨")
+                    print("nothing matches these filters" if args.level or args.project
+                          or args.search else "inbox empty ✨")
     finally:
         central.close()
     return 0

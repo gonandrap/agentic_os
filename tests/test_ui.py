@@ -86,6 +86,8 @@ def test_dashboard_renders_quiet(client):
     assert r.status_code == 200
     assert "all quiet" in r.text
     assert "proj_a" in r.text
+    # the sidebar lists projects; the dashboard has no projects column (wo-27a8661c)
+    assert "<h2>Projects</h2>" not in r.text
 
 
 def test_dashboard_auto_refresh_is_scoped_to_the_live_regions(client):
@@ -839,6 +841,29 @@ def test_inbox_page_and_ack(client, daemon, project):
     assert "disk almost full" in r.text and "critical" in r.text
     client.post("/inbox/ack", data={})
     assert "inbox empty" in client.get("/inbox").text
+
+
+def test_inbox_filters_sort_and_ack_shown(client, daemon, project):
+    store = ProjectStore(project)
+    store.add_notification("low news", level="info")
+    store.add_notification("disk almost full", level="critical")
+    store.add_notification("quota near", level="warning")
+    daemon.tick()
+    text = client.get("/inbox").text
+    assert text.index("disk almost full") < text.index("quota near") < text.index("low news")
+    text = client.get("/inbox?level=warning").text
+    assert "quota near" in text and "disk almost full" not in text and "1 of 3 shown" in text
+    text = client.get("/inbox?q=DISK").text
+    assert "disk almost full" in text and "low news" not in text
+    assert "nothing matches" in client.get("/inbox?project=nope").text
+    central = CentralStore()
+    shown = [it["id"] for it in ops.select_inbox(central.unacked_inbox(), level="critical")]
+    central.close()
+    r = client.post("/inbox/ack", data={"shown": ",".join(map(str, shown)),
+                                        "next": "/inbox?level=critical"})
+    assert r.headers["location"] == "/inbox?level=critical"
+    text = client.get("/inbox").text
+    assert "disk almost full" not in text and "low news" in text
 
 
 def test_dashboard_clears_unacked_banner_after_ack(client, daemon, project):

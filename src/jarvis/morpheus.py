@@ -337,6 +337,36 @@ def waive(central: CentralStore, item_id: str, reason: str) -> dict:
     return central.morpheus_item(item_id) or {}
 
 
+#: How a confirmed item's resolution starts: one fix order per item
+CONFIRMED = "confirmed failed by the user"
+
+
+def confirm(central: CentralStore, item_id: str, fix: str,
+            file: Callable[[dict[str, Any]], str]) -> tuple[dict, str]:
+    """The user rules the failure real; `file` opens the fix order. (item, order id)"""
+    item = _item_or_raise(central, item_id)
+    if item["state"] not in ACTION_STATES:
+        raise ValueError(f"{item_id} is {item['state']}: only a failed or timed-out check "
+                         f"can be confirmed")
+    if (item["resolution"] or "").startswith(CONFIRMED):
+        raise ValueError(f"{item_id} is already {item['resolution']}")
+    if not (fix or "").strip():
+        raise ValueError("say what needs fixing")
+    order = file(item)
+    central.update_morpheus_item(
+        item_id, resolution=f"{CONFIRMED}; fix filed as {order}: {fix.strip()}"[:1000])
+    return central.morpheus_item(item_id) or {}, order
+
+
+def fix_description(item: dict[str, Any], fix: str) -> str:
+    """A confirmed failure's fix order: the user's words, then what Morpheus saw"""
+    return (f"{fix.strip()}\n\nPR {item['pr_url']} {item['state']} its production "
+            f"validation ({item['resolution']}); the user confirmed the failure is real.\n"
+            f"The check: `jarvis morpheus show {item['id']}`. Once the fix ships, "
+            f"`jarvis morpheus requeue {item['id']}` watches it again.\n\n"
+            f"Last check output:\n{(item.get('last_output') or '—')[-1500:]}")
+
+
 def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str, *,
             resolution: str = "") -> dict:
     """Watch it again with a fresh deadline (and a fresh action)"""
@@ -494,7 +524,7 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
         steward.Candidate("morpheus", "critical", project,
                           f"PR #{item['pr_number']} {item['state']} production validation",
                           evidence=(item.get("last_output") or item["resolution"],),
-                          parent_wo_id=wo_id),
+                          parent_wo_id=wo_id, payload={"morpheus_item": item["id"]}),
         catalog=catalog)
     if not decision.allowed:
         return "", f"the steward did not dispatch it ({decision.outcome}: {decision.reason})"
@@ -513,7 +543,8 @@ def _improve(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
     title = f"PR #{item['pr_number']} {item['state']} production validation"
     decision = steward.gate(
         steward.Candidate("morpheus", "critical", project, title,
-                          evidence=(item.get("last_output") or item["resolution"],)),
+                          evidence=(item.get("last_output") or item["resolution"],),
+                          payload={"morpheus_item": item["id"]}),
         catalog=catalog)
     if not decision.allowed:
         return "", f"the steward did not dispatch it ({decision.outcome}: {decision.reason})"
@@ -550,12 +581,13 @@ REQUEUE_OFFER = """If the failure was transient — production had not exercised
 environment hiccup — add `"action": "requeue"` to your JSON and the OS watches it again
 with a fresh deadline. That is available ONCE per item, and this item still has it.
 Ruling the change fine is the USER'S: recommend `jarvis morpheus waive {id} --reason "…"`,
-never a waive of your own."""
+never a waive of your own; ruling it broken is theirs too: `jarvis morpheus confirm {id} --fix "…"`."""
 
 #: It has spent it, so saying `requeue` would only look like an action
 REQUEUE_SPENT = """This item has already spent its one automatic requeue, so `"action": "requeue"` is
 refused and it stays {state}. The user re-watches it with `jarvis morpheus requeue {id}`
-or rules it fine with `jarvis morpheus waive {id} --reason "…"`."""
+rules it fine with `jarvis morpheus waive {id} --reason "…"`, or rules it broken and files
+the fix with `jarvis morpheus confirm {id} --fix "…"`."""
 
 
 def _ask_neo(catalog: Catalog, item: dict[str, Any], note: str = "") -> int:
