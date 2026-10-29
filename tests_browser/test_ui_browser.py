@@ -1120,3 +1120,70 @@ def test_the_feature_page_labels_its_coarse_span_as_approximate(page, server, pr
     assert "nothing on the record for 4.0h" in section["text"]
     assert "executing" in section["text"]
     _shot_clip(page, section["clip"], "fo-time-in-state")
+
+
+# §2 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+_WIDTHS = ({"width": 1440, "height": 900}, {"width": 390, "height": 844})
+_LONG = "a sentence long enough to need several words on every line of the cell it sits in"
+
+
+def test_the_readable_check_fails_a_squeezed_cell_and_passes_a_wide_one(page, readable):
+    import pytest
+
+    page.set_content(f"<main><table><tr><td style='width:40px;max-width:40px'>{_LONG}</td>"
+                     f"</tr></table></main>")
+    with pytest.raises(AssertionError, match="squeezed"):
+        readable(page)
+    page.set_content(f"<main><table><tr><td>{_LONG}</td></tr></table>"
+                     f"<details><summary>why</summary><p style='width:40px'>{_LONG}</p></details>"
+                     f"<pre><p style='width:40px'>{_LONG}</p></pre></main>")
+    readable(page)  # hidden in a closed <details>, or inside <pre>: skipped
+
+
+def _inbox_rows(project_wo=None):
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        central.add_inbox("proj_a", "routine deploy finished", body=_LONG, level="info")
+        central.add_inbox("proj_a", "quota nearly used up", level="warning")
+        central.add_inbox("proj_a", "worker crashed twice", level="critical", wo_id=project_wo)
+    finally:
+        central.close()
+
+
+def test_the_inbox_reads_at_desktop_and_phone_width(page, server, readable):
+    _inbox_rows()
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/inbox")
+        assert "worker crashed twice" in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"inbox-{size['width']}")
+
+
+def test_an_inbox_filter_in_the_url_narrows_the_rows(page, server):
+    _inbox_rows()
+    page.goto(f"{server}/inbox?level=warning")
+    body = page.locator("main").inner_text()
+    assert "quota nearly used up" in body
+    assert "routine deploy finished" not in body and "worker crashed twice" not in body
+    assert "1 of 3 shown" in body and "level: warning" in body
+    page.goto(f"{server}/inbox?project=nope")
+    assert "nothing matches these filters" in page.locator("main").inner_text()
+
+
+def test_a_critical_inbox_row_sits_above_the_others(page, server):
+    _inbox_rows()
+    page.goto(f"{server}/inbox?sort=newest")
+    crit = page.locator(".needs-you :text('worker crashed twice')").bounding_box()
+    for other in ("quota nearly used up", "routine deploy finished"):
+        assert crit["y"] < page.locator(f"main .panel :text('{other}')").bounding_box()["y"]
+
+
+def test_clicking_an_inbox_row_id_opens_its_order(page, server, daemon):
+    wo = ops.create_work_order("proj_a", "the order the alert is about")
+    _inbox_rows(project_wo=wo["id"])
+    page.goto(f"{server}/inbox")
+    page.click(f"a.rowid:has-text('{wo['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
+    assert "the order the alert is about" in page.locator("main").inner_text()

@@ -5620,26 +5620,21 @@ INBOX_LIST_NOTE = ("a log of notifications; `jarvis inbox ack` marks them read �
 
 def cmd_inbox(args: argparse.Namespace) -> int:
     from . import ops
-    from .central_store import CentralStore
-    central = CentralStore()
-    try:
-        if args.ib_cmd == "ack":
-            _print(ops.ack_inbox(args.inbox_id), args.json)
-        else:
-            items = ops.select_inbox(central.unacked_inbox(), level=args.level,
-                                     project=args.project, q=args.search, sort=args.sort)
-            if args.json:
-                _print(items, True)
-            else:
-                for it in items:
-                    print(f"[{it['id']}] {it['level'].upper()} [{it['project']}] "
-                          f"{it['title']} ({_age(it['ts'])})"
-                          + (f" — {it['body']}" if it["body"] else ""))
-                if not items:
-                    print("nothing matches these filters" if args.level or args.project
-                          or args.search else "inbox empty ✨")
-    finally:
-        central.close()
+    if args.ib_cmd == "ack":
+        _print(ops.ack_inbox(args.inbox_id), args.json)
+        return 0
+    items = ops.select_inbox(ops.unacked_inbox(), level=args.level,
+                             project=args.project, q=args.search, sort=args.sort)
+    if args.json:
+        _print(items, True)
+        return 0
+    for it in items:
+        print(f"[{it['id']}] {it['level'].upper()} [{it['project']}] "
+              f"{it['title']} ({_age(it['ts'])})"
+              + (f" — {it['body']}" if it["body"] else ""))
+    if not items:
+        print("nothing matches these filters" if args.level or args.project
+              or args.search else "inbox empty ✨")
     return 0
 
 

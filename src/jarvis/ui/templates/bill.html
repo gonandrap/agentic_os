@@ -3,9 +3,6 @@
 {% import "_order_nav.html" as nav %}
 {% block title %}bill — {{ bill.id }} — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 760px;">
 
 <h2>What {{ bill.id }} cost</h2>
 
@@ -288,6 +285,4 @@
 <p class="sub" style="margin-top: 6px;">
   Every figure on this page is {{ bill.floor_reason }}.
 </p>
-
-</div>
 {% endblock %}
