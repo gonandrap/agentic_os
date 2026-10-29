@@ -3163,6 +3163,36 @@ def check_config_drift() -> Iterator[Violation]:
     )
 
 
+def check_offboarded_activity() -> Iterator[Violation]:
+    """INV-OFFBOARDED-ACTIVITY — nothing the OS acts on names a project with no `projects` row (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
+    from .central_store import CentralStore
+    from .neo_store import OPEN_Q_STATUSES, NeoStore
+
+    central = CentralStore()
+    neo = NeoStore()
+    try:
+        # Archived projects keep their row, so their left-behind rows are by design, never a violation
+        known = {p["name"] for p in central.list_projects()} | {"", "os"}
+        found = central.live_rows_by_project()
+        asked: dict[str, int] = {}
+        for q in neo.list_questions(statuses=OPEN_Q_STATUSES, limit=-1):
+            asked[q["project"]] = asked.get(q["project"], 0) + 1
+        found += [("questions", name, n) for name, n in sorted(asked.items())]
+    finally:
+        neo.close()
+        central.close()
+    for table, project, count in found:
+        if project in known:
+            continue
+        yield Violation(
+            invariant="INV-OFFBOARDED-ACTIVITY",
+            detail=(f"{count} live {table} row(s) name project {project!r}, which the OS has "
+                    f"no record of. Finish the purge with `jarvis offboard {project} --purge "
+                    f"--yes`, or re-register it with `jarvis adopt <path>` and `jarvis start`."),
+            context={"project": project, "table": table, "rows": count},
+        )
+
+
 def check_service_path() -> Iterator[Violation]:
     """INV-SERVICE-PATH — the installed units' PATH must reach `gh` (#41)"""
     from . import bugreport, release
@@ -3600,11 +3630,67 @@ def check_morpheus_moves() -> Iterator[Violation]:
             context={"item": item["id"], "pr": item["pr_number"], "state": item["state"]})
 
 
+#: libsqlite3 releases that deadlock in-process on WAL close vs open (io-6fdf5c66); fixed in 3.51.2
+KNOWN_BAD_SQLITE = frozenset({"3.51.0", "3.51.1"})
+
+
+def check_sqlite_version() -> Iterator[Violation]:
+    """INV-SQLITE-VERSION — the runtime's libsqlite3 is not a known-deadlocking release"""
+    import sqlite3
+    import sys
+
+    version = sqlite3.sqlite_version
+    if version not in KNOWN_BAD_SQLITE:
+        return
+    yield Violation(
+        invariant="INV-SQLITE-VERSION",
+        detail=(f"{sys.executable} runs libsqlite3 {version}, which deadlocks two threads "
+                f"opening and closing a WAL database (fixed in 3.51.2). Rebuild the venv "
+                f"on an interpreter with SQLite 3.51.2+ or older than 3.51.0 (e.g. "
+                f"`uv venv --python-preference only-managed`, then `uv sync`)."),
+        level="critical", context={"sqlite_version": version, "python": sys.executable},
+    )
+
+
+def report_at_startup(who: str) -> list[Violation]:
+    """Run the startup post-conditions once and inbox each, deduped across daemon and UI"""
+    import logging
+
+    from . import schedule
+    from .project_store import ProjectStore
+
+    log = logging.getLogger(__name__)
+    found = list(check_sqlite_version())
+    for v in found:
+        log.critical("[%s startup] %s", who, v)
+    catalog = _live_catalog() if found else None
+    if catalog is None:
+        return found
+    try:
+        owner = schedule.os_project((p.name, p.path) for p in catalog.projects)
+        if owner is None:
+            return found
+        store = ProjectStore(Path(catalog.project(owner).path))
+    except Exception:  # noqa: BLE001 — the log line above already carries it
+        log.exception("startup check: cannot reach the OS project's store")
+        return found
+    try:
+        for v in found:
+            if store.open_violation_report(v.invariant, None, level=v.level, detail=v.detail):
+                store.add_notification(title=f"OS invariant violated: {v.invariant}",
+                                       body=v.detail, level=v.level, source="invariants")
+    finally:
+        store.close()
+    return found
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
+    check_sqlite_version,
     check_ui_healthy,
     check_ui_wedged,
     check_gate_canaries,
     check_config_drift,
+    check_offboarded_activity,
     check_service_path,
     check_production_clean,
     check_prod_cli,
@@ -3823,11 +3909,15 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
         doc = str(plan.get("design_doc") or "").strip()
         if not doc:
             continue
-        found = landing.committed_exists(store.project_path, _planner_row(store, fo),
-                                         doc, fetched)
+        planner = _planner_row(store, fo)
+        found = landing.committed_exists(store.project_path, planner, doc, fetched)
         if found is None or found.present:
             continue
         fo_id = fo["id"]
+        unmerged = _unmerged_spec(store, fo, planner, doc, fetched)
+        if unmerged is not None:
+            yield from unmerged
+            continue
         matches = _tracked_with_basename(found.repo, found.ref, Path(doc).name)
         detail = (f"feature order {fo_id} stores its design document at `{doc}`, and no "
                   f"file is there. `jarvis fo show {fo_id}` and the work order pages "
@@ -3860,6 +3950,46 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
             subject_id=fo_id,           # per-feature dedupe identity — spec §2.3
             context={"fo_id": fo_id, "was": doc, "matches": matches[:10]},
         )
+
+
+def _unmerged_spec(store: ProjectStore, fo: dict[str, Any],
+                   planner: dict[str, Any] | None, doc: str,
+                   fetched: set[str]) -> list[Violation] | None:
+    """The design doc is on the planner's PUSHED branch and not the default one: the spec PR is unmerged (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §3)"""
+    from . import landing, ops
+    from .project_store import FO_OPEN_STATUSES, SPEC_PR_OPEN_STATUSES
+
+    if planner is None:
+        return None
+    work = landing.latest_authorship(
+        [(float(e["ts"]), db.from_json(e["payload"], {}))
+         for kind in landing.SETTLEMENT_EVENTS
+         for e in store.events_of_kind(planner["id"], kind)])
+    branch = work.branch if work is not None else ""
+    if not branch or not landing.pushed_exists(store.project_path, branch, doc, fetched):
+        return None
+    fo_id, planner_id = fo["id"], planner["id"]
+    pr_url = str(planner.get("pr_url") or "")
+    context = {"fo_id": fo_id, "was": doc, "planner": planner_id, "branch": branch,
+               "pr_url": pr_url}
+    if pr_url and planner["status"] in SPEC_PR_OPEN_STATUSES:
+        return []       # parked behind it: the OS is already driving that merge
+    detail = (f"feature order {fo_id}'s design document `{doc}` is committed on "
+              f"`origin/{branch}` and not on the default branch: its spec pull request "
+              f"{pr_url or '(none recorded)'} has not merged.")
+    if pr_url and planner["status"] == "completed" and fo["status"] in FO_OPEN_STATUSES:
+        now = ops.repark_spec_pull_request(planner_id)
+        return [Violation(
+            invariant=INV_SPEC_POINTER_REAL, detail=detail, repaired=True,
+            repair=f"put planner {planner_id} back behind {pr_url} ({now}); the OS "
+                   f"merges it like any delivered pull request",
+            subject_id=fo_id, context=context)]
+    remedy = (f"merge {pr_url}" if pr_url else
+              f"open a pull request on `{branch}` and record it with "
+              f"`jarvis wo pr {planner_id} <url>`")
+    owed = f"{detail} The children's spec_section references resolve nowhere on main until it does: {remedy}."
+    return [Violation(invariant=INV_SPEC_POINTER_REAL, detail=owed, owed=owed,
+                      subject_id=fo_id, context=context)]
 
 
 def _planner_row(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any] | None:

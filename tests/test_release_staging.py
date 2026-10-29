@@ -483,8 +483,11 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
-#: `uv sync` is a no-op here, but `uv lock` must not be: the release commit carries the relocked file...
+#: `uv sync` leaves a stub venv python for the SQLite check; `uv lock` relocks for real
 _STUB_UV = """#!/bin/sh
+if [ "$1" = "sync" ]; then
+  mkdir -p .venv/bin && printf '#!/bin/sh\\nexit 0\\n' > .venv/bin/python && chmod +x .venv/bin/python
+fi
 if [ "$1" = "lock" ]; then
   v=$(grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\\1/')
   awk -v v="$v" 'prev && /^version = / { sub(/"[^"]+"/, "\\"" v "\\"") } { prev = ($0 == "name = \\"jarvis-os\\""); print }' uv.lock > uv.lock.new && mv uv.lock.new uv.lock

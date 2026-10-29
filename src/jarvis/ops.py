@@ -3994,8 +3994,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     return status
 
 
-#: The `pr_url_recorded` sources that route the merge queue; `gate` and `plan_submit` stay inert
-DECLARING_SOURCES = ("user", "auto")
+#: The `pr_url_recorded` sources that route the merge queue; `gate` stays inert (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §1)
+DECLARING_SOURCES = ("user", "auto", "plan_submit")
 
 
 def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
@@ -6622,7 +6622,7 @@ def resolve_ref(ref: str) -> str:
     if numbered:
         kind, n = numbered.groups()
         if kind == "gate-":
-            return f"/gates#gate-{n}"
+            return f"/gates/{n}"
         if kind in ("issue-", "#"):
             return "/search?q=" + quote(f"#{n}")
         # a bare number is the one id a reader is shown without a prefix: a Neo question's
@@ -6643,8 +6643,9 @@ def resolve_ref(ref: str) -> str:
             return f"/alarms/{name}/{rid}"
     except OpsError:
         return search
-    # Listed on one fleet-wide page each, and addressed there by their own id
-    return {"kn": "/knowledge", "mv": "/morpheus", "bl": "/backlog"}[prefix] + f"#{rid}"
+    if prefix == "mv":
+        return f"/morpheus/{rid}"
+    return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"/{rid}"
 
 
 def worker_prompts(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -8290,7 +8291,8 @@ def submit_verdict(inv_id: str, doc: Any,
 
 
 def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
-                      payload: dict[str, Any]) -> dict[str, Any] | None:
+                      payload: dict[str, Any],
+                      pr_url: str | None = None) -> dict[str, Any] | None:
     """Settle the work order whose submission was just stored, BY ITS KIND'S ROUTE"""
     store = ProjectStore(path)
     try:
@@ -8306,7 +8308,7 @@ def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
     finally:
         store.close()
     if route == SETTLE_BY_FINISH:
-        return finish(wo_id, summary)
+        return finish(wo_id, summary, pr_url=pr_url)
     raise OpsError(f"{wo_id} is a {wo.get('kind') or 'worker'}, whose kind settles by "
                    f"{route!r} and never by a submission")
 
@@ -8486,6 +8488,47 @@ def _record_spec_pull_request(path: Path, fo_id: str,
         store.close()
 
 
+def _spec_pull_request(path: Path, planner_id: str) -> str | None:
+    """The planner's `pr_url` when `plan_submit` recorded it; a gate-recorded URL stays inert (#742)"""
+    store = ProjectStore(path)
+    try:
+        pr_url = str(store.get_work_order(planner_id).get("pr_url") or "")
+        recorded = {str(db.from_json(e["payload"], {}).get("pr_url") or "")
+                    for e in store.events_of_kind(planner_id, "pr_url_recorded")
+                    if db.from_json(e["payload"], {}).get("source") == "plan_submit"}
+    finally:
+        store.close()
+    return pr_url if pr_url and pr_url in recorded else None
+
+
+#: A completed planner put back behind its unmerged spec pull request
+SPEC_PR_REPARKED_EVENT = "spec_pr_reparked"
+
+
+def repark_spec_pull_request(wo_id: str) -> str:
+    """A COMPLETED planner whose spec PR never merged goes back behind it, as `finish` parks it (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §4)"""
+    name, path, _wo = find_work_order(wo_id)
+    cfg = validation_config(name)
+    store = ProjectStore(path)
+    try:
+        wo = store.get_work_order(wo_id)
+        pr_url = str(wo.get("pr_url") or "")
+        if wo["status"] != "completed" or not pr_url:
+            return str(wo["status"])
+        store.add_event(wo_id, SPEC_PR_REPARKED_EVENT, {"pr_url": pr_url})
+        submits = validation_applies(cfg, wo, store)
+        opened = (submit_for_validation(store, path, wo,
+                                        declared=declared_evidence(store, wo_id), cfg=cfg)
+                  if submits else None)
+        if str((opened or {}).get("outcome") or "") == "escalated":
+            return str(store.get_work_order(wo_id)["status"])
+        return land_when_cleared(store, store.get_work_order(wo_id), pr_url,
+                                 panel_open=submits and opened is None,
+                                 panel_cleared=not submits)
+    finally:
+        store.close()
+
+
 def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
                      planner_id: str, source: str, why: str) -> dict[str, Any]:
     """Ask for a review of this plan, closing whichever review it replaces"""
@@ -8578,10 +8621,13 @@ def submit_plan(fo_id: str, doc: Any,
     if fo.get("plan_wo_id"):
         # The planner has no more to say until the review lands
         summary = f"submitted a plan for {fo_id}: {len(plan['children'])} work orders"
+        # The spec PR is DELIVERED, so it parks and the OS merges it (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §1)
+        spec_pr = _spec_pull_request(path, fo["plan_wo_id"])
         try:
             out["planner"] = _settle_submitter(path, fo["plan_wo_id"], summary,
                                                "plan_submitted_settled",
-                                               {"feature_order": fo_id})
+                                               {"feature_order": fo_id},
+                                               pr_url=spec_pr)
         except OpsError as e:
             # docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md
             out["warning"] = _planner_unsettled(path, fo_id, fo["plan_wo_id"],
@@ -10782,7 +10828,15 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
     """One approval request in full, including the text the reviewer saw"""
     from .neo_store import NeoStore
 
-    name, _path, approval = _find_approval(approval_id, project_name)
+    from . import gates
+
+    name, path, approval = _find_approval(approval_id, project_name)
+    store = ProjectStore(path)
+    try:  # sweep as list_gates does, so the record and the list agree
+        store.expire_approvals()
+        approval = store.get_approval(approval_id) or approval
+    finally:
+        store.close()
     question = None
     if approval["neo_question_id"]:
         neo = NeoStore()
@@ -10790,7 +10844,11 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
             question = neo.get(approval["neo_question_id"])
         finally:
             neo.close()
-    return {**approval, "project": name, "neo_question": question}
+    out = {**approval, "project": name, "neo_question": question}
+    if approval["status"] == gates.AWAITING_CASE:  # its next event is a clock, as in list_gates
+        ttl = _case_ttl_seconds().get(name, gates.DEFAULT_CASE_TTL_SECONDS)
+        out["case_ttl_seconds"], out["case_deadline"] = ttl, approval["ts"] + ttl
+    return out
 
 
 # -- the config console
@@ -11846,6 +11904,37 @@ def defer(wo_id: str, title: str, why: str, description: str = "",
 
 
 # -- backlog
+
+def list_backlog(project: str | None = None, status: str | None = "open"
+                 ) -> list[dict[str, Any]]:
+    """Backlog items, oldest first, each open one with its blockers"""
+    central = CentralStore()
+    try:
+        items = central.list_backlog(project=project, status=status)
+        for it in items:
+            it["blockers"] = (central.unfinished_dependencies(it["id"])
+                              if it["status"] == "open" else [])
+    finally:
+        central.close()
+    return items
+
+
+def show_backlog(item_id: str) -> dict[str, Any]:
+    """One backlog item with its dependencies and blockers"""
+    central = CentralStore()
+    try:
+        item = central.get_backlog(item_id)
+        if not item:
+            raise OpsError(f"backlog item {item_id!r} not found")
+        item["dependencies"] = [
+            central.get_backlog(d) or {"id": d, "status": "missing", "title": "?"}
+            for d in item["depends_on"]]
+        item["blockers"] = [d for d in item["dependencies"] if d["status"] != "done"] \
+            if item["status"] == "open" else []
+    finally:
+        central.close()
+    return item
+
 
 def promote_backlog(item_id: str, force: bool = False,
                     as_feature: bool = False,
@@ -13541,6 +13630,70 @@ def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]
     return effects
 
 
+def list_knowledge(q: str = "", topic: str | None = None, limit: int = 5000
+                   ) -> dict[str, Any]:
+    """Entries matching words/topic, each with its headline and read count"""
+    from .central_store import PINNED_TAG, has_tag, headline
+
+    central = CentralStore()
+    try:
+        rows = central.search_knowledge(q.strip(), limit=limit, topic=topic)
+        topics = central.knowledge_topics()
+        hits = central.knowledge_hit_counts()
+    finally:
+        central.close()
+    if not q.strip():  # a word search keeps its rank order
+        rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
+    for r in rows:
+        r["pinned"] = has_tag(r["tags"], PINNED_TAG)
+        r["headline"] = headline(r["content"])
+        r["reads"] = hits.get(r["id"], 0)
+    return {"rows": rows, "topics": topics}
+
+
+def show_knowledge(ids: Sequence[str], project: str | None = None,
+                   wo_id: str | None = None, record: bool = True) -> list[dict[str, Any]]:
+    """Entries in full — `jarvis learn show`; `record` logs the read an agent made"""
+    central = CentralStore()
+    try:
+        rows = [r for r in (central.get_knowledge(i) for i in ids) if r]
+        if record:
+            central.record_knowledge_read("show", rows, term=" ".join(ids),
+                                          project=project, wo_id=wo_id)
+    finally:
+        central.close()
+    missing = set(ids) - {r["id"] for r in rows}
+    if missing:
+        raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
+    return rows
+
+
+def knowledge_detail(kn_id: str) -> dict[str, Any]:
+    """One entry for the dashboard, not logged as a read"""
+    from .central_store import PINNED_TAG, has_tag, headline
+
+    [row] = show_knowledge([kn_id], record=False)
+    central = CentralStore()
+    try:
+        reads = central.knowledge_hit_counts().get(kn_id, 0)
+    finally:
+        central.close()
+    return {**row, "pinned": has_tag(row["tags"], PINNED_TAG),
+            "headline": headline(row["content"]), "reads": reads}
+
+
+def pin_knowledge(kn_id: str, pinned: bool = True) -> dict[str, Any]:
+    """Pin or unpin an entry: pinned ones ride verbatim in every worker prompt"""
+    central = CentralStore()
+    try:
+        row = central.pin_knowledge(kn_id, pinned=pinned)
+    finally:
+        central.close()
+    if row is None:
+        raise OpsError(f"unknown knowledge id {kn_id!r}")
+    return row
+
+
 def knowledge_usage_report(project: str | None = None, days: int | None = None,
                            limit: int = 20) -> dict[str, Any]:
     """What memory costs and whether anyone uses it"""
@@ -13775,7 +13928,8 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     scope = {project: paths[project]} if project else paths
 
     questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
-                 "superseded": 0, "escalation_rate": None, "unreachable_rate": None}
+                 "superseded": 0, "refined": 0, "escalation_rate": None,
+                 "unreachable_rate": None}
     by_kind: dict[str, dict[str, Any]] = {}
     by_project: dict[str, dict[str, Any]] = {}
     by_day: dict[str, dict[str, Any]] = {}
@@ -13804,6 +13958,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         elif row["status"] == "answered" and row["answered_by"] == "os":
             # `NeoStore.supersede`: decided somewhere else, so neither Neo answering nor Neo handing back
             questions["superseded"] += n
+        elif row["status"] == "refined":
+            # Bounced to the asker to split: not an escalation (wo-ea3c6f0c)
+            questions["refined"] += n
         elif row["status"] in ("escalated", "failed"):
             for bucket in buckets:
                 bucket[row["status"]] += n

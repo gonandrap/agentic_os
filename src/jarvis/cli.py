@@ -5013,8 +5013,8 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                                        origin_note=args.origin_note)
             _print(item, args.json)
         elif args.bl_cmd == "list":
-            items = central.list_backlog(project=args.project,
-                                         status=None if args.all else "open")
+            items = ops.list_backlog(project=args.project,
+                                     status=None if args.all else "open")
             if args.json:
                 _print(items, True)
             else:
@@ -5028,8 +5028,9 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                 if not items:
                     print("backlog empty")
         elif args.bl_cmd == "show":
-            item = central.get_backlog(args.item_id)
-            if not item:
+            try:
+                item = ops.show_backlog(args.item_id)
+            except OpsError:
                 print(f"backlog item {args.item_id!r} not found")
                 return 1
             if args.json:
@@ -5186,6 +5187,7 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     print(f"  unreachable       {q['failed']}  (Neo was never reached — NOT judged)")
     print(f"  still open        {q['open']}")
     print(f"  superseded        {q['superseded']}  (decided elsewhere, out of the rate)")
+    print(f"  refined           {q['refined']}  (returned to the asker to split, out of the rate)")
     print(f"  escalation rate   {_pct(q['escalation_rate'])}  "
           f"(over settled questions only)")
     # Its own figure, never blended into the escalation rate: a crash is not a decision
@@ -5342,13 +5344,8 @@ def cmd_learn(args: argparse.Namespace) -> int:
                       "(`chars` prices it first)")
             _print(index, args.json)
         elif args.kn_cmd == "show":
-            rows = [r for r in (central.get_knowledge(i) for i in args.ids) if r]
-            central.record_knowledge_read("show", rows, term=" ".join(args.ids),
-                                          project=reader_project, wo_id=acting_wo)
-            missing = set(args.ids) - {r["id"] for r in rows}
-            if missing:
-                raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
-            _print(rows, args.json)
+            _print(ops.show_knowledge(args.ids, project=reader_project, wo_id=acting_wo),
+                   args.json)
         elif args.kn_cmd == "topics":
             topics = central.knowledge_topics(args.project)
             central.record_knowledge_read("topics", [{"topic": t} for t, _ in topics],
@@ -5359,10 +5356,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
             _print_knowledge_usage(ops.knowledge_usage_report(
                 project=args.project, days=args.days), args.json)
         elif args.kn_cmd in ("pin", "unpin"):
-            row = central.pin_knowledge(args.kn_id, pinned=args.kn_cmd == "pin")
-            if row is None:
-                raise OpsError(f"unknown knowledge id {args.kn_id!r}")
-            _print(row, args.json)
+            _print(ops.pin_knowledge(args.kn_id, pinned=args.kn_cmd == "pin"), args.json)
         elif args.kn_cmd == "retract":
             try:
                 row = ops.learn_retract(args.knowledge_id, args.reason,

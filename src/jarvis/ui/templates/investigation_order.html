@@ -1,5 +1,9 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}{{ inv.id }} — Jarvis{% endblock %}
+{% block style %}
+  @media (max-width: 640px) { main .row { flex-wrap: wrap; } main .row > .grow { flex-basis: 100%; } }
+{% endblock %}
 {% block content %}
 {# §2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md. The CLASSIFICATION
    and the SUBJECT first, then the root cause, then the evidence, then what was filed or
@@ -8,7 +12,8 @@
 {% set m = fo_status_meta.get(inv.status, {'word': inv.status, 'icon': '•', 'tone': 'muted'}) %}
 {% set v = inv.verdict or {} %}
 
-<h2><span class="mono">{{ inv.id }}</span> {{ inv.title }}</h2>
+{# Laid out by §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md #}
+{{ ui.page_head(inv.id ~ " " ~ inv.title) }}
 <p class="sub">
   {# The kind-aware word, from `ops`: `planning` on an investigation means the
      investigator is reading, and a page spelling that itself would be a second label
@@ -27,12 +32,13 @@
 <div class="panel"><div class="row tone-warn">◭ {{ inv.attention_reason }}</div></div>
 {% endif %}
 
-<h3>Why it was opened</h3>
-<div class="panel"><div class="row"><div class="grow">{{ inv.why }}</div></div></div>
+{% call ui.explain("Why it was opened") %}
+<div class="panel"><div class="row"><div class="grow" style="white-space: pre-wrap;">{{ inv.why }}</div></div></div>
+{% endcall %}
 
 {% if inv.investigator %}
 <p class="sub">investigator:
-  <a class="mono" href="/wo/{{ project }}/{{ inv.investigator.id }}">{{ inv.investigator.id }}</a>
+  {{ ui.row_id(inv.investigator.id, '/wo/' ~ project ~ '/' ~ inv.investigator.id) }}
   ({{ inv.investigator.status }})
   {% if inv.investigator.result_summary %}— {{ inv.investigator.result_summary }}{% endif %}
 </p>
@@ -74,7 +80,7 @@
       filed as an EXPEDITED bug — it ships a release when the fix lands:
       <a href="{{ inv.filed.issue_url }}">{{ inv.filed.issue_url }}</a>
       {% if inv.filed.wo_id %}
-      · <a class="mono" href="/wo/{{ project }}/{{ inv.filed.wo_id }}">{{ inv.filed.wo_id }}</a>
+      · {{ ui.row_id(inv.filed.wo_id, '/wo/' ~ project ~ '/' ~ inv.filed.wo_id) }}
       {% endif %}
     </div>
   </div>
