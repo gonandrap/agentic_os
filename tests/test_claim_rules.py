@@ -68,11 +68,22 @@ def _held_by_plan_assumption(store: ProjectStore) -> str:
     return store.create_work_order("child", parent_id=fo["id"])["id"]
 
 
+def _held_by_spec_unmerged(store: ProjectStore) -> str:
+    fo = store.create_feature_order("CSV export")
+    planner = store.create_work_order("plan it", kind="planner", parent_id=fo["id"],
+                                      status="waiting_pr_merge")
+    store.update_work_order(planner["id"], pr_url="https://github.com/x/y/pull/9")
+    store.update_feature_order(fo["id"], plan_wo_id=planner["id"], status="executing")
+    return store.create_work_order("child", parent_id=fo["id"])["id"]
+
+
 HOLDS = [
     ("dependency", _held_by_dependency),
     ("max_parallel", _held_by_max_parallel),
     ("retry_after", _held_by_retry_after),
     ("plan_assumption", _held_by_plan_assumption),
+    # docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2
+    ("spec_unmerged", _held_by_spec_unmerged),
     # §2.2 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md
     ("precondition", _held_by_precondition),
 ]
@@ -139,9 +150,20 @@ def test_both_queries_are_built_from_the_same_rule_sql(store):
 def test_every_rule_carries_a_reason(store):
     assert [r.code for r in CLAIM_RULES] == [
         "selection", "precondition", "retry_after", "dependency", "max_parallel",
-        "plan_assumption"]
+        "plan_assumption", "spec_unmerged"]
     assert all(r.why.strip() for r in CLAIM_RULES)
-    assert [r.delayed for r in CLAIM_RULES] == [False, True, True, True, True, True]
+    assert [r.delayed for r in CLAIM_RULES] == [False, True, True, True, True, True, True]
+
+
+def test_a_merged_spec_releases_the_child(store):
+    child = _held_by_spec_unmerged(store)
+    planner = store.get_feature_order(store.get_work_order(child)["parent_id"])["plan_wo_id"]
+    assert store.spec_hold(store.get_work_order(child))["planner_id"] == planner
+
+    store.set_status(planner, "completed", trigger="merged")
+
+    assert store.spec_hold(store.get_work_order(child)) is None
+    assert store.claim_next_pending()["id"] == child
 
 
 # -- §2.2: the precondition rule, ranked at index 1
