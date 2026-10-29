@@ -1413,10 +1413,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="this project's rules AND the fleet-wide ones")
     r.add_argument("--status", choices=("dry_run", "armed", "retracted"))
     r.add_argument("--gap-class", dest="gap_class", default="")
+    r.add_argument("--days", type=int, default=30,
+                   help="window of each rule's cost line (default 30; 0 = all time)")
 
     r = ru.add_parser("show", help="one detector: its condition in prose, its remedy "
-                                   "rules, its provenance and its newest fires")
+                                   "rules, its provenance, what it cost and its newest "
+                                   "fires")
     r.add_argument("detector_id", metavar="dt-id")
+    r.add_argument("--days", type=int, default=30,
+                   help="window of the cost line (default 30; 0 = all time)")
 
     r = ru.add_parser("retract", help="retire a detector or one remedy rule: it stops "
                                       "applying, the record keeps that it once did")
@@ -4527,7 +4532,9 @@ def _print_rules_list(data: dict) -> None:
             hits, total = r["fires"]["hits"], r["fires"]["total"]
             print(f"      {hits} {'hit' if hits == 1 else 'hits'} of "
                   f"{total} {'fire' if total == 1 else 'fires'}")
+        print(f"      cost: {r['cost']['note']}")
     print(f"\n{data['note']}")
+    print(data["cost_unattributed"])
 
 
 def _print_rules_show(data: dict) -> None:
@@ -4552,6 +4559,11 @@ def _print_rules_show(data: dict) -> None:
     print("  provenance: " + ", ".join(f"{k}={v}" for k, v in prov.items() if v))
     if data["hit_rate"] is None:
         print(f"  {data['hit_rate_note']}")
+    cost = data["cost"]
+    print(f"  cost: {cost['note']}")
+    for rm, usd in sorted(cost["by_remedy"].items()):
+        print(f"    {rm or 'no remedy rule'}: ${usd:,.2f}")
+    print(f"    {data['cost_unattributed']}")
     for f in data["fires"]:
         print(f"  fire {f['id']} {f['outcome']} · {f['order_id']} · {f['mode']}"
               # A fire is one line: the stored detail stays at rules.FACTS_CHARS
@@ -4668,6 +4680,8 @@ def _print_rules_summary(data: dict) -> None:
                 print(f"      last fired {_stamp(rule_row['last_fired'])}"
                       + (f" · last cleared {_stamp(rule_row['last_cleared'])}"
                          if rule_row["last_cleared"] else ""))
+            print(f"      cost: {rule_row['cost']['note']}")
+        print(f"  {data['cost_unattributed']}")
 
     # The WEAKER HALF is printed as `ops`' own sentence and in no other form
     rec = data["recurrences"]
@@ -4707,10 +4721,10 @@ def cmd_rules(args) -> int:
 
     if args.rules_cmd == "list":
         data = ops.rules_list(project=args.project, status=args.status or "",
-                              gap_class=args.gap_class)
+                              gap_class=args.gap_class, days=args.days)
         _print(data, True) if args.json else _print_rules_list(data)
     elif args.rules_cmd == "show":
-        data = ops.rules_show(args.detector_id)
+        data = ops.rules_show(args.detector_id, days=args.days)
         _print(data, True) if args.json else _print_rules_show(data)
     elif args.rules_cmd == "retract":
         data = ops.rules_retract(args.rule_id, args.reason)

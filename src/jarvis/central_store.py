@@ -382,7 +382,9 @@ CREATE TABLE IF NOT EXISTS rule_fires (
     detail TEXT NOT NULL DEFAULT '',
     cleared_at REAL, cleared_seconds REAL,
     false_positive INTEGER NOT NULL DEFAULT 0,
-    false_positive_reason TEXT NOT NULL DEFAULT ''
+    false_positive_reason TEXT NOT NULL DEFAULT '',
+    question_id INTEGER,                  -- the self-heal gate's Neo question
+    filed_orders TEXT NOT NULL DEFAULT '[]'   -- orders the remedy filed, JSON
 );
 CREATE INDEX IF NOT EXISTS idx_rule_fires_detector ON rule_fires(detector_id, ts);
 CREATE INDEX IF NOT EXISTS idx_rule_fires_order ON rule_fires(order_id, detector_id);
@@ -640,6 +642,11 @@ ADDED_COLUMNS = {
         "queue_state": "TEXT NOT NULL DEFAULT ''",
         "queue_note": "TEXT NOT NULL DEFAULT ''",
         "queue_ts": "REAL",
+    },
+    "rule_fires": {
+        # Per-rule cost attribution (wo-85906675, Neo q2519)
+        "question_id": "INTEGER",
+        "filed_orders": "TEXT NOT NULL DEFAULT '[]'",
     },
 }
 
@@ -1695,7 +1702,8 @@ class CentralStore:
     def record_rule_fire(self, *, detector_id: str, project: str, order_id: str,
                          order_kind: str, fingerprint: str, mode: str, outcome: str,
                          remedy_rule_id: str = "", alarm_id: str = "",
-                         detail: str = "") -> dict[str, Any]:
+                         detail: str = "",
+                         question_id: int | None = None) -> dict[str, Any]:
         """Record one thing the registry noticed about one order"""
         from . import rules
 
@@ -1706,10 +1714,10 @@ class CentralStore:
         cur = self.conn.execute(
             """INSERT INTO rule_fires
                (ts, detector_id, remedy_rule_id, project, order_id, order_kind,
-                fingerprint, mode, outcome, alarm_id, detail)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                fingerprint, mode, outcome, alarm_id, detail, question_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (now, detector_id, remedy_rule_id, project, order_id, order_kind,
-             fingerprint, mode, outcome, alarm_id, rules.bound(detail)),
+             fingerprint, mode, outcome, alarm_id, rules.bound(detail), question_id),
         )
         if outcome in (rules.RECORDED, rules.PROPOSED, rules.APPLIED):
             self.conn.execute(
@@ -1720,6 +1728,47 @@ class CentralStore:
                     "UPDATE remedy_rules SET hits = hits + 1, last_fired=? WHERE id=?",
                     (now, remedy_rule_id))
         return self.get_rule_fire(int(cur.lastrowid))  # type: ignore[return-value]
+
+    def note_fire_orders(self, alarm_id: str, wo_ids: list[str]) -> int:
+        """Charge orders a remedy filed to the fire behind `alarm_id`; returns fires updated"""
+        if not alarm_id or not wo_ids:
+            return 0
+        rows = self.conn.execute(
+            "SELECT id, filed_orders FROM rule_fires WHERE alarm_id=?",
+            (alarm_id,)).fetchall()
+        for row in rows:
+            known = list(db.from_json(row["filed_orders"], []) or [])
+            merged = known + [w for w in wo_ids if w not in known]
+            self.conn.execute("UPDATE rule_fires SET filed_orders=? WHERE id=?",
+                              (db.to_json(merged), row["id"]))
+        return len(rows)
+
+    def rule_fires_since(self, since: float | None = None, *,
+                         detector_id: str = "",
+                         project: str = "") -> list[dict[str, Any]]:
+        """Every fire in the window that could have spent: it asked Neo or filed an order"""
+        q = ("SELECT * FROM rule_fires WHERE (question_id IS NOT NULL "
+             "OR filed_orders NOT IN ('', '[]'))")
+        params: list[Any] = []
+        if since is not None:
+            q += " AND ts>=?"
+            params.append(since)
+        for column, value in (("detector_id", detector_id), ("project", project)):
+            if value:
+                q += f" AND {column}=?"
+                params.append(value)
+        return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
+    def question_call_costs(self, question_ids: list[int]) -> dict[int, float]:
+        """What the OS's calls on each Neo question cost — its retries included"""
+        if not question_ids:
+            return {}
+        marks = ",".join("?" * len(question_ids))
+        rows = self.conn.execute(
+            f"SELECT question_id, COALESCE(SUM(cost_usd), 0) AS c FROM agent_calls "
+            f"WHERE question_id IN ({marks}) GROUP BY question_id",
+            list(question_ids)).fetchall()
+        return {int(r["question_id"]): float(r["c"] or 0.0) for r in rows}
 
     def get_rule_fire(self, fire_id: int) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM rule_fires WHERE id=?",

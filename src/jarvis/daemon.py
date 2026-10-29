@@ -4528,7 +4528,9 @@ class Daemon:
             order_kind=facts.order_kind, fingerprint=fingerprint, mode=rules.ARMED,
             outcome=rules.PROPOSED if proposed else rules.REFUSED,
             remedy_rule_id=str(remedy_row["id"]), alarm_id=str(alarm["id"]),
-            detail=reason if proposed else str(outcome.get("reason") or ""))
+            detail=reason if proposed else str(outcome.get("reason") or ""),
+            question_id=(int(outcome["question"]["id"])
+                         if proposed and outcome.get("question") else None))
         return "fired"
 
     # -- 2 & 6. turns, settlement, and injected sessions

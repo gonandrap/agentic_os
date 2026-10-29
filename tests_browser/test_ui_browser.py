@@ -1642,7 +1642,8 @@ def _evolution_rules(monkeypatch) -> None:
                 "hits": 0, "false_positives": 0, "recurrences": 0, "last_fired": None,
                 "last_cleared": None, "hit_rate": None, "hit_rate_note": "never fired",
                 "readable": True, "condition_problems": [], "median_cleared_seconds": None,
-                "median_cleared_seconds_note": "not a median yet"}
+                "median_cleared_seconds_note": "not a median yet",
+                "cost": ops.rule_cost_entry({}, "det")}
         report["per_rule"] = [
             {**base, "id": "det-firing", "hits": 4, "last_fired": 1.0, "hit_rate": 0.5},
             {**base, "id": "det-quiet"},
