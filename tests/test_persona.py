@@ -79,6 +79,12 @@ def test_crib_sheet_documents_every_improvement_order_verb(persona: str, verb: s
     assert verb in persona, f"crib sheet no longer documents {verb!r}"
 
 
+def test_crib_sheet_documents_onboard_start_in_one_line(persona: str) -> None:
+    """docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §5: one line, the cap is tight"""
+    assert "jarvis onboard start <path>" in persona
+    assert sum(line.startswith("jarvis onboard") for line in persona.splitlines()) <= 1
+
+
 def test_improvement_order_block_expands_the_abbreviation(persona: str) -> None:
     """Unexpanded, `io` reads as input/output and the whole block means nothing"""
     assert '"io" = improvement' in persona, (
