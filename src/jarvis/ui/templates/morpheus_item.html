@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% import "_morpheus.html" as mv %}
+{% block title %}{{ item.id }} · Morpheus — Jarvis{% endblock %}
+{% block style %}
+  .mv-acts { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+  .mv-acts form { display: flex; gap: 6px; margin: 0; }
+  .mv-acts input[type=text] { min-width: 14em; }
+  .mv-runs td { white-space: nowrap; }
+  .mv-runs pre, .mv-pre { max-height: 60vh; overflow: auto; white-space: pre-wrap; margin: 6px 0 0; }
+{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §4.2 #}
+{% set open = item.state in ("queued", "monitoring") %}
+{% set confirmable = item.state in ("failed", "timedout")
+                     and not (item.resolution or "").startswith("confirmed failed") %}
+{% set r = d.retries %}
+
+{{ ui.page_head(item.id, (item.project or "—") ~ " · " ~ item.state) }}
+<p class="kv">
+  <a href="{{ item.pr_url }}">#{{ item.pr_number }}</a> {{ item.pr_title }}<br>
+  <span class="mono {{ mv.tone[item.state] }}">{{ item.state }}</span>
+  {% if item.release_tag %} · release <span class="mono">{{ item.release_tag }}</span>{% endif %}
+  {% if item.wo_id %} · work order {{ ui.row_id(item.wo_id, "/go/" ~ item.wo_id) }}{% endif %}
+  · created {{ fmt_ts(item.created_ts) }} · updated {{ fmt_ts(item.updated_ts) }}
+  {% if item.resolution %}<br><span class="sub">{{ item.resolution }}</span>{% endif %}
+</p>
+
+<div class="mv-acts">
+  <form method="post" action="/morpheus/{{ item.id }}/requeue">
+    <input type="hidden" name="next" value="{{ back }}">
+    <button title="run the check again with a fresh deadline">retry now</button>
+  </form>
+  {% if item.state != "validated" %}
+  <form method="post" action="/morpheus/{{ item.id }}/waive">
+    <input type="hidden" name="next" value="{{ back }}">
+    <input type="text" name="reason" required placeholder="why it works">
+    <button title="rule it validated">waive</button>
+  </form>
+  {% endif %}
+  {% if confirmable %}
+  <form method="post" action="/morpheus/{{ item.id }}/confirm">
+    <input type="hidden" name="next" value="{{ back }}">
+    <input type="text" name="fix" required placeholder="broken: what to fix">
+    <button title="files a work order that fixes it">confirm failed</button>
+  </form>
+  {% endif %}
+</div>
+
+<p class="kv">
+  {{ r.checks }} check(s) run · {{ r.auto_requeues }} of {{ r.max_auto_requeues }} auto-requeue(s) used ·
+  {% if open and d.next_check_ts %}next check {{ fmt_ts(d.next_check_ts) }} (in {{ fmt_left(d.next_check_ts) }}),
+    deadline {{ fmt_ts(item.deadline_ts) }}
+  {% elif open %}no check due: waiting for a check script · deadline {{ fmt_ts(item.deadline_ts) }}
+  {% else %}no check due: settled{% endif %}
+</p>
+
+<div class="tabbed" id="mv-tabs">
+  <div class="tabs" role="tablist">
+    <button role="tab" data-panel="tab-runs" aria-selected="true" aria-controls="tab-runs">runs
+      <span class="n">{{ d.runs | length }}</span></button>
+    <button role="tab" data-panel="tab-output" aria-selected="false" aria-controls="tab-output">last output</button>
+    <button role="tab" data-panel="tab-script" aria-selected="false" aria-controls="tab-script">check script</button>
+    <button role="tab" data-panel="tab-neo" aria-selected="false" aria-controls="tab-neo">Neo questions
+      <span class="n">{{ d.questions | length }}</span></button>
+    <button role="tab" data-panel="tab-handoff" aria-selected="false" aria-controls="tab-handoff">handoff</button>
+  </div>
+
+<section class="tabpanel on" id="tab-runs" role="tabpanel">
+<h2>Runs</h2>
+<div class="panel table-wrap">
+  {% if d.runs %}
+  <table class="mv-runs">
+    <tr><th>time</th><th>kind</th><th>exit</th><th>state after</th><th>output</th></tr>
+    {% for run in d.runs %}
+    <tr>
+      <td class="mono">{{ fmt_ts(run.ts) }}</td>
+      <td class="mono">{{ run.kind }}</td>
+      <td class="mono">{{ "—" if run.exit is none else run.exit }}</td>
+      <td class="mono {{ mv.tone.get(run.state_after, '') }}">{{ run.state_after or "—" }}</td>
+      <td>{% if run.output %}<details><summary>output</summary><pre>{{ run.output }}</pre></details>{% else %}—{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% elif r.checks %}<p class="empty">no runs recorded yet — history starts with this release</p>
+  {% else %}<p class="empty">no checks run yet</p>{% endif %}
+</div>
+</section>
+
+<section class="tabpanel" id="tab-output" role="tabpanel">
+<h2>Last output</h2>
+<div class="panel">
+  {% if item.last_output %}<pre class="mv-pre">{{ item.last_output }}</pre>
+  {% else %}<p class="empty">no output yet</p>{% endif %}
+</div>
+</section>
+
+<section class="tabpanel" id="tab-script" role="tabpanel">
+<h2>Check script</h2>
+<div class="panel">
+  {% if item.script %}<p class="sub">written by {{ item.script_source or "—" }}</p>
+  <pre class="mv-pre">{{ item.script }}</pre>
+  {% else %}<p class="empty">no check script yet</p>{% endif %}
+  {% if item.hints %}<h3>The PR's validation hints</h3><pre class="mv-pre">{{ item.hints }}</pre>{% endif %}
+</div>
+</section>
+
+<section class="tabpanel" id="tab-neo" role="tabpanel">
+<h2>Neo questions</h2>
+<div class="panel table-wrap">
+  {% if d.questions %}
+  <table>
+    <tr><th>id</th><th>status</th><th>question</th><th>answer</th></tr>
+    {% for q in d.questions %}
+    <tr>
+      <td>{{ ui.row_id("q" ~ q.id, "/neo/question/" ~ q.id) }}</td>
+      <td class="mono">{{ q.status }}</td>
+      <td>{{ q.question }}</td>
+      <td>{{ q.answer or "—" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="empty">no Neo question about this item</p>{% endif %}
+</div>
+</section>
+
+<section class="tabpanel" id="tab-handoff" role="tabpanel">
+<h2>Handoff</h2>
+<div class="panel">
+  <p class="kv">handed to: {{ mv.handoff(item.action) }}</p>
+  {% if item.resolution %}<p class="kv">{{ item.resolution }}</p>{% endif %}
+</div>
+</section>
+</div>
+
+<p class="sub"><a href="/morpheus">all watched PRs</a> · from a terminal:
+  <span class="mono">jarvis morpheus show {{ item.id }}</span></p>
+{% endblock %}

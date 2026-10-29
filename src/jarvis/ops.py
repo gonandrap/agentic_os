@@ -6643,8 +6643,10 @@ def resolve_ref(ref: str) -> str:
             return f"/alarms/{name}/{rid}"
     except OpsError:
         return search
+    if prefix == "mv":
+        return f"/morpheus/{rid}"
     # Listed on one fleet-wide page each, and addressed there by their own id
-    return {"kn": "/knowledge", "mv": "/morpheus", "bl": "/backlog"}[prefix] + f"#{rid}"
+    return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"#{rid}"
 
 
 def worker_prompts(wo_id: str, project_name: str | None = None) -> dict[str, Any]:

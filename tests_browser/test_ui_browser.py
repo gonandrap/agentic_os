@@ -1187,3 +1187,69 @@ def test_clicking_an_inbox_row_id_opens_its_order(page, server, daemon):
     page.click(f"a.rowid:has-text('{wo['id']}')")
     page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
     assert "the order the alert is about" in page.locator("main").inner_text()
+
+
+# §4 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _morpheus_rows() -> tuple[str, str]:
+    """One failed item and one newer monitoring one; returns (failed id, monitoring id)"""
+    import time
+
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        ids = []
+        for n in (7, 8):
+            item = central.add_morpheus_item(
+                project="proj_a", repo="o/r", pr_number=n,
+                pr_url=f"https://github.com/o/r/pull/{n}", pr_title=f"[wo-1234abcd] {_LONG}",
+                wo_id="wo-1234abcd", release_tag="jarvis-0.1.0", hints=_LONG, script="exit 1",
+                script_source="agent", state="monitoring", deadline_ts=time.time() + 86400)
+            ids.append(item["id"])
+        central.update_morpheus_item(ids[0], state="failed", last_exit=1, checks=2,
+                                     resolution="script exited 1", last_output="boom")
+        central.add_morpheus_run(ids[0], exit=1, output="boom", kind="check",
+                                 state_after="failed")
+        central.update_morpheus_item(ids[1], checks=1, last_exit=75)
+    finally:
+        central.close()
+    return ids[0], ids[1]
+
+
+def test_morpheus_reads_at_desktop_and_phone_width(page, server, readable):
+    failed, _ = _morpheus_rows()
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/morpheus")
+        assert failed in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"morpheus-{size['width']}")
+        page.goto(f"{server}/morpheus/{failed}")
+        assert "boom" in page.locator("#tab-runs").inner_html()
+        readable(page)
+        _shot(page, f"morpheus-item-{size['width']}")
+
+
+def test_a_morpheus_filter_in_the_url_narrows_the_rows(page, server):
+    failed, watching = _morpheus_rows()
+    page.goto(f"{server}/morpheus?state=monitoring")
+    table = page.locator("table.mv-list").inner_text()
+    assert watching in table and failed not in table
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+
+
+def test_a_failed_morpheus_row_sits_above_the_others(page, server):
+    failed, watching = _morpheus_rows()
+    page.goto(f"{server}/morpheus")
+    rows = page.locator("table.mv-list a.rowid")
+    first = rows.filter(has_text=failed).bounding_box()
+    assert first["y"] < rows.filter(has_text=watching).bounding_box()["y"]
+
+
+def test_clicking_a_morpheus_row_id_opens_its_detail(page, server):
+    failed, _ = _morpheus_rows()
+    page.goto(f"{server}/morpheus")
+    page.click(f"table.mv-list a.rowid:has-text('{failed}')")
+    page.wait_for_url(f"**/morpheus/{failed}")
+    assert "confirm failed" in page.locator("main").inner_text()
+    page.goto(f"{server}/go/{failed}")
+    page.wait_for_url(f"**/morpheus/{failed}")
