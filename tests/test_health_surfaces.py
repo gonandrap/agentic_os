@@ -270,7 +270,7 @@ def test_a_remedy_is_on_the_page_for_the_alarm_that_has_one_and_absent_otherwise
     page = _client().get("/alarms").text
 
     assert ARGUMENT in _block(page, f'id="alarm-{proposed_subject}"')
-    assert f'href="/gates#gate-{gate_id}"' in page
+    assert f'href="/gates/{gate_id}"' in page
     assert "it needs your permission first" in page
     assert ARGUMENT not in _block(page, f'id="alarm-{plain_subject}"')
     assert NOWHERE not in page
@@ -309,7 +309,7 @@ def test_the_per_alarm_page_carries_the_remedy_and_the_evidence_it_cited(store):
 
     assert ARGUMENT in page
     assert NOWHERE in page, "the evidence the finding cited"
-    assert f'href="/gates#gate-{approval["id"]}"' in page
+    assert f'href="/gates/{approval["id"]}"' in page
     assert f"jarvis gate approve {approval['id']}" in page
     assert 'name="decision"' not in page, \
         "a proposal is answered at the gate, and review_alarm would refuse this"

@@ -37,7 +37,7 @@
         <div class="sub">{{ a.reason }}
           {%- if a.approval_id %}
           {# the item names a command to approve; the place to do that is the gates tab #}
-          · <a href="/gates#gate-{{ a.approval_id }}">decide it →</a>
+          · <a href="/gates/{{ a.approval_id }}">decide it →</a>
           {%- endif %}</div>
       </li>
       {% endfor %}
