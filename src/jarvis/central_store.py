@@ -700,6 +700,9 @@ class CentralStore:
     def set_project_status(self, name: str, status: str) -> None:
         self.conn.execute("UPDATE projects SET status=? WHERE name=?", (status, name))
 
+    def delete_project(self, name: str) -> None:
+        self.conn.execute("DELETE FROM projects WHERE name=?", (name,))
+
     def list_projects(self) -> list[dict[str, Any]]:
         return db.rows_to_dicts(
             self.conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
