@@ -489,6 +489,10 @@ if [ "$1" = "lock" ]; then
   v=$(grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\\1/')
   awk -v v="$v" 'prev && /^version = / { sub(/"[^"]+"/, "\\"" v "\\"") } { prev = ($0 == "name = \\"jarvis-os\\""); print }' uv.lock > uv.lock.new && mv uv.lock.new uv.lock
 fi
+if [ "$1" = "sync" ]; then
+  # a venv whose python passes shipit's INV-SQLITE-VERSION check
+  mkdir -p .venv/bin && printf '#!/bin/sh\\nexit 0\\n' > .venv/bin/python && chmod +x .venv/bin/python
+fi
 exit 0
 """
 

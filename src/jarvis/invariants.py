@@ -3623,7 +3623,7 @@ def check_sqlite_version() -> Iterator[Violation]:
 
 
 def report_at_startup(who: str) -> list[Violation]:
-    """Run the startup post-conditions once and put each into the OS project's inbox, deduped across daemon and UI"""
+    """Run the startup post-conditions once and inbox each, deduped across daemon and UI"""
     import logging
 
     from . import schedule

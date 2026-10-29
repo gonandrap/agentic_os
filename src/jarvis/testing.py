@@ -2273,7 +2273,7 @@ def jarvis_home(tmp_path, monkeypatch):
     transcripts = tmp_path / "claude-projects"
     transcripts.mkdir(exist_ok=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(transcripts))
-    # The host's libsqlite3 must not decide whether `jarvis doctor` is green in a test (INV-SQLITE-VERSION)
+    # Host libsqlite3 must not decide whether doctor is green (INV-SQLITE-VERSION)
     import sqlite3
     monkeypatch.setattr(sqlite3, "sqlite_version", "3.51.2")
     return home
