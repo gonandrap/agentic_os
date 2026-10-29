@@ -1,62 +1,49 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}Inbox — Jarvis{% endblock %}
+{% block style %}.needs-you li { padding: 0; }{% endblock %}
 {% block content %}
 
-<h2>Inbox
+{% macro item_row(it) %}
+<div class="row">
+  <span class="st tone-{{ level_tone.get(it.level, 'muted') }}">
+    <span class="i">{{ '🚨' if it.level == 'critical' else '⚠' if it.level == 'warning' else 'ℹ' }}</span>{{ it.level }}</span>
+  {% if it.wo_id %}{{ ui.row_id(it.wo_id, '/go/' ~ it.wo_id) }}{% endif %}
+  <div class="grow">
+    <strong>{{ it.project }}</strong> — {{ it.title }}
+    {% if it.body %}<div class="sub" style="white-space: pre-wrap;">{{ it.body }}</div>{% endif %}
+  </div>
+  <span class="sub mono">{{ fmt_age(it.ts) }}</span>
+  <form class="inline" method="post" action="/inbox/ack">
+    <input type="hidden" name="inbox_id" value="{{ it.id }}">
+    <input type="hidden" name="next" value="{{ back }}">
+    <button>Ack</button>
+  </form>
+</div>
+{% endmacro %}
+
+{% call ui.page_head("Inbox", total ~ " unacked") %}
   {% if items %}
-  <form class="inline" method="post" action="/inbox/ack" style="float: right;">
+  <form class="inline" method="post" action="/inbox/ack">
     {% if filtered %}<input type="hidden" name="shown" value="{{ items | map(attribute='id') | join(',') }}">{% endif %}
     <input type="hidden" name="next" value="{{ back }}">
     <button>{{ 'Ack shown' if filtered else 'Ack all' }}</button>
   </form>
   {% endif %}
-</h2>
+{% endcall %}
 <div class="sub">{{ inbox_list_note }}</div>
 
-<form class="panel search-form" method="get" action="/inbox">
-  <input type="text" name="q" value="{{ q }}" placeholder="search title, body or wo id">
-  <select name="level" aria-label="criticality">
-    <option value="">every level</option>
-    {% for lv in levels %}
-    <option value="{{ lv }}" {{ 'selected' if lv == level }}>{{ lv }}</option>
-    {% endfor %}
-  </select>
-  <select name="project" aria-label="project">
-    <option value="">every project</option>
-    {% for p in projects %}
-    <option value="{{ p }}" {{ 'selected' if p == project }}>{{ p }}</option>
-    {% endfor %}
-  </select>
-  <select name="sort" aria-label="sort">
-    {% for s in sorts %}
-    <option value="{{ s }}" {{ 'selected' if s == sort }}>{{ 'priority' if s == 'priority' else s + ' first' }}</option>
-    {% endfor %}
-  </select>
-  <button class="primary">Apply</button>
-  {% if filtered %}<a href="/inbox?sort={{ sort }}">clear</a>{% endif %}
-</form>
-{% if filtered %}<p class="sub">{{ items | length }} of {{ total }} shown</p>{% endif %}
+{{ ui.filter_bar("/inbox", filters, options, items | length, total,
+                 labels={"sort": "priority first", "q": "search title, body or wo id"}) }}
 
+{% call(it) ui.needs_you(critical, "critical — needs you") %}{{ item_row(it) }}{% endcall %}
+
+{% if rest %}
 <div class="panel">
-  {% for it in items %}
-  <div class="row">
-    <span class="st tone-{{ level_tone.get(it.level, 'muted') }}">
-      <span class="i">{{ '🚨' if it.level == 'critical' else '⚠' if it.level == 'warning' else 'ℹ' }}</span>{{ it.level }}</span>
-    <div class="grow">
-      <strong>{{ it.project }}</strong> — {{ it.title }}
-      {% if it.body %}<div class="sub" style="white-space: pre-wrap;">{{ it.body }}</div>{% endif %}
-      {% if it.wo_id %}<a class="mono sub" href="/wo/{{ it.project }}/{{ it.wo_id }}">{{ it.wo_id }}</a>{% endif %}
-    </div>
-    <span class="sub mono">{{ fmt_age(it.ts) }}</span>
-    <form class="inline" method="post" action="/inbox/ack">
-      <input type="hidden" name="inbox_id" value="{{ it.id }}">
-      <input type="hidden" name="next" value="{{ back }}">
-      <button>Ack</button>
-    </form>
-  </div>
-  {% else %}
-  <div class="empty">{{ 'nothing matches these filters' if filtered else 'inbox empty — Jarvis will post here when something needs you' }}</div>
-  {% endfor %}
+  {% for it in rest %}{{ item_row(it) }}{% endfor %}
 </div>
+{% elif not critical %}
+<p class="empty">{{ 'nothing matches these filters' if filters else 'inbox empty — Jarvis will post here when something needs you' }}</p>
+{% endif %}
 
 {% endblock %}

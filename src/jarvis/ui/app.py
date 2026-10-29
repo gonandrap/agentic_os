@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -160,6 +161,40 @@ def fmt_ts(ts: float | None) -> str:
     if not ts:
         return "–"
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+# The list-page primitives: §2.2 of... (docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md)
+FREE_TEXT_MAX = 100
+
+
+def query_filters(request: Request, allowed: Mapping[str, Sequence[str]]) -> dict[str, str]:
+    """Named query params, capped; an unknown value is kept to match nothing (Q2361)"""
+    out: dict[str, str] = {}
+    for key in allowed:
+        text = (request.query_params.get(key) or "").strip()[:FREE_TEXT_MAX]
+        if text:
+            out[key] = text
+    return out
+
+
+def filter_rows(rows: Iterable[dict], filters: Mapping[str, str],
+                text_keys: Sequence[str] = ()) -> list[dict]:
+    """Rows equal on every non-empty filter; `q` is a case-insensitive substring over `text_keys`"""
+    q = (filters.get("q") or "").lower()
+    exact = {k: v for k, v in filters.items() if v and k != "q"}
+    return [r for r in rows
+            if all(str(r.get(k) or "") == v for k, v in exact.items())
+            and (not q or any(q in str(r.get(k) or "").lower() for k in text_keys))]
+
+
+def filter_options(rows: Iterable[dict], key: str) -> list[str]:
+    """Sorted distinct non-empty values of one column — a filter select's options"""
+    return sorted({str(r[key]) for r in rows if r.get(key)})
+
+
+def attention_first(rows: Iterable[dict], needs_you: Callable[[dict], bool]) -> list[dict]:
+    """Rows needing the user first; each group keeps its incoming order"""
+    return sorted(rows, key=lambda r: not needs_you(r))
 
 
 def _offset_param(raw: str) -> int:
@@ -1021,6 +1056,7 @@ def create_app() -> FastAPI:
         fleet_held_statuses=invariants.FLEET_HELD_STATUSES,
         instance=instance_badge(),
         fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
+        filter_rows=filter_rows, filter_options=filter_options, attention_first=attention_first,
         # The bill's two explanations, taken from the module that computes the numbers rather than written...
         rate_note=bill.rate_note, tokens_mean=bill.TOKENS_MEAN,
         write_rate_of=bill.write_rate_of,
@@ -1519,21 +1555,23 @@ def create_app() -> FastAPI:
                       turn_rows=turn_rows, bar_scale=scale, own_label=OWN_LABEL)
 
     @app.get("/inbox", response_class=HTMLResponse)
-    def inbox(request: Request, level: str = "", project: str = "", q: str = "",
-              sort: str = "priority"):
-        central = CentralStore()
-        try:
-            every = central.unacked_inbox()
-        finally:
-            central.close()
-        if sort not in ops.INBOX_SORTS:
-            sort = "priority"
-        items = ops.select_inbox(every, level=level, project=project, q=q, sort=sort)
-        return render(request, "inbox.html", active="inbox", items=items, total=len(every),
-                      projects=sorted({it["project"] for it in every}),
-                      levels=ops.INBOX_LEVELS, sorts=ops.INBOX_SORTS,
-                      level=level, project=project, q=q, sort=sort,
-                      filtered=bool(level or project or q),
+    def inbox(request: Request):
+        every = ops.unacked_inbox()
+        # "priority" is the default, so it is the select's empty choice rather than an option
+        options = {"level": list(ops.INBOX_LEVELS), "project": filter_options(every, "project"),
+                   "q": [], "sort": [s for s in ops.INBOX_SORTS if s != "priority"]}
+        filters = query_filters(request, options)
+        sort = filters.get("sort", "priority")
+        items = ops.select_inbox(every, level=filters.get("level", ""),
+                                 project=filters.get("project", ""), q=filters.get("q", ""),
+                                 sort=sort if sort in ops.INBOX_SORTS else "priority")
+        # A sort is not a filter: only the other three narrow what "Ack shown" acks
+        filtered = any(k in filters for k in ("level", "project", "q"))
+        return render(request, "inbox.html", active="inbox",
+                      critical=[it for it in items if it["level"] == "critical"],
+                      rest=[it for it in items if it["level"] != "critical"],
+                      items=items, total=len(every), filters=filters, options=options,
+                      filtered=filtered,
                       back=str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""))
 
     @app.get("/backlog", response_class=HTMLResponse)
