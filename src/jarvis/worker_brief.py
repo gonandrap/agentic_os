@@ -20,7 +20,9 @@ def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
         f"(`per Q1234`/`per assumption #2`)."
         # Dropped in the CORE only: `CORE_BUDGET_CHARS` leaves no room for it there
         + (f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), never by "
-           f"pasting it and never by naming a whole document." if cite_spec else "")
+           f"pasting it and never by naming a whole document. A citation points, it "
+           f"does not argue: still state the fact the decision rests on, since Neo "
+           f"may not be shown what you cite." if cite_spec else "")
         + tail)
 
 #: Budget for the rendered core contract block (between "# Operating contract" and "# Full... (docs/superpowers/specs/2026-08-22-agent-concision.md)
@@ -222,7 +224,8 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             "below names the area you are unsure about — a lookup is not a doubt.",
         ] if has_knowledge else []),
         assume_shape(wo_id, cite_spec=False,
-                     tail=" It should be RARE. Record EVERY such call, including "
+                     tail=" It should be RARE and self-contained. Record EVERY "
+                          "such call, including "
                           "the small and obvious ones: the only audit trail."),
         *([
             f"- READ the OS knowledge base before you touch an area it covers — it "
@@ -261,8 +264,8 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"report, and where detail goes.",
         # What to do when review feedback asks for more moved into `record_section` (Neo question 946): this...
         f"- Add `--evidence \"<what you ran and what it showed>\"` to that same "
-        f"finish: the tests, evals and checks you ran, and what they reported. It says "
-        f"how you know it works, and review feedback may ask for more.",
+        f"finish: the tests, evals and checks you ran, and what they reported; "
+        f"review feedback may ask for more.",
         f"- **Pass a REFERENCE, never a payload.** No diff, log, file or JSON dump in "
         f"a `jarvis` command, message or question: pass a pull request URL, commit "
         f"SHA, path with a line range, or the command that reproduces it. An "

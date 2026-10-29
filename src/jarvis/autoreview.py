@@ -743,8 +743,17 @@ omission line: those are cases to escalate, not blanks to fill in.
 
 A SIBLING MARKED `(withheld — high-stakes …)` IS NOT A BLANK TO FILL IN. The OS holds
 those assumptions for the user and does not show you their text, deliberately. Do not
-guess at what one says, and do not treat its absence as permission: if your ruling would
-turn on what it contains, that is precisely a case to ESCALATE.
+guess at what one says, and do not treat its absence as permission.
+
+NEVER RULE ON PARTIAL DATA. When the assumption leans on something you cannot see — a
+reference marked `(cited by the text)` that is withheld, `(not shown)` or
+`(not answered)`, or a fact it names without stating — and your ruling would turn on it,
+ask for the missing data instead of deciding. On a RUNNING order that is an OBJECTION
+(`deny`) whose `reason` tells the worker to restate the assumption self-contained: name
+the reference you could not see and the fact you need from it. On a FINISHED order there
+is no worker to ask, so ESCALATE with cause `evidence-insufficient`. Either way, never
+accept, and never escalate a running order's assumption only because a reference was
+hidden from you.
 
 WHEN IN ANY DOUBT, ESCALATE. The cost of escalating wrongly is one review action the user
 was going to make anyway. The cost of accepting wrongly is a decision they never made,

@@ -674,3 +674,11 @@ def test_the_brief_follows_the_order_s_own_transport():
     born_bg = build_worker_prompt(dict(WO, id="wo-bg03", transport="background"), SPEC)
     assert "one-shot" in born_headless and "one-shot" not in born_bg
     assert "it wakes you" in born_bg
+
+
+def test_assume_guidance_says_a_citation_does_not_carry_the_argument():
+    """Neo Q2290: a cited sibling may be withheld from Neo, so the assumption must stand alone"""
+    from jarvis import worker_brief
+    assert "Neo may not be shown what you cite" in worker_brief.assume_shape("wo-x")
+    core = "\n".join(worker_brief.core_contract("wo-x", "t", "p", has_knowledge=False))
+    assert "RARE and self-contained" in core
