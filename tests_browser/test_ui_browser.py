@@ -3,7 +3,7 @@ real forms, real navigation, headless Chromium."""
 
 from __future__ import annotations
 
-from jarvis import background, ops
+from jarvis import background, db, ops
 from jarvis.project_store import ProjectStore
 
 
@@ -1004,24 +1004,25 @@ def _backdate_spans(store, order_id, stamps):
     old — a shape no real order has — and the next store the server opens replays every
     one of them.
     """
-    ids = [r["id"] for r in store.conn.execute(
-        "SELECT id FROM wo_state_spans WHERE order_id=? ORDER BY id", (order_id,))]
-    assert len(ids) == len(stamps), (ids, stamps)
-    for span_id, ts in zip(ids, stamps):
-        store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE id=?", (ts, span_id))
-    # The first span is the creation, which no transition supplies and no event records,
-    # so the events line up with the stamps from the second on.
-    events = [r["id"] for r in store.conn.execute(
-        "SELECT id FROM wo_events WHERE wo_id=? AND kind='status' ORDER BY id",
-        (order_id,))]
-    assert len(events) <= len(stamps) - 1, (events, stamps)
-    for event_id, ts in zip(events, stamps[1:]):
-        store.conn.execute("UPDATE wo_events SET ts=? WHERE id=?", (ts, event_id))
-    store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
-                       (stamps[0], order_id))
-    store.conn.execute("UPDATE feature_orders SET created_at=? WHERE id=?",
-                       (stamps[0], order_id))
-    store.conn.commit()
+    # ONE TRANSACTION: the server's CostCache opens this store concurrently, and its backfill between autocommitted UPDATEs replays the events not yet moved (issue 1279)
+    with db.write_transaction(store.conn):
+        ids = [r["id"] for r in store.conn.execute(
+            "SELECT id FROM wo_state_spans WHERE order_id=? ORDER BY id", (order_id,))]
+        assert len(ids) == len(stamps), (ids, stamps)
+        for span_id, ts in zip(ids, stamps):
+            store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE id=?", (ts, span_id))
+        # The first span is the creation, which no transition supplies and no event records,
+        # so the events line up with the stamps from the second on.
+        events = [r["id"] for r in store.conn.execute(
+            "SELECT id FROM wo_events WHERE wo_id=? AND kind='status' ORDER BY id",
+            (order_id,))]
+        assert len(events) <= len(stamps) - 1, (events, stamps)
+        for event_id, ts in zip(events, stamps[1:]):
+            store.conn.execute("UPDATE wo_events SET ts=? WHERE id=?", (ts, event_id))
+        store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
+                           (stamps[0], order_id))
+        store.conn.execute("UPDATE feature_orders SET created_at=? WHERE id=?",
+                           (stamps[0], order_id))
 
 
 def _event_at(store, wo_id, kind, ts):
