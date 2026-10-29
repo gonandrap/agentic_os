@@ -6886,12 +6886,16 @@ def steward_queue_report(limit: int = 200) -> dict[str, Any]:
     try:
         counts = central.steward_queue_counts()
         rows = central.steward_queue_rows(limit)
+        asks = central.steward_asks(db.now() - steward.WINDOW_SECONDS)
     finally:
         central.close()
-    items = [{k: r[k] for k in ("id", "ts", "project", "origin_kind", "severity",
-                                "subject", "rule", "reason", "wo_id",
-                                "queue_state", "queue_note", "queue_ts")} for r in rows]
-    return {"counts": {s: counts.get(s, 0) for s in ("waiting", "reoffered", "expired")},
+    keys = ("id", "ts", "project", "origin_kind", "severity", "subject", "rule", "reason",
+            "wo_id", "queue_state", "queue_note", "queue_ts")
+    items = [{k: r[k] for k in keys} for r in rows]
+    return {"asks": [{**{k: r[k] for k in keys}, "parent_wo_id": r["parent_wo_id"],
+                      "morpheus_item": (steward._candidate_of(r).get("payload") or {}).get(
+                          "morpheus_item", "")} for r in asks],
+            "counts": {s: counts.get(s, 0) for s in ("waiting", "reoffered", "expired")},
             "line": steward.queue_line(counts),
             "waiting": [i for i in items if i["queue_state"] == "waiting"],
             "settled": [i for i in items if i["queue_state"] != "waiting"]}
@@ -9174,7 +9178,8 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
                 f"check ({item}), and no worker is waiting for a reply. If it works in "
                 f"production: jarvis morpheus waive {item} --reason \"...\". To run the "
                 f"check again (after fixing what made it fail): "
-                f"jarvis morpheus requeue {item}. Either closes this question.")
+                f"jarvis morpheus requeue {item}. If it is broken and needs a fix: "
+                f"jarvis morpheus confirm {item} --fix \"...\". Each closes this question.")
         neo.record_answer(question_id, answer, answered_by="user")
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:
@@ -13956,6 +13961,30 @@ def morpheus_waive(item_id: str, reason: str) -> dict[str, Any]:
     _close_validation_questions(item_id, f"The user waived {item_id}: {reason.strip()}",
                                 f"decided by the user on {item_id} itself")
     return item
+
+
+def morpheus_confirm(item_id: str, fix: str) -> dict[str, Any]:
+    """The user rules a failed check real and files its fix: the user's own order, no steward"""
+    from . import morpheus
+
+    catalog = _morpheus_catalog()
+
+    def file(item: dict[str, Any]) -> str:
+        project = item.get("project") or morpheus._os_project(catalog)
+        title = f"Fix PR #{item['pr_number']} failing production validation"
+        return str(create_work_order(project, title,
+                                     description=morpheus.fix_description(item, fix))["id"])
+
+    central = CentralStore()
+    try:
+        item, order = morpheus.confirm(central, item_id, fix, file)
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+    _close_validation_questions(item_id, f"The user confirmed {item_id} failed; fix: {order}",
+                                f"decided by the user on {item_id} itself")
+    return {**item, "fix_order": order}
 
 
 def morpheus_pause(mode: str | None, reason: str = "") -> dict[str, Any]:

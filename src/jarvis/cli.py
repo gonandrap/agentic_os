@@ -740,6 +740,10 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--reason", required=True)
     m = mo.add_parser("requeue", help="watch a settled PR again with a fresh deadline")
     m.add_argument("item_id")
+    m = mo.add_parser("confirm", help="rule a failed check real and file the work order "
+                                      "that fixes it")
+    m.add_argument("item_id")
+    m.add_argument("--fix", required=True, help="what needs fixing: the order's description")
     m = mo.add_parser("pause", help="hold Morpheus's session turns, whatever the fleet does "
                                     "(checks still run; they spend nothing)")
     m.add_argument("--reason", required=True)
@@ -4062,6 +4066,11 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
     if args.morpheus_cmd == "requeue":
         item = ops.morpheus_requeue(args.item_id)
         _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
+    if args.morpheus_cmd == "confirm":
+        item = ops.morpheus_confirm(args.item_id, args.fix)
+        _print({"id": item["id"], "state": item["state"], "fix_order": item["fix_order"]},
+               args.json)
         return 0
     if args.morpheus_cmd in ("pause", "unpause", "follow-fleet"):
         mode = {"pause": "paused", "unpause": "running"}.get(args.morpheus_cmd)

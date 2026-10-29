@@ -211,6 +211,24 @@ def test_enforce_never_dispatches_with_self_dispatch_off(fleet):
     assert (d.outcome, d.allowed) == ("dispatch", False)
 
 
+def test_an_ask_reaches_the_inbox_with_a_link_and_the_command_that_acts(fleet):
+    make, store = fleet
+    cat = make(mode="enforce", critical_weekly_usd=0)
+    d = steward.gate(cand(origin_kind="morpheus", severity="critical", parent_wo_id="wo-p1",
+                          payload={"morpheus_item": "mv-1"}), catalog=cat, store=store)
+    assert d.outcome == "ask"
+    central = CentralStore()
+    try:
+        [item] = central.new_inbox()
+        [held] = central.steward_asks(0)
+    finally:
+        central.close()
+    assert (item["level"], item["wo_id"], held["id"]) == ("critical", "wo-p1", d.decision_id)
+    assert "jarvis morpheus confirm mv-1 --fix" in item["body"]
+    assert f"/steward#decision-{d.decision_id}" in item["body"]
+    assert "does not re-run this one" in item["body"]
+
+
 def test_the_ledger_counts_stamped_spend_and_what_is_still_reserved(fleet):
     make, store = fleet
     cat = make(mode="enforce", weekly_usd=100)
