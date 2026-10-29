@@ -1511,13 +1511,22 @@ def create_app() -> FastAPI:
                       turn_rows=turn_rows, bar_scale=scale, own_label=OWN_LABEL)
 
     @app.get("/inbox", response_class=HTMLResponse)
-    def inbox(request: Request):
+    def inbox(request: Request, level: str = "", project: str = "", q: str = "",
+              sort: str = "priority"):
         central = CentralStore()
         try:
-            items = central.unacked_inbox()
+            every = central.unacked_inbox()
         finally:
             central.close()
-        return render(request, "inbox.html", active="inbox", items=items)
+        if sort not in ops.INBOX_SORTS:
+            sort = "priority"
+        items = ops.select_inbox(every, level=level, project=project, q=q, sort=sort)
+        return render(request, "inbox.html", active="inbox", items=items, total=len(every),
+                      projects=sorted({it["project"] for it in every}),
+                      levels=ops.INBOX_LEVELS, sorts=ops.INBOX_SORTS,
+                      level=level, project=project, q=q, sort=sort,
+                      filtered=bool(level or project or q),
+                      back=str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""))
 
     @app.get("/backlog", response_class=HTMLResponse)
     def backlog(request: Request):
@@ -2138,9 +2147,15 @@ def create_app() -> FastAPI:
         return RedirectResponse(_same_site_back(next, "/"), status_code=303)
 
     @app.post("/inbox/ack")
-    def ack(inbox_id: str = Form("")):
-        ops.ack_inbox(int(inbox_id) if inbox_id else None)
-        return RedirectResponse("/inbox", status_code=303)
+    def ack(inbox_id: str = Form(""), shown: str | None = Form(None), next: str = Form("")):
+        if shown is not None:
+            # "Ack shown" under a filter acks only the rows the reader saw, never ack-all
+            for one in shown.split(","):
+                if one.strip().isdigit():
+                    ops.ack_inbox(int(one))
+        else:
+            ops.ack_inbox(int(inbox_id) if inbox_id else None)
+        return RedirectResponse(_same_site_back(next, "/inbox"), status_code=303)
 
     @app.post("/backlog/promote/{item_id}")
     def promote(item_id: str, force: str = Form("")):

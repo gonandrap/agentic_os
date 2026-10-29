@@ -5,11 +5,38 @@
 <h2>Inbox
   {% if items %}
   <form class="inline" method="post" action="/inbox/ack" style="float: right;">
-    <button>Ack all</button>
+    {% if filtered %}<input type="hidden" name="shown" value="{{ items | map(attribute='id') | join(',') }}">{% endif %}
+    <input type="hidden" name="next" value="{{ back }}">
+    <button>{{ 'Ack shown' if filtered else 'Ack all' }}</button>
   </form>
   {% endif %}
 </h2>
 <div class="sub">{{ inbox_list_note }}</div>
+
+<form class="panel search-form" method="get" action="/inbox">
+  <input type="text" name="q" value="{{ q }}" placeholder="search title, body or wo id">
+  <select name="level" aria-label="criticality">
+    <option value="">every level</option>
+    {% for lv in levels %}
+    <option value="{{ lv }}" {{ 'selected' if lv == level }}>{{ lv }}</option>
+    {% endfor %}
+  </select>
+  <select name="project" aria-label="project">
+    <option value="">every project</option>
+    {% for p in projects %}
+    <option value="{{ p }}" {{ 'selected' if p == project }}>{{ p }}</option>
+    {% endfor %}
+  </select>
+  <select name="sort" aria-label="sort">
+    {% for s in sorts %}
+    <option value="{{ s }}" {{ 'selected' if s == sort }}>{{ 'priority' if s == 'priority' else s + ' first' }}</option>
+    {% endfor %}
+  </select>
+  <button class="primary">Apply</button>
+  {% if filtered %}<a href="/inbox?sort={{ sort }}">clear</a>{% endif %}
+</form>
+{% if filtered %}<p class="sub">{{ items | length }} of {{ total }} shown</p>{% endif %}
+
 <div class="panel">
   {% for it in items %}
   <div class="row">
@@ -23,11 +50,12 @@
     <span class="sub mono">{{ fmt_age(it.ts) }}</span>
     <form class="inline" method="post" action="/inbox/ack">
       <input type="hidden" name="inbox_id" value="{{ it.id }}">
+      <input type="hidden" name="next" value="{{ back }}">
       <button>Ack</button>
     </form>
   </div>
   {% else %}
-  <div class="empty">inbox empty — Jarvis will post here when something needs you</div>
+  <div class="empty">{{ 'nothing matches these filters' if filtered else 'inbox empty — Jarvis will post here when something needs you' }}</div>
   {% endfor %}
 </div>
 
