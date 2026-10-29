@@ -1064,7 +1064,8 @@ def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: 
     """The first (subagent, span) whose LAST span is an unfinished tool call older than `older_than`..."""
     for sub in subs:
         span = next((t.spans[-1] for t in reversed(sub.turns) if t.spans), None)
-        if span is None or span.finished or span.started < since:
+        # A zero start is a missing stamp, not 1970 (issue 1309)
+        if span is None or span.finished or not span.started or span.started < since:
             continue
         if now - span.started >= older_than:
             return sub, span
@@ -1233,7 +1234,7 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
                 f"{held_note(wall, holding)} with nothing completed yet; the model is "
                 f"answering slowly, and this is not a stall{hint}")))
     for span in turn.spans:
-        if not span.is_join or span.finished or not now:
+        if not span.is_join or span.finished or not now or not span.started:
             continue
         # A DELEGATION is judged on HANG EVIDENCE and never on elapsed wait (spec §2b): at...
         if span.name in DELEGATION_TOOLS:
