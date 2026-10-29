@@ -38,8 +38,10 @@ history`), and file one inbox row under `os`.
   settings, so a reason is required whenever the project is in the catalog.
 - The project that runs the OS itself is refused. No flag overrides that.
 - A worker session may not offboard.
-- The strip never removes a file you edited: a hand-edited `settings.json`, a committed or
-  edited `OPERATION.md`, a changed skill stay, each named as a warning. A missing project
+- The strip never removes a file you edited: a hand-edited `settings.json` or a changed
+  skill stays, each named as a warning. `OPERATION.md` always goes: a committed one's
+  deletion is left for you to commit; edits git cannot restore move to
+  `.jarvis/OPERATION.md.offboarded` (on purge the file stays, with the `rm` to run). A missing project
   directory is a warning too; the registry and catalog still move. Run it again to finish a
   strip that failed.
 

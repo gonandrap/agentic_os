@@ -448,8 +448,51 @@ def test_unbootstrap_keeps_user_edits_and_is_idempotent(tmp_path, monkeypatch):
     assert _snapshot(p) == kept
     assert any("already absent" in a for a in second.actions)
     assert (p / SKILL).read_text() == "mine\n"
-    assert op.read_text().endswith("my notes\n")
-    assert any("OPERATION.md left in place" in w for w in second.warnings)
+    assert not op.exists()
+    assert (p / ".jarvis" / "OPERATION.md.offboarded").read_text().endswith("my notes\n")
+
+
+def test_unbootstrap_operation_md_committed_or_edited(tmp_path, monkeypatch):
+    """Offboard spec §4: OPERATION.md never lingers; only bytes git cannot restore survive"""
+    import subprocess
+    from jarvis.bootstrap import unbootstrap_project
+    from jarvis.testing import make_git_project
+    monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(tmp_path / "claude.json"))
+    p = make_git_project(tmp_path, "committed")
+    bootstrap_project(spec(p))
+    git = ["git", "-C", str(p), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", "OPERATION.md"], check=True)
+    subprocess.run([*git, "commit", "-qm", "op"], check=True)
+    op = p / "OPERATION.md"
+    op.write_text("committed, then edited\n")
+    subprocess.run([*git, "commit", "-qam", "edit"], check=True)
+
+    report = unbootstrap_project(spec(p), purge=False, dry_run=False)
+    assert "removed OPERATION.md" in report.actions and not op.exists()
+    assert not (p / ".jarvis" / "OPERATION.md.offboarded").exists()
+    assert any("left for you to commit" in w for w in report.warnings)
+
+    q = make_git_project(tmp_path, "purged-edited")
+    bootstrap_project(spec(q))
+    (q / "OPERATION.md").write_text("mine\n")
+    purge = unbootstrap_project(spec(q), purge=True, dry_run=False)
+    assert (q / "OPERATION.md").read_text() == "mine\n"
+    assert any(f"rm {q / 'OPERATION.md'}" in w for w in purge.warnings)
+
+
+def test_unbootstrap_keeps_claude_dir_holding_an_empty_user_dir(tmp_path, monkeypatch):
+    """Issue 1330: an empty .claude/worktrees/ the OS never wrote must not abort the strip"""
+    from jarvis.bootstrap import unbootstrap_project, workspace_trusted
+    from jarvis.testing import make_git_project
+    p = make_git_project(tmp_path, "worktrees")
+    monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(tmp_path / "claude.json"))
+    bootstrap_project(spec(p))
+    (p / ".claude" / "worktrees").mkdir()
+
+    report = unbootstrap_project(spec(p), purge=False, dry_run=False)
+    assert [x.name for x in (p / ".claude").iterdir()] == ["worktrees"]
+    assert "removed OPERATION.md" in report.actions
+    assert not (p / "OPERATION.md").exists() and workspace_trusted(p) is False
 
 
 def test_unbootstrap_purge_restores_backup_and_dry_run_writes_nothing(tmp_path, monkeypatch):
