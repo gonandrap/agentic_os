@@ -11259,6 +11259,128 @@ def onboard_apply(draft_path: str, *, catalog_path: str | None = None,
             **{**payload, "changed": row["id"] != was}}
 
 
+def offboard_project(name: str, *, purge: bool = False, force: bool = False,
+                     dry_run: bool = False, catalog_path: str | None = None,
+                     reason: str = "") -> dict[str, Any]:
+    """Take a project out of the OS; step order is a safety constraint (docs/superpowers/specs/2026-10-28-offboard-a-project.md §7)"""
+    from . import bootstrap, schedule
+    from .neo_store import NeoStore
+
+    if os.environ.get("JARVIS_WO_ID"):
+        raise OpsError(
+            f"{os.environ['JARVIS_WO_ID']} is a worker session — a worker may not "
+            "`jarvis offboard`. The fleet's project list is the user's. Ask on the work "
+            "order record (`jarvis wo ask`).")
+    # 1. Resolve
+    paths = registered_project_paths(include_archived=True)
+    if name not in paths:
+        raise OpsError(f"project {name!r} not registered (known: {sorted(paths)})")
+    central = CentralStore()
+    try:
+        status = central.get_project(name)["status"]
+    finally:
+        central.close()
+    # 2. The OS-owning project carries Morpheus, the steward and the OS health sweep
+    try:
+        owner = schedule.os_project(paths.items())
+    except (OSError, ValueError):
+        owner = None
+    if owner == name:
+        raise OpsError(
+            f"{name} runs the OS itself — Morpheus's release queue, the steward and the "
+            f"OS health sweep all hang off it, so it cannot be offboarded. No flag "
+            f"overrides this.")
+
+    # 3. The plan: a pure read, and the whole return value under --dry-run
+    file = _catalog_file(catalog_path)
+    document = _read_document(file)
+    in_catalog = name in _project_names(document)
+    changes: list[dict[str, Any]] = []
+    spec = ProjectSpec(name=name, path=paths[name])
+    if in_catalog:
+        try:
+            before = _resolved_of(document, file)
+            spec = next(p for p in parse_catalog(json.loads(json.dumps(document)),
+                                                 source_path=file).projects
+                        if p.name == name)
+        except (OpsError, CatalogError):
+            before = {}  # an already-invalid catalog is exactly what this may be fixing
+        document["projects"] = [p for p in document["projects"]
+                                if not (isinstance(p, dict) and p.get("name") == name)]
+        changes = config_version.diff(before, _resolved_of(document, file))
+        _require_reason(changes, reason,
+                        f"jarvis offboard {name}{' --purge --yes' if purge else ''}"
+                        f'{" --force" if force else ""} --reason "…"')
+    open_ = quiesce_project(name)["open"] if status != ARCHIVED else []
+    strip = bootstrap.unbootstrap_project(spec, purge=purge, dry_run=True)
+    plan: dict[str, Any] = {
+        "project": name, "mode": "purge" if purge else "archive", "dry_run": dry_run,
+        "status": status, "open": open_, "cancelled": [], "sessions_stopped": 0,
+        "backlog_dropped": 0, "inbox_acked": 0,
+        "strip": {"actions": strip.actions, "warnings": strip.warnings},
+        "registry": "would delete the projects row and every row scoped to it in os.db "
+                    "and neo.db" if purge else f"would set status {ARCHIVED!r}",
+        "purged": {},
+        "catalog": {"path": str(file), "in_catalog": in_catalog,
+                    "removed": len(changes), "version": None},
+        "inbox_id": None,
+    }
+    # 4. Refuse on open orders
+    if open_ and not force:
+        listed = ", ".join(f"{o['id']} ({o['status']})" for o in open_)
+        raise OpsError(
+            f"{name} has {len(open_)} open order(s): {listed}. Offboarding cancels them "
+            f"— re-run with --force to do that, or settle them first.")
+    if dry_run:
+        return plan
+
+    # 5. Quiesce
+    if status != ARCHIVED:
+        q = quiesce_project(name, apply=True, reason=reason or "project offboarded")
+        plan.update({k: q[k] for k in ("cancelled", "sessions_stopped",
+                                       "backlog_dropped", "inbox_acked")})
+    # 6. Strip, after quiescing: a live worker's gate runs through .claude/settings.json
+    try:
+        strip = bootstrap.unbootstrap_project(spec, purge=purge, dry_run=False)
+        plan["strip"] = {"actions": strip.actions, "warnings": strip.warnings}
+    except OSError as e:
+        # A stale repo is inert and a second offboard fixes it; registry and catalog still move
+        plan["strip"]["warnings"] = [*strip.warnings, f"strip failed: {e}"]
+    # 7. Registry, then 8. catalog: these two move together
+    central = CentralStore()
+    try:
+        if purge:
+            plan["purged"]["os"] = central.purge_project(name)
+            neo = NeoStore()
+            try:
+                plan["purged"]["neo"] = neo.purge_project(name)
+            finally:
+                neo.close()
+            central.delete_project(name)
+            plan["registry"] = "deleted"
+        else:
+            central.set_project_status(name, ARCHIVED)
+            plan["registry"] = ARCHIVED
+    finally:
+        central.close()
+    if in_catalog:
+        row = _commit_document(document, path=file, actor="user",
+                               reason=reason or f"offboard {name}", changes=changes)
+        plan["catalog"]["version"] = row["id"]
+    # 9. On the record the user reads
+    central = CentralStore()
+    try:
+        plan["inbox_id"] = central.add_inbox(
+            "os", f"{name} offboarded ({plan['mode']})",
+            f"{len(plan['cancelled'])} order(s) cancelled, "
+            f"{len(plan['strip']['actions'])} repo action(s), "
+            f"{len(plan['strip']['warnings'])} warning(s); "
+            f"catalog {'rewritten' if in_catalog else 'had no entry'}. {reason}".strip())
+    finally:
+        central.close()
+    return plan
+
+
 def config_get(path: str, project: str | None = None,
                catalog_path: str | None = None) -> dict[str, Any]:
     """One setting as the fleet would read it, and whether the file says so"""
