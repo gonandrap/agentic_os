@@ -14,6 +14,9 @@ from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -1162,6 +1165,20 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001 — the chrome itself may be what broke
             return HTMLResponse(f"<h1>Something went wrong</h1><p>{message}</p>",
                                 status_code=500)
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError):
+        """A page link the user followed gets the error page, never FastAPI's raw JSON; /api/* keeps the 422"""
+        if request.url.path.startswith("/api/"):
+            return await request_validation_exception_handler(request, exc)
+        errors = exc.errors()
+        # A junk id in the path names nothing, so 404; a bad form or query value is the request's fault
+        status = 404 if any(e.get("loc", ())[:1] == ("path",) for e in errors) else 400
+        detail = "; ".join(f"{'.'.join(str(p) for p in e.get('loc', ()))}: {e.get('msg', '')}"
+                           for e in errors)
+        message = f"{request.url.path} could not be read — {detail}"
+        return await run_in_threadpool(render, request, "error.html", message=message,
+                                       status_code=status)
 
     @app.middleware("http")
     async def access_log(request: Request, call_next):
