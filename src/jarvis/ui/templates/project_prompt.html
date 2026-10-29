@@ -20,21 +20,26 @@
   section or dependencies. Each real order's prompts are on its own page, under
   <em>prompts</em>.</p>
 
-<div class="grid wide">
-<div class="sec">
-<h2 id="prompt">The dispatch prompt</h2>
+{# Tabs, not side by side — kn-fa085e88; the #prompt/#operation jumps open their tab. #}
+<div class="tabbed" id="prompt-tabs">
+  <div class="tabs" role="tablist">
+    <button role="tab" data-panel="prompt" aria-selected="true" aria-controls="prompt">dispatch prompt</button>
+    <button role="tab" data-panel="operation" aria-selected="false" aria-controls="operation">OPERATION.md</button>
+  </div>
+<section class="tabpanel on" id="prompt" role="tabpanel">
+<h2>The dispatch prompt</h2>
 <pre class="request-text" style="max-height: none;">{{ preview.prompt }}</pre>
-</div>
-<div class="sec">
-<h2 id="operation">OPERATION.md</h2>
+</section>
+<section class="tabpanel" id="operation" role="tabpanel">
+<h2>OPERATION.md</h2>
 <p class="kv mono">{{ preview.operation_path }}</p>
 {% if preview.operation is not none %}
 <pre class="request-text" style="max-height: none;">{{ preview.operation }}</pre>
 {% else %}
-<div class="panel"><div class="empty">no OPERATION.md in this project yet —
-  <code>jarvis adopt</code> writes it.</div></div>
+<p class="empty">no OPERATION.md in this project yet —
+  <code>jarvis adopt</code> writes it.</p>
 {% endif %}
-</div>
+</section>
 </div>
 
 {% endblock %}

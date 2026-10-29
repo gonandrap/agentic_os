@@ -1237,6 +1237,29 @@ def test_a_morpheus_filter_in_the_url_narrows_the_rows(page, server):
     assert "1 of 2 shown" in page.locator("main").inner_text()
 
 
+# §9 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def test_debug_prompt_spec_and_sessions_pages_read_at_desktop_and_phone_width(
+        page, server, readable):
+    wo = ops.create_work_order("proj_a", "an order to read the debug page of",
+                               description=_LONG)
+    pages = {"debug": f"/wo/proj_a/{wo['id']}/debug", "wo-prompt": f"/wo/proj_a/{wo['id']}/prompt",
+             "project-prompt": "/project/proj_a/prompt", "spec": "/spec/proj_a/fo-00000000",
+             "sessions": "/project/proj_a/sessions"}
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        for name, path in pages.items():
+            page.goto(f"{server}{path}")
+            assert not page.locator("main .grid").count(), path
+            readable(page, "main td, main th, main p, main .row > span")
+            _shot(page, f"{name}-{size['width']}")
+
+
+def test_the_operation_jump_opens_its_tab_on_the_worker_prompt_page(page, server):
+    page.goto(f"{server}/project/proj_a/prompt#operation")
+    assert page.locator("#operation").is_visible()
+    assert not page.locator("#prompt").is_visible()
+
+
 def test_a_failed_morpheus_row_sits_above_the_others(page, server):
     failed, watching = _morpheus_rows()
     page.goto(f"{server}/morpheus")

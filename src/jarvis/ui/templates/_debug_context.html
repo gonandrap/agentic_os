@@ -14,8 +14,7 @@
 {{ ui.provenance(c.provenance) }}
 {% if not c.recorded %}{{ ui.note(c.note) }}{% endif %}
 {# FOLDED like the turns above (2026-10-22 spec §3): `#ctx-<seq>` opens one, the last three
-   are open, and two turns sit side by side at width so a delta can be read across. #}
-<div class="grid" style="--col: 860px; gap: 0 18px;">
+   are open. Full width, one turn per row — kn-fa085e88. #}
 {% for turn in c.turns %}
 <details class="turn panel" id="ctx-{{ turn.seq }}" style="margin-bottom: 10px;"{% if loop.revindex <= 3 %} open{% endif %}>
   <summary>
@@ -32,7 +31,8 @@
   {% else %}
   {# Fixed columns: `table-layout: auto` sized turn 1's table off its empty note column and
      turn 2's off a full one, so two readings of the same ledger did not line up. #}
-  <table style="table-layout: fixed;">
+  <div class="table-wrap">
+  <table style="table-layout: fixed; min-width: 680px;">
     <tr><th style="width: 200px;">ingredient</th><th style="width: 120px;">bytes</th>
         <th style="width: 120px;">tokens</th><th>what it is</th></tr>
     {% for row in turn.ingredients %}
@@ -47,6 +47,7 @@
     </tr>
     {% endfor %}
   </table>
+  </div>
   <div class="row">
     <span class="kv" style="width: 120px;">residual</span>
     {% if turn.residual %}
@@ -97,6 +98,5 @@
   {% endif %}
 </details>
 {% endfor %}
-</div>
 {% endif %}
 </section>
