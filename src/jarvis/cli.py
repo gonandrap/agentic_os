@@ -773,7 +773,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--catalog", help="read this catalog instead of the registered one")
     sp.add_argument("--json", action="store_true")
 
-    sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
+    sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, "
+                                      "settings); to choose its settings in an interview "
+                                      "instead, `jarvis onboard start <path>`")
     sp.add_argument("path", help="project directory")
     sp.add_argument("--name", help="project name (default: directory name)")
     sp.add_argument("--catalog", help="catalog to take overrides/defaults from")
@@ -1508,6 +1510,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="onboard a project: decide what the OS does for it automatically, then "
              "apply that as one configuration version plus a bootstrap",
     ).add_subparsers(dest="ob_cmd", required=True)
+
+    c = ob.add_parser("start", help="open the interview: an interactive greeting_agent "
+                                    "session in this terminal")
+    c.add_argument("path", help="the project's git repository")
+    c.add_argument("--name", help="project name (default: directory name)")
+    c.add_argument("--print-prompt", dest="print_prompt", action="store_true",
+                   help="print the persona root and the opening prompt instead of "
+                        "launching claude")
 
     c = ob.add_parser(
         "apply",
@@ -4868,10 +4878,24 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_onboard_start(args: argparse.Namespace) -> int:
+    """`jarvis onboard start` — §5 of the onboarding-interview spec"""
+    from . import ops
+
+    data = ops.onboard_session(args.path, args.name)
+    if args.print_prompt:
+        print(f"persona root: {data['persona_root']}\n\n{data['prompt']}")
+        return 0
+    os.chdir(data["cwd"])
+    os.execvp(data["argv"][0], data["argv"])
+    return 0
+
+
 def cmd_onboard(args: argparse.Namespace) -> int:
     from . import ops
 
-    # The group handler, so a sibling adding `start` branches here as `cmd_config` does
+    if args.ob_cmd == "start":
+        return cmd_onboard_start(args)
     if args.ob_cmd in ("questions", "explain"):
         return _cmd_onboard_read(args)
     if args.ob_cmd != "apply":
