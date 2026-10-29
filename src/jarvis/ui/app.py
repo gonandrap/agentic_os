@@ -1608,6 +1608,11 @@ def create_app() -> FastAPI:
                                      offset=_offset_param(offset), tz=tz or None,
                                      since=_in_zone(since, zone) if since else None,
                                      until=_in_zone(until, zone) if until else None)
+            # Checked here because the aggregation that refuses a typo no longer runs on the request path
+            known = ops.registered_project_paths()
+            if project and project not in known:
+                raise ops.OpsError(
+                    f"project {project!r} not registered (known: {sorted(known)})")
             # docs/superpowers/specs/2026-10-22-cost-tab-precompute.md §Matching rule
             entry = None
             if (not project and offset in ("", "0") and not since and not until

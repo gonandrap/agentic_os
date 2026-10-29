@@ -182,6 +182,15 @@ def test_cost_page_can_be_scoped_to_one_project(client, project, transcript):
     assert "not registered" in unknown.text
 
 
+def test_an_unknown_project_is_refused_on_the_first_visit_not_after_computing(
+        client, project, transcript):
+    """A typo must not come back as a computing page nobody can clear"""
+    page = client.get("/cost?project=nope")
+    assert page.status_code == 200
+    assert "not registered" in page.text
+    assert "What the work cost — computing" not in page.text
+
+
 def test_the_work_order_page_shows_two_numbers_and_a_way_in(client, project,
                                                             transcript):
     """Total tokens, total dollars, and a link"""
