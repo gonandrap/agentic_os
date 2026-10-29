@@ -224,6 +224,16 @@ def committed_exists(project_path: Path, planner_wo: dict[str, Any] | None,
     return CommittedAt(project_path, ref, seen)
 
 
+def pushed_exists(project_path: Path, branch: str, repo_path: str,
+                  fetched: set[str]) -> bool:
+    """Is this path committed on `origin/<branch>`, or the local branch a removed worktree left? (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §3)"""
+    ref = f"origin/{branch}"
+    if ref not in fetched:
+        fetched.add(ref)
+        _fetch_ref(project_path, ref)
+    return any(_object_exists(project_path, r, repo_path) for r in (ref, branch))
+
+
 def _object_exists(repo: Path, ref: str, repo_path: str) -> bool | None:
     """`git cat-file -e <ref>:<path>`, silent on the miss"""
     try:
