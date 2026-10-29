@@ -3194,6 +3194,11 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = candidate
     if newest is None:
         return None
+    # A hold names ONE assumption, and the OS holds them one at a time: every still-pending one it declined is owed
+    if newest["kind"] == "autoreview_held":
+        held = _held_pending(store, wo["id"], stale)
+        if len(held) > 1:
+            newest = {**newest, "held": held}
     # An ask is a claim about a question
     if newest["kind"] == "autoreview_asked":
         gone = _unreachable_asks()(newest.get("neo_question_id"))
@@ -3208,6 +3213,23 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = {**newest, "resolved_status": status,
                       "resolved_decider": assumption_decider(row or {})}
     return {**newest, "line": _autoreview_line(newest)}
+
+
+def _held_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[dict[str, Any]]:
+    """The newest live hold per assumption still pending, in assumption order"""
+    from . import db
+
+    pending = {int(a["id"]): a for a in store.pending_assumptions(wo_id)}
+    latest: dict[int, dict[str, Any]] = {}
+    for row in store.events_of_kind(wo_id, "autoreview_held"):
+        payload = db.from_json(row["payload"], {})
+        aid = int(payload.get("assumption_id") or 0)
+        if aid in pending and not stale("autoreview_held", payload):
+            latest[aid] = {"assumption_id": aid,
+                           "n": payload.get("n") or pending[aid].get("n"),
+                           "code": payload.get("code"),
+                           "reason": str(payload.get("reason") or "")}
+    return sorted(latest.values(), key=lambda h: int(h.get("n") or 0))
 
 
 def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
@@ -3790,6 +3812,15 @@ def _autoreview_line(state: dict[str, Any]) -> str:
     if kind == "autoreview_unconfirmed":
         return (f"assumption #{n} left with you — the OS did not confirm its early "
                 f"reading: {state.get('reason') or 'no reason recorded'}{since}")
+    held = state.get("held") or []
+    if len(held) > 1:
+        # Grouped by reason, so ten holds on the same word read as one clause
+        groups: dict[str, list[str]] = {}
+        for h in held:
+            why = re.sub(r"^assumption #\d+ ", "", h["reason"]) or "no reason recorded"
+            groups.setdefault(why, []).append(f"#{h.get('n')}")
+        return (f"held — the OS would not decide {len(held)} assumptions: "
+                + "; ".join(f"{', '.join(ns)} {why}" for why, ns in groups.items()))
     return f"held — {state.get('reason') or 'no reason recorded'}"
 
 
