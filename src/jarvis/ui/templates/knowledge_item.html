@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% block title %}{{ k.id }} · Knowledge — Jarvis{% endblock %}
+{% block style %}
+  .kn-body { white-space: pre-wrap; }
+{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6 #}
+{% set meta = (k.project or "global") ~ " · " ~ (k.topic or "no topic")
+              ~ (" · pinned" if k.pinned else "") ~ (" · retired" if k.retired_at else "") %}
+{{ ui.page_head(k.id, meta) }}
+
+<p class="kv">
+  recorded {{ fmt_ts(k.ts) }} ({{ fmt_age(k.ts) }} ago)
+  {% if k.wo_id %}· by {{ ui.row_id(k.wo_id, "/go/" ~ k.wo_id) }}{% endif %}
+  · {{ k.reads }} read{{ '' if k.reads == 1 else 's' }} · {{ k.content | length }} chars
+  {% if k.topic %}· <a href="/knowledge?topic={{ k.topic | urlencode }}">more on {{ k.topic }}</a>{% endif %}
+</p>
+
+{% if k.retired_at %}
+<p class="kv tone-warn">retired {{ fmt_ts(k.retired_at) }}
+  {% if k.retired_by_wo_id %}by {{ ui.row_id(k.retired_by_wo_id, "/go/" ~ k.retired_by_wo_id) }}{% endif %}
+  — {{ k.retired_reason or 'no reason recorded' }}</p>
+{% endif %}
+
+<div class="panel">
+  <div class="kv kn-body">{{ k.content }}</div>
+  {% if k.tags %}<p class="sub">tags: <span class="mono">{{ k.tags }}</span></p>{% endif %}
+</div>
+
+<form method="post" action="/knowledge/pin" style="margin-top:12px">
+  <input type="hidden" name="kn_id" value="{{ k.id }}">
+  <input type="hidden" name="pinned" value="{{ '0' if k.pinned else '1' }}">
+  <input type="hidden" name="next" value="/knowledge/{{ k.id }}">
+  <button title="{{ 'stop injecting this into every worker prompt' if k.pinned else 'inject this into every worker prompt verbatim' }}">{{ 'unpin' if k.pinned else 'pin' }}</button>
+  <span class="sub">{{ 'pasted verbatim into every worker prompt' if k.pinned else 'reaches workers through the index' }}</span>
+</form>
+
+<p class="sub"><a href="/knowledge">the whole base</a> · from a terminal:
+  <span class="mono">jarvis learn show {{ k.id }}</span></p>
+{% endblock %}

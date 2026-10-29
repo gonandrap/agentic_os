@@ -102,7 +102,7 @@ def _from_project(store: "ProjectStore", name: str, words: list[str], kinds: set
                             title=f"{row['kind']} for {row['wo_id']}",
                             status=row["status"], ts=row["ts"], score=row["_score"],
                             body=row["command"], words=words,
-                            url=f"/gates#gate-{row['id']}",
+                            url=f"/gates/{row['id']}?project={name}",
                             ref=f"jarvis gate show {row['id']}"))
     return out
 
@@ -148,7 +148,7 @@ def search(query: str, *, project: str | None = None,
                                      title=row["title"], status=row["status"],
                                      ts=row["created_at"], score=row["_score"],
                                      body=row["description"], words=words,
-                                     url="/backlog",
+                                     url=f"/backlog/{row['id']}",
                                      ref=f"jarvis backlog show {row['id']}"))
             if "knowledge" in wanted:
                 rows = central.search_knowledge(query, limit=limit, project=project)
@@ -158,7 +158,7 @@ def search(query: str, *, project: str | None = None,
                                      status="retired" if row["retired_at"] else "",
                                      ts=row["ts"], score=len(words) - rank / len(rows),
                                      body=row["content"], words=words,
-                                     url=f"/knowledge#{row['id']}",
+                                     url=f"/knowledge/{row['id']}",
                                      ref=f"jarvis learn show {row['id']}"))
         finally:
             central.close()

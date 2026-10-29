@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -255,16 +255,18 @@ class NeoStore:
                           (question, question_id))
         return True
 
-    def claim_next(self) -> dict[str, Any] | None:
-        """Atomically claim the OLDEST queued question (FIFO"""
+    def claim_next(self, skip: Collection[str] = ()) -> dict[str, Any] | None:
+        """Atomically claim the OLDEST queued question (FIFO), never one whose project is in `skip`"""
         now = db.now()
+        skip = sorted(skip)
         cur = self.conn.execute(
-            """UPDATE questions SET status='answering', claimed_at=?
+            f"""UPDATE questions SET status='answering', claimed_at=?
                WHERE id = (SELECT id FROM questions WHERE status='queued'
                              AND COALESCE(retry_after, 0) <= ?
+                             AND project NOT IN ({','.join('?' for _ in skip)})
                            ORDER BY ts LIMIT 1)
                RETURNING *""",
-            (now, now),
+            (now, now, *skip),
         )
         row = cur.fetchone()
         return dict(row) if row else None

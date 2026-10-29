@@ -20,7 +20,7 @@ from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspect
 from . import budget as budget_mod
 from . import steward
 from .catalog import DEFAULT_STAKES_CLASSIFIER, Catalog, ProjectSpec, load_catalog
-from .central_store import SETTLED_BACKLOG_STATUSES, CentralStore
+from .central_store import ARCHIVED, SETTLED_BACKLOG_STATUSES, CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
@@ -565,6 +565,11 @@ CACHE_1H_INBOX_TITLE = {
 }
 
 
+def archived_projects(central: CentralStore) -> frozenset[str]:
+    """Projects the fleet must not act on (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6)"""
+    return frozenset(p["name"] for p in central.list_projects() if p["status"] == ARCHIVED)
+
+
 def _holds_not_recorded(early: bool) -> tuple[str, ...]:
     """Which `autoreview` holds this PASS must not write to the timeline"""
     from . import autoreview
@@ -670,6 +675,10 @@ class Daemon:
         self._catalog_stamp = self._catalog_file_stamp()
         # Reload refused (unreadable, unparseable
         self.catalog_reload_warned = False
+        #: Last archived set read; kept when a read fails, so nothing evicted comes back (§6.1)
+        self.offboarded: frozenset[str] = frozenset()
+        self.owner_move_warned = False
+        self.evict_offboarded()
 
     # -- lifecycle
 
@@ -677,6 +686,47 @@ class Daemon:
         if project.name not in self.stores:
             self.stores[project.name] = ProjectStore(project.path)
         return self.stores[project.name]
+
+    def _read_offboarded(self) -> frozenset[str]:
+        try:
+            self.offboarded = archived_projects(self.central)
+        except Exception:  # noqa: BLE001 — fail closed, like `fleet.load_pause`
+            log.exception("could not read archived projects; keeping %s", sorted(self.offboarded))
+        return self.offboarded
+
+    def evict_offboarded(self) -> None:
+        """Drop archived projects from the live catalog and close stores it no longer names (§6.1, §6.2.4)"""
+        gone = self._read_offboarded()
+        if any(p.name in gone for p in self.catalog.projects):
+            owner = self._os_owner()
+            self.catalog = self.catalog.without_projects(gone)
+            log.info("evicted offboarded project(s) %s", sorted(gone))
+            self._warn_owner_moved(owner)
+        self._close_orphan_stores()
+
+    def _warn_owner_moved(self, old: str | None) -> None:
+        """An offboard that moves fleet-wide OS job ownership says so, once per daemon run (§6.2.5)"""
+        new = self._os_owner()
+        if old is None or new == old or any(p.name == old for p in self.catalog.projects):
+            return
+        log.warning("OS job owner moved from %s to %s", old, new)
+        if self.owner_move_warned:
+            return
+        self.owner_move_warned = True
+        self.central.add_inbox(
+            project="os", level="warning",
+            title="fleet-wide OS jobs moved to another project",
+            body=(f"{old} owned the fleet-wide OS jobs by fallback (no project's checkout "
+                  f"holds the running code) and was offboarded. They now run under "
+                  f"{new or 'no project'}."))
+
+    def _close_orphan_stores(self) -> None:
+        live = {p.name for p in self.catalog.projects}
+        for name in [n for n in self.stores if n not in live]:
+            try:
+                self.stores.pop(name).close()
+            except Exception:  # noqa: BLE001 — a purged file may already be gone
+                log.warning("closing %s's store failed", name, exc_info=True)
 
     def _fleet_stores(self) -> dict[str, ProjectStore]:
         """Every live project's store, for a question about the account (`fleet.read`)"""
@@ -806,14 +856,26 @@ class Daemon:
                 f"{e}\n\nThe fleet is still running the configuration it started with. "
                 f"Fix {path} and it will be picked up on the next tick.")
             return False
-        if {p.name for p in fresh.projects} != {p.name for p in self.catalog.projects}:
+        # Removing an archived or purged (row-less) project is applicable; any other set change is not (§6.1)
+        before = {p.name for p in self.catalog.projects}
+        try:
+            registered = {p["name"] for p in self.central.list_projects()}
+        except Exception:  # noqa: BLE001 — unreadable registry: no removal counts as purged
+            registered = before
+        after = {p.name for p in fresh.projects}
+        gone = self._read_offboarded()
+        offboarded = {n for n in before - after if n in gone or n not in registered}
+        if after - gone != before - gone - offboarded:
             self._refuse_reload(
                 f"{path} added or removed a project, and that is not a setting: a new "
                 f"project has never been through `bootstrap_project`, and a removed one "
                 f"leaves an open store behind. Run `jarvis start` to apply it. Setting "
                 f"changes in the same file are not applied either until you do.")
             return False
-        self.catalog = fresh
+        owner = self._os_owner()
+        self.catalog = fresh.without_projects(gone)
+        self._warn_owner_moved(owner)
+        self._close_orphan_stores()
         self.catalog_reload_warned = False
         log.info("catalog reloaded from %s", path)
         return True
@@ -905,6 +967,7 @@ class Daemon:
     def tick(self) -> None:
         # First, so everything below runs under one configuration — and the same one
         self.reload_catalog()
+        self.evict_offboarded()
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
         poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
@@ -3017,11 +3080,16 @@ class Daemon:
                 finally:
                     store.close()
             fallback = next(iter(dirs.values()), Path.cwd())
+            # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
+            skip = archived_projects(central)
             moved = morpheus.sweep(central, cfg,
-                                   lambda item: dirs.get(item.get("project") or "", fallback))
+                                   lambda item: dirs.get(item.get("project") or "", fallback),
+                                   skip=skip)
             if any(moved.values()):
                 log.info("morpheus sweep: %s", {k: v for k, v in moved.items() if v})
             for item in morpheus.owed_actions(central):
+                if (item["project"] or "") in skip:
+                    continue
                 try:
                     log.info("morpheus %s (PR #%s) %s -> %s", item["id"], item["pr_number"],
                              item["state"], morpheus.act(central, self.catalog, item))
@@ -3030,7 +3098,7 @@ class Daemon:
             # The session lives in the OS project's checkout; each batch adds the projects it touches
             home = next((p.path for p in self.catalog.projects if p.name == os_name), fallback)
             morpheus.wake(central, self.catalog, home, dirs=dirs,
-                          paused=morpheus.pause_state(central)["paused"])
+                          paused=morpheus.pause_state(central)["paused"], skip=skip)
         except Exception:  # noqa: BLE001 — the loop must survive anything
             log.exception("morpheus pass failed")
         finally:
@@ -3280,6 +3348,8 @@ class Daemon:
                 unreachable=lambda q, detail: self._note_question_unreachable(
                     central, q, detail),
                 refused=refused,
+                # Answering an offboarded project's question is spend delivered to nothing (§6.2 of the offboard spec)
+                skip=archived_projects(central),
             )
             if results:
                 log.info("neo drained %d question(s)", len(results))
