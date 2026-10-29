@@ -1,4 +1,4 @@
-"""The interpreter's libsqlite3 must not deadlock WAL close vs open across threads (kn-8e43df8e)."""
+"""libsqlite3 must not deadlock WAL close vs open across threads (kn-8e43df8e)"""
 import subprocess
 import sys
 
