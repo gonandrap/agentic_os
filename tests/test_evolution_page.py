@@ -105,6 +105,13 @@ def test_the_days_parameter_narrows_the_window(client):
     assert "7 days" in body_of(res.text)
 
 
+def test_the_filter_bars_own_submission_renders(client):
+    """The exact URL the filter bar submits with 'every days' picked was a 422 (wo-522ea53a)"""
+    res = client.get("/evolution?project=proj_a&days=&firing=")
+    assert res.status_code == 200
+    assert "90 days" in body_of(res.text)
+
+
 # -- the page prints what the dict says and computes nothing
 
 
