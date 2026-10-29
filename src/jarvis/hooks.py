@@ -2111,12 +2111,15 @@ def memory_files(root: Path, cwd: Path) -> list[Path]:
 def _memory_digest(root: Path, cwd: Path) -> str:
     chunks: list[bytes] = []
     budget = PREFIX_MEMORY_BYTE_CAP
+    origin = cwd.resolve() if cwd.exists() else cwd
     for path in memory_files(root, cwd):
+        # Relative to the walk origin: a resume reporting the root, not the worktree, is not drift (issue 1328)
+        name = path.relative_to(origin) if path.is_relative_to(origin) else path
         try:
             body = path.read_bytes()[:budget]
         except OSError:
             continue
-        chunks += [str(path).encode(), body]  # the path too: a file APPEARING is drift
+        chunks += [str(name).encode(), body]  # the path too: a file APPEARING is drift
         budget -= len(body)
         if budget <= 0:
             break
