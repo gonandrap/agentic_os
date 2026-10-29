@@ -12367,6 +12367,20 @@ def cost_meter(**kwargs: Any) -> dict[str, Any]:
     return usage_meter.reconciliation(**kwargs)
 
 
+METER_TIMELINE_MAX_SECONDS = 31 * 86_400
+
+
+def cost_meter_timeline(since: float, until: float) -> list[dict[str, Any]]:
+    """The meter's series for any span — the /cost chart's zoom and overlays (no reconciliation)"""
+    from . import usage_meter
+
+    if not until > since:
+        raise OpsError(f"until ({until}) must be after since ({since})")
+    if until - since > METER_TIMELINE_MAX_SECONDS:
+        raise OpsError("span longer than 31 days")
+    return usage_meter.timeline_between(since=since, until=until)
+
+
 def meter_samples(**kwargs: Any) -> list[dict[str, Any]]:
     """The raw usage-meter series for one span — see `usage_meter.sample_rows`"""
     from . import usage_meter
