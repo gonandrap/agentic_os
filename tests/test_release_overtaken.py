@@ -867,8 +867,8 @@ def test_the_production_layout_still_knows_which_project_is_the_os(
     deploy(project, TAG)
     fix = landed_fix(store, ISSUE, landed)
 
-    assert fleet._os_owner() == "shared_schedule", "the old answer, for contrast"
     assert fleet._os_project() == "proj_a"
+    assert fleet._os_owner() == "proj_a", "fleet-wide checks follow, not the first project"
 
     assert fleet.ensure_release(fleet.catalog.project("proj_a"), store, fix) == ""
     assert len(events(store, fix["id"], Daemon.ALREADY_SHIPPED_EVENT)) == 1

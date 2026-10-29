@@ -4129,10 +4129,12 @@ class Daemon:
     # -- 6b. the scheduler: work orders nobody typed
 
     def _os_owner(self) -> str | None:
-        """Which project runs the fleet-wide OS checks — `schedule.os_owner`, per tick"""
+        """Which project runs the fleet-wide OS checks — the OS project, else `schedule.os_owner`"""
         from . import schedule
 
-        return schedule.os_owner((p.name, p.path) for p in self.catalog.projects)
+        # Origin first: the production install sits outside every catalog path (wo-04fd0fc7)
+        return self._os_project() or schedule.os_owner(
+            (p.name, p.path) for p in self.catalog.projects)
 
     def _os_project(self) -> str | None:
         """Which project IS the OS — `schedule.os_project`, per tick"""
