@@ -1330,3 +1330,18 @@ def test_a_detail_action_lands_back_on_the_detail(central):
     r = TestClient(create_app()).post(f"/morpheus/{item['id']}/requeue", follow_redirects=False,
                                      data={"next": f"/morpheus/{item['id']}"})
     assert r.headers["location"] == f"/morpheus/{item['id']}"
+
+
+def test_a_failed_item_offers_all_three_decisions_and_links_its_neo_question(central):
+    """Issue #1302: list row links Neo question; its detail offers confirm, waive, requeue"""
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    item = _failed(central)
+    central.claim_morpheus_action(item["id"], "neo:2259")
+    client = TestClient(create_app())
+    assert 'Neo <a href="/neo/question/2259">q2259</a>' in client.get("/morpheus").text
+    page = client.get(f"/morpheus/{item['id']}").text
+    for verb in ("confirm", "waive", "requeue"):
+        assert f'action="/morpheus/{item["id"]}/{verb}"' in page

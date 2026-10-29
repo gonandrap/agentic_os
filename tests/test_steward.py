@@ -86,6 +86,15 @@ def test_a_spent_ledger_queues_a_major():
                                                                               "ledger")
 
 
+def test_scraps_of_room_queue_instead_of_dispatching_a_doomed_order():
+    # #1305: $0.46 left dispatched an order that hit its ceiling in two minutes
+    scraps = steward.Ledger(evolution_usd=CFG.weekly_usd - 0.46)
+    assert outcome(cand(), scraps) == ("queue", "ledger")
+    assert outcome(cand(severity="blocker"), scraps) == ("ask", "critical-ceiling")
+    enough = steward.Ledger(evolution_usd=CFG.weekly_usd - steward.MIN_ORDER_USD)
+    assert outcome(cand(), enough)[0] == "dispatch"
+
+
 def test_a_medium_needs_recurrence_a_major_needs_less():
     assert outcome(cand(severity="medium", refs=2)) == ("queue", "recurrence")
     assert outcome(cand(severity="medium", refs=3)) == ("dispatch", "medium")
