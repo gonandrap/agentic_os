@@ -782,6 +782,26 @@ def build_parser() -> argparse.ArgumentParser:
                          "OPERATION.md the generator would otherwise leave alone")
     sp.add_argument("--dry-run", action="store_true")
 
+    # onboarding — whichever section lands first creates the group (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §0.2)
+    onboard = sub.add_parser(
+        "onboard", help="onboard a project by interview: what each automatic behaviour "
+                        "costs, and the configuration you chose",
+    ).add_subparsers(dest="onboard_cmd", required=True)
+
+    sp = onboard.add_parser("questions", help="the whole interview as data — every area, "
+                                              "its postures and its knobs; no model needed")
+    sp.add_argument("--area", help="one area only")
+    sp.add_argument("--json", action="store_true")
+
+    sp = onboard.add_parser("explain", help="what an area or one setting does and costs, "
+                                            "its current value, and how to change it later")
+    sp.add_argument("target", help="an area (`validation`) or a setting "
+                                   "(`os.neo.enabled`, `validation.auto_merge`)")
+    sp.add_argument("--project", help="read current values from this project "
+                                      "(default: the shipped defaults)")
+    sp.add_argument("--catalog", help="a catalog file other than the registered one")
+    sp.add_argument("--json", action="store_true")
+
     # work orders
     wo = sub.add_parser("wo", help="work orders").add_subparsers(dest="wo_cmd", required=True)
 
@@ -4687,6 +4707,51 @@ def _print_wiring(data: dict[str, Any]) -> None:
           "\nJarvis wires into a worker at dispatch. Change it on /config.")
 
 
+def cmd_onboard(args: argparse.Namespace) -> int:
+    """`jarvis onboard questions | explain` — §4 of the onboarding-interview spec"""
+    from . import ops
+
+    if args.onboard_cmd == "questions":
+        data = ops.onboard_questions(args.area)
+        if args.json:
+            _print(data, True)
+            return 0
+        for area in data["areas"]:
+            star = "*" if area["must_have"] else " "
+            print(f"{star} {area['area']:<14} {area['title']}")
+            if area["postures"]:
+                print(f"    postures: {', '.join(area['postures'])}")
+            print(f"    asked: {', '.join(k['tail'] for k in area['knobs']['asked']) or '—'}")
+        return 0
+
+    data = ops.onboard_explain(args.target, project=args.project, catalog_path=args.catalog)
+    if args.json:
+        _print(data, True)
+        return 0
+    if data["kind"] == "area":
+        print(f"{data['title']}  ({data['area']}, scope {data['scope']})")
+        print(f"\n{data['summary']}\n\nOn: {data['on_costs']}\nOff: {data['off_costs']}")
+        if data["enable"]:
+            print(f"\n{data['enable']['path']} = {_cfg_value(data['enable']['value'])}")
+        for name, rows in data["postures"].items():
+            print(f"\n{name}:")
+            for row in rows:
+                print(f"  {row['path']} = {_cfg_value(row['value'])} — {row['line']}")
+        for ref in data["grounding"]:
+            print(f"\n— {ref['path']} § {ref['section']}\n{ref['excerpt'] or '(unreadable)'}")
+        return 0
+    print(f"{data['path']} = {_cfg_value(data['current'])}   "
+          f"(default {_cfg_value(data['default'])}; area {data['area']})")
+    if data["line"]:
+        print(f"  {data['line']}")
+    if data["example"]:
+        print(f"  e.g. {data['example']}")
+    print(f"  {data['apply']} — {data['apply_note']}"
+          + ("  [safety: needs --reason]" if data["safety"] else ""))
+    print(f"  change it later: {data['command']}")
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     from . import ops
 
@@ -5584,6 +5649,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_rules(args)
         if args.cmd == "config":
             return cmd_config(args)
+        if args.cmd == "onboard":
+            return cmd_onboard(args)
         if args.cmd == "backlog":
             return cmd_backlog(args)
         if args.cmd == "brief":

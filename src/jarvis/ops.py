@@ -11057,6 +11057,185 @@ def config_show(project: str | None = None, version: str | None = None,
             "drift": drift}
 
 
+# -- onboarding: the catalogue and `explain` (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §4)
+
+#: Characters of a grounding section `onboard explain` quotes before pointing at the rest
+ONBOARD_EXCERPT_CHARS = 1500
+#: How a project-scoped path is spelled before the project exists
+ONBOARD_PLACEHOLDER = "<project>"
+
+
+def _onboard_defaults() -> dict[str, Any]:
+    """The shipped resolved map, with one placeholder project named `_`"""
+    document = {"os": {}, "projects": [{"name": "_", "path": "/", "description": ""}]}
+    return config_version.resolve(parse_catalog(document))
+
+
+def _onboard_spellings(defaults: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Canonical tail to its `os` and `project` key-space paths (project under `_`)"""
+    from . import onboard_knobs
+
+    out: dict[str, dict[str, str]] = {}
+    for path in defaults:
+        hit = onboard_knobs.area_of(path)
+        if hit is not None:
+            out.setdefault(hit[1], {})["os" if path.startswith("os.") else "project"] = path
+    return out
+
+
+def _onboard_lookup(tail: str, area: str, spellings: dict[str, dict[str, str]]) -> str | None:
+    """Where §2 writes a tail: the project spelling, unless the area is os-only"""
+    from .onboard_knobs import AREA_SCOPE
+
+    spelled = spellings.get(tail, {})
+    if AREA_SCOPE[area] != "os" and "project" in spelled:
+        return spelled["project"]
+    return spelled.get("os") or spelled.get("project")
+
+
+def _onboard_named(path: str, project: str | None) -> str:
+    return path.replace("projects._.", f"projects.{project or ONBOARD_PLACEHOLDER}.", 1)
+
+
+def _onboard_values(project: str | None,
+                    catalog_path: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(current, shipped default), both keyed by `_`-project path"""
+    defaults = _onboard_defaults()
+    if not project:
+        return defaults, defaults
+    live = config_show(project, catalog_path=catalog_path)["resolved"]
+    prefix = f"projects.{project}."
+    current = dict(defaults)
+    for path, value in live.items():
+        current["projects._." + path[len(prefix):] if path.startswith(prefix) else path] = value
+    return current, defaults
+
+
+def _onboard_refuse(target: str) -> OpsError:
+    from .onboard_knobs import AREA_KEYS
+
+    return OpsError(f"{target!r} is neither an area nor a setting the onboarding knows — "
+                    f"areas: {', '.join(AREA_KEYS)}")
+
+
+def _onboard_grounding(ref: tuple[str, str]) -> dict[str, Any]:
+    import shlex
+
+    from . import spec_index
+
+    file = Path(__file__).resolve().parents[2] / ref[0]
+    command = f"jarvis spec section {shlex.quote(ref[0])} {shlex.quote(ref[1])}"
+    try:
+        text = spec_index.section(file.read_text(encoding="utf-8"), ref[1]) or ""
+    except OSError:
+        text = ""
+    truncated = len(text) > ONBOARD_EXCERPT_CHARS
+    excerpt = text[:ONBOARD_EXCERPT_CHARS]
+    if truncated:
+        excerpt += f"\n… truncated — the rest of {ref[0]} § {ref[1]}: `{command}`"
+    return {"path": ref[0], "section": ref[1], "excerpt": excerpt or None,
+            "truncated": truncated, "command": command}
+
+
+def _onboard_set_command(path: str, tail: str, value: Any, project: str | None) -> str:
+    import shlex
+
+    literal = shlex.quote(json.dumps(value))
+    reason = shlex.quote("<why, in your words>")
+    if path.startswith("os."):
+        return f"jarvis config set {path} {literal} --reason {reason}"
+    name = shlex.quote(project or ONBOARD_PLACEHOLDER)
+    return f"jarvis config set {name} {tail} {literal} --reason {reason}"
+
+
+def onboard_explain(target: str, *, project: str | None = None,
+                    catalog_path: str | None = None) -> dict[str, Any]:
+    """What an area or one setting does, costs and is set to — every word from `onboard_prose`"""
+    from . import onboard_knobs, onboard_prose
+
+    target = target.strip()
+    areas = {a.key: a for a in onboard_prose.AREAS}
+    current, defaults = _onboard_values(project, catalog_path)
+    spellings = _onboard_spellings(defaults)
+
+    if target in areas:
+        area = areas[target]
+        enable = None
+        if target in onboard_prose.ENABLE:
+            tail = onboard_prose.ENABLE[target]
+            path = _onboard_lookup(tail, target, spellings)
+            enable = {"path": _onboard_named(path, project), "value": current.get(path)}
+        postures = {
+            name: [{"path": _onboard_named(_onboard_lookup(tail, target, spellings),
+                                           project),
+                    "value": value, "line": onboard_prose.LINES.get(tail)}
+                   for tail, value in preset.items()]
+            for name, preset in area.presets.items()}
+        return {"kind": "area", "area": area.key, "title": area.title, "scope": area.scope,
+                "must_have": area.key in onboard_knobs.MUST_HAVE,
+                "summary": area.summary, "on_costs": area.on_costs,
+                "off_costs": area.off_costs, "enable": enable, "postures": postures,
+                "grounding": [_onboard_grounding(ref) for ref in area.refs]}
+
+    if target.startswith(("os.", "projects.")):
+        hit = onboard_knobs.area_of(target)
+        lookup = None
+        if hit is not None:
+            lookup = (target if target.startswith("os.") else
+                      "projects._." + hit[1])
+            if target.startswith("projects.") and project is None:
+                project = target.split(".", 2)[1]
+    else:
+        hit = onboard_knobs.area_of("projects._." + target) or \
+            onboard_knobs.area_of("os." + target)
+        lookup = _onboard_lookup(hit[1], hit[0], spellings) if hit else None
+    if hit is None or lookup not in defaults:
+        raise _onboard_refuse(target)
+    area_key, tail = hit
+    path = _onboard_named(lookup, project)
+    value = current.get(lookup)
+    return {"kind": "path", "path": path, "tail": tail, "area": area_key,
+            "line": onboard_prose.LINES.get(tail),
+            "example": onboard_prose.EXAMPLES.get(tail),
+            "current": value, "default": defaults.get(lookup),
+            "apply": apply_class(path), "apply_note": APPLY_NOTES[apply_class(path)],
+            "safety": safety_key(path),
+            "command": _onboard_set_command(path, tail, value, project)}
+
+
+def onboard_questions(area: str | None = None) -> dict[str, Any]:
+    """The whole interview as data: every area, its prose, postures and knobs by tier"""
+    from . import onboard_knobs, onboard_prose
+
+    areas = [a for a in onboard_prose.AREAS if area is None or a.key == area]
+    if not areas:
+        raise _onboard_refuse(area or "")
+    defaults = _onboard_defaults()
+    spellings = _onboard_spellings(defaults)
+    out = []
+    for a in areas:
+        tails = sorted(t for t, spelled in spellings.items()
+                       if onboard_knobs.area_of(next(iter(spelled.values())))[0] == a.key)
+        asked = [t for t in tails
+                 if onboard_knobs.asked(_onboard_lookup(t, a.key, spellings))]
+        out.append({
+            "area": a.key, "title": a.title, "scope": a.scope,
+            "must_have": a.key in onboard_knobs.MUST_HAVE,
+            "summary": a.summary, "on_costs": a.on_costs, "off_costs": a.off_costs,
+            "refs": [list(ref) for ref in a.refs],
+            "enable": onboard_prose.ENABLE.get(a.key),
+            "postures": a.presets,
+            "knobs": {
+                "asked": [{"tail": t, "line": onboard_prose.LINES.get(t),
+                           "example": onboard_prose.EXAMPLES.get(t),
+                           "default": defaults.get(_onboard_lookup(t, a.key, spellings))}
+                          for t in asked],
+                "classified": [t for t in tails if t not in asked],
+            },
+        })
+    return {"areas": out}
+
+
 def wiring_config(project: str | None = None,
                   catalog_path: str | None = None) -> Any:
     """The `WiringConfig` a scope runs under — a project's, or the fleet's base"""
