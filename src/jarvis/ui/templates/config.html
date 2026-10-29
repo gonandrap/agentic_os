@@ -40,6 +40,13 @@
   .cfg-table { table-layout: fixed; }
   .cfg-table td, .cfg-table th { overflow-wrap: anywhere; }
   .cfg-table td { padding: 7px 12px; }
+  /* A phone has no room for three columns: each setting becomes a stacked card. */
+  @media (max-width: 600px) {
+    .cfg-table, .cfg-table tbody, .cfg-table tr, .cfg-table td { display: block;
+                                                                  width: auto !important; }
+    .cfg-table tr:has(th) { display: none; }
+    .cfg-table tr { border-bottom: 1px solid var(--line); }
+  }
   .cfg-table th { padding-left: 12px; padding-right: 12px; }
 
   .cfg-edit { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
@@ -260,9 +267,8 @@
   {% endif %}
 </div>
 
-{# History and the diff side by side at width (2026-10-22 spec §5). #}
-<div class="grid" style="--col: 640px;">
-<div class="sec">
+{# History, then the diff, stacked full width: §8 of
+   docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md #}
 <h2 id="cfg-history">History</h2>
 <div class="panel">
   {% for row in history %}
@@ -286,9 +292,7 @@
     <code>jarvis config adopt</code> records the file as the first</div>
   {% endfor %}
 </div>
-</div>
 
-<div class="sec sticky-col">
 <h2>Diff</h2>
 <div class="panel" style="padding: 10px 16px">
   <form method="get" action="/config" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center">
@@ -325,8 +329,6 @@
   {% else %}
   <div class="sub" style="margin-top:8px">pick two versions to compare</div>
   {% endif %}
-</div>
-</div>
 </div>
 
 {% endblock %}

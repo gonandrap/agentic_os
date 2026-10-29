@@ -24,6 +24,8 @@
   </p>
 
   {% if fleet.orders.n %}
+  {# scrolls sideways on a phone rather than squeezing `basis` (spec 2026-10-29 dashboard §8) #}
+  <div class="table-wrap">
   <table class="mono" style="width: 100%; border-collapse: collapse; font-size: 13px;">
     <tr class="sub">
       <th style="text-align: left;">metric</th>
@@ -45,7 +47,7 @@
         {{ figure(m.max.value if m.max else none, m.unit) }}
         {%- if m.max %} <span class="sub">{{ m.max.wo_id }}</span>{% endif -%}
       </td>
-      <td class="sub" style="padding-left: 10px;">
+      <td class="sub prose" style="padding-left: 10px;">
         {{ m.provenance }}
         {%- if m.cost_basis and m.cost_basis.transcript and m.provenance == 'envelope' %}
           — {{ m.cost_basis.envelope }} turn{{ 's' if m.cost_basis.envelope != 1 }} from
@@ -62,6 +64,7 @@
     </tr>
     {% endfor %}
   </table>
+  </div>
   {% else %}
   <div class="empty">nothing ran in that window</div>
   {% endif %}
@@ -100,6 +103,7 @@
     {{ fmt_tok(tools.totals.carried_tokens) }} carried tok ·
     ${{ '%.2f'|format(tools.totals.carried_usd) }} carried.
   </p>
+  <div class="table-wrap">
   <table class="mono" style="width: 100%; border-collapse: collapse; font-size: 13px;">
     <tr class="sub">
       <th style="text-align: left;">tool</th>
@@ -129,6 +133,7 @@
     {% endif %}
     {% endfor %}
   </table>
+  </div>
   {% if rows|length > tools.row_limit %}
   <p class="sub mono" style="margin: 4px 0 0;">
     ({{ rows|length - tools.row_limit }} more
