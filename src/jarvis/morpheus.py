@@ -432,8 +432,12 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
     elif now >= float(item["deadline_ts"]):
         fields.update(state="timedout", next_check_ts=None,
                       resolution=_timeout_reason(item, cfg, result.exit))
-    central.update_morpheus_item(item["id"], **fields)
-    return str(fields.get("state", item["state"]))
+    state = str(fields.get("state", item["state"]))
+    with db.write_transaction(central.conn):  # the run and the item move together: db.write_transaction
+        central.update_morpheus_item(item["id"], **fields)
+        central.add_morpheus_run(item["id"], exit=result.exit, output=result.output,
+                                 state_after=state, now=now)
+    return state
 
 
 def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig,
