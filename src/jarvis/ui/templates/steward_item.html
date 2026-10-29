@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% block title %}Steward {{ ref }} — Jarvis{% endblock %}
+{% block style %}.decision th { width: 16ch; white-space: nowrap; text-align: left; vertical-align: top; }
+@media (max-width: 600px) { .decision th, .decision td { display: block; width: auto; } }{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §5:
+   `ops.steward_why`, the reader behind `jarvis steward why <wo-id>` #}
+{{ ui.page_head("Steward · " ~ ref, decisions | length ~ " decision(s), newest first") }}
+<p class="sub"><a href="/steward">← every queued decision</a> · from a terminal:
+  <span class="mono">jarvis steward why {{ ref }}</span></p>
+
+{% for d in decisions %}
+<div class="panel table-wrap" id="decision-{{ d.id }}">
+  <h2>#{{ d.id }} · {{ d.outcome }}{% if d.queue_state %} · queue {{ d.queue_state }}{% endif %}</h2>
+  <table class="decision">
+    <tr><th>subject</th><td>{{ d.subject }}</td></tr>
+    <tr><th>rule</th><td><span class="mono">{{ d.rule }}</span>: {{ d.reason }}</td></tr>
+    <tr><th>outcome</th><td class="mono">{{ d.outcome }} · {{ "applied" if d.applied else d.mode }}</td></tr>
+    <tr><th>severity</th><td class="mono">{{ d.severity }}{% if d.claimed_severity and d.claimed_severity != d.severity %} (claimed {{ d.claimed_severity }}){% endif %}</td></tr>
+    <tr><th>origin</th><td class="mono">{{ d.origin_kind }} · generation {{ d.generation }}</td></tr>
+    <tr><th>project</th><td class="mono">{% if d.project %}<a href="/project/{{ d.project }}">{{ d.project }}</a>{% else %}—{% endif %}</td></tr>
+    <tr><th>order</th><td class="mono">{{ d.wo_id or "—" }}{% if d.parent_wo_id %} · from {{ d.parent_wo_id }}{% endif %}</td></tr>
+    {% if d.queue_state %}
+    <tr><th>queue</th><td>{{ d.queue_state }}{% if d.queue_note %}: {{ d.queue_note }}{% endif %}
+      {% if d.queue_ts %}<span class="sub">({{ fmt_ts(d.queue_ts) }})</span>{% endif %}</td></tr>
+    {% endif %}
+    <tr><th>decided</th><td class="mono">{{ fmt_ts(d.ts) }} · {{ fmt_age(d.ts) }} ago</td></tr>
+  </table>
+</div>
+{% endfor %}
+{% endblock %}
