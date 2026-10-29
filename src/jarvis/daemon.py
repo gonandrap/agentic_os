@@ -6342,8 +6342,7 @@ class Daemon:
                                "the push that moved the head off the judged commit",
                                base_tip=base_oid,
                                cause=ops.CATCH_UP_DEFER_HEAD_MOVED)
-        # EXPONENTIAL BACKOFF between catch-ups: a base that keeps moving is chased ever more slowly.
-        # After the head check, so a head the OS's own catch-up moved is still carried (#1188)
+        # EXPONENTIAL BACKOFF, after the head check so the OS's own merge commit is still carried (#1188)
         if ops.catch_up_backoff(store, wo_id, policy=policy) > 0:
             delay = ops.catch_up_delay(attempts, policy)
             log.debug("[%s] %s was caught up %d time(s) — backing off %ds before the next",
