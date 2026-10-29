@@ -1,0 +1,38 @@
+{
+  "summary": "The /cost hang is a libsqlite3 3.51.1 bug: WAL close and open in two threads deadlock in the unix VFS. Dev and prod venvs both run on it.",
+  "findings": [
+    {
+      "key": "sqlite-3511-deadlock",
+      "symptom": "Threads A and B from the test hang sit in fleetcost.py:884 conn.close() and db.py:17 sqlite3.connect for more than 120s. Two plain Python threads that loop connect, SELECT, close on one WAL file hang the same way within seconds. No app code is involved.",
+      "root_cause": "SQLite 3.51.1 has an ABBA mutex inversion in the unix VFS. sqlite3WalClose calls unixLock, which holds the inode mutex and waits on a static VFS mutex. unixOpen calls findReusableFd, which holds that static mutex and waits on the inode mutex. SQLite 3.51.2 fixed it upstream: 'obscure deadlock in the new broken-posix-lock detection logic'. busy_timeout does not apply here. This is a pthread mutex, not SQLITE_BUSY, so the 0 vs 10s timeout and the pragma order are irrelevant. PR 1275 did not cause it. The PR only made A and B overlap.",
+      "evidence": [
+        {"source": "gdb -batch -ex run -ex 'thread apply all bt 14' on the 2-thread repro (miniconda python3)", "quote": "#4  0x00007ffff71d9d20 in unixLock () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0"},
+        {"source": "same gdb dump, the other thread", "quote": "#4  0x00007ffff71bfbce in findReusableFd () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0"},
+        {"source": "repro driver over four interpreters (WAL, connect+SELECT+close in 2 threads)", "quote": "/home/gonzalo/miniconda3/bin/python3 wal HUNG"},
+        {"source": "same driver", "quote": "/home/gonzalo/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13 wal ok 3.13.13 3.50.4 wal [18310, 17758]"}
+      ],
+      "why_insufficient": "Cheapest fixes: busy_timeout on connect_ro, reordered pragmas, a Python lock around these two call sites, or the old 5s wait back. None reaches the cause. Any two threads in jarvis-ui or the daemon opening or closing a WAL DB can still deadlock, and a hung prod page never recovers.",
+      "recommendation": "Get off SQLite 3.51.0 and 3.51.1. Pin the project to uv-managed CPython (3.13.13 bundles SQLite 3.50.4, which is unaffected) and rebuild the dev and prod venvs. Add one regression test that runs the 2-thread loop in a subprocess with a timeout. Keep PR 1275's no-wait change and CostCache.quiesce.",
+      "proposed_orders": [
+        {"type": "work", "project": "jarvis_os", "title": "Pin Jarvis OS to a uv-managed CPython: libsqlite3 3.51.1 deadlocks WAL close vs open across threads",
+         "description": "SQLite 3.51.1 (miniconda python3 3.13.12, which the dev and prod venvs use because there is no .python-version) deadlocks WAL close vs open across threads. Scope: make uv use a managed CPython (.python-version 3.13 plus [tool.uv] python-preference only-managed), and make shipit's venv rebuild land prod on it. Add one subprocess test, 20s timeout, with two threads looping connect, SELECT, close on a WAL file. Do NOT touch connection code, busy_timeout, pragmas, or CostCache. Done: the prod venv reports a sqlite3.sqlite_version other than 3.51.0 or 3.51.1, and the test passes."}
+      ]
+    },
+    {
+      "key": "host-sqlite-unverified",
+      "symptom": "No check anywhere in the OS knows which libsqlite3 it runs on. CI uses actions/setup-python, which has a different SQLite, so it cannot see a bug in the host's library. The bug showed up as a flaky test on one branch and was blamed on PR 1275.",
+      "root_cause": "The runtime's SQLite comes from whatever interpreter is on PATH when the venv is created. Neither jarvis doctor, the release path nor the daemon's startup records or verifies it. A conda update could put a bad library back with no code change, and nothing would notice until a thread deadlocks in prod.",
+      "evidence": [
+        {"source": "cat /home/gonzalo/workspace/production/jarvis_os/.venv/pyvenv.cfg", "quote": "home = /home/gonzalo/miniconda3/bin"},
+        {"source": "ls /home/gonzalo/miniconda3/conda-meta | grep -i sqlite", "quote": "sqlite-3.51.1-he0a8d7e_0.json"},
+        {"source": "grep setup-python .github/workflows/ci.yml", "quote": ".github/workflows/ci.yml:52:      - uses: actions/setup-python@v5"}
+      ],
+      "why_insufficient": "Cheapest fix: pin the interpreter once (finding 1) and stop there. The pin can drift with uv defaults or a hand-made venv, and CI still cannot catch a bad host library. The next one would again cost an investigation like this one.",
+      "recommendation": "Add a mechanical post-condition. jarvis doctor and daemon/UI startup check sqlite3.sqlite_version against a known-bad list (3.51.0, 3.51.1) and raise a CRITICAL naming the version and the fix. shipit refuses to deploy onto a venv that fails the check.",
+      "proposed_orders": [
+        {"type": "work", "project": "jarvis_os", "title": "jarvis doctor and shipit verify the runtime libsqlite3 is not a known-deadlocking version",
+         "description": "Nothing checks which libsqlite3 the OS runs on, and CI's setup-python cannot see the host's. Scope: add a jarvis doctor post-condition that reports CRITICAL when sqlite3.sqlite_version is in a known-bad set, initially {'3.51.0','3.51.1'} (deadlock fixed in 3.51.2). It names the version, sys.executable and the fix. Run it once at UI and daemon startup through the existing alarm/inbox path, and make shipit refuse a deploy that fails it. One test that monkeypatches the version. Out of scope: pinning the interpreter (separate order) and connection code. Done: doctor flags 3.51.1."}
+      ]
+    }
+  ]
+}

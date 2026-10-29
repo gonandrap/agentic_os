@@ -1,0 +1,24 @@
+/home/gonzalo/miniconda3/bin/python3 [3.13.12 3.51.1] wal run 1: HUNG (faulthandler after 20s) at File "/home/gonzalo/workspace/agentic_os/.claude/worktrees/wo-a45bce4c/evidence/io-6fdf5c66/repro.py", line 23 in loop; File "/home/gonzalo/workspace/agentic_os/.claude/worktrees/wo-a45bce4c/evidence/io-6fdf5c66/repro.py", line 21 in loop; File "/home/gonzalo/workspace/agentic_os/.claude/worktrees/wo-a45bce4c/evidence/io-6fdf5c66/repro.py", line 29 in <module>
+/home/gonzalo/miniconda3/bin/python3 [3.13.12 3.51.1] wal run 2: HUNG (faulthandler after 20s) at File "/home/gonzalo/workspace/agentic_os/.claude/worktrees/wo-a45bce4c/evidence/io-6fdf5c66/repro.py", line 21 in loop; File "/home/gonzalo/workspace/agentic_os/.claude/worktrees/wo-a45bce4c/evidence/io-6fdf5c66/repro.py", line 23 in loop; File "/home/gonzalo/workspace/agentic_os/.claude/worktrees/wo-a45bce4c/evidence/io-6fdf5c66/repro.py", line 29 in <module>
+/home/gonzalo/miniconda3/bin/python3 [3.13.12 3.51.1] wal run 3: HUNG (faulthandler after 20s) at File "/home/gonzalo/workspace/agentic_os/.claude/worktrees/wo-a45bce4c/evidence/io-6fdf5c66/repro.py", line 21 in loop; File "/home/gonzalo/workspace/agentic_os/.claude/worktrees/wo-a45bce4c/evidence/io-6fdf5c66/repro.py", line 23 in loop; File "/home/gonzalo/workspace/agentic_os/.claude/worktrees/wo-a45bce4c/evidence/io-6fdf5c66/repro.py", line 29 in <module>
+/home/gonzalo/miniconda3/bin/python3 [3.13.12 3.51.1] delete run 1: ok 3.13.12 3.51.1 delete [30141, 30143] in 8s
+/home/gonzalo/miniconda3/bin/python3 [3.13.12 3.51.1] delete run 2: ok 3.13.12 3.51.1 delete [30386, 30049] in 8s
+/home/gonzalo/miniconda3/bin/python3 [3.13.12 3.51.1] delete run 3: ok 3.13.12 3.51.1 delete [28812, 28574] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13 [3.13.13 3.50.4] wal run 1: ok 3.13.13 3.50.4 wal [8214, 8244] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13 [3.13.13 3.50.4] wal run 2: ok 3.13.13 3.50.4 wal [9704, 8528] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13 [3.13.13 3.50.4] wal run 3: ok 3.13.13 3.50.4 wal [11581, 11642] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13 [3.13.13 3.50.4] delete run 1: ok 3.13.13 3.50.4 delete [28536, 29020] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13 [3.13.13 3.50.4] delete run 2: ok 3.13.13 3.50.4 delete [29436, 29947] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13 [3.13.13 3.50.4] delete run 3: ok 3.13.13 3.50.4 delete [28893, 28193] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11 [3.11.15 3.50.4] wal run 1: ok 3.11.15 3.50.4 wal [10549, 10976] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11 [3.11.15 3.50.4] wal run 2: ok 3.11.15 3.50.4 wal [7698, 8073] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11 [3.11.15 3.50.4] wal run 3: ok 3.11.15 3.50.4 wal [7908, 7170] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11 [3.11.15 3.50.4] delete run 1: ok 3.11.15 3.50.4 delete [26756, 26783] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11 [3.11.15 3.50.4] delete run 2: ok 3.11.15 3.50.4 delete [26131, 26206] in 8s
+/home/gonzalo/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11 [3.11.15 3.50.4] delete run 3: ok 3.11.15 3.50.4 delete [25938, 25574] in 8s
+/usr/bin/python3.12 [3.12.3 3.45.1] wal run 1: ok 3.12.3 3.45.1 wal [8386, 8414] in 8s
+/usr/bin/python3.12 [3.12.3 3.45.1] wal run 2: ok 3.12.3 3.45.1 wal [7677, 8365] in 8s
+/usr/bin/python3.12 [3.12.3 3.45.1] wal run 3: ok 3.12.3 3.45.1 wal [11663, 10224] in 8s
+/usr/bin/python3.12 [3.12.3 3.45.1] delete run 1: ok 3.12.3 3.45.1 delete [29326, 29578] in 8s
+/usr/bin/python3.12 [3.12.3 3.45.1] delete run 2: ok 3.12.3 3.45.1 delete [25771, 25221] in 8s
+/usr/bin/python3.12 [3.12.3 3.45.1] delete run 3: ok 3.12.3 3.45.1 delete [27576, 27424] in 8s

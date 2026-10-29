@@ -1,0 +1,46 @@
+Thread 1 "python3" received signal SIGTRAP, Trace/breakpoint trap.
+Thread 4 (Thread 0x7ffff51a96c0 (LWP 2569912) "python3"):
+#0  futex_wait (private=0, expected=2, futex_word=0x7fffe8001338) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x7fffe8001338, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007ffff7ca01e1 in lll_mutex_lock_optimized (mutex=0x7fffe8001338) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x7fffe8001338) at ./nptl/pthread_mutex_lock.c:93
+#4  0x00007ffff71bfbce in findReusableFd () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#5  0x00007ffff723409b in unixOpen () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#6  0x00007ffff723af84 in sqlite3BtreeOpen () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#7  0x00007ffff72c33bf in openDatabase () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#8  0x00007ffff7be6615 in pysqlite_connection_init_impl (factory=<optimized out>, self=0x7ffff74e97b0, database=<optimized out>, timeout=5, detect_types=0, isolation_level=0x7ffff7bf4746 "", check_same_thread=<optimized out>, cache_size=128, uri=0, autocommit=AUTOCOMMIT_LEGACY) at /usr/local/src/conda/python-3.13.12/Modules/_sqlite/connection.c:261
+#9  pysqlite_connection_init (self=0x7ffff74e97b0, args=<optimized out>, kwargs=<optimized out>) at /usr/local/src/conda/python-3.13.12/Modules/_sqlite/clinic/connection.c.h:165
+#10 0x00005555556e63c7 in type_call (self=0x555555c0f060, args=0x7ffff74963b0, kwds=0x0) at /usr/local/src/conda/python-3.13.12/Objects/typeobject.c:2008
+#11 _PyObject_MakeTpCall (tstate=0x555555c27ab0, callable=0x555555c0f060, args=<optimized out>, nargs=<optimized out>, keywords=<optimized out>) at /usr/local/src/conda/python-3.13.12/Objects/call.c:242
+#12 0x00005555556fa48a in _PyEval_EvalFrameDefault (tstate=tstate@entry=0x555555c27ab0, frame=<optimized out>, throwflag=throwflag@entry=0) at /usr/local/src/conda/python-3.13.12/Python/generated_cases.c.h:1224
+#13 0x000055555574ab7e in _PyEval_EvalFrame (tstate=0x555555c27ab0, frame=<optimized out>, throwflag=0) at /usr/local/src/conda/python-3.13.12/Include/internal/pycore_ceval.h:120
+Thread 3 (Thread 0x7ffff61aa6c0 (LWP 2569911) "python3"):
+#0  futex_wait (private=0, expected=2, futex_word=0x7ffff72fefc8 <staticMutexes.103+360>) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x7ffff72fefc8 <staticMutexes.103+360>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007ffff7ca01e1 in lll_mutex_lock_optimized (mutex=0x7ffff72fefc8 <staticMutexes.103+360>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0x7ffff72fefc8 <staticMutexes.103+360>) at ./nptl/pthread_mutex_lock.c:93
+#4  0x00007ffff71d9d20 in unixLock () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#5  0x00007ffff7235da0 in sqlite3WalClose () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#6  0x00007ffff723ab6b in sqlite3PagerClose.isra.0 () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#7  0x00007ffff7247267 in sqlite3BtreeClose.isra.0 () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#8  0x00007ffff72492a8 in sqlite3LeaveMutexAndCloseZombie () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#9  0x00007ffff7249b9b in sqlite3Close () from /home/gonzalo/miniconda3/lib/python3.13/lib-dynload/../../libsqlite3.so.0
+#10 0x00007ffff7bead37 in connection_close (self=0x7ffff74e98a0) at /usr/local/src/conda/python-3.13.12/Modules/_sqlite/connection.c:472
+#11 pysqlite_connection_close_impl (self=0x7ffff74e98a0) at /usr/local/src/conda/python-3.13.12/Modules/_sqlite/connection.c:673
+#12 pysqlite_connection_close (self=0x7ffff74e98a0, _unused_ignored=<optimized out>) at /usr/local/src/conda/python-3.13.12/Modules/_sqlite/clinic/connection.c.h:374
+#13 0x00005555556feea9 in _PyEval_EvalFrameDefault (tstate=tstate@entry=0x555555c27820, frame=<optimized out>, throwflag=throwflag@entry=0) at /usr/local/src/conda/python-3.13.12/Python/generated_cases.c.h:1753
+Thread 1 (Thread 0x7ffff7ea7740 (LWP 2569836) "python3"):
+#0  0x00007ffff7c98e51 in __futex_abstimed_wait_common64 (private=<optimized out>, cancel=true, abstime=0x0, op=393, expected=0, futex_word=0x7fffffffc7a0) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=<optimized out>, abstime=0x0, clockid=0, expected=0, futex_word=0x7fffffffc7a0) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7fffffffc7a0, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=<optimized out>) at ./nptl/futex-internal.c:139
+#3  0x00007ffff7ca4fff in do_futex_wait (sem=sem@entry=0x7fffffffc7a0, abstime=0x0, clockid=0) at ./nptl/sem_waitcommon.c:111
+#4  0x00007ffff7ca5098 in __new_sem_wait_slow64 (sem=sem@entry=0x7fffffffc7a0, abstime=0x0, clockid=0) at ./nptl/sem_waitcommon.c:183
+#5  0x00007ffff7ca511d in __new_sem_wait (sem=sem@entry=0x7fffffffc7a0) at ./nptl/sem_wait.c:42
+#6  0x00005555558374fa in _PySemaphore_PlatformWait (sema=0x7fffffffc7a0, timeout=-1) at /usr/local/src/conda/python-3.13.12/Python/parking_lot.c:149
+#7  _PySemaphore_Wait (sema=0x7fffffffc7a0, timeout=-1, detach=<optimized out>) at /usr/local/src/conda/python-3.13.12/Python/parking_lot.c:220
+#8  0x00005555558373b0 in _PyParkingLot_Park (addr=addr@entry=0x555555b81929, expected=expected@entry=0x7fffffffc837, size=size@entry=1, timeout_ns=timeout_ns@entry=-1, park_arg=park_arg@entry=0x0, detach=detach@entry=1) at /usr/local/src/conda/python-3.13.12/Python/parking_lot.c:323
+#9  0x0000555555837679 in PyEvent_WaitTimed (evt=evt@entry=0x555555b81929, timeout_ns=timeout_ns@entry=-1, detach=detach@entry=1) at /usr/local/src/conda/python-3.13.12/Python/lock.c:292
+#10 0x0000555555837ebf in ThreadHandle_join (self=0x555555b818f0, timeout_ns=-1) at /usr/local/src/conda/python-3.13.12/Modules/_threadmodule.c:513
+#11 0x0000555555837bab in PyThreadHandleObject_join (self=0x7ffff7364700, args=<optimized out>) at /usr/local/src/conda/python-3.13.12/Modules/_threadmodule.c:649
+#12 0x000055555578a06b in method_vectorcall_VARARGS (func=0x7ffff75c5f80, args=0x7ffff7fb0110, nargsf=<optimized out>, kwnames=<optimized out>) at /usr/local/src/conda/python-3.13.12/Objects/descrobject.c:324
+#13 0x00005555556e86ce in _PyObject_VectorcallTstate (tstate=0x555555a98d88 <_PyRuntime+283048>, callable=0x7ffff75c5f80, args=<optimized out>, nargsf=<optimized out>, kwnames=<optimized out>) at /usr/local/src/conda/python-3.13.12/Include/internal/pycore_call.h:168
