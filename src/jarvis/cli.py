@@ -782,26 +782,6 @@ def build_parser() -> argparse.ArgumentParser:
                          "OPERATION.md the generator would otherwise leave alone")
     sp.add_argument("--dry-run", action="store_true")
 
-    # onboarding — whichever section lands first creates the group (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §0.2)
-    onboard = sub.add_parser(
-        "onboard", help="onboard a project by interview: what each automatic behaviour "
-                        "costs, and the configuration you chose",
-    ).add_subparsers(dest="onboard_cmd", required=True)
-
-    sp = onboard.add_parser("questions", help="the whole interview as data — every area, "
-                                              "its postures and its knobs; no model needed")
-    sp.add_argument("--area", help="one area only")
-    sp.add_argument("--json", action="store_true")
-
-    sp = onboard.add_parser("explain", help="what an area or one setting does and costs, "
-                                            "its current value, and how to change it later")
-    sp.add_argument("target", help="an area (`validation`) or a setting "
-                                   "(`os.neo.enabled`, `validation.auto_merge`)")
-    sp.add_argument("--project", help="read current values from this project "
-                                      "(default: the shipped defaults)")
-    sp.add_argument("--catalog", help="a catalog file other than the registered one")
-    sp.add_argument("--json", action="store_true")
-
     # work orders
     wo = sub.add_parser("wo", help="work orders").add_subparsers(dest="wo_cmd", required=True)
 
@@ -1538,6 +1518,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="what it WOULD change, writing nothing — the confirmation diff")
     c.add_argument("--catalog")
     c.add_argument("--json", action="store_true", help="machine-readable output")
+
+    c = ob.add_parser("questions", help="the whole interview as data — every area, "
+                                        "its postures and its knobs; no model needed")
+    c.add_argument("--area", help="one area only")
+    c.add_argument("--json", action="store_true")
+
+    c = ob.add_parser("explain", help="what an area or one setting does and costs, "
+                                      "its current value, and how to change it later")
+    c.add_argument("target", help="an area (`validation`) or a setting "
+                                  "(`os.neo.enabled`, `validation.auto_merge`)")
+    c.add_argument("--project", help="read current values from this project "
+                                     "(default: the shipped defaults)")
+    c.add_argument("--catalog", help="a catalog file other than the registered one")
+    c.add_argument("--json", action="store_true")
 
     # backlog
     bl = sub.add_parser("backlog", help="unified deferred-work backlog").add_subparsers(
@@ -4735,11 +4729,11 @@ def _print_wiring(data: dict[str, Any]) -> None:
           "\nJarvis wires into a worker at dispatch. Change it on /config.")
 
 
-def cmd_onboard(args: argparse.Namespace) -> int:
+def _cmd_onboard_read(args: argparse.Namespace) -> int:
     """`jarvis onboard questions | explain` — §4 of the onboarding-interview spec"""
     from . import ops
 
-    if args.onboard_cmd == "questions":
+    if args.ob_cmd == "questions":
         data = ops.onboard_questions(args.area)
         if args.json:
             _print(data, True)
@@ -4878,6 +4872,8 @@ def cmd_onboard(args: argparse.Namespace) -> int:
     from . import ops
 
     # The group handler, so a sibling adding `start` branches here as `cmd_config` does
+    if args.ob_cmd in ("questions", "explain"):
+        return _cmd_onboard_read(args)
     if args.ob_cmd != "apply":
         return 0
     data = ops.onboard_apply(args.draft, catalog_path=args.catalog,
