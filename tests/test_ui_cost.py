@@ -83,6 +83,45 @@ def give_session(project, wo_id: str, session_id: str) -> None:
         store.close()
 
 
+def test_shutdown_waits_out_a_detached_cost_compute(monkeypatch):
+    """A strand would read transcripts and a DB nobody is holding open any more"""
+    import threading
+
+    from jarvis.ui import app as ui_app
+
+    cache = ui_app.CostCache()
+    release, ran = threading.Event(), []
+    monkeypatch.setattr(ui_app, "_cost_payloads",
+                        lambda picked, project: (release.wait(10),
+                                                 ran.append(1), {})[2])
+    cache.start(("k",), {"label": "w"}, "")
+    assert cache.computing
+
+    release.set()
+    cache.quiesce(timeout=10)
+
+    assert ran == [1]
+    assert not cache.computing
+
+
+def test_quiesce_gives_up_rather_than_blocking_a_shutdown_forever(monkeypatch):
+    import threading
+
+    from jarvis.ui import app as ui_app
+
+    cache = ui_app.CostCache()
+    release = threading.Event()
+    monkeypatch.setattr(ui_app, "_cost_payloads",
+                        lambda picked, project: (release.wait(10), {})[1])
+    cache.start(("k",), {"label": "w"}, "")
+
+    cache.quiesce(timeout=0.05)
+
+    assert cache.computing          # still running, and shutdown moved on anyway
+    release.set()
+    cache.quiesce(timeout=10)
+
+
 def test_cost_page_lists_work_orders_dearest_first(client, project, transcript):
     cheap = ops.create_work_order("proj_a", "a small ask")
     dear = ops.create_work_order("proj_a", "a large ask")

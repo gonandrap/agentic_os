@@ -474,6 +474,7 @@ class CostCache:
         self.computing: dict[tuple, threading.Event] = {}
         self.failures: dict[tuple, str] = {}
         self._lock = threading.Lock()
+        self._threads: set[threading.Thread] = set()
 
     def compute(self, name: str) -> dict:
         picked = ops.cost_window(window=name)
@@ -509,6 +510,7 @@ class CostCache:
         finally:
             with self._lock:
                 event = self.computing.pop(key, None)
+                self._threads.discard(threading.current_thread())
             if event is not None:
                 event.set()
 
@@ -519,8 +521,23 @@ class CostCache:
                 return
             self.computing[key] = threading.Event()
         # A plain thread, NOT the anyio pool: it must not borrow the token a page needs
-        threading.Thread(target=self._compute_on_demand, args=(key, picked, project),
-                         name="jarvis-ui-cost", daemon=True).start()
+        thread = threading.Thread(target=self._compute_on_demand,
+                                  args=(key, picked, project),
+                                  name="jarvis-ui-cost", daemon=True)
+        with self._lock:
+            self._threads.add(thread)
+        thread.start()
+
+    def quiesce(self, timeout: float = 10.0) -> None:
+        """Wait out the detached computes, so shutdown cannot strand one mid-query"""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                alive = [t for t in self._threads if t.is_alive()]
+            left = deadline - time.monotonic()
+            if not alive or left <= 0:
+                return
+            alive[0].join(left)
 
     def serve(self, picked: dict, project: str) -> dict | None:
         """One window's payloads, or None while they are still being computed"""
@@ -966,6 +983,8 @@ def create_app() -> FastAPI:
                 yield
             finally:
                 watchdog.stop()
+                # Before the loop goes: a strand holds a SQLite read nobody will close
+                cost_cache.quiesce()
                 tg.cancel_scope.cancel()
 
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None, lifespan=lifespan)

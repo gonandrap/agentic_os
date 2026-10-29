@@ -74,6 +74,36 @@ reader never sees half a file.
 `prefers-reduced-motion`, and the count of transcripts the cache has already parsed.
 The count comes from `transcript_cache.stats()`, which touches no disk.
 
+## The strand the no-wait change left behind
+
+Found by a 120s pytest-timeout on the merged branch, not by review. Because `serve` no
+longer waits, a `/cost` request returns while its compute thread is still running, and
+that thread outlives whatever set `JARVIS_TRANSCRIPT_ROOT` for it. In the suite the
+thread survived its test's `monkeypatch` teardown and went on to scan the real
+`~/.claude/projects` — 694 files, 1073MB — holding a SQLite read while an anyio worker
+thread servicing the next request blocked on the same lock, and the request's blocking
+portal could then never shut down. Three threads, no progress, 120s.
+
+This drain is worth having, but it did **not** fix the hang. A second, deeper deadlock
+sits underneath it and is filed as `io-6fdf5c66`: the compute thread at
+`fleetcost.py:884` (`conn.close()` on a `mode=ro` connection to `os.db`) against an anyio
+worker at `db.py:17` (the raw `sqlite3.connect` on the same file, reached through
+`render` → `gate_badge` → `list_gates` → `resolve_catalog`). It happens mid-request,
+before any drain runs, in 2 of 5 runs of one six-file combination, and 0 of 3 on
+`origin/main`. Deleting the wait is what makes those two concurrent; the code they
+deadlock on is older and untouched here. The mechanism is not established — `connect_ro`
+sets no `busy_timeout` at all, so it should fail fast rather than block.
+
+Two places, because the two scopes cannot see each other:
+
+- `CostCache.quiesce(timeout=10.0)` joins the detached threads, and `lifespan` calls it
+  before cancelling the task group. A `jarvis-ui` restart therefore no longer strands a
+  compute mid-query. It gives up at the timeout rather than blocking shutdown forever.
+- An autouse `no_stray_cost_threads` fixture joins any thread named `jarvis-ui-cost` at
+  the end of every test, before `monkeypatch` restores the environment. It matches on the
+  thread name rather than the cache object because `jarvis.testing` cannot import the UI
+  module (fastapi is optional there).
+
 ## What is NOT changed
 
 - The two named windows are still computed serially, one after the other, in
@@ -106,3 +136,8 @@ The count comes from `transcript_cache.stats()`, which touches no disk.
 - a damaged cache file is ignored rather than raised
 - the cache is bounded by file count
 - a transcript that cannot be `stat`-ed is still read
+
+`tests/test_ui_cost.py`
+
+- shutdown waits out a detached cost compute
+- `quiesce` gives up rather than blocking a shutdown forever

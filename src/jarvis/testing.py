@@ -2558,6 +2558,21 @@ def commit(repo: Path, message: str, *paths: str) -> None:
                     "commit", "-qm", message], check=True)
 
 
+#: `CostCache.start` names its threads this; kept as text because importing the UI needs fastapi
+COST_THREAD_NAME = "jarvis-ui-cost"
+
+
+@pytest.fixture(autouse=True)
+def no_stray_cost_threads():
+    """A detached /cost compute outliving its test would scan the REAL transcripts"""
+    import threading
+
+    yield
+    for thread in threading.enumerate():
+        if thread.name == COST_THREAD_NAME:
+            thread.join(30)
+
+
 @pytest.fixture(autouse=True)
 def claude_json(tmp_path, monkeypatch):
     """Point trust checks at a scratch claude.json; tests opt paths in as trusted"""
