@@ -56,6 +56,10 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
 
   An assumption is a disclosure of something you were *sure* about. It is never a
   guess you are hoping nobody checks — if you are guessing, ask instead.
+
+  One claim per assumption and per question, in the `ponytail` register: no narrative,
+  no "Also:", and cite the spec down to the item you rely on (`6.2 item 5`). Neo returns
+  a bundled or oversized one unanswered, and you re-file it as atomic items.
 - **Defer work that is not this work order's job** instead of leaving "future work"
   notes — and instead of filing it yourself:
   `jarvis wo defer <wo-id> "<title>" --why "<why it should not be done now>"`
