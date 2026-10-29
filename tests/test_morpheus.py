@@ -1255,3 +1255,17 @@ def test_the_dashboard_opens_check_and_output_in_a_modal_not_in_the_table(centra
         assert f'data-peek="{item["id"]}-{kind}"' in page
         assert f'<dialog id="{item["id"]}-{kind}"' in page
     assert "boom &lt;x&gt;" in page
+
+
+def test_the_dashboard_row_offers_all_three_decisions_and_links_its_neo_question(central):
+    """#1302: only 'file fix' was offered, and 'neo:N' was plain text"""
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    item = _failed(central)
+    central.claim_morpheus_action(item["id"], "neo:2259")
+    page = TestClient(create_app()).get("/morpheus").text
+    for verb in ("confirm", "waive", "requeue"):
+        assert f'action="/morpheus/{item["id"]}/{verb}"' in page
+    assert '<a href="/neo/question/2259">neo:2259</a>' in page
