@@ -535,6 +535,7 @@ CREATE TABLE IF NOT EXISTS morpheus_items (
     action TEXT NOT NULL DEFAULT '',        -- neo:<qid> | investigation:<id> | improvement:<io-id> | none:<why>
     action_ts REAL,
     auto_requeues INTEGER NOT NULL DEFAULT 0,  -- requeues Neo's own verdict has spent (capped)
+    last_check_version TEXT NOT NULL DEFAULT '',  -- what production ran at the last check (#1301)
     UNIQUE (repo, pr_number)
 );
 CREATE INDEX IF NOT EXISTS idx_morpheus_items_state ON morpheus_items(state);
@@ -586,6 +587,8 @@ ADDED_COLUMNS = {
         "project": "TEXT NOT NULL DEFAULT ''",
         # …and before Neo's verdict could act on an item (issue #1254)
         "auto_requeues": "INTEGER NOT NULL DEFAULT 0",
+        # …and before a check recorded the version it ran on (issue #1301)
+        "last_check_version": "TEXT NOT NULL DEFAULT ''",
     },
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
@@ -2052,6 +2055,7 @@ class CentralStore:
         """Write the named columns, stamping `updated_ts`"""
         allowed = {"script", "script_source", "state", "deadline_ts", "last_check_ts",
                    "next_check_ts", "checks", "last_exit", "last_output", "resolution",
+                   "last_check_version",
                    "action", "action_ts", "hints"}
         bad = set(fields) - allowed
         assert not bad, bad

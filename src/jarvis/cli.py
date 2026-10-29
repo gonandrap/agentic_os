@@ -4065,8 +4065,11 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             _print(item, True)
             return 0
         print(_morpheus_line(item))
-        print(f"{item['pr_url']}  release {item['release_tag'] or '—'}"
+        print(f"{item['pr_url']}  first release with this PR {item['release_tag'] or '—'}"
               f"  work order {item['wo_id'] or '—'}")
+        if item["last_check_ts"]:
+            print(f"last check {_stamp(item['last_check_ts'])}"
+                  f" on {item.get('last_check_version') or 'an unknown version'}")
         print(f"checks {item['checks']} · last exit {item['last_exit']}"
               f" · deadline {_stamp(item['deadline_ts'])}"
               + (f" · {item['auto_requeues']} automatic requeue(s)"
