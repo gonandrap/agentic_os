@@ -8790,6 +8790,57 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
             "status": "cancelled", "cancelled_work_orders": stop_ids}
 
 
+OFFBOARDED_EVENT = "offboarded"
+
+
+def quiesce_project(name: str, apply: bool = False,
+                    reason: str = "project offboarded") -> dict[str, Any]:
+    """Report a project's open orders; with `apply`, cancel them and stop it asking the user
+    (docs/superpowers/specs/2026-10-28-offboard-a-project.md §5)"""
+    paths = registered_project_paths()
+    if name not in paths:
+        raise OpsError(f"project {name!r} not registered (known: {sorted(paths)})")
+    store = ProjectStore(paths[name])
+    try:
+        wos = store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True, limit=-1)
+        fos = store.list_feature_orders(statuses=FO_OPEN_STATUSES, kind=None, limit=-1)
+    finally:
+        store.close()
+    open_ = [{"id": w["id"], "kind": "work_order", "status": w["status"],
+              "title": w["title"]} for w in wos]
+    open_ += [{"id": f["id"], "kind": f["kind"] or "feature", "status": f["status"],
+               "title": f["title"]} for f in fos]
+    out: dict[str, Any] = {"open": open_, "cancelled": [], "sessions_stopped": 0,
+                           "backlog_dropped": 0, "inbox_acked": 0, "reason": reason}
+    if not apply:
+        return out
+    # Work orders first: a feature's manager and children stopped before the feature cannot re-dispatch
+    for w in wos:
+        out["sessions_stopped"] += int(cancel(w["id"])["session_stopped"])
+        out["cancelled"].append(w["id"])
+    store = ProjectStore(paths[name])
+    try:
+        for w in wos:
+            store.add_event(w["id"], OFFBOARDED_EVENT, {"reason": reason})
+    finally:
+        store.close()
+    for f in fos:
+        try:
+            cancel_feature_order(f["id"], name)
+        except OpsError:
+            continue  # settled itself once its children were cancelled
+        out["cancelled"].append(f["id"])
+    central = CentralStore()
+    try:
+        for item in central.list_backlog(name, "open"):
+            central.mark_backlog(item["id"], "dropped")
+            out["backlog_dropped"] += 1
+        out["inbox_acked"] = central.ack_project_inbox(name)
+    finally:
+        central.close()
+    return out
+
+
 #: The most of a `--fix` that becomes the corrective child's title
 FIX_TITLE_CHARS = 120
 
