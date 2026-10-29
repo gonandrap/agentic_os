@@ -630,6 +630,9 @@ CREATE INDEX IF NOT EXISTS idx_steward_decisions_dedupe
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_queue ON steward_decisions(queue_state);
 """
 
+#: Tables whose `project` is provenance, not scope: a purge rewrites them, never deletes (docs/superpowers/specs/2026-10-28-offboard-a-project.md §3)
+PROVENANCE_TABLES = ("detectors", "gate_rules")
+
 
 class CentralStore:
     def __init__(self, path: Path | None = None):
@@ -837,6 +840,21 @@ class CentralStore:
         ).rowcount
         return {"inbox": inbox, "agent_calls": calls, "knowledge_reads": reads,
                 "backlog_reopened": backlog}
+
+    def purge_project(self, name: str) -> dict[str, int]:
+        """Delete every row scoped to `name`; provenance rows keep guarding the fleet"""
+        scope = [t for t in db.tables_with_column(self.conn, "project")
+                 if t not in PROVENANCE_TABLES]
+        with db.write_transaction(self.conn):
+            counts = db.delete_where(self.conn, scope, "project", name)
+            counts["gate_rules_provenance_cleared"] = self.conn.execute(
+                "UPDATE gate_rules SET project='' WHERE project=?", (name,)).rowcount
+            live = [r["id"] for r in self.conn.execute(
+                "SELECT id FROM detectors WHERE project=? AND retired_at IS NULL", (name,))]
+            for detector_id in live:
+                self.retract_detector(detector_id, f"project {name} purged from the OS")
+            counts["detectors_retracted"] = len(live)
+        return counts
 
     def inbox_titled_since(self, project: str, title: str, since: float) -> bool:
         """Has this exact item been raised for this project since `since`, acked or not?"""

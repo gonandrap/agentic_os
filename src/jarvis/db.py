@@ -54,6 +54,38 @@ def add_missing_columns(conn: sqlite3.Connection,
                     raise
 
 
+def _tables(conn: sqlite3.Connection) -> list[str]:
+    return [r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+
+
+def tables_with_column(conn: sqlite3.Connection, column: str) -> list[str]:
+    """Every table in the live schema carrying `column`, sorted"""
+    return sorted(t for t in _tables(conn) if any(
+        c["name"] == column for c in conn.execute(f"PRAGMA table_info({t})")))
+
+
+def delete_where(conn: sqlite3.Connection, tables: Sequence[str], column: str,
+                 value: Any) -> dict[str, int]:
+    """Delete rows whose `column` is `value` from each table, foreign-key children first, counted"""
+    every = _tables(conn)
+    counts: dict[str, int] = {}
+    for parent in tables:
+        for child in every:
+            for fk in conn.execute(f"PRAGMA foreign_key_list({child})").fetchall():
+                if fk["table"] != parent:
+                    continue
+                # Explicit even under ON DELETE CASCADE: sqlite reports no rowcount for a cascade
+                n = conn.execute(
+                    f"DELETE FROM {child} WHERE {fk['from']} IN "
+                    f"(SELECT {fk['to'] or 'rowid'} FROM {parent} WHERE {column}=?)",
+                    (value,)).rowcount
+                counts[child] = counts.get(child, 0) + n
+        counts[parent] = counts.get(parent, 0) + conn.execute(
+            f"DELETE FROM {parent} WHERE {column}=?", (value,)).rowcount
+    return counts
+
+
 def now() -> float:
     return time.time()
 
