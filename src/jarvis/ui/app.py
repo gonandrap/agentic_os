@@ -119,6 +119,8 @@ REFRESH_SECONDS = 15
 # The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
                      "validating", "waiting_pr_merge")
+# The work-order statuses that sort to the top of a list: each waits on the user
+NEEDS_YOU_STATUSES = ("failed", "budget_exhausted", "needs_review", "waiting_input")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
@@ -1146,15 +1148,27 @@ def create_app() -> FastAPI:
     def dashboard(request: Request, show: str = ""):
         """The pulse"""
         st = ops.os_status()
-        rows = [{**wo, "project": p["name"]}
-                for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        every = [{**wo, "project": p["name"]}
+                 for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        # §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+        options = {"project": filter_options(every, "project"),
+                   "status": filter_options(every, "status")}
+        filters = query_filters(request, options)
+        rows = filter_rows(every, filters)
+        # A status filter reveals that status even when it is one that collapses into a count
+        show = show or filters.get("status", "")
         revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
             else ""
         featured, rest = group_open(rows, revealed)
+        # Same predicate as project(): a status that waits on the user, or a raised flag
+        shown = attention_first(featured + rest,
+                                lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                                or bool(wo.get("needs_attention")))
         rest_counts = _counts_by_status(
             wo["status"] for wo in rows if wo["status"] not in FEATURED_STATUSES)
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
-                      featured=featured, rest=rest, rest_counts=rest_counts,
+                      shown=shown, total=len(every), rest_counts=rest_counts,
+                      filters=filters, options=options,
                       revealed=revealed, model_ids=ops.suggested_model_ids())
 
     @app.get("/search", response_class=HTMLResponse)
@@ -1184,8 +1198,15 @@ def create_app() -> FastAPI:
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
         show_hidden = hidden not in ("", "0", "false")
+        options = {"status": list(WO_STATUSES)}
+        filters = query_filters(request, options)
+        status = filters.get("status", "")
+        # A status filter reveals that status; an unknown one matches nothing (Q2361)
+        show = status or show
         revealed = show if show in WO_STATUSES else ("all" if show == "all" else "")
-        if revealed == "all":
+        if status:
+            statuses = (status,)
+        elif revealed == "all":
             statuses = None
         else:
             statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
@@ -1239,13 +1260,27 @@ def create_app() -> FastAPI:
             central.close()
         settled = [(s, counts[s]) for s in TERMINAL_STATUSES if counts.get(s)]
         featured, rest = group_open(wos, revealed)
+        rows = attention_first(featured + rest,
+                               lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                               or bool(wo.get("needs_attention")))
         # Counted in SQL rather than from `wos`
         other_open = [s for s in OPEN_STATUSES if s not in FEATURED_STATUSES]
         open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
         fo_settled = [(s, fo_counts[s]) for s in FO_TERMINAL_STATUSES
                       if fo_counts.get(s)]
+        flagged = lambda r: bool(r.get("needs_attention"))  # noqa: E731
+        features = attention_first(features, flagged)
+        improvements = attention_first(improvements, flagged)
+        investigations = attention_first(investigations, flagged)
         return render(request, "project.html", project_name=name, path=paths[name],
-                      featured=featured, rest=rest, open_counts=open_counts,
+                      # "of M": the open orders plus whatever the URL revealed, never every settled one
+                      total=sum(n for s, n in counts.items()
+                                if revealed == "all" or s in OPEN_STATUSES
+                                or s in (status, revealed)),
+                      rows=rows, filters=filters,
+                      # Parsed against every status, offered only where a row has it
+                      options={"status": [s for s in WO_STATUSES if counts.get(s)]},
+                      open_counts=open_counts,
                       backlog=backlog, show_hidden=show_hidden, blocked=blocked,
                       pauses=pauses,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
@@ -1285,6 +1320,10 @@ def create_app() -> FastAPI:
             for c in (detail.get("plan") or {}).get("children", [])
             if c.get("spec_section")
         }
+        detail["children"] = attention_first(
+            detail.get("children") or [],
+            lambda c: not c.get("superseded") and (
+                c["status"] in NEEDS_YOU_STATUSES or bool(c.get("needs_attention"))))
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
                       states=states, child_anchors=child_anchors,
                       cap=ops.feature_order_budget(fo_id, detail["project"],
@@ -1329,6 +1368,14 @@ def create_app() -> FastAPI:
             detail = ops.show_improvement_order(io_id, name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        report = detail.get("report") or {}
+        if report.get("findings"):
+            # Owed a decision first: pending and not held by Neo, or a filing that failed
+            report["findings"] = attention_first(
+                report["findings"],
+                lambda f: bool(f.get("filing_error")) or (
+                    (f.get("status") or "pending") == "pending"
+                    and not (f.get("neo_question_id") and not f.get("neo_verdict"))))
         return render(request, "improvement_order.html", io=detail,
                       project=detail["project"], error=error)
 
