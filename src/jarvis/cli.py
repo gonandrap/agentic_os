@@ -2849,7 +2849,7 @@ def cmd_steward(args: argparse.Namespace) -> int:
             print(f"fleet      ${book.fleet_usd:8.2f} (new self-work waits above "
                   f"${cfg.yield_above_usd:.2f})")
             return 0
-        rows = (central.steward_decisions(wo_id=args.wo_id) if args.steward_cmd == "why"
+        rows = (ops.steward_why(args.wo_id) if args.steward_cmd == "why"
                 else central.steward_decisions(limit=args.limit))
         if args.json:
             print(json.dumps(rows))
@@ -4114,8 +4114,11 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             _print(item, True)
             return 0
         print(_morpheus_line(item))
-        print(f"{item['pr_url']}  release {item['release_tag'] or '—'}"
+        print(f"{item['pr_url']}  first release with this PR {item['release_tag'] or '—'}"
               f"  work order {item['wo_id'] or '—'}")
+        if item["last_check_ts"]:
+            print(f"last check {_stamp(item['last_check_ts'])}"
+                  f" on {item.get('last_check_version') or 'an unknown version'}")
         print(f"checks {item['checks']} · last exit {item['last_exit']}"
               f" · deadline {_stamp(item['deadline_ts'])}"
               + (f" · {item['auto_requeues']} automatic requeue(s)"

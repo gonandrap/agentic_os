@@ -395,6 +395,7 @@ def test_the_fleet_brake_from_the_dashboard(page, server):
     """Pause from the form, the banner appears (and on other pages), resume lifts it."""
     page.goto(server)
     assert page.locator(".brake").count() == 0
+    page.click("button[role=tab][data-panel='tab-brake']")  # §7: the brake lives in a tab
     page.fill("form[action='/fleet/pause'] input[name='reason']", "browser brake")
     page.click("form[action='/fleet/pause'] button")
     banner = page.locator(".brake")
@@ -1453,6 +1454,183 @@ def test_config_reads_and_stacks_history_over_diff(page, server, readable):
         diff = page.locator("h2:text-is('Diff')").bounding_box()
         assert diff["y"] > history["y"] and diff["x"] == history["x"]  # stacked, not beside
     assert page.locator(".cfg-tree").is_visible()                       # the tree stays
+# §5 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+def _stuck_rows(monkeypatch) -> tuple[str, str]:
+    """Two real orders, one judged past its threshold; returns (stuck id, fine id)"""
+    stuck = ops.create_work_order("proj_a", f"stuck: {_LONG}")["id"]
+    fine = ops.create_work_order("proj_a", "inside its threshold")["id"]
+
+    def row(wo_id, title, over):
+        return {"id": wo_id, "project": "proj_a", "title": title,
+                "status": "waiting_pr_merge" if over else "running",
+                "status_label": "waiting on a PR merge" if over else "running",
+                "seconds_in_status": 18000 if over else 60, "seconds_since_activity": 60,
+                "discounted_seconds": 0, "active_seconds": 60, "threshold_seconds": 3600,
+                "clock": "in status", "stuck": over, "excluded": "",
+                "reason": _LONG if over else "", "blocker": "the PR has not merged",
+                "fingerprint": "f", "investigation": None}
+    # Fine row first, so the page's attention ordering is what lifts the stuck one
+    monkeypatch.setattr(ops, "stuck_report", lambda *a, **k: [
+        row(fine, "inside its threshold", False), row(stuck, f"stuck: {_LONG}", True)])
+    return stuck, fine
+
+
+def test_stuck_reads_at_desktop_and_phone_width(page, server, readable, monkeypatch):
+    stuck, _ = _stuck_rows(monkeypatch)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/stuck")
+        assert stuck in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"stuck-{size['width']}")
+
+
+def test_a_stuck_filter_in_the_url_narrows_the_rows(page, server, monkeypatch):
+    stuck, fine = _stuck_rows(monkeypatch)
+    page.goto(f"{server}/stuck?status=running")
+    table = page.locator("main .panel table").inner_text()
+    assert fine in table and stuck not in table
+    assert "1 of 2 shown" in page.locator("main").inner_text()
+    page.goto(f"{server}/stuck?kind=fo")
+    assert "nothing matches these filters" in page.locator("main").inner_text()
+
+
+def test_a_stuck_row_sits_above_the_others(page, server, monkeypatch):
+    stuck, fine = _stuck_rows(monkeypatch)
+    page.goto(f"{server}/stuck")
+    rows = page.locator("main .panel table a.rowid")
+    assert rows.filter(has_text=stuck).bounding_box()["y"] < \
+        rows.filter(has_text=fine).bounding_box()["y"]
+
+
+def test_clicking_a_stuck_row_id_opens_its_order(page, server, monkeypatch):
+    stuck, _ = _stuck_rows(monkeypatch)
+    page.goto(f"{server}/stuck")
+    page.click(f"main .panel table a.rowid:has-text('{stuck}')")
+    page.wait_for_url(f"**/wo/proj_a/{stuck}")
+
+
+def _steward_rows() -> tuple[int, int]:
+    """One critical ask and one expired queued decision; returns (ask id, expired id)"""
+    import json
+
+    from jarvis import db, steward
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        base = {"project": "proj_a", "severity": "medium", "outcome": "queue",
+                "rule": "recurrence", "mode": "enforce", "origin_kind": "panel"}
+        expired = central.record_steward_decision({**base, "subject": f"old: {_LONG}",
+                                                   "reason": _LONG})
+        steward.settle_unrecoverable(central)
+        ask = central.record_steward_decision({
+            **base, "origin_kind": "morpheus", "outcome": "ask", "severity": "critical",
+            "rule": "critical-ceiling", "subject": f"PR failed in production: {_LONG}",
+            "ts": db.now(), "candidate_json": json.dumps({"payload": {"morpheus_item": "mv-1"}})})
+    finally:
+        central.close()
+    return ask, expired
+
+
+def test_steward_reads_at_desktop_and_phone_width(page, server, readable):
+    ask, expired = _steward_rows()
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/steward")
+        assert f"#{ask}" in page.locator(".needs-you").inner_text()
+        readable(page)
+        _shot(page, f"steward-{size['width']}")
+        page.goto(f"{server}/steward/{expired}")
+        readable(page)
+        _shot(page, f"steward-item-{size['width']}")
+
+
+def test_a_steward_filter_in_the_url_narrows_the_rows(page, server):
+    ask, expired = _steward_rows()
+    page.goto(f"{server}/steward?tab=settled")
+    main = page.locator("main").inner_text()
+    assert f"#{expired}" in main and f"#{ask}" not in main
+    assert "1 of 2 shown" in main
+    page.goto(f"{server}/steward?project=nope")
+    assert "nothing matches these filters" in page.locator("main").inner_text()
+
+
+def test_a_steward_ask_sits_above_the_others(page, server):
+    ask, expired = _steward_rows()
+    page.goto(f"{server}/steward")
+    assert page.locator("#steward-asks").is_visible()
+    assert not page.locator("#steward-settled").is_visible()
+    assert page.locator(".needs-you").bounding_box()["y"] < \
+        page.locator("#steward-tabs").bounding_box()["y"]
+
+
+def test_clicking_a_steward_row_id_opens_its_decision(page, server):
+    _, expired = _steward_rows()
+    page.goto(f"{server}/steward?tab=settled")
+    page.click(f"#steward-settled a.rowid:has-text('#{expired}')")
+    page.wait_for_url(f"**/steward/{expired}")
+    assert "critical" not in page.locator("main h2").inner_text()
+    assert "re-offer" in page.locator("main").inner_text()
+
+
+def _evolution_rules(monkeypatch) -> None:
+    """A firing rule, a quiet one and an unreadable one, newest-first in that order"""
+    real = ops.evolution_report
+
+    def fake(project=None, *, days=90):
+        report = real(project, days=days)
+        base = {"gap_class": "stuck_order", "summary": _LONG, "status": "dry_run",
+                "hits": 0, "false_positives": 0, "recurrences": 0, "last_fired": None,
+                "last_cleared": None, "hit_rate": None, "hit_rate_note": "never fired",
+                "readable": True, "condition_problems": [], "median_cleared_seconds": None,
+                "median_cleared_seconds_note": "not a median yet"}
+        report["per_rule"] = [
+            {**base, "id": "det-firing", "hits": 4, "last_fired": 1.0, "hit_rate": 0.5},
+            {**base, "id": "det-quiet"},
+            {**base, "id": "det-broken", "hits": 1, "last_fired": 1.0, "readable": False,
+             "condition_problems": ["field `nope` is not known"]}]
+        report["by_gap_class"] = [{"gap_class": "stuck_order", "total": 5,
+                                   "weeks": [{"week": "2026-10-19", "count": 5}]}]
+        return report
+    monkeypatch.setattr(ops, "evolution_report", fake)
+
+
+def test_evolution_reads_at_desktop_and_phone_width(page, server, readable, monkeypatch):
+    _evolution_rules(monkeypatch)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/evolution")
+        assert "det-broken" in page.locator(".needs-you").inner_text()
+        assert not page.locator("#quiet-detectors table").is_visible()
+        readable(page)
+        _shot(page, f"evolution-{size['width']}")
+        page.goto(f"{server}/evolution/rule/det-firing")
+        readable(page)
+        _shot(page, f"evolution-rule-{size['width']}")
+
+
+def test_an_evolution_filter_in_the_url_narrows_the_rows(page, server, monkeypatch):
+    _evolution_rules(monkeypatch)
+    page.goto(f"{server}/evolution?firing=quiet")
+    main = page.locator("main").inner_text()
+    assert "det-quiet" in main and "det-firing" not in main
+    assert "1 of 3 shown" in main
+
+
+def test_an_unreadable_rule_sits_above_the_others(page, server, monkeypatch):
+    _evolution_rules(monkeypatch)
+    page.goto(f"{server}/evolution")
+    rows = page.locator("main .panel table a.rowid")
+    assert rows.filter(has_text="det-broken").bounding_box()["y"] < \
+        rows.filter(has_text="det-firing").bounding_box()["y"]
+
+
+def test_clicking_an_evolution_rule_id_opens_its_page(page, server, monkeypatch):
+    _evolution_rules(monkeypatch)
+    page.goto(f"{server}/evolution")
+    page.click("main .panel table a.rowid:has-text('det-firing')")
+    page.wait_for_url("**/evolution/rule/det-firing")
+    assert "2026-10-19" in page.locator("main").inner_text()
 
 
 # §6 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
@@ -1569,3 +1747,198 @@ def test_clicking_a_record_row_id_opens_its_detail(page, server):
     page.wait_for_url(f"**/backlog/{r['tower']}")
     page.goto(f"{server}/go/gate-{r['hot']}")
     page.wait_for_url(f"**/gates/{r['hot']}")
+# §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+_ROWS = "main .panel .row .grow, main td, main th, main p"
+
+
+def _open_orders(project, parent_id=None):
+    """Three open orders, the one owed a review created FIRST so newest-first puts it last"""
+    store = ProjectStore(project)
+    try:
+        made = {}
+        for title, status in (("an order owed a review", "needs_review"),
+                              ("a pull request waiting to merge", "waiting_pr_merge"),
+                              ("a worker busy on it", "validating")):
+            wo = store.create_work_order(title, description=_LONG, parent_id=parent_id)
+            store.set_status(wo["id"], status)
+            made[status] = wo
+    finally:
+        store.close()
+    ops.assume(made["needs_review"]["id"], "went with sqlite over postgres")  # what it owes
+    return made
+
+
+def _first_row_text(page, panel):
+    return page.locator(f"{panel} > .row").first.inner_text()
+
+
+def test_the_dashboard_reads_at_desktop_and_phone_width(page, server, project, readable):
+    _open_orders(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(server)
+        assert "an order owed a review" in page.locator(".needs-you").inner_text()
+        assert page.locator("#live-top .open-work").is_visible()
+        readable(page, _ROWS)
+        _shot(page, f"dashboard-{size['width']}")
+
+
+def test_a_dashboard_filter_in_the_url_narrows_the_rows(page, server, project):
+    _open_orders(project)
+    page.goto(f"{server}/?status=waiting_pr_merge")
+    work = page.locator(".open-work").inner_text()
+    assert "a pull request waiting to merge" in work
+    assert "a worker busy on it" not in work and "an order owed a review" not in work
+    assert "1 of 3 shown" in page.locator("main").inner_text()
+    page.goto(f"{server}/?project=nope")
+    assert "nothing matches these filters" in page.locator(".open-work").inner_text()
+
+
+def test_a_dashboard_row_needing_you_sits_above_the_others(page, server, project):
+    _open_orders(project)
+    page.goto(server)
+    assert "an order owed a review" in _first_row_text(page, ".open-work")
+
+
+def test_a_flagged_dashboard_row_outside_the_needs_you_statuses_sits_on_top(page, server,
+                                                                            project):
+    store = ProjectStore(project)
+    try:
+        quiet = store.create_work_order("an unflagged order")
+        store.set_status(quiet["id"], "validating")
+        flagged = store.create_work_order("a flagged order under review")
+        store.set_status(flagged["id"], "validating")
+        store.flag_attention(flagged["id"], "its reviewer gave up")
+        newest = store.create_work_order("the newest unflagged order")
+        store.set_status(newest["id"], "validating")
+    finally:
+        store.close()
+    page.goto(server)
+    assert "a flagged order under review" in _first_row_text(page, ".open-work")
+
+
+def test_a_dashboard_filter_survives_a_live_poll(page, server, project):
+    made = _open_orders(project)
+    page.goto(f"{server}/?status=waiting_pr_merge")
+    page.evaluate("window.jarvisLiveSync()")
+    store = ProjectStore(project)
+    try:
+        store.create_work_order("landed after the page loaded", status="waiting_pr_merge")
+    finally:
+        store.close()
+    page.evaluate("window.jarvisLiveSync()")
+    work = page.locator("#live-top .open-work").inner_text()
+    assert "landed after the page loaded" in work, "the poll swapped the region"
+    assert made["waiting_pr_merge"]["title"] in work
+    assert "a worker busy on it" not in work and "an order owed a review" not in work
+    assert page.locator("select[name=status]").input_value() == "waiting_pr_merge"
+
+
+def test_clicking_a_dashboard_row_id_opens_its_order(page, server, project):
+    wo = _open_orders(project)["validating"]
+    page.goto(server)
+    page.click(f".open-work a.rowid:has-text('{wo['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
+    assert "a worker busy on it" in page.locator("main").inner_text()
+
+
+def test_the_project_page_reads_at_desktop_and_phone_width(page, server, project, readable):
+    _open_orders(project)
+    ops.create_feature_order("proj_a", "a feature in the tabs", description=_LONG)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/project/proj_a")
+        assert page.locator(".proj-orders").is_visible()
+        assert "a feature in the tabs" in page.locator("#tab-features").inner_text()
+        assert not page.locator("#tab-improvements").is_visible()
+        readable(page, _ROWS)
+        _shot(page, f"project-{size['width']}")
+
+
+def test_a_project_status_filter_in_the_url_narrows_the_rows(page, server, project):
+    _open_orders(project)
+    page.goto(f"{server}/project/proj_a?status=needs_review")
+    rows = page.locator(".proj-orders").inner_text()
+    assert "an order owed a review" in rows
+    assert "a pull request waiting to merge" not in rows and "a worker busy on it" not in rows
+    page.goto(f"{server}/project/proj_a?status=nope")
+    assert "nothing matches these filters" in page.locator(".proj-orders").inner_text()
+
+
+def test_a_project_row_needing_you_sits_above_the_others(page, server, project):
+    _open_orders(project)
+    page.goto(f"{server}/project/proj_a")
+    assert "an order owed a review" in _first_row_text(page, ".proj-orders")
+
+
+def test_clicking_a_project_row_id_opens_its_order(page, server, project):
+    fo = ops.create_feature_order("proj_a", "a feature in the tabs", description=_LONG)
+    wo = _open_orders(project)["waiting_pr_merge"]
+    page.goto(f"{server}/project/proj_a")
+    page.click(f".proj-orders a.rowid:has-text('{wo['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
+    page.goto(f"{server}/project/proj_a")
+    page.click(f"#tab-features a.rowid:has-text('{fo['id']}')")
+    page.wait_for_url(f"**/fo/proj_a/{fo['id']}")
+
+
+def _executing_feature(project):
+    fo = ops.create_feature_order("proj_a", "a feature with children", description=_LONG)
+    store = ProjectStore(project)
+    try:
+        store.set_feature_status(fo["id"], "executing")
+    finally:
+        store.close()
+    return fo, _open_orders(project, parent_id=fo["id"])
+
+
+def test_the_feature_page_reads_at_desktop_and_phone_width(page, server, project, readable):
+    fo, _ = _executing_feature(project)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/fo/proj_a/{fo['id']}")
+        assert page.locator(".page-head").inner_text().startswith(fo["id"])
+        assert not page.locator("details.explain > div.panel").is_visible()  # the ask folds
+        readable(page, _ROWS)
+        _shot(page, f"feature-{size['width']}")
+
+
+def test_a_feature_child_needing_you_sits_above_the_others(page, server, project):
+    fo, _ = _executing_feature(project)
+    page.goto(f"{server}/fo/proj_a/{fo['id']}")
+    assert "an order owed a review" in _first_row_text(page, ".fo-children")
+
+
+def test_clicking_a_feature_child_id_opens_its_order(page, server, project):
+    fo, kids = _executing_feature(project)
+    page.goto(f"{server}/fo/proj_a/{fo['id']}")
+    page.click(f".fo-children a.rowid:has-text('{kids['validating']['id']}')")
+    page.wait_for_url(f"**/wo/proj_a/{kids['validating']['id']}")
+
+
+def test_the_improvement_and_investigation_pages_read_at_both_widths(page, server, project,
+                                                                     readable):
+    stuck = _open_orders(project)["validating"]
+    io = ops.create_improvement_order("proj_a", "workers keep stalling", description=_LONG,
+                                      refs=[stuck["id"]])
+    inv = ops.create_investigation_order("proj_a", stuck["id"], _LONG)
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        for kind, rec in (("io", io), ("inv", inv)):
+            page.goto(f"{server}/{kind}/proj_a/{rec['id']}")
+            assert page.locator(".page-head").inner_text().startswith(rec["id"])
+            readable(page, _ROWS)
+            _shot(page, f"{kind}-{size['width']}")
+
+
+def test_the_work_order_card_and_asks_stack_full_width(page, server, project, readable):
+    wo = _open_orders(project)["needs_review"]
+    for size in _WIDTHS:
+        page.set_viewport_size(size)
+        page.goto(f"{server}/wo/proj_a/{wo['id']}")
+        card = page.locator(".wo-card").bounding_box()
+        asks = page.locator(".asks").bounding_box()
+        assert asks["y"] >= card["y"] + card["height"] - 1, "asks sit below the card"
+        assert abs(asks["width"] - card["width"]) < 2, "both span the same full width"
+        readable(page, _ROWS)
+        _shot(page, f"work-order-{size['width']}")

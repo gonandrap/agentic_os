@@ -21,10 +21,10 @@
 {{ nav.order_nav(project, wo, 'record') }}
 {{ nav.debug_jumps('/wo/' ~ project ~ '/' ~ wo.id ~ '/debug') }}
 
-{# AT WIDTH — §5 of docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md:
-   the order's card on the left, everything it asks of the reader on the right, the tabs
-   full width under both. One column when nothing is asked. #}
-<div class="grid wo-top" style="--col: 680px;">
+{# §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md:
+   the order's card, then everything it asks of the reader, stacked full width; the tabs
+   under both. #}
+<div class="wo-top">
 <div class="wo-card">
 <div class="panel" style="padding: 14px 16px; margin-top: 18px;">
   <div style="display:flex; gap: 12px; align-items: baseline; flex-wrap: wrap;">

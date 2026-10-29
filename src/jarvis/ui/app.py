@@ -119,6 +119,8 @@ REFRESH_SECONDS = 15
 # The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
                      "validating", "waiting_pr_merge")
+# The work-order statuses that sort to the top of a list: each waits on the user
+NEEDS_YOU_STATUSES = ("failed", "budget_exhausted", "needs_review", "waiting_input")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
@@ -985,6 +987,11 @@ def create_app() -> FastAPI:
         """Owns the liveness probe task (spec §2) and the watchdog thread (issue #1221)"""
         import anyio
 
+        try:
+            invariants.report_at_startup("ui")
+        except Exception:  # noqa: BLE001 — a startup check must not stop the dashboard
+            import logging
+            logging.getLogger(__name__).exception("startup invariant check failed")
         watchdog.start()
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
@@ -1146,15 +1153,27 @@ def create_app() -> FastAPI:
     def dashboard(request: Request, show: str = ""):
         """The pulse"""
         st = ops.os_status()
-        rows = [{**wo, "project": p["name"]}
-                for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        every = [{**wo, "project": p["name"]}
+                 for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        # §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+        options = {"project": filter_options(every, "project"),
+                   "status": filter_options(every, "status")}
+        filters = query_filters(request, options)
+        rows = filter_rows(every, filters)
+        # A status filter reveals that status even when it is one that collapses into a count
+        show = show or filters.get("status", "")
         revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
             else ""
         featured, rest = group_open(rows, revealed)
+        # Same predicate as project(): a status that waits on the user, or a raised flag
+        shown = attention_first(featured + rest,
+                                lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                                or bool(wo.get("needs_attention")))
         rest_counts = _counts_by_status(
             wo["status"] for wo in rows if wo["status"] not in FEATURED_STATUSES)
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
-                      featured=featured, rest=rest, rest_counts=rest_counts,
+                      shown=shown, total=len(every), rest_counts=rest_counts,
+                      filters=filters, options=options,
                       revealed=revealed, model_ids=ops.suggested_model_ids())
 
     @app.get("/search", response_class=HTMLResponse)
@@ -1184,8 +1203,15 @@ def create_app() -> FastAPI:
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
         show_hidden = hidden not in ("", "0", "false")
+        options = {"status": list(WO_STATUSES)}
+        filters = query_filters(request, options)
+        status = filters.get("status", "")
+        # A status filter reveals that status; an unknown one matches nothing (Q2361)
+        show = status or show
         revealed = show if show in WO_STATUSES else ("all" if show == "all" else "")
-        if revealed == "all":
+        if status:
+            statuses = (status,)
+        elif revealed == "all":
             statuses = None
         else:
             statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
@@ -1239,13 +1265,27 @@ def create_app() -> FastAPI:
             central.close()
         settled = [(s, counts[s]) for s in TERMINAL_STATUSES if counts.get(s)]
         featured, rest = group_open(wos, revealed)
+        rows = attention_first(featured + rest,
+                               lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                               or bool(wo.get("needs_attention")))
         # Counted in SQL rather than from `wos`
         other_open = [s for s in OPEN_STATUSES if s not in FEATURED_STATUSES]
         open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
         fo_settled = [(s, fo_counts[s]) for s in FO_TERMINAL_STATUSES
                       if fo_counts.get(s)]
+        flagged = lambda r: bool(r.get("needs_attention"))  # noqa: E731
+        features = attention_first(features, flagged)
+        improvements = attention_first(improvements, flagged)
+        investigations = attention_first(investigations, flagged)
         return render(request, "project.html", project_name=name, path=paths[name],
-                      featured=featured, rest=rest, open_counts=open_counts,
+                      # "of M": the open orders plus whatever the URL revealed, never every settled one
+                      total=sum(n for s, n in counts.items()
+                                if revealed == "all" or s in OPEN_STATUSES
+                                or s in (status, revealed)),
+                      rows=rows, filters=filters,
+                      # Parsed against every status, offered only where a row has it
+                      options={"status": [s for s in WO_STATUSES if counts.get(s)]},
+                      open_counts=open_counts,
                       backlog=backlog, show_hidden=show_hidden, blocked=blocked,
                       pauses=pauses,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
@@ -1285,6 +1325,10 @@ def create_app() -> FastAPI:
             for c in (detail.get("plan") or {}).get("children", [])
             if c.get("spec_section")
         }
+        detail["children"] = attention_first(
+            detail.get("children") or [],
+            lambda c: not c.get("superseded") and (
+                c["status"] in NEEDS_YOU_STATUSES or bool(c.get("needs_attention"))))
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
                       states=states, child_anchors=child_anchors,
                       cap=ops.feature_order_budget(fo_id, detail["project"],
@@ -1329,6 +1373,14 @@ def create_app() -> FastAPI:
             detail = ops.show_improvement_order(io_id, name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        report = detail.get("report") or {}
+        if report.get("findings"):
+            # Owed a decision first: pending and not held by Neo, or a filing that failed
+            report["findings"] = attention_first(
+                report["findings"],
+                lambda f: bool(f.get("filing_error")) or (
+                    (f.get("status") or "pending") == "pending"
+                    and not (f.get("neo_question_id") and not f.get("neo_verdict"))))
         return render(request, "improvement_order.html", io=detail,
                       project=detail["project"], error=error)
 
@@ -1813,10 +1865,15 @@ def create_app() -> FastAPI:
     @app.get("/stuck", response_class=HTMLResponse)
     def stuck_page(request: Request):
         """Open orders judged on time in status (docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md)"""
-        rows = ops.stuck_report()
-        return render(request, "stuck.html", active="stuck",
-                      over=[r for r in rows if r["stuck"]],
-                      rest=[r for r in rows if not r["stuck"]])
+        # Spec 2026-10-29 dashboard §5: past-threshold first, one full-width table
+        every = [{**r, "kind": str(r["id"]).split("-", 1)[0]} for r in ops.stuck_report()]
+        options = {"project": filter_options(every, "project"), "kind": ["wo", "fo", "io"],
+                   "status": filter_options(every, "status")}
+        filters = query_filters(request, options)
+        rows = attention_first(filter_rows(every, filters), lambda r: r["stuck"])
+        return render(request, "stuck.html", active="stuck", rows=rows,
+                      attention=[r for r in rows if r["stuck"]], filters=filters,
+                      options=options, total=len(every))
 
     @app.get("/morpheus", response_class=HTMLResponse)
     def morpheus_page(request: Request):
@@ -1881,24 +1938,85 @@ def create_app() -> FastAPI:
     @app.get("/steward", response_class=HTMLResponse)
     def steward_page(request: Request):
         """Self-work the steward queued: what still waits, what was re-offered, what expired (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)"""
-        return render(request, "steward.html", active="steward",
-                      report=ops.steward_queue_report())
+        report = ops.steward_queue_report()
+        # Spec 2026-10-29 dashboard §5: one table, three tabs; `tab` filters which ones show
+        every = ([{**i, "tab": "asks"} for i in report["asks"]]
+                 + [{**i, "tab": "waiting"} for i in report["waiting"]]
+                 + [{**i, "tab": "settled"} for i in report["settled"]])
+        options = {"project": filter_options(every, "project"),
+                   "tab": ["asks", "waiting", "settled"]}
+        filters = query_filters(request, options)
+        shown = filter_rows(every, filters)
+        tabs = {t: [i for i in shown if i["tab"] == t] for t in options["tab"]}
+        return render(request, "steward.html", active="steward", report=report,
+                      tabs=tabs, attention=tabs["asks"], filters=filters,
+                      options=options, shown=len(shown), total=len(every),
+                      open_tab=filters.get("tab") or ("asks" if tabs["asks"] else "waiting"))
 
-    @app.get("/evolution", response_class=HTMLResponse)
-    def evolution_page(request: Request, days: int = 90):
-        """Is the OS getting better at running itself — and where is it still weak? (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
-        return render(request, "evolution.html", active="evolution",
-                      report=ops.evolution_report(None, days=days))
+    @app.get("/steward/{ref}", response_class=HTMLResponse)
+    def steward_item_page(request: Request, ref: str):
+        """`jarvis steward why <ref>` as a page (spec 2026-10-29 dashboard §5)"""
+        decisions = ops.steward_why(ref)
+        if not decisions:
+            return render(request, "error.html", active="steward", status_code=404,
+                          message=f"no steward decision about {ref}")
+        return render(request, "steward_item.html", active="steward", ref=ref,
+                      decisions=decisions)
 
-    @app.get("/evolution/{project}", response_class=HTMLResponse)
-    def evolution_project_page(request: Request, project: str, days: int = 90):
-        """The same report scoped to one project — where each project page links"""
+    def _evolution(request: Request, project: str | None, days: int):
+        """/evolution[/<project>], failures first (spec 2026-10-29 dashboard §5)"""
         try:
             report = ops.evolution_report(project, days=days)
         except ops.OpsError as e:
             return render(request, "error.html", active="evolution",
                           message=str(e), status_code=404)
-        return render(request, "evolution.html", active="evolution", report=report)
+        every = [{**r, "firing": "firing" if r["hits"] or r["last_fired"] else "quiet"}
+                 for r in report["per_rule"]]
+        options = {"project": sorted(ops.registered_project_paths()),
+                   "days": ["7", "30", "90", "365"], "firing": ["firing", "quiet"]}
+        filters = query_filters(request, options)
+        if project:
+            filters["project"] = project
+        if days != 90:
+            filters["days"] = str(days)
+        shown = attention_first(filter_rows(every, {"firing": filters.get("firing", "")}),
+                                lambda r: not r["readable"])
+        return render(request, "evolution.html", active="evolution", report=report,
+                      rows=[r for r in shown if r["firing"] == "firing"],
+                      quiet=[r for r in shown if r["firing"] == "quiet"],
+                      attention=[r for r in shown if not r["readable"]],
+                      weeks_of={g["gap_class"]: g["weeks"] for g in report["by_gap_class"]},
+                      filters=filters, options=options, shown=len(shown), total=len(every))
+
+    @app.get("/evolution", response_class=HTMLResponse)
+    def evolution_page(request: Request, days: int = 90, project: str = ""):
+        """Is the OS getting better at running itself — and where is it still weak? (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
+        return _evolution(request, project.strip() or None, days)
+
+    @app.get("/evolution/rule/{key}", response_class=HTMLResponse)
+    def evolution_rule_page(request: Request, key: str, project: str = "", days: int = 90):
+        """One detector's history and what it filed (spec 2026-10-29 dashboard §5)"""
+        try:
+            report = ops.evolution_report(project.strip() or None, days=days)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="evolution",
+                          message=str(e), status_code=404)
+        rule = next((r for r in report["per_rule"] if str(r["id"]) == key), None)
+        if rule is None:
+            return render(request, "error.html", active="evolution", status_code=404,
+                          message=f"no detector {key!r} in this scope")
+        return render(request, "evolution_rule.html", active="evolution", report=report,
+                      rule=rule,
+                      weeks=next((g["weeks"] for g in report["by_gap_class"]
+                                  if g["gap_class"] == rule["gap_class"]), []),
+                      recurrences=[r for r in report["recurrences"]["rows"]
+                                   if r["gap_class"] == rule["gap_class"]],
+                      filed=[e for e in report["timeline"] if e["id"] == str(key)])
+
+    @app.get("/evolution/{project}", response_class=HTMLResponse)
+    def evolution_project_page(request: Request, project: str, days: int = 90):
+        """The same report scoped to one project — where each project page links"""
+        return _evolution(request, project, days)
 
     @app.get("/alarms/{project}/{alarm_id}", response_class=HTMLResponse)
     def alarm_page(request: Request, project: str, alarm_id: str):

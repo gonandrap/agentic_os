@@ -130,19 +130,55 @@ def test_an_absent_share_prints_the_sentence_and_no_digit(client, monkeypatch):
     assert "0.0" not in body
 
 
+def _rule(**over) -> dict:
+    """One `per_rule` row of a detector that never fired"""
+    return {"id": "det-1", "gap_class": "stuck_order", "summary": "a summary",
+            "status": "dry_run", "hits": 0, "false_positives": 0,
+            "recurrences": 0, "last_fired": None, "last_cleared": None,
+            "hit_rate": None,
+            "hit_rate_note": "this detector has never fired, so it has no hit rate",
+            "readable": True, "condition_problems": [],
+            "median_cleared_seconds": None,
+            "median_cleared_seconds_note": "0 cleared fires, not a median yet", **over}
+
+
 def test_a_rule_with_no_hit_rate_shows_the_note(client, monkeypatch):
-    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
-        per_rule=[{"id": "det-1", "gap_class": "stuck_order", "summary": "a summary",
-                   "status": "dry_run", "hits": 0, "false_positives": 0,
-                   "recurrences": 0, "last_fired": None, "last_cleared": None,
-                   "hit_rate": None,
-                   "hit_rate_note": "this detector has never fired, so it has no hit rate",
-                   "readable": True, "condition_problems": [],
-                   "median_cleared_seconds": None,
-                   "median_cleared_seconds_note": "0 cleared fires, not a median yet"}]))
+    """The note left the table for the rule's own page (fo-744c42a5 §5); the list folds it as quiet"""
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(per_rule=[_rule()]))
     body = body_of(client.get("/evolution").text)
-    assert "this detector has never fired, so it has no hit rate" in body
-    assert "det-1" in body
+    quiet = body.split('id="quiet-detectors"', 1)[1].split("</details>", 1)[0]
+    assert 'href="/evolution/rule/det-1"' in quiet
+    detail = body_of(client.get("/evolution/rule/det-1").text)
+    assert "this detector has never fired, so it has no hit rate" in detail
+    assert "a summary" in detail
+
+
+def test_an_unknown_rule_is_a_404(client, monkeypatch):
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(per_rule=[_rule()]))
+    assert client.get("/evolution/rule/det-nope").status_code == 404
+
+
+def test_a_rule_page_shows_what_it_filed_and_its_history(client, monkeypatch):
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
+        per_rule=[_rule(hits=3, last_fired=1.0)],
+        by_gap_class=[{"gap_class": "stuck_order", "total": 3,
+                       "weeks": [{"week": "2026-10-19", "count": 3}]}],
+        timeline=[{"ts": 1.0, "kind": "detector_added", "id": "det-1",
+                   "headline": "a detector was registered", "links": {"fix_wo": "wo-9"}},
+                  {"ts": 1.0, "kind": "detector_added", "id": "det-2",
+                   "headline": "another detector", "links": {}}]))
+    listing = body_of(client.get("/evolution").text)
+    assert 'id="rule-det-1"' in listing.split('id="quiet-detectors"')[0]
+    detail = body_of(client.get("/evolution/rule/det-1?project=").text)
+    assert "2026-10-19" in detail and 'href="/go/wo-9"' in detail
+    assert "another detector" not in detail
+
+
+def test_the_firing_filter_narrows_the_rules(client, monkeypatch):
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
+        per_rule=[_rule(), _rule(id="det-2", hits=2, last_fired=1.0)]))
+    body = body_of(client.get("/evolution?firing=firing").text)
+    assert "det-2" in body and "det-1" not in body
 
 
 def test_a_timeline_entry_with_no_links_renders_no_link(client, monkeypatch):
