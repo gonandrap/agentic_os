@@ -928,6 +928,33 @@ def test_knowledge_page(client):
     assert "prefer uv" in r.text and "global" in r.text
 
 
+def test_work_order_page_lists_its_learnings(client):
+    """wo-9f943f10: the knowledge an order wrote or retired, as a rail section"""
+    from jarvis.project_store import ProjectStore
+    ps = ProjectStore(ops.registered_project_paths()["proj_a"])
+    try:
+        wo = ps.create_work_order("learn things")
+        other = ps.create_work_order("another learner")
+        quiet = ps.create_work_order("quiet one")
+    finally:
+        ps.close()
+    central = CentralStore()
+    wrote = central.add_knowledge("held panels hide stuck orders", project="proj_a",
+                                  topic="ui", wo_id=wo["id"])
+    old = central.add_knowledge("stale lesson", project="proj_a")
+    central.retract_knowledge(old["id"], "superseded", wo_id=wo["id"])
+    central.add_knowledge("someone else's lesson", project="proj_a", wo_id=other["id"])
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert '<h2 id="learnings">Learnings</h2>' in page
+    assert f'href="/knowledge/{wrote["id"]}"' in page and "held panels" in page
+    assert "retired by this order: superseded" in page
+    assert "someone else" not in page
+
+    assert "This order wrote no learnings." not in page
+    assert "This order wrote no learnings." in client.get(f"/wo/proj_a/{quiet['id']}").text
+
+
 def test_knowledge_page_filters_by_topic_and_words(client):
     """Topics were a flat run of text: no link, no way to narrow 800 entries to one topic"""
     central = CentralStore()
