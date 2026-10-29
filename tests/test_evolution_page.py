@@ -44,6 +44,8 @@ def report(**over) -> dict:
                                         "excluded_note": None}},
         "stuck_resolution": [],
         "timeline": [],
+        "lineage": {"rows": [], "user_asked": 0, "untraced": 0,
+                    "note": "nothing self-induced learned anything"},
         "unreadable": {"projects": [], "detectors": [], "fires": []},
     }
     base.update(over)
@@ -110,6 +112,37 @@ def test_the_filter_bars_own_submission_renders(client):
     res = client.get("/evolution?project=proj_a&days=&firing=")
     assert res.status_code == 200
     assert "90 days" in body_of(res.text)
+
+
+def test_self_induced_knowledge_renders_with_every_hop_of_its_chain(client):
+    """The lineage the user asked for, end to end through the real report (Neo q2514)"""
+    from jarvis.central_store import CentralStore
+    from jarvis.project_store import ProjectStore
+
+    ps = ProjectStore(ops.registered_project_paths()["proj_a"])
+    try:
+        inv = ps.create_feature_order("investigate wo-1", origin="fleet_health",
+                                      kind="investigation",
+                                      metadata={ops.SUBJECT_KEY: "wo-1"})
+        investigator = ps.create_work_order("diagnose", kind="investigator",
+                                            parent_id=inv["id"])
+        asked = ps.create_work_order("user work", origin="ui")
+    finally:
+        ps.close()
+    central = CentralStore()
+    try:
+        evolved = central.add_knowledge("held panels hide stuck orders", project="proj_a",
+                                        wo_id=investigator["id"])
+        central.add_knowledge("user-asked lesson", project="proj_a", wo_id=asked["id"])
+    finally:
+        central.close()
+
+    body = body_of(client.get("/evolution").text)
+
+    assert f'id="lineage-{evolved["id"]}"' in body
+    assert investigator["id"] in body and inv["id"] in body
+    assert "origin fleet_health" in body
+    assert "user-asked lesson" not in body
 
 
 # -- the page prints what the dict says and computes nothing
