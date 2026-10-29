@@ -251,6 +251,8 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
         f"catch this branch up. Merge it by hand, re-judge it "
         f"(`jarvis validation force`), or `jarvis wo send` the worker"
         if cause == ops.CATCH_UP_DEFER_CARRY_UNPROVEN else
+        f"{moved}; the branch is caught up again once {catch_up.reason} runs out"
+        if cause == ops.CATCH_UP_DEFER_BACKOFF else
         f"{moved}; the branch is being caught up as soon as "
         f"{catch_up.reason or 'the work in flight'} finishes — the OS retries every "
         f"tick")
