@@ -87,12 +87,24 @@
       <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
       <td class="mono" style="white-space:nowrap">{{ fmt_ts(i.deadline_ts) }}</td>
       <td class="mono">{% if i.last_output %}{{ peek(i.id ~ "-tail", "tail", "output · " ~ i.id ~ " · #" ~ i.pr_number, i.last_output) }}{% else %}—{% endif %}</td>
-      <td class="mono" style="word-break:break-all">{{ i.action or "—" }}
+      <td class="mono" style="word-break:break-all">
+        {%- if (i.action or "").startswith("neo:") %}<a href="/neo/question/{{ i.action[4:] }}">{{ i.action }}</a>
+        {%- else %}{{ i.action or "—" }}{% endif %}
         {%- if i.state in ("failed", "timedout") and not (i.resolution or "").startswith("confirmed failed") %}
+        {# the same three decisions as the Neo card in _question.html (issue #1302) #}
         <form method="post" action="/morpheus/{{ i.id }}/confirm" style="display:flex; gap:6px; margin-top:6px">
           <input type="hidden" name="next" value="/morpheus#{{ i.id }}">
           <input type="text" name="fix" required placeholder="broken: what to fix">
           <button title="files a work order that fixes it">file fix</button>
+        </form>
+        <form method="post" action="/morpheus/{{ i.id }}/waive" style="display:flex; gap:6px; margin-top:6px">
+          <input type="hidden" name="next" value="/morpheus#{{ i.id }}">
+          <input type="text" name="reason" required placeholder="works because… (marks it validated)">
+          <button title="rules it working in production">waive</button>
+        </form>
+        <form method="post" action="/morpheus/{{ i.id }}/requeue" style="margin-top:6px">
+          <input type="hidden" name="next" value="/morpheus#{{ i.id }}">
+          <button title="after fixing what made it fail">check again</button>
         </form>
         {%- elif i.resolution %}<div class="sub">{{ i.resolution }}</div>{% endif %}</td>
     </tr>
