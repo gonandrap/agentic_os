@@ -3194,7 +3194,7 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = candidate
     if newest is None:
         return None
-    # A hold names ONE assumption, and the OS holds them one at a time: every still-pending one it declined is owed
+    # A hold names ONE assumption: list every still-pending one the OS declined
     if newest["kind"] == "autoreview_held":
         held = _held_pending(store, wo["id"], stale)
         if len(held) > 1:
