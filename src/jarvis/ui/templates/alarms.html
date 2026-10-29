@@ -3,7 +3,7 @@
 {% from "_alarm.html" import verdict_body, review_form, subject_link, what_fired,
                              remedy_block %}
 {% block title %}Alarms — Jarvis{% endblock %}
-{% block style %}.alarm-live { padding: 8px 0; }{% endblock %}
+{% block style %}.needs-you .msg { padding: 8px 0; }{% endblock %}
 {% block content %}
 
 {# Three halves, deliberately not one table: a queue the user empties (the needs-you
@@ -27,7 +27,7 @@
 {% endcall %}
 
 {% call(g) ui.needs_you(live, "burning — asking for you") %}
-  <div class="alarm-live" id="alarm-{{ g.subject_id }}">
+  <div class="msg" id="alarm-{{ g.subject_id }}">
     <div class="who tone-warn">{{ g.project }} · {{ subject_link(g) }} ·
       {{ g.status }} · {{ fmt_age(g.alarms[0].ts) }} ago</div>
     <div style="margin:6px 0">{{ g.title }}</div>
