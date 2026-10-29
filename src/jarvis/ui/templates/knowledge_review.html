@@ -319,7 +319,7 @@ window._ = window._ || {
         'color': C.ink } },
       { selector: 'node.entry.f-me', style: { 'border-width': 3, 'border-color': '#ffffff',
         'min-zoomed-font-size': 0, 'z-index': 16, 'color': '#ffffff', 'font-weight': 600 } },
-      { selector: 'edge.f-out, edge.f-in, edge.f-und', style: { 'display': 'element',
+      { selector: 'edge.f-out, edge.f-in, edge.f-und, edge.f-int', style: { 'display': 'element',
         'width': 2.4, 'opacity': 1, 'z-index': 14, 'curve-style': 'bezier',
         'arrow-scale': 1 } },
       { selector: 'edge.f-out', style: { 'line-color': C.amber, 'target-arrow-color': C.amber,
@@ -327,6 +327,9 @@ window._ = window._ || {
       { selector: 'edge.f-in', style: { 'line-color': C.cyan, 'target-arrow-color': C.cyan,
         'target-arrow-shape': 'triangle' } },
       { selector: 'edge.f-und', style: { 'line-color': C.ink2, 'target-arrow-shape': 'none' } },
+      // a selection's links between two of its own members
+      { selector: 'edge.f-int', style: { 'line-color': '#ffffff', 'target-arrow-color': '#ffffff',
+        'target-arrow-shape': 'triangle' } },
       // edgehandles' own pieces while a link is being drawn
       { selector: '.eh-ghost-edge, edge.eh-preview', style: { 'width': 2, 'line-color': C.amber,
         'target-arrow-color': C.amber, 'target-arrow-shape': 'triangle', 'curve-style': 'bezier' } },
@@ -1059,7 +1062,16 @@ window._ = window._ || {
   });
   cy.on('tap', 'edge', function (e) { openEdge(e.target); });
   cy.on('dbltap', 'node.domain', function (e) { openDomain(e.target.id(), true); });
-  cy.on('select unselect', 'node', function () { clearTimeout(state.selT); state.selT = setTimeout(drawSelbar, 30); });
+  cy.on('select unselect', 'node', function () { clearTimeout(state.selT); state.selT = setTimeout(selChanged, 30); });
+  // a selection lights up like a clicked entry: its links and neighbours, the rest fades
+  function selChanged() {
+    drawSelbar();
+    var sel = cy.$('node.entry:selected');
+    if (sel.length > 1) focus(sel);
+    else if (state.open && state.open.kind === 'entry') focus(state.open.id);
+    else if (sel.length) focus(sel);
+    else unfocus();
+  }
 
   // -- the selection bar: group, move, accept
 
@@ -1106,16 +1118,19 @@ window._ = window._ || {
   // `same_wo` is stored once per pair, so its direction means nothing
   function isUndirected(e) { return e.data('rel') === 'same_wo'; }
   function unfocus() {
-    cy.elements('.fdim, .f-nb, .f-me, .f-out, .f-in, .f-und')
-      .removeClass('fdim f-nb f-me f-out f-in f-und');
+    cy.elements('.fdim, .f-nb, .f-me, .f-out, .f-in, .f-und, .f-int')
+      .removeClass('fdim f-nb f-me f-out f-in f-und f-int');
   }
+  // `id` is one entry, or a collection (the selection): out/in are relative to the set,
+  // links between two members are internal
   function focus(id) {
-    var me = cy.getElementById(id); if (!me.length) return;
+    var me = typeof id === 'string' ? cy.getElementById(id) : id; if (!me.length) return;
     cy.batch(function () {
       unfocus();
       var edges = me.connectedEdges().filter(function (e) { return !e.hasClass('eh-ghost-edge'); });
       edges.forEach(function (e) {
-        e.addClass(isUndirected(e) ? 'f-und' : e.source().id() === id ? 'f-out' : 'f-in');
+        var s = me.contains(e.source()), t = me.contains(e.target());
+        e.addClass(isUndirected(e) ? 'f-und' : s && t ? 'f-int' : s ? 'f-out' : 'f-in');
       });
       var near = edges.connectedNodes().add(me);
       near.difference(me).addClass('f-nb');
