@@ -466,6 +466,9 @@
     </div>
   {% endif %}
   </div>
+  {% if project_archived %}
+    <div class="note-flash" role="status">This project is archived: its record is readable here, and the OS no longer runs anything in it.</div>
+  {% endif %}
   {% if request.query_params.get('error') %}
     <div class="error-flash">{{ request.query_params.get('error') }}</div>
   {% endif %}

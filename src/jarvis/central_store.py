@@ -14,6 +14,9 @@ from .paths import central_db_path, ensure_home
 #: How old a base-health reading may be before the merge pause stops acting on it (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2)
 BASE_HEALTH_FRESH_SECONDS = 900
 
+#: `projects.status` of an offboarded project whose history is kept (docs/superpowers/specs/2026-10-28-offboard-a-project.md §1.1)
+ARCHIVED = "archived"
+
 
 def base_health_key(project: str) -> str:
     """The `os_state` key holding one project's default-branch health"""

@@ -553,7 +553,7 @@ def test_a_turn_that_predates_the_context_ledger_reads_as_not_recorded(tmp_path,
         store.close()
 
     # and the read path says so in words rather than rendering an empty table
-    monkeypatch.setattr(ops, "registered_project_paths", lambda: {"legacy": proj})
+    monkeypatch.setattr(ops, "registered_project_paths", lambda **_: {"legacy": proj})
     out = ops.context_report("wo-old")
 
     assert out["recorded"] is False

@@ -2841,6 +2841,16 @@ def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
     assert [w["id"] for w in featured] == ["wo-2", "wo-1"]
 
 
+def test_a_validating_order_has_a_row_of_its_own():
+    """A pending row's "blocked by" can name it, so it must not hide in a collapsed count"""
+    from jarvis.ui.app import group_open
+
+    featured, rest = group_open([{"status": "pending", "id": "wo-1"},
+                                 {"status": "validating", "id": "wo-2"}], revealed="pending")
+    assert [w["id"] for w in featured] == ["wo-2"]
+    assert [w["id"] for w in rest] == ["wo-1"]
+
+
 # -- a budget at CREATION time
 
 
