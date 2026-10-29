@@ -1,80 +1,66 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}Stuck — Jarvis{% endblock %}
 {% block content %}
 
-{# `alarms.html`'s split, for its reason: the top is the queue that is an ask, the bottom
-   is the record and is MEANT to be long. Merged, the record buries the asks. §7 of
-   docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md. #}
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §5;
+   the sweep itself is §7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md #}
+{{ ui.page_head("Stuck", attention | length ~ " past its threshold · " ~ total ~ " on the record") }}
 
-<p class="kv" style="margin-top:18px">
+{% call(r) ui.needs_you(attention, "past its threshold") %}
+  {{ ui.row_id(r.id, order_path(r.project, r.id)) }}
+  <span class="mono tone-warn">{{ r.status_label }} · {{ fmt_dur(r.seconds_in_status) }}</span>
+  <span class="sub">{{ r.blocker }}</span>
+{% endcall %}
+
+{% call ui.explain("how an order is judged stuck") %}
+<p class="kv">
   Every open order judged on <em>time in state</em>, most overdue first. No model call
   decides any of this — the sweep is arithmetic over rows the OS already writes, and the
   spend it authorises is the investigation it opens. Seconds the account's usage window
   held do not count.
-  <span class="counts">({{ over|length }} past its threshold ·
-  {{ rest|length }} on the record)</span>
 </p>
+<p class="kv">
+  An order held by the account's usage window, a fleet pause, the reopen ramp, or a
+  validation round waiting for GitHub to finish the checks says so under <em>excluded</em>
+  — as does one of a kind this sweep never judges, a manager whose feature has not finished
+  with it, a worker whose turn is in flight, a merge the OS is holding itself because the
+  default branch is red or because GitHub has not finished the checks on the commit the
+  panel judged, and an order parked at its budget cap, which only you can raise: nothing is
+  wrong there and an investigation would buy a session to be told so.
+</p>
+<p class="sub">the gap classes behind these: <span class="mono">jarvis rules list</span> ·
+  one order in full: <span class="mono">jarvis stuck &lt;project&gt;</span></p>
+{% endcall %}
 
-<h2>Past its threshold</h2>
-<div class="panel">
-  {% for r in over %}
-  <div class="msg" id="stuck-{{ r.id }}">
-    <div class="who tone-warn">{{ r.project }} ·
-      <a href="/wo/{{ r.project }}/{{ r.id }}" class="mono">{{ r.id }}</a> ·
-      {{ r.status_label }} · {{ fmt_dur(r.seconds_in_status) }} in status</div>
-    <div style="margin:6px 0">{{ r.title }}</div>
-    <div class="sub">{{ r.reason }}</div>
-    <div class="sub">what the record says blocks it: {{ r.blocker }}</div>
-    {% if r.investigation %}
-    <div class="sub"><a href="{{ order_path(r.project, r.investigation.id) }}"
-      class="mono">{{ r.investigation.id }}</a> · {{ r.investigation.status }}
-      {%- if r.investigation.classification %} ·
-      {{ r.investigation.classification }}{% endif %}</div>
-    {% endif %}
-  </div>
-  {% else %}
-  <div class="empty">nothing is stuck — every open order is inside its threshold</div>
-  {% endfor %}
-</div>
+{{ ui.filter_bar("/stuck", filters, options, rows | length, total) }}
 
-<h2>On the record</h2>
-<div class="panel">
-  <p class="kv">
-    Every open order and the clock it is judged on. An order held by the account's usage
-    window, a fleet pause, the reopen ramp, or a validation round waiting for GitHub to
-    finish the checks says so under <em>excluded</em> — as does one of a kind this sweep
-    never judges, a manager whose feature has not finished with it, a worker whose turn is
-    in flight, a merge the OS is holding itself because the default branch is red or
-    because GitHub has not finished the checks on the commit the panel judged, and an
-    order parked at its budget cap, which only you can raise: nothing is wrong there and
-    an investigation would buy a session to be told so.
-  </p>
+{% if rows %}
+<div class="panel table-wrap">
   <table>
-    <tr><th>project / order</th><th>status</th><th>in status</th><th>since activity</th>
-      <th>threshold</th><th>clock</th><th>excluded</th><th>investigation</th></tr>
-    {% for r in rest %}
-    <tr>
-      <td class="mono" style="white-space:nowrap">{{ r.project }}<br>
-        <a href="/wo/{{ r.project }}/{{ r.id }}">{{ r.id }}</a></td>
-      <td class="mono">{{ r.status_label }}<div class="sub">{{ r.title }}</div></td>
-      <td class="mono">{{ fmt_dur(r.seconds_in_status) }}</td>
-      <td class="mono">{{ fmt_dur(r.seconds_since_activity) }}</td>
-      <td class="mono">{{ fmt_dur(r.threshold_seconds) }}</td>
+    <tr><th>order</th><th>project</th><th>status</th><th>title</th><th>in status</th>
+      <th>since activity</th><th>threshold</th><th>clock</th><th>excluded</th>
+      <th>investigation</th></tr>
+    {% for r in rows %}
+    <tr id="stuck-{{ r.id }}">
+      <td>{{ ui.row_id(r.id, order_path(r.project, r.id)) }}</td>
+      <td class="mono">{{ r.project }}</td>
+      <td class="mono {{ 'tone-warn' if r.stuck }}">{{ r.status_label }}</td>
+      <td class="prose"><span class="clamp" title="{{ r.title }}{% if r.stuck %} — {{ r.reason }}{% endif %}">{{ r.title }}</span></td>
+      <td class="num mono">{{ fmt_dur(r.seconds_in_status) }}</td>
+      <td class="num mono">{{ fmt_dur(r.seconds_since_activity) }}</td>
+      <td class="num mono">{{ fmt_dur(r.threshold_seconds) }}</td>
       <td class="mono">{{ r.clock }}</td>
       <td class="mono">{{ r.excluded or '—' }}</td>
-      <td class="mono">{% if r.investigation %}<a
-        href="{{ order_path(r.project, r.investigation.id) }}">{{ r.investigation.id }}</a>
-        {{ r.investigation.classification }}{% else %}—{% endif %}</td>
+      <td class="mono">{% if r.investigation %}{{ ui.row_id(r.investigation.id, order_path(r.project, r.investigation.id)) }}
+        {{ r.investigation.classification or r.investigation.status }}{% else %}—{% endif %}</td>
     </tr>
-    {% else %}
-    <tr><td colspan="8" class="empty">no project has `fleet_health` enabled</td></tr>
     {% endfor %}
   </table>
 </div>
-
-{# THE EVOLUTION VIEW IS LINKED, NOT BUILT: that page is fo-69ba1cc4's and did not land,
-   so this is TEXT and gains an href the day the route exists. No dead link. #}
-<p class="sub">the gap classes behind these:
-  <span class="mono">jarvis rules list</span> ·
-  one order in full: <span class="mono">jarvis stuck &lt;project&gt;</span></p>
+{% elif filters %}
+<p class="empty">nothing matches these filters</p>
+{% else %}
+<p class="empty">no project has `fleet_health` enabled</p>
+{% endif %}
 {% endblock %}

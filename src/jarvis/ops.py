@@ -6993,7 +6993,7 @@ def steward_queue_report(limit: int = 200) -> dict[str, Any]:
     finally:
         central.close()
     keys = ("id", "ts", "project", "origin_kind", "severity", "subject", "rule", "reason",
-            "wo_id", "queue_state", "queue_note", "queue_ts")
+            "wo_id", "parent_wo_id", "queue_state", "queue_note", "queue_ts")
     items = [{k: r[k] for k in keys} for r in rows]
     return {"asks": [{**{k: r[k] for k in keys}, "parent_wo_id": r["parent_wo_id"],
                       "morpheus_item": (steward._candidate_of(r).get("payload") or {}).get(
@@ -7002,6 +7002,19 @@ def steward_queue_report(limit: int = 200) -> dict[str, Any]:
             "line": steward.queue_line(counts),
             "waiting": [i for i in items if i["queue_state"] == "waiting"],
             "settled": [i for i in items if i["queue_state"] != "waiting"]}
+
+
+def steward_why(ref: str) -> list[dict[str, Any]]:
+    """`jarvis steward why` and `/steward/<ref>`: the decisions about one order, or one decision by number"""
+    number = ref.strip().lstrip("#")
+    central = CentralStore()
+    try:
+        if number.isdigit():
+            row = central.steward_decision(int(number))
+            return [row] if row else []
+        return central.steward_decisions(wo_id=ref.strip())
+    finally:
+        central.close()
 
 
 def steward_dispatchers() -> dict[str, Any]:

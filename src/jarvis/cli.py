@@ -2849,7 +2849,7 @@ def cmd_steward(args: argparse.Namespace) -> int:
             print(f"fleet      ${book.fleet_usd:8.2f} (new self-work waits above "
                   f"${cfg.yield_above_usd:.2f})")
             return 0
-        rows = (central.steward_decisions(wo_id=args.wo_id) if args.steward_cmd == "why"
+        rows = (ops.steward_why(args.wo_id) if args.steward_cmd == "why"
                 else central.steward_decisions(limit=args.limit))
         if args.json:
             print(json.dumps(rows))
