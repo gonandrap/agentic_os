@@ -532,6 +532,23 @@
    rather than once per round, which is the thing the per-round fragment could not be. #}
 {{ issues_ui.unit(issues) }}
 
+<h2 id="learnings">Learnings</h2>
+<div class="panel">
+  {% for k in learnings %}
+  <div class="row">
+    <div class="grow">
+      <a class="mono" href="/knowledge/{{ k.id }}">{{ k.id }}</a>
+      <span class="sub">· {{ k.topic or 'no topic' }} · {{ k.project or 'global' }}
+        {%- if k.retired_by_wo_id == wo.id %} · retired by this order: {{ k.retired_reason or '—' }}
+        {%- elif k.retired_at %} · retired{% endif %}</span>
+      <div>{{ k.content|truncate(300) }}</div>
+    </div>
+  </div>
+  {% else %}
+  <div class="row"><div class="grow sub">This order wrote no learnings.</div></div>
+  {% endfor %}
+</div>
+
 </div>
 </div>
 
