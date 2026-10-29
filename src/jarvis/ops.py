@@ -8813,22 +8813,31 @@ def quiesce_project(name: str, apply: bool = False,
                            "backlog_dropped": 0, "inbox_acked": 0, "reason": reason}
     if not apply:
         return out
-    # Work orders first: a feature's manager and children stopped before the feature cannot re-dispatch
-    for w in wos:
-        out["sessions_stopped"] += int(cancel(w["id"])["session_stopped"])
-        out["cancelled"].append(w["id"])
+    cancellers = {"improvement": cancel_improvement_order,
+                  "investigation": cancel_investigation_order}
     store = ProjectStore(paths[name])
     try:
+        # Work orders first: a feature's manager and children stopped before the feature cannot re-dispatch
         for w in wos:
+            try:
+                if store.get_work_order(w["id"])["status"] not in OPEN_STATUSES:
+                    continue  # settled since the listing
+            except KeyError:
+                continue
+            out["sessions_stopped"] += int(cancel(w["id"])["session_stopped"])
             store.add_event(w["id"], OFFBOARDED_EVENT, {"reason": reason})
+            out["cancelled"].append(w["id"])
+        for f in fos:
+            try:
+                cancellers.get(f["kind"], cancel_feature_order)(f["id"], name)
+            except OpsError:
+                # Only a feature that settled once its children were cancelled is skipped
+                if store.get_feature_order(f["id"])["status"] not in FO_TERMINAL_STATUSES:
+                    raise
+                continue
+            out["cancelled"].append(f["id"])
     finally:
         store.close()
-    for f in fos:
-        try:
-            cancel_feature_order(f["id"], name)
-        except OpsError:
-            continue  # settled itself once its children were cancelled
-        out["cancelled"].append(f["id"])
     central = CentralStore()
     try:
         for item in central.list_backlog(name, "open"):
