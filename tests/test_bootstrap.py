@@ -460,11 +460,12 @@ def test_unbootstrap_operation_md_committed_or_edited(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(tmp_path / "claude.json"))
     p = make_git_project(tmp_path, "committed")
     bootstrap_project(spec(p))
-    subprocess.run(["git", "-C", str(p), "add", "OPERATION.md"], check=True)
-    subprocess.run(["git", "-C", str(p), "commit", "-qm", "op"], check=True)
+    git = ["git", "-C", str(p), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", "OPERATION.md"], check=True)
+    subprocess.run([*git, "commit", "-qm", "op"], check=True)
     op = p / "OPERATION.md"
     op.write_text("committed, then edited\n")
-    subprocess.run(["git", "-C", str(p), "commit", "-qam", "edit"], check=True)
+    subprocess.run([*git, "commit", "-qam", "edit"], check=True)
 
     report = unbootstrap_project(spec(p), purge=False, dry_run=False)
     assert "removed OPERATION.md" in report.actions and not op.exists()
