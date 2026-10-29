@@ -1,128 +1,131 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}Knowledge — Jarvis{% endblock %}
 {% block content %}
 
-<h2>Knowledge base <span class="sub">({{ rows|length }} entries{% if topic or q %} matching{% if topic %} topic <b>{{ topic }}</b>{% endif %}{% if q %} “{{ q }}”{% endif %}{% endif %})</span></h2>
-<p class="sub">
-  Workers get this as an <strong>index</strong> and pull entries on demand
-  (<code>jarvis learn search</code> says which entries match — headline, id and one
-  matching line; <code>jarvis learn show &lt;id&gt;</code> is the only verb that returns a
-  body), so the base can grow without inflating every prompt. <strong>Pinned</strong> entries are the
-  exception — they are pasted verbatim into every worker prompt. Pin sparingly: safety
-  rails only.
-</p>
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6 #}
+{{ ui.page_head("Knowledge base", total ~ " entries · " ~ (topics | length) ~ " topics") }}
 
-<div class="panel" style="padding: 10px 16px; margin-bottom: 10px;">
-  <b>what it costs a prompt</b>
+{{ ui.filter_bar("/knowledge", filters, options, rows | length, total,
+                 labels={"q": "words in the entry", "project": "every scope"}) }}
+
+<div class="tabbed" id="kn-tabs">
+  <div class="tabs" role="tablist">
+    <button role="tab" data-panel="tab-entries" aria-selected="true" aria-controls="tab-entries">entries
+      <span class="n">{{ rows | length }}</span></button>
+    <button role="tab" data-panel="tab-cost" aria-selected="false" aria-controls="tab-cost">what it costs</button>
+    <button role="tab" data-panel="tab-reads" aria-selected="false" aria-controls="tab-reads">who reads it</button>
+    <button role="tab" data-panel="tab-topics" aria-selected="false" aria-controls="tab-topics">topics
+      <span class="n">{{ topics | length }}</span></button>
+  </div>
+
+<section class="tabpanel on" id="tab-entries" role="tabpanel">
+<h2>Entries</h2>
+<div class="panel table-wrap">
+  <table class="kn-list">
+    <tr><th>id</th><th>scope</th><th>topic</th><th>index line</th><th>reads</th><th>age</th><th></th></tr>
+    {% for k in rows %}
+    <tr id="{{ k.id }}">
+      <td>{{ ui.row_id(k.id, "/knowledge/" ~ k.id) }}</td>
+      <td class="mono">{{ k.scope }}</td>
+      <td class="mono"><a href="/knowledge?topic={{ (k.topic or '(none)')|urlencode }}">{{ k.topic or '–' }}</a></td>
+      <td class="prose"><div class="clamp" title="{{ k.headline }}">{% if k.pinned %}📌 {% endif %}{{ k.headline }}</div></td>
+      <td class="num mono {{ 'sub' if not k.reads }}">{{ k.reads or '–' }}</td>
+      <td class="when mono sub">{{ fmt_age(k.ts) }}</td>
+      <td>
+        <form method="post" action="/knowledge/pin">
+          <input type="hidden" name="kn_id" value="{{ k.id }}">
+          <input type="hidden" name="pinned" value="{{ '0' if k.pinned else '1' }}">
+          <input type="hidden" name="next" value="{{ request.url.path }}{{ '?' ~ request.url.query if request.url.query }}">
+          <button title="{{ 'stop injecting this into every worker prompt' if k.pinned else 'inject this into every worker prompt verbatim' }}">{{ 'unpin' if k.pinned else 'pin' }}</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="empty">{{ 'nothing matches these filters' if filters else 'nothing learned yet — workers report with jarvis learn add' }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% call ui.explain("how workers read this") %}
+<p class="kv">
+  Workers get this as an <strong>index</strong> and pull entries on demand
+  (<code>jarvis learn search</code> says which entries match; <code>jarvis learn show &lt;id&gt;</code>
+  is the only verb that returns a body), so the base can grow without inflating every
+  prompt. <strong>Pinned</strong> entries are the exception — pasted verbatim into every
+  worker prompt. Pin sparingly: safety rails only.
+</p>
+{% endcall %}
+</section>
+
+<section class="tabpanel" id="tab-cost" role="tabpanel">
+<h2>What it costs a prompt</h2>
+<div class="panel table-wrap">
   <table>
     <tr><th>project</th><th>index</th><th>share of a dispatch prompt</th>
         <th>indexed</th><th>overflow</th><th>never sent</th></tr>
     {% for c in usage.prompt_cost %}
     <tr>
       <td class="mono">{{ c.project }}</td>
-      <td class="mono">{{ c.index_chars }} chars</td>
-      <td class="mono">{{ '%.0f' % (c.share_of_prompt * 100) }}%</td>
-      <td class="mono">{{ c.indexed }}{% if c.pinned %} + {{ c.pinned }} pinned{% endif %}</td>
-      <td class="mono">{{ c.overflow }}</td>
-      <td class="mono sub">{{ c.body_chars // 1000 }}k chars</td>
+      <td class="num mono">{{ c.index_chars }} chars</td>
+      <td class="num mono">{{ '%.0f' % (c.share_of_prompt * 100) }}%</td>
+      <td class="num mono">{{ c.indexed }}{% if c.pinned %} + {{ c.pinned }} pinned{% endif %}</td>
+      <td class="num mono">{{ c.overflow }}</td>
+      <td class="num mono sub">{{ c.body_chars // 1000 }}k chars</td>
     </tr>
     {% endfor %}
   </table>
-  <p class="sub">
-    <strong>Overflow</strong> is the entries that did not fit the index and reach a worker
-    only as a topic name and a count. {{ usage.size.truncated_headlines }} of
-    {{ usage.entries }} entries reach the index as a first line cut mid-sentence — the
-    index line is the only thing that decides whether an entry is ever opened, so a
-    shorter opening sentence buys both precision and more entries indexed.
-  </p>
 </div>
+<p class="kv">
+  <strong>Overflow</strong> is the entries that did not fit the index and reach a worker
+  only as a topic name and a count. {{ usage.size.truncated_headlines }} of
+  {{ usage.entries }} entries reach the index as a first line cut mid-sentence (…) — the
+  index line is the only thing that decides whether an entry is ever opened.
+</p>
+</section>
 
-<div class="panel" style="padding: 10px 16px; margin-bottom: 10px;">
-  <b>who reads it</b>
-  <span class="sub">
-    {{ usage.reads.reads }} reads ({{ usage.reads.by_workers }} by workers across
-    {{ usage.reads.orders }} orders) ·
-    {{ usage.reads.chars // 1000 }}k chars fetched ·
-    {{ usage.reads.misses }} came back empty ·
-    {{ usage.never_read_count }} entries never opened ·
-    {% if usage.observed_from %}{{ usage.silent_order_count }} orders completed without
-    one read{% else %}no reads recorded yet — the log starts at the first
-    <code>jarvis learn</code> a worker runs, and work before it was never observed{% endif %}
-  </span>
-  {% if usage.could_have_read %}
-  <details class="disclosure" style="margin-top:6px">
-    <summary class="sub">{{ usage.could_have_read_count }} of those orders had an entry
-      matching their own title, recorded before they started — a hint, not a verdict</summary>
-    <table>
-      {% for m in usage.could_have_read %}
-      <tr>
-        <td class="mono"><a href="/go/{{ m.wo_id }}">{{ m.wo_id }}</a></td>
-        <td>{{ m.title }}</td>
-        <td class="mono sub">{% for e in m.entries %}{{ e.id }} {% endfor %}</td>
-      </tr>
-      {% endfor %}
-    </table>
-  </details>
-  {% endif %}
-  {% if usage.reads.unanswered %}
-  <details class="disclosure" style="margin-top:6px">
-    <summary class="sub">asked and unanswered — what agents looked for and did not find</summary>
-    <table>
-      {% for u in usage.reads.unanswered %}
-      <tr><td class="mono sub">{{ u.wo_id or 'you' }}</td>
-          <td class="mono">{{ u.verb }}</td><td>{{ u.term }}</td></tr>
-      {% endfor %}
-    </table>
-  </details>
-  {% endif %}
-</div>
-
-<form class="panel search-form" method="get" action="/knowledge">
-  <input type="text" name="topic" value="{{ topic }}" list="kn-topics"
-         placeholder="topic — type to find one" aria-label="topic">
-  <datalist id="kn-topics">
-    {% for t, n in topics %}<option value="{{ t or '(none)' }}">{{ n }} entries</option>{% endfor %}
-  </datalist>
-  <input type="text" name="q" value="{{ q }}" placeholder="words in the entry" aria-label="words">
-  <button>filter</button>
-  {% if topic or q %}<a href="/knowledge">clear</a>{% endif %}
-</form>
-
-{% if topics %}
-<details class="panel disclosure" {{ 'open' if not topic }}>
-  <summary><b>topics</b> <span class="sub">({{ topics|length }}, biggest first — click one to filter)</span></summary>
-  <div class="sub" style="padding: 6px 16px 10px; line-height: 1.8">{% for t, n in topics %}{% set name = t or '(none)' %}<a href="/knowledge?topic={{ name|urlencode }}"{% if name == topic %} class="here"{% endif %}>{{ name }}</a> ({{ n }}){% if not loop.last %} · {% endif %}{% endfor %}</div>
-</details>
-{% endif %}
-
-<div class="panel">
+<section class="tabpanel" id="tab-reads" role="tabpanel">
+<h2>Who reads it</h2>
+<p class="kv">
+  {{ usage.reads.reads }} reads ({{ usage.reads.by_workers }} by workers across
+  {{ usage.reads.orders }} orders) ·
+  {{ usage.reads.chars // 1000 }}k chars fetched ·
+  {{ usage.reads.misses }} came back empty ·
+  {{ usage.never_read_count }} entries never opened ·
+  {% if usage.observed_from %}{{ usage.silent_order_count }} orders completed without
+  one read{% else %}no reads recorded yet — the log starts at the first
+  <code>jarvis learn</code> a worker runs{% endif %}
+</p>
+{% if usage.could_have_read %}
+<h3>{{ usage.could_have_read_count }} orders had an entry matching their own title — a hint, not a verdict</h3>
+<div class="panel table-wrap">
   <table>
-    <tr><th>scope</th><th>topic</th><th>index line</th><th>reads</th><th>age</th><th></th></tr>
-    {% for k in rows %}
-    <tr id="{{ k.id }}">
-      <td class="mono">{{ k.project or 'global' }}</td>
-      <td class="mono"><a href="/knowledge?topic={{ (k.topic or '(none)')|urlencode }}">{{ k.topic or '–' }}</a></td>
-      <td>
-        <details class="disclosure">
-          <summary>{% if k.pinned %}📌 {% endif %}{{ k.headline }}</summary>
-          <div style="white-space: pre-wrap">{{ k.content }}</div>
-        </details>
-        <div class="sub mono">{{ k.id }} · {{ k.content|length }} chars</div>
-      </td>
-      <td class="mono {{ 'sub' if not k.reads }}">{{ k.reads or '–' }}</td>
-      <td class="mono sub">{{ fmt_age(k.ts) }}</td>
-      <td>
-        <form method="post" action="/knowledge/pin">
-          <input type="hidden" name="kn_id" value="{{ k.id }}">
-          <input type="hidden" name="pinned" value="{{ '0' if k.pinned else '1' }}">
-          <button title="{{ 'stop injecting this into every worker prompt' if k.pinned else 'inject this into every worker prompt verbatim' }}">{{ 'unpin' if k.pinned else 'pin' }}</button>
-        </form>
-      </td>
+    {% for m in usage.could_have_read %}
+    <tr>
+      <td>{{ ui.row_id(m.wo_id, "/go/" ~ m.wo_id) }}</td>
+      <td>{{ m.title }}</td>
+      <td class="mono sub">{% for e in m.entries %}{{ ui.row_id(e.id, "/knowledge/" ~ e.id) }} {% endfor %}</td>
     </tr>
-    {% else %}
-    <tr><td colspan="6" class="empty">nothing learned yet — workers report with <code>jarvis learn add</code></td></tr>
     {% endfor %}
   </table>
+</div>
+{% endif %}
+{% if usage.reads.unanswered %}
+<h3>Asked and unanswered — what agents looked for and did not find</h3>
+<div class="panel table-wrap">
+  <table>
+    {% for u in usage.reads.unanswered %}
+    <tr><td class="mono sub">{{ u.wo_id or 'you' }}</td>
+        <td class="mono">{{ u.verb }}</td><td>{{ u.term }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+</section>
+
+<section class="tabpanel" id="tab-topics" role="tabpanel">
+<h2>Topics</h2>
+<p class="kv" style="line-height: 1.8">{% for t, n in topics %}{% set name = t or '(none)' %}<a href="/knowledge?topic={{ name|urlencode }}"{% if name == filters.get('topic') %} class="here"{% endif %}>{{ name }}</a> ({{ n }}){% if not loop.last %} · {% endif %}{% endfor %}</p>
+</section>
 </div>
 
 {% endblock %}

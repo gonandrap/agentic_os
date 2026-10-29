@@ -3994,8 +3994,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     return status
 
 
-#: The `pr_url_recorded` sources that route the merge queue; `gate` and `plan_submit` stay inert
-DECLARING_SOURCES = ("user", "auto")
+#: The `pr_url_recorded` sources that route the merge queue; `gate` stays inert (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §1)
+DECLARING_SOURCES = ("user", "auto", "plan_submit")
 
 
 def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
@@ -6622,7 +6622,7 @@ def resolve_ref(ref: str) -> str:
     if numbered:
         kind, n = numbered.groups()
         if kind == "gate-":
-            return f"/gates#gate-{n}"
+            return f"/gates/{n}"
         if kind in ("issue-", "#"):
             return "/search?q=" + quote(f"#{n}")
         # a bare number is the one id a reader is shown without a prefix: a Neo question's
@@ -6643,8 +6643,9 @@ def resolve_ref(ref: str) -> str:
             return f"/alarms/{name}/{rid}"
     except OpsError:
         return search
-    # Listed on one fleet-wide page each, and addressed there by their own id
-    return {"kn": "/knowledge", "mv": "/morpheus", "bl": "/backlog"}[prefix] + f"#{rid}"
+    if prefix == "mv":
+        return f"/morpheus/{rid}"
+    return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"/{rid}"
 
 
 def worker_prompts(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -8290,7 +8291,8 @@ def submit_verdict(inv_id: str, doc: Any,
 
 
 def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
-                      payload: dict[str, Any]) -> dict[str, Any] | None:
+                      payload: dict[str, Any],
+                      pr_url: str | None = None) -> dict[str, Any] | None:
     """Settle the work order whose submission was just stored, BY ITS KIND'S ROUTE"""
     store = ProjectStore(path)
     try:
@@ -8306,7 +8308,7 @@ def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
     finally:
         store.close()
     if route == SETTLE_BY_FINISH:
-        return finish(wo_id, summary)
+        return finish(wo_id, summary, pr_url=pr_url)
     raise OpsError(f"{wo_id} is a {wo.get('kind') or 'worker'}, whose kind settles by "
                    f"{route!r} and never by a submission")
 
@@ -8486,6 +8488,47 @@ def _record_spec_pull_request(path: Path, fo_id: str,
         store.close()
 
 
+def _spec_pull_request(path: Path, planner_id: str) -> str | None:
+    """The planner's `pr_url` when `plan_submit` recorded it; a gate-recorded URL stays inert (#742)"""
+    store = ProjectStore(path)
+    try:
+        pr_url = str(store.get_work_order(planner_id).get("pr_url") or "")
+        recorded = {str(db.from_json(e["payload"], {}).get("pr_url") or "")
+                    for e in store.events_of_kind(planner_id, "pr_url_recorded")
+                    if db.from_json(e["payload"], {}).get("source") == "plan_submit"}
+    finally:
+        store.close()
+    return pr_url if pr_url and pr_url in recorded else None
+
+
+#: A completed planner put back behind its unmerged spec pull request
+SPEC_PR_REPARKED_EVENT = "spec_pr_reparked"
+
+
+def repark_spec_pull_request(wo_id: str) -> str:
+    """A COMPLETED planner whose spec PR never merged goes back behind it, as `finish` parks it (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §4)"""
+    name, path, _wo = find_work_order(wo_id)
+    cfg = validation_config(name)
+    store = ProjectStore(path)
+    try:
+        wo = store.get_work_order(wo_id)
+        pr_url = str(wo.get("pr_url") or "")
+        if wo["status"] != "completed" or not pr_url:
+            return str(wo["status"])
+        store.add_event(wo_id, SPEC_PR_REPARKED_EVENT, {"pr_url": pr_url})
+        submits = validation_applies(cfg, wo, store)
+        opened = (submit_for_validation(store, path, wo,
+                                        declared=declared_evidence(store, wo_id), cfg=cfg)
+                  if submits else None)
+        if str((opened or {}).get("outcome") or "") == "escalated":
+            return str(store.get_work_order(wo_id)["status"])
+        return land_when_cleared(store, store.get_work_order(wo_id), pr_url,
+                                 panel_open=submits and opened is None,
+                                 panel_cleared=not submits)
+    finally:
+        store.close()
+
+
 def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
                      planner_id: str, source: str, why: str) -> dict[str, Any]:
     """Ask for a review of this plan, closing whichever review it replaces"""
@@ -8578,10 +8621,13 @@ def submit_plan(fo_id: str, doc: Any,
     if fo.get("plan_wo_id"):
         # The planner has no more to say until the review lands
         summary = f"submitted a plan for {fo_id}: {len(plan['children'])} work orders"
+        # The spec PR is DELIVERED, so it parks and the OS merges it (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §1)
+        spec_pr = _spec_pull_request(path, fo["plan_wo_id"])
         try:
             out["planner"] = _settle_submitter(path, fo["plan_wo_id"], summary,
                                                "plan_submitted_settled",
-                                               {"feature_order": fo_id})
+                                               {"feature_order": fo_id},
+                                               pr_url=spec_pr)
         except OpsError as e:
             # docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md
             out["warning"] = _planner_unsettled(path, fo_id, fo["plan_wo_id"],
@@ -10782,7 +10828,15 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
     """One approval request in full, including the text the reviewer saw"""
     from .neo_store import NeoStore
 
-    name, _path, approval = _find_approval(approval_id, project_name)
+    from . import gates
+
+    name, path, approval = _find_approval(approval_id, project_name)
+    store = ProjectStore(path)
+    try:  # sweep as list_gates does, so the record and the list agree
+        store.expire_approvals()
+        approval = store.get_approval(approval_id) or approval
+    finally:
+        store.close()
     question = None
     if approval["neo_question_id"]:
         neo = NeoStore()
@@ -10790,7 +10844,11 @@ def show_gate(approval_id: int, project_name: str | None = None) -> dict[str, An
             question = neo.get(approval["neo_question_id"])
         finally:
             neo.close()
-    return {**approval, "project": name, "neo_question": question}
+    out = {**approval, "project": name, "neo_question": question}
+    if approval["status"] == gates.AWAITING_CASE:  # its next event is a clock, as in list_gates
+        ttl = _case_ttl_seconds().get(name, gates.DEFAULT_CASE_TTL_SECONDS)
+        out["case_ttl_seconds"], out["case_deadline"] = ttl, approval["ts"] + ttl
+    return out
 
 
 # -- the config console
@@ -11268,6 +11326,132 @@ def onboard_apply(draft_path: str, *, catalog_path: str | None = None,
             **{**payload, "changed": row["id"] != was}}
 
 
+def offboard_project(name: str, *, purge: bool = False, force: bool = False,
+                     dry_run: bool = False, catalog_path: str | None = None,
+                     reason: str = "") -> dict[str, Any]:
+    """Take a project out of the OS; step order is a safety constraint (docs/superpowers/specs/2026-10-28-offboard-a-project.md §7)"""
+    from . import bootstrap, schedule
+    from .neo_store import NeoStore
+
+    if os.environ.get("JARVIS_WO_ID"):
+        raise OpsError(
+            f"{os.environ['JARVIS_WO_ID']} is a worker session — a worker may not "
+            "`jarvis offboard`. The fleet's project list is the user's. Ask on the work "
+            "order record (`jarvis wo ask`).")
+    paths = registered_project_paths(include_archived=True)
+    if name not in paths:
+        raise OpsError(f"project {name!r} not registered (known: {sorted(paths)})")
+    central = CentralStore()
+    try:
+        status = central.get_project(name)["status"]
+    finally:
+        central.close()
+    # The OS-owning project carries Morpheus, the steward and the OS health sweep
+    try:
+        owner = schedule.os_project(paths.items())
+    except Exception as e:  # fail closed: an undecided owner may be this project
+        raise OpsError(
+            f"cannot tell whether {name} runs the OS itself ({type(e).__name__}: {e}), "
+            f"so it is not offboarded. Fix that, then run it again.") from e
+    if owner == name:
+        raise OpsError(
+            f"{name} runs the OS itself — Morpheus's release queue, the steward and the "
+            f"OS health sweep all hang off it, so it cannot be offboarded. No flag "
+            f"overrides this.")
+
+    # The plan: a pure read, and the whole return value under --dry-run
+    file = _catalog_file(catalog_path)
+    document = _read_document(file)
+    in_catalog = name in _project_names(document)
+    changes: list[dict[str, Any]] = []
+    spec = ProjectSpec(name=name, path=paths[name])
+    if in_catalog:
+        try:
+            before = _resolved_of(document, file)
+            spec = next(p for p in parse_catalog(json.loads(json.dumps(document)),
+                                                 source_path=file).projects
+                        if p.name == name)
+        except (OpsError, CatalogError):
+            before = {}  # an already-invalid catalog is exactly what this may be fixing
+        document["projects"] = [p for p in document["projects"]
+                                if not (isinstance(p, dict) and p.get("name") == name)]
+        changes = config_version.diff(before, _resolved_of(document, file))
+        _require_reason(changes, reason,
+                        f"jarvis offboard {name}{' --purge --yes' if purge else ''}"
+                        f'{" --force" if force else ""} --reason "…"')
+    # Opening a ProjectStore recreates a moved project's directory, so a missing one is not read
+    live = status != ARCHIVED and paths[name].is_dir()
+    open_ = quiesce_project(name)["open"] if live else []
+    try:
+        strip = bootstrap.unbootstrap_project(spec, purge=purge, dry_run=True)
+    except OSError as e:
+        strip = BootstrapReport(project=name)
+        strip.warn(f"strip dry run failed: {e}")
+    plan: dict[str, Any] = {
+        "project": name, "mode": "purge" if purge else "archive", "dry_run": dry_run,
+        "status": status, "open": open_, "cancelled": [], "sessions_stopped": 0,
+        "backlog_dropped": 0, "inbox_acked": 0,
+        "strip": {"actions": strip.actions, "warnings": strip.warnings},
+        "registry": "would delete the projects row and every row scoped to it in os.db "
+                    "and neo.db" if purge else f"would set status {ARCHIVED!r}",
+        "purged": {},
+        "catalog": {"path": str(file), "in_catalog": in_catalog,
+                    "removed": len(changes), "version": None},
+        "inbox_id": None,
+    }
+    if open_ and not force:
+        listed = ", ".join(f"{o['id']} ({o['status']})" for o in open_)
+        raise OpsError(
+            f"{name} has {len(open_)} open order(s): {listed}. Offboarding cancels them "
+            f"— re-run with --force to do that, or settle them first.")
+    if dry_run:
+        return plan
+
+    if live:
+        q = quiesce_project(name, apply=True, reason=reason or "project offboarded")
+        plan.update({k: q[k] for k in ("cancelled", "sessions_stopped",
+                                       "backlog_dropped", "inbox_acked")})
+    # Strip only after quiescing: a live worker's gate runs through .claude/settings.json
+    try:
+        strip = bootstrap.unbootstrap_project(spec, purge=purge, dry_run=False)
+        plan["strip"] = {"actions": strip.actions, "warnings": strip.warnings}
+    except OSError as e:
+        # A stale repo is inert and a second offboard fixes it; registry and catalog still move
+        plan["strip"] = {"actions": [], "warnings": [f"strip failed: {e}"]}
+    # Registry, then catalog: these two move together
+    central = CentralStore()
+    try:
+        if purge:
+            plan["purged"]["os"] = central.purge_project(name)
+            neo = NeoStore()
+            try:
+                plan["purged"]["neo"] = neo.purge_project(name)
+            finally:
+                neo.close()
+            central.delete_project(name)
+            plan["registry"] = "deleted"
+        else:
+            central.set_project_status(name, ARCHIVED)
+            plan["registry"] = ARCHIVED
+    finally:
+        central.close()
+    if in_catalog:
+        row = _commit_document(document, path=file, actor="user",
+                               reason=reason or f"offboard {name}", changes=changes)
+        plan["catalog"]["version"] = row["id"]
+    central = CentralStore()
+    try:
+        plan["inbox_id"] = central.add_inbox(
+            "os", f"{name} offboarded ({plan['mode']})",
+            f"{len(plan['cancelled'])} order(s) cancelled, "
+            f"{len(plan['strip']['actions'])} repo action(s), "
+            f"{len(plan['strip']['warnings'])} warning(s); "
+            f"catalog {'rewritten' if in_catalog else 'had no entry'}. {reason}".strip())
+    finally:
+        central.close()
+    return plan
+
+
 def config_get(path: str, project: str | None = None,
                catalog_path: str | None = None) -> dict[str, Any]:
     """One setting as the fleet would read it, and whether the file says so"""
@@ -11720,6 +11904,37 @@ def defer(wo_id: str, title: str, why: str, description: str = "",
 
 
 # -- backlog
+
+def list_backlog(project: str | None = None, status: str | None = "open"
+                 ) -> list[dict[str, Any]]:
+    """Backlog items, oldest first, each open one with its blockers"""
+    central = CentralStore()
+    try:
+        items = central.list_backlog(project=project, status=status)
+        for it in items:
+            it["blockers"] = (central.unfinished_dependencies(it["id"])
+                              if it["status"] == "open" else [])
+    finally:
+        central.close()
+    return items
+
+
+def show_backlog(item_id: str) -> dict[str, Any]:
+    """One backlog item with its dependencies and blockers"""
+    central = CentralStore()
+    try:
+        item = central.get_backlog(item_id)
+        if not item:
+            raise OpsError(f"backlog item {item_id!r} not found")
+        item["dependencies"] = [
+            central.get_backlog(d) or {"id": d, "status": "missing", "title": "?"}
+            for d in item["depends_on"]]
+        item["blockers"] = [d for d in item["dependencies"] if d["status"] != "done"] \
+            if item["status"] == "open" else []
+    finally:
+        central.close()
+    return item
+
 
 def promote_backlog(item_id: str, force: bool = False,
                     as_feature: bool = False,
@@ -13415,6 +13630,70 @@ def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]
     return effects
 
 
+def list_knowledge(q: str = "", topic: str | None = None, limit: int = 5000
+                   ) -> dict[str, Any]:
+    """Entries matching words/topic, each with its headline and read count"""
+    from .central_store import PINNED_TAG, has_tag, headline
+
+    central = CentralStore()
+    try:
+        rows = central.search_knowledge(q.strip(), limit=limit, topic=topic)
+        topics = central.knowledge_topics()
+        hits = central.knowledge_hit_counts()
+    finally:
+        central.close()
+    if not q.strip():  # a word search keeps its rank order
+        rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
+    for r in rows:
+        r["pinned"] = has_tag(r["tags"], PINNED_TAG)
+        r["headline"] = headline(r["content"])
+        r["reads"] = hits.get(r["id"], 0)
+    return {"rows": rows, "topics": topics}
+
+
+def show_knowledge(ids: Sequence[str], project: str | None = None,
+                   wo_id: str | None = None, record: bool = True) -> list[dict[str, Any]]:
+    """Entries in full — `jarvis learn show`; `record` logs the read an agent made"""
+    central = CentralStore()
+    try:
+        rows = [r for r in (central.get_knowledge(i) for i in ids) if r]
+        if record:
+            central.record_knowledge_read("show", rows, term=" ".join(ids),
+                                          project=project, wo_id=wo_id)
+    finally:
+        central.close()
+    missing = set(ids) - {r["id"] for r in rows}
+    if missing:
+        raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
+    return rows
+
+
+def knowledge_detail(kn_id: str) -> dict[str, Any]:
+    """One entry for the dashboard, not logged as a read"""
+    from .central_store import PINNED_TAG, has_tag, headline
+
+    [row] = show_knowledge([kn_id], record=False)
+    central = CentralStore()
+    try:
+        reads = central.knowledge_hit_counts().get(kn_id, 0)
+    finally:
+        central.close()
+    return {**row, "pinned": has_tag(row["tags"], PINNED_TAG),
+            "headline": headline(row["content"]), "reads": reads}
+
+
+def pin_knowledge(kn_id: str, pinned: bool = True) -> dict[str, Any]:
+    """Pin or unpin an entry: pinned ones ride verbatim in every worker prompt"""
+    central = CentralStore()
+    try:
+        row = central.pin_knowledge(kn_id, pinned=pinned)
+    finally:
+        central.close()
+    if row is None:
+        raise OpsError(f"unknown knowledge id {kn_id!r}")
+    return row
+
+
 def knowledge_usage_report(project: str | None = None, days: int | None = None,
                            limit: int = 20) -> dict[str, Any]:
     """What memory costs and whether anyone uses it"""
@@ -13649,7 +13928,8 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     scope = {project: paths[project]} if project else paths
 
     questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
-                 "superseded": 0, "escalation_rate": None, "unreachable_rate": None}
+                 "superseded": 0, "refined": 0, "escalation_rate": None,
+                 "unreachable_rate": None}
     by_kind: dict[str, dict[str, Any]] = {}
     by_project: dict[str, dict[str, Any]] = {}
     by_day: dict[str, dict[str, Any]] = {}
@@ -13678,6 +13958,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         elif row["status"] == "answered" and row["answered_by"] == "os":
             # `NeoStore.supersede`: decided somewhere else, so neither Neo answering nor Neo handing back
             questions["superseded"] += n
+        elif row["status"] == "refined":
+            # Bounced to the asker to split: not an escalation (wo-ea3c6f0c)
+            questions["refined"] += n
         elif row["status"] in ("escalated", "failed"):
             for bucket in buckets:
                 bucket[row["status"]] += n
@@ -14342,6 +14625,41 @@ def morpheus_item(item_id: str) -> dict[str, Any]:
     return item
 
 
+def morpheus_detail(item_id: str) -> dict[str, Any]:
+    """One item with its run history, Neo questions, retries and handoff (spec 2026-10-29 §3)"""
+    from . import morpheus
+    from .central_store import headline
+    from .neo_store import NeoStore
+
+    item = morpheus_item(item_id)
+    central = CentralStore()
+    try:
+        runs = central.morpheus_runs(item_id)
+    finally:
+        central.close()
+    neo = NeoStore()
+    try:
+        # No context filter in the store; questions about one item are few, the scan is cheap
+        asked = [q for q in neo.list_questions(limit=100_000)
+                 if morpheus.item_of_question(q) == item_id]
+    finally:
+        neo.close()
+    kind, _, rest = str(item.get("action") or "").partition(":")
+    return {
+        "item": item,
+        "runs": runs,
+        "questions": [{"id": q["id"], "status": q["status"], "kind": q["kind"],
+                       "question": headline(q["question"] or ""),
+                       "answer": headline(q["answer"] or ""), "ts": q["ts"]} for q in asked],
+        "next_check_ts": item.get("next_check_ts"),
+        "retries": {"checks": int(item.get("checks") or 0),
+                    "auto_requeues": int(item.get("auto_requeues") or 0),
+                    "max_auto_requeues": morpheus.MAX_AUTO_REQUEUES},
+        "handoff": {"kind": kind, "ref": "" if kind == "none" else rest,
+                    "why": rest if kind == "none" else ""},
+    }
+
+
 def morpheus_enqueue_release(tag: str, from_ref: str | None = None,
                              to_ref: str | None = None,
                              repo: str | None = None,
@@ -14422,6 +14740,8 @@ def morpheus_check(item_id: str) -> dict[str, Any]:
             return central.morpheus_item(item_id) or {}
         # A settled item is only probed: its state is the record and stays put
         result = morpheus.run_script(item["script"], cwd, cfg.script_timeout_seconds)
+        central.add_morpheus_run(item_id, exit=result.exit, output=result.output,
+                                 kind="probe", state_after=item["state"])
         return {**item, "probe_exit": result.exit, "probe_output": result.output}
     finally:
         central.close()

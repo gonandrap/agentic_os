@@ -814,7 +814,9 @@ def test_parse_verdict_tolerates_fences():
                  # And a reply that rates no finding rates none
                  "severity": "",
                  # And a reply that asks for nothing asks for nothing (issue #1254)
-                 "action": ""}
+                 "action": "",
+                 # And a reply that returns nothing to its asker returns nothing
+                 "refine": False}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True
 
