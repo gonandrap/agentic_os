@@ -112,3 +112,8 @@ On a PRIVILEGED ACTION REQUEST, add the verdict you propose:
 When the user must decide:
 
   {"escalate": true, "answer": "", "reason": "<one line why the user must decide>", "route": "panel"}
+
+When a worker's question or assumption bundles independent claims, or is too big to rule
+on, return it to the worker instead of answering or escalating:
+
+  {"escalate": false, "refine": true, "answer": "", "reason": "<one line: what to split or narrow>", "route": "fast"}

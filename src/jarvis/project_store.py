@@ -685,7 +685,7 @@ CREATE TABLE IF NOT EXISTS assumptions (
     wo_id TEXT NOT NULL REFERENCES work_orders(id),
     ts REAL NOT NULL,
     content TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected
+    status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected | refined
     -- WHO settled it, why, under which model and configuration, and the Neo question
     -- that ruled. All in ADDED_COLUMNS, where the reasoning is — this table already
     -- ships, so a live database gets them only there. So are the PROVISIONAL verdict
@@ -3492,7 +3492,8 @@ class ProjectStore:
                           decided_by: str = "", reason: str = "", model: str = "",
                           config_version: str | None = None) -> None:
         """Settle one assumption, recording WHO settled it and on what basis"""
-        assert status in ("accepted", "rejected"), status
+        # `refined`: Neo returned it to the worker to split, per Q2402 (wo-ea3c6f0c)
+        assert status in ("accepted", "rejected", "refined"), status
         self.conn.execute(
             """UPDATE assumptions SET status=?, decided_by=?, decided_reason=?,
                    decided_model=?, decided_config_version=? WHERE id=?""",

@@ -13820,7 +13820,8 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     scope = {project: paths[project]} if project else paths
 
     questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
-                 "superseded": 0, "escalation_rate": None, "unreachable_rate": None}
+                 "superseded": 0, "refined": 0, "escalation_rate": None,
+                 "unreachable_rate": None}
     by_kind: dict[str, dict[str, Any]] = {}
     by_project: dict[str, dict[str, Any]] = {}
     by_day: dict[str, dict[str, Any]] = {}
@@ -13849,6 +13850,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         elif row["status"] == "answered" and row["answered_by"] == "os":
             # `NeoStore.supersede`: decided somewhere else, so neither Neo answering nor Neo handing back
             questions["superseded"] += n
+        elif row["status"] == "refined":
+            # Bounced to the asker to split: not an escalation (wo-ea3c6f0c)
+            questions["refined"] += n
         elif row["status"] in ("escalated", "failed"):
             for bucket in buckets:
                 bucket[row["status"]] += n

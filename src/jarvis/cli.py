@@ -5186,6 +5186,7 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     print(f"  unreachable       {q['failed']}  (Neo was never reached — NOT judged)")
     print(f"  still open        {q['open']}")
     print(f"  superseded        {q['superseded']}  (decided elsewhere, out of the rate)")
+    print(f"  refined           {q['refined']}  (returned to the asker to split, out of the rate)")
     print(f"  escalation rate   {_pct(q['escalation_rate'])}  "
           f"(over settled questions only)")
     # Its own figure, never blended into the escalation rate: a crash is not a decision

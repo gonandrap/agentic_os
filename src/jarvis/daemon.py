@@ -3205,6 +3205,16 @@ class Daemon:
                 elif q.get("kind") == "assumption":
                     # Above it for the alarm's reason
                     self._deliver_assumption_verdict(central, store, pstore, q, verdict)
+                elif verdict.get("refine"):
+                    if pstore:
+                        # Delivered like an answer, so the wait the question started ends
+                        pstore.queue_message(
+                            q["wo_id"], f"{neo_mod.REFINE_PREFIX} {verdict['reason']}",
+                            source="neo")
+                        pstore.add_event(q["wo_id"], "neo_refined",
+                                         {"neo_question_id": q["id"],
+                                          "reason": verdict["reason"]})
+                        invariants.end_wait_if_nothing_is_out(pstore, q["wo_id"])
                 elif verdict["escalate"]:
                     # A headline, never the verbatim question: this row's job is to get the user's attention (#67)
                     head = q["question"].strip().splitlines()[0][:200]
@@ -6029,6 +6039,15 @@ class Daemon:
         # `n` is a position in the work order's list and is derived
         numbered = next((a for a in pstore.all_assumptions(wo["id"])
                          if a["id"] == assumption["id"]), assumption)
+        if verdict.get("refine"):
+            if self._asked_early(pstore, wo["id"], int(q["id"])):
+                autoreview.return_to_worker(pstore, wo["id"], numbered,
+                                            verdict["reason"], int(q["id"]))
+                return
+            # A delivered worker cannot re-file: the user settles it
+            neo_store.mark(q["id"], "escalated", reason=verdict["reason"],
+                           cause="scope-too-large")
+            verdict = {**verdict, "refine": False, "escalate": True}
         if self._asked_early(pstore, wo["id"], int(q["id"])):
             # THE EARLY PASS ASKED THIS ONE, so its answer may only be RECORDED
             self._record_early_assumption_verdict(neo_store, pstore, wo, numbered, q,
