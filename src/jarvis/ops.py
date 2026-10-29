@@ -8795,8 +8795,7 @@ OFFBOARDED_EVENT = "offboarded"
 
 def quiesce_project(name: str, apply: bool = False,
                     reason: str = "project offboarded") -> dict[str, Any]:
-    """Report a project's open orders; with `apply`, cancel them and stop it asking the user
-    (docs/superpowers/specs/2026-10-28-offboard-a-project.md §5)"""
+    """Report a project's open orders; `apply` cancels them (docs/superpowers/specs/2026-10-28-offboard-a-project.md §5)"""
     paths = registered_project_paths()
     if name not in paths:
         raise OpsError(f"project {name!r} not registered (known: {sorted(paths)})")
