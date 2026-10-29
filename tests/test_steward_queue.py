@@ -262,9 +262,9 @@ def test_the_steward_page_shows_counts_then_each_queued_decision(enforcing, stor
     assert "Find what moves the prompt prefix between calls." in waiting
     assert "a finding from before 0.12.15" in settled
     assert steward.UNRECOVERABLE_NOTE in settled
-    # #1185's console: the sidebar link, a `g w` jump, and sections that reflow at width
+    # #1185's console: the sidebar link and a `g w` jump; sections stack full width (fo-744c42a5 §2.1)
     assert 'href="/steward"' in html and "w: '/steward'" in html
-    assert 'class="flow"' in html
+    assert 'class="flow"' not in html
 
 
 def test_the_steward_page_lists_an_ask_with_where_to_act(jarvis_home, catalog_file):

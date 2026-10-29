@@ -1,0 +1,56 @@
+{# Shared list-page macros — §2.3 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md.
+   Import with {% import "_layout.html" as ui %}. #}
+
+{% macro page_head(title, meta="") %}
+<div class="page-head">
+  <h1>{{ title }}</h1>
+  {% if meta %}<span class="meta">{{ meta }}</span>{% endif %}
+  {% if caller %}<span class="acts">{{ caller() }}</span>{% endif %}
+</div>
+{% endmacro %}
+
+{# Renders NOTHING for no rows; the caller renders one row: {% call(row) ui.needs_you(rows, "label") %} #}
+{% macro needs_you(rows, label) %}
+{% if rows %}
+<section class="attention hot needs-you">
+  <div class="strip-head"><span class="n">{{ rows | length }}</span>{{ label }}</div>
+  <ul>
+    {% for row in rows %}<li>{{ caller(row) }}</li>{% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endmacro %}
+
+{# `options` maps each query key to its values; a `q` key gives a text box instead of a select.
+   `labels` names a select's empty choice (default "every <key>") or the text box's placeholder. #}
+{% macro filter_bar(action, filters, options, shown, total, labels={}) %}
+<form class="filter-bar" method="get" action="{{ action }}">
+  {% for key, values in options.items() %}
+  {% if key == "q" %}
+  <input type="text" name="q" value="{{ filters.get('q', '') }}" aria-label="search"
+         placeholder="{{ labels.get('q', 'search') }}">
+  {% else %}
+  <select name="{{ key }}" aria-label="{{ key }}" onchange="this.form.submit()">
+    <option value="">{{ labels.get(key, 'every ' ~ key) }}</option>
+    {% for v in values %}
+    <option value="{{ v }}" {{ 'selected' if filters.get(key) == v }}>{{ v }}</option>
+    {% endfor %}
+  </select>
+  {% endif %}
+  {% endfor %}
+  <button>Apply</button>
+  {% for key, v in filters.items() if v %}
+  {% set rest = {} %}
+  {% for k2, v2 in filters.items() if k2 != key and v2 %}{% if rest.update({k2: v2}) %}{% endif %}{% endfor %}
+  <a class="chip" href="{{ action }}{{ '?' ~ (rest | urlencode) if rest }}" title="remove this filter">{{ key }}: {{ v }} ×</a>
+  {% endfor %}
+  <span class="shown">{{ shown }} of {{ total }} shown</span>
+  {% if filters %}<a href="{{ action }}">clear</a>{% endif %}
+</form>
+{% endmacro %}
+
+{% macro row_id(id, href) %}<a class="rowid" href="{{ href }}">{{ id }}</a>{% endmacro %}
+
+{% macro explain(summary) %}
+<details class="explain"><summary>{{ summary }}</summary>{{ caller() }}</details>
+{% endmacro %}

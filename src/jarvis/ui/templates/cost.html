@@ -1,9 +1,6 @@
 {% extends "base.html" %}
 {% block title %}cost — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 600px;">
 
 <h2>What the work cost — {{ report.scope }}</h2>
 
@@ -229,6 +226,4 @@
 <p class="sub" style="margin-top: 6px;">
   Every figure on this page is {{ report.floor_reason }}.
 </p>
-
-</div>
 {% endblock %}

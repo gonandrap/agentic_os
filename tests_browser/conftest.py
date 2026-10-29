@@ -115,6 +115,31 @@ def gated_server(jarvis_home, fake_claude, gated_catalog, live_daemon):
     yield from _serve(gated_catalog)
 
 
+_SQUEEZED_JS = """(selector) => {
+  const out = [];
+  for (const el of document.querySelectorAll(selector)) {
+    if (el.offsetParent === null || el.closest('pre')) continue;
+    const text = el.innerText.trim();
+    if (text.length <= 30) continue;
+    const cs = getComputedStyle(el);
+    const lh = cs.lineHeight === 'normal' ? 1.2 * parseFloat(cs.fontSize) : parseFloat(cs.lineHeight);
+    const lines = Math.max(1, Math.round(el.getBoundingClientRect().height / lh));
+    if (text.length / lines < 12) out.push(`${lines} lines: ${text.slice(0, 80)}`);
+  }
+  return out;
+}"""
+
+
+@pytest.fixture()
+def readable():
+    """`check(page, selector)` fails on any text squeezed to a word or two per line — §2.6 of
+    docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md"""
+    def check(page, selector: str = "main td, main th, main p") -> None:
+        squeezed = page.evaluate(_SQUEEZED_JS, selector)
+        assert not squeezed, f"text squeezed into a narrow column at {page.viewport_size}: {squeezed}"
+    return check
+
+
 @pytest.fixture()
 def daemon(catalog_file):
     from jarvis.catalog import load_catalog

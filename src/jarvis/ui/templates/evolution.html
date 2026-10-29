@@ -1,9 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Evolution — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 640px;">
 
 {# THIS TEMPLATE DERIVES NO NUMBER. Not a total, not a percentage, not a count, not a
    delta — no `|sum`, no `|length` where the dict already carries a count, no `{% set %}`
@@ -259,6 +256,4 @@
   {% endif %}
 </div>
 {% endif %}
-
-</div>
 {% endblock %}

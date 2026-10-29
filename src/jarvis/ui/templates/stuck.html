@@ -1,9 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Stuck — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 600px;">
 
 {# `alarms.html`'s split, for its reason: the top is the queue that is an ask, the bottom
    is the record and is MEANT to be long. Merged, the record buries the asks. §7 of
@@ -80,6 +77,4 @@
 <p class="sub">the gap classes behind these:
   <span class="mono">jarvis rules list</span> ·
   one order in full: <span class="mono">jarvis stuck &lt;project&gt;</span></p>
-
-</div>
 {% endblock %}
