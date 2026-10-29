@@ -91,9 +91,15 @@ function. This is the pattern every later section copies.
 Add a fixture `readable` to `tests_browser/conftest.py` returning
 `check(page, selector="main td, main th, main p")`: for every matched element whose text is
 longer than 30 chars, `lines = round(height / line-height)` and it fails when
-`len(text) / lines < 12` (one or two words per line), naming the element's text. Each later
-section calls it on its pages at **1440×900 and 390×844** (`page.set_viewport_size`). It
-ignores elements inside a closed `<details>` or hidden tab and inside `pre`.
+`len(text) / lines < 12` (one or two words per line), naming the element's text.
+`line-height` comes from `getComputedStyle`; when it is `normal` use `1.2 × font-size`.
+Each later section calls it on its pages at **1440×900 and 390×844**
+(`page.set_viewport_size`). It skips elements that are not rendered (`offsetParent ===
+null`: a closed `<details>`, a hidden tab panel) and anything inside `pre`. Foundation
+proves the check with a test page fragment that squeezes a `td` and must fail it.
+
+Empty sections: a section with nothing to show renders as a single `p.empty` line, never an
+empty table or panel.
 
 ## 3. Morpheus run history (data, no UI)
 
@@ -119,7 +125,8 @@ Today `morpheus_items` (`central_store.py`) keeps only `checks`, `last_exit` and
   beside `morpheus_item` in `ops.py`.
 - `jarvis morpheus show <id>` prints the last 10 runs (time, kind, exit, state after) and
   the questions, after what it prints today.
-- Existing items have no runs; the detail page says "no runs recorded before <release>".
+- Existing items have no runs; `runs` is then an empty list and the detail page (§4) says
+  "no runs recorded yet — history starts with this release" when `item["checks"] > 0`.
 
 ## 4. Morpheus: the reference build
 
@@ -173,7 +180,7 @@ Owns `stuck.html`, `steward.html`, `evolution.html` and their routes.
   table. Detectors that never fired fold into a closed "quiet detectors" section. Each rule
   links to `/evolution/rule/{key}` (optional `?project=`): description, firing history,
   what it filed, read from `ops.evolution_report`. Filters: project, days, firing/quiet.
-  Sections that are a single empty-state line collapse to one line under the primary view.
+  An empty section renders as one `p.empty` line under the primary view (§2.6).
 
 ## 6. Record lists: gates, backlog, knowledge, search
 
@@ -191,7 +198,11 @@ behind ops functions.
   `/knowledge/{kn_id}`: full body, topic, origin order (linked), reads count, pin toggle
   (existing POST), via the ops function behind `jarvis learn show`.
 - **/search**: results full width, kind/project filters through `ui.filter_bar`.
-- `ops.resolve_ref` sends `gate-<n>`, `bl-…`, `kn-…` to these routes.
+- `ops.resolve_ref` sends `gate-<n>`, `bl-…`, `kn-…` to these routes (update the
+  parametrized cases in `tests/test_ui_navigation.py`). Links the OS builds to
+  `/gates#gate-<n>` (the `holds.GATE` hold and the health surfaces) move to
+  `/gates/<n>`; update their tests (`tests/test_ui_navigation.py`, `tests/test_ui.py`,
+  `tests/test_health_surfaces.py`).
 
 ## 7. Order views: dashboard, project, orders
 
@@ -276,7 +287,10 @@ Proving it:
   (§2.6), plus a test that a filter in the URL narrows the rows, that a failed/needing-you
   row is above the others, and that clicking a row id navigates to its detail route (the
   URL changes; it does not just scroll).
-- Fixtures: `jarvis_home` is autouse; the project fixture is `proj_a`; never call
+- Fixtures: `jarvis_home` is autouse; the `project` fixture (from `jarvis.testing`) is a
+  git repo whose project is named `proj_a`; browser tests also use `page`, `server`,
+  `daemon` from `tests_browser/conftest.py`. When you change a link or a page, rewrite the
+  existing test that asserted the old behaviour; never just delete it. Never call
   `monkeypatch.undo()`. A multi-row SQL fixture edit goes in `db.write_transaction(...)`
   (kn-fd19afc7).
 - Take a screenshot of each page you changed at both widths and attach it to the PR (the
