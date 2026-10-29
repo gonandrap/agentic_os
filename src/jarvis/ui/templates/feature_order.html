@@ -4,9 +4,6 @@
 {% import "_states.html" as states_ui %}
 {% block title %}{{ fo.id }} — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 600px;">
 {# The one page where the whole feature is visible at once: the ask the user wrote, the
    decomposition the planner submitted against it, and each child's live status. That
    ordering is the point — a plan is only judgeable next to the ask it answers, and this
@@ -213,6 +210,4 @@
   <span class="sub">stops the planner and every child still running</span>
 </form>
 {% endif %}
-
-</div>
 {% endblock %}

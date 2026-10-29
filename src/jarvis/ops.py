@@ -6129,6 +6129,15 @@ INBOX_LEVELS = ("critical", "warning", "info")
 INBOX_SORTS = ("priority", "newest", "oldest")
 
 
+def unacked_inbox() -> list[dict[str, Any]]:
+    """Every unacked inbox row, unfiltered — what `jarvis inbox` and /inbox select from"""
+    central = CentralStore()
+    try:
+        return central.unacked_inbox()
+    finally:
+        central.close()
+
+
 def select_inbox(items: list[dict[str, Any]], *, level: str = "", project: str = "",
                  q: str = "", sort: str = "priority") -> list[dict[str, Any]]:
     """Filter and order unacked inbox rows; `priority` is critical first, newest first within a level"""

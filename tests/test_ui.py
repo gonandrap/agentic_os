@@ -866,6 +866,23 @@ def test_inbox_filters_sort_and_ack_shown(client, daemon, project):
     assert "disk almost full" not in text and "low news" in text
 
 
+def test_the_list_page_primitives_filter_and_order_rows():
+    from starlette.requests import Request
+
+    from jarvis.ui.app import attention_first, filter_options, filter_rows, query_filters
+    q = "level=bogus&q=%20" + "x" * 300 + "&project=&other=1"
+    req = Request({"type": "http", "query_string": q.encode()})
+    got = query_filters(req, {"level": ["info"], "q": [], "project": ["a"]})
+    # an unknown value is kept so it matches nothing; free text is capped; empty is absent
+    assert got == {"level": "bogus", "q": "x" * 100}
+    rows = [{"id": 1, "level": "info", "t": "Disk full"}, {"id": 2, "level": "crit", "t": "ok"},
+            {"id": 3, "level": "info", "t": None}, {"id": 4, "level": "crit", "t": "disk"}]
+    assert filter_rows(rows, {"level": "bogus"}) == []
+    assert [r["id"] for r in filter_rows(rows, {"level": "info", "q": "DISK"}, ("t",))] == [1]
+    assert filter_options(rows + [{"level": ""}], "level") == ["crit", "info"]
+    assert [r["id"] for r in attention_first(rows, lambda r: r["level"] == "crit")] == [2, 4, 1, 3]
+
+
 def test_dashboard_clears_unacked_banner_after_ack(client, daemon, project):
     """Acking every inbox item must clear the "unacked notification" banner on the main dashboard"""
     store = ProjectStore(project)
@@ -2839,6 +2856,16 @@ def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
     featured, _ = group_open([{"status": "needs_review", "id": "wo-1"},
                               {"status": "budget_exhausted", "id": "wo-2"}])
     assert [w["id"] for w in featured] == ["wo-2", "wo-1"]
+
+
+def test_a_validating_order_has_a_row_of_its_own():
+    """A pending row's "blocked by" can name it, so it must not hide in a collapsed count"""
+    from jarvis.ui.app import group_open
+
+    featured, rest = group_open([{"status": "pending", "id": "wo-1"},
+                                 {"status": "validating", "id": "wo-2"}], revealed="pending")
+    assert [w["id"] for w in featured] == ["wo-2"]
+    assert [w["id"] for w in rest] == ["wo-1"]
 
 
 # -- a budget at CREATION time

@@ -1,9 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Gates — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 600px;">
 
 {% macro decide_form(g) %}
 {# One form, three submit buttons: the reason is shared, and `decision` carries the
@@ -196,7 +193,5 @@
     <tr><td colspan="7" class="empty">no gate has been dismissed as a false positive</td></tr>
     {% endfor %}
   </table>
-</div>
-
 </div>
 {% endblock %}
