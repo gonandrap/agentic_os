@@ -1550,7 +1550,14 @@ def create_app() -> FastAPI:
         bill = wo_bill(wo_id, pname)
         # The ceiling, what has gone against it
         cap = ops.work_order_budget(wo_id, pname, include_archived=True)
+        # What this order wrote to, or retired from, the knowledge base
+        central = CentralStore()
+        try:
+            learnings = central.knowledge_by_work_order(wo_id)
+        finally:
+            central.close()
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
+                      learnings=learnings,
                       # What has already been dismissed here
                       seen=invariants.acknowledged(wo),
                       cap=cap,
