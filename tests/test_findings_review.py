@@ -466,7 +466,7 @@ def test_show_reports_each_filed_orders_live_status(reviewable, store):
     entry = detail["filed_orders"]["first-turn-reads"][0]
     assert entry == {"id": filed_id, "type": "work", "project": "proj_a",
                      "title": "name the entry point in every dispatch brief",
-                     "status": "pending"}
+                     "status": "pending", "pr_url": "", "merged": False}
 
     # LIVE, not the snapshot taken at filing (§5.3.1)
     store.update_work_order(filed_id, status="running")

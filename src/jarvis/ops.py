@@ -7091,13 +7091,15 @@ def show_improvement_order(io_id: str, project_name: str | None = None) -> dict[
         alarms = store.alarms_for_feature(io_id)
     finally:
         store.close()
+    filed = _filed_orders(findings)
     return {
         "project": name, **fo,
         "findings": len(findings),
         "by_decision": by_decision,
         "with_neo": with_neo,
         "report": report if isinstance(report, dict) else {},
-        "filed_orders": _filed_orders(findings),
+        "filed_orders": filed,
+        "dispatched": dispatched_orders(filed),
         "observation": fo["description"],
         "evidence_refs": evidence_refs(fo),
         "analyst": analyst,
@@ -7114,21 +7116,48 @@ def _filed_orders(findings: list[Any]) -> dict[str, list[dict[str, Any]]]:
             continue
         rows = []
         for order in finding.get("created_orders") or []:
-            status = "deleted"
+            status, pr_url, merged = "deleted", "", False
             try:
                 if order.get("type") == "feature":
                     _n, _p, row = find_feature_order(order["id"])
                 else:
-                    _n, _p, row = find_work_order(order["id"])
+                    _n, _p, row = find_work_order(order["id"], include_archived=True)
+                    pr_url = str(row.get("pr_url") or "")
+                    wo_store = ProjectStore(_p)
+                    try:
+                        landed = merge_state(wo_store, row)
+                    finally:
+                        wo_store.close()
+                    merged = bool(landed and landed["state"] == "MERGED")
                 status = row["status"]
             except OpsError:
                 pass
             rows.append({"id": order.get("id"), "type": order.get("type"),
                          "title": order.get("title"), "project": order.get("project"),
-                         "status": status})
+                         "status": status, "pr_url": pr_url, "merged": merged})
         if rows:
             out[finding.get("key", "")] = rows
     return out
+
+
+def dispatched_orders(filed_orders: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """Every order an io's findings filed, flat, for its header (issue 1323)"""
+    orders = [o for rows in filed_orders.values() for o in rows]
+    return {"orders": orders, "count": len(orders),
+            "merged": sum(1 for o in orders if o["merged"])}
+
+
+def analyst_dispatched(wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The orders the analyst's io dispatched — its sibling fix orders — or None"""
+    if wo.get("kind") != "analyst" or not wo.get("parent_id"):
+        return None
+    try:
+        _n, _p, fo = find_feature_order(wo["parent_id"])
+    except OpsError:
+        return None
+    report = db.from_json(fo.get("plan"), None) or {}
+    findings = report.get("findings") or [] if isinstance(report, dict) else []
+    return {"io_id": fo["id"], **dispatched_orders(_filed_orders(findings))}
 
 
 def cancel_improvement_order(io_id: str, project_name: str | None = None

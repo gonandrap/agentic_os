@@ -1997,6 +1997,29 @@ def test_an_accepted_finding_lists_the_orders_it_filed(improvement):
         assert order["status"] in row
 
 
+def test_dispatched_orders_lead_the_io_page_and_the_analyst_page(improvement, project):
+    """Issue 1323: what the findings dispatched, up front, on the io AND its analyst"""
+    client, io, _ = improvement
+    ops.review_findings(io["id"], accept=("first-turn-reads",), project_name="proj_a")
+    filed = ops.show_improvement_order(io["id"])["dispatched"]["orders"]
+    store = ProjectStore(project)
+    try:
+        store.update_work_order(filed[0]["id"], pr_url="https://github.com/o/r/pull/1306")
+        analyst = store.create_work_order("analyse it", kind="analyst",
+                                          parent_id=io["id"], status="completed")
+    finally:
+        store.close()
+
+    page = client.get(f"/io/proj_a/{io['id']}").text
+    head = page[:page.index('id="findings"')]
+    assert f"{len(filed)} dispatched, 0 merged" in head
+    assert f"/wo/proj_a/{filed[0]['id']}" in head and "PR #1306" in head
+
+    sibling = client.get(f"/wo/proj_a/{analyst['id']}").text
+    assert f"its findings dispatched ({io['id']})" in sibling
+    assert f"/wo/proj_a/{filed[0]['id']}" in sibling
+
+
 def test_a_finding_with_neo_says_so_and_a_decided_one_shows_neos_reading(
         client, project, improvement_order):
     client, io, _ = _reported(client, project, improvement_order)

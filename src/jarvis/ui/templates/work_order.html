@@ -6,6 +6,7 @@
 {% import "_review.html" as review_ui %}
 {% import "_brake.html" as brake_ui %}
 {% import "_order_nav.html" as nav %}
+{% import "_dispatched.html" as dispatched_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -113,6 +114,7 @@
       from you. The conversation is intact and the worker picks up from where it got
       to.</p>
   {% endif %}
+  {{ dispatched_ui.dispatched(siblings, project, 'its findings dispatched (' ~ siblings.io_id ~ ')') if siblings }}
   {% if wo.description %}<p class="kv" style="white-space: pre-wrap;">{{ wo.description }}</p>{% endif %}
   {# The brief above is only the MARGIN around this order's section of its feature's
      spec — the scope boundary and what done means. The section itself is the work, and
