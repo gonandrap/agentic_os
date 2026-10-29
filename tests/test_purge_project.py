@@ -52,8 +52,21 @@ def test_neither_purge_takes_a_dry_run():
 def test_scope_and_provenance_tables_are_pinned(central):
     derived = db.tables_with_column(central.conn, "project")
     assert sorted(PROVENANCE_TABLES) == ["detectors", "gate_rules"]
-    assert [t for t in derived if t not in PROVENANCE_TABLES] == SCOPE_TABLES
-    assert set(PROVENANCE_TABLES) <= set(derived)
+    assert sorted(SCOPE_TABLES + list(PROVENANCE_TABLES)) == derived, (
+        "a table gained or lost a `project` column: classify it as scope (deleted) or "
+        "PROVENANCE_TABLES (never deleted) before purge_project may touch it")
+    assert len(derived) == 11
+
+
+def test_fk_without_target_column_resolves_to_primary_key(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    conn.executescript(
+        "CREATE TABLE p (key TEXT PRIMARY KEY, project TEXT);"
+        "CREATE TABLE c (pk_ref TEXT REFERENCES p);"
+        "INSERT INTO p VALUES ('k1', 'proj_a'), ('k2', 'proj_b');"
+        "INSERT INTO c VALUES ('k1'), ('k2');")
+    assert db.delete_where(conn, ["p"], "project", "proj_a") == {"c": 1, "p": 1}
+    assert [r[0] for r in conn.execute("SELECT pk_ref FROM c")] == ["k2"]
 
 
 def test_central_purge_leaves_no_scoped_row_and_counts_it(central):

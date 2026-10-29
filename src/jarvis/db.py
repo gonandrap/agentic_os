@@ -75,10 +75,13 @@ def delete_where(conn: sqlite3.Connection, tables: Sequence[str], column: str,
             for fk in conn.execute(f"PRAGMA foreign_key_list({child})").fetchall():
                 if fk["table"] != parent:
                     continue
+                # An FK naming no column targets the parent's primary key
+                target = fk["to"] or next(c["name"] for c in conn.execute(
+                    f"PRAGMA table_info({parent})") if c["pk"])
                 # Explicit even under ON DELETE CASCADE: sqlite reports no rowcount for a cascade
                 n = conn.execute(
                     f"DELETE FROM {child} WHERE {fk['from']} IN "
-                    f"(SELECT {fk['to'] or 'rowid'} FROM {parent} WHERE {column}=?)",
+                    f"(SELECT {target} FROM {parent} WHERE {column}=?)",
                     (value,)).rowcount
                 counts[child] = counts.get(child, 0) + n
         counts[parent] = counts.get(parent, 0) + conn.execute(
