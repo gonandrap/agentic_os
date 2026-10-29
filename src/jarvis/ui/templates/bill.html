@@ -33,7 +33,7 @@
    arrives with; the same tokens re-grouped by turn follow, because "when" is the
    question they leave with. #}
 <h2>The bill — by who spent it</h2>
-{{ bill_ui.view(bill.actors, bill.total, 'total for ' ~ bill.id) }}
+<div class="table-wrap">{{ bill_ui.view(bill.actors, bill.total, 'total for ' ~ bill.id) }}</div>
 
 {# What is NOT here, said out loud. The question that prompted this page was "not a
    single token spent on the OS that wasn't jarvis?" — and the honest answer is a list
@@ -101,7 +101,7 @@
   turn's own tokens, plus whatever Jarvis and the worker's subprocesses spent while it
   ran or because of what it asked. Which is why the two totals are the same number.
 </p>
-{{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ bill.id) }}
+<div class="table-wrap">{{ bill_ui.view(bill.turns, bill.total, 'total for ' ~ bill.id) }}</div>
 
 {% if turn_rows %}
 <h2>How the context grew</h2>
@@ -271,7 +271,7 @@
 <p class="sub" style="margin: 6px 0 0;">{{ placeholder_zero }}</p>
 {% endif %}
 {% endif %}
-{{ bill_ui.view(bill.agents, worker, 'every agent of ' ~ bill.id) }}
+<div class="table-wrap">{{ bill_ui.view(bill.agents, worker, 'every agent of ' ~ bill.id) }}</div>
 {% endif %}
 
 {% for note in bill.notes %}
