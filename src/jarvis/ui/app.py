@@ -16,7 +16,19 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, db, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
+from .. import (
+    bill,
+    db,
+    fleet,
+    fleetcost,
+    github,
+    invariants,
+    ops,
+    specs,
+    transcript_cache,
+    uilog,
+    wiring,
+)
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -536,6 +548,11 @@ class CostCache:
                 self.entries[name] = await anyio.to_thread.run_sync(self.compute, name)
             except Exception as e:                      # noqa: BLE001
                 uilog.record_error("TASK", f"cost/cache/{name}", e)
+        try:
+            # The ONLY writer of the file, so a `jarvis cost` run can never lose entries
+            await anyio.to_thread.run_sync(transcript_cache.save)
+        except Exception as e:                          # noqa: BLE001
+            uilog.record_error("TASK", "cost/cache/save", e)
 
     async def run(self) -> None:
         import anyio
@@ -1474,7 +1491,8 @@ def create_app() -> FastAPI:
                 entry = cost_cache.serve(picked, project)
                 if entry is None:
                     return render(request, "computing.html", active="cost",
-                                  window=picked)
+                                  window=picked,
+                                  parsed=transcript_cache.stats()["files"])
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
         report, fleet, meter = entry["report"], entry["fleet"], entry["meter"]

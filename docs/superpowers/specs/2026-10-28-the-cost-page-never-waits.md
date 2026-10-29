@@ -39,7 +39,11 @@ entry is already served with.
 The current 5h and week windows stay instantaneous the way #1241 made them: the
 `CostCache.run` precompute, served through `lookup`, no aggregation on the path.
 
-### What is NOT changed
+#> Amended by [2026-10-29-the-cost-page-reuses-what-it-parsed.md](2026-10-29-the-cost-page-reuses-what-it-parsed.md),
+> which caches each transcript's parse so the cold window costs ~0.35s rather than
+> 3.47s. The "8-22s" figure quoted below was an estimate; measured it is 3.47s.
+
+## What is NOT changed
 
 - A cold `jarvis-ui` serves `computing.html` for the current window until the first
   precompute round lands (8-22s per window, measured 2026-10-22). Persisting the cache

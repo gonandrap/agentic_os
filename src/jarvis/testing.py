@@ -16,7 +16,16 @@ from typing import Any, Sequence
 
 import pytest
 
-from . import agent_usage, keychain, paths, release, service_manager, systemd_units, usage
+from . import (
+    agent_usage,
+    keychain,
+    paths,
+    release,
+    service_manager,
+    systemd_units,
+    transcript_cache,
+    usage,
+)
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -2273,6 +2282,8 @@ def jarvis_home(tmp_path, monkeypatch):
     transcripts = tmp_path / "claude-projects"
     transcripts.mkdir(exist_ok=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(transcripts))
+    # The parsed-transcript cache follows the home too, and it is process-global
+    transcript_cache.reset()
     return home
 
 
