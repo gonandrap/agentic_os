@@ -203,6 +203,12 @@ class NeoStore:
         self.conn.executescript(SCHEMA)
         self._migrate()
 
+    def purge_project(self, name: str) -> dict[str, int]:
+        """Delete every question and learning scoped to `name`, with the questions' panel opinions"""
+        with db.write_transaction(self.conn):
+            return db.delete_where(self.conn, db.tables_with_column(self.conn, "project"),
+                                   "project", name)
+
     def _migrate(self) -> None:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
 
