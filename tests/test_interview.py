@@ -196,11 +196,22 @@ def test_the_spec_draft_round_trips_and_schema_2_is_refused(tmp_path):
         onboard_draft.load(on_disk)
 
 
-def test_two_wiring_levers_compose_in_the_draft(project):
+def test_wiring_starts_from_the_runtime_config_and_levers_compose(project, monkeypatch):
+    from jarvis.catalog import WiringConfig
+
+    scopes = []
+    monkeypatch.setattr(ops, "wiring_config", lambda project=None, catalog_path=None:
+                        scopes.append(project) or WiringConfig(disabled_skills=("live",)))
+    monkeypatch.setattr(ops, "wiring_show", lambda project=None, **kw:
+                        {"project": project, "items": ["x"]})
     document = {"os": {}, "projects": []}
     draft = interview.new_draft(project, "proj")
 
     interview.wire(draft, "skill:a", False, document=document)
     interview.wire(draft, "skill:b", False, document=document)
 
-    assert draft.values == {"projects.proj.wiring.disabled_skills": ["a", "b"]}
+    assert draft.values == {"projects.proj.wiring.disabled_skills": ["a", "b", "live"]}
+    # Not in the catalog yet, so the fleet base, never `project_spec`'s refusal
+    assert scopes == [None, None]
+    assert interview.wiring_choices(draft, document=document) == {"project": None,
+                                                                  "items": ["x"]}

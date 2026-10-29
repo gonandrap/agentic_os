@@ -309,14 +309,30 @@ def set_reason(draft: Draft, text: str) -> Draft:
     return draft
 
 
+def _wiring_scope(draft: Draft, document: dict[str, Any]) -> str | None:
+    # `ops.project_spec` refuses a project not yet in the catalog, so a new one reads the fleet base
+    adopted = {p.get("name") for p in document.get("projects", [])}
+    return draft.project.name if draft.project.name in adopted else None
+
+
+def wiring_choices(draft: Draft, *, document: dict[str, Any]) -> dict[str, Any]:
+    """The user's real MCP servers, skills and plugins, discovered at runtime (§2)"""
+    from . import ops
+
+    return ops.wiring_show(_wiring_scope(draft, document))
+
+
 def wire(draft: Draft, lever: str, wired: bool, *, document: dict[str, Any]) -> Draft:
     """Wiring is the user's real inventory, so a lever, not a posture (§2)"""
-    from . import wiring
+    import dataclasses
 
-    candidate = onboard_draft.candidate_document(draft, document)
-    spec = next(p for p in parse_catalog(json.loads(json.dumps(candidate))).projects
-                if p.name == draft.project.name)
-    tail, value = wiring.lever_setting(lever, wired, spec.wiring)
+    from . import ops, wiring
+
+    live = ops.wiring_config(_wiring_scope(draft, document))
+    prefix = f"projects.{draft.project.name}.wiring."
+    # Levers already in the draft overlay the live config, so two levers compose
+    pending = {p[len(prefix):]: v for p, v in draft.values.items() if p.startswith(prefix)}
+    tail, value = wiring.lever_setting(lever, wired, dataclasses.replace(live, **pending))
     return set_value(draft, f"projects.{draft.project.name}.{tail}", value,
                      document=document)
 
