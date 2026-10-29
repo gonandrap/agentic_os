@@ -382,7 +382,9 @@ CREATE TABLE IF NOT EXISTS rule_fires (
     detail TEXT NOT NULL DEFAULT '',
     cleared_at REAL, cleared_seconds REAL,
     false_positive INTEGER NOT NULL DEFAULT 0,
-    false_positive_reason TEXT NOT NULL DEFAULT ''
+    false_positive_reason TEXT NOT NULL DEFAULT '',
+    question_id INTEGER,                  -- the self-heal gate's Neo question
+    filed_orders TEXT NOT NULL DEFAULT '[]'   -- orders the remedy filed, JSON
 );
 CREATE INDEX IF NOT EXISTS idx_rule_fires_detector ON rule_fires(detector_id, ts);
 CREATE INDEX IF NOT EXISTS idx_rule_fires_order ON rule_fires(order_id, detector_id);
