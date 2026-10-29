@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 {% import "_order_nav.html" as nav %}
 {% block title %}prompts — {{ wo.id }} — Jarvis{% endblock %}
+{# A row's prose drops under its label on a phone instead of one word per line — kn-fa085e88. #}
+{% block style %}.row { flex-wrap: wrap; } .row .grow { flex: 1 1 22ch; }{% endblock %}
 {% block content %}
 
 {# EVERY PROMPT THIS ORDER'S CONVERSATION WAS SENT — §4 of

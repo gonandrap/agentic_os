@@ -1,15 +1,18 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}{{ io.id }} — Jarvis{% endblock %}
+{% block style %}
+  @media (max-width: 640px) { main .row { flex-wrap: wrap; } main .row > .grow { flex-basis: 100%; } }
+{% endblock %}
 {% block content %}
-{# §6.1 of docs/superpowers/specs/2026-09-23-improvement-orders.md, laid out by §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md: counts, then the
-   findings as cards the reader DECIDES on, then — beside them at width, below them when
-   narrow — the brief, the evidence it was given and the analyst that read it. The brief
-   is long prose and the findings are what is acted on, so the findings come first. #}
+{# §6.1 of docs/superpowers/specs/2026-09-23-improvement-orders.md, laid out by §7 of
+   docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md:
+   counts, then the findings full width as cards the reader DECIDES on (the ones owed a
+   decision first), then the brief folded below them. #}
 {% set m = fo_status_meta.get(io.status, {'word': io.status, 'icon': '•', 'tone': 'muted'}) %}
 {% set findings = io.report.findings or [] %}
 
-<h2><span class="mono">{{ io.id }}</span> {{ io.title }}</h2>
+{{ ui.page_head(io.id ~ " " ~ io.title) }}
 <p class="sub">
   {# The kind-aware word, from `ops`: `plan_review` on an improvement order means
      findings are awaiting the user, and a page spelling that itself would be a second
@@ -42,8 +45,6 @@
 <div class="panel" style="margin-top: 12px;"><div class="row tone-warn">◭ {{ io.attention_reason }}</div></div>
 {% endif %}
 
-<div class="grid io-layout" style="--col: 520px;">
-<div class="io-findings">
 {% if io.report.summary %}
 <h2 id="findings">Findings — {{ io.report.summary }}</h2>
 {% else %}
@@ -107,7 +108,7 @@
       <div class="sub">✓ accepted{% if f.feedback %} — {{ f.feedback }}{% endif %}</div>
       {% for o in io.filed_orders.get(f.key) or [] %}
       <div class="sub">filed:
-        <a class="mono" href="/{{ 'fo' if o.type == 'feature' else 'wo' }}/{{ o.project or project }}/{{ o.id }}">{{ o.id }}</a>
+        {{ ui.row_id(o.id, order_path(o.project or project, o.id)) }}
         {{ o.title }} ({{ o.status }})</div>
       {% endfor %}
       {% elif status == 'rejected' %}
@@ -141,17 +142,12 @@
   no report yet — the analyst is still working, and an order in analysis asks nothing
 </div></div>
 {% endfor %}
-</div>
 
-<div class="io-context">
 <h2 id="brief">The brief</h2>
 {# Collapsed: it is the order's input, read once; the findings are its output. #}
-<div class="panel">
-  <details class="disclosure" style="margin: 10px 16px;">
-    <summary>the observation the analyst was given · {{ io.observation|length }} chars</summary>
-    <div class="measure" style="white-space: pre-wrap; margin-top: 8px;">{{ io.observation }}</div>
-  </details>
-</div>
+{% call ui.explain("the observation the analyst was given · " ~ io.observation|length ~ " chars") %}
+<div class="panel"><div class="measure" style="white-space: pre-wrap; padding: 10px 16px;">{{ io.observation }}</div></div>
+{% endcall %}
 
 {% if io.evidence_refs %}
 {# The refs as the user typed them — unresolved on purpose (§2.6): one that does not
@@ -169,7 +165,5 @@
   {% if io.analyst.result_summary %}— {{ io.analyst.result_summary }}{% endif %}
 </p>
 {% endif %}
-</div>
-</div>
 
 {% endblock %}

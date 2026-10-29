@@ -1,42 +1,59 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% import "_morpheus.html" as mv %}
 {% block title %}Morpheus — Jarvis{% endblock %}
+{% block style %}.mv-list td { white-space: nowrap; }{% endblock %}
 {% block content %}
 
-{# docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md #}
-{% set tone = {"queued": "tone-active", "monitoring": "tone-active", "validated": "tone-ok",
-               "failed": "tone-bad", "timedout": "tone-warn"} %}
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §4.1 #}
+{% set act = report.activity %}
+{% set meta -%}
+  {% for s, n in report.counts.items() if n %}{{ n }} {{ s }} · {% endfor -%}
+  {% if report.enabled == false %}disabled{% elif report.paused %}paused{% else %}running{% endif %}
+  · {% if act.turn_in_flight %}{{ act.turn_kind or "turn" }} in flight{% else %}idle{% endif %}
+  {%- if act.usage_hold_until %} · held until {{ fmt_ts(act.usage_hold_until) }}{% endif %}
+  {%- if act.kill_hold_until %} · held until {{ fmt_ts(act.kill_hold_until) }}{% endif %}
+{%- endset %}
+{{ ui.page_head("Morpheus", meta) }}
 
-{# A long script or output opens in a modal: expanded in its cell it stretched the table. #}
-{% macro peek(id, label, heading, text) -%}
-<button type="button" class="peek" data-peek="{{ id }}">{{ label }}</button>
-<dialog id="{{ id }}" class="peek-modal" aria-label="{{ heading }}">
-  <div class="peek-head"><span class="mono">{{ heading }}</span>
-    <form method="dialog"><button aria-label="close">✕</button></form></div>
-  <pre class="request-text">{{ text }}</pre>
-</dialog>
-{%- endmacro %}
-<style>
-  .peek { background: var(--raised); color: var(--ink-2); border: 1px solid var(--line);
-          border-radius: 6px; padding: 2px 9px; font: 12px var(--mono); cursor: pointer; }
-  .peek:hover { color: var(--ink); border-color: var(--ink-3); }
-  .peek-modal { width: min(900px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
-                background: var(--surface); color: var(--ink); border: 1px solid var(--line);
-                border-radius: 8px; padding: 14px 16px; }
-  .peek-modal::backdrop { background: rgb(0 0 0 / 0.6); }
-  .peek-modal .request-text { max-height: calc(100vh - 160px); margin: 0; }
-  .peek-head { display: flex; justify-content: space-between; align-items: center;
-               gap: 12px; margin-bottom: 10px; color: var(--ink-2); font-size: 13px; }
-  .peek-head form { margin: 0; }
-</style>
+{% call(i) ui.needs_you(attention, "failed checks — need you") %}
+  {{ ui.row_id(i.id, "/morpheus/" ~ i.id) }}
+  <a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a>
+  <span class="mono {{ mv.tone[i.state] }}">{{ i.state }}</span>
+  <span class="sub">{{ (i.resolution or "").split("\n")[0] }}</span>
+{% endcall %}
 
-<p class="kv" style="margin-top:18px">
+{{ ui.filter_bar("/morpheus", filters, options, rows | length, total) }}
+
+<div class="panel table-wrap">
+  <table class="mv-list">
+    <tr><th>id</th><th>project</th><th>PR</th><th>state</th><th>runs</th>
+      <th>next check / deadline</th><th>handed to</th></tr>
+    {% for i in rows %}
+    <tr id="{{ i.id }}">
+      <td class="mono">{{ ui.row_id(i.id, "/morpheus/" ~ i.id) }}</td>
+      <td class="mono">{{ i.project or "—" }}</td>
+      <td class="mono"><a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a></td>
+      <td class="mono {{ mv.tone[i.state] }}">{{ i.state }}</td>
+      <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
+      <td class="mono">
+        {%- if i.state in ("failed", "timedout", "validated") %}settled
+        {%- elif i.next_check_ts %}next {{ fmt_ts(i.next_check_ts) }}
+        {%- else %}deadline {{ fmt_ts(i.deadline_ts) }}{% endif %}</td>
+      <td class="mono">{{ mv.handoff(i.action) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="empty">{{ 'nothing matches these filters' if filters else 'nothing queued — a release or a merge fills this' }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% call ui.explain("session") %}
+<p class="kv">
   Every PR that reached production, in every project, watched until its check exits 0.
   Morpheus only runs the check and reads the exit code; a PR that fails or times out is
   handed to an investigation or to Neo, once.
-  <span class="counts">({% for s, n in report.counts.items() %}{{ n }} {{ s }}{{ " · " if not loop.last }}{% endfor %})</span>
 </p>
-
-<h2>Session</h2>
 <div class="panel">
   {% set sess = report.session %}
   <table>
@@ -47,7 +64,6 @@
       {% elif report.paused %}<span class="tone-warn">paused with the fleet — checks still run, no session turns</span>
       {% else %}<span class="tone-ok">unpaused (follows the fleet)</span>{% endif %}</td></tr>
     {# the state row above is the pause MODE; this one is what the session is doing (issue #1162) #}
-    {% set act = report.activity %}
     <tr><th>activity</th><td class="mono">
       {% if act.turn_in_flight %}<span class="tone-active">{{ act.turn_kind or "turn" }} in flight since {{ fmt_ts(act.turn_started_ts) }}</span>
       {% elif act.abandoned_turn_ts %}<span class="tone-warn">idle — the {{ act.turn_kind or "turn" }} started {{ fmt_ts(act.abandoned_turn_ts) }} never finished</span>
@@ -71,52 +87,9 @@
     <tr><th>last release</th><td class="mono">{{ report.last_release or "—" }}</td></tr>
   </table>
 </div>
-
-<h2>Pull requests</h2>
-<div class="panel">
-  <table>
-    <tr><th>id</th><th>project</th><th>PR</th><th>state</th><th>check</th><th>runs</th>
-      <th>deadline</th><th>output</th><th>handed to</th></tr>
-    {% for i in report["items"] %}
-    <tr id="{{ i.id }}">
-      <td class="mono" style="white-space:nowrap;user-select:all" title="click to select, then copy">{{ i.id }}</td>
-      <td class="mono">{{ i.project or "—" }}</td>
-      <td class="mono" style="white-space:nowrap"><a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a></td>
-      <td class="mono {{ tone[i.state] }}">{{ i.state }}</td>
-      <td class="mono">{% if i.script %}{{ peek(i.id ~ "-check", i.script_source, "check · " ~ i.id ~ " · #" ~ i.pr_number, i.script) }}{% else %}—{% endif %}</td>
-      <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
-      <td class="mono" style="white-space:nowrap">{{ fmt_ts(i.deadline_ts) }}</td>
-      <td class="mono">{% if i.last_output %}{{ peek(i.id ~ "-tail", "tail", "output · " ~ i.id ~ " · #" ~ i.pr_number, i.last_output) }}{% else %}—{% endif %}</td>
-      <td class="mono" style="word-break:break-all">{{ i.action or "—" }}
-        {%- if i.state in ("failed", "timedout") and not (i.resolution or "").startswith("confirmed failed") %}
-        <form method="post" action="/morpheus/{{ i.id }}/confirm" style="display:flex; gap:6px; margin-top:6px">
-          <input type="hidden" name="next" value="/morpheus#{{ i.id }}">
-          <input type="text" name="fix" required placeholder="broken: what to fix">
-          <button title="files a work order that fixes it">file fix</button>
-        </form>
-        {%- elif i.resolution %}<div class="sub">{{ i.resolution }}</div>{% endif %}</td>
-    </tr>
-    {% else %}
-    <tr><td colspan="9" class="empty">nothing queued — a release or a merge fills this</td></tr>
-    {% endfor %}
-  </table>
-</div>
-
 <p class="sub">from a terminal: <span class="mono">jarvis morpheus status</span> ·
   <span class="mono">jarvis morpheus show &lt;id&gt;</span> ·
-  <span class="mono">jarvis morpheus waive &lt;id&gt; --reason "…"</span> ·
-  <span class="mono">jarvis morpheus requeue &lt;id&gt;</span> ·
-  <span class="mono">jarvis morpheus confirm &lt;id&gt; --fix "…"</span> ·
   <span class="mono">jarvis morpheus pause|unpause --reason "…"</span> ·
   <span class="mono">jarvis morpheus follow-fleet</span></p>
-
-<script>
-document.querySelectorAll('[data-peek]').forEach(function (b) {
-  b.addEventListener('click', function () { document.getElementById(b.dataset.peek).showModal(); });
-});
-// A click on the backdrop lands on the dialog itself, never on its content.
-document.querySelectorAll('.peek-modal').forEach(function (d) {
-  d.addEventListener('click', function (e) { if (e.target === d) d.close(); });
-});
-</script>
+{% endcall %}
 {% endblock %}
