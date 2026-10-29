@@ -1735,6 +1735,63 @@ def uncollected_task_turn_block(store: ProjectStore, wo_id: str,
             "reason": UNCOLLECTED_TASK_BLOCK.format(labels=background.labels(jobs))}
 
 
+#: Claude Code's native question dialog: answerable only from an attached terminal
+NATIVE_QUESTION_TOOL = "AskUserQuestion"
+
+
+def native_question_text(entry: dict[str, Any], with_descriptions: bool = True) -> str:
+    """One `AskUserQuestion` entry as the one paragraph `jarvis wo ask` takes"""
+    header = str(entry.get("header") or "").strip()
+    text = str(entry.get("question") or "").strip()
+    options = []
+    for n, option in enumerate(entry.get("options") or [], start=1):
+        if not isinstance(option, dict):
+            continue
+        label = str(option.get("label") or "").strip()
+        description = str(option.get("description") or "").strip()
+        options.append(f"({n}) {label} — {description}" if with_descriptions and description
+                       else f"({n}) {label}")
+    out = f"[{header}] {text}" if header else text
+    if options:
+        pick = "pick any of" if entry.get("multiSelect") else "pick one of"
+        out += f" Options, {pick}: " + "; ".join(options) + "."
+    return out
+
+
+def native_question_decision(payload: dict[str, Any],
+                             env: dict[str, str]) -> dict[str, Any] | None:
+    """A worker's `AskUserQuestion` becomes Neo questions, never a dialog nobody is attached to answer (docs/superpowers/specs/2026-10-29-a-worker-question-is-a-neo-question.md)"""
+    wo_id = env.get("JARVIS_WO_ID")
+    if payload.get("tool_name") != NATIVE_QUESTION_TOOL or not wo_id:
+        return None
+    from . import ops
+
+    entries = [e for e in (payload.get("tool_input") or {}).get("questions") or []
+               if isinstance(e, dict)]
+    filed: list[str] = []
+    failed: list[str] = []
+    for entry in entries:
+        text = native_question_text(entry)
+        cap = concision.DEFAULT_QUESTION_MAX_CHARS
+        if len(text) > cap:
+            text = native_question_text(entry, with_descriptions=False)[:cap]
+        try:
+            filed.append(f"Q{ops.ask_question(wo_id, text)['question_id']}")
+        except Exception as exc:  # noqa: BLE001
+            failed.append(f"{(entry.get('header') or entry.get('question') or '?')!s}: {exc}")
+
+    why = ("AskUserQuestion opens a dialog only an attached terminal can answer, and nobody "
+           "watches a work-order session: a detach rejects it, which is NOT the user declining.")
+    if filed and not failed:
+        return _deny(f"{why} The OS filed your question(s) for Neo instead: {', '.join(filed)}. "
+                     "Do not re-ask them. End your turn now; each answer arrives as your next "
+                     "user turn. Ask with `jarvis wo ask` from the start next time.")
+    head = f"{why} Filed for Neo: {', '.join(filed)}. " if filed else f"{why} "
+    return _deny(head + "These could not be filed — ask each with `jarvis wo ask "
+                 f"{wo_id} --question-file <file>`, then end your turn: " + " | ".join(failed or
+                 ["the call carried no questions"]))
+
+
 def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     """PreToolUse auto-approvals that keep autonomous workers unattended (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
     tool = payload.get("tool_name")
@@ -1799,6 +1856,9 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         if text_read is not None:
             return text_read
         return doc_nav_decision(payload, env)
+
+    if tool == NATIVE_QUESTION_TOOL:
+        return native_question_decision(payload, env)
 
     # Its own branch for the same reason as `mcp__` below: a delegation enters no other block (§3 of... (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)
     if tool in ("Agent", "Task"):
