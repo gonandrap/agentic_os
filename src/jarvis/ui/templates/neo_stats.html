@@ -2,9 +2,6 @@
 {% import "_bill.html" as bill_ui %}
 {% block title %}Neo stats — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 560px;">
 
 {# §6 of docs/superpowers/specs/2026-10-01-neo-observability.md. No arithmetic here and none in the
    route: every figure comes off `ops.neo_stats_report`, so the terminal and this page can
@@ -258,6 +255,4 @@
   The spend and latency figures are {{ report.floor_reason }}. Question counts are a
   census: every question Neo was asked has a row, so a zero there is measured.
 </p>
-
-</div>
 {% endblock %}

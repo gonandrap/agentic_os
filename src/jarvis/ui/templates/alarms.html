@@ -3,9 +3,6 @@
                              remedy_block %}
 {% block title %}Alarms — Jarvis{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 600px;">
 
 {# Three halves, deliberately not one table. The top is a queue the user empties, the
    middle is what the supervisor already answered on their behalf, and the bottom is the
@@ -131,7 +128,5 @@
     <tr><td colspan="7" class="empty">no cost alarm has ever been raised</td></tr>
     {% endfor %}
   </table>
-</div>
-
 </div>
 {% endblock %}

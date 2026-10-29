@@ -538,6 +538,17 @@ CREATE TABLE IF NOT EXISTS morpheus_items (
     UNIQUE (repo, pr_number)
 );
 CREATE INDEX IF NOT EXISTS idx_morpheus_items_state ON morpheus_items(state);
+-- One row per script run of an item, newest MORPHEUS_RUNS_KEPT kept (docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §3)
+CREATE TABLE IF NOT EXISTS morpheus_runs (
+    id INTEGER PRIMARY KEY,
+    item_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    exit INTEGER,
+    output TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'check',     -- check | probe (a settled item run on demand)
+    state_after TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_morpheus_runs_item ON morpheus_runs(item_id, ts);
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_ts ON steward_decisions(ts);
 CREATE INDEX IF NOT EXISTS idx_os_config_versions_ts ON os_config_versions(ts);
 CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
@@ -569,6 +580,9 @@ CREATE TRIGGER IF NOT EXISTS knowledge_fts_au AFTER UPDATE ON knowledge BEGIN
     VALUES (new.rowid, new.content, new.topic, new.tags);
 END;
 """
+
+# Runs kept per Morpheus item
+MORPHEUS_RUNS_KEPT = 50
 
 # One-time backfill marker, NOT a row count
 FTS_BUILT_KEY = "knowledge_fts_built"
@@ -2074,6 +2088,26 @@ class CentralStore:
         cols = ", ".join(f"{k}=?" for k in fields)
         self.conn.execute(f"UPDATE morpheus_items SET {cols} WHERE id=?",
                           (*fields.values(), item_id))
+
+    def add_morpheus_run(self, item_id: str, *, exit: int | None, output: str,
+                         kind: str = "check", state_after: str = "",
+                         now: float | None = None) -> None:
+        """Record one script run, pruning the item's runs past MORPHEUS_RUNS_KEPT"""
+        with db.write_transaction(self.conn):  # insert + prune commit together: db.write_transaction
+            self.conn.execute(
+                "INSERT INTO morpheus_runs (item_id, ts, exit, output, kind, state_after) "
+                "VALUES (?,?,?,?,?,?)",
+                (item_id, db.now() if now is None else now, exit, output, kind, state_after))
+            self.conn.execute(
+                "DELETE FROM morpheus_runs WHERE item_id=? AND id NOT IN "
+                "(SELECT id FROM morpheus_runs WHERE item_id=? ORDER BY ts DESC, id DESC LIMIT ?)",
+                (item_id, item_id, MORPHEUS_RUNS_KEPT))
+
+    def morpheus_runs(self, item_id: str, limit: int = MORPHEUS_RUNS_KEPT) -> list[dict[str, Any]]:
+        """Newest first"""
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM morpheus_runs WHERE item_id=? ORDER BY ts DESC, id DESC LIMIT ?",
+            (item_id, limit)).fetchall())
 
     def claim_morpheus_action(self, item_id: str, action: str) -> bool:
         """Record the action ONCE: False when another pass already took it"""

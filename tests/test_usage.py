@@ -188,6 +188,19 @@ def test_a_boundary_inside_the_ttl_is_the_prefix_moving_however_little_it_read(
     assert far.rewrite_ttl_share == 1.0
 
 
+def test_an_hour_bought_prefix_is_not_expired_at_five_minutes(transcripts):
+    """Issue #1291: the gap is judged against the TTL the prefix was last written at"""
+    def session(gap_at: str) -> list[dict]:
+        return [row("m1", write=9_000, ttl_1h=9_000, at="2026-08-09T00:00:00.000Z"),
+                row("m2", read=9_000, at="2026-08-09T00:00:02.000Z"),  # a read keeps the hour
+                row("m3", write=9_000, read=10, ttl_1h=9_000, at=gap_at)]
+
+    transcripts("s1", session("2026-08-09T00:11:00.000Z"))   # 11 min: still warm
+    assert usage.read_session("s1", FLOOR).total.boundaries_ttl == 0
+    transcripts("s2", session("2026-08-09T01:05:00.000Z"))   # 65 min: gone
+    assert usage.read_session("s2", FLOOR).total.boundaries_ttl == 1
+
+
 def test_a_long_gap_that_still_read_the_static_prefix_is_not_an_expiry(transcripts):
     """An expired entry leaves NOTHING; a moved prefix still serves the system prompt"""
     transcripts("s1", [
