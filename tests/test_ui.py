@@ -3388,3 +3388,34 @@ def test_a_knowledge_entry_page_shows_the_body_and_pins_back_to_itself(client):
 
 def test_a_gate_page_404s_on_an_unknown_id(client):
     assert client.get("/gates/999").status_code == 404
+
+
+def test_a_gate_number_in_two_projects_lists_both_candidates(client, project, tmp_path):
+    """Approval ids are per project: a bare /gates/<n> must not dead-end"""
+    other = tmp_path / "proj_b"
+    other.mkdir()
+    central = CentralStore()
+    central.upsert_project("proj_b", str(other))
+    central.close()
+    ids = {}
+    for name, path in (("proj_a", project), ("proj_b", other)):
+        store = ProjectStore(path)
+        try:
+            wo = store.create_work_order(f"ship {name}")
+            ids[name] = store.add_approval(wo["id"], "release", f"./ship-{name}.sh")["id"]
+        finally:
+            store.close()
+    n = ids["proj_a"]
+    assert ids["proj_b"] == n
+
+    r = client.get(f"/gates/{n}", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == f"/gates?id={n}"
+
+    page = client.get(f"/gates?id={n}").text
+    assert f'href="/gates/{n}?project=proj_a"' in page
+    assert f'href="/gates/{n}?project=proj_b"' in page
+    assert "nothing matches these filters" not in page
+
+    r = client.get(f"/gates/{n}?project=proj_b")
+    assert r.status_code == 200
+    assert "./ship-proj_b.sh" in r.text and "./ship-proj_a.sh" not in r.text

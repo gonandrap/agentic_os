@@ -1741,7 +1741,7 @@ def create_app() -> FastAPI:
         try:
             g = ops.show_gate(approval_id, project_name=project or None)
         except ops.OpsError as e:
-            if " exists in " in str(e):  # the same number in several projects
+            if not project and sum(g["id"] == approval_id for g in ops.list_gates()) > 1:
                 return RedirectResponse(f"/gates?id={approval_id}", status_code=303)
             return render(request, "error.html", active="gates", message=str(e),
                           status_code=404)
