@@ -1119,7 +1119,7 @@ REWRITE_TTL_ALARM = "rewrite-tax-ttl"
 
 #: THE OTHER AGGREGATE PAIR
 CACHE_1H_DISPATCHED_ALARM = "cache-1h-dispatched"
-#: Historical: no longer raised — it priced the 1h write premium but never the reads it saves (wo-10a5f151)
+#: Historical, never raised now: it priced the 1h premium, not the reads saved (wo-10a5f151)
 CACHE_1H_FOREIGN_ALARM = "cache-1h-foreign"
 
 #: THE STAMP AGAINST THE RATE: an arm that never reached the CLI (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
@@ -1372,7 +1372,7 @@ def one_hour_writes(since: float, *, root: Path | None = None,
                 if entry is None:
                     entry = found[path.stem] = HourWrites(session_id=path.stem,
                                                           directory=path.parent.name)
-                # The record outranks promptSource: a `claude --bg` worker's prompts read "typed" (wo-10a5f151)
+                # The record outranks promptSource: --bg worker prompts read "typed" (wo-10a5f151)
                 arm = _arm_of(arms, path.stem, call.ts)
                 if arm in DELIBERATE_ARMS:
                     entry.deliberate += call.cache_1h
@@ -1406,7 +1406,7 @@ def _name_sessions(found: Sequence[HourWrites], attr: str) -> str:
 
 def hour_alarms(found: Sequence[HourWrites], cfg: InspectConfig, *,
                 days: int) -> list[Alarm]:
-    """What is standing-wrong with the fleet's cache TTL: Jarvis's own 5m-armed turns buying the hour"""
+    """Jarvis's own 5m-armed turns buying the one-hour cache write, fleet-wide"""
     dispatched = sum(e.dispatched for e in found)
     deliberate = sum(e.deliberate for e in found)
     window = f"in the last {days} days"

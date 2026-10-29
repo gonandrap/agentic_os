@@ -1935,13 +1935,20 @@ def create_app() -> FastAPI:
             group = live.setdefault(a["subject_id"], {**a, "alarms": []})
             group["alarms"].append(a)
         every = [r for r in rows if not r["live"]]
-        options = {"kind": filter_options(every, "kind"),
+        for r in every:
+            r["state"] = r["alarm_status"]
+        options = {"state": filter_options(every, "state"),
+                   "kind": filter_options(every, "kind"),
                    "project": filter_options(every, "project")}
         filters = query_filters(request, options)
+        # Gates' order: what a person must decide first, newest first inside each group
+        history = attention_first(filter_rows(every, filters),
+                                  lambda r: r["state"] == "escalated")
+        queue = filter_rows(ops.alarm_review_queue(),
+                            {k: filters.get(k, "") for k in ("kind", "project")})
         return render(request, "alarms.html", active="alarms",
-                      live=list(live.values()),
-                      review_queue=ops.alarm_review_queue(),
-                      history=filter_rows(every, filters), total=len(every),
+                      live=list(live.values()), review_queue=queue,
+                      history=history, total=len(every),
                       filters=filters, options=options, kinds=ALARM_KINDS)
 
     @app.get("/stuck", response_class=HTMLResponse)
