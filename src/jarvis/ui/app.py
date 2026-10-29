@@ -163,15 +163,12 @@ def fmt_ts(ts: float | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
-# The list-page primitives: §2.2 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+# The list-page primitives: §2.2 of... (docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md)
 FREE_TEXT_MAX = 100
 
 
 def query_filters(request: Request, allowed: Mapping[str, Sequence[str]]) -> dict[str, str]:
-    """The named query parameters, stripped and capped; an empty allowed list means free text.
-
-    A value outside its allowed list is kept, so `filter_rows` matches nothing and its chip
-    shows what was asked for (Neo, question 2361): a bad filter never silently shows everything."""
+    """Named query params, capped; an unknown value is kept to match nothing (Q2361)"""
     out: dict[str, str] = {}
     for key in allowed:
         text = (request.query_params.get(key) or "").strip()[:FREE_TEXT_MAX]
