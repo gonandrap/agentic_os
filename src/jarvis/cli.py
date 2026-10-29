@@ -1522,6 +1522,23 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--reason", default="")
     c.add_argument("--catalog")
 
+    # onboard: `questions` and `explain` are added to THIS group (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §0.2)
+    ob = sub.add_parser(
+        "onboard",
+        help="onboard a project: decide what the OS does for it automatically, then "
+             "apply that as one configuration version plus a bootstrap",
+    ).add_subparsers(dest="ob_cmd", required=True)
+
+    c = ob.add_parser(
+        "apply",
+        help="apply an interview's draft: ONE configuration version, then the bootstrap")
+    c.add_argument("--from", dest="draft", required=True, metavar="PATH",
+                   help="the draft file the interview wrote")
+    c.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="what it WOULD change, writing nothing — the confirmation diff")
+    c.add_argument("--catalog")
+    c.add_argument("--json", action="store_true", help="machine-readable output")
+
     # backlog
     bl = sub.add_parser("backlog", help="unified deferred-work backlog").add_subparsers(
         dest="bl_cmd", required=True)
@@ -1686,9 +1703,20 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--level", default="info", choices=["info", "warning", "critical"])
     n.add_argument("--wo-id")
 
-    ib = sub.add_parser("inbox", help="central notification inbox").add_subparsers(
-        dest="ib_cmd", required=False)
-    ib.add_parser("list")
+    ibp = sub.add_parser("inbox", help="central notification inbox")
+    ib = ibp.add_subparsers(dest="ib_cmd", required=False)
+    ibl = ib.add_parser("list")
+    for ibx, sub_level in ((ibp, False), (ibl, True)):
+        # SUPPRESS on `list` so its defaults never overwrite flags given before it
+        d = (lambda v: argparse.SUPPRESS) if sub_level else (lambda v: v)
+        ibx.add_argument("--level", choices=["critical", "warning", "info"], default=d(""),
+                         help="only this criticality")
+        ibx.add_argument("--project", default=d(""), help="only this project")
+        ibx.add_argument("--search", "-s", default=d(""),
+                         help="words that must all appear in title, body or wo id")
+        ibx.add_argument("--sort", choices=["priority", "newest", "oldest"],
+                         default=d("priority"),
+                         help="priority (default) = critical first, newest first within a level")
     i = ib.add_parser("ack")
     i.add_argument("inbox_id", nargs="?", type=int, help="omit to ack everything")
 
@@ -4846,6 +4874,38 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_onboard(args: argparse.Namespace) -> int:
+    from . import ops
+
+    # The group handler, so a sibling adding `start` branches here as `cmd_config` does
+    if args.ob_cmd != "apply":
+        return 0
+    data = ops.onboard_apply(args.draft, catalog_path=args.catalog,
+                             dry_run=args.dry_run)
+    if args.json:
+        _print(data, True)
+        return 0
+
+    head = "would onboard" if args.dry_run else "✓ onboarded"
+    print(f"{head} {data['project']}: {len(data['changes'])} setting(s)")
+    for change in data["changes"]:
+        print(f"  {_cfg_change(change)}")
+    if not data["changes"]:
+        print("  (every answer was the shipped default — the document stays silent)")
+    if args.dry_run:
+        print("\n(dry run — nothing was written)")
+        return 0
+    print(f"  {data['version']['id']}"
+          + ("" if data["changed"] else "  (the document was already this — "
+                                        "no new version)"))
+    for warning in data["bootstrap"]["warnings"]:
+        print(f"  ⚠ {warning}")
+    if data["restart_needed"]:
+        print(f"\nnext: jarvis start --catalog {data['catalog']}")
+        print(f"  {data['restart_why']}")
+    return 0
+
+
 def _backlog_origin(item: dict) -> str:
     """One line saying where a deferred item came from, or "" for one somebody typed"""
     bits = []
@@ -5546,7 +5606,8 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         if args.ib_cmd == "ack":
             _print(ops.ack_inbox(args.inbox_id), args.json)
         else:
-            items = central.unacked_inbox()
+            items = ops.select_inbox(central.unacked_inbox(), level=args.level,
+                                     project=args.project, q=args.search, sort=args.sort)
             if args.json:
                 _print(items, True)
             else:
@@ -5555,7 +5616,8 @@ def cmd_inbox(args: argparse.Namespace) -> int:
                           f"{it['title']} ({_age(it['ts'])})"
                           + (f" — {it['body']}" if it["body"] else ""))
                 if not items:
-                    print("inbox empty ✨")
+                    print("nothing matches these filters" if args.level or args.project
+                          or args.search else "inbox empty ✨")
     finally:
         central.close()
     return 0

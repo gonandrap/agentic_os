@@ -3194,6 +3194,11 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = candidate
     if newest is None:
         return None
+    # A hold names ONE assumption: list every still-pending one the OS declined
+    if newest["kind"] == "autoreview_held":
+        held = _held_pending(store, wo["id"], stale)
+        if len(held) > 1:
+            newest = {**newest, "held": held}
     # An ask is a claim about a question
     if newest["kind"] == "autoreview_asked":
         gone = _unreachable_asks()(newest.get("neo_question_id"))
@@ -3208,6 +3213,23 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = {**newest, "resolved_status": status,
                       "resolved_decider": assumption_decider(row or {})}
     return {**newest, "line": _autoreview_line(newest)}
+
+
+def _held_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[dict[str, Any]]:
+    """The newest live hold per assumption still pending, in assumption order"""
+    from . import db
+
+    pending = {int(a["id"]): a for a in store.pending_assumptions(wo_id)}
+    latest: dict[int, dict[str, Any]] = {}
+    for row in store.events_of_kind(wo_id, "autoreview_held"):
+        payload = db.from_json(row["payload"], {})
+        aid = int(payload.get("assumption_id") or 0)
+        if aid in pending and not stale("autoreview_held", payload):
+            latest[aid] = {"assumption_id": aid,
+                           "n": payload.get("n") or pending[aid].get("n"),
+                           "code": payload.get("code"),
+                           "reason": str(payload.get("reason") or "")}
+    return sorted(latest.values(), key=lambda h: int(h.get("n") or 0))
 
 
 def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
@@ -3790,6 +3812,15 @@ def _autoreview_line(state: dict[str, Any]) -> str:
     if kind == "autoreview_unconfirmed":
         return (f"assumption #{n} left with you — the OS did not confirm its early "
                 f"reading: {state.get('reason') or 'no reason recorded'}{since}")
+    held = state.get("held") or []
+    if len(held) > 1:
+        # Grouped by reason, so ten holds on the same word read as one clause
+        groups: dict[str, list[str]] = {}
+        for h in held:
+            why = re.sub(r"^assumption #\d+ ", "", h["reason"]) or "no reason recorded"
+            groups.setdefault(why, []).append(f"#{h.get('n')}")
+        return (f"held — the OS would not decide {len(held)} assumptions: "
+                + "; ".join(f"{', '.join(ns)} {why}" for why, ns in groups.items()))
     return f"held — {state.get('reason') or 'no reason recorded'}"
 
 
@@ -6034,6 +6065,26 @@ def ack_inbox(inbox_id: int | None = None) -> dict[str, Any]:
         finally:
             store.close()
     return {"acked": n, "attention_lowered": lowered, "attention_kept": kept}
+
+
+INBOX_LEVELS = ("critical", "warning", "info")
+INBOX_SORTS = ("priority", "newest", "oldest")
+
+
+def select_inbox(items: list[dict[str, Any]], *, level: str = "", project: str = "",
+                 q: str = "", sort: str = "priority") -> list[dict[str, Any]]:
+    """Filter and order unacked inbox rows; `priority` is critical first, newest first within a level"""
+    words = q.lower().split()
+    out = [it for it in items
+           if (not level or it["level"] == level)
+           and (not project or it["project"] == project)
+           and all(w in f"{it['title']} {it.get('body') or ''} {it.get('wo_id') or ''}".lower()
+                   for w in words)]
+    out.sort(key=lambda it: it["ts"], reverse=sort != "oldest")
+    if sort == "priority":
+        rank = {lv: i for i, lv in enumerate(INBOX_LEVELS)}
+        out.sort(key=lambda it: rank.get(it["level"], len(rank)))
+    return out
 
 
 def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -10995,6 +11046,95 @@ def unset_config(path: str, project: str | None = None, *, reason: str = "",
     return {"version": row, "changed": True, "path": key, "value": after.get(key),
             "change": changes[0], "apply": apply_class(key), "note": apply_note(key),
             "safety": safety_key(key), "catalog": str(file)}
+
+
+def onboard_apply(draft_path: str, *, catalog_path: str | None = None,
+                  dry_run: bool = False) -> dict[str, Any]:
+    """Apply one onboarding interview: ONE config version, then the bootstrap, then the restart (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §3)"""
+    from . import bootstrap, onboard_draft
+
+    _refuse_worker_write("onboard apply")
+    try:
+        draft = onboard_draft.load(draft_path)
+    except onboard_draft.DraftError as e:
+        raise OpsError(str(e)) from None
+
+    project_path = Path(draft.project.path).expanduser().resolve()
+    if not project_path.is_dir():
+        raise OpsError(f"{project_path} is not a directory — onboarding configures a "
+                       f"project that already exists on disk")
+    if not (project_path / ".git").exists():
+        raise OpsError(f"not a git repository: {project_path} — run `git init` there "
+                       f"first, then onboard it")
+
+    file = _catalog_file(catalog_path)
+    document = _read_document(file)
+    entry = next((p for p in document.get("projects", [])
+                  if isinstance(p, dict) and p.get("name") == draft.project.name), None)
+    if entry is not None:
+        known = Path(str(entry.get("path") or ".")).expanduser().resolve()
+        if known != project_path:
+            raise OpsError(
+                f"{draft.project.name} already names {known} in the catalog, not "
+                f"{project_path} — onboard it under another name, or move the project "
+                f"with `jarvis config set {draft.project.name} path <dir>`")
+
+    before = _resolved_of(document, file)
+    was = config_version.version_id(document)
+    try:
+        candidate = onboard_draft.candidate_document(draft, document)
+    except onboard_draft.DraftError as e:
+        raise OpsError(str(e)) from None
+    problems = onboard_draft.validate(draft, document)
+    if problems:
+        raise OpsError("this draft does not produce a valid catalog:\n  "
+                       + "\n  ".join(problems))
+
+    after = _resolved_of(candidate, file)
+    changes = config_version.diff(before, after)
+    for change in changes:
+        _refuse_os_sweep_off(change["path"], candidate, after, file)
+    _require_reason(changes, draft.reason,
+                    f'set "reason" in {draft_path} — the user\'s own words for why '
+                    f"these settings are what they are — and apply it again")
+
+    classes = {c["path"]: apply_class(c["path"]) for c in changes}
+    restart_why = ""
+    if entry is None:
+        restart_why = (
+            f"{draft.project.name} is a NEW project, and `Daemon.reload_catalog` refuses "
+            f"to reload at all when the set of project names changes — so the project "
+            f"does not exist for the daemon, and every other setting change in this "
+            f"file stays frozen, until you run `jarvis start`")
+    elif "restart" in classes.values():
+        cold = sorted(p for p, cls in classes.items() if cls == "restart")
+        restart_why = f"{', '.join(cold[:3])} only take effect on a restart"
+    payload = {"changed": config_version.version_id(candidate) != was,
+               "changes": changes, "apply": classes,
+               "restart_needed": bool(restart_why), "restart_why": restart_why,
+               "project": draft.project.name, "catalog": str(file)}
+    if dry_run:
+        return {"version": None, "bootstrap": None, **payload}
+
+    row = _commit_document(candidate, path=file, actor="onboard", reason=draft.reason,
+                           changes=changes)
+    # Bootstrap from what was COMMITTED, never from a hand-built spec (§3 step 6)
+    spec = next(p for p in parse_catalog(json.loads(json.dumps(candidate)),
+                                         source_path=file).projects
+                if p.name == draft.project.name)
+    report = bootstrap.bootstrap_project(spec)
+    central = CentralStore()
+    try:
+        # A catalog entry with no `projects` row is invisible to `jarvis status` (§3 step 7)
+        central.upsert_project(name=spec.name, path=str(spec.path),
+                               description=spec.description, model=spec.model,
+                               catalog_json=json.dumps(spec.raw))
+    finally:
+        central.close()
+    return {"version": row,
+            "bootstrap": {"project": report.project, "actions": report.actions,
+                          "warnings": report.warnings},
+            **{**payload, "changed": row["id"] != was}}
 
 
 def config_get(path: str, project: str | None = None,
