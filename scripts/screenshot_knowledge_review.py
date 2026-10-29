@@ -103,7 +103,9 @@ def shoot() -> list[Path]:
         page = browser.new_page(viewport={"width": 1600, "height": 1000})
         errors: list[str] = []
         page.on("pageerror", lambda e: errors.append(str(e)))
-        page.goto(f"http://127.0.0.1:{PORT}/knowledge/review")
+        # Canvas renderer: headless Chromium's WebGL is software (SwiftShader) and too slow
+        # to drive; hit-testing and the drag/drop code are the same under either renderer.
+        page.goto(f"http://127.0.0.1:{PORT}/knowledge/review?webgl=0")
         drawn(page)
         out.append(SHOTS / "knowledge-review.png")
         page.screenshot(path=out[-1])

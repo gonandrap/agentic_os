@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -45,6 +46,10 @@ TEMPLATES = Path(__file__).parent / "templates"
 # Third-party browser code, shipped in the package so no page loads a CDN (vendor/README.md)
 VENDOR = Path(__file__).parent / "vendor"
 VENDORED = frozenset(p.name for p in VENDOR.glob("*.js"))
+# `?v=<content hash>` on every vendored URL: `/vendor/` is cached for an hour, and an
+# upgraded library must reach a browser that still holds the old one
+VENDOR_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+                  for p in VENDOR.glob("*.js")}
 
 
 # -- the knowledge review's JSON bodies (`/knowledge/review/*`)
@@ -1517,7 +1522,7 @@ def create_app() -> FastAPI:
     def knowledge_review(request: Request):
         """The graph editor; it draws from `/knowledge/review.json`"""
         return render(request, "knowledge_review.html", active="knowledge",
-                      link_rels=KB_LINK_RELS)
+                      link_rels=KB_LINK_RELS, vendor_v=VENDOR_VERSION)
 
     @app.get("/knowledge/review.json")
     def knowledge_review_json(retired: str = "") -> JSONResponse:

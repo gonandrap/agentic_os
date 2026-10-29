@@ -6,7 +6,7 @@ review page (`/knowledge/review`) draws with these, served by `/vendor/<file>` i
 
 | File | Package | Version | License | Source |
 |---|---|---|---|---|
-| `cytoscape.min.js` | cytoscape | 3.30.2 | MIT | https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js |
+| `cytoscape.min.js` | cytoscape | 3.34.4 | MIT | https://cdn.jsdelivr.net/npm/cytoscape@3.34.4/dist/cytoscape.min.js |
 | `layout-base.js` | layout-base | 2.0.1 | MIT | https://cdn.jsdelivr.net/npm/layout-base@2.0.1/layout-base.js |
 | `cose-base.js` | cose-base | 2.2.0 | MIT | https://cdn.jsdelivr.net/npm/cose-base@2.2.0/cose-base.js |
 | `cytoscape-fcose.js` | cytoscape-fcose | 2.2.0 | MIT | https://cdn.jsdelivr.net/npm/cytoscape-fcose@2.2.0/cytoscape-fcose.js |
@@ -27,7 +27,7 @@ To upgrade: download the new file over the old one, update the table, and re-run
 sha256 (as vendored):
 
 ```
-83e8c54a6bec655bfd81df07df605649c268af69aeca67a5ea2da54ea42dac81  cytoscape.min.js
+081591ab735b2b6a3b31a3c60f8f3a3e2fee8c92939e0c7820ad1208571b6cd8  cytoscape.min.js
 ec15ab5df9af3f20708f4faab994accf91cda71848cd5bb10a23432cc50b6745  layout-base.js
 7cae9509bd36235a63a85e71c8d9fa2cd0bc1d0c1ecc5b5a737976f39d040ddf  cose-base.js
 4b1cab218d74996aa59cd8473f9239cc6398b8c1774d84d7e59ad9a68959cb57  cytoscape-fcose.js
