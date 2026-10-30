@@ -242,6 +242,12 @@ class NeoStore:
                 f"ask again, referencing what you would have pasted",
                 question_chars=len(question), context_chars=len(context),
                 ceiling=ceiling)
+        from .central_store import CentralStore
+        central = CentralStore()
+        try:
+            central.require_project(project)
+        finally:
+            central.close()
         cur = self.conn.execute(
             "INSERT INTO questions (ts, project, wo_id, question, context, kind) "
             "VALUES (?,?,?,?,?,?)",

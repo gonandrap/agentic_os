@@ -6978,7 +6978,7 @@ class Daemon:
         start = issues.START_COMMAND.format(url=out["issue_url"])
         if out["outcome"] == "unconfirmed":
             central.add_inbox(
-                project=q.get("project") or "os", level="warning",
+                project=q.get("project") or self._os_project() or "os", level="warning",
                 title=f"a `{out['claimed']}` bug report is UNCONFIRMED",
                 body=(f"{out['issue_url']}\nNeo could not settle the priority "
                       f"({head}), so NOTHING was dispatched and no release was cut. The "
@@ -6986,7 +6986,7 @@ class Daemon:
                       f"with `{start}` if you agree with the rating.\n{full}"))
         elif out["outcome"] == "downgraded":
             central.add_inbox(
-                project=q.get("project") or "os", level="info",
+                project=q.get("project") or self._os_project() or "os", level="info",
                 title=f"Neo downgraded a `{out['claimed']}` bug to "
                       f"`{out['settled']}`",
                 body=(f"{out['issue_url']}\n{head}\n"

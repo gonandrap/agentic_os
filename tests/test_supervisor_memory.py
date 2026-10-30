@@ -9,6 +9,8 @@ from jarvis import ops, supervisor
 from jarvis.neo_store import LEARNING_SCOPES, SEATS, SUPERVISOR_SEAT, NeoStore
 from jarvis.project_store import ProjectStore
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
     """The registered fleet `ops.review_alarm` reads projects out of"""

@@ -254,7 +254,7 @@ def _gate_whose_reviewer_died(store: ProjectStore, cause: str = "transport-unrea
     return wo, approval, q
 
 
-def test_a_gate_whose_neo_question_died_comes_to_the_user(project):
+def test_a_gate_whose_neo_question_died_comes_to_the_user(project, neo_projects):
     """Issue #1261: nobody holds the request, so no surface may claim a verdict is coming"""
     store = ProjectStore(project)
     wo, approval, q = _gate_whose_reviewer_died(store)
@@ -275,7 +275,7 @@ def test_a_gate_whose_neo_question_died_comes_to_the_user(project):
         "gate_escalated")
 
 
-def test_a_gate_still_with_neo_is_left_alone(project):
+def test_a_gate_still_with_neo_is_left_alone(project, neo_projects):
     """The whole point of the gate: while a reviewer really is holding it"""
     store = ProjectStore(project)
     _, approval, _ = _gate_whose_reviewer_died(store, cause="")
@@ -293,7 +293,7 @@ def test_a_gate_still_with_neo_is_left_alone(project):
     assert not store.get_approval(approval["id"])["escalated"]
 
 
-def test_a_dead_reviewer_is_reported_but_not_escalated_in_reporting_mode(project):
+def test_a_dead_reviewer_is_reported_but_not_escalated_in_reporting_mode(project, neo_projects):
     store = ProjectStore(project)
     _, approval, _ = _gate_whose_reviewer_died(store)
 

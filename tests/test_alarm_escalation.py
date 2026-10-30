@@ -15,6 +15,8 @@ from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 #: Put in a work order's description
 ESCALATE = "FORCE_SUPERVISOR_ESCALATE"
 

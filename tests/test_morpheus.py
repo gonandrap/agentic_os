@@ -14,6 +14,8 @@ from jarvis.catalog import Catalog, CatalogError, MorpheusConfig, OsConfig, pars
 from jarvis.central_store import CentralStore
 from jarvis.testing import TEST_EPOCH
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAY = 86400
 

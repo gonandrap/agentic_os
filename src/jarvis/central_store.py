@@ -710,6 +710,10 @@ PROVENANCE_TABLES = ("detectors", "gate_rules")
 OS_PROJECT_NAMES = frozenset({"", "os"})
 
 
+class UnknownProjectError(ValueError):
+    pass
+
+
 def spelled_like(name: str, registered: Iterable[str]) -> str | None:
     """The one registered name `name` mistypes (case, '-' for '_'), or None when none or several do"""
     def key(s: str) -> str:
@@ -942,6 +946,16 @@ class CentralStore:
                 self.retract_detector(detector_id, f"project {name} purged from the OS")
             counts["detectors_retracted"] = len(live)
         return counts
+
+    def require_project(self, name: str) -> str:
+        """Refuse a row under a project the OS does not know (issue #1333)"""
+        if name in OS_PROJECT_NAMES or self.get_project(name):
+            return name
+        known = [p["name"] for p in self.list_projects()]
+        guess = spelled_like(name, known)
+        hint = f" Did you mean {guess!r}?" if guess else ""
+        raise UnknownProjectError(f"unknown project {name!r}.{hint} Registered projects: "
+                                  f"{', '.join(known) or '(none)'}")
 
     def record_offboard(self, name: str, reason: str = "") -> None:
         self.conn.execute(

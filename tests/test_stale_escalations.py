@@ -12,6 +12,8 @@ from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 
 @pytest.fixture()
 def store(project):

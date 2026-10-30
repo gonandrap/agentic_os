@@ -8,6 +8,7 @@ import pytest
 
 from jarvis import gates
 from jarvis import neo as neo_mod
+from jarvis.testing import register_projects
 from jarvis.neo_store import NeoStore
 
 pytestmark = [
@@ -83,6 +84,7 @@ def verdicts(tmp_path_factory):
     """One drain over the whole battery (mirrors production: FIFO, shared prefix)"""
     home = tmp_path_factory.mktemp("gate-llm-home")
     os.environ["JARVIS_HOME"] = str(home)
+    register_projects("evalproj")
     store = NeoStore(home / "neo.db")
     try:
         return {name: _review(store, command, why)
@@ -138,6 +140,7 @@ RELEASE_EVIDENCE = [
 def release_verdicts(tmp_path_factory):
     home = tmp_path_factory.mktemp("gate-release-home")
     os.environ["JARVIS_HOME"] = str(home)
+    register_projects("evalproj")
     store = NeoStore(home / "neo.db")
     action = gates.classify("./scripts/shipit.sh --stage 0.5.4 --wo wo-eval02",
                             gates.GateConfig(enabled=frozenset(gates.KIND_NAMES)))
@@ -250,6 +253,7 @@ CONTESTS = [
 def contest_verdicts(tmp_path_factory):
     home = tmp_path_factory.mktemp("gate-contest-home")
     os.environ["JARVIS_HOME"] = str(home)
+    register_projects("evalproj")
     store = NeoStore(home / "neo.db")
     try:
         out = {}

@@ -8,6 +8,8 @@ from jarvis import autoreview
 from jarvis import neo as neo_mod
 from jarvis.neo_store import NeoStore
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 COMPOUND = ("6.2 item 5 gets no guard here: section 7 step 2 closes it. Also: "
             "_supervisor_config already falls back on CatalogError.")
 ATOMIC = "_supervisor_config already falls back to SupervisorConfig on CatalogError."

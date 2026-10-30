@@ -5683,13 +5683,17 @@ def cmd_notify(args: argparse.Namespace) -> int:
             store.close()
         _print({"queued": True, "project": project, "via": "project outbox"}, args.json)
     else:
+        from .ops import os_inbox_project
         central = CentralStore()
         try:
-            central.add_inbox(project or "os", args.title, body=args.body,
+            # A checkout's directory name is not a registered project
+            if not (project and central.get_project(project)):
+                project = os_inbox_project()
+            central.add_inbox(project, args.title, body=args.body,
                               level=args.level, wo_id=args.wo_id)
         finally:
             central.close()
-        _print({"queued": True, "project": project or "os",
+        _print({"queued": True, "project": project,
                 "via": "central inbox"}, args.json)
     return 0
 

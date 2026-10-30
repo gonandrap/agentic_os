@@ -8,7 +8,7 @@ import pytest
 
 from jarvis import invariants, morpheus, ops
 from jarvis.catalog import MorpheusConfig
-from jarvis.central_store import ARCHIVED, CentralStore
+from jarvis.central_store import ARCHIVED, CentralStore, UnknownProjectError
 from jarvis.neo_store import NeoStore
 
 COND = {"field": "status", "op": "eq", "value": "needs_review"}
@@ -33,6 +33,14 @@ def _queue(central, project, *, deadline_ts=0.0):
         project=project, repo="o/r", pr_number=7, pr_url="", pr_title="t", wo_id="",
         release_tag="", hints="", script="", script_source="", state="queued",
         deadline_ts=deadline_ts)
+
+
+def _left_behind_question(central, neo, name):
+    """A question `ask` would now refuse: written while `name` was registered, which it no longer is"""
+    central.upsert_project(name, f"/tmp/{name}")
+    q = neo.ask(name, "wo-1", "which way?")
+    central.delete_project(name)
+    return q
 
 
 def offboarded() -> list:
@@ -74,7 +82,7 @@ def test_repair_repoints_a_typo_to_the_one_registered_spelling(central, neo):
     central.upsert_project("jarvis_os", "/tmp/jarvis_os")
     item = central.add_backlog("jarvis-os", "filed with a hyphen")
     inbox_id = central.add_inbox("Jarvis-OS", "and odd case")
-    q = neo.ask("jarvis-os", "wo-1", "which way?")
+    q = _left_behind_question(central, neo, "jarvis-os")
 
     found = offboarded()
     assert {v.invariant for v in found} == {"INV-UNKNOWN-PROJECT"}
@@ -85,6 +93,25 @@ def test_repair_repoints_a_typo_to_the_one_registered_spelling(central, neo):
     assert central.get_inbox(inbox_id)["project"] == "jarvis_os"
     assert neo.get(q["id"])["project"] == "jarvis_os"
     assert offboarded() == []
+
+
+def test_neo_refuses_a_question_under_an_unknown_project(central, neo):
+    central.upsert_project("jarvis_os", "/tmp/jarvis_os")
+
+    with pytest.raises(UnknownProjectError, match="Did you mean 'jarvis_os'"):
+        neo.ask("jarvis-os", "wo-1", "which way?")
+    assert neo.ask("os", "", "the OS's own question")["project"] == "os"
+
+
+def test_a_row_about_the_os_takes_its_registered_name_and_os_only_before_start(monkeypatch):
+    monkeypatch.setattr(morpheus, "_os_project", lambda catalog: "jarvis_os")
+    monkeypatch.setattr(ops, "resolve_catalog", lambda *a, **kw: object())
+    assert ops.os_inbox_project() == "jarvis_os"
+
+    def no_catalog(*a, **kw):
+        raise ops.OpsError("no catalog")
+    monkeypatch.setattr(ops, "resolve_catalog", no_catalog)
+    assert ops.os_inbox_project() == "os"
 
 
 def test_an_ambiguous_typo_is_never_repointed(central):
@@ -126,8 +153,10 @@ def test_a_clean_archive_is_never_a_violation(central, neo, seed, archived):
         central.set_project_status("proj_b", ARCHIVED)
     if seed == "morpheus":
         _queue(central, "proj_b", deadline_ts=9e12)
-    elif seed == "question":
+    elif seed == "question" and archived:
         neo.ask("proj_b", "wo-1", "which way?")
+    elif seed == "question":
+        _left_behind_question(central, neo, "proj_b")
     else:
         central.arm_detector(
             central.add_detector("scoped-gap", COND, project="proj_b", source="user")["id"],
@@ -150,7 +179,7 @@ def test_morpheus_sweep_leaves_an_archived_projects_item_alone(central, tmp_path
     assert central.morpheus_item(item["id"])["state"] == "timedout"
 
 
-def test_neo_never_claims_an_archived_projects_question(neo):
+def test_neo_never_claims_an_archived_projects_question(neo, neo_projects):
     neo.ask("proj_b", "wo-1", "older, offboarded")
     mine = neo.ask("proj_a", "wo-2", "newer, live")
 

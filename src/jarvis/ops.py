@@ -46,7 +46,7 @@ from .agent_usage import (
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import (ARCHIVED, MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES,
-                            CentralStore, spelled_like)
+                            CentralStore, UnknownProjectError)
 from .daemon import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
@@ -826,13 +826,22 @@ def registered_project_paths(*, include_archived: bool = False) -> dict[str, Pat
 
 def require_registered_project(name: str) -> str:
     """Refuse a row under a project the OS does not know (issue #1333)"""
-    known = registered_project_paths(include_archived=True)
-    if name in known:
-        return name
-    guess = spelled_like(name, known)
-    hint = f" Did you mean {guess!r}?" if guess else ""
-    raise OpsError(f"unknown project {name!r}.{hint} Registered projects: "
-                   f"{', '.join(sorted(known)) or '(none)'}")
+    central = CentralStore()
+    try:
+        return central.require_project(name)
+    except UnknownProjectError as e:
+        raise OpsError(str(e)) from None
+    finally:
+        central.close()
+
+
+def os_inbox_project() -> str:
+    """The OS project's registered name for a row about the OS itself; 'os' only with no catalog"""
+    from .morpheus import _os_project
+    try:
+        return _os_project(resolve_catalog())
+    except (OpsError, CatalogError):
+        return "os"
 
 
 MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
