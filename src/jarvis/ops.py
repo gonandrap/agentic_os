@@ -4379,18 +4379,21 @@ BOUNCE_EXHAUSTED = (
 
 
 def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id: int,
-                              n: int, reason: str, *, cause: str) -> None:
+                              n: int, reason: str, *, cause: str,
+                              user_action: str = "") -> None:
     """Give up on this unit and ask the user (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §2)"""
     from .daemon import escalation_body
-    from .invariants import VALIDATION_STUCK_BLOCKER
+    from .invariants import VALIDATION_STUCK_BLOCKER, user_action_blocker
 
     wo_id = wo["id"]
     store.settle_validation_round(
         round_id, "escalated",
-        {"round": n, "round_id": round_id, "reason": reason, "cause": cause},
+        {"round": n, "round_id": round_id, "reason": reason, "cause": cause,
+         **({"user_action": user_action} if user_action else {})},
         wo_id=wo_id, reason=reason)
     store.set_status(wo_id, "needs_review")
-    store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
+    store.flag_attention(wo_id, user_action_blocker(user_action) if user_action
+                         else VALIDATION_STUCK_BLOCKER)
     store.add_notification(
         # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §3
         title=ESCALATION_TITLE.format(
@@ -5216,8 +5219,8 @@ def unlanded_refusal(wo: dict[str, Any], summary: str, work: landing.Authored) -
 
 
 def finish(wo_id: str, summary: str, pr_url: str | None = None,
-           evidence: str = "", abandon: str = "", superseded_by: str = ""
-           ) -> dict[str, Any]:
+           evidence: str = "", abandon: str = "", superseded_by: str = "",
+           needs_user: str = "") -> dict[str, Any]:
     """The worker reporting its own result (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §1)"""
     name, path, _wo = find_work_order(wo_id)
     superseded_by = (superseded_by or "").strip()
@@ -5254,6 +5257,8 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                         {"summary": summary,
                          **({"pr_url": pr_url} if pr_url else {}),
                          **({"evidence": evidence} if evidence else {}),
+                         **({"needs_user": needs_user.strip()}
+                            if needs_user.strip() else {}),
                          **({"authored": work.record()} if work.base else {})})
         if superseded_by:
             # Morpheus follows it to the order that carries a confirmed failure's fix (#1307)
@@ -5735,6 +5740,8 @@ ESCALATION_VALIDATOR_UNREACHABLE = "validator_unreachable"
 ESCALATION_PROMPT_REFUSED = "prompt_refused"
 #: A KILL IS NOT AN OUTAGE: the seats were reached and were killed by a signal (docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md §4)
 ESCALATION_PANEL_KILLED = "panel_killed"
+#: Nothing to judge BECAUSE what is left is a command only the user may run (#1352)
+ESCALATION_USER_ACTION = "user_action"
 #: READ-TIME FALLBACK, never written by any call site: every `validation_escalated` event written...
 ESCALATION_CAUSE_UNRECORDED = "unrecorded"
 
@@ -5745,6 +5752,7 @@ ESCALATION_FAMILY: dict[str, str] = {
     ESCALATION_REBINDS_SPENT: "handover",
     ESCALATION_BOUNCE_EXHAUSTED: "not_reviewed",
     ESCALATION_NOTHING_TO_JUDGE: "not_reviewed",
+    ESCALATION_USER_ACTION: "not_reviewed",
     ESCALATION_REPEAT_SUBMISSION: "not_reviewed",
     ESCALATION_NO_VERDICT: "unjudged",
     ESCALATION_VALIDATOR_UNREACHABLE: "unjudged",
@@ -5771,6 +5779,9 @@ ESCALATION_WHY: dict[str, str] = {
     ESCALATION_NOTHING_TO_JUDGE:
         "the submission changed no files and recorded no other durable effect, so no "
         "seat judged it.",
+    ESCALATION_USER_ACTION:
+        "the submission changed no files because what is left is a command only you "
+        "may run, so no seat judged it.",
     ESCALATION_REPEAT_SUBMISSION:
         "the submission was identical to the preceding round, so the panel had nothing "
         "new to judge.",
@@ -15347,5 +15358,22 @@ def morpheus_requeue(item_id: str) -> dict[str, Any]:
     finally:
         central.close()
     _close_validation_questions(item_id, f"The user put {item_id} back on the watch list",
+                                f"decided by the user on {item_id} itself")
+    return item
+
+
+def morpheus_rewrite(item_id: str, why: str) -> dict[str, Any]:
+    """The user rules the script wrong: Morpheus writes a new one from `why` (#1358)"""
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        item = morpheus.rewrite(central, _morpheus_catalog().os.morpheus, item_id, why)
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+    _close_validation_questions(item_id, f"The user sent {item_id}'s script back to be "
+                                         f"rewritten: {why.strip()}",
                                 f"decided by the user on {item_id} itself")
     return item

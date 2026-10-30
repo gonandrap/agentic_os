@@ -1555,16 +1555,26 @@ elif argv[:2] in (["pr", "close"], ["pr", "reopen"]):
     print(f"{state.title()} pull request {url}")
 elif argv[:2] == ["api", "--method"]:
     # The API reads the OS makes — a commit (its parents, or its subject), a branch's
-    # protection, and the repository's default branch name. Anything else is an unhandled
-    # argv, deliberately, so a FOURTH shape cannot appear here without the fixture
-    # noticing.
+    # protection, the repository's default branch name, and its workflow count. Anything
+    # else is an unhandled argv, deliberately, so a FIFTH shape cannot appear here
+    # without the fixture noticing.
     path = argv[3] if len(argv) > 3 else ""
     jq = argv[argv.index("--jq") + 1] if "--jq" in argv else ""
     repo_path = "/".join(path.split("/")[:3]) if path.startswith("repos/") else ""
     if argv[2] != "GET" or not ("/commits/" in path or path.endswith("/protection")
+                                or path == repo_path + "/actions/workflows"
                                 or (path == repo_path and jq == ".default_branch")):
         sys.stderr.write(f"fake gh: unhandled api call {argv}\n")
         sys.exit(2)
+    if path.endswith("/actions/workflows"):
+        # Unregistered repositories have CI, which is what every older test assumed
+        try:
+            with open(os.path.join(state_dir, "workflows.json")) as f:
+                counts = json.load(f)
+        except (OSError, ValueError):
+            counts = {}
+        print(counts.get(repo_path.removeprefix("repos/"), 1))
+        sys.exit(0)
     if jq == ".default_branch":
         # The repository's own default branch. Unregistered answers GitHub's 404, which
         # is what an origin pointing at a repository nobody created really does.
@@ -2208,6 +2218,13 @@ def fake_gh(tmp_path, monkeypatch):
             rules = json.loads(path.read_text()) if path.exists() else {}
             rules[branch] = list(checks)
             path.write_text(json.dumps(rules))
+
+        def set_workflows(self, repo: str, count: int) -> None:
+            """What `gh api repos/<owner>/<repo>/actions/workflows` counts; unset is 1"""
+            path = gdir / "workflows.json"
+            rows = json.loads(path.read_text()) if path.exists() else {}
+            rows[repo] = count
+            path.write_text(json.dumps(rows))
 
         def refuse_protection(self, message: str) -> None:
             """Fail the protection read and NOTHING else — a 403, say"""
