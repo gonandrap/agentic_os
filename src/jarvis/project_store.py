@@ -190,7 +190,7 @@ VALIDATION_OPINION_STATUSES = ("ok", "abstained", "failed")
 
 # How the work order entered the system. jarvis/ui follow the framework (docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md §5)
 WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo", "schedule",
-              "fleet_health")
+              "fleet_health", "os")
 
 # Origins whose session Jarvis did not dispatch: it belongs to the user
 UNGOVERNED_ORIGINS = ("adhoc", "injected")
@@ -2482,7 +2482,7 @@ class ProjectStore:
                 wo = self.create_work_order(
                     title=child["title"],
                     description=child["description"],
-                    origin="jarvis",
+                    origin="os",
                     depends_on=[by_key[k] for k in child["needs"] if k in by_key],
                     parent_id=fo_id,
                     spec_section=child.get("spec_section"),
@@ -2505,7 +2505,7 @@ class ProjectStore:
                 f"files ordinary work orders under the feature when something has to "
                 f"change. Between messages it is idle, and that is correct."
             ),
-            origin="jarvis",
+            origin="os",
             parent_id=fo_id,
             kind="manager",
         )

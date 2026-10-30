@@ -51,6 +51,9 @@
 
 {% macro row_id(id, href) %}<a class="rowid" href="{{ href }}">{{ id }}</a>{% endmacro %}
 
+{# `ops.wo_tags`: the project first, then bug/expedite, then automatic|manual #}
+{% macro wo_tags(tags) %}{% for t in tags %}<span class="badge {{ 'framework' if loop.first else 'outside' if t in ('bug', 'expedite') }}">{{ t }}</span> {% endfor %}{% endmacro %}
+
 {% macro explain(summary) %}
 <details class="explain"><summary>{{ summary }}</summary>{{ caller() }}</details>
 {% endmacro %}

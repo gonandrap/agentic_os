@@ -626,7 +626,7 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
                 spec, {"issue_url": issue_url, "title": title, "body": body,
                        # NO RELEASE OFF AN UNCONFIRMED CLAIM
                        "priority": "" if dispatches(priority) else priority},
-                metadata={EXPEDITED_KEY: True},
+                metadata={EXPEDITED_KEY: True}, origin="jarvis",
                 why=EXPEDITED_WHY.format(
                     priority=priority,
                     tail=EXPEDITED_TRIAGE_TAIL if dispatches(priority) else ""))
@@ -922,7 +922,7 @@ def was_expedited(wo: dict[str, Any]) -> bool:
 
 def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
                       metadata: dict[str, Any] | None = None,
-                      budget_usd: float | None = None) -> str:
+                      budget_usd: float | None = None, origin: str = "os") -> str:
     """Create the work order a confirmed `critical`/`blocker` earned (#240)"""
     from .ops import create_work_order
     from .project_store import ProjectStore
@@ -938,7 +938,7 @@ def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
         description=WORK_ORDER_BRIEF.format(
             url=url, body=payload.get("body") or "",
             why=why or TRIAGED_WHY.format(priority=priority)),
-        origin="jarvis", issue_url=url, issue_priority=priority, metadata=metadata,
+        origin=origin, issue_url=url, issue_priority=priority, metadata=metadata,
         budget_usd=budget_usd)
     store = ProjectStore(spec.path)
     try:
@@ -987,7 +987,8 @@ def issue_ref_url(target: str, repo: str) -> str:
 
 def start_work(target: str, project: str | None = None, *,
                metadata: dict[str, Any] | None = None,
-               budget_usd: float | None = None) -> dict[str, Any]:
+               budget_usd: float | None = None,
+               origin: str = "jarvis") -> dict[str, Any]:
     """Open a work order on a tracker issue"""
     from . import github
     from .ops import OpsError, registered_project_paths, resolve_catalog
@@ -1022,5 +1023,5 @@ def start_work(target: str, project: str | None = None, *,
         spec, {"issue_url": url, "title": issue.title, "priority": level,
                "body": issue_body(url, repo)},
         why=STARTED_WHY.format(priority=level or "unrated"), metadata=metadata,
-        budget_usd=budget_usd)
+        budget_usd=budget_usd, origin=origin)
     return {"wo_id": wo_id, "project": spec.name, "issue_url": url, "priority": level}

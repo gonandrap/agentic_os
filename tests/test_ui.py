@@ -110,10 +110,11 @@ def test_create_wo_via_ui_marks_origin(client, project):
     wo = store.list_work_orders()[0]
     assert wo["origin"] == "ui"
     assert wo["title"] == "from the ui"
-    # detail page renders with framework badge
+    # detail page renders the project and who launched it (wo-776ac037)
     page = client.get(r.headers["location"])
     assert "from the ui" in page.text
-    assert "⚙" in page.text
+    assert '<span class="badge framework">proj_a</span>' in page.text
+    assert ">manual</span>" in page.text
 
 
 def test_waiting_input_wo_shows_resume_hint_and_auto_action(client, daemon, project):
@@ -856,7 +857,9 @@ def test_injected_badge_visible(client, daemon, fake_claude, project):
     _add_session(fake_claude, project)
     client.post("/project/proj_a/inject", data={"session_id": "adhoc-9"})
     r = client.get("/")
-    assert "injected" in r.text
+    # The user handed it over: `manual`, under its own project (wo-776ac037)
+    assert '<span class="badge framework">proj_a</span>' in r.text
+    assert ">manual</span>" in r.text
 
 
 def test_inbox_page_and_ack(client, daemon, project):
