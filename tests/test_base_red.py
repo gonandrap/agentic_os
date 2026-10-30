@@ -461,6 +461,46 @@ def test_the_green_transition_announces_recovery_and_re_arms_the_report(
     assert len(warnings) == 2
 
 
+def test_the_inbox_row_follows_the_fix_order_and_acks_on_green(
+        started, spec, project, fake_gh):
+    """Issue #1357: the row raised CRITICAL is revised, not frozen, then settled"""
+    red_fleet(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    started.check_invariants(spec, store)
+    started.route_outbox(spec, store)
+    central = CentralStore()
+    title = invariants.invariant_title(invariants.INV_BASE_RED)
+    [row] = [r for r in central.unacked_inbox() if r["title"] == title]
+    assert row["level"] == "critical" and "--expedite" in row["body"]
+
+    fix = ops.create_work_order("proj_a", "fix red main")["id"]
+    central.set_base_health("proj_a", {**fact(central), "fix_wo_id": fix})
+    started.check_invariants(spec, store)
+
+    [row] = [r for r in central.unacked_inbox() if r["title"] == title]
+    assert row["level"] == "warning" and f"{fix} is producing it" in row["body"]
+    assert "--expedite" not in row["body"]
+
+    fake_gh.set_runs("main", [MAIN_GREEN])
+    poll(started, store)
+    assert not [r for r in central.unacked_inbox() if r["title"] == title]
+
+
+def test_a_revision_before_routing_rewrites_the_queued_notice(started, spec, project, fake_gh):
+    red_fleet(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    started.check_invariants(spec, store)
+    fix = ops.create_work_order("proj_a", "fix red main")["id"]
+    CentralStore().set_base_health("proj_a", {**fact(), "fix_wo_id": fix})
+    started.check_invariants(spec, store)
+
+    [note] = [n for n in store.unrouted_notifications()
+              if invariants.INV_BASE_RED in n["title"]]
+    assert note["level"] == "warning" and fix in note["body"]
+
+
 def test_closing_one_report_leaves_every_other_standing(project):
     """Why the plural sweep version is unusable here: it DELETES every report not in the iterable it is..."""
     store = ProjectStore(project)
