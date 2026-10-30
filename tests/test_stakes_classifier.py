@@ -139,7 +139,8 @@ def test_shadow_records_the_disagreement_and_changes_nothing_else(started, monke
     assert event["category"] == "none"
     assert event["parsed"] is True
     assert event["model"] == "claude-haiku-4-5-20251001"
-    assert questions() == []
+    # A high-stakes hold is asked for ADVICE only, never for a ruling (wo-6d90354c)
+    assert [autoreview.is_advisory(q) for q in questions()] == [True]
     assert [h["code"] for h in events(store, wo["id"], "autoreview_held")] == [
         autoreview.HELD_HIGH_STAKES]
 
@@ -231,7 +232,8 @@ def test_the_classifier_holds_an_act_the_regex_missed(started, monkeypatch):
     store, wo = park(started, mode="classifier", content=ACT)
     tick(started, store, FakeCall(HIGH_REPLY), monkeypatch)
 
-    assert questions() == []
+    # A high-stakes hold is asked for ADVICE only, never for a ruling (wo-6d90354c)
+    assert [autoreview.is_advisory(q) for q in questions()] == [True]
     [held] = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_HIGH_STAKES
     assert "cuts and pushes a release tag" in held["reason"]
@@ -250,7 +252,8 @@ def test_a_transport_failure_holds_and_says_it_was_unreachable(started, monkeypa
     store, wo = park(started, mode="classifier", content=MENTION)
     tick(started, store, FakeCall(raises=True), monkeypatch)
 
-    assert questions() == []
+    # A high-stakes hold is asked for ADVICE only, never for a ruling (wo-6d90354c)
+    assert [autoreview.is_advisory(q) for q in questions()] == [True]
     [held] = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_HIGH_STAKES
     assert stakes.HIGH_UNREACHABLE in held["reason"]
@@ -387,7 +390,8 @@ def test_the_tightened_mode_holds_an_act_the_shipped_net_missed(started, monkeyp
     store, wo = park(started, mode="regex-tightened", content=ACT)
     tick(started, store, FakeCall(ROUTINE_REPLY), monkeypatch)
 
-    assert questions() == []
+    # A high-stakes hold is asked for ADVICE only, never for a ruling (wo-6d90354c)
+    assert [autoreview.is_advisory(q) for q in questions()] == [True]
     [held] = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_HIGH_STAKES
     assert "tag jarvis-0.6.2" in held["reason"]

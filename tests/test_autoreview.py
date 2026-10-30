@@ -631,7 +631,10 @@ def test_no_question_the_os_files_carries_a_high_stakes_assumptions_text(started
     ask(started, store)
 
     filed = questions()
-    # Two routine assumptions are asked about; the high-stakes one is not
+    # Two routine assumptions are ruled on; the high-stakes one is asked for ADVICE only (wo-6d90354c)
+    (advice,) = [q for q in filed if autoreview.ADVISORY_INTRO in q["question"]]
+    assert SECRET in advice["question"]
+    filed = [q for q in filed if q is not advice]
     assert len(filed) == 2
     for q in filed:
         assert SECRET not in q["question"]
@@ -665,7 +668,9 @@ def test_a_hold_is_recorded_once_per_reason_and_is_not_an_attention_item(started
 
     (held,) = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_HIGH_STAKES
-    assert questions() == []
+    # One advisory question, asked once (wo-6d90354c)
+    (q,) = questions()
+    assert autoreview.is_advisory(q)
     assert store.get_work_order(wo["id"])["attention_reason"] != held["reason"]
     assert "held" in ops.autoreview_state(store, wo)["line"]
 
@@ -939,6 +944,32 @@ def test_an_order_level_hold_names_no_row_and_is_never_dropped_by_one(started):
 
 def drain(daemon):
     daemon._neo_drain()
+
+
+def test_neos_approval_of_a_high_stakes_hold_is_advice_and_never_settles_it(
+        started, catalog_file):
+    """wo-6d90354c: the user reads Neo's view on a held row, and still decides it"""
+    ops.set_config("validation.auto_review", True, project="proj_a",
+                   reason="the panel has been right for a month",
+                   catalog_path=str(catalog_file))
+    store, wo = park(started, auto_review=True,
+                     assumptions=("FORCE_ACCEPT — reused the production api key",))
+    ask(started, store)
+    (q,) = questions()
+
+    drain(started)
+
+    (row,) = store.all_assumptions(wo["id"])
+    assert row["status"] == "pending"
+    assert events(store, wo["id"], "autoreview_accepted") == []
+    (advice,) = events(store, wo["id"], "autoreview_escalated")
+    assert advice["advisory"] is True and advice["neo_question_id"] == q["id"]
+    (line,) = rulings(store, wo["id"])
+    assert line.startswith("Held by the OS — mentions 'production'")
+    assert f"; Neo's advice (question {q['id']}): Neo would approve it: " in line
+    # Asked once: the answered advice is not re-asked on the next pass
+    ask(started, store)
+    assert len(questions()) == 1
 
 
 def test_an_accepted_assumption_settles_and_the_record_says_the_os_did_it(
@@ -1518,7 +1549,8 @@ def test_a_held_assumption_says_what_held_it_and_an_asked_one_says_it_is_out(sta
     assert held.startswith("Held by the OS — mentions 'production'")
     # The number is on the row already; repeating it inside the reason is not a ruling
     assert "assumption #1" not in held
-    (q,) = questions()
+    # The held row is asked for ADVICE too (wo-6d90354c); its hold stays its state
+    (q,) = [q for q in questions() if not autoreview.is_advisory(q)]
     assert asked == f"Asked Neo (question {q['id']}), awaiting ruling"
 
 
