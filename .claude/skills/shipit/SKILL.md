@@ -1,6 +1,6 @@
 ---
 name: shipit
-description: Cut a Jarvis OS release from ALREADY-merged main and deploy it to production. Use when the user wants to ship/release/deploy Jarvis OS, promote dev to prod, or cut a new jarvis-X.Y.Z version. Cuts release/jarvis-X.Y.Z from main, bumps + tags on that branch (main is never committed to), pushes branch and tag to origin, deploys the tag to $PRODUCTION_CODE/jarvis_os, restarts the systemd services, and notifies Telegram.
+description: Cut a Jarvis OS release from ALREADY-merged main and deploy it to production. Use when the user wants to ship/release/deploy Jarvis OS, promote dev to prod, or cut a new jarvis-X.Y.Z version. Cuts release/jarvis-X.Y.Z from main, bumps + tags on that branch (main is never committed to), pushes branch and tag to origin, deploys the tag to $PRODUCTION_CODE/jarvis_os, restarts the systemd services, and notifies Telegram. Also the way to upgrade (or roll back) prod to an EXISTING tag: `scripts/shipit.sh --deploy jarvis-X.Y.Z`.
 ---
 
 # shipit — release Jarvis OS to production
@@ -88,6 +88,10 @@ scripts/shipit.sh patch|minor|major
 scripts/shipit.sh 1.4.0           # explicit version
 scripts/shipit.sh --dry-run       # preview; changes nothing
 ```
+
+**Upgrade prod to a release that already exists** (no new release):
+`scripts/shipit.sh --deploy jarvis-X.Y.Z` — steps 5–8 only; nothing cut, tagged or
+pushed. Never use `install.sh` on a production machine; it refuses (issue 1348).
 
 Always run `--dry-run` first if the user is unsure of the version, show them the plan,
 then run for real — the dry run prints the exact release notes that would be published,

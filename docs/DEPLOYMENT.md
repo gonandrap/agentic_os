@@ -74,6 +74,27 @@ Version numbering comes from the latest `jarvis-*` **tag**, not from `pyproject.
 on `main` — the bump lives only on release branches, so `main`'s version string
 intentionally lags behind the shipped one.
 
+### Upgrading production to an existing release
+
+```bash
+scripts/shipit.sh --deploy jarvis-X.Y.Z      # from a dev clone; --dry-run first to preview
+```
+
+Cuts nothing: no branch, bump, tag, push or GitHub release, and the dev checkout may be
+dirty or off `main`. It checks the tag is on `origin`, then runs the deploy half of a
+release (steps 5–8): `checkout` the tag + `uv sync --frozen --extra ui`, re-render the
+units and the `~/.local/bin/jarvis` wrapper, check `jarvis --version` reports the tag,
+restart the UI and then the daemon, notify. Same on systemd and launchd. Works for a
+rollback to an older tag too. Afterwards the UI header and `jarvis status` show the
+version.
+
+Two scripts, two jobs (issue 1348): **`scripts/shipit.sh` owns production** (cut + deploy,
+or `--deploy` alone); **`install.sh` is only the standalone `curl | bash` install** for a
+new user (a `uv tool` copy that reads `~/.jarvis`). install.sh refuses to run where
+`~/.local/bin/jarvis` is the production wrapper, because replacing it points the shell at
+dev state while the services keep the old tag. shipit exits 2 with usage on an unknown
+flag, a `v`-prefixed version, or `--deploy` mixed with a version, `--stage` or `--base`.
+
 > Git note: there is no bare `release` branch. Git cannot hold both a ref named
 > `release` and refs named `release/…` (a file/directory conflict), so the release line
 > is the versioned `release/jarvis-X.Y.Z` branches plus `jarvis-X.Y.Z` tags.
