@@ -1213,10 +1213,24 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
     return question
 
 
+#: PERSISTED in stored questions; never change it, or old advice gets ruled on (wo-6d90354c)
+ADVISORY_MARKER = "[ADVISORY-ONLY]"
+#: Heads Neo's question on a HIGH-STAKES hold; free to reword (wo-6d90354c)
+ADVISORY_INTRO = (f"{ADVISORY_MARKER} The OS held this assumption as high-stakes, so your "
+                  "verdict is NOT acted on: the user decides it, and reads your answer first. "
+                  "Rule as you would, and make `reason` the advice they need.")
+
+
+def is_advisory(question: dict[str, Any] | None) -> bool:
+    """Was this question filed by `propose(advisory=True)`?"""
+    return str((question or {}).get("question") or "").startswith(ADVISORY_MARKER)
+
+
 def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
             assumption: dict[str, Any], siblings: list[dict[str, Any]], *,
-            early: bool = False, cfg: Any = None) -> dict[str, Any]:
-    """Put ONE assumption to Neo"""
+            early: bool = False, cfg: Any = None,
+            advisory: bool = False) -> dict[str, Any]:
+    """Put ONE assumption to Neo; `advisory` asks for advice the OS never acts on"""
     # Only a running worker can re-file what a refine returns
     note = refine_note(str(assumption.get("content") or ""),
                        concision.DEFAULT_ASSUME_MAX_CHARS) if early else ""
@@ -1233,18 +1247,23 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
         store.link_assumption_question(assumption["id"], question["id"])
         return_to_worker(store, wo["id"], assumption, note, question["id"])
         return question
-    question = neo.ask(project, wo["id"],
-                       _ruling_question(
-                           project, wo, assumption, siblings, early=early,
-                           record=decision_record(store, neo, wo["id"], siblings,
-                                                  assumption,
-                                                  chars=_record_chars(cfg)),
-                           # GitHub issue #1035: resolved here, so no caller changes
-                           spec=specs.spec_of(store, wo),
-                           spec_chars=_spec_chars(cfg)),
-                       # No `context`: the packet carries the description already (wo-ea3c6f0c)
-                       kind=QUESTION_KIND)
+    text = _ruling_question(
+        project, wo, assumption, siblings, early=early,
+        record=decision_record(store, neo, wo["id"], siblings, assumption,
+                               chars=_record_chars(cfg)),
+        # GitHub issue #1035: resolved here, so no caller changes
+        spec=specs.spec_of(store, wo),
+        spec_chars=_spec_chars(cfg))
+    if advisory:
+        text = f"{ADVISORY_INTRO}\n\n{text}"
+    # No `context`: the packet carries the description already (wo-ea3c6f0c)
+    question = neo.ask(project, wo["id"], text, kind=QUESTION_KIND)
     store.link_assumption_question(assumption["id"], question["id"])
+    if advisory:
+        # No `autoreview_asked`: the hold stays the row's state until the advice lands
+        log.info("auto-review asked Neo to advise on held assumption #%s of %s as "
+                 "question %s", assumption.get("n"), wo["id"], question["id"])
+        return question
     store.add_event(wo["id"], "autoreview_asked", {
         "assumption_id": assumption["id"], "n": assumption.get("n"),
         "neo_question_id": question["id"], "early": early})
