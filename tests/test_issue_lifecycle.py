@@ -889,6 +889,19 @@ def test_an_issue_a_human_already_closed_is_commented_on_but_not_reclosed(fleet)
     assert len(closing) == 1, "and exactly once"
 
 
+def test_a_refused_close_does_not_repost_the_closing_comment_every_sweep(fleet):
+    """#1257: 764 identical comments from an account that could comment but not close"""
+    wo_id = fleet.blocker_wo()
+    fleet.gh.refuse_issue_close()
+    fleet.land(wo_id)
+    for _ in range(3):
+        fleet.sweep()
+
+    closing = [c for c in fleet.gh.issue()["comments"] if "Closed by" in c]
+    assert fleet.gh.issue()["state"] == "OPEN"
+    assert len(closing) <= 1, f"{len(closing)} closing comments on an issue still open"
+
+
 def test_an_issue_a_human_reopened_is_left_reopened(fleet):
     from jarvis import ops
 
