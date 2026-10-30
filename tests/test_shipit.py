@@ -895,7 +895,7 @@ def test_an_unknown_service_manager_refuses_to_ship(tmp_path):
     assert "JARVIS_SERVICE_MANAGER" in r.stderr
 
 
-# --- argument parsing and --deploy (issue 1348) -------------------------------------
+# --- argument parsing and --deploy (issue 1348)
 
 @pytest.mark.parametrize("args, says", [
     (["--deploy-now", "patch"], "unknown option: --deploy-now"),
