@@ -29,6 +29,10 @@
 #   scripts/shipit.sh 1.2.0           # release an explicit version
 #   scripts/shipit.sh patch|minor|major
 #   scripts/shipit.sh --dry-run [ver] # print what would happen, change nothing
+#   scripts/shipit.sh --deploy jarvis-X.Y.Z
+#                                     # DEPLOY-ONLY: move production to an EXISTING tag.
+#                                     # Skips 1's main checks and 2-4a (nothing is cut,
+#                                     # tagged or pushed), runs 5-8. Issue 1348.
 #   scripts/shipit.sh --base <sha>    # cut the release from THAT commit, not from HEAD.
 #                                     # A release approval is scoped to the exact command
 #                                     # string, so the commit being shipped has to be in
@@ -61,16 +65,50 @@ STAGE=0
 WO_ID=""
 BASE_SHA=""
 BUMP_OR_VERSION=""
+DEPLOY_TAG=""
+usage() {
+  cat <<'USAGE'
+usage: scripts/shipit.sh [--dry-run] [X.Y.Z|major|minor|patch] [--base <sha>]
+       scripts/shipit.sh [--dry-run] --stage <X.Y.Z> --wo <wo-id> --base <sha>
+       scripts/shipit.sh [--dry-run] --deploy <jarvis-X.Y.Z|X.Y.Z>
+
+  (no --deploy)  CUT a new release from merged main, then deploy it to production
+  --deploy TAG   deploy an EXISTING release tag to production; cuts nothing
+                 (checkout, uv sync, re-render units + `jarvis` wrapper, restart)
+
+Fresh install for a new user (not production): install.sh. See docs/DEPLOYMENT.md.
+USAGE
+}
+# Exit 2, not 1: a mistyped flag must never be read as a version — issue 1348.
+usage_die() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; usage >&2; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --stage)   STAGE=1 ;;
     --wo)      shift; WO_ID="${1:-}" ;;
     --base)    shift; BASE_SHA="${1:-}" ;;
-    *) BUMP_OR_VERSION="$1" ;;
+    --deploy)  shift; DEPLOY_TAG="${1:-}"
+               [ -n "$DEPLOY_TAG" ] || usage_die "--deploy needs a release tag (jarvis-X.Y.Z)" ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage_die "unknown option: $1" ;;
+    *) [ -z "$BUMP_OR_VERSION" ] || usage_die "one version only, got '$BUMP_OR_VERSION' and '$1'"
+       BUMP_OR_VERSION="$1" ;;
   esac
   shift
 done
+case "$BUMP_OR_VERSION" in
+  v[0-9]*) usage_die "version '$BUMP_OR_VERSION': drop the v — did you mean ${BUMP_OR_VERSION#v}?" ;;
+esac
+if [ -n "$DEPLOY_TAG" ]; then
+  [ "$STAGE" = 0 ] && [ -z "$BASE_SHA" ] && [ -z "$BUMP_OR_VERSION" ] \
+    || usage_die "--deploy takes no version, --stage or --base: it cuts nothing, it deploys an existing tag"
+  case "$DEPLOY_TAG" in
+    jarvis-[0-9]*.[0-9]*.[0-9]*) ;;
+    [0-9]*.[0-9]*.[0-9]*) DEPLOY_TAG="jarvis-$DEPLOY_TAG" ;;
+    v[0-9]*) usage_die "--deploy '$DEPLOY_TAG': release tags have no v — did you mean jarvis-${DEPLOY_TAG#v}?" ;;
+    *) usage_die "--deploy '$DEPLOY_TAG' is not a release tag (want jarvis-X.Y.Z)" ;;
+  esac
+fi
 if [ "$STAGE" = 1 ] && [ -z "$WO_ID" ]; then
   printf '\033[1;31m✗ %s\033[0m\n' \
     "--stage requires --wo <work-order-id>: the daemon needs to know which work order to wait for and settle" >&2
@@ -123,7 +161,11 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 # Nothing to warn about under --base: the commit is named, the checkout is not an input,
 # and every daemon-filed release runs from a `wo-*` worktree branch — so the line would
 # fire on all of them and teach readers to ignore it (2026-10-01 spec §3).
-if [ -z "$BASE_SHA" ] && [ "$BRANCH" != "main" ]; then
+if [ "$(cd "$PROD_DIR" 2>/dev/null && pwd -P)" = "$(pwd -P)" ]; then
+  # step 5 checks out another tag in PROD_DIR, rewriting this script while bash reads it
+  die "run shipit from a dev clone, not from production's own checkout ($PROD_DIR)"
+fi
+if [ -z "$DEPLOY_TAG" ] && [ -z "$BASE_SHA" ] && [ "$BRANCH" != "main" ]; then
   say "warning: shipping from '$BRANCH', not 'main' (releases cut from merged main)"
 fi
 
@@ -174,7 +216,8 @@ if [ "${#IGNORED[@]}" -gt 0 ]; then
   say "ignoring dirty OS-managed runtime artifacts (not authored edits, not an input to the release):"
   for p in "${IGNORED[@]}"; do printf '    %s\n' "$p"; done
 fi
-if [ "${#BLOCKING[@]}" -gt 0 ]; then
+# --deploy reads nothing from this tree, so its edits cannot reach production
+if [ -z "$DEPLOY_TAG" ] && [ "${#BLOCKING[@]}" -gt 0 ]; then
   die "tracked changes present — releases are cut from a clean, already-merged main:
 $(printf '     %s\n' "${BLOCKING[@]}")"
 fi
@@ -199,7 +242,10 @@ git rev-parse -q --verify refs/remotes/origin/main >/dev/null \
 # old precondition stands verbatim, because ancestry alone would let a stale checkout
 # release an old main. Existence before ancestry — `merge-base --is-ancestor` on an
 # unknown object exits non-zero with a git error, which reports the wrong fault.
-if [ -n "$BASE_SHA" ]; then
+if [ -n "$DEPLOY_TAG" ]; then
+  git ls-remote --exit-code --tags origin "refs/tags/$DEPLOY_TAG" >/dev/null 2>&1 \
+    || die "release tag $DEPLOY_TAG is not on origin ($ORIGIN_URL) — --deploy ships existing releases only"
+elif [ -n "$BASE_SHA" ]; then
   git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
     || die "--base $BASE_SHA is not a commit in this checkout — fetch origin and pass a sha from origin/main"
   git merge-base --is-ancestor "$BASE_SHA" origin/main \
@@ -264,6 +310,9 @@ $stray"
 # Version numbering derives from the latest release TAG, not pyproject.toml — main's
 # pyproject is never bumped by shipit (the bump lives only on release branches).
 BASE="$(latest_tagged)"; BASE="${BASE:-$(cur_version)}"
+if [ -n "$DEPLOY_TAG" ]; then
+  BUMP_OR_VERSION="${DEPLOY_TAG#jarvis-}"
+fi
 case "$BUMP_OR_VERSION" in
   "")                   VERSION="$(bump "$BASE" patch)" ;;
   major|minor|patch)    VERSION="$(bump "$BASE" "$BUMP_OR_VERSION")" ;;
@@ -273,13 +322,20 @@ esac
 
 TAG="jarvis-$VERSION"
 REL_BRANCH="release/jarvis-$VERSION"
+SHIP_SHA="$(git rev-parse "${BASE_SHA:-HEAD}")"
+PREV_TAG="jarvis-$BASE"
+
+# >>> steps 2-4a CUT a new release; --deploy jumps straight to step 5 (issue 1348)
+if [ -n "$DEPLOY_TAG" ]; then
+  say "Deploying existing release $TAG to production — nothing is cut, tagged or pushed"
+  say "  deploy: $PROD_DIR"
+else
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG already exists"
 git rev-parse -q --verify "refs/heads/$REL_BRANCH" >/dev/null && die "branch $REL_BRANCH already exists"
 
 # The single ref the rest of the script hangs off. Not "main's sha" since §3: the branch,
 # the bump commit, the tag and production's checkout all descend from this one commit, so
-# whatever merged after the reviewer approved it rides the next release.
-SHIP_SHA="$(git rev-parse "${BASE_SHA:-HEAD}")"
+# whatever merged after the reviewer approved it rides the next release. (SHIP_SHA, set above.)
 say "Releasing Jarvis OS $VERSION  (base tag: ${BASE}, base: ${SHIP_SHA:0:9})"
 say "  branch: $REL_BRANCH   tag: $TAG"
 say "  deploy: $PROD_DIR"
@@ -340,7 +396,6 @@ run "git push origin 'refs/tags/$TAG'"
 # token or a page that already exists are all reasons to say so and carry on, never to
 # abort a release halfway through. Every failure prints the command to run by hand, so
 # a release that missed its page is one paste away from having one.
-PREV_TAG="jarvis-$BASE"
 GH_TITLE="Jarvis OS $VERSION"
 
 release_notes() {  # the body of the release page, on stdout
@@ -387,6 +442,8 @@ else
   fi
   rm -f "$NOTES_FILE"
 fi
+fi
+# <<< steps 2-4a
 
 # --- 5. deploy to production (from origin, not this checkout) --------------------
 say "deploying to $PROD_DIR"
@@ -487,16 +544,32 @@ else
   say "re-rendering the production \`jarvis\` wrapper from $TAG"
   run "'$CLI_INSTALLER' || say 'NOTE: wrapper install failed — jarvis doctor (INV-PROD-CLI)'"
 fi
+# Proof the shell's `jarvis` is this release against prod state, not a stray uv-tool copy (issue 1348)
+CLI_WRAPPER="${JARVIS_CLI_BIN_DIR:-$HOME/.local/bin}/jarvis"
+if [ "$DRY_RUN" = 1 ]; then
+  printf '  [dry-run] verify %s --version reports %s\n' "$CLI_WRAPPER" "$VERSION"
+else
+  CLI_REPORTED="$("$CLI_WRAPPER" --version 2>/dev/null || true)"
+  case "$CLI_REPORTED" in
+    *"$VERSION"*) say "verified: $CLI_WRAPPER --version → $CLI_REPORTED" ;;
+    *) say "NOTE: $CLI_WRAPPER --version reports '${CLI_REPORTED:-nothing}', not $VERSION — jarvis doctor (INV-PROD-CLI)" ;;
+  esac
+fi
 
 # --- 5a3. queue this release's PRs for Morpheus (production validation) ----------
 # BEST-EFFORT: the daemon queues the running release itself at boot if this fails (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
-MORPHEUS_FROM=""
-if git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
-  MORPHEUS_FROM="--from '$PREV_TAG'"
+# --deploy skips it: SHIP_SHA is this checkout's HEAD there, not the tag's base
+if [ -n "$DEPLOY_TAG" ]; then
+  say "Morpheus: not queued by --deploy — the daemon queues the running release at boot"
+else
+  MORPHEUS_FROM=""
+  if git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
+    MORPHEUS_FROM="--from '$PREV_TAG'"
+  fi
+  say "queueing $TAG's pull requests for production validation (Morpheus)"
+  run "JARVIS_HOME='$PROD_ROOT/state' '$PROD_DIR/.venv/bin/jarvis' morpheus enqueue-release '$TAG' $MORPHEUS_FROM --to '$SHIP_SHA' --repo '$PROD_DIR' \
+    || say 'NOTE: Morpheus queueing failed — the daemon queues the running release at boot'"
 fi
-say "queueing $TAG's pull requests for production validation (Morpheus)"
-run "JARVIS_HOME='$PROD_ROOT/state' '$PROD_DIR/.venv/bin/jarvis' morpheus enqueue-release '$TAG' $MORPHEUS_FROM --to '$SHIP_SHA' --repo '$PROD_DIR' \
-  || say 'NOTE: Morpheus queueing failed — the daemon queues the running release at boot'"
 
 # --- 5b. --stage: stop here and hand the restarts to the daemon ------------------
 #
