@@ -891,6 +891,18 @@ class CentralStore:
         )
         return int(cur.lastrowid)
 
+    def revise_inbox(self, project: str, title: str, wo_id: str | None, *,
+                     body: str = "", level: str = "", ack: bool = False) -> int:
+        """Rewrite, or ack, the unacked rows that announced one standing condition (issue #1357)"""
+        where = " WHERE project=? AND title=? AND wo_id IS ? AND status != 'acked'"
+        key = (project, title, wo_id or None)
+        if ack:
+            cur = self.conn.execute("UPDATE inbox SET status='acked'" + where, key)
+        else:
+            cur = self.conn.execute("UPDATE inbox SET body=?, level=?" + where,
+                                    (body, level, *key))
+        return cur.rowcount
+
     def get_inbox(self, inbox_id: int) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM inbox WHERE id=?", (inbox_id,)).fetchone()
         return dict(row) if row else None
