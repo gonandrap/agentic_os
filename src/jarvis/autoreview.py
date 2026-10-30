@@ -1213,9 +1213,9 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
     return question
 
 
-#: PERSISTED in stored questions and matched by `is_advisory`: never change it, or old advice is ruled on (wo-6d90354c)
+#: PERSISTED in stored questions; never change it, or old advice gets ruled on (wo-6d90354c)
 ADVISORY_MARKER = "[ADVISORY-ONLY]"
-#: Heads a question on a HIGH-STAKES hold: the user asked for Neo's view before deciding; free to reword
+#: Heads Neo's question on a HIGH-STAKES hold; free to reword (wo-6d90354c)
 ADVISORY_INTRO = (f"{ADVISORY_MARKER} The OS held this assumption as high-stakes, so your "
                   "verdict is NOT acted on: the user decides it, and reads your answer first. "
                   "Rule as you would, and make `reason` the advice they need.")
