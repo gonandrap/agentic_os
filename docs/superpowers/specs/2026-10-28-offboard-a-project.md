@@ -227,7 +227,8 @@ have a command blocked by an OS that is no longer managing it. Verify that again
 `hooks.gate_decision` before writing the test; if the classifier does not in fact fire
 without a `JARVIS_WO_ID`, say so in the PR and the argument becomes latency alone.
 
-What it takes out, and the rule for each — **the rule is never to destroy a user edit**:
+What it takes out, and the rule for each — **the rule is never to destroy a user edit**
+(for `OPERATION.md`, read as amended 2026-10-29 below):
 
 | Artifact | Archive | Purge | Rule |
 |---|---|---|---|
@@ -238,6 +239,19 @@ What it takes out, and the rule for each — **the rule is never to destroy a us
 | trust entry in `~/.claude.json` | remove this path's `hasTrustDialogAccepted` | same | write through a temp file and `replace`, as `ensure_trust` (`bootstrap.py:373`) does. A malformed or unreadable `~/.claude.json` is a warning, never a crash |
 | `.jarvis/` | **kept** | removed | the archived order history lives in `.jarvis/jarvis.db`, and section 2 promises `jarvis search` still reaches it |
 | the `.jarvis/` line in `.gitignore` | **kept** | removed, with the `# Jarvis OS local state` comment above it if that is all that is left of the block | the directory still exists on archive, so the ignore line is still right |
+
+> **Amendment 2026-10-29 (wo-5e2e4651, issue #1330, user ruling option B via Neo Q2500).**
+> Supersedes the original `OPERATION.md` row ("remove if it is the generated file and
+> untracked"; "`tracked_in_vcs` decides; committed, or edited past the `SPECIFICS_MARKER`
+> block, means it stays") and the "never destroy a user edit" framing as it applied to that
+> row. Current rule: offboard deletes the generated `OPERATION.md` in every case. When its
+> bytes are NOT recoverable from version control (untracked and edited, or tracked with
+> uncommitted local changes), archive first keeps them at `.jarvis/OPERATION.md.offboarded`;
+> purge, which removes `.jarvis/`, leaves such a file in place and warns with the exact `rm`
+> command. When tracked, a warning says the deletion is left unstaged in the working tree for
+> the user to commit — the OS never commits it. For `OPERATION.md`, "never destroy a user
+> edit" now means "never destroy bytes version control cannot return", not "never delete an
+> edited `OPERATION.md`". Trigger: hermes_sandbox, committed plus local edits, archive mode.
 
 `.claude/` and `.claude/skills/` are removed only if they end up empty. Everything is
 idempotent: a second run is a report full of "already absent", never an error. `--dry-run`
