@@ -999,11 +999,11 @@ def start_work(target: str, project: str | None = None, *,
                      if p.name == project), None)
         if spec is None:
             raise OpsError(f"project {project!r} is not in the catalog")
-        origin = github.origin_repo(spec.path)
-        if origin is None:
+        remote = github.origin_repo(spec.path)
+        if remote is None:
             raise OpsError(f"project {project!r} has no git `origin`, so it owns no "
                            f"tracker to start an issue from")
-        repo = f"{origin[0]}/{origin[1]}"
+        repo = f"{remote[0]}/{remote[1]}"
     else:
         repo = bug_repo()
         spec = tracker_project(catalog, repo)
