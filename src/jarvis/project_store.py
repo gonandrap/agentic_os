@@ -882,6 +882,14 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     outfile TEXT NOT NULL DEFAULT '',
     errfile TEXT NOT NULL DEFAULT ''
 );
+-- THE EXACT TEXT of each context-ledger ingredient, keyed by its sha256, which the
+-- ingredient row in `wo_turns.context_json` carries as `sha`. Content-addressed so an
+-- ingredient that is identical on every turn (the appended prompt, the memory files)
+-- is stored once. Written only by `context.record`.
+CREATE TABLE IF NOT EXISTS ctx_blobs (
+    sha TEXT PRIMARY KEY,
+    text TEXT NOT NULL
+);
 -- THE MESSAGE BUS. One row is one message posted to a ROLE about a SUBJECT (a work
 -- order or a feature order), delivered by the router in bus.py. The sender never names
 -- a recipient and never learns who read it.

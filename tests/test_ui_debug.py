@@ -484,6 +484,37 @@ def test_the_live_poll_is_quiet_while_it_succeeds_and_logged_when_it_fails(clien
     assert "[404] GET /api/wo/proj_a/wo-nope/live" in uilog.access_log_path().read_text()
 
 
+def test_an_ingredient_name_opens_its_exact_text(client, dispatched):
+    """wo-05092a1c: the modal fetches the text the worker received, stored per turn in ctx_blobs"""
+    wo_id, store = dispatched["wo_id"], dispatched["store"]
+    page = client.get(f"/wo/proj_a/{wo_id}/debug").text
+    assert 'data-name="append_system_prompt"' in page and 'id="ctx-modal"' in page
+
+    turn = store.list_turns(wo_id)[0]
+    prompt = client.get(f"/api/wo/proj_a/{wo_id}/context/1/worker_prompt").json()
+    assert prompt["exact"] and prompt["text"] == turn["prompt"]
+    append = client.get(f"/api/wo/proj_a/{wo_id}/context/1/append_system_prompt").json()
+    assert append["exact"] and "# Git" in append["text"]
+    assert client.get(f"/api/wo/proj_a/{wo_id}/context/9/worker_prompt").status_code == 404
+
+
+def test_a_turn_recorded_before_the_text_store_says_so(client, dispatched):
+    """Old payloads carry no `sha`: the prompt is still exact from wo_turns.prompt, the rest is labelled"""
+    wo_id, store = dispatched["wo_id"], dispatched["store"]
+    turn = store.list_turns(wo_id)[0]
+    payload = json.loads(turn["context_json"])
+    for row in payload["ingredients"]:
+        row.pop("sha", None)
+    store.conn.execute("UPDATE wo_turns SET context_json=? WHERE id=?",
+                       (json.dumps(payload), turn["id"]))
+    store.conn.commit()
+
+    prompt = client.get(f"/api/wo/proj_a/{wo_id}/context/1/worker_prompt").json()
+    assert prompt["text"] == turn["prompt"]
+    old = client.get(f"/api/wo/proj_a/{wo_id}/context/1/memory_files").json()
+    assert old["text"] is None and "predates" in old["note"]
+
+
 # -- 10. everything on this page is attacker-influenced text
 
 def test_tool_parameters_are_html_escaped(client, dispatched, transcripts):
