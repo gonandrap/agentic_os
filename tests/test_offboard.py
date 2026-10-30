@@ -85,6 +85,9 @@ def test_purge_after_archive_deletes_everything(started, catalog_file, project):
     assert not (project / ".jarvis").exists()
     assert search.search("zanzibar quokka") == []
     assert out["catalog"]["in_catalog"] is False
+    central = CentralStore()
+    assert "proj_a" in central.offboarded_names()  # a later leak reads as offboarded, not unknown
+    central.close()
 
 
 @pytest.mark.parametrize("purge", [False, True])

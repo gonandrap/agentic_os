@@ -9,6 +9,8 @@ import pytest
 from jarvis import catalog, digest, neo, testing
 from jarvis.neo_store import NeoStore
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 
 @pytest.fixture()
 def store(jarvis_home):

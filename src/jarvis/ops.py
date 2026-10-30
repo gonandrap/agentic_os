@@ -46,7 +46,7 @@ from .agent_usage import (
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import (ARCHIVED, MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES,
-                            CentralStore)
+                            CentralStore, UnknownProjectError)
 from .daemon import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
@@ -309,7 +309,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
             raise OpsError(f"unknown project: {project}")
 
     # OS-level checks first: they are about the OS itself (is the dashboard alive?)
-    os_found = check_os() if include_os else []
+    os_found = check_os(repair=repair) if include_os else []
     results, total = [], len(os_found)
     for p in rows:
         if p["status"] != "active":
@@ -823,6 +823,26 @@ def registered_project_paths(*, include_archived: bool = False) -> dict[str, Pat
                 if p["status"] in wanted}
     finally:
         central.close()
+
+
+def require_registered_project(name: str) -> str:
+    """Refuse a row under a project the OS does not know (issue #1333)"""
+    central = CentralStore()
+    try:
+        return central.require_project(name)
+    except UnknownProjectError as e:
+        raise OpsError(str(e)) from None
+    finally:
+        central.close()
+
+
+def os_inbox_project() -> str:
+    """The OS project's registered name for a row about the OS itself; 'os' only with no catalog"""
+    from .morpheus import _os_project
+    try:
+        return _os_project(resolve_catalog())
+    except (OpsError, CatalogError):
+        return "os"
 
 
 MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
@@ -11854,6 +11874,7 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
             finally:
                 neo.close()
             central.delete_project(name)
+            central.record_offboard(name, reason)
             plan["registry"] = "deleted"
         else:
             central.set_project_status(name, ARCHIVED)

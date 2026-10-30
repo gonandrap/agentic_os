@@ -15,6 +15,7 @@ from jarvis.testing import (  # noqa: F401
     jarvis_home,
     live_daemon,
     make_git_project,
+    neo_projects,
     project,
     self_dispatch_on,
     settle_turns,

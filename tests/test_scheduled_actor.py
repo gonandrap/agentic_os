@@ -34,6 +34,8 @@ from jarvis.project_store import (
 )
 from test_claim_rules import HOLDS  # the four delayed rules, built once
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 ORIGINS = ("jarvis", "injected", "adhoc")
 
 PR = "https://github.com/acme/proj/pull/7"

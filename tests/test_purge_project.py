@@ -123,7 +123,7 @@ def test_scoped_detector_is_retracted_never_widened(central):
     assert central.purge_project("proj_a")["detectors_retracted"] == 0
 
 
-def test_neo_purge_takes_questions_learnings_and_opinions(neo):
+def test_neo_purge_takes_questions_learnings_and_opinions(neo, neo_projects):
     q = neo.ask("proj_a", "wo-1", "which way?")
     neo.record_opinion(q["id"], "premise", reply="left")
     neo.add_learning("prefer left", project="proj_a")

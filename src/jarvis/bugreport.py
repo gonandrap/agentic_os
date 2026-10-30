@@ -310,7 +310,8 @@ def _notify(project: str, title: str, url: str, version: str, wo_id: str,
         body += f"\n{pickup_note(pickup)}"
     central = CentralStore()
     try:
-        central.add_inbox(project or "jarvis-os", f"{heading}: {title}",
+        from .ops import os_inbox_project
+        central.add_inbox(project or os_inbox_project(), f"{heading}: {title}",
                           body=body, level="warning")
         if daemon_running() is None:
             from .notify import route_new_inbox

@@ -10,6 +10,7 @@ import pytest
 
 from jarvis import claude_cli, gates, panel
 from jarvis.catalog import NeoConfig, PanelConfig
+from jarvis.testing import register_projects
 from jarvis.neo_store import SEATS, NeoStore
 
 pytestmark = [
@@ -231,6 +232,7 @@ def runs(tmp_path_factory, request):
     """Every decision this file grades, made once"""
     home = tmp_path_factory.mktemp("panel-llm-home")
     os.environ["JARVIS_HOME"] = str(home)
+    register_projects("evalproj")
     store = NeoStore(home / "neo.db")
     meter = Meter()
     real = claude_cli.run_headless_result

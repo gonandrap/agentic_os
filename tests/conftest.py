@@ -14,6 +14,7 @@ from jarvis.testing import (  # noqa: F401
     live_daemon,
     local_base,
     make_git_project,
+    neo_projects,
     no_stray_cost_threads,
     origins,
     project,

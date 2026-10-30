@@ -7,6 +7,7 @@ import os
 import pytest
 
 from jarvis import neo as neo_mod
+from jarvis.testing import register_projects
 from jarvis.neo_store import NeoStore
 
 pytestmark = [
@@ -67,6 +68,7 @@ def neo_verdicts(tmp_path_factory):
     """One drain over the whole battery (mirrors production: FIFO, shared prefix)"""
     home = tmp_path_factory.mktemp("neo-llm-home")
     os.environ["JARVIS_HOME"] = str(home)
+    register_projects("evalproj")
     store = NeoStore(home / "neo.db")
     try:
         for content, proj in LEARNINGS:
@@ -141,6 +143,7 @@ OVERRIDE = [
 def brevity_verdicts(tmp_path_factory):
     home = tmp_path_factory.mktemp("neo-brevity-home")
     os.environ["JARVIS_HOME"] = str(home)
+    register_projects("evalproj")
     store = NeoStore(home / "neo.db")
     try:
         for content, proj in LEARNINGS:
