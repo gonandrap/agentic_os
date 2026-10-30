@@ -46,7 +46,7 @@ from .agent_usage import (
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import (ARCHIVED, MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES,
-                            CentralStore)
+                            CentralStore, UnknownProjectError)
 from .daemon import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
@@ -309,7 +309,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
             raise OpsError(f"unknown project: {project}")
 
     # OS-level checks first: they are about the OS itself (is the dashboard alive?)
-    os_found = check_os() if include_os else []
+    os_found = check_os(repair=repair) if include_os else []
     results, total = [], len(os_found)
     for p in rows:
         if p["status"] != "active":
@@ -676,7 +676,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # Same rule, for the other reason a work order can be sitting still: the transport dropped its turn
                          "pause": invariants.pause_note(store, wo),
                          # And the whole answer in one string
-                         "status_label": invariants.status_label(store, wo, fleet_state)}
+                         "status_label": invariants.status_label(store, wo, fleet_state),
+                         "tags": wo_tags(wo, p["name"])}
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
@@ -822,6 +823,26 @@ def registered_project_paths(*, include_archived: bool = False) -> dict[str, Pat
                 if p["status"] in wanted}
     finally:
         central.close()
+
+
+def require_registered_project(name: str) -> str:
+    """Refuse a row under a project the OS does not know (issue #1333)"""
+    central = CentralStore()
+    try:
+        return central.require_project(name)
+    except UnknownProjectError as e:
+        raise OpsError(str(e)) from None
+    finally:
+        central.close()
+
+
+def os_inbox_project() -> str:
+    """The OS project's registered name for a row about the OS itself; 'os' only with no catalog"""
+    from .morpheus import _os_project
+    try:
+        return _os_project(resolve_catalog())
+    except (OpsError, CatalogError):
+        return "os"
 
 
 MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
@@ -10643,8 +10664,36 @@ def _evolution_knowledge(central: CentralStore, scope: str) -> list[dict[str, An
                                     project=scope or None)
 
 
-#: Origins of an order the OS opened for itself, with no user asking (Neo q2514)
-_SELF_ORIGINS = ("fleet_health", "morpheus", "neo", "schedule")
+#: Origins of an order the OS opened for itself, with no user asking (Neo q2514, q2585)
+_SELF_ORIGINS = ("fleet_health", "morpheus", "neo", "os", "schedule")
+
+
+def launched_by_os(wo: dict[str, Any]) -> bool:
+    """Did the OS open this order with no user asking? (Neo q2585)"""
+    from . import steward
+
+    origin = wo.get("origin")
+    if origin in _SELF_ORIGINS:
+        return True
+    if origin != "jarvis":
+        return False
+    # Rows from before `os` existed carry `jarvis` whoever opened them: read their provenance
+    return bool(wo.get("parent_id") or (wo.get("kind") or "worker") != "worker"
+                or wo.get("detector_id") or wo.get("remedy_rule_id")
+                or wo.get("trigger_wo_id") or steward.stamp_of(wo))
+
+
+def wo_tags(wo: dict[str, Any], project: str) -> list[str]:
+    """The chips on an order's row: project, bug, expedite, automatic|manual"""
+    from . import issues
+
+    tags = [project]
+    if wo.get("issue_url"):
+        tags.append("bug")
+    if issues.was_expedited(wo):
+        tags.append("expedite")
+    tags.append("automatic" if launched_by_os(wo) else "manual")
+    return tags
 
 #: A chain longer than this is cut, never looped: `seen` stops cycles, this stops depth
 _LINEAGE_MAX_HOPS = 12
@@ -11832,6 +11881,7 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
             finally:
                 neo.close()
             central.delete_project(name)
+            central.record_offboard(name, reason)
             plan["registry"] = "deleted"
         else:
             central.set_project_status(name, ARCHIVED)

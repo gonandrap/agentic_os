@@ -2307,6 +2307,29 @@ def jarvis_home(tmp_path, monkeypatch):
     return home
 
 
+#: Fixture project names a test may ask Neo under without adopting a checkout
+NEO_FIXTURE_PROJECTS = ("proj_a", "proj_b", "evalproj")
+
+
+def register_projects(*names: str) -> None:
+    """Register fixture names in the current home: `NeoStore.ask` refuses an unknown project"""
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        for name in names:
+            if not central.get_project(name):
+                central.upsert_project(name, f"/nonexistent/{name}", "test project")
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+@pytest.fixture()
+def neo_projects(jarvis_home):
+    register_projects(*NEO_FIXTURE_PROJECTS)
+
+
 @pytest.fixture()
 def live_daemon(jarvis_home):
     """A fleet whose jarvisd is UP: a pidfile for this process and a fresh reconcile stamp (docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md)"""

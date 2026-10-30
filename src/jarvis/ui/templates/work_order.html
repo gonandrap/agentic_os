@@ -7,11 +7,11 @@
 {% import "_brake.html" as brake_ui %}
 {% import "_order_nav.html" as nav %}
 {% import "_dispatched.html" as dispatched_ui %}
+{% import "_layout.html" as ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
 {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
-{% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
 {# #pending is the deep-link target used by notifications: it lands on whatever
    is actually waiting on the user, falling back to the reply box. #}
 {# `review.placement`, never `unreviewed` — spec
@@ -31,8 +31,7 @@
   <div style="display:flex; gap: 12px; align-items: baseline; flex-wrap: wrap;">
     <strong style="font-size: 17px;">{{ wo.title }}</strong>
     <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
-    <span class="badge {{ 'framework' if o.framework else 'outside' }}">
-      {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
+    <span>{{ ui.wo_tags(wo_tags(wo, project)) }}</span>
     <span class="grow"></span>
     {% if wo.status not in ('completed', 'failed', 'cancelled') %}
     {# Not offered while assumptions are pending: closing over them would accept them

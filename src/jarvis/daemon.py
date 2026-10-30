@@ -23,7 +23,7 @@ from .catalog import DEFAULT_STAKES_CLASSIFIER, Catalog, ProjectSpec, load_catal
 from .central_store import ARCHIVED, SETTLED_BACKLOG_STATUSES, CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
-from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
+from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE, invariant_title
 from .neo_store import QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
 # The `os_state` keys the dashboard's self-heal keeps
@@ -1273,7 +1273,7 @@ class Daemon:
                     title=f"Plan: {fo['title']}"[:200],
                     # The ask verbatim
                     description=fo["description"],
-                    origin="jarvis", kind="planner", parent_id=fo["id"],
+                    origin="os", kind="planner", parent_id=fo["id"],
                 )
             except Exception:  # noqa: BLE001 — one bad feature order must not stop the rest
                 log.exception("[%s] could not open a planner for %s", project.name,
@@ -1289,7 +1289,7 @@ class Daemon:
                     title=f"Analyse: {fo['title']}"[:200],
                     # The observation verbatim — the analyst CONTRACT is composed at dispatch (dispatch._analyst_prompt)
                     description=fo["description"],
-                    origin="jarvis", kind="analyst", parent_id=fo["id"],
+                    origin="os", kind="analyst", parent_id=fo["id"],
                 )
             except Exception:  # noqa: BLE001 — one bad improvement order must not stop the rest
                 log.exception("[%s] could not open an analyst for %s", project.name,
@@ -1307,7 +1307,7 @@ class Daemon:
                     title=f"Investigate: {fo['title']}"[:200],
                     # The `why` verbatim; the investigator CONTRACT is composed at dispatch...
                     description=fo["description"],
-                    origin="jarvis", kind="investigator", parent_id=fo["id"],
+                    origin="os", kind="investigator", parent_id=fo["id"],
                 )
             except Exception:  # noqa: BLE001 — one bad investigation must not stop the rest
                 log.exception("[%s] could not open an investigator for %s", project.name,
@@ -4246,8 +4246,11 @@ class Daemon:
                     v.key for v in violations):
                 log.info("[%s] %s%s no longer violated", project.name,
                          f"{wo_id}: " if wo_id else "", invariant)
+                self.settle_invariant_notice(project, invariant, wo_id)
 
+        prior = {(r["invariant"], r["wo_id"]): r for r in store.violation_reports()}
         for v in violations:
+            was = prior.get((v.invariant, v.key[1] or ""))
             # `level` and `detail` ride along so a standing CRITICAL one can reach the attention list from state...
             first = store.open_violation_report(v.invariant, v.key[1], level=v.level,
                                                 detail=v.detail, owed=v.owed)
@@ -4262,7 +4265,15 @@ class Daemon:
                     blockers = invariants_mod.true_blockers(store, wo)
                     if blockers:
                         store.flag_attention(wo["id"], blockers[0])
+            notify = not v.repaired and not routed
+            body = v.notice or (f"{v.detail}" + (f" ({v.wo_id})" if v.wo_id else ""))
             if not first:
+                # Issue #1357: the notice tracks the live violation rather than the moment it was raised
+                if notify and was is not None and (was["level"], was["detail"]) != (v.level, v.detail):
+                    title = invariant_title(v.invariant)
+                    store.revise_unrouted(title, v.wo_id, body=body, level=v.level)
+                    self.central.revise_inbox(project.name, title, v.wo_id,
+                                              body=body, level=v.level)
                 continue
             log.warning("[%s] %s", project.name, v)
             if v.wo_id:
@@ -4270,15 +4281,18 @@ class Daemon:
                     "invariant": v.invariant, "detail": v.detail,
                     "repaired": v.repaired, "repair": v.repair, **v.context,
                 })
-            if not v.repaired and not routed:
+            if notify:
                 # Nothing deterministic to do about it — this one needs a human
                 store.add_notification(
-                    title=f"OS invariant violated: {v.invariant}",
-                    body=v.notice or (f"{v.detail}"
-                                      + (f" ({v.wo_id})" if v.wo_id else "")),
+                    title=invariant_title(v.invariant), body=body,
                     # The violation's OWN level: most are `warning`
                     level=v.level, wo_id=v.wo_id, source="invariants",
                 )
+
+    def settle_invariant_notice(self, project: ProjectSpec, invariant: str,
+                                wo_id: str | None) -> None:
+        """A violation no longer standing acks the inbox row that raised it (issue #1357)"""
+        self.central.revise_inbox(project.name, invariant_title(invariant), wo_id, ack=True)
 
     def rules_tick(self, project: ProjectSpec, store: ProjectStore) -> dict[str, Any]:
         """Evaluate the rule registry against this project's open orders (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
@@ -5078,6 +5092,7 @@ class Daemon:
         if was_red and worst is None:
             self._record_red_episode(project, red=False, now=fact["checked_at"])
             store.close_violation_report(INV_BASE_RED)
+            self.settle_invariant_notice(project, INV_BASE_RED, None)
             store.add_notification(
                 title=f"`{base}` is green again in {project.name}",
                 body=(f"the default branch's build recovered — workflow "
@@ -5194,7 +5209,7 @@ class Daemon:
                 issue_os_filed = bool(issue_url)
             if issue_url and decision.allowed:
                 fix_wo_id = str(issues.start_work(
-                    issue_url, project=project.name,
+                    issue_url, project=project.name, origin="os",
                     metadata=steward.stamped({}, decision),
                     budget_usd=decision.budget_usd).get("wo_id") or "")
             elif not cleared and not issue_url:
@@ -7046,7 +7061,7 @@ class Daemon:
         start = issues.START_COMMAND.format(url=out["issue_url"])
         if out["outcome"] == "unconfirmed":
             central.add_inbox(
-                project=q.get("project") or "jarvis-os", level="warning",
+                project=q.get("project") or self._os_project() or "os", level="warning",
                 title=f"a `{out['claimed']}` bug report is UNCONFIRMED",
                 body=(f"{out['issue_url']}\nNeo could not settle the priority "
                       f"({head}), so NOTHING was dispatched and no release was cut. The "
@@ -7054,7 +7069,7 @@ class Daemon:
                       f"with `{start}` if you agree with the rating.\n{full}"))
         elif out["outcome"] == "downgraded":
             central.add_inbox(
-                project=q.get("project") or "jarvis-os", level="info",
+                project=q.get("project") or self._os_project() or "os", level="info",
                 title=f"Neo downgraded a `{out['claimed']}` bug to "
                       f"`{out['settled']}`",
                 body=(f"{out['issue_url']}\n{head}\n"
@@ -7217,7 +7232,7 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
             self_dispatch=self.self_dispatch)
         fresh = store.create_work_order(
             title=f"Ship the fix for {wo.get('title') or url}",
-            description="", origin="jarvis",
+            description="", origin="os",
             metadata=steward.stamped({self.RELEASE_BATCH_KEY: [url]}, decision))
         steward.linked(decision, fresh["id"])
         store.update_work_order(

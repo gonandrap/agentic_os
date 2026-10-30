@@ -23,6 +23,8 @@ from jarvis.invariants import (
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 IDLE_NOTIFICATION = "Claude is waiting for your input"
 GENERIC_BLOCKER = "worker is waiting on your input"
 

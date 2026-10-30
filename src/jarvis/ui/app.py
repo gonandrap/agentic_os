@@ -133,16 +133,6 @@ FO_STATUS_META = {
     "failed":      {"word": "failed",       "icon": "✗", "tone": "bad"},
     "cancelled":   {"word": "cancelled",    "icon": "–", "tone": "muted"},
 }
-ORIGIN_META = {
-    "jarvis": {"word": "jarvis", "framework": True},
-    "ui":     {"word": "ui",     "framework": True},
-    "manual": {"word": "manual", "framework": False},
-    # `injected` is not a warning: the user handed this session over on purpose
-    "injected": {"word": "injected", "framework": True},
-    "adhoc":  {"word": "ad-hoc", "framework": False},
-    # Framework-spawned like `jarvis`
-    "neo":    {"word": "neo",    "framework": True},
-}
 LEVEL_TONE = {"info": "muted", "warning": "warn", "critical": "bad"}
 # Privileged-action gates
 GATE_META = {
@@ -1115,7 +1105,7 @@ def create_app() -> FastAPI:
 
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
-        status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
+        status_meta=STATUS_META, wo_tags=ops.wo_tags, gate_meta=GATE_META,
         gate_display=gate_display,
         # What each list is and which command clears it — the same words `jarvis status` prints (io-d2a5dd69)
         attention_list_note=ATTENTION_LIST_NOTE, inbox_list_note=INBOX_LIST_NOTE,

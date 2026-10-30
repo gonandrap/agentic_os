@@ -77,7 +77,8 @@ def test_a_database_from_the_live_release_upgrades_in_full(tmp_path, current):
     }
 
 
-def test_neos_database_from_the_live_release_upgrades_in_full(tmp_path, current_neo):
+def test_neos_database_from_the_live_release_upgrades_in_full(tmp_path, current_neo,
+                                                              neo_projects):
     """`neo.db` had no upgrade test at all until the panel work needed one"""
     path = tmp_path / "legacy-neo.db"
     old = sqlite3.connect(path)
@@ -223,7 +224,8 @@ def test_the_latency_column_arrives_on_an_existing_agent_calls_table(tmp_path):
         store.close()
 
 
-def test_the_escalation_cause_column_arrives_on_an_existing_questions_table(tmp_path):
+def test_the_escalation_cause_column_arrives_on_an_existing_questions_table(tmp_path,
+                                                                           neo_projects):
     """NULL on every pre-existing row (docs/superpowers/specs/2026-10-01-neo-observability.md)"""
     path = tmp_path / "legacy-cause.db"
     old = sqlite3.connect(path)

@@ -23,6 +23,8 @@ from jarvis.daemon import Daemon
 from jarvis.neo_store import SEATS, NeoStore
 from jarvis.project_store import ProjectStore
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 SEAT_DIR = ASSETS / "neo-seats"
 
 # Every seat, read off the SHIPPED DIRECTORY rather than listed here

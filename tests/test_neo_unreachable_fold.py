@@ -5,6 +5,9 @@ from __future__ import annotations
 from jarvis import claude_cli, ops
 from jarvis import neo as neo_mod
 from jarvis.neo_store import MAX_ANSWER_ATTEMPTS, MAX_REVIVALS, NeoStore
+import pytest
+
+pytestmark = pytest.mark.usefixtures("neo_projects")
 
 OAUTH = "Failed to authenticate: OAuth session expired and could not be refreshed"
 

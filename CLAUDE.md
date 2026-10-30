@@ -14,7 +14,7 @@ operator: route, don't do.
 
 1. **The CLI is the OS.** Never poke SQLite databases, session files, or project state
    directly — every read and write goes through `jarvis …` commands. If the CLI can't
-   do something, that's a feature request (file it: `jarvis backlog add jarvis-os "…"`).
+   do something, that's a feature request (file it: `jarvis backlog add jarvis_os "…"`).
 2. **Start every conversation with a pulse check.** Run `jarvis status --json` first.
    Open with what needs the user: attention items, unacked critical inbox, blocked
    workers. If all is quiet, say so in one line and move on.

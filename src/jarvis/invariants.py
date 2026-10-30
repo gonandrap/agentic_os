@@ -345,6 +345,11 @@ class Violation:
         return f"{self.invariant} — {where}{self.detail}{fixed}"
 
 
+def invariant_title(invariant: str) -> str:
+    """The inbox title a violation is raised under, and later revised or acked by"""
+    return f"OS invariant violated: {invariant}"
+
+
 #: What a FEATURE order says when one of its children ended badly
 FEATURE_CHILD_FAILED = "{id} failed — this feature cannot finish without it"
 FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver what the "
@@ -3223,33 +3228,60 @@ def check_config_drift() -> Iterator[Violation]:
     )
 
 
-def check_offboarded_activity() -> Iterator[Violation]:
-    """INV-OFFBOARDED-ACTIVITY — nothing the OS acts on names a project with no `projects` row (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
-    from .central_store import CentralStore
+def check_offboarded_activity(repair: bool = False) -> Iterator[Violation]:
+    """INV-OFFBOARDED-ACTIVITY / INV-UNKNOWN-PROJECT (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
+    from .central_store import OS_PROJECT_NAMES, CentralStore, spelled_like
     from .neo_store import OPEN_Q_STATUSES, NeoStore
 
     central = CentralStore()
     neo = NeoStore()
     try:
         # Archived projects keep their row, so their left-behind rows are by design, never a violation
-        known = {p["name"] for p in central.list_projects()} | {"", "os"}
+        registered = {p["name"] for p in central.list_projects()}
+        purged = central.offboarded_names()
         found = central.live_rows_by_project()
         asked: dict[str, int] = {}
         for q in neo.list_questions(statuses=OPEN_Q_STATUSES, limit=-1):
             asked[q["project"]] = asked.get(q["project"], 0) + 1
         found += [("questions", name, n) for name, n in sorted(asked.items())]
+        unknown = sorted({p for _, p, _ in found} - registered - purged - OS_PROJECT_NAMES)
+        repointed: dict[str, str] = {}
+        for name in unknown:
+            target = spelled_like(name, registered)
+            if repair and target:
+                central.repoint_project(name, target)
+                neo.repoint_project(name, target)
+                repointed[name] = target
     finally:
         neo.close()
         central.close()
     for table, project, count in found:
-        if project in known:
+        if project in registered or project in OS_PROJECT_NAMES:
             continue
+        if project in purged:
+            yield Violation(
+                invariant="INV-OFFBOARDED-ACTIVITY",
+                detail=(f"{count} live {table} row(s) name project {project!r}, which was "
+                        f"purged. Finish the purge with `jarvis offboard {project} --purge "
+                        f"--yes`, or re-register it with `jarvis adopt <path>` and `jarvis start`."),
+                context={"project": project, "table": table, "rows": count},
+            )
+            continue
+        target = spelled_like(project, registered)
+        if project in repointed:
+            remedy = f"re-pointed to {target!r}"
+        elif target:
+            remedy = f"looks like a typo for {target!r}; `jarvis doctor --repair` re-points them"
+        else:
+            remedy = (f"re-file them under a registered project ({', '.join(sorted(registered))}) "
+                      f"and close these: `jarvis backlog done <id>`, `jarvis inbox ack <id>`")
         yield Violation(
-            invariant="INV-OFFBOARDED-ACTIVITY",
+            invariant="INV-UNKNOWN-PROJECT",
             detail=(f"{count} live {table} row(s) name project {project!r}, which the OS has "
-                    f"no record of. Finish the purge with `jarvis offboard {project} --purge "
-                    f"--yes`, or re-register it with `jarvis adopt <path>` and `jarvis start`."),
+                    f"never registered: {remedy}."),
             context={"project": project, "table": table, "rows": count},
+            repaired=project in repointed,
+            repair=remedy if project in repointed else "",
         )
 
 
@@ -3737,7 +3769,7 @@ def report_at_startup(who: str) -> list[Violation]:
     try:
         for v in found:
             if store.open_violation_report(v.invariant, None, level=v.level, detail=v.detail):
-                store.add_notification(title=f"OS invariant violated: {v.invariant}",
+                store.add_notification(title=invariant_title(v.invariant),
                                        body=v.detail, level=v.level, source="invariants")
     finally:
         store.close()
@@ -3762,12 +3794,17 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
 )
 
 
-def check_os() -> list[Violation]:
+#: The OS-level checks that take `repair`
+OS_REPAIRABLE = (check_offboarded_activity,)
+
+
+def check_os(repair: bool = False) -> list[Violation]:
     """Run the OS-level invariants"""
     found: list[Violation] = []
     for check in OS_INVARIANTS:
         try:
-            found.extend(check())
+            found.extend(check(repair=True) if repair and check in OS_REPAIRABLE  # type: ignore[call-arg]
+                         else check())
         except Exception as e:  # noqa: BLE001 — one broken check must not hide the rest
             found.append(Violation(
                 invariant=getattr(check, "__name__", "unknown"),

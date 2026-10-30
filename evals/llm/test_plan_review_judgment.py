@@ -160,6 +160,8 @@ def verdicts(tmp_path_factory):
 
 
 def collect_verdicts(model: str, home) -> dict[str, dict[str, Any]]:
+    from jarvis.testing import register_projects
+    register_projects("evalproj")
     store = NeoStore(home / "neo.db")
     try:
         out = {}

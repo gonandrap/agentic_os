@@ -119,6 +119,20 @@ def test_dry_run_writes_nothing(tmp_path):
     assert not (tmp_path / "home").exists()
 
 
+def test_refuses_to_replace_the_production_wrapper(tmp_path):
+    """Issue 1348: on a prod machine the upgrade path is shipit --deploy, never install.sh"""
+    remote = _remote_with_tags(tmp_path, "jarvis-1.0.0")
+    wrapper = tmp_path / "bin" / "jarvis"
+    wrapper.parent.mkdir()
+    body = (REPO_ROOT / "deploy" / "jarvis.cli.template").read_text()
+    wrapper.write_text(body)
+    r = _install(tmp_path, remote=remote)
+    assert r.returncode == 1
+    assert "PRODUCTION wrapper" in r.stderr
+    assert "scripts/shipit.sh --deploy jarvis-X.Y.Z" in r.stderr
+    assert wrapper.read_text() == body
+
+
 def test_installs_the_ui_extra_by_default_and_skips_it_on_demand(tmp_path):
     remote = _remote_with_tags(tmp_path, "jarvis-1.0.0")
     assert "jarvis_os[ui]" in _install(tmp_path, remote=remote).stdout
