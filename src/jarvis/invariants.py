@@ -345,6 +345,11 @@ class Violation:
         return f"{self.invariant} — {where}{self.detail}{fixed}"
 
 
+def invariant_title(invariant: str) -> str:
+    """The inbox title a violation is raised under, and later revised or acked by"""
+    return f"OS invariant violated: {invariant}"
+
+
 #: What a FEATURE order says when one of its children ended badly
 FEATURE_CHILD_FAILED = "{id} failed — this feature cannot finish without it"
 FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver what the "
@@ -3764,7 +3769,7 @@ def report_at_startup(who: str) -> list[Violation]:
     try:
         for v in found:
             if store.open_violation_report(v.invariant, None, level=v.level, detail=v.detail):
-                store.add_notification(title=f"OS invariant violated: {v.invariant}",
+                store.add_notification(title=invariant_title(v.invariant),
                                        body=v.detail, level=v.level, source="invariants")
     finally:
         store.close()
