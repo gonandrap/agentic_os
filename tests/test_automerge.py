@@ -1820,6 +1820,46 @@ def test_the_request_states_the_protection_github_reported_this_tick(started, pr
     assert "required-by-protection" in text and "is protected" in text
 
 
+# -- a repository with no CI is not a pending CI (#1347)
+
+
+def test_zero_checks_on_a_repo_with_no_ci_arms_and_says_so():
+    armed = decide(rnd(), pull=pr(checks=()), no_ci=True)
+    assert armed.armed and armed.no_ci and automerge.NO_CI in armed.reason
+    # A check that DID report is judged as ever, whatever the workflow count says
+    failed = decide(rnd(), pull=pr(checks=(check("unit", "FAILURE"),)), no_ci=True)
+    assert failed.code == automerge.HELD_CHECKS_FAILED
+    assert not decide(rnd(), pull=pr()).no_ci
+
+
+@pytest.mark.parametrize("workflows, proposed", [(0, True), (2, False)])
+def test_the_poll_reads_the_workflow_count_before_holding_checks_none(
+        started, project, fake_gh, workflows, proposed):
+    import subprocess as sp
+
+    from jarvis.neo_store import NeoStore
+
+    store, wo = arm(started, project, auto_merge=True)
+    sp.run(["git", "-C", str(project), "remote", "add", "origin",
+            "https://github.com/acme/proj.git"], check=True)
+    fake_gh.set_pr(PR, "OPEN", checks=[], merge_state="CLEAN", head_oid=JUDGED)
+    fake_gh.set_workflows("acme/proj", workflows)
+
+    poll(started, store)
+
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert bool(store.events_of_kind(wo["id"], "automerge_proposed")) is proposed
+    assert bool(held) is not proposed
+    if proposed:
+        neo = NeoStore()
+        try:
+            assert automerge.NO_CI in neo.list_questions()[0]["question"]
+        finally:
+            neo.close()
+    else:
+        assert '"checks_none"' in held[-1]["payload"]
+
+
 def test_greenness_is_never_re_derived_in_this_module():
     """Issue #224's shape: `github.failing_checks` / `PullRequest.checks_green` stay the single predicate"""
     tree = ast.parse(Path(automerge.__file__).read_text())

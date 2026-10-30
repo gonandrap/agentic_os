@@ -25,6 +25,11 @@ Each item has a state:
 
 `jarvis morpheus requeue <id>` moves a terminal item back to `monitoring` with a fresh deadline.
 
+A wrong check is not a wrong PR (issue #1358). `jarvis morpheus rewrite <id> --why "…"`, or Neo's
+validation verdict with `"action": "rewrite"` (once per item), moves a failed or timed-out item back
+to `queued` with its script, last exit and offers cleared and a fresh deadline. `why` and the rejected
+script become the item's `rewrite_brief`, which Morpheus's next turn gets with the hints.
+
 ## Three halves, and only one of them spends tokens
 
 1. **Reaching production fills the queue (mechanical).** Each queueing is idempotent per PR.
