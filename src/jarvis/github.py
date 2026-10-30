@@ -411,6 +411,19 @@ def branch_protection(owner_repo: tuple[str, str], base: str,
     return BranchProtection(required_checks=tuple(dict.fromkeys(n for n in names if n)))
 
 
+def workflow_count(owner_repo: tuple[str, str], cwd: Path | None = None) -> int:
+    """How many GitHub Actions workflows the repository has (#1347)"""
+    owner, repo = owner_repo
+    path = f"repos/{owner}/{repo}/actions/workflows"
+    stdout = _run(["api", "--method", "GET", path, "--jq", ".total_count"], url=path,
+                  cwd=cwd, missing_hint="so Jarvis cannot read the repository's workflows")
+    try:
+        return int(stdout.strip())
+    except ValueError as e:
+        raise GitHubError(f"`gh api {path}` returned no count ({stdout[:200]!r})",
+                          GitHubError.UNREADABLE) from e
+
+
 #: The fields of one `gh pr view --json …` for the PANEL
 ARTIFACT_FIELDS = ("number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,"
                    "url,additions,deletions,changedFiles,files,statusCheckRollup")
