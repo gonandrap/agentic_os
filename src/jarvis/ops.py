@@ -13508,7 +13508,7 @@ def context_ingredient(wo_id: str, project: str | None, seq: int,
             return out
         if found and found.get("absent"):
             out["note"] = found.get("note") or "absent on this turn"
-        elif ingredient in ("add_dirs", "mcp_servers"):
+        elif ingredient == "mcp_servers":
             out["note"] = "no text is stored for this ingredient; its detail is below"
         else:
             out["note"] = "not captured: this turn predates the context text store"

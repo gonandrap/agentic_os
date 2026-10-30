@@ -83,24 +83,38 @@ def _knowledge_block(knowledge: Any, project_name: str) -> str:
     return "\n".join(render_knowledge_block(knowledge, project_name))
 
 
-def _walk(dirs: list[Path]) -> tuple[int, dict[str, Any]]:
-    """Bytes under `dirs`, under both caps"""
+def _frontmatter(text: str) -> str:
+    """The leading `---` YAML block of a skill or agent file; empty when it has none"""
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for i, line in enumerate(lines[1:], 1):
+        if line.strip() == "---":
+            return "".join(lines[1:i])
+    return ""
+
+
+def _walk(dirs: list[Path]) -> tuple[int, str, dict[str, Any]]:
+    """The skill and agent listings `dirs` contribute, under both caps"""
+    # Claude Code lists only a definition's frontmatter; the body loads on invocation (wo-5e817830)
+    parts: list[str] = []
     total = files = 0
     truncated = False
     for d in dirs:
-        for path in sorted(Path(d).rglob("*")):
-            if not path.is_file():
-                continue
+        paths = sorted([*Path(d).glob(".claude/skills/*/SKILL.md"),
+                        *Path(d).glob(".claude/agents/*.md")])
+        for path in paths:
             if files >= MAX_FILES or total >= MAX_BYTES:
                 truncated = True
                 break
-            size, _ = _file_bytes(path)
-            if size is None:
+            head = _frontmatter(_read_text(path) or "")
+            if not head:
                 continue
-            total += size
+            parts.append(f"==> {path} <==\n{head}")
+            total += _text_bytes(head)
             files += 1
-    return total, {"dirs": [str(d) for d in dirs], "files": files,
-                   "truncated": truncated}
+    return total, "\n".join(parts), {"dirs": [str(d) for d in dirs], "files": files,
+                                     "truncated": truncated}
 
 
 def _mcp_row(project: Any) -> dict[str, Any]:
@@ -187,7 +201,7 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
     rows.append(_memory_row(project, wo, turn, texts))
     rows.append(_session_start_row(project, wo, turn, texts))
     rows.append(_agent_row(briefing, texts))
-    rows.append(_add_dirs_row(briefing))
+    rows.append(_add_dirs_row(briefing, texts))
     rows.append(_mcp_row(project))
     return rows
 
@@ -275,15 +289,17 @@ def _agent_row(briefing: dict[str, Any], texts: dict[str, str]) -> dict[str, Any
                    detail={"agent": name})
 
 
-def _add_dirs_row(briefing: dict[str, Any]) -> dict[str, Any]:
+def _add_dirs_row(briefing: dict[str, Any], texts: dict[str, str]) -> dict[str, Any]:
     dirs = [Path(d) for d in (briefing.get("add_dirs") or []) if Path(d).is_dir()]
     if not dirs:
         return _absent("add_dirs", "no --add-dir on this turn")
-    total, detail = _walk(dirs)
+    total, text, detail = _walk(dirs)
+    texts["add_dirs"] = text
     return _row("add_dirs", total, detail=detail,
-                note="the skills, seats and feature-agent trees reachable through "
-                     "--add-dir" + (" (truncated at the cap)" if detail["truncated"]
-                                    else ""))
+                note="the frontmatter of each skill and agent reachable through "
+                     "--add-dir, which Claude Code lists in the window; their bodies "
+                     "load only when invoked" + (" (truncated at the cap)"
+                                                 if detail["truncated"] else ""))
 
 
 def _sha(text: str) -> str:

@@ -166,7 +166,7 @@ def test_each_ingredient_text_is_stored_and_splits_the_prompt_exactly(dispatched
         return ops.context_ingredient(wo_id, "proj_a", 1, name)["text"]
 
     assert text("worker_prompt") + text("knowledge_index") == turn["prompt"]
-    assert text("add_dirs") is None and text("mcp_servers") is None
+    assert text("mcp_servers") is None
 
     payload = json.loads(turn["context_json"])
     for row in payload["ingredients"]:
@@ -175,6 +175,25 @@ def test_each_ingredient_text_is_stored_and_splits_the_prompt_exactly(dispatched
                        (json.dumps(payload), turn["id"]))
     store.conn.commit()
     assert text("worker_prompt") + text("knowledge_index") == turn["prompt"]
+
+
+def test_add_dirs_counts_only_the_listed_frontmatter(tmp_path):
+    """wo-5e817830: bodies, LICENSE and templates are not in the window, so not in the row"""
+    skill = tmp_path / "skills" / ".claude" / "skills" / "s"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n" + "body " * 500)
+    (skill / "LICENSE").write_text("x" * 5000)
+    agents = tmp_path / "crew" / ".claude" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "a.md").write_text("---\nname: a\ndescription: e\n---\n" + "persona " * 500)
+    texts: dict[str, str] = {}
+
+    row = context._add_dirs_row({"add_dirs": [str(skill.parents[2]), str(agents.parents[1])]},
+                                texts)
+
+    assert row["bytes"] == len("name: s\ndescription: d\n") + len("name: a\ndescription: e\n")
+    assert row["detail"]["files"] == 2
+    assert "body" not in texts["add_dirs"] and "description: e" in texts["add_dirs"]
 
 
 def test_an_unreadable_ingredient_is_none_with_a_reason(dispatched, monkeypatch):
