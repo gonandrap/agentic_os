@@ -375,11 +375,7 @@ _FIX_ORDER = re.compile(r"fix filed as (wo-[0-9a-f]{8})")
 def requeue_fixed(central: CentralStore, cfg: MorpheusConfig,
                   carrier: Callable[[str], str],
                   investigation_fix: Callable[[str], str] | None = None) -> list[str]:
-    """Re-watch each item whose fix order (via `carrier`) has a PR in production (#1307, #1344)
-
-    The fix is the one `confirm` filed, or the one the item's investigation filed
-    (`investigation_fix` maps an inv- id to it).
-    """
+    """Re-watch each item once its fix reaches production (#1307, #1344)"""
     # An item exists for an order only once its PR reached production: released (the OS) or merged
     shipped: dict[str, dict[str, Any]] = {}
     for i in central.morpheus_items():

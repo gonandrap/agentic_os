@@ -1557,7 +1557,7 @@ def test_the_cli_prints_the_work_order_it_expedited(fleet, capsys):
     assert fleet.wo_id() in out and "expedited" in out
 
 
-# -- an investigation's GAP closes its own loop (#1344) --------------------------
+# -- an investigation's GAP closes its own loop (#1344)
 
 INV = {"investigation": "fo-1a2b3c4d", "morpheus_item": "mv-0000aaaa"}
 
