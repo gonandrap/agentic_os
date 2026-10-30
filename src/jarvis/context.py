@@ -193,7 +193,7 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
 
 
 def _memory_row(project: Any, wo: dict[str, Any], turn: dict[str, Any],
-                texts: dict[str, str]) -> dict[str, Any]:
+                texts: dict[str, str] | None = None) -> dict[str, Any]:
     from . import hooks
 
     cwd = _worktree_cwd(project, wo, turn)
@@ -213,7 +213,8 @@ def _memory_row(project: Any, wo: dict[str, Any], turn: dict[str, Any],
         counted.append(str(path))
         # The `==>` header is ours, to tell files apart; Claude Code wraps each in its own
         parts.append(f"==> {path} <==\n{_read_text(path) or ''}")
-    texts["memory_files"] = "\n".join(parts)
+    if texts is not None:
+        texts["memory_files"] = "\n".join(parts)
     # `excluded` names the dropped ancestor copies: absent and zero are different (module docstring) (docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §5.)
     return _row("memory_files", total,
                 detail={"paths": counted, "count": len(counted), "cwd": str(cwd),
