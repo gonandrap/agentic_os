@@ -141,6 +141,25 @@ def navigates_source(command: str, suffixes: tuple[str, ...],
     return False
 
 
+#: A subcommand word; ids, paths and project names (`wo-5a89`, `jarvis_os`) never match
+_SUBCOMMAND = re.compile(r"[a-z][a-z-]*\Z")
+
+
+def jarvis_verb(command: str) -> str | None:
+    """The `jarvis` subcommand a Bash command runs (`wo finish`), "" for a bare `jarvis`, None for none"""
+    for words in _statements(_mask_shell_text(command or "")):
+        if _command_word(words) != "jarvis":
+            continue
+        start = next(i for i, w in enumerate(words) if w not in _WRAPPERS) + 1
+        verb: list[str] = []
+        for word in words[start:start + 2]:
+            if not _SUBCOMMAND.match(word):
+                break
+            verb.append(word)
+        return " ".join(verb)
+    return None
+
+
 #: Markdown
 DOC_SUFFIXES: tuple[str, ...] = (".md",)
 

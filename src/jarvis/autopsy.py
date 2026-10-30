@@ -52,7 +52,8 @@ def _span(span: inspection.ToolSpan, *, params: bool) -> dict[str, Any]:
                            "started": span.started, "ended": span.ended,
                            "detail": span.detail, "backgrounded": span.backgrounded,
                            # §3: at EVERY level, for `backgrounded`'s reason
-                           "navigates_source": span.navigates_source}
+                           "navigates_source": span.navigates_source,
+                           "jarvis_verb": span.jarvis_verb}
     # §6: the parameters are what `full` buys, so at `normal` none of the three keys exist
     if params:
         row["params"] = span.params
@@ -261,6 +262,16 @@ def _nav_of(row: dict[str, Any]) -> bool | None:
     return navigation.navigates_source(command, navigation.SOURCE_SUFFIXES)
 
 
+def _verb_of(row: dict[str, Any]) -> str | None:
+    """The span's `jarvis` subcommand; a seal older than the key reads it from its params"""
+    if "jarvis_verb" in row:
+        return row["jarvis_verb"]
+    command = str((row.get("params") or {}).get("command") or "")
+    if row.get("name") != "Bash" or not command:
+        return None
+    return navigation.jarvis_verb(command)
+
+
 def _read_span(row: dict[str, Any]) -> inspection.ToolSpan:
     return inspection.ToolSpan(name=row["name"], tool_id=row["tool_id"],
                                started=row["started"], ended=row["ended"],
@@ -269,7 +280,8 @@ def _read_span(row: dict[str, Any]) -> inspection.ToolSpan:
                                params_truncated=list(row.get("params_truncated") or []),
                                params_dropped=list(row.get("params_dropped") or []),
                                backgrounded=bool(row.get("backgrounded")),
-                               navigates_source=_nav_of(row))
+                               navigates_source=_nav_of(row),
+                               jarvis_verb=_verb_of(row))
 
 
 def _read_call(row: dict[str, Any]) -> usage_mod.Call:
