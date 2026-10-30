@@ -13358,6 +13358,55 @@ def context_report(wo_id: str, project: str | None = None, *,
     }
 
 
+def context_ingredient(wo_id: str, project: str | None, seq: int,
+                       ingredient: str) -> dict[str, Any]:
+    """The exact text one ledger ingredient put in one turn's window, or why it cannot be shown"""
+    from . import context as context_mod
+
+    _name, path, _wo = find_work_order(wo_id, project)
+    store = ProjectStore(path)
+    try:
+        row = next((r for r in store.all_turns(wo_id) if r["seq"] == seq), None)
+        if row is None:
+            raise OpsError(f"{wo_id} has no turn {seq}")
+        payload = db.from_json(row["context_json"]) if row["context_json"] else {}
+        found = next((r for r in payload.get("ingredients") or []
+                      if r.get("name") == ingredient), None)
+        out: dict[str, Any] = {"wo_id": wo_id, "seq": seq, "name": ingredient,
+                               "text": None, "exact": False, "note": "",
+                               "detail": (found or {}).get("detail") or {}}
+        if found and found.get("sha"):
+            out["text"] = context_mod.blob(store, found["sha"])
+            out["exact"] = out["text"] is not None
+            if out["text"] is None:
+                out["note"] = "the row names a stored text that is no longer in ctx_blobs"
+            return out
+        prompt = row["prompt"] or ""
+        if ingredient in ("worker_prompt", "knowledge_index"):
+            # Recorded before ctx_blobs: split wo_turns.prompt by the ledger's own byte count
+            kb = next((r.get("bytes") for r in payload.get("ingredients") or []
+                       if r.get("name") == "knowledge_index"), None) or 0
+            if ingredient == "knowledge_index" and not kb:
+                out["note"] = "no knowledge block on this turn"
+                return out
+            raw = prompt.encode("utf-8")
+            cut = len(raw) - kb if 0 < kb <= len(raw) else len(raw)
+            part = raw[:cut] if ingredient == "worker_prompt" else raw[cut:]
+            out["text"] = part.decode("utf-8", "replace")
+            out["exact"] = True
+            out["note"] = "read from the turn's stored prompt"
+            return out
+        if found and found.get("absent"):
+            out["note"] = found.get("note") or "absent on this turn"
+        elif ingredient in ("add_dirs", "mcp_servers"):
+            out["note"] = "no text is stored for this ingredient; its detail is below"
+        else:
+            out["note"] = "not captured: this turn predates the context text store"
+        return out
+    finally:
+        store.close()
+
+
 def _in_window(ts: float, turn: dict[str, Any]) -> bool:
     """Is this cache write inside the turn's process window?"""
     if ts < (turn["started_at"] or 0.0):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -120,11 +121,21 @@ def _mcp_row(project: Any) -> dict[str, Any]:
                                              "count": len(names)}, note=note)
 
 
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
 def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
-            briefing: dict[str, Any], knowledge: Any = None) -> list[dict[str, Any]]:
-    """Every ingredient of this turn's window that Jarvis itself supplied"""
+            briefing: dict[str, Any], knowledge: Any = None,
+            texts: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """Every ingredient of this turn's window that Jarvis supplied; fills `texts` with each one's text"""
     rows: list[dict[str, Any]] = []
+    texts = {} if texts is None else texts
     append = str(briefing.get("append_system_prompt") or "")
+    texts["append_system_prompt"] = append
     rows.append(_row("append_system_prompt", _text_bytes(append),
                      detail={"lines": len(append.splitlines())},
                      note="Jarvis's git briefing plus the standing instructions, on "
@@ -135,6 +146,8 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
     if knowledge:
         block = _knowledge_block(knowledge, project.name)
         if prompt.endswith(block):
+            texts["worker_prompt"] = prompt[:len(prompt) - len(block)]
+            texts["knowledge_index"] = block
             rows.append(_row("worker_prompt", _text_bytes(prompt) - _text_bytes(block),
                              note="the turn's prompt, with the knowledge block counted "
                                   "separately below"))
@@ -144,6 +157,7 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
                                   "`render_knowledge_block` appends to the dispatch "
                                   "prompt"))
         else:
+            texts["worker_prompt"] = prompt
             rows.append(_row("worker_prompt", _text_bytes(prompt),
                              note="the turn's prompt WHOLE: the knowledge block could "
                                   "not be separated from it, so it is counted here and "
@@ -154,6 +168,7 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
                                 "`worker_prompt` — absent, not empty",
                                 detail={"entries": getattr(knowledge, "total", None)}))
     else:
+        texts["worker_prompt"] = prompt
         rows.append(_row("worker_prompt", _text_bytes(prompt),
                          note="the turn's prompt"))
         rows.append(_absent("knowledge_index",
@@ -166,17 +181,19 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
     size, why = _file_bytes(settings)
     rows.append(_row("worker_settings", size, detail={"path": str(settings)},
                      note=why or "the --settings file: hooks, permissions, env"))
+    if size is not None:
+        texts["worker_settings"] = _read_text(settings) or ""
 
-    rows.append(_memory_row(project, wo, turn))
-    rows.append(_session_start_row(project, wo, turn))
-    rows.append(_agent_row(briefing))
+    rows.append(_memory_row(project, wo, turn, texts))
+    rows.append(_session_start_row(project, wo, turn, texts))
+    rows.append(_agent_row(briefing, texts))
     rows.append(_add_dirs_row(briefing))
     rows.append(_mcp_row(project))
     return rows
 
 
-def _memory_row(project: Any, wo: dict[str, Any],
-                turn: dict[str, Any]) -> dict[str, Any]:
+def _memory_row(project: Any, wo: dict[str, Any], turn: dict[str, Any],
+                texts: dict[str, str]) -> dict[str, Any]:
     from . import hooks
 
     cwd = _worktree_cwd(project, wo, turn)
@@ -187,12 +204,16 @@ def _memory_row(project: Any, wo: dict[str, Any],
         return _absent("memory_files", f"the memory walk could not be read ({e})")
     total = 0
     counted: list[str] = []
+    parts: list[str] = []
     for path in paths[:MAX_FILES]:
         size, _ = _file_bytes(path)
         if size is None:
             continue
         total += min(size, max(0, MAX_BYTES - total))
         counted.append(str(path))
+        # The `==>` header is ours, to tell files apart; Claude Code wraps each in its own
+        parts.append(f"==> {path} <==\n{_read_text(path) or ''}")
+    texts["memory_files"] = "\n".join(parts)
     # `excluded` names the dropped ancestor copies: absent and zero are different (module docstring) (docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §5.)
     return _row("memory_files", total,
                 detail={"paths": counted, "count": len(counted), "cwd": str(cwd),
@@ -212,12 +233,13 @@ def session_start_text(serena: bool, cwd: Path) -> str:
     return text + hooks.serena_activation_context(cwd) if serena else text
 
 
-def _session_start_row(project: Any, wo: dict[str, Any],
-                       turn: dict[str, Any]) -> dict[str, Any]:
+def _session_start_row(project: Any, wo: dict[str, Any], turn: dict[str, Any],
+                       texts: dict[str, str]) -> dict[str, Any]:
     from . import wiring
 
     text = session_start_text(wiring.serena_wired(project.wiring),
                               _worktree_cwd(project, wo, turn))
+    texts["session_start_context"] = text
     return _row("session_start_context", _text_bytes(text),
                 note="the house style and Serena activation the SessionStart hook "
                      "injects on every turn")
@@ -231,7 +253,7 @@ def start_budget(ingredients: list[dict[str, Any]]) -> dict[str, Any]:
             "over": tokens > START_BUDGET_TOKENS}
 
 
-def _agent_row(briefing: dict[str, Any]) -> dict[str, Any]:
+def _agent_row(briefing: dict[str, Any], texts: dict[str, str]) -> dict[str, Any]:
     name = briefing.get("agent")
     if not name:
         return _absent("agent_persona",
@@ -241,6 +263,8 @@ def _agent_row(briefing: dict[str, Any]) -> dict[str, Any]:
         path = Path(d) / ".claude" / "agents" / f"{name}.md"
         if path.is_file():
             size, why = _file_bytes(path)
+            if size is not None:
+                texts["agent_persona"] = _read_text(path) or ""
             return _row("agent_persona", size,
                         detail={"agent": name, "path": str(path)},
                         note=why or "the feature's own agent definition (--agent)")
@@ -261,12 +285,27 @@ def _add_dirs_row(briefing: dict[str, Any]) -> dict[str, Any]:
                                     else ""))
 
 
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
 def payload(project: Any, wo: dict[str, Any], turn: dict[str, Any],
-            briefing: dict[str, Any], knowledge: Any = None) -> dict[str, Any]:
+            briefing: dict[str, Any], knowledge: Any = None,
+            texts: dict[str, str] | None = None) -> dict[str, Any]:
     """What `record` stores: the measurement plus everything needed to read it back"""
-    ingredients = measure(project, wo, turn, briefing, knowledge)
+    texts = {} if texts is None else texts
+    ingredients = measure(project, wo, turn, briefing, knowledge, texts)
+    for row in ingredients:
+        if row["name"] in texts:
+            row["sha"] = _sha(texts[row["name"]])
     return {"schema": SCHEMA, "caps": caps(), "token_bytes": TOKEN_BYTES,
             "ingredients": ingredients, "start_budget": start_budget(ingredients)}
+
+
+def blob(store: Any, sha: str) -> str | None:
+    """An ingredient's exact text by the `sha` its row carries; None when never stored"""
+    row = store.conn.execute("SELECT text FROM ctx_blobs WHERE sha=?", (sha,)).fetchone()
+    return None if row is None else row[0]
 
 
 # The meter wraps the WHOLE function (docs/superpowers/specs/2026-09-24-order-observability.md)
@@ -280,9 +319,12 @@ def record(store: Any, project: Any, wo: dict[str, Any], turn: dict[str, Any],
     try:
         import json as _json
 
+        texts: dict[str, str] = {}
+        body = payload(project, wo, turn, briefing, knowledge, texts)
+        store.conn.executemany("INSERT OR IGNORE INTO ctx_blobs (sha, text) VALUES (?, ?)",
+                               [(_sha(t), t) for t in texts.values()])
         store.conn.execute("UPDATE wo_turns SET context_json=? WHERE id=?",
-                           (_json.dumps(payload(project, wo, turn, briefing, knowledge)),
-                            turn["id"]))
+                           (_json.dumps(body), turn["id"]))
         store.conn.commit()
     except Exception:  # noqa: BLE001 — see the docstring: never into the dispatch path
         log.warning("could not record the context ledger for %s turn %s",

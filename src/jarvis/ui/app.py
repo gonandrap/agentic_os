@@ -1623,6 +1623,14 @@ def create_app() -> FastAPI:
         """Any id the OS mints, to the page that shows it (2026-10-22 spec §1)"""
         return RedirectResponse(ops.resolve_ref(ref), status_code=303)
 
+    @app.get("/api/wo/{name}/{wo_id}/context/{seq}/{ingredient}")
+    def work_order_context_ingredient(name: str, wo_id: str, seq: int, ingredient: str):
+        """`ops.context_ingredient` as JSON — what the debug page's ingredient modal fetches"""
+        try:
+            return JSONResponse(ops.context_ingredient(wo_id, name, seq, ingredient))
+        except ops.OpsError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+
     @app.get("/api/wo/{name}/{wo_id}/live")
     def work_order_live(name: str, wo_id: str):
         """`ops.live_report` as JSON, nothing reshaped — what the debugging page polls"""

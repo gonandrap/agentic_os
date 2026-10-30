@@ -37,7 +37,9 @@
         <th style="width: 120px;">tokens</th><th>what it is</th></tr>
     {% for row in turn.ingredients %}
     <tr>
-      <td class="mono">{{ row.name }}</td>
+      {# Opens the exact text in the modal below (`ops.context_ingredient`) #}
+      <td class="mono"><a href="#ctx-{{ turn.seq }}" class="ctx-open"
+        data-seq="{{ turn.seq }}" data-name="{{ row.name }}">{{ row.name }}</a></td>
       {# An ingredient that cannot be read is None with a sentence, never 0 bytes. #}
       <td class="mono">{{ '{:,}'.format(row.bytes) if row.bytes is not none else '–' }}</td>
       {# Commas and not `fmt_tok`: `jarvis wo context` prints this column as `{:,}` and an
@@ -99,4 +101,38 @@
 </details>
 {% endfor %}
 {% endif %}
+<dialog id="ctx-modal" style="width: min(1000px, 95vw); max-height: 90vh;">
+  <div class="row">
+    <span class="grow mono" id="ctx-modal-title"></span>
+    <button type="button" id="ctx-modal-close">close</button>
+  </div>
+  <div class="sub" id="ctx-modal-note"></div>
+  <pre id="ctx-modal-text" style="white-space: pre-wrap; overflow: auto; max-height: 70vh;"></pre>
+</dialog>
+<script id="ctx-modal-js">
+(function () {
+  var modal = document.getElementById("ctx-modal");
+  var base = "/api/wo/{{ project }}/{{ wo.id }}/context/";
+  var put = function (id, text) { document.getElementById(id).textContent = text; };
+  document.getElementById("ctx-modal-close").onclick = function () { modal.close(); };
+  document.querySelectorAll(".ctx-open").forEach(function (a) {
+    a.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      put("ctx-modal-title", a.dataset.name + " — turn " + a.dataset.seq);
+      put("ctx-modal-note", "loading…");
+      put("ctx-modal-text", "");
+      modal.showModal();
+      fetch(base + a.dataset.seq + "/" + encodeURIComponent(a.dataset.name))
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          put("ctx-modal-note", d.error || d.note || "");
+          var detail = d.detail && Object.keys(d.detail).length
+            ? JSON.stringify(d.detail, null, 2) : "";
+          put("ctx-modal-text", d.text !== null && d.text !== undefined ? d.text : detail);
+        })
+        .catch(function (e) { put("ctx-modal-note", "could not load: " + e); });
+    });
+  });
+})();
+</script>
 </section>
