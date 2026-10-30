@@ -115,6 +115,41 @@
     order was created, so there is nobody to reply to. The report is on the tracker;
     start work on it with <code>jarvis issues start {{ q.issue_url or '&lt;issue-url&gt;' }}</code>.
     {% if q.issue_url %}<a href="{{ q.issue_url }}">open the issue →</a>{% endif %}</div>
+  {% elif q.kind == 'validation' and q.morpheus_item %}
+  {# Morpheus asking about a shipped PR: no worker is waiting, and the only decisions are
+     the item's own two. Either one closes this question (`ops.morpheus_waive`/`_requeue`).
+     `ops.neo_answer_escalated` refuses a reply too; this is the half that stops the user
+     typing into a box that then errors. #}
+  <div class="sub" style="margin-top:8px">This asks you to rule on a shipped PR's
+    production check (<a href="/morpheus" class="mono">{{ q.morpheus_item }}</a>) — no
+    worker is waiting for a reply. Either choice closes this question.</div>
+  <div style="display:flex; gap:10px; margin-top:8px; align-items:flex-start">
+    <form method="post" action="/morpheus/{{ q.morpheus_item }}/waive"
+          style="flex:1; display:flex; gap:8px">
+      <input type="hidden" name="next" value="{{ back }}">
+      <input type="text" name="reason" required
+             placeholder="It works in production because… (marks it validated)">
+      <button class="accept">✓ Works — waive</button>
+    </form>
+    <form method="post" action="/morpheus/{{ q.morpheus_item }}/requeue" class="inline">
+      <input type="hidden" name="next" value="{{ back }}">
+      <button title="after fixing what made it fail">↻ Check again</button>
+    </form>
+  </div>
+  <form method="post" action="/morpheus/{{ q.morpheus_item }}/confirm"
+        style="display:flex; gap:8px; margin-top:8px">
+    <input type="hidden" name="next" value="{{ back }}">
+    <input type="text" name="fix" required
+           placeholder="It is broken: what needs fixing… (files a work order)">
+    <button class="reject">✗ Broken — file fix</button>
+  </form>
+  {% elif q.kind == 'findings' %}
+  {# An improvement-order finding: the analyst has settled, and the decision is taken on
+     the io. Same refusal in `ops.neo_answer_escalated`, same reason for this branch. #}
+  <div class="sub" style="margin-top:8px">This decides an improvement-order finding —
+    no worker is waiting for a reply.
+    {% if q.io_url %}<a href="{{ q.io_url }}">accept or reject it on the order →</a>
+    {% else %}Decide it with <code>jarvis io review &lt;io-id&gt; --accept|--reject &lt;key&gt;</code>.{% endif %}</div>
   {% else %}
   <form method="post" action="/neo/{{ q.id }}/answer" style="margin-top:8px">
     <input type="hidden" name="next" value="{{ back }}">

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ Q_STATUSES = (
     "answered",   # Neo answered; answer delivered to the worker
     "escalated",  # Neo declined — the user must answer
     "failed",     # answering errored; surfaced as attention
+    "refined",    # returned to the asker to split or narrow; nobody ruled (wo-ea3c6f0c)
 )
 # Review lifecycle of an answered question
 REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
@@ -38,6 +39,9 @@ SUPERVISOR_SEAT = "supervisor"
 
 # The seat values a LEARNING may legally carry, which is a wider vocabulary than the panel's roster
 LEARNING_SCOPES = SEATS + (SUPERVISOR_SEAT,)
+
+# What a learning's `origin_id` points at — the record of the review that taught it
+LEARNING_ORIGIN_KINDS = ("assumption", "finding", "alarm", "question")
 
 # WHY an escalation happened, as one groupable label (docs/superpowers/specs/2026-10-01-neo-observability.md)
 ESCALATION_CAUSES_CHOSEN = (
@@ -137,7 +141,13 @@ CREATE TABLE IF NOT EXISTS learnings (
     question_id INTEGER,
     seat TEXT NOT NULL DEFAULT '',           -- '' = global (every seat sees it)
     retired_at REAL,                         -- NULL = standing; set = superseded
-    retired_reason TEXT                      -- why, in the user's words
+    retired_reason TEXT,                     -- why, in the user's words
+    -- WHERE THE RULING CAME FROM, so a stale one can be audited before it is retracted.
+    -- Also in ADDED_COLUMNS: '' on every row written before these columns existed, and
+    -- on anything a person typed at a terminal. Never backfilled by guessing.
+    wo_id TEXT NOT NULL DEFAULT '',          -- the order the review settled
+    origin_kind TEXT NOT NULL DEFAULT '',    -- LEARNING_ORIGIN_KINDS
+    origin_id TEXT NOT NULL DEFAULT ''       -- the record within it, comma-joined if several
 );
 CREATE TABLE IF NOT EXISTS panel_opinions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -178,6 +188,10 @@ ADDED_COLUMNS = {
         # Retraction
         "retired_at": "REAL",
         "retired_reason": "TEXT",
+        # Provenance — the comment on the column in SCHEMA has the reasoning
+        "wo_id": "TEXT NOT NULL DEFAULT ''",
+        "origin_kind": "TEXT NOT NULL DEFAULT ''",
+        "origin_id": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -189,6 +203,12 @@ class NeoStore:
         self.conn = db.connect(self.db_path)
         self.conn.executescript(SCHEMA)
         self._migrate()
+
+    def purge_project(self, name: str) -> dict[str, int]:
+        """Delete every question and learning scoped to `name`, with the questions' panel opinions"""
+        with db.write_transaction(self.conn):
+            return db.delete_where(self.conn, db.tables_with_column(self.conn, "project"),
+                                   "project", name)
 
     def _migrate(self) -> None:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
@@ -235,16 +255,18 @@ class NeoStore:
                           (question, question_id))
         return True
 
-    def claim_next(self) -> dict[str, Any] | None:
-        """Atomically claim the OLDEST queued question (FIFO"""
+    def claim_next(self, skip: Collection[str] = ()) -> dict[str, Any] | None:
+        """Atomically claim the OLDEST queued question (FIFO), never one whose project is in `skip`"""
         now = db.now()
+        skip = sorted(skip)
         cur = self.conn.execute(
-            """UPDATE questions SET status='answering', claimed_at=?
+            f"""UPDATE questions SET status='answering', claimed_at=?
                WHERE id = (SELECT id FROM questions WHERE status='queued'
                              AND COALESCE(retry_after, 0) <= ?
+                             AND project NOT IN ({','.join('?' for _ in skip)})
                            ORDER BY ts LIMIT 1)
                RETURNING *""",
-            (now, now),
+            (now, now, *skip),
         )
         row = cur.fetchone()
         return dict(row) if row else None
@@ -491,6 +513,12 @@ class NeoStore:
                 FROM questions WHERE {' AND '.join(where)}
                 GROUP BY project, wo_id""", params).fetchall())
 
+    def refines(self, wo_id: str, kind: str) -> int:
+        """How many questions of `kind` this order has had returned to it — the loop cap's count"""
+        return int(self.conn.execute(
+            "SELECT COUNT(*) c FROM questions WHERE wo_id=? AND kind=? AND status='refined'",
+            (wo_id, kind)).fetchone()["c"])
+
     def counts(self) -> dict[str, int]:
         by_status = {
             r["status"]: r["c"]
@@ -552,12 +580,17 @@ class NeoStore:
     # -- learnings
 
     def add_learning(self, content: str, project: str = "", source: str = "manual",
-                     question_id: int | None = None, seat: str = "") -> dict[str, Any]:
-        """Record a learning"""
+                     question_id: int | None = None, seat: str = "", wo_id: str = "",
+                     origin_kind: str = "", origin_id: str = "") -> dict[str, Any]:
+        """Record a learning, with the review record that taught it"""
+        if origin_kind and origin_kind not in LEARNING_ORIGIN_KINDS:
+            raise ValueError(f"unknown learning origin kind {origin_kind!r} — the kinds "
+                             f"are: {', '.join(LEARNING_ORIGIN_KINDS)}")
         cur = self.conn.execute(
-            "INSERT INTO learnings (ts, project, content, source, question_id, seat) "
-            "VALUES (?,?,?,?,?,?)",
-            (db.now(), project, content, source, question_id, seat or ""),
+            "INSERT INTO learnings (ts, project, content, source, question_id, seat, "
+            "wo_id, origin_kind, origin_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (db.now(), project, content, source, question_id, seat or "",
+             wo_id or "", origin_kind or "", origin_id or ""),
         )
         row = self.conn.execute("SELECT * FROM learnings WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)

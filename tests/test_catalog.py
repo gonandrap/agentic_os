@@ -1349,3 +1349,29 @@ def test_a_zero_recompute_stall_threshold_is_refused_rather_than_clamped():
 def test_the_shipped_recompute_stall_default_is_thirty_minutes():
     """Neo question 1830"""
     assert jarvis.catalog.DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES == 30
+
+
+def test_the_catch_up_cap_window_and_backoff_ship_with_their_defaults():
+    """A cap of 10 in 2h, backing off from 1m to at most 10m between catch-ups"""
+    cat = parse_catalog({"projects": []})
+    cfg = cat.os.pull_requests
+    assert (cfg.catch_up_max, cfg.catch_up_window_minutes,
+            cfg.catch_up_backoff_base_seconds, cfg.catch_up_backoff_max_seconds) \
+        == (10, 120, 60, 600)
+
+
+def test_the_catch_up_knobs_are_fleet_wide_and_per_project():
+    cat = parse_catalog({
+        "os": {"pull_requests": {"catch_up_max": 4}},
+        "projects": [{"name": "a", "path": "/tmp/a",
+                      "pull_requests": {"catch_up_backoff_max_seconds": 120}},
+                     {"name": "b", "path": "/tmp/b"}]})
+    assert cat.project("a").pull_requests.catch_up_max == 4          # inherited
+    assert cat.project("a").pull_requests.catch_up_backoff_max_seconds == 120
+    assert cat.project("b").pull_requests.catch_up_backoff_max_seconds == 600
+
+
+def test_a_backoff_base_above_its_ceiling_is_refused():
+    with pytest.raises(CatalogError, match="catch_up_backoff_base_seconds 900 is above"):
+        parse_catalog({"os": {"pull_requests": {"catch_up_backoff_base_seconds": 900}},
+                       "projects": []})

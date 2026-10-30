@@ -1,37 +1,42 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}Backlog — Jarvis{% endblock %}
 {% block content %}
 
-<h2>Backlog</h2>
-<div class="panel">
-  {% for it in items %}
-  <div class="row" id="{{ it.id }}">
-    <span class="st tone-{{ 'muted' if it.status != 'open' else 'active' }}">
-      <span class="i">{{ '◌' if it.status == 'open' else '✓' if it.status == 'done' else '→' }}</span>{{ it.status }}</span>
-    <div class="grow">
-      <span class="mono">{{ it.id }}</span> <strong>{{ it.project }}</strong> — {{ it.title }}
-      {% if it.description %}<div class="sub">{{ it.description }}</div>{% endif %}
-      {% if it.status == 'open' and blockers.get(it.id) %}
-        <div class="sub tone-warn">◭ blocked by:
-          {% for b in blockers[it.id] %}{{ b.id }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
-        </div>
-      {% endif %}
-      {% if it.promoted_wo_id %}
-        <div class="sub">promoted → <a class="mono" href="/wo/{{ it.project }}/{{ it.promoted_wo_id }}">{{ it.promoted_wo_id }}</a></div>
-      {% endif %}
-    </div>
-    {% if it.status == 'open' %}
-    <form class="inline" method="post" action="/backlog/promote/{{ it.id }}">
-      {% if blockers.get(it.id) %}
-        <label class="sub"><input type="checkbox" name="force" value="1"> force</label>
-      {% endif %}
-      <button {{ 'class=primary' if not blockers.get(it.id) }}>Promote</button>
-    </form>
-    {% endif %}
-  </div>
-  {% else %}
-  <div class="empty">backlog empty — workers file deferred work here automatically</div>
-  {% endfor %}
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6 #}
+{{ ui.page_head("Backlog", (attention | length) ~ " blocked · " ~ total ~ " items") }}
+
+{% call(it) ui.needs_you(attention, "blocked by unfinished dependencies") %}
+  {{ ui.row_id(it.id, "/backlog/" ~ it.id) }}
+  <span class="sub">{{ it.title }} — waits on
+    {% for b in it.blockers %}{{ b.id }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}</span>
+{% endcall %}
+
+{{ ui.filter_bar("/backlog", filters, options, rows | length, total) }}
+
+<div class="panel table-wrap">
+  <table class="backlog-list">
+    <tr><th>id</th><th>project</th><th>title</th><th>status</th><th>became</th><th></th></tr>
+    {% for it in rows %}
+    <tr id="{{ it.id }}">
+      <td>{{ ui.row_id(it.id, "/backlog/" ~ it.id) }}</td>
+      <td class="mono">{{ it.project }}</td>
+      <td class="prose"><div class="clamp" title="{{ it.description or it.title }}">{{ it.title }}</div>
+        {% if it.blockers %}<div class="sub tone-warn">◭ blocked by
+          {% for b in it.blockers %}{{ b.id }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}</td>
+      <td class="when"><span class="st tone-{{ 'active' if it.status == 'open' else 'muted' }}">
+        <span class="i">{{ '◌' if it.status == 'open' else '✓' if it.status == 'done' else '→' }}</span>{{ it.status }}</span></td>
+      <td>{% if it.promoted_wo_id %}{{ ui.row_id(it.promoted_wo_id, "/go/" ~ it.promoted_wo_id) }}{% else %}—{% endif %}</td>
+      <td>{% if it.status == 'open' %}
+        <form class="inline" method="post" action="/backlog/promote/{{ it.id }}">
+          {% if it.blockers %}<label class="sub"><input type="checkbox" name="force" value="1"> force</label>{% endif %}
+          <button {{ 'class=primary' if not it.blockers }}>Promote</button>
+        </form>{% endif %}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6" class="empty">{{ 'nothing matches these filters' if filters else 'backlog empty — workers file deferred work here automatically' }}</td></tr>
+    {% endfor %}
+  </table>
 </div>
 
 {% endblock %}

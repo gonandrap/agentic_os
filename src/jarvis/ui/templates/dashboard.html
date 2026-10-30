@@ -1,5 +1,12 @@
 {% extends "base.html" %}
 {% block title %}Jarvis — dashboard{% endblock %}
+{% block style %}
+  .form-line { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; margin-bottom: 10px; }
+  .form-line > input[type=text], .form-line > textarea { flex: 1 1 20ch; min-width: 0; }
+  .form-line > select, .form-line > input[style] { flex: 0 1 auto; }
+  .form-line:last-child { margin-bottom: 0; }
+  @media (max-width: 640px) { main .row { flex-wrap: wrap; } main .row > .grow { flex-basis: 100%; } }
+{% endblock %}
 {% block head %}
 {# No whole-page refresh: it would wipe whatever the user is typing into the new
    work order form. JS swaps the live regions in place; noscript falls back. #}
@@ -7,48 +14,31 @@
 {% endblock %}
 {% block content %}
 {% import "_brake.html" as brake_ui %}
+{% import "_layout.html" as ui %}
 
-{# AT WIDTH — §5 of docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md:
-   what needs you and what is running | the projects | the controls. `live-top` is
-   `display: contents`, so the poll still swaps it whole while its two halves are
-   columns of the grid. #}
-<div class="grid dash" style="--col: 520px;">
-<div id="live-top" style="display: contents;">
-<div class="dash-now">
+{# §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md:
+   what needs you, then open work full width; the forms and the brake sit in tabs below,
+   outside every live region so a poll never clobbers a half-typed order. #}
+<div id="live-top">
 
-<div class="attention {{ 'hot' if st.attention else '' }}">
-  {% if st.attention %}
-    <div class="strip-head">NEEDS YOU — {{ st.attention | length }} item{{ 's' if st.attention | length != 1 }}</div>
-    <div class="sub">{{ attention_list_note }}</div>
-    <ul>
-      {% for a in st.attention %}
-      <li>
-        {% if a.wo_id %}
-          <a href="{{ order_path(a.project, a.wo_id) }}" class="mono">{{ a.wo_id }}</a>
-        {% elif a.fo_id %}
-          {# One line for the whole feature, its flagged children rolled into the reason.
-             The link goes to that order's OWN page, which is where they are individually
-             reachable — that page is what makes the rollup safe to collapse. Via
-             `order_path`, because an `io-`/`inv-` id rendered with the feature template
-             hid the decision the user owed (GitHub issue #997). #}
-          <a href="{{ order_path(a.project, a.fo_id) }}" class="mono">{{ a.fo_id }}</a>
-        {% endif %}
-        <strong>{{ a.project }}</strong> — {{ a.title }}
-        <div class="sub">{{ a.reason }}
-          {%- if a.approval_id %}
-          {# the item names a command to approve; the place to do that is the gates tab #}
-          · <a href="/gates#gate-{{ a.approval_id }}">decide it →</a>
-          {%- endif %}</div>
-      </li>
-      {% endfor %}
-    </ul>
-  {% else %}
-    {% set running = st.projects | map(attribute='summary.by_status.running') | select | sum %}
-    <div class="quiet"><span class="dot">●</span> all quiet —
-      {{ running }} worker{{ 's' if running != 1 }} running,
-      nothing needs you{% if not st.daemon.running %} (but the daemon is down){% endif %}</div>
-  {% endif %}
+{% if st.attention %}
+{% call(a) ui.needs_you(st.attention, "NEEDS YOU") %}
+  {% if a.wo_id %}{{ ui.row_id(a.wo_id, order_path(a.project, a.wo_id)) }}
+  {# a feature's flagged children roll into its one line; its own page lists them (#997) #}
+  {% elif a.fo_id %}{{ ui.row_id(a.fo_id, order_path(a.project, a.fo_id)) }}{% endif %}
+  <strong>{{ a.project }}</strong> — {{ a.title }}
+  <div class="sub">{{ a.reason }}
+    {%- if a.approval_id %} · <a href="/gates/{{ a.approval_id }}">decide it →</a>{% endif %}</div>
+{% endcall %}
+<div class="sub">{{ attention_list_note }}</div>
+{% else %}
+<div class="attention">
+  {% set running = st.projects | map(attribute='summary.by_status.running') | select | sum %}
+  <div class="quiet"><span class="dot">●</span> all quiet —
+    {{ running }} worker{{ 's' if running != 1 }} running,
+    nothing needs you{% if not st.daemon.running %} (but the daemon is down){% endif %}</div>
 </div>
+{% endif %}
 
 {% if st.inbox.unacked %}
 <div class="panel" style="margin-bottom: 6px;">
@@ -65,9 +55,10 @@
 {% endif %}
 
 <h2>Open work orders</h2>
-{# The decisions you owe, then what is being worked on now, then what is waiting for you
-   to merge it — those are the rows. Only the statuses the OS has not started yet collapse
-   into a count you can expand: those are waiting on the OS, not on you. #}
+{{ ui.filter_bar("/", filters, options, shown | length, total,
+                 labels={"project": "every project", "status": "every status"}) }}
+{# The decisions you owe first, then what is running, then what waits for a merge. Only the
+   statuses the OS has not started yet collapse into a count: they wait on the OS, not you. #}
 {% if rest_counts %}
 <p class="sub">
   {% for status, n in rest_counts %}
@@ -84,31 +75,28 @@
   {% else %}<a href="/?show=all">show all</a>{% endif %}
 </p>
 {% endif %}
-<div class="panel">
-  {% for wo in featured + rest %}
+<div class="panel open-work">
+  {% for wo in shown %}
     {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
     {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
-    <div class="row">
+    <div class="row" data-status="{{ wo.status }}">
       <span class="st tone-{{ m.tone }} {{ 'pulse' if wo.status == 'running' }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
       <div class="grow">
-        <a href="/wo/{{ wo.project }}/{{ wo.id }}" class="mono">{{ wo.id }}</a>
+        {{ ui.row_id(wo.id, '/wo/' ~ wo.project ~ '/' ~ wo.id) }}
         {{ wo.title }}
         <span class="sub">· {{ wo.project }}</span>
         {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
           <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
         {% endif %}
-        {# Still `running`, and nothing is running: the transport lost the turn — the
-           usage window is spent, or the Claude API failed. The OS resumes it by itself,
-           so this is an explanation and not an ask — no attention flag, no action for
-           the user. #}
+        {# Still `running` with nothing running: the transport lost the turn and the OS
+           resumes it by itself, so this explains rather than asks. #}
         {% if wo.pause %}
           <div class="sub">⏳ {{ wo.pause }}</div>
         {% endif %}
         {{ brake_ui.let_through(brake, wo, '/') }}
         {% if wo.blocked_by %}
           <div class="sub">⊘ blocked by:
-            {% for b in wo.blocked_by %}<a class="mono"
-              href="/wo/{{ wo.project }}/{{ b.id }}">{{ b.id }}</a> ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
+            {% for b in wo.blocked_by %}{{ ui.row_id(b.id, '/wo/' ~ wo.project ~ '/' ~ b.id) }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
           </div>
         {% endif %}
       </div>
@@ -117,60 +105,29 @@
     </div>
   {% else %}
     <div class="empty">
-      {% if rest_counts %}nothing running and nothing waiting on you — the rest is counted above
+      {% if filters %}nothing matches these filters
+      {% elif rest_counts %}nothing running and nothing waiting on you — the rest is counted above
       {% else %}no open work orders{% endif %}
     </div>
   {% endfor %}
 </div>
 
-</div>
-<div class="dash-projects">
-<h2>Projects</h2>
-<div class="panel">
-  {% for p in st.projects %}
-  <div class="row">
-    <div class="grow">
-      <a href="/project/{{ p.name }}"><strong>{{ p.name }}</strong></a>
-      {% if p.settings_drift %}<span class="badge outside">settings drift</span>{% endif %}
-      <div class="sub">{{ p.description or p.path }}</div>
-    </div>
-    <span class="counts">
-      {% for status, n in (p.summary.by_status or {}).items() %}
-        {% set m = status_meta.get(status, {'word': status, 'icon': '•', 'tone': 'muted'}) %}
-        <span class="st tone-{{ m.tone }}" title="{{ m.word }}"><span class="i">{{ m.icon }}</span>{{ n }} {{ m.word }}</span>&nbsp;
-      {% else %}
-        <span class="tone-muted">no work orders yet</span>
-      {% endfor %}
-    </span>
-  </div>
-  {% else %}
-  <div class="empty">No projects registered — run <code>jarvis start --catalog …</code></div>
-  {% endfor %}
-</div>
-
-</div>
 </div><!-- /live-top -->
 
-<div class="dash-act">
+<div class="tabbed" id="dash-tabs">
+  <div class="tabs" role="tablist">
+    <button role="tab" data-panel="tab-new-wo" aria-selected="true" aria-controls="tab-new-wo">New work order</button>
+    <button role="tab" data-panel="tab-new-fo" aria-selected="false" aria-controls="tab-new-fo">New feature order</button>
+    {% if not (brake and brake.paused) %}
+    <button role="tab" data-panel="tab-brake" aria-selected="false" aria-controls="tab-brake">Fleet brake</button>
+    {% endif %}
+  </div>
 
-{# The brake, from here as from `jarvis pause`. Outside every live region, like the
-   forms below: a poll must not clobber a half-typed reason. While paused the banner at
-   the top carries "Resume all" instead. #}
-{% if not (brake and brake.paused) %}
-<h2>Fleet brake</h2>
-<div class="panel" style="padding: 14px 16px;">
-  <form method="post" action="/fleet/pause" style="display: flex; gap: 10px;">
-    <input type="text" name="reason" aria-label="why the fleet is paused"
-           placeholder="why (optional) — shown on every page while paused">
-    <button type="submit" class="danger" title="`jarvis pause`: no work order starts a turn — dispatch, relaunch, message delivery, validation — until you let it through or resume. Turns in flight finish; nothing is killed or lost.">Pause fleet</button>
-  </form>
-</div>
-{% endif %}
-
+<div class="tabpanel on" id="tab-new-wo">
 <h2>New work order</h2>
 <div class="panel" style="padding: 14px 16px;">
   <form method="post" action="/wo/create">
-    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+    <div class="form-line">
       <select name="project" required style="max-width: 220px;">
         {% for p in st.projects %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}
       </select>
@@ -185,21 +142,21 @@
                     Jarvis spends on it. e.g. 5 or $5.50. Leave empty for the project's
                     default, which is usually no ceiling.">
     </div>
-    <div style="display: flex; gap: 10px; align-items: flex-start;">
+    <div class="form-line">
       <textarea name="description" placeholder="details, context, constraints (optional)"></textarea>
       <button type="submit" class="primary">Create work order</button>
     </div>
   </form>
 </div>
+</div>
 
-{# The coarse ask, for work that is bigger than one session. Deliberately a SECOND form
-   rather than a checkbox on the one above: the two produce different things, and the
-   description field is optional there and required here — a feature order's first
-   reader is a planner in a fresh session, and it will decompose four words. #}
+{# A SECOND form rather than a checkbox: the two produce different things, and a feature
+   order's first reader is a planner in a fresh session, so its description is required. #}
+<div class="tabpanel" id="tab-new-fo">
 <h2>New feature order</h2>
 <div class="panel" style="padding: 14px 16px;">
   <form method="post" action="/fo/create">
-    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+    <div class="form-line">
       <select name="project" required style="max-width: 220px;">
         {% for p in st.projects %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}
       </select>
@@ -211,12 +168,28 @@
                     child. Each child takes a slice of what is left when it is dispatched.
                     e.g. 50 or $50.00.">
     </div>
-    <div style="display: flex; gap: 10px; align-items: flex-start;">
+    <div class="form-line">
       <textarea name="description" required
                 placeholder="the whole ask — the planner sees only this text, and the plan is built from it"></textarea>
       <button type="submit" class="primary">Plan it</button>
     </div>
   </form>
+</div>
+</div>
+
+{# The brake, as `jarvis pause`. While paused the banner carries "Resume all" instead. #}
+{% if not (brake and brake.paused) %}
+<div class="tabpanel" id="tab-brake">
+<h2>Fleet brake</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <form method="post" action="/fleet/pause" class="form-line">
+    <input type="text" name="reason" aria-label="why the fleet is paused"
+           placeholder="why (optional) — shown on every page while paused">
+    <button type="submit" class="danger" title="`jarvis pause`: no work order starts a turn — dispatch, relaunch, message delivery, validation — until you let it through or resume. Turns in flight finish; nothing is killed or lost.">Pause fleet</button>
+  </form>
+</div>
+</div>
+{% endif %}
 </div>
 
 <div id="live-bottom">
@@ -228,8 +201,6 @@
 </div></div>
 {% endif %}
 </div><!-- /live-bottom -->
-</div>
-</div>
 
 <script>
 /* Live dashboard without losing your place: re-fetch this same server-rendered

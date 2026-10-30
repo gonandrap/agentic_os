@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}cost — Jarvis{% endblock %}
+{% block head %}<meta http-equiv="refresh" content="2">
+<style>
+  /* CSS only, so the bar cannot wedge the page the way a script could */
+  .computing-bar { height: 6px; border-radius: 3px; overflow: hidden;
+                   background: rgba(127, 127, 127, 0.22); margin: 12px 0 0; }
+  .computing-bar > span { display: block; width: 34%; height: 100%;
+                          border-radius: 3px; background: currentColor;
+                          animation: computing-sweep 1.4s ease-in-out infinite; }
+  @keyframes computing-sweep {
+    0%   { margin-left: -34%; }
+    100% { margin-left: 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .computing-bar > span { animation: none; width: 100%; opacity: 0.5; }
+  }
+</style>{% endblock %}
+{% block content %}
+{# No JavaScript on this page either: a meta refresh is the honest control.
+   docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md #}
+<h2>What the work cost — computing</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <p style="margin: 0;">This window is being read off the session transcripts, which
+    takes a while the first time. The page refreshes itself every 2 seconds.</p>
+  <div class="computing-bar" aria-hidden="true"><span></span></div>
+  <p class="kv mono" style="margin: 8px 0 0;">
+    {{ window.label }} · {{ window.local_label }}
+    {%- if parsed %} · {{ parsed }} transcript{{ "" if parsed == 1 else "s" }} parsed{% endif %}
+  </p>
+</div>
+<p style="margin-top: 14px;"><a href="/cost">← the current usage week</a></p>
+{% endblock %}

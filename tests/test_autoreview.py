@@ -670,6 +670,31 @@ def test_a_hold_is_recorded_once_per_reason_and_is_not_an_attention_item(started
     assert "held" in ops.autoreview_state(store, wo)["line"]
 
 
+def test_every_pending_hold_is_named_not_only_the_newest(started):
+    """Holds land one assumption at a time; the summary must not show only the last one"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=("reused the production api key",
+                                  "reused the production db password", ROUTINE,
+                                  "pointed the production cron at the new host"))
+
+    ask(started, store)
+
+    held = events(store, wo["id"], "autoreview_held")
+    assert len(held) == 3
+    line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert line.startswith("held — the OS would not decide 3 assumptions: ")
+    for h in held:
+        assert f"#{h['n']}" in line
+    assert "#3" not in line
+
+    # A decided assumption stops being owed, and one left reads as it always did
+    first, second, *_ = store.pending_assumptions(wo["id"])
+    store.review_assumption(first["id"], "accepted")
+    store.review_assumption(second["id"], "accepted")
+    line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "would not decide" not in line and "#4" in line
+
+
 def settled_round(store, wo_id: str, outcome: str, reason: str = "") -> None:
     """A fresh settled round on the judged commit, `park`'s way"""
     row = store.open_validation_round(wo_id=wo_id, fingerprint="fp1")
@@ -2545,3 +2570,20 @@ def test_an_ask_dropped_on_a_cancelled_order_is_not_re_armed(started):
     assert questions()[0]["status"] == "escalated"
     (escalated,) = events(store, wo["id"], "autoreview_escalated")
     assert escalated["re_asked"] is False
+
+
+def test_an_unseen_reference_is_asked_for_not_ruled_on():
+    """Neo Q2290: assumption #2 argued from a withheld #1; Neo must ask for the data, not guess"""
+    persona = autoreview.ASSUMPTION_REVIEWER_PERSONA
+    assert "NEVER RULE ON PARTIAL DATA" in persona
+    # Running order: object so the worker restates it; finished: escalate as evidence-insufficient
+    rule = persona[persona.index("NEVER RULE ON PARTIAL DATA"):]
+    rule = rule[:rule.index("\n\n")]
+    assert "OBJECTION" in rule and "self-contained" in rule
+    assert "evidence-insufficient" in rule
+    assert "never\naccept" in rule or "never accept" in " ".join(rule.split())
+
+
+def test_neo_answers_an_unseen_reference_by_asking_for_it():
+    """The question-side twin of the rule above"""
+    assert "NEVER DECIDE ON PARTIAL DATA" in neo.PERSONA

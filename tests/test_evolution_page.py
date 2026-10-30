@@ -44,7 +44,10 @@ def report(**over) -> dict:
                                         "excluded_note": None}},
         "stuck_resolution": [],
         "timeline": [],
+        "lineage": {"rows": [], "user_asked": 0, "untraced": 0,
+                    "note": "nothing self-induced learned anything"},
         "unreadable": {"projects": [], "detectors": [], "fires": []},
+        "cost_unattributed": ops.RULE_COST_UNATTRIBUTED,
     }
     base.update(over)
     return base
@@ -105,6 +108,44 @@ def test_the_days_parameter_narrows_the_window(client):
     assert "7 days" in body_of(res.text)
 
 
+def test_the_filter_bars_own_submission_renders(client):
+    """The exact URL the filter bar submits with 'every days' picked was a 422 (wo-522ea53a)"""
+    res = client.get("/evolution?project=proj_a&days=&firing=")
+    assert res.status_code == 200
+    assert "90 days" in body_of(res.text)
+
+
+def test_self_induced_knowledge_renders_with_every_hop_of_its_chain(client):
+    """The lineage the user asked for, end to end through the real report (Neo q2514)"""
+    from jarvis.central_store import CentralStore
+    from jarvis.project_store import ProjectStore
+
+    ps = ProjectStore(ops.registered_project_paths()["proj_a"])
+    try:
+        inv = ps.create_feature_order("investigate wo-1", origin="fleet_health",
+                                      kind="investigation",
+                                      metadata={ops.SUBJECT_KEY: "wo-1"})
+        investigator = ps.create_work_order("diagnose", kind="investigator",
+                                            parent_id=inv["id"])
+        asked = ps.create_work_order("user work", origin="ui")
+    finally:
+        ps.close()
+    central = CentralStore()
+    try:
+        evolved = central.add_knowledge("held panels hide stuck orders", project="proj_a",
+                                        wo_id=investigator["id"])
+        central.add_knowledge("user-asked lesson", project="proj_a", wo_id=asked["id"])
+    finally:
+        central.close()
+
+    body = body_of(client.get("/evolution").text)
+
+    assert f'id="lineage-{evolved["id"]}"' in body
+    assert investigator["id"] in body and inv["id"] in body
+    assert "origin fleet_health" in body
+    assert "user-asked lesson" not in body
+
+
 # -- the page prints what the dict says and computes nothing
 
 
@@ -130,19 +171,74 @@ def test_an_absent_share_prints_the_sentence_and_no_digit(client, monkeypatch):
     assert "0.0" not in body
 
 
+def _rule(**over) -> dict:
+    """One `per_rule` row of a detector that never fired"""
+    return {"id": "det-1", "gap_class": "stuck_order", "summary": "a summary",
+            "status": "dry_run", "hits": 0, "false_positives": 0,
+            "recurrences": 0, "last_fired": None, "last_cleared": None,
+            "hit_rate": None,
+            "hit_rate_note": "this detector has never fired, so it has no hit rate",
+            "readable": True, "condition_problems": [],
+            "median_cleared_seconds": None,
+            "median_cleared_seconds_note": "0 cleared fires, not a median yet",
+            "cost": ops.rule_cost_entry({}, "det-1"), **over}
+
+
+def test_rule_cost_shows_on_the_list_and_the_rule_page(client, monkeypatch):
+    costs = {"det-1": {"days": 30, "total_usd": 1.25, "neo_usd": 0.25, "orders_usd": 1.0,
+                       "by_remedy": {"rm-1": 1.25}, "questions": 1,
+                       "orders": [{"id": "wo-7", "project": "proj_a"}],
+                       "unread_orders": []}}
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(per_rule=[
+        _rule(hits=1, last_fired=1.0, cost=ops.rule_cost_entry(costs, "det-1")),
+        _rule(id="det-2", hits=1, last_fired=1.0)]))
+    listing = body_of(client.get("/evolution").text)
+    assert "$1.25" in listing
+    assert "none" in listing.split('id="rule-det-2"', 1)[1].split("</tr>", 1)[0]
+    assert "`force_rejudge` spend lands in the subject order" in listing
+    detail = body_of(client.get("/evolution/rule/det-1").text)
+    assert "rm-1: $1.25" in detail and 'href="/wo/proj_a/wo-7"' in detail
+    quiet = body_of(client.get("/evolution/rule/det-2").text)
+    assert "which is not a measured $0" in quiet
+
+
 def test_a_rule_with_no_hit_rate_shows_the_note(client, monkeypatch):
-    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
-        per_rule=[{"id": "det-1", "gap_class": "stuck_order", "summary": "a summary",
-                   "status": "dry_run", "hits": 0, "false_positives": 0,
-                   "recurrences": 0, "last_fired": None, "last_cleared": None,
-                   "hit_rate": None,
-                   "hit_rate_note": "this detector has never fired, so it has no hit rate",
-                   "readable": True, "condition_problems": [],
-                   "median_cleared_seconds": None,
-                   "median_cleared_seconds_note": "0 cleared fires, not a median yet"}]))
+    """The note left the table for the rule's own page (fo-744c42a5 §5); the list folds it as quiet"""
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(per_rule=[_rule()]))
     body = body_of(client.get("/evolution").text)
-    assert "this detector has never fired, so it has no hit rate" in body
-    assert "det-1" in body
+    quiet = body.split('id="quiet-detectors"', 1)[1].split("</details>", 1)[0]
+    assert 'href="/evolution/rule/det-1"' in quiet
+    detail = body_of(client.get("/evolution/rule/det-1").text)
+    assert "this detector has never fired, so it has no hit rate" in detail
+    assert "a summary" in detail
+
+
+def test_an_unknown_rule_is_a_404(client, monkeypatch):
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(per_rule=[_rule()]))
+    assert client.get("/evolution/rule/det-nope").status_code == 404
+
+
+def test_a_rule_page_shows_what_it_filed_and_its_history(client, monkeypatch):
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
+        per_rule=[_rule(hits=3, last_fired=1.0)],
+        by_gap_class=[{"gap_class": "stuck_order", "total": 3,
+                       "weeks": [{"week": "2026-10-19", "count": 3}]}],
+        timeline=[{"ts": 1.0, "kind": "detector_added", "id": "det-1",
+                   "headline": "a detector was registered", "links": {"fix_wo": "wo-9"}},
+                  {"ts": 1.0, "kind": "detector_added", "id": "det-2",
+                   "headline": "another detector", "links": {}}]))
+    listing = body_of(client.get("/evolution").text)
+    assert 'id="rule-det-1"' in listing.split('id="quiet-detectors"')[0]
+    detail = body_of(client.get("/evolution/rule/det-1?project=").text)
+    assert "2026-10-19" in detail and 'href="/go/wo-9"' in detail
+    assert "another detector" not in detail
+
+
+def test_the_firing_filter_narrows_the_rules(client, monkeypatch):
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
+        per_rule=[_rule(), _rule(id="det-2", hits=2, last_fired=1.0)]))
+    body = body_of(client.get("/evolution?firing=firing").text)
+    assert "det-2" in body and "det-1" not in body
 
 
 def test_a_timeline_entry_with_no_links_renders_no_link(client, monkeypatch):
@@ -259,12 +355,124 @@ def test_the_project_page_links_to_its_own_evolution_report(client):
     assert 'href="/evolution/proj_a"' in body
 
 
-# -- read-only, by the work order's scope boundary
+# -- operating the registry: the `jarvis rules` verbs as forms (wo-ded7522d)
+
+COND = {"field": "status", "op": "eq", "value": "needs_review"}
 
 
-def test_nothing_under_evolution_accepts_a_post(app):
-    """The scope boundary says no arming and no rule editing from the page"""
-    offenders = [(r.path, sorted(r.methods)) for r in app.routes
-                 if getattr(r, "path", "").startswith("/evolution")
-                 and "POST" in getattr(r, "methods", set())]
-    assert offenders == []
+@pytest.fixture()
+def central(client):
+    from jarvis.central_store import CentralStore
+    c = CentralStore()
+    yield c
+    c.close()
+
+
+@pytest.fixture()
+def det(central):
+    d = central.add_detector("gap-under-test", COND, project="proj_a", source="user")
+    rm = central.add_remedy_rule(d["id"], "nudge", argument="ask where it got to")
+    return {**d, "remedy_id": rm["id"] if isinstance(rm, dict) else rm}
+
+
+def _fire(central, det, outcome="recorded"):
+    return central.record_rule_fire(detector_id=det["id"], project="proj_a",
+                                    order_id="wo-1", order_kind="wo", fingerprint="fp",
+                                    mode="dry_run", outcome=outcome)
+
+
+def _post(client, path, **form):
+    return client.post(path, data=form)
+
+
+def test_the_rule_page_offers_arm_and_retract_on_a_dry_run_detector(client, det):
+    body = body_of(client.get(f"/evolution/rule/{det['id']}").text)
+    assert f'action="/evolution/rule/{det["id"]}/arm"' in body
+    assert f'action="/evolution/rule/{det["id"]}/retract"' in body
+
+
+def test_arm_records_the_reason_and_the_page_shows_armed(client, central, det):
+    res = _post(client, f"/evolution/rule/{det['id']}/arm", reason="three clean hits")
+    assert res.status_code == 303 and "error=" not in res.headers["location"]
+    row = central.get_detector(det["id"])
+    assert row["status"] == "armed" and row["armed_reason"] == "three clean hits"
+    body = body_of(client.get(res.headers["location"]).text)
+    assert "three clean hits" in body
+    assert f'/evolution/rule/{det["id"]}/arm"' not in body
+
+
+def test_arm_without_a_reason_is_refused(client, central, det):
+    res = _post(client, f"/evolution/rule/{det['id']}/arm", reason="  ")
+    assert "error=" in res.headers["location"]
+    assert central.get_detector(det["id"])["status"] != "armed"
+
+
+def test_arming_an_armed_detector_is_refused(client, det):
+    _post(client, f"/evolution/rule/{det['id']}/arm", reason="first")
+    res = _post(client, f"/evolution/rule/{det['id']}/arm", reason="again")
+    assert "already+armed" in res.headers["location"] or "already%20armed" in res.headers["location"]
+
+
+def test_retract_a_detector_then_no_action_is_offered(client, central, det):
+    res = _post(client, f"/evolution/rule/{det['id']}/retract",
+                rule_id=det["id"], reason="it was wrong")
+    assert "error=" not in res.headers["location"]
+    assert central.get_detector(det["id"])["retired_at"] is not None
+    body = body_of(client.get(res.headers["location"]).text)
+    assert "/arm\"" not in body and "retract detector" not in body
+
+
+def test_retract_one_remedy_rule_leaves_the_detector(client, central, det):
+    res = _post(client, f"/evolution/rule/{det['id']}/retract",
+                rule_id=det["remedy_id"], reason="nudging never helped")
+    assert "error=" not in res.headers["location"]
+    assert central.get_remedy_rule(det["remedy_id"])["retired_at"] is not None
+    assert central.get_detector(det["id"])["retired_at"] is None
+
+
+def test_retract_without_a_reason_or_twice_is_refused(client, det):
+    path = f"/evolution/rule/{det['id']}/retract"
+    assert "error=" in _post(client, path, rule_id=det["id"], reason="").headers["location"]
+    _post(client, path, rule_id=det["id"], reason="gone")
+    assert "error=" in _post(client, path, rule_id=det["id"], reason="again").headers["location"]
+
+
+def test_flag_a_fire_false_positive(client, central, det):
+    fire = _fire(central, det)
+    page = body_of(client.get(f"/evolution/rule/{det['id']}").text)
+    action = f'/evolution/rule/{det["id"]}/fires/{fire["id"]}/false-positive'
+    assert action in page
+    res = _post(client, action, reason="the order was fine")
+    assert "error=" not in res.headers["location"]
+    assert central.get_rule_fire(fire["id"])["false_positive"]
+    body = body_of(client.get(res.headers["location"]).text)
+    assert "the order was fine" in body and action not in body
+
+
+def test_false_positive_without_a_reason_or_on_an_undecided_fire_is_refused(client, central, det):
+    fire = _fire(central, det)
+    action = f'/evolution/rule/{det["id"]}/fires/{fire["id"]}/false-positive'
+    assert "error=" in _post(client, action, reason="").headers["location"]
+    cleared = _fire(central, det, outcome="cleared")
+    page = body_of(client.get(f"/evolution/rule/{det['id']}").text)
+    cleared_action = f'/fires/{cleared["id"]}/false-positive'
+    assert cleared_action not in page
+    assert "error=" in _post(client, f"/evolution/rule/{det['id']}" + cleared_action,
+                             reason="x").headers["location"]
+
+
+def test_enough_false_positives_return_an_armed_detector_to_dry_run(client, central, det):
+    _post(client, f"/evolution/rule/{det['id']}/arm", reason="go")
+    for _ in range(2):  # RulesConfig.false_positive_disarm's default
+        fire = _fire(central, det)
+        _post(client, f'/evolution/rule/{det["id"]}/fires/{fire["id"]}/false-positive',
+              reason="wrong")
+    assert central.get_detector(det["id"])["status"] == "dry_run"
+
+
+def test_the_page_says_arming_does_nothing_while_the_pass_is_off(client, det, monkeypatch):
+    from jarvis.catalog import RulesConfig
+    monkeypatch.setattr(ops, "rules_config", lambda *a: RulesConfig(enabled=False))
+    assert 'id="rules-disabled"' in client.get(f"/evolution/rule/{det['id']}").text
+    monkeypatch.setattr(ops, "rules_config", lambda *a: RulesConfig(enabled=True))
+    assert 'id="rules-disabled"' not in client.get(f"/evolution/rule/{det['id']}").text

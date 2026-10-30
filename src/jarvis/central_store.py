@@ -14,6 +14,9 @@ from .paths import central_db_path, ensure_home
 #: How old a base-health reading may be before the merge pause stops acting on it (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2)
 BASE_HEALTH_FRESH_SECONDS = 900
 
+#: `projects.status` of an offboarded project whose history is kept (docs/superpowers/specs/2026-10-28-offboard-a-project.md §1.1)
+ARCHIVED = "archived"
+
 
 def base_health_key(project: str) -> str:
     """The `os_state` key holding one project's default-branch health"""
@@ -419,7 +422,9 @@ CREATE TABLE IF NOT EXISTS rule_fires (
     detail TEXT NOT NULL DEFAULT '',
     cleared_at REAL, cleared_seconds REAL,
     false_positive INTEGER NOT NULL DEFAULT 0,
-    false_positive_reason TEXT NOT NULL DEFAULT ''
+    false_positive_reason TEXT NOT NULL DEFAULT '',
+    question_id INTEGER,                  -- the self-heal gate's Neo question
+    filed_orders TEXT NOT NULL DEFAULT '[]'   -- orders the remedy filed, JSON
 );
 CREATE INDEX IF NOT EXISTS idx_rule_fires_detector ON rule_fires(detector_id, ts);
 CREATE INDEX IF NOT EXISTS idx_rule_fires_order ON rule_fires(order_id, detector_id);
@@ -572,9 +577,21 @@ CREATE TABLE IF NOT EXISTS morpheus_items (
     action TEXT NOT NULL DEFAULT '',        -- neo:<qid> | investigation:<id> | improvement:<io-id> | none:<why>
     action_ts REAL,
     auto_requeues INTEGER NOT NULL DEFAULT 0,  -- requeues Neo's own verdict has spent (capped)
+    last_check_version TEXT NOT NULL DEFAULT '',  -- what production ran at the last check (#1301)
     UNIQUE (repo, pr_number)
 );
 CREATE INDEX IF NOT EXISTS idx_morpheus_items_state ON morpheus_items(state);
+-- One row per script run of an item, newest MORPHEUS_RUNS_KEPT kept (docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §3)
+CREATE TABLE IF NOT EXISTS morpheus_runs (
+    id INTEGER PRIMARY KEY,
+    item_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    exit INTEGER,
+    output TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'check',     -- check | probe (a settled item run on demand)
+    state_after TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_morpheus_runs_item ON morpheus_runs(item_id, ts);
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_ts ON steward_decisions(ts);
 CREATE INDEX IF NOT EXISTS idx_os_config_versions_ts ON os_config_versions(ts);
 CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
@@ -607,6 +624,9 @@ CREATE TRIGGER IF NOT EXISTS knowledge_fts_au AFTER UPDATE ON knowledge BEGIN
 END;
 """
 
+# Runs kept per Morpheus item
+MORPHEUS_RUNS_KEPT = 50
+
 # One-time backfill marker, NOT a row count
 FTS_BUILT_KEY = "knowledge_fts_built"
 
@@ -623,6 +643,8 @@ ADDED_COLUMNS = {
         "project": "TEXT NOT NULL DEFAULT ''",
         # …and before Neo's verdict could act on an item (issue #1254)
         "auto_requeues": "INTEGER NOT NULL DEFAULT 0",
+        # …and before a check recorded the version it ran on (issue #1301)
+        "last_check_version": "TEXT NOT NULL DEFAULT ''",
     },
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
@@ -661,6 +683,11 @@ ADDED_COLUMNS = {
         "queue_note": "TEXT NOT NULL DEFAULT ''",
         "queue_ts": "REAL",
     },
+    "rule_fires": {
+        # Per-rule cost attribution (wo-85906675, Neo q2519)
+        "question_id": "INTEGER",
+        "filed_orders": "TEXT NOT NULL DEFAULT '[]'",
+    },
 }
 
 # Indexes over columns ADDED_COLUMNS backfills, which SCHEMA runs too early to see
@@ -669,6 +696,9 @@ CREATE INDEX IF NOT EXISTS idx_steward_decisions_dedupe
     ON steward_decisions(dedupe_key, duplicate_of);
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_queue ON steward_decisions(queue_state);
 """
+
+#: Tables whose `project` is provenance, not scope: purge clears or retracts, never deletes (docs/superpowers/specs/2026-10-28-offboard-a-project.md §3)
+PROVENANCE_TABLES = ("detectors", "gate_rules")
 
 
 class CentralStore:
@@ -719,6 +749,9 @@ class CentralStore:
 
     def set_project_status(self, name: str, status: str) -> None:
         self.conn.execute("UPDATE projects SET status=? WHERE name=?", (status, name))
+
+    def delete_project(self, name: str) -> None:
+        self.conn.execute("DELETE FROM projects WHERE name=?", (name,))
 
     def list_projects(self) -> list[dict[str, Any]]:
         return db.rows_to_dicts(
@@ -810,6 +843,13 @@ class CentralStore:
             (limit,))
         return [dict(r) for r in rows.fetchall()]
 
+    def steward_asks(self, since: float, limit: int = 50) -> list[dict[str, Any]]:
+        """The `ask` decisions since `since` that led to no order, newest first"""
+        rows = self.conn.execute(
+            "SELECT * FROM steward_decisions WHERE outcome='ask' AND wo_id='' AND applied=0 "
+            "AND duplicate_of=0 AND ts>=? ORDER BY ts DESC, id DESC LIMIT ?", (since, limit))
+        return [dict(r) for r in rows.fetchall()]
+
     def steward_queue_counts(self) -> dict[str, int]:
         """{queue_state: n} over every decision that was ever queued for a re-offer"""
         rows = self.conn.execute(
@@ -871,6 +911,36 @@ class CentralStore:
         return {"inbox": inbox, "agent_calls": calls, "knowledge_reads": reads,
                 "backlog_reopened": backlog}
 
+    def purge_project(self, name: str) -> dict[str, int]:
+        """Delete every row scoped to `name`; provenance rows keep guarding the fleet"""
+        scope = [t for t in db.tables_with_column(self.conn, "project")
+                 if t not in PROVENANCE_TABLES]
+        with db.write_transaction(self.conn):
+            counts = db.delete_where(self.conn, scope, "project", name)
+            counts["gate_rules_provenance_cleared"] = self.conn.execute(
+                "UPDATE gate_rules SET project='' WHERE project=?", (name,)).rowcount
+            live = [r["id"] for r in self.conn.execute(
+                "SELECT id FROM detectors WHERE project=? AND retired_at IS NULL", (name,))]
+            for detector_id in live:
+                self.retract_detector(detector_id, f"project {name} purged from the OS")
+            counts["detectors_retracted"] = len(live)
+        return counts
+
+    def live_rows_by_project(self) -> list[tuple[str, str, int]]:
+        """(table, project, count) of rows the OS would still act on (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
+        live = {
+            "morpheus_items": "state IN ('queued', 'monitoring')",
+            # '' is fleet-wide and names no project
+            "detectors": "status = 'armed' AND retired_at IS NULL AND project != ''",
+            "rule_fires": "cleared_at IS NULL",
+            "inbox": "status != 'acked'",
+            "backlog": "status = 'open'",
+        }
+        return [(table, r["project"], r["n"]) for table, where in live.items()
+                for r in self.conn.execute(
+                    f"SELECT project, COUNT(*) AS n FROM {table} WHERE {where} "
+                    f"GROUP BY project ORDER BY project")]
+
     def inbox_titled_since(self, project: str, title: str, since: float) -> bool:
         """Has this exact item been raised for this project since `since`, acked or not?"""
         return self.conn.execute(
@@ -906,6 +976,12 @@ class CentralStore:
         else:
             cur = self.conn.execute("UPDATE inbox SET status='acked' WHERE id=?", (inbox_id,))
         return cur.rowcount
+
+    def ack_project_inbox(self, project: str) -> int:
+        """Ack every unacked item one project raised"""
+        return self.conn.execute(
+            "UPDATE inbox SET status='acked' WHERE project=? AND status != 'acked'",
+            (project,)).rowcount
 
     # -- backlog
 
@@ -1798,7 +1874,8 @@ class CentralStore:
     def record_rule_fire(self, *, detector_id: str, project: str, order_id: str,
                          order_kind: str, fingerprint: str, mode: str, outcome: str,
                          remedy_rule_id: str = "", alarm_id: str = "",
-                         detail: str = "") -> dict[str, Any]:
+                         detail: str = "",
+                         question_id: int | None = None) -> dict[str, Any]:
         """Record one thing the registry noticed about one order"""
         from . import rules
 
@@ -1809,10 +1886,10 @@ class CentralStore:
         cur = self.conn.execute(
             """INSERT INTO rule_fires
                (ts, detector_id, remedy_rule_id, project, order_id, order_kind,
-                fingerprint, mode, outcome, alarm_id, detail)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                fingerprint, mode, outcome, alarm_id, detail, question_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (now, detector_id, remedy_rule_id, project, order_id, order_kind,
-             fingerprint, mode, outcome, alarm_id, rules.bound(detail)),
+             fingerprint, mode, outcome, alarm_id, rules.bound(detail), question_id),
         )
         if outcome in (rules.RECORDED, rules.PROPOSED, rules.APPLIED):
             self.conn.execute(
@@ -1823,6 +1900,47 @@ class CentralStore:
                     "UPDATE remedy_rules SET hits = hits + 1, last_fired=? WHERE id=?",
                     (now, remedy_rule_id))
         return self.get_rule_fire(int(cur.lastrowid))  # type: ignore[return-value]
+
+    def note_fire_orders(self, alarm_id: str, wo_ids: list[str]) -> int:
+        """Charge orders a remedy filed to the fire behind `alarm_id`; returns fires updated"""
+        if not alarm_id or not wo_ids:
+            return 0
+        rows = self.conn.execute(
+            "SELECT id, filed_orders FROM rule_fires WHERE alarm_id=?",
+            (alarm_id,)).fetchall()
+        for row in rows:
+            known = list(db.from_json(row["filed_orders"], []) or [])
+            merged = known + [w for w in wo_ids if w not in known]
+            self.conn.execute("UPDATE rule_fires SET filed_orders=? WHERE id=?",
+                              (db.to_json(merged), row["id"]))
+        return len(rows)
+
+    def rule_fires_since(self, since: float | None = None, *,
+                         detector_id: str = "",
+                         project: str = "") -> list[dict[str, Any]]:
+        """Every fire in the window that could have spent: it asked Neo or filed an order"""
+        q = ("SELECT * FROM rule_fires WHERE (question_id IS NOT NULL "
+             "OR filed_orders NOT IN ('', '[]'))")
+        params: list[Any] = []
+        if since is not None:
+            q += " AND ts>=?"
+            params.append(since)
+        for column, value in (("detector_id", detector_id), ("project", project)):
+            if value:
+                q += f" AND {column}=?"
+                params.append(value)
+        return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
+    def question_call_costs(self, question_ids: list[int]) -> dict[int, float]:
+        """What the OS's calls on each Neo question cost — its retries included"""
+        if not question_ids:
+            return {}
+        marks = ",".join("?" * len(question_ids))
+        rows = self.conn.execute(
+            f"SELECT question_id, COALESCE(SUM(cost_usd), 0) AS c FROM agent_calls "
+            f"WHERE question_id IN ({marks}) GROUP BY question_id",
+            list(question_ids)).fetchall()
+        return {int(r["question_id"]): float(r["c"] or 0.0) for r in rows}
 
     def get_rule_fire(self, fire_id: int) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM rule_fires WHERE id=?",
@@ -2190,6 +2308,7 @@ class CentralStore:
         """Write the named columns, stamping `updated_ts`"""
         allowed = {"script", "script_source", "state", "deadline_ts", "last_check_ts",
                    "next_check_ts", "checks", "last_exit", "last_output", "resolution",
+                   "last_check_version",
                    "action", "action_ts", "hints"}
         bad = set(fields) - allowed
         assert not bad, bad
@@ -2197,6 +2316,26 @@ class CentralStore:
         cols = ", ".join(f"{k}=?" for k in fields)
         self.conn.execute(f"UPDATE morpheus_items SET {cols} WHERE id=?",
                           (*fields.values(), item_id))
+
+    def add_morpheus_run(self, item_id: str, *, exit: int | None, output: str,
+                         kind: str = "check", state_after: str = "",
+                         now: float | None = None) -> None:
+        """Record one script run, pruning the item's runs past MORPHEUS_RUNS_KEPT"""
+        with db.write_transaction(self.conn):  # insert + prune commit together: db.write_transaction
+            self.conn.execute(
+                "INSERT INTO morpheus_runs (item_id, ts, exit, output, kind, state_after) "
+                "VALUES (?,?,?,?,?,?)",
+                (item_id, db.now() if now is None else now, exit, output, kind, state_after))
+            self.conn.execute(
+                "DELETE FROM morpheus_runs WHERE item_id=? AND id NOT IN "
+                "(SELECT id FROM morpheus_runs WHERE item_id=? ORDER BY ts DESC, id DESC LIMIT ?)",
+                (item_id, item_id, MORPHEUS_RUNS_KEPT))
+
+    def morpheus_runs(self, item_id: str, limit: int = MORPHEUS_RUNS_KEPT) -> list[dict[str, Any]]:
+        """Newest first"""
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM morpheus_runs WHERE item_id=? ORDER BY ts DESC, id DESC LIMIT ?",
+            (item_id, limit)).fetchall())
 
     def claim_morpheus_action(self, item_id: str, action: str) -> bool:
         """Record the action ONCE: False when another pass already took it"""

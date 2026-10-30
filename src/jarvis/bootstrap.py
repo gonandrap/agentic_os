@@ -247,6 +247,17 @@ def tracked_in_vcs(path: Path) -> bool:
     return proc.returncode == 0
 
 
+def _clean_in_vcs(path: Path) -> bool:
+    """Whether the working-tree bytes equal HEAD's, so deleting the file loses nothing"""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path.parent), "diff", "--quiet", "HEAD", "--", path.name],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def ensure_operation_md(project: ProjectSpec, report: BootstrapReport,
                         force: bool = False) -> None:
     """Generate/refresh OPERATION.md, preserving the 'Project specifics' section"""
@@ -386,10 +397,15 @@ def ensure_trust(project: ProjectSpec, report: BootstrapReport) -> None:
     projects = data.setdefault("projects", {})
     entry = projects.setdefault(str(project.path), {})
     entry["hasTrustDialogAccepted"] = True
+    _write_claude_json(cfg, data)
+    report.note("trusted workspace in ~/.claude.json (hasTrustDialogAccepted)")
+
+
+def _write_claude_json(cfg: Path, data: dict[str, Any]) -> None:
+    """Replace ~/.claude.json whole, so a crash never leaves it half-written"""
     tmp = cfg.with_suffix(cfg.suffix + ".jarvis-tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(cfg)
-    report.note("trusted workspace in ~/.claude.json (hasTrustDialogAccepted)")
 
 
 def ensure_project_skills(project: ProjectSpec, report: BootstrapReport) -> None:
@@ -434,4 +450,116 @@ def bootstrap_project(project: ProjectSpec, force_config: bool = False,
     inject_settings(project, report, force=force_config)
     ensure_project_skills(project, report)
     ensure_trust(project, report)
+    return report
+
+
+def _empty_after(d: Path, gone: set[Path]) -> bool:
+    """Whether `d` holds nothing but paths in `gone`; a kept empty child counts (issue 1330)"""
+    return d.is_dir() and all(c in gone for c in d.iterdir())
+
+
+def unbootstrap_project(project: ProjectSpec, *, purge: bool,
+                        dry_run: bool) -> BootstrapReport:
+    """Take back out what bootstrap_project wrote, never a user edit (docs/superpowers/specs/2026-10-28-offboard-a-project.md §4)"""
+    report = BootstrapReport(project=project.name)
+    root = project.path
+    if not root.is_dir():
+        report.warn(f"path does not exist: {root}")
+        return report
+    if dry_run:
+        report.note("(dry run — no changes written)")
+    gone: set[Path] = set()
+
+    def do(verb: str, path: Path, fn: Any, *also: Path) -> None:
+        label = path.relative_to(root) if path.is_relative_to(root) else path
+        report.note(f"would {verb} {label}" if dry_run else f"{verb.rstrip('e')}ed {label}")
+        gone.update((path, *also))
+        if not dry_run:
+            fn()
+
+    claude = root / ".claude"
+    settings, backup = claude / "settings.json", claude / "settings.json.pre-jarvis"
+    drift = settings_drift(settings)
+    if drift in ("missing", "not managed by jarvis"):
+        report.note("Jarvis .claude/settings.json already absent")
+    elif drift is not None:
+        report.warn(f".claude/settings.json left in place: {drift}")
+    elif backup.exists():
+        do("restore", settings, lambda: backup.replace(settings), backup)
+        gone.discard(settings)
+    else:
+        do("remove", settings, settings.unlink)
+
+    skills = claude / "skills"
+    for src in sorted(p for p in (ASSETS / "project-skills").iterdir() if p.is_dir()):
+        dest = skills / src.name
+        if not dest.exists():
+            report.note(f".claude/skills/{src.name} already absent")
+        elif _tree_matches(src, dest):
+            do("remove", dest, lambda d=dest: shutil.rmtree(d))
+        else:
+            report.warn(f".claude/skills/{src.name} left in place: edited since Jarvis installed it")
+    for d in (skills, claude):
+        if d.exists() and _empty_after(d, gone):
+            do("remove", d, d.rmdir)
+
+    state, gi = root / ".jarvis", root / ".gitignore"
+    op = root / "OPERATION.md"
+    if not op.exists():
+        report.note("OPERATION.md already absent")
+    else:
+        tracked = tracked_in_vcs(op)
+        if _clean_in_vcs(op) if tracked else op.read_text() == render_operation_md(project):
+            do("remove", op, op.unlink)
+        elif not purge:
+            keep = state / "OPERATION.md.offboarded"
+            def stash() -> None:
+                state.mkdir(exist_ok=True)
+                op.replace(keep)
+            do("move", op, stash)
+            report.note(f"  to {keep.relative_to(root)}, keeping its edits")
+        else:
+            report.warn("OPERATION.md left in place: it holds edits version control cannot restore; "
+                        f"delete it yourself: rm {op}")
+        if tracked and op in gone:
+            report.warn("OPERATION.md is committed; its deletion is left for you to commit: "
+                        "git rm --cached OPERATION.md && git commit")
+
+    cfg = _claude_json_path()
+    try:
+        data = json.loads(cfg.read_text()) if cfg.exists() else {}
+    except (json.JSONDecodeError, OSError) as e:
+        data = None
+        report.warn(f"could not read {cfg} to remove workspace trust ({e}); left in place")
+    if data is not None:
+        entry = (data.get("projects") or {}).get(str(root))
+        if not isinstance(entry, dict) or "hasTrustDialogAccepted" not in entry:
+            report.note("workspace trust already absent")
+        else:
+            def untrust() -> None:
+                del entry["hasTrustDialogAccepted"]
+                _write_claude_json(cfg, data)
+            do("remove", cfg, untrust)
+            gone.discard(cfg)
+
+    if not purge:
+        report.note("kept .jarvis/ and its .gitignore line (archive keeps history)")
+        return report
+    if state.exists():
+        do("remove", state, lambda: shutil.rmtree(state))
+    else:
+        report.note(".jarvis/ already absent")
+    lines = gi.read_text().split("\n") if gi.exists() else []
+    if ".jarvis/" not in lines:
+        report.note(".jarvis/ line in .gitignore already absent")
+    else:
+        end = lines.index(".jarvis/")
+        start = end
+        if start and lines[start - 1] == "# Jarvis OS local state":
+            start -= 1
+            if start and not lines[start - 1]:
+                start -= 1  # the blank line ensure_gitignore wrote before its block
+        kept = "\n".join(lines[:start] + lines[end + 1:])
+        do("edit", gi, lambda: gi.write_text(kept))
+        gone.discard(gi)
     return report

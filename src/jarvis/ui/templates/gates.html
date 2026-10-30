@@ -1,202 +1,71 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}Gates — Jarvis{% endblock %}
+{% block style %}
+  .gate-list td.prose .clamp { font-family: var(--mono); font-size: 0.92em; }
+{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 600px;">
 
-{% macro decide_form(g) %}
-{# One form, three submit buttons: the reason is shared, and `decision` carries the
-   value of whichever button was pressed. A denial or a dismissal without a reason is
-   refused by ops.decide_gate — the worker acts on the first, and the second IS the
-   defect report on the recogniser.
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6 #}
+{% macro href(g) %}/gates/{{ g.id }}?project={{ g.project | urlencode }}{% endmacro %}
+{% set meta -%}
+  {{ counts.get('escalated', 0) }} waiting on you · {{ counts.get('with neo', 0) }} with Neo ·
+  {{ counts.get('awaiting_case', 0) }} awaiting the worker's case
+{%- endset %}
+{{ ui.page_head("Gates", meta) }}
 
-   "Not a gated action" is deliberately not styled as a third opinion between approve
-   and deny. It answers a different question — whether this command was privileged at
-   all — so it sits apart from the two verdicts that assume it was. #}
-<form method="post" action="/gates/{{ g.id }}/decide"
-      style="display:flex; gap:8px; margin-top:8px">
-  <input type="hidden" name="project" value="{{ g.project }}">
-  <input type="hidden" name="next" value="/gates">
-  <input type="text" name="reason"
-         placeholder="reason — goes to the worker; required to deny or dismiss">
-  {# No Approve on a CONTEST — `ops.decide_gate` refuses it. Spec 2026-09-12 §2. #}
-  {% if not g.contested %}
-  <button class="accept" name="decision" value="approve">✓ Approve</button>
-  {% endif %}
-  <button class="danger" name="decision" value="deny">✗ Deny</button>
-  <button name="decision" value="dismiss"
-          title="The command performs no privileged action — the gate matched it by
-                 mistake. Unblocks it and records a classifier defect, not an approval."
-          >⊘ Not a gated action</button>
-</form>
-{% endmacro %}
+{% call(g) ui.needs_you(attention, "waiting on you — Neo escalated") %}
+  {{ ui.row_id("#" ~ g.id, href(g)) }}
+  <span class="mono">{{ g.kind }} · {{ g.project }}</span>
+  <span class="sub">{{ g.escalation_reason or g.command }}</span>
+  <a href="{{ href(g) }}">decide it →</a>
+{% endcall %}
 
-{% macro request_detail(g) %}
-{% if g.contested %}
-<div class="sub">CONTESTED — the worker says the recogniser matched this by mistake and
-  that the command performs no privileged action. Dismiss it if that is right; deny it if
-  it is wrong. Nothing here can be approved.</div>
-{% endif %}
-{% if g.justification %}<div class="sub">Case made: {{ g.justification }}</div>{% endif %}
-{% if g.evidence %}<div class="sub">Evidence: {{ g.evidence }}</div>{% endif %}
-{% if g.neo_question %}
-<details style="margin-top:6px">
-  <summary class="sub">the request exactly as the reviewer saw it</summary>
-  <pre class="request-text">{{ g.neo_question.question }}</pre>
-</details>
-{% else %}
-<div class="sub">no review record — this request never reached Neo</div>
-{% endif %}
-{% endmacro %}
+{{ ui.filter_bar("/gates", filters, options, rows | length, total) }}
 
-<p class="kv" style="margin-top:18px">
+<div class="panel table-wrap">
+  <table class="gate-list">
+    <tr><th>#</th><th>project / order</th><th>action</th><th>command</th>
+        <th>state</th><th>by</th><th>age</th></tr>
+    {% for g in rows %}
+    {% set m = gate_meta.get(g.state, {'word': g.state, 'icon': '◌', 'tone': 'warn'}) %}
+    <tr>
+      <td>{{ ui.row_id("#" ~ g.id, href(g)) }}</td>
+      <td class="mono">{{ g.project }}<br>{{ ui.row_id(g.wo_id, "/wo/" ~ g.project ~ "/" ~ g.wo_id) }}</td>
+      <td class="mono">{{ g.kind }}</td>
+      <td class="prose"><div class="clamp" title="{{ g.command }}">{{ g.command }}</div></td>
+      <td class="when"><span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+        {% if g.state == 'awaiting_case' %}<div class="sub">abandoned in {{ fmt_left(g.case_deadline) }}</div>{% endif %}
+        {% if g.status == 'approved' or g.state == 'spent' %}<div class="sub">{{ g.uses }}/{{ g.max_uses }} used</div>{% endif %}</td>
+      <td class="mono">{{ g.decided_by or '—' }}</td>
+      <td class="when mono">{{ fmt_age(g.ts) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="empty">{{ 'nothing matches these filters' if filters else 'no privileged action has been gated yet' }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% call ui.explain("how gates work") %}
+<p class="kv">
   Workers may attempt privileged actions — merging a PR, cutting a release, restarting a
   service — but the attempt is held here first. Neo reviews most of them for you; only the
-  ones it declines to decide reach this page as yours.
-  <span class="counts">({{ escalated|length }} waiting on you ·
-  {{ with_neo|length }} with Neo ·
-  {{ held|length }} awaiting the worker's case ·
-  {{ decided|length }} decided ·
-  {{ dismissed|length }} not gated actions)</span>
+  ones it declines to decide wait on you.
 </p>
-
-{# The fifth state, and the one that reads as a dead end without a sentence of its own:
-   a worker that ran the command instead of asking gets its attempt RECORDED and held,
-   in front of nobody — gates.AWAITING_CASE. Listed with the open ones rather than under
-   "Decided", which is what it used to fall into, and carrying its deadline, because the
-   next thing to happen to it is a clock. #}
-{% if held %}
-<h2>Awaiting the worker's case — no action needed</h2>
-<div class="panel">
-  <p class="kv">
-    The worker ran one of these instead of asking, so the attempt was blocked and
-    recorded — but nobody is reviewing it: there is no case to review yet. The move is the
-    worker's, and it has two — <span class="mono">jarvis gate request</span> to argue for
-    the action, or <span class="mono">jarvis gate contest</span> to argue the match was
-    wrong. If neither comes, the OS ABANDONS the request on the
-    <span class="mono">gates.case_ttl_seconds</span> timer rather than refusing it: a
-    refusal would assert a reviewer looked, and none did. Nothing was authorised, and
-    nothing here asks anything of you.
-  </p>
-  {% for g in held %}
-  <div class="msg" id="gate-{{ g.id }}">
-    <div class="who tone-warn">#{{ g.id }} · {{ g.kind }} · {{ g.project }} ·
-      <a href="/wo/{{ g.project }}/{{ g.wo_id }}" class="mono">{{ g.wo_id }}</a> ·
-      recorded {{ fmt_age(g.ts) }} ago</div>
-    <div class="mono" style="margin:6px 0">$ {{ g.command }}</div>
-    {# No decide form, deliberately: the point of the hold is that nothing has been put
-       to a reviewer, and a verdict on an unargued request is a verdict on a bare command
-       string. The deadline is what the row is for. #}
-    <div class="sub">No reviewer sees it yet — awaiting the worker's case.
-      Abandoned automatically in {{ fmt_left(g.case_deadline) }} if none is made.</div>
-  </div>
-  {% endfor %}
-</div>
-{% endif %}
-
-{% if escalated %}
-<h2>Waiting on you — Neo escalated</h2>
-<div class="panel">
-  {% for g in escalated %}
-  <div class="msg" id="gate-{{ g.id }}">
-    <div class="who tone-warn">#{{ g.id }} · {{ g.kind }} · {{ g.project }} ·
-      <a href="/wo/{{ g.project }}/{{ g.wo_id }}" class="mono">{{ g.wo_id }}</a> ·
-      {{ fmt_age(g.ts) }} ago</div>
-    <div class="mono" style="margin:6px 0">$ {{ g.command }}</div>
-    <div class="sub">Why Neo escalated: {{ g.escalation_reason or '—' }}</div>
-    {{ request_detail(g) }}
-    {{ decide_form(g) }}
-  </div>
-  {% endfor %}
-</div>
-{% endif %}
-
-<h2>With Neo — no action needed</h2>
-<div class="panel">
-  {% for g in with_neo %}
-  <div class="msg" id="gate-{{ g.id }}">
-    <div class="who">#{{ g.id }} · {{ g.kind }} · {{ g.project }} ·
-      <a href="/wo/{{ g.project }}/{{ g.wo_id }}" class="mono">{{ g.wo_id }}</a> ·
-      requested {{ fmt_age(g.ts) }} ago</div>
-    <div class="mono" style="margin:6px 0">$ {{ g.command }}</div>
-    <details>
-      <summary class="sub">under review — decide it yourself instead</summary>
-      {{ request_detail(g) }}
-      {{ decide_form(g) }}
-    </details>
-  </div>
-  {% else %}
-  <div class="empty">nothing under review</div>
-  {% endfor %}
-</div>
-
-<h2>Decided</h2>
-<div class="panel">
-  <table>
-    <tr><th>#</th><th>project / wo</th><th>action</th><th>command</th>
-        <th>verdict</th><th>by</th><th>age</th></tr>
-    {% for g in decided %}
-    {# Keyed on the DISPLAY state: an abandoned or spent row is `expired` in the DB. #}
-    {% set display = gate_display(g) %}
-    {% set m = gate_meta.get(display,
-                             {'word': g.status, 'icon': '•', 'tone': 'muted'}) %}
-    <tr>
-      <td class="mono">{{ g.id }}</td>
-      <td class="mono">{{ g.project }}<br><a href="/wo/{{ g.project }}/{{ g.wo_id }}">{{ g.wo_id }}</a></td>
-      <td class="mono">{{ g.kind }}</td>
-      <td class="mono">{{ g.command[:80] }}
-        {% if g.decision_reason %}<div class="sub">{{ g.decision_reason }}</div>{% endif %}</td>
-      <td><span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
-        {% if g.status == 'approved' or display == 'spent' %}<div class="sub">{{ g.uses }}/{{ g.max_uses }} used</div>{% endif %}</td>
-      <td class="mono">{{ g.decided_by or '—' }}</td>
-      <td class="mono">{{ fmt_age(g.ts) }}</td>
-    </tr>
-    {% else %}
-    <tr><td colspan="7" class="empty">no gate has been decided yet</td></tr>
-    {% endfor %}
-  </table>
-</div>
-
-<h2>Not gated actions — the OS got these wrong</h2>
-<div class="panel">
-  <p class="kv">
-    Commands that tripped a gate but perform no privileged action: a release script named
-    inside a search pattern, a path quoted in a PR body, a plain <span class="mono">grep</span>.
-    Nothing was authorised and nothing was refused — the recogniser in
-    <span class="mono">gates.py</span> matched text it should not have. These cost a review
-    each and are listed apart from the verdicts because they measure the OS, not the fleet.
-    {% if false_positive_rate %}
-    <span class="counts">false-positive rate: {{ false_positive_rate }} of all gates ruled on</span>
-    {% endif %}
-  </p>
-  {% if abandoned %}
-  <p class="kv">
-    <span class="counts">{{ abandoned }} more were abandoned</span> — a worker was blocked,
-    made no case and contested nothing, so nobody ever ruled on them. They are NOT in the
-    rate above, and on the evidence so far they are mostly false positives somebody routed
-    around rather than contested.
-  </p>
-  {% endif %}
-  <table>
-    <tr><th>#</th><th>project / wo</th><th>gate</th><th>command</th>
-        <th>what the recogniser got wrong</th><th>by</th><th>age</th></tr>
-    {% for g in dismissed %}
-    <tr>
-      <td class="mono">{{ g.id }}</td>
-      <td class="mono">{{ g.project }}<br><a href="/wo/{{ g.project }}/{{ g.wo_id }}">{{ g.wo_id }}</a></td>
-      <td class="mono">{{ g.kind }}</td>
-      <td class="mono">{{ g.command[:80] }}
-        {% if g.matched %}<div class="sub">matched: {{ g.matched }}</div>{% endif %}</td>
-      <td>{{ g.decision_reason or '—' }}</td>
-      <td class="mono">{{ g.decided_by or '—' }}</td>
-      <td class="mono">{{ fmt_age(g.ts) }}</td>
-    </tr>
-    {% else %}
-    <tr><td colspan="7" class="empty">no gate has been dismissed as a false positive</td></tr>
-    {% endfor %}
-  </table>
-</div>
-
-</div>
+<p class="kv">
+  <b>Awaiting the worker's case — no action needed.</b> The worker ran the command instead
+  of asking, so the attempt was blocked and recorded, but nobody reviews it until the
+  worker runs <span class="mono">jarvis gate request</span> (argue for it) or
+  <span class="mono">jarvis gate contest</span> (argue the match was wrong). If neither
+  comes, the OS abandons it on the <span class="mono">gates.case_ttl_seconds</span> timer.
+</p>
+<p class="kv">
+  <b>Not gated actions — the OS got these wrong.</b> A dismissed request tripped a gate but
+  performs no privileged action: the recogniser in <span class="mono">gates.py</span>
+  matched text it should not have. They measure the OS, not the fleet.
+  {% if false_positive_rate %}<span class="counts">false-positive rate: {{ false_positive_rate }} of all gates ruled on</span>{% endif %}
+  {% if abandoned %}<span class="counts">{{ abandoned }} more were abandoned</span> — never
+  ruled on, so not in that rate.{% endif %}
+</p>
+{% endcall %}
 {% endblock %}

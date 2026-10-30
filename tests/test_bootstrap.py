@@ -414,3 +414,105 @@ def test_install_agent_assets_returns_three_roots_for_worker(project, jarvis_hom
     assert [r.name for r in roots] == ["agent-skills", "agent-crew"]
     assert [r.name for r in install_agent_assets(project, kind="planner")] == [
         "agent-skills", "agent-seats"]
+
+
+# -- offboard: the repo strip (docs/superpowers/specs/2026-10-28-offboard-a-project.md §4)
+
+
+def _snapshot(root):
+    return {p: p.read_bytes() for p in sorted(root.rglob("*"))
+            if p.is_file() and ".git" not in p.parts}
+
+
+def test_unbootstrap_keeps_user_edits_and_is_idempotent(tmp_path, monkeypatch):
+    from jarvis.bootstrap import unbootstrap_project, workspace_trusted
+    from jarvis.testing import make_git_project
+    p = make_git_project(tmp_path, "offboarded")
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"projects": {str(p): {"lastCost": 1.5}}}))
+    monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(cfg))
+    bootstrap_project(spec(p))
+    (p / SKILL).write_text("mine\n")
+    op = p / "OPERATION.md"
+    op.write_text(op.read_text() + "\nmy notes\n")
+
+    first = unbootstrap_project(spec(p), purge=False, dry_run=False)
+    assert "removed .claude/settings.json" in first.actions
+    assert not (p / ".claude" / "settings.json").exists()
+    assert workspace_trusted(p) is False
+    assert json.loads(cfg.read_text())["projects"][str(p)] == {"lastCost": 1.5}
+    assert (p / ".jarvis").is_dir() and ".jarvis/" in (p / ".gitignore").read_text()
+
+    kept = _snapshot(p)
+    second = unbootstrap_project(spec(p), purge=False, dry_run=False)
+    assert _snapshot(p) == kept
+    assert any("already absent" in a for a in second.actions)
+    assert (p / SKILL).read_text() == "mine\n"
+    assert not op.exists()
+    assert (p / ".jarvis" / "OPERATION.md.offboarded").read_text().endswith("my notes\n")
+
+
+def test_unbootstrap_operation_md_committed_or_edited(tmp_path, monkeypatch):
+    """Offboard spec §4: OPERATION.md never lingers; only bytes git cannot restore survive"""
+    import subprocess
+    from jarvis.bootstrap import unbootstrap_project
+    from jarvis.testing import make_git_project
+    monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(tmp_path / "claude.json"))
+    p = make_git_project(tmp_path, "committed")
+    bootstrap_project(spec(p))
+    git = ["git", "-C", str(p), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", "OPERATION.md"], check=True)
+    subprocess.run([*git, "commit", "-qm", "op"], check=True)
+    op = p / "OPERATION.md"
+    op.write_text("committed, then edited\n")
+    subprocess.run([*git, "commit", "-qam", "edit"], check=True)
+
+    report = unbootstrap_project(spec(p), purge=False, dry_run=False)
+    assert "removed OPERATION.md" in report.actions and not op.exists()
+    assert not (p / ".jarvis" / "OPERATION.md.offboarded").exists()
+    assert any("left for you to commit" in w for w in report.warnings)
+
+    q = make_git_project(tmp_path, "purged-edited")
+    bootstrap_project(spec(q))
+    (q / "OPERATION.md").write_text("mine\n")
+    purge = unbootstrap_project(spec(q), purge=True, dry_run=False)
+    assert (q / "OPERATION.md").read_text() == "mine\n"
+    assert any(f"rm {q / 'OPERATION.md'}" in w for w in purge.warnings)
+
+
+def test_unbootstrap_keeps_claude_dir_holding_an_empty_user_dir(tmp_path, monkeypatch):
+    """Issue 1330: an empty .claude/worktrees/ the OS never wrote must not abort the strip"""
+    from jarvis.bootstrap import unbootstrap_project, workspace_trusted
+    from jarvis.testing import make_git_project
+    p = make_git_project(tmp_path, "worktrees")
+    monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(tmp_path / "claude.json"))
+    bootstrap_project(spec(p))
+    (p / ".claude" / "worktrees").mkdir()
+
+    report = unbootstrap_project(spec(p), purge=False, dry_run=False)
+    assert [x.name for x in (p / ".claude").iterdir()] == ["worktrees"]
+    assert "removed OPERATION.md" in report.actions
+    assert not (p / "OPERATION.md").exists() and workspace_trusted(p) is False
+
+
+def test_unbootstrap_purge_restores_backup_and_dry_run_writes_nothing(tmp_path, monkeypatch):
+    from jarvis.bootstrap import unbootstrap_project
+    from jarvis.testing import make_git_project
+    p = make_git_project(tmp_path, "purged")
+    monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(tmp_path / "claude.json"))
+    (p / ".gitignore").write_text("node_modules/\n")
+    (p / ".claude").mkdir()
+    (p / ".claude" / "settings.json").write_text('{"mine": true}\n')
+    bootstrap_project(spec(p))
+
+    before = _snapshot(p)
+    dry = unbootstrap_project(spec(p), purge=True, dry_run=True)
+    assert _snapshot(p) == before
+    assert "would remove .claude/skills" in dry.actions
+    assert "would remove .jarvis" in dry.actions
+
+    unbootstrap_project(spec(p), purge=True, dry_run=False)
+    assert (p / ".claude" / "settings.json").read_text() == '{"mine": true}\n'
+    assert sorted(x.name for x in (p / ".claude").iterdir()) == ["settings.json"]
+    assert not (p / "OPERATION.md").exists() and not (p / ".jarvis").exists()
+    assert (p / ".gitignore").read_text() == "node_modules/\n"

@@ -17,6 +17,7 @@ from jarvis.project_store import ProjectStore
 
 # The alarm-raising and drain helpers are §2's
 from test_supervisor import _alarm, _burning, _drain, _supervisor_calls
+from jarvis.catalog import DEFAULT_PULL_REQUESTS_CATCH_UP_MAX as CATCH_UP_MAX
 
 
 @pytest.fixture()
@@ -889,10 +890,10 @@ def test_update_branch_can_apply_reads_the_local_holds_only(project):
         bare.close()
 
         store.mark_message(msg, "delivered")
-        for _ in range(ops.CATCH_UP_MAX):
+        for _ in range(CATCH_UP_MAX):
             store.add_event(wo["id"], invariants.PR_BASE_UPDATED_EVENT,
                             {"cause": "behind"})
-        assert str(ops.CATCH_UP_MAX) in remedy.can_apply(store, wo, {})
+        assert str(CATCH_UP_MAX) in remedy.can_apply(store, wo, {})
     finally:
         store.close()
 
@@ -1364,7 +1365,7 @@ def test_update_branch_apply_refuses_past_the_catch_up_bound_before_touching_git
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
     try:
         _judged(store, wo["id"])
-        for _ in range(ops.CATCH_UP_MAX):
+        for _ in range(CATCH_UP_MAX):
             store.add_event(wo["id"], invariants.PR_BASE_UPDATED_EVENT,
                             {"cause": "behind"})
         pr_view_calls: list[Any] = []

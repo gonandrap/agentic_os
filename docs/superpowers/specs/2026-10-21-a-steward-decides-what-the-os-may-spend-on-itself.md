@@ -290,6 +290,9 @@ There are two ledgers, both rolling 7-day sums of order bills at list-price USD 
 Every order the steward dispatches is created with
 `budget = min(order_budget_usd, ledger remaining)`, using the existing per-order budget
 machinery (`src/jarvis/budget.py`). That bounds the overshoot of any single order.
+When less than `MIN_ORDER_USD` ($5, the measured floor for a one-pass order) remains,
+the candidate is queued (critical: asked) instead of dispatched with scraps, and the
+drain re-offers it once there is room (#1305).
 
 ### 3.3 Configuration
 

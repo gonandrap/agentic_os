@@ -39,6 +39,8 @@ WINDOW_SECONDS = 7 * 86400
 PRECISION_WINDOW_SECONDS = 28 * 86400
 #: A detector is judged on at least this many dispatched orders before it can be throttled
 PRECISION_MIN_SAMPLES = 5
+#: Measured floor for a one-pass order: less room queues, never dispatches scraps (#1305)
+MIN_ORDER_USD = 5.0
 
 #: Events on a work order that mean the USER engaged with it (§3.2 decision 2)
 USER_TOUCH_EVENTS = ("reviewed", "retry_requested", "budget_set", "budget_resumed",
@@ -161,7 +163,7 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
                 severity)
     if severity in URGENT:
         spent = ledger.critical_usd
-        if spent >= cfg.critical_weekly_usd or room <= 0:
+        if spent >= cfg.critical_weekly_usd or room < MIN_ORDER_USD:
             return ("ask", "critical-ceiling",
                     f"`{severity}`, but the critical ceiling is spent "
                     f"(${spent:.2f} of ${cfg.critical_weekly_usd:.2f}, "
@@ -174,10 +176,10 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
         return ("queue", "yield",
                 f"fleet spend ${ledger.fleet_usd:.2f} this week is above "
                 f"${cfg.yield_above_usd:.2f}: feature work comes first", severity)
-    if room <= 0:
+    if room < MIN_ORDER_USD:
         return ("queue", "ledger",
                 f"the evolution ledger is spent (${ledger.evolution_usd:.2f} of "
-                f"${cfg.weekly_usd:.2f})", severity)
+                f"${cfg.weekly_usd:.2f}; an order needs ${MIN_ORDER_USD:.2f})", severity)
     threshold = cfg.min_refs_by_kind.get(
         c.origin_kind, cfg.major_min_refs if severity == "major" else cfg.medium_min_refs)
     if c.refs < threshold:
@@ -426,14 +428,35 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
         decision.stamp["decision_id"] = decision.decision_id
         if outcome == "ask" and mode == "enforce" and self_dispatch:
             central.add_inbox(c.project, f"steward: {c.subject[:120]}",
-                              f"{reason}. Decide it yourself, or raise "
-                              f"os.evolution.critical_weekly_usd.", level="critical")
+                              ask_body(c, reason, decision.decision_id, catalog),
+                              level="critical", wo_id=c.parent_wo_id or None)
         log.info("steward[%s] %s %s -> %s (%s): %s", mode, c.origin_kind, c.subject[:80],
                  outcome, rule, reason)
         return decision
     finally:
         if own_central:
             central.close()
+
+
+def ask_body(c: Candidate, reason: str, decision_id: int, catalog: Catalog) -> str:
+    """An `ask`'s inbox body: the one command that acts on it, and where it is listed"""
+    from .notify import ui_base_url
+
+    item = str(c.payload.get("morpheus_item") or "")
+    if c.origin_kind == "morpheus" and item:
+        act = (f"`jarvis morpheus confirm {item} --fix \"<what to fix>\"` files the fix; "
+               f"`jarvis morpheus waive|requeue {item}` if it is not broken. "
+               f"{ui_base_url(catalog)}/morpheus#{item}")
+    elif c.origin_kind == "morpheus":
+        act = "`jarvis morpheus status` names the item; then `jarvis morpheus confirm <mv-id>`"
+    elif c.parent_wo_id:
+        act = f"`jarvis investigate {c.parent_wo_id} --why \"<what you saw>\"`"
+    else:
+        act = f"`jarvis wo create {c.project} \"<title>\"` to file it by hand"
+    # An `ask` is never re-offered (`_queue_fields`), so the cap is no answer for THIS one
+    return (f"{reason}. Act: {act}. Raising os.evolution.critical_weekly_usd lets later "
+            f"ones through; it does not re-run this one.\n"
+            f"{ui_base_url(catalog)}/steward#decision-{decision_id}")
 
 
 #: How long an identical decision is not recorded again

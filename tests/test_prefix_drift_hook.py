@@ -102,6 +102,25 @@ def test_a_projects_claude_md_moving_mid_conversation_is_reported(wo, project):
     assert json.loads(drift["payload"])["changed"] == ["memory"]
 
 
+def test_a_resume_reporting_the_root_instead_of_the_worktree_is_not_drift(wo, project):
+    """Issue 1328: the same CLAUDE.md bytes, seen from another walk origin"""
+    settings_file(project, wo["id"]).write_text("{}")
+    e = env(project, wo["id"])
+    tree = project / ".claude" / "worktrees" / wo["id"]
+    tree.mkdir(parents=True)
+    (project / "CLAUDE.md").write_text("# rules\nbe brief\n")
+    (tree / "CLAUDE.md").write_text("# rules\nbe brief\n")
+
+    handle_hook(session_start(cwd=tree), e)
+    handle_hook(session_start(cwd=project), e)
+    assert events(project, wo["id"]) == []
+
+    (tree / "CLAUDE.md").write_text("# rules\nbe brief\nand be kind\n")
+    handle_hook(session_start(cwd=tree), e)
+    [drift] = events(project, wo["id"])
+    assert json.loads(drift["payload"])["changed"] == ["memory"], "an edit still is"
+
+
 def test_two_work_orders_are_never_compared_with_each_other(jarvis_home, fake_claude,
                                                             catalog_file, project):
     """The cache's own scope, and the reason the baseline is per work order"""

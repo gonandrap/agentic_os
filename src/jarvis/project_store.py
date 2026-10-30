@@ -431,6 +431,9 @@ ISSUE_LINK_KINDS = ("cited", "assigned", "raised")
 #: One reclaim of a settled order's checkout — also what `settled_worktrees` excludes on (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md)
 WORKTREE_RECLAIMED_EVENT = "worktree_reclaimed"
 
+#: Why `claude rm` would not take a closed order's session — written once per refusal (#1257)
+SESSION_KEPT_EVENT = "background_session_kept"
+
 #: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
 MAX_PER_SWEEP_ROWS = 50
 
@@ -682,7 +685,7 @@ CREATE TABLE IF NOT EXISTS assumptions (
     wo_id TEXT NOT NULL REFERENCES work_orders(id),
     ts REAL NOT NULL,
     content TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected
+    status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected | refined
     -- WHO settled it, why, under which model and configuration, and the Neo question
     -- that ruled. All in ADDED_COLUMNS, where the reasoning is — this table already
     -- ships, so a live database gets them only there. So are the PROVISIONAL verdict
@@ -878,6 +881,14 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     context_json TEXT,
     outfile TEXT NOT NULL DEFAULT '',
     errfile TEXT NOT NULL DEFAULT ''
+);
+-- THE EXACT TEXT of each context-ledger ingredient, keyed by its sha256, which the
+-- ingredient row in `wo_turns.context_json` carries as `sha`. Content-addressed so an
+-- ingredient that is identical on every turn (the appended prompt, the memory files)
+-- is stored once. Written only by `context.record`.
+CREATE TABLE IF NOT EXISTS ctx_blobs (
+    sha TEXT PRIMARY KEY,
+    text TEXT NOT NULL
 );
 -- THE MESSAGE BUS. One row is one message posted to a ROLE about a SUBJECT (a work
 -- order or a feature order), delivered by the router in bus.py. The sender never names
@@ -1208,6 +1219,9 @@ MESSAGE_AUTHOR_USER = "user"
 # A dependency is satisfied only when it reaches `completed`
 DEPENDENCY_SATISFIED_STATUS = "completed"
 
+#: A planner parked here behind its `pr_url` has a spec not yet on the default branch
+SPEC_PR_OPEN_STATUSES = ("validating", "waiting_pr_merge", "needs_review")
+
 # ...and these are the statuses from which it can never get there
 DEPENDENCY_DEAD_STATUSES = ("cancelled", "failed")
 
@@ -1294,6 +1308,19 @@ CLAIM_RULES: tuple[_ClaimRule, ...] = (
                ))""",
         delayed=True,
         params=lambda: (),
+    ),
+    # Its feature's SPEC pull request has not merged (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2)
+    _ClaimRule(
+        code="spec_unmerged",
+        why="its feature's spec pull request has not merged yet",
+        sql=f"""NOT (w.kind = 'worker' AND EXISTS (
+                   SELECT 1 FROM feature_orders f
+                   JOIN work_orders p ON p.id = f.plan_wo_id
+                   WHERE f.id = w.parent_id AND COALESCE(p.pr_url, '') != ''
+                     AND p.status IN ({",".join("?" for _ in SPEC_PR_OPEN_STATUSES)})
+               ))""",
+        delayed=True,
+        params=lambda: tuple(SPEC_PR_OPEN_STATUSES),
     ),
 )
 
@@ -1710,6 +1737,13 @@ class ProjectStore:
             "WHERE l.unit_id=? ORDER BY l.round, i.number", (unit_id,)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def issue_raiser(self, issue_url: str) -> dict[str, Any] | None:
+        """The `raised` link of this issue — the unit, and panel seat, that filed it"""
+        row = self.conn.execute(
+            "SELECT * FROM issue_links WHERE issue_url=? AND kind='raised' "
+            "ORDER BY created_at LIMIT 1", (issue_url,)).fetchone()
+        return dict(row) if row else None
+
     def issue_board(self) -> list[dict[str, Any]]:
         """Every tracked issue with its reference count, most-referenced first"""
         rows = self.conn.execute(
@@ -1924,6 +1958,21 @@ class ProjectStore:
         if row is None or not row["n"]:
             return None
         return {"fo_id": parent, "planner_id": row["planner"], "n": int(row["n"])}
+
+    def spec_hold(self, wo: dict[str, Any]) -> dict[str, Any] | None:
+        """`{"fo_id", "planner_id", "pr_url"}` while this child's spec PR is unmerged, else None (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2)"""
+        parent = wo.get("parent_id")
+        if not parent or wo.get("kind") != "worker":
+            return None
+        row = self.conn.execute(
+            f"""SELECT p.id planner, p.pr_url pr_url
+               FROM feature_orders f JOIN work_orders p ON p.id = f.plan_wo_id
+               WHERE f.id = ? AND COALESCE(p.pr_url, '') != ''
+                 AND p.status IN ({",".join("?" for _ in SPEC_PR_OPEN_STATUSES)})""",
+            (parent, *SPEC_PR_OPEN_STATUSES)).fetchone()
+        if row is None:
+            return None
+        return {"fo_id": parent, "planner_id": row["planner"], "pr_url": row["pr_url"]}
 
     def claim_next_pending(self, only: Collection[str] | None = None
                            ) -> dict[str, Any] | None:
@@ -3458,7 +3507,8 @@ class ProjectStore:
                           decided_by: str = "", reason: str = "", model: str = "",
                           config_version: str | None = None) -> None:
         """Settle one assumption, recording WHO settled it and on what basis"""
-        assert status in ("accepted", "rejected"), status
+        # `refined`: Neo returned it to the worker to split, per Q2402 (wo-ea3c6f0c)
+        assert status in ("accepted", "rejected", "refined"), status
         self.conn.execute(
             """UPDATE assumptions SET status=?, decided_by=?, decided_reason=?,
                    decided_model=?, decided_config_version=? WHERE id=?""",

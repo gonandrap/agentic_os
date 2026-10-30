@@ -86,6 +86,15 @@ def test_a_spent_ledger_queues_a_major():
                                                                               "ledger")
 
 
+def test_scraps_of_room_queue_instead_of_dispatching_a_doomed_order():
+    # #1305: $0.46 left dispatched an order that hit its ceiling in two minutes
+    scraps = steward.Ledger(evolution_usd=CFG.weekly_usd - 0.46)
+    assert outcome(cand(), scraps) == ("queue", "ledger")
+    assert outcome(cand(severity="blocker"), scraps) == ("ask", "critical-ceiling")
+    enough = steward.Ledger(evolution_usd=CFG.weekly_usd - steward.MIN_ORDER_USD)
+    assert outcome(cand(), enough)[0] == "dispatch"
+
+
 def test_a_medium_needs_recurrence_a_major_needs_less():
     assert outcome(cand(severity="medium", refs=2)) == ("queue", "recurrence")
     assert outcome(cand(severity="medium", refs=3)) == ("dispatch", "medium")
@@ -209,6 +218,24 @@ def test_enforce_never_dispatches_with_self_dispatch_off(fleet):
     d = steward.gate(cand(severity="critical"), catalog=make(mode="enforce"),
                      store=store, self_dispatch=False)
     assert (d.outcome, d.allowed) == ("dispatch", False)
+
+
+def test_an_ask_reaches_the_inbox_with_a_link_and_the_command_that_acts(fleet):
+    make, store = fleet
+    cat = make(mode="enforce", critical_weekly_usd=0)
+    d = steward.gate(cand(origin_kind="morpheus", severity="critical", parent_wo_id="wo-p1",
+                          payload={"morpheus_item": "mv-1"}), catalog=cat, store=store)
+    assert d.outcome == "ask"
+    central = CentralStore()
+    try:
+        [item] = central.new_inbox()
+        [held] = central.steward_asks(0)
+    finally:
+        central.close()
+    assert (item["level"], item["wo_id"], held["id"]) == ("critical", "wo-p1", d.decision_id)
+    assert "jarvis morpheus confirm mv-1 --fix" in item["body"]
+    assert f"/steward#decision-{d.decision_id}" in item["body"]
+    assert "does not re-run this one" in item["body"]
 
 
 def test_the_ledger_counts_stamped_spend_and_what_is_still_reserved(fleet):

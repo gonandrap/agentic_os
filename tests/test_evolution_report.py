@@ -399,17 +399,108 @@ def test_the_timeline_folds_the_registry_and_omits_a_missing_link(store, detecto
     assert "issue" not in added["links"] and "pr" not in added["links"]
 
 
-def test_a_knowledge_entry_reaches_the_timeline_with_its_work_order(store, clock):
-    """What the OS learned is half of §9's timeline, and the entry links its author"""
-    entry = store.add_knowledge("a panel hold nobody clears needs a nudge",
-                                project="proj_a", wo_id="wo-9")
+def _project(store, tmp_path, project="proj_a"):
+    """Register `project` and open its store"""
+    from jarvis.project_store import ProjectStore
 
-    event = next(e for e in ops.evolution_report()["timeline"]
-                 if e["kind"] == "knowledge_added")
+    path = tmp_path / project
+    path.mkdir(exist_ok=True)
+    store.upsert_project(project, str(path))
+    return ProjectStore(path)
 
+
+def test_knowledge_from_a_health_sweep_investigation_is_evolution_with_its_chain(
+        store, clock, tmp_path):
+    """Health sweep, investigation, investigator, learned: every hop on the page (Neo q2514)"""
+    ps = _project(store, tmp_path)
+    try:
+        stuck = ps.create_work_order("the stuck one", origin="ui")
+        inv = ps.create_feature_order("investigate it", origin="fleet_health",
+                                      kind="investigation",
+                                      metadata={ops.SUBJECT_KEY: stuck["id"]})
+        investigator = ps.create_work_order("diagnose", kind="investigator",
+                                            parent_id=inv["id"])
+    finally:
+        ps.close()
+    entry = store.add_knowledge("stuck orders hide behind a held panel",
+                                project="proj_a", wo_id=investigator["id"])
+
+    report = ops.evolution_report()
+
+    [row] = report["lineage"]["rows"]
+    assert row["id"] == entry["id"]
+    assert [(h["kind"], h["id"]) for h in row["chain"]] == [
+        ("work_order", investigator["id"]), ("feature_order", inv["id"])]
+    assert row["chain"][-1]["self_induced"]
+    event = next(e for e in report["timeline"] if e["kind"] == "knowledge_added")
     assert event["id"] == entry["id"]
-    assert "learned: a panel hold nobody clears needs a nudge" == event["headline"]
-    assert event["links"] == {"fix_wo": "wo-9"}
+    assert event["links"] == {"fix_wo": investigator["id"]}
+
+
+def test_knowledge_from_work_the_user_asked_for_stays_off_the_evolution_view(
+        store, clock, tmp_path):
+    """The knowledge base is /knowledge; evolution is only self-induced work (Neo q2514)"""
+    ps = _project(store, tmp_path)
+    try:
+        asked = ps.create_work_order("fix the login bug", origin="ui")
+    finally:
+        ps.close()
+    store.add_knowledge("login needs a CSRF token", project="proj_a", wo_id=asked["id"])
+    store.add_knowledge("an entry no order wrote", project="proj_a")
+
+    report = ops.evolution_report()
+
+    assert report["lineage"]["rows"] == []
+    assert report["lineage"]["user_asked"] == 1
+    assert report["lineage"]["untraced"] == 1
+    assert report["lineage"]["note"]
+    assert not any(e["kind"] == "knowledge_added" for e in report["timeline"])
+
+
+def test_a_steward_stamp_traces_through_its_decision_to_the_parent_order(
+        store, clock, tmp_path):
+    """The steward's decision is a hop, and its parent order is the next one"""
+    ps = _project(store, tmp_path)
+    try:
+        parent = ps.create_work_order("user work", origin="ui")
+        decision_id = store.record_steward_decision({
+            "project": "proj_a", "origin_kind": "panel", "subject": "a follow-up",
+            "severity": "major", "outcome": "dispatch", "applied": 1, "generation": 1,
+            "parent_wo_id": parent["id"]})
+        fix = ps.create_work_order("the follow-up", metadata={"steward": {
+            "origin_kind": "panel", "generation": 1, "severity": "major",
+            "decision_id": decision_id}})
+    finally:
+        ps.close()
+    store.add_knowledge("follow-ups need a file", project="proj_a", wo_id=fix["id"])
+
+    report = ops.evolution_report()
+
+    [row] = report["lineage"]["rows"]
+    assert [(h["kind"], h["id"]) for h in row["chain"]] == [
+        ("work_order", fix["id"]), ("steward_decision", f"#{decision_id}"),
+        ("work_order", parent["id"])]
+    assert any(e["kind"] == "self_dispatched" and e["id"] == f"#{decision_id}"
+               for e in report["timeline"])
+
+
+def test_an_issue_a_validation_seat_raised_is_a_self_induced_hop(store, clock, tmp_path):
+    """A user-started order on an OS-raised issue still traces to the seat that raised it"""
+    url = "https://github.com/o/r/issues/7"
+    ps = _project(store, tmp_path)
+    try:
+        validated = ps.create_work_order("user work", origin="ui")
+        ps.link_issue(url, validated["id"], "raised", round_no=2, seat="correctness")
+        picked = ps.create_work_order("fix #7", origin="ui", issue_url=url)
+    finally:
+        ps.close()
+    store.add_knowledge("seat finding learned", project="proj_a", wo_id=picked["id"])
+
+    [row] = ops.evolution_report()["lineage"]["rows"]
+
+    assert [(h["kind"], h["self_induced"]) for h in row["chain"]] == [
+        ("work_order", False), ("issue", True), ("work_order", False)]
+    assert "correctness" in row["chain"][1]["headline"]
 
 
 def test_a_gate_exemption_reaches_the_timeline_with_its_pattern(store, clock):

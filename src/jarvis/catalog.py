@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import zoneinfo
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Collection
 
 from . import claude_cli
 from . import concision
@@ -414,10 +415,7 @@ DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD = 10.0
 #: The window, in days
 DEFAULT_INSPECT_ALARM_CACHE_1H_WINDOW_DAYS = 7
 
-#: One-hour tokens written in the window by sessions JARVIS DID NOT DISPATCH
-DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS = 500_000
-
-#: The same, for turns JARVIS ITSELF dispatched
+#: One-hour tokens written in the window by 5m-armed turns JARVIS ITSELF dispatched
 DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS = 50_000
 
 #: Tokens a STAMPED turn paid at the TTL it was NOT armed for (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
@@ -452,7 +450,6 @@ class InspectConfig:
     alarm_rewrite_min_orders: int = DEFAULT_INSPECT_ALARM_REWRITE_MIN_ORDERS
     alarm_rewrite_min_usd: float = DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD
     alarm_cache_1h_window_days: int = DEFAULT_INSPECT_ALARM_CACHE_1H_WINDOW_DAYS
-    alarm_cache_1h_tokens: int = DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS
     alarm_cache_1h_dispatched_tokens: int = \
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
     alarm_cache_arm_missed_tokens: int = \
@@ -535,6 +532,9 @@ DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
 #: How long one project's red-base episodes are REMEMBERED (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)
 DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS = 168
 
+#: How long a red default branch may heal itself before the OS pays for a fix (wo-6bc0cd90, Neo 2227)
+DEFAULT_FLEET_HEALTH_BASE_FIX_GRACE_MINUTES = 30
+
 #: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`' arrangement
 FLEET_HEALTH_MAP_KEYS = ("thresholds",)
 
@@ -572,6 +572,8 @@ class FleetHealthConfig:
     exempt_kinds: tuple[str, ...] = DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
     #: §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md
     red_episode_retention_hours: int = DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS
+    #: Minutes `main` stays red before `dispatch_base_fix` asks the steward
+    base_fix_grace_minutes: int = DEFAULT_FLEET_HEALTH_BASE_FIX_GRACE_MINUTES
 
     def threshold_seconds(self, status: str) -> float:
         """This status's threshold, in the seconds `stuck.assess` compares"""
@@ -771,12 +773,26 @@ class MessagingConfig:
 #: Half an hour (#995)
 DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES = 30
 
+#: How many times the OS may catch one pull request up with a MOVING base...
+DEFAULT_PULL_REQUESTS_CATCH_UP_MAX = 10
+#: ...within this window: a RATE, not a lifetime budget (#1215, Neo 2191)
+DEFAULT_PULL_REQUESTS_CATCH_UP_WINDOW_MINUTES = 120
+#: The wait after the first catch-up of a window, doubled after each one since...
+DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_BASE_SECONDS = 60
+#: ...and never longer than this between two catch-ups
+DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_MAX_SECONDS = 600
+
 
 @dataclass
 class PullRequestsConfig:
     """When GitHub's silence about a pull request stops being a wait and becomes a stall"""
 
     recompute_stall_minutes: int = DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES
+    #: How often the OS catches one branch up with its base, and how far apart (`ops.catch_up_backoff`)
+    catch_up_max: int = DEFAULT_PULL_REQUESTS_CATCH_UP_MAX
+    catch_up_window_minutes: int = DEFAULT_PULL_REQUESTS_CATCH_UP_WINDOW_MINUTES
+    catch_up_backoff_base_seconds: int = DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_BASE_SECONDS
+    catch_up_backoff_max_seconds: int = DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_MAX_SECONDS
 
 
 # -- the scheduler: the OS filing a work order nobody typed
@@ -1183,6 +1199,11 @@ class Catalog:
                 return p
         raise CatalogError(f"unknown project {name!r} (known: {[p.name for p in self.projects]})")
 
+    def without_projects(self, names: Collection[str]) -> "Catalog":
+        """A copy with `names` dropped; the caller says which (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.1)"""
+        return dataclasses.replace(
+            self, projects=[p for p in self.projects if p.name not in names])
+
 
 def _err(msg: str) -> CatalogError:
     return CatalogError(f"catalog error: {msg}")
@@ -1487,8 +1508,6 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                             base.alarm_rewrite_min_usd)),
         alarm_cache_1h_window_days=int(raw.get("alarm_cache_1h_window_days",
                                                base.alarm_cache_1h_window_days)),
-        alarm_cache_1h_tokens=int(raw.get("alarm_cache_1h_tokens",
-                                          base.alarm_cache_1h_tokens)),
         alarm_cache_1h_dispatched_tokens=int(
             raw.get("alarm_cache_1h_dispatched_tokens",
                     base.alarm_cache_1h_dispatched_tokens)),
@@ -1588,6 +1607,8 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         exempt_kinds=exempt_kinds,
         red_episode_retention_hours=int(raw.get(
             "red_episode_retention_hours", base.red_episode_retention_hours)),
+        base_fix_grace_minutes=int(raw.get(
+            "base_fix_grace_minutes", base.base_fix_grace_minutes)),
     )
     for name, value in vars(cfg).items():
         if name in FLEET_HEALTH_MAP_KEYS or name in FLEET_HEALTH_LIST_KEYS \
@@ -1890,13 +1911,20 @@ def _parse_pull_requests(raw: Any, base: PullRequestsConfig | None = None,
     base = base or PullRequestsConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
-    cfg = PullRequestsConfig(
-        recompute_stall_minutes=int(raw.get("recompute_stall_minutes",
-                                            base.recompute_stall_minutes)),
-    )
-    for name, value in vars(cfg).items():
+    values: dict[str, int] = {}
+    for name, default in vars(base).items():
+        value = raw.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _err(f"{where}.{name} must be a whole number, got {value!r}")
         if value < 1:
             raise _err(f"{where}.{name} must be >= 1")
+        values[name] = value
+    cfg = PullRequestsConfig(**values)
+    if cfg.catch_up_backoff_base_seconds > cfg.catch_up_backoff_max_seconds:
+        raise _err(f"{where}.catch_up_backoff_base_seconds "
+                   f"{cfg.catch_up_backoff_base_seconds} is above "
+                   f"{where}.catch_up_backoff_max_seconds "
+                   f"{cfg.catch_up_backoff_max_seconds}")
     return cfg
 
 

@@ -401,6 +401,8 @@ run "git -C '$PROD_DIR' fetch origin --tags --prune --force"
 run "git -C '$PROD_DIR' checkout -f '$TAG'"
 say "building production venv (uv sync --frozen --extra ui)"
 run "(cd '$PROD_DIR' && uv sync --frozen --extra ui)"
+# .python-version + only-managed make uv rebuild the venv; refuse a libsqlite3 that deadlocks WAL (kn-8e43df8e)
+run "'$PROD_DIR/.venv/bin/python' -c 'import sqlite3,sys; v=sqlite3.sqlite_version; print(\"prod sqlite\", v); sys.exit(v in (\"3.51.0\", \"3.51.1\"))' || die 'production venv links SQLite 3.51.0/3.51.1 (WAL deadlock); rebuild it on a uv-managed CPython'"
 
 # default production catalog (empty fleet until prod onboarding lands)
 if [ ! -f "$PROD_CONFIG" ]; then

@@ -157,6 +157,26 @@ def test_the_knowledge_block_is_not_counted_twice_in_the_prompt(dispatched):
             + _named(rows, "knowledge_index")["bytes"]) == len(prompt.encode())
 
 
+def test_each_ingredient_text_is_stored_and_splits_the_prompt_exactly(dispatched):
+    """wo-05092a1c: ctx_blobs holds the exact text, and old payloads without `sha` still split the prompt"""
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    turn = store.list_turns(wo_id)[0]
+
+    def text(name: str) -> str | None:
+        return ops.context_ingredient(wo_id, "proj_a", 1, name)["text"]
+
+    assert text("worker_prompt") + text("knowledge_index") == turn["prompt"]
+    assert text("add_dirs") is None and text("mcp_servers") is None
+
+    payload = json.loads(turn["context_json"])
+    for row in payload["ingredients"]:
+        row.pop("sha", None)
+    store.conn.execute("UPDATE wo_turns SET context_json=? WHERE id=?",
+                       (json.dumps(payload), turn["id"]))
+    store.conn.commit()
+    assert text("worker_prompt") + text("knowledge_index") == turn["prompt"]
+
+
 def test_an_unreadable_ingredient_is_none_with_a_reason(dispatched, monkeypatch):
     """A missing settings file is unknown, not empty"""
     store, spec, wo = dispatched["store"], dispatched["spec"], dispatched["wo"]

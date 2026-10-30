@@ -11,6 +11,20 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+# WAL close vs open deadlocks across threads on these (kn-8e43df8e)
+DEADLOCKING_SQLITE = ("3.51.0", "3.51.1")
+
+
+def refuse_deadlocking_sqlite(version: str = sqlite3.sqlite_version) -> None:
+    if version in DEADLOCKING_SQLITE:
+        raise RuntimeError(
+            f"SQLite {version} deadlocks WAL close vs open across threads (kn-8e43df8e); "
+            "run `uv sync` to rebuild the venv on the pinned uv-managed CPython"
+        )
+
+
+refuse_deadlocking_sqlite()
+
 
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +66,41 @@ def add_missing_columns(conn: sqlite3.Connection,
                 # Two processes opening one fresh store both saw the column missing
                 if "duplicate column name" not in str(e):
                     raise
+
+
+def _tables(conn: sqlite3.Connection) -> list[str]:
+    return [r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+
+
+def tables_with_column(conn: sqlite3.Connection, column: str) -> list[str]:
+    """Every table in the live schema carrying `column`, sorted"""
+    return sorted(t for t in _tables(conn) if any(
+        c["name"] == column for c in conn.execute(f"PRAGMA table_info({t})")))
+
+
+def delete_where(conn: sqlite3.Connection, tables: Sequence[str], column: str,
+                 value: Any) -> dict[str, int]:
+    """Delete rows whose `column` is `value` from each table, foreign-key children first, counted"""
+    every = _tables(conn)
+    counts: dict[str, int] = {}
+    for parent in tables:
+        for child in every:
+            for fk in conn.execute(f"PRAGMA foreign_key_list({child})").fetchall():
+                if fk["table"] != parent:
+                    continue
+                # An FK naming no column targets the parent's primary key
+                target = fk["to"] or next(c["name"] for c in conn.execute(
+                    f"PRAGMA table_info({parent})") if c["pk"])
+                # Explicit even under ON DELETE CASCADE: sqlite reports no rowcount for a cascade
+                n = conn.execute(
+                    f"DELETE FROM {child} WHERE {fk['from']} IN "
+                    f"(SELECT {target} FROM {parent} WHERE {column}=?)",
+                    (value,)).rowcount
+                counts[child] = counts.get(child, 0) + n
+        counts[parent] = counts.get(parent, 0) + conn.execute(
+            f"DELETE FROM {parent} WHERE {column}=?", (value,)).rowcount
+    return counts
 
 
 def now() -> float:

@@ -1,0 +1,17 @@
+{# What an io's findings dispatched, up front (issue 1323): `ops.dispatched_orders`. #}
+{% import "_layout.html" as ui %}
+{% macro dispatched(d, project, label='dispatched') %}
+{% if d and d.count %}
+<div class="panel" id="dispatched" style="margin-top: 12px;">
+  <div class="row"><strong>{{ label }}: {{ d.count }} order{{ 's' if d.count != 1 }}, {{ d.merged }} merged</strong></div>
+  {% for o in d.orders %}
+  <div class="row">
+    {{ ui.row_id(o.id, order_path(o.project or project, o.id)) }}
+    <span class="st">{{ 'merged' if o.merged else o.status }}</span>
+    {% if o.pr_url %}<a class="mono" href="{{ o.pr_url }}" rel="noopener">PR #{{ o.pr_url.rstrip('/').rsplit('/', 1)[-1] }}</a>{% endif %}
+    <span class="grow clamp1" title="{{ o.title }}">{{ o.title }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endmacro %}

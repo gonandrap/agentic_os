@@ -1,22 +1,20 @@
 {% extends "base.html" %}
+{% import "_layout.html" as ui %}
 {% block title %}cost — Jarvis{% endblock %}
+{% block style %}
+  .cost-list td.prose a.title { display: block; overflow: hidden; text-overflow: ellipsis;
+                                white-space: nowrap; }
+{% endblock %}
 {% block content %}
-{# Sections reflow into columns at width — `.flow` in base.html, §5 of
-   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
-<div class="flow" style="--col: 600px;">
 
-<h2>What the work cost — {{ report.scope }}</h2>
+{# §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md #}
+{{ ui.page_head("What the work cost", report.scope) }}
 
-{# The scope switcher. A plain link row rather than a form: there is one parameter and
-   the whole page is a GET, so a link is the honest control. #}
-<div class="panel" style="padding: 10px 16px;">
-  <span class="kv">
-    <a href="/cost">{{ '● ' if not project }}fleet</a>
-    {% for p in projects %}
-      · <a href="/cost?project={{ p }}">{{ '● ' if project == p }}{{ p }}</a>
-    {% endfor %}
-  </span>
-</div>
+{# The project scope. The filter form carries no window, so switching project returns to
+   the default window — as the link row it replaced did (Neo, question 2442). #}
+{{ ui.filter_bar("/cost", {"project": project} if project else {},
+                 {"project": projects}, units|length, units|length,
+                 labels={"project": "fleet"}) }}
 
 {# The WINDOW switcher. Links and a GET form, no JavaScript, so the selection is in the
    URL and is shareable by construction — and it governs EVERY number on this page, not
@@ -161,23 +159,23 @@
    built — see `cost_page`. #}
 {% if fleet %}{% include "_fleet_distribution.html" %}{% endif %}
 
-<div class="panel" style="margin-top: 14px;">
+<div class="panel table-wrap" style="margin-top: 14px;">
+  <table class="cost-list">
+  <tr><th>id</th><th>cost</th><th>order</th><th>state</th></tr>
   {% for u in units %}
-  <div class="row">
-    <span class="mono" style="width: 76px; text-align: right; color: var(--ink);"
+  <tr>
+    <td>{{ ui.row_id(u.id, order_path(u.project, u.id)) }}</td>
+    <td class="mono num" style="text-align: right; color: var(--ink);"
           title="Worker plus jarvis. {% if u.os_calls %}~${{ '%.2f'|format(u.os_cost_usd) }} of it is jarvis.{% endif %}">
       {%- if u.found %}${{ '%.2f'|format(u.total_cost_usd) }}
       {%- elif u.os_calls %}${{ '%.2f'|format(u.os_cost_usd) }}+
       {%- else %}—{% endif -%}
-    </span>
-    {# A work order title is a whole paragraph of user intent often enough that letting
-       it wrap turns this table into a wall. Clamped rather than truncated server-side:
-       the full text stays in the DOM for search and for the hover title. #}
-    <div class="grow">
-      <a href="/wo/{{ u.project }}/{{ u.id }}" title="{{ u.title }}"
-         style="display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
-        >{{ u.title }}</a>
-      <div class="sub mono">{{ u.id }} · {{ u.project }} ·
+    </td>
+    {# A title is often a paragraph of user intent: clamped to one line, full text in
+       the DOM and the hover title. #}
+    <td class="prose">
+      <a class="title" href="{{ order_path(u.project, u.id) }}" title="{{ u.title }}">{{ u.title }}</a>
+      <div class="sub mono">{{ u.project }} ·
         {%- if u.found %}
           {{ u.turns }} turn{{ 's' if u.turns != 1 }} ·
           {{ fmt_tok(u.billed_input) }} in / {{ fmt_tok(u.output) }} out ·
@@ -204,13 +202,14 @@
         · <a href="/cost/{{ u.project }}/{{ u.id }}"
           >bill{% if u.recorded_turns %} ({{ u.recorded_turns }} turns recorded){% endif %} →</a>
       </div>
-    </div>
+    </td>
     {% set m = status_meta.get(u.status, {'word': u.status, 'icon': '•', 'tone': 'muted'}) %}
-    <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
-  </div>
+    <td class="when"><span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span></td>
+  </tr>
   {% else %}
-  <div class="empty">no work orders to measure</div>
+  <tr><td colspan="4" class="empty">no work orders to measure</td></tr>
   {% endfor %}
+  </table>
 </div>
 
 {# Said on the page, not only in the docs: this figure is the only number on screen and
@@ -229,6 +228,4 @@
 <p class="sub" style="margin-top: 6px;">
   Every figure on this page is {{ report.floor_reason }}.
 </p>
-
-</div>
 {% endblock %}

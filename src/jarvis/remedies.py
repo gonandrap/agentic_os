@@ -451,6 +451,7 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
             steward.linked(decision, fix["id"])
     except ops.OpsError as exc:
         raise RemedyRefused(str(exc)) from exc
+    _attribute(central, intent, fix["id"])
     try:
         ship = ops.create_work_order(
             project, ship_title,
@@ -462,8 +463,20 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
         return (f"filed {fix['id']} to fix the root cause; its ship order could NOT be "
                 f"filed ({exc}) — file one by hand with `jarvis wo create {project} "
                 f"\"…\" --depends-on {fix['id']}`")
+    _attribute(central, intent, ship["id"])
     return (f"filed {fix['id']} to fix the root cause, and {ship['id']} to ship it "
             f"(blocked until {fix['id']} completes; the release itself is still gated)")
+
+
+def _attribute(central: Any, intent: Intent, wo_id: str) -> None:
+    """Charge a filed order to the rule fire behind the alarm, if a rule raised it"""
+    if intent.alarm_id is None or central is None:
+        return
+    try:
+        central.note_fire_orders(intent.alarm_id, [wo_id])
+    except Exception:  # noqa: BLE001 — the order is filed; losing its attribution must not undo that
+        log.warning("could not attribute %s to the fire behind %s", wo_id,
+                    intent.alarm_id, exc_info=True)
 
 
 def reoffer_file_work_order(row: Mapping[str, Any], candidate: Any,
@@ -545,8 +558,6 @@ def _in_flight(pstore: Any, wo_id: str) -> str:
 
 def _can_update_branch(pstore: Any, subject: dict[str, Any],
                        params: dict[str, Any]) -> str:
-    from . import ops
-
     wo_id = str(subject.get("id") or "")
     if not str(subject.get("pr_url") or ""):
         return (f"{wo_id} carries no pull request, so there is no branch to merge a base "
@@ -554,14 +565,21 @@ def _can_update_branch(pstore: Any, subject: dict[str, Any],
     flight = _in_flight(pstore, wo_id)
     if flight:
         return flight
-    attempts = ops.catch_up_attempts(pstore, wo_id)
-    if attempts >= ops.CATCH_UP_MAX:
-        return (f"the OS has already caught {wo_id} up with its base "
-                f"{ops.CATCH_UP_MAX} times inside one "
-                f"`ops.CATCH_UP_WINDOW_SECONDS` window, which is the bound "
-                f"`ops.CATCH_UP_MAX` sets — a base moving faster than this one is caught "
-                f"up is a person's problem, not another merge")
-    return ""
+    return _catch_up_cap_reached(pstore, wo_id)
+
+
+def _catch_up_cap_reached(pstore: Any, wo_id: str) -> str:
+    """Why `pull_requests.catch_up_max` refuses another catch-up of `wo_id`, or ''"""
+    from . import ops
+
+    policy = ops.catch_up_policy(pstore)
+    if ops.catch_up_attempts(pstore, wo_id, policy=policy) < policy.catch_up_max:
+        return ""
+    return (f"the OS has already caught {wo_id} up with its base "
+            f"{policy.catch_up_max} times inside one "
+            f"{policy.catch_up_window_minutes}-minute window, which is the bound "
+            f"`pull_requests.catch_up_max` sets — a base moving faster than this one is "
+            f"caught up is a person's problem, not another merge")
 
 
 def _apply_update_branch(pstore: Any, central: Any, project: str,
@@ -579,13 +597,9 @@ def _apply_update_branch(pstore: Any, central: Any, project: str,
     flight = _in_flight(pstore, wo_id)
     if flight:
         raise RemedyRefused(flight)
-    attempts = ops.catch_up_attempts(pstore, wo_id)
-    if attempts >= ops.CATCH_UP_MAX:
-        raise RemedyRefused(
-            f"the OS has already caught {wo_id} up with its base "
-            f"{ops.CATCH_UP_MAX} times inside one `ops.CATCH_UP_WINDOW_SECONDS` window, "
-            f"which is the bound `ops.CATCH_UP_MAX` sets — a base moving faster than "
-            f"this one is caught up is a person's problem, not another merge")
+    capped = _catch_up_cap_reached(pstore, wo_id)
+    if capped:
+        raise RemedyRefused(capped)
     path = Path(str(pstore.project_path))
     try:
         fresh = github.pr_view(pr_url, cwd=path)

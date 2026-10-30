@@ -570,10 +570,15 @@ def respawn_bg(short: str) -> bool:
 
 def remove_bg(short: str) -> str | None:
     """`claude rm`: the session, and its worktree when that is safe; its report, or None on failure"""
+    return remove_bg_report(short)[0]
+
+
+def remove_bg_report(short: str) -> tuple[str | None, str]:
+    """`remove_bg` with the refusal beside it: (report, "") or (None, what the CLI said) (#1257)"""
     try:
-        return (_run(["rm", short], timeout=60) or "").strip()
-    except ClaudeCliError:
-        return None
+        return (_run(["rm", short], timeout=60) or "").strip(), ""
+    except ClaudeCliError as e:
+        return None, str(e)
 
 
 # -- worker turns (the transport every worker conversation runs on)

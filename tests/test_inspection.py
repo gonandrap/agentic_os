@@ -370,7 +370,8 @@ def burning(*, wall: float = 0.0, write: int = 0, join: float = 0.0,
     turn.calls = [api_call(1.0 + n) for n in range(calls)]
     if join:
         turn.spans.append(inspection.ToolSpan(name="TaskOutput", tool_id="t1",
-                                              started=0.0, detail="a subagent"))
+                                              # 1.0, not 0.0: a zero start is a missing stamp (issue 1309)
+                                              started=1.0, detail="a subagent"))
     anatomy = inspection.Anatomy(session_id="s", found=True, turns=[turn])
     if write:
         anatomy.writes.append(inspection.Write(ts=1.0, written=write, read=0, gap=5.0,
@@ -703,6 +704,30 @@ def test_a_subagent_tool_call_under_the_threshold_is_not_a_hang(write_transcript
                                     sub_rows=hung_sub_rows())
 
     assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=190,
+                                  dispatched=0.0) == []
+
+
+def _blob(role: str, content: list[dict]) -> dict:
+    """Claude Code's untimed copy of a request's messages (issue 1309)"""
+    return {"type": "api-request-blob", "hash": "h", "sessionId": "s",
+            "message": {"role": role, "content": content}}
+
+
+def test_an_untimed_replay_of_a_tool_call_is_not_a_span_from_1970(write_transcript):
+    """Issue 1309: replayed tool_use rows became open spans started at 0 and a 498127.9h join alarm"""
+    agent = {"type": "tool_use", "id": "t1", "name": "Agent",
+             "input": {"description": "write the spec", "prompt": "go"}}
+    read = {"type": "tool_use", "id": "s1", "name": "Read",
+            "input": {"file_path": "/x.py"}}
+    session = write_transcript("replayed", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m2", content=[agent]),
+        _blob("assistant", [agent]),
+    ], subagents={"agent-a7b62083": [*healthy_sub_rows(), _blob("assistant", [read])]})
+    anatomy = inspection.read_session(session)
+
+    assert [s.started for s in anatomy.turns[0].spans] == [10.0]
+    assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=311,
                                   dispatched=0.0) == []
 
 
@@ -1453,19 +1478,32 @@ def test_an_unstamped_turn_is_dispatched_because_unknown_is_not_a_licence(
     assert elsewhere.dispatched == 900_000 and elsewhere.deliberate == 0
 
 
-def test_a_foreign_write_is_untouched_by_any_arm(write_transcript):
-    """A person's own `claude` is not an arm"""
+@pytest.mark.parametrize(("arm", "split"), [
+    ("1h", (0, 900_000, 0)), ("5m", (0, 0, 900_000))])
+def test_a_typed_prompt_inside_a_stamped_turn_is_jarvis_s(write_transcript, arm, split):
+    """A `claude --bg` worker's prompts read "typed": the record decides, not promptSource (wo-10a5f151)"""
+    write_transcript("bg-worker", [
+        prompt_row(0, "Your full instructions for this turn are in …", sdk=False),
+        assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
+    ])
+
+    (entry,) = inspection.one_hour_writes(ALL_OF_IT, arms=_arms("bg-worker", arm))
+
+    assert (entry.foreign, entry.deliberate, entry.dispatched) == split
+
+
+def test_a_foreign_write_raises_nothing(write_transcript):
+    """A person's own `claude`, outside every stamped turn, is counted and never alarmed on"""
     write_transcript("typed", [
         prompt_row(0, "have a look", sdk=False),
         assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
     ])
 
-    (entry,) = inspection.one_hour_writes(ALL_OF_IT, arms=_arms("typed", "1h"))
+    (entry,) = inspection.one_hour_writes(
+        ALL_OF_IT, arms=_arms("typed", "1h", start=5_000, end=6_000))
 
     assert (entry.foreign, entry.deliberate, entry.dispatched) == (900_000, 0, 0)
-    (alarm,) = inspection.hour_alarms([entry], InspectConfig(), days=7)
-    assert alarm.kind == inspection.CACHE_1H_FOREIGN_ALARM
-    assert inspection.REMEDY_LINE in alarm.reason
+    assert inspection.hour_alarms([entry], InspectConfig(), days=7) == []
 
 
 def test_the_breach_alarm_names_the_arm_it_is_about_and_the_hour_bought_on_purpose():

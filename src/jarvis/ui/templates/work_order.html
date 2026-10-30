@@ -6,6 +6,7 @@
 {% import "_review.html" as review_ui %}
 {% import "_brake.html" as brake_ui %}
 {% import "_order_nav.html" as nav %}
+{% import "_dispatched.html" as dispatched_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -21,10 +22,10 @@
 {{ nav.order_nav(project, wo, 'record') }}
 {{ nav.debug_jumps('/wo/' ~ project ~ '/' ~ wo.id ~ '/debug') }}
 
-{# AT WIDTH — §5 of docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md:
-   the order's card on the left, everything it asks of the reader on the right, the tabs
-   full width under both. One column when nothing is asked. #}
-<div class="grid wo-top" style="--col: 680px;">
+{# §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md:
+   the order's card, then everything it asks of the reader, stacked full width; the tabs
+   under both. #}
+<div class="wo-top">
 <div class="wo-card">
 <div class="panel" style="padding: 14px 16px; margin-top: 18px;">
   <div style="display:flex; gap: 12px; align-items: baseline; flex-wrap: wrap;">
@@ -113,6 +114,7 @@
       from you. The conversation is intact and the worker picks up from where it got
       to.</p>
   {% endif %}
+  {{ dispatched_ui.dispatched(siblings, project, 'its findings dispatched (' ~ siblings.io_id ~ ')') if siblings }}
   {% if wo.description %}<p class="kv" style="white-space: pre-wrap;">{{ wo.description }}</p>{% endif %}
   {# The brief above is only the MARGIN around this order's section of its feature's
      spec — the scope boundary and what done means. The section itself is the work, and
@@ -442,7 +444,7 @@
       <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
       {%- if a.status == 'pending' %} with {{ 'you' if a.escalated else 'Neo' }}
       {%- elif a.decided_by %} by {{ a.decided_by }}{% endif %} ·
-      {{ fmt_age(a.ts) }} ago · <a href="/gates#gate-{{ a.id }}">gates →</a></div>
+      {{ fmt_age(a.ts) }} ago · <a href="/gates/{{ a.id }}">gates →</a></div>
     <div class="mono" style="margin:6px 0">$ {{ a.command }}</div>
     {% if a.status == 'pending' and a.escalated %}
     <div class="sub">Neo escalated: {{ a.escalation_reason or '—' }}</div>
@@ -529,6 +531,23 @@
 {# Below the rounds, because it is what came OUT of them — and once for the whole order
    rather than once per round, which is the thing the per-round fragment could not be. #}
 {{ issues_ui.unit(issues) }}
+
+<h2 id="learnings">Learnings</h2>
+<div class="panel">
+  {% for k in learnings %}
+  <div class="row">
+    <div class="grow">
+      <a class="mono" href="/knowledge/{{ k.id }}">{{ k.id }}</a>
+      <span class="sub">· {{ k.topic or 'no topic' }} · {{ k.project or 'global' }}
+        {%- if k.retired_by_wo_id == wo.id %} · retired by this order: {{ k.retired_reason or '—' }}
+        {%- elif k.retired_at %} · retired{% endif %}</span>
+      <div>{{ k.content|truncate(300) }}</div>
+    </div>
+  </div>
+  {% else %}
+  <div class="row"><div class="grow sub">This order wrote no learnings.</div></div>
+  {% endfor %}
+</div>
 
 </div>
 </div>

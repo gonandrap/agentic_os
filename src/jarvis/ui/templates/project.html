@@ -1,7 +1,11 @@
 {% extends "base.html" %}
 {% import "_issues.html" as issues_ui %}
 {% import "_brake.html" as brake_ui %}
+{% import "_layout.html" as ui %}
 {% block title %}{{ project_name }} — Jarvis{% endblock %}
+{% block style %}
+  @media (max-width: 640px) { main .row { flex-wrap: wrap; } main .row > .grow { flex-basis: 100%; } }
+{% endblock %}
 {% block content %}
 
 <h2>{{ project_name }} <span class="kv mono">{{ path }}</span></h2>
@@ -69,59 +73,112 @@
     <a href="{{ purl(p_show, p_fo, hidden=true) }}">show</a>
   {% endif %}
 </p>
-{# Improvement orders, their own short block beside the features: same "counts, not
-   trees" rule (§6.1 of the improvement-orders spec) — the findings are what the order's
-   own page is for, and the label is kind-aware because `plan_review` here means a
-   decision is owed, not a plan awaiting release. #}
-{# AT WIDTH (§5): the work orders are the main column, the planned units above them —
-   improvements, investigations, features — sit beside it. `order` puts the work orders
-   first on screen without moving them in the document. #}
-<div class="grid main-side" style="--col: 560px;">
-<div class="proj-side">
+{# §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md:
+   work orders full width and attention first; the planned units sit in tabs below. #}
+<h2 id="proj-orders">Work orders</h2>
+{{ ui.filter_bar("/project/" ~ project_name, filters, options, rows | length, total,
+                 labels={"status": "open work"}) }}
+<div class="panel proj-orders">
+  {% for wo in rows %}
+    {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
+    {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
+    <div class="row" data-status="{{ wo.status }}">
+      <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+      <div class="grow">
+        {{ ui.row_id(wo.id, '/wo/' ~ project_name ~ '/' ~ wo.id) }} {{ wo.title }}
+        {% if wo.hidden %}<span class="badge outside" title="hidden">🙈 hidden</span>{% endif %}
+        {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
+          <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
+        {% endif %}
+        {% if blocked.get(wo.id) %}
+          <div class="sub">⊘ blocked by:
+            {% for b in blocked[wo.id] %}{{ ui.row_id(b.id, '/wo/' ~ project_name ~ '/' ~ b.id) }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
+          </div>
+        {% endif %}
+        {{ brake_ui.let_through(brake, wo, '/project/' ~ project_name) }}
+        {# Not an attention item on purpose: the OS resumes this one itself. #}
+        {% if pauses.get(wo.id) %}
+          <div class="sub">⏳ {{ pauses[wo.id] }}</div>
+        {% endif %}
+        {% if wo.needs_attention %}<div class="sub tone-warn">◭ {{ wo.attention_reason }}</div>{% endif %}
+      </div>
+      <span class="badge {{ 'framework' if o.framework else 'outside' }}">
+        {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
+      <span class="sub mono">{{ fmt_age(wo.created_at) }}</span>
+    </div>
+  {% else %}
+    <div class="empty">
+      {% if filters %}nothing matches these filters
+      {% elif open_counts or settled %}nothing running and nothing waiting on you — the rest is counted above
+      {% else %}no work orders yet{% endif %}
+    </div>
+  {% endfor %}
+</div>
+
+{% macro tab(id, label, items) -%}
+<button role="tab" data-panel="{{ id }}" aria-selected="{{ 'true' if id == 'tab-features' else 'false' }}"
+        aria-controls="{{ id }}">{{ label }}
+  {%- if items %}<span class="n {{ 'hot' if items | selectattr('needs_attention') | list }}">{{ items | length }}</span>{% endif %}</button>
+{%- endmacro %}
+<div class="tabbed" id="proj-tabs">
+  <div class="tabs" role="tablist">
+    {{ tab('tab-features', 'Feature orders', features) }}
+    {{ tab('tab-improvements', 'Improvement orders', improvements) }}
+    {{ tab('tab-investigations', 'Investigations', investigations) }}
+  </div>
+
+{# Improvements: "counts, not trees" (§6.1 of the improvement-orders spec); the label is
+   kind-aware because `plan_review` here means a decision is owed. #}
+<div class="tabpanel" id="tab-improvements">
+<h2>Improvement orders</h2>
 {% if improvements %}
-<h3>Improvement orders</h3>
 <div class="panel">
   {% for io in improvements %}
     {% set im = fo_status_meta.get(io.status, {'word': io.status, 'icon': '•', 'tone': 'muted'}) %}
     <div class="row">
       <span class="st tone-{{ im.tone }}"><span class="i">{{ im.icon }}</span>{{ io.status_label }}</span>
       <div class="grow">
-        <a href="/io/{{ project_name }}/{{ io.id }}" class="mono">{{ io.id }}</a> {{ io.title }}
+        {{ ui.row_id(io.id, '/io/' ~ project_name ~ '/' ~ io.id) }} {{ io.title }}
         {% if io.needs_attention %}<div class="sub tone-warn">◭ {{ io.attention_reason }}</div>{% endif %}
       </div>
       <span class="sub mono">{{ fmt_age(io.created_at) }}</span>
     </div>
   {% endfor %}
 </div>
+{% else %}
+<p class="empty">no open improvement orders</p>
 {% endif %}
+</div>
 
-{# Investigations, beside the two blocks above on the same "counts, not trees" rule
-   (§2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md): the verdict is
-   what the order's own page is for, and this line only says what is being diagnosed. #}
+{# Investigations, on the same "counts, not trees" rule (§2.9 of
+   docs/superpowers/specs/2026-09-27-investigation-orders.md): the verdict is on its page. #}
+<div class="tabpanel" id="tab-investigations">
+<h2>Investigations</h2>
 {% if investigations %}
-<h3>Investigations</h3>
 <div class="panel">
   {% for inv in investigations %}
     {% set vm = fo_status_meta.get(inv.status, {'word': inv.status, 'icon': '•', 'tone': 'muted'}) %}
     <div class="row">
       <span class="st tone-{{ vm.tone }}"><span class="i">{{ vm.icon }}</span>{{ inv.status_label }}</span>
       <div class="grow">
-        <a href="/inv/{{ project_name }}/{{ inv.id }}" class="mono">{{ inv.id }}</a> {{ inv.title }}
+        {{ ui.row_id(inv.id, '/inv/' ~ project_name ~ '/' ~ inv.id) }} {{ inv.title }}
         {% if inv.needs_attention %}<div class="sub tone-warn">◭ {{ inv.attention_reason }}</div>{% endif %}
       </div>
       <span class="sub mono">{{ fmt_age(inv.created_at) }}</span>
     </div>
   {% endfor %}
 </div>
+{% else %}
+<p class="empty">no open investigations</p>
 {% endif %}
+</div>
 
-{# Feature orders sit ABOVE the work orders and do not expand into their children here:
-   the children are already in the listing below as ordinary work orders, and printing
-   the same tree twice on one page is how a page stops being read. The tree is on the
-   feature's own page. Settled ones collapse to a count of their own, on the `fo` param
-   rather than `show` — see the project route for why the two cannot share one. #}
+{# Feature orders do not expand into their children here: the children are already in
+   the work orders above, and the tree is on the feature's own page. Settled ones collapse
+   to a count of their own, on the `fo` param rather than `show` — see the project route. #}
+<div class="tabpanel on" id="tab-features">
+<h2>Feature orders</h2>
 {% if features or fo_settled %}
-<h3>Feature orders</h3>
 {% if fo_settled %}
 <p class="sub">
   {{ count_line(fo_settled, fo_status_meta, fo_revealed, 'fo', p_show, 'feature') }}
@@ -139,7 +196,7 @@
     <div class="row">
       <span class="st tone-{{ fm.tone }}"><span class="i">{{ fm.icon }}</span>{{ fm.word }}</span>
       <div class="grow">
-        <a href="/fo/{{ project_name }}/{{ fo.id }}" class="mono">{{ fo.id }}</a> {{ fo.title }}
+        {{ ui.row_id(fo.id, '/fo/' ~ project_name ~ '/' ~ fo.id) }} {{ fo.title }}
         <span class="sub">{{ fo.progress.label }}</span>
         {% if fo.needs_attention %}<div class="sub tone-warn">◭ {{ fo.attention_reason }}</div>{% endif %}
       </div>
@@ -147,47 +204,9 @@
     </div>
   {% endfor %}
 </div>
+{% else %}
+<p class="empty">no open feature orders</p>
 {% endif %}
-</div>
-
-<div class="proj-main" style="order: -1;">
-<h3 id="proj-orders">Work orders</h3>
-<div class="panel">
-  {% for wo in featured + rest %}
-    {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
-    {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
-    <div class="row">
-      <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
-      <div class="grow">
-        <a href="/wo/{{ project_name }}/{{ wo.id }}" class="mono">{{ wo.id }}</a> {{ wo.title }}
-        {% if wo.hidden %}<span class="badge outside" title="hidden">🙈 hidden</span>{% endif %}
-        {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
-          <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
-        {% endif %}
-        {% if blocked.get(wo.id) %}
-          <div class="sub">⊘ blocked by:
-            {% for b in blocked[wo.id] %}<a class="mono"
-              href="/wo/{{ project_name }}/{{ b.id }}">{{ b.id }}</a> ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
-          </div>
-        {% endif %}
-        {{ brake_ui.let_through(brake, wo, '/project/' ~ project_name) }}
-        {# Not an attention item on purpose: the OS resumes this one itself. #}
-        {% if pauses.get(wo.id) %}
-          <div class="sub">⏳ {{ pauses[wo.id] }}</div>
-        {% endif %}
-        {% if wo.needs_attention %}<div class="sub tone-warn">◭ {{ wo.attention_reason }}</div>{% endif %}
-      </div>
-      <span class="badge {{ 'framework' if o.framework else 'outside' }}">
-        {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
-      <span class="sub mono">{{ fmt_age(wo.created_at) }}</span>
-    </div>
-  {% else %}
-    <div class="empty">
-      {% if open_counts or settled %}nothing running and nothing waiting on you — the rest is counted above
-      {% else %}no work orders yet{% endif %}
-    </div>
-  {% endfor %}
-</div>
 </div>
 </div>
 

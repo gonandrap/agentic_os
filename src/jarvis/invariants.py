@@ -31,6 +31,7 @@ from .project_store import (
     OPEN_STATUSES,
     RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
+    SESSION_KEPT_EVENT,
     SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
     VALIDATION_AUTH_CAUSE,
@@ -1737,6 +1738,49 @@ def check_no_orphan_gate_requests(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+#: Why a gate becomes the user's when the reviewer it was handed to never judged it (issue #1261)
+GATE_UNJUDGED_ESCALATION = (
+    "Neo question {question_id} failed without a verdict ({cause}) and nothing re-asks "
+    "it — NOBODY HAS JUDGED THIS request"
+)
+
+
+def check_gate_requests_have_a_reviewer(store: ProjectStore) -> Iterator[Violation]:
+    """INV-GATE-UNJUDGED — a pending gate whose Neo question died must come to the user"""
+    from .neo_store import NeoStore
+
+    waiting = [a for a in store.pending_approvals()
+               if not a["escalated"] and a["neo_question_id"]]
+    if not waiting:
+        return
+    readonly = getattr(store, "readonly", False)
+    neo = NeoStore()
+    try:
+        for approval in waiting:
+            q = neo.get(int(approval["neo_question_id"]))
+            # Every `failed` cause means the same thing here: the call never produced a verdict
+            if q is None or q["status"] != "failed":
+                continue
+            reason = GATE_UNJUDGED_ESCALATION.format(
+                question_id=q["id"],
+                cause=q["escalation_cause"] or "no cause recorded")
+            if not readonly:
+                store.mark_approval_escalated(approval["id"], reason)
+            yield Violation(
+                invariant="INV-GATE-UNJUDGED",
+                wo_id=approval["wo_id"],
+                detail=f"gate request {approval['id']} ({approval['kind']}) was pending "
+                       f"with Neo, but question {q['id']} failed without a verdict",
+                repaired=True,
+                repair=("would escalate" if readonly else "escalated") + " to the user",
+                context={"approval_id": approval["id"], "kind": approval["kind"],
+                         "question_id": q["id"],
+                         "escalation_cause": q["escalation_cause"] or ""},
+            )
+    finally:
+        neo.close()
+
+
 def check_no_phantom_attention(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-PHANTOM — a work order with nothing pending must not ask for you (docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §5)"""
     for wo in store.list_work_orders(statuses=TERMINAL_STATUSES, include_hidden=True):
@@ -1937,12 +1981,13 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
                 if q["kind"] in ("approval", "plan", "alarm", "triage",
-                                 "assumption", "question", "findings")]
-        # `triage` is the one kind whose subject is not a row in THIS database (#240)
+                                 "assumption", "question", "findings", "validation")]
+        # `triage` and `validation` are the kinds whose subject is not a row in THIS database (#240)
+        elsewhere = ("triage", "validation")
         mine = (registered_project_paths()
-                if any(q["kind"] == "triage" for q in held) else {})
+                if any(q["kind"] in elsewhere for q in held) else {})
         for q in held:
-            if q["kind"] == "triage" and mine.get(q["project"]) != store.project_path:
+            if q["kind"] in elsewhere and mine.get(q["project"]) != store.project_path:
                 continue
             moot = {"approval": _stale_approval_question,
                     "plan": _stale_plan_question,
@@ -1950,7 +1995,8 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
                     "triage": _stale_triage_question,
                     "assumption": _stale_assumption_question,
                     "question": _stale_worker_question,
-                    "findings": _stale_findings_question}[q["kind"]](store, q)
+                    "findings": _stale_findings_question,
+                    "validation": _stale_validation_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -2024,6 +2070,20 @@ def _stale_findings_question(store: ProjectStore,
         return (f"SUPERSEDED — finding {finding.get('key')!r} is {status}",
                 f"finding {finding.get('key')!r} of {fo['id']} was already {status}")
     return None
+
+
+def _stale_validation_question(store: ProjectStore,
+                               q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if the user already waived or requeued the PR this asks about"""
+    from . import morpheus
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(morpheus.item_of_question(q) or "")
+    finally:
+        central.close()
+    return morpheus.stale_question(item, q)
 
 
 def _stale_alarm_question(store: ProjectStore,
@@ -2461,6 +2521,46 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+INV_DOCUMENT_CONSUMED = "INV-DOCUMENT-CONSUMED"
+
+
+def check_consumed_documents_settle(store: ProjectStore) -> Iterator[Violation]:
+    """INV-DOCUMENT-CONSUMED — a document kind `validating` under a completed parent (issue 1322)"""
+    readonly = getattr(store, "readonly", False)
+    marks = ",".join("?" * len(DOCUMENT_DELIVERY_KINDS))
+    for row in store.conn.execute(
+            f"""SELECT w.id AS id, f.id AS fo_id FROM work_orders w
+                  JOIN feature_orders f ON f.id = w.parent_id
+                 WHERE w.status='validating' AND f.status='completed'
+                   AND w.kind IN ({marks})""", DOCUMENT_DELIVERY_KINDS).fetchall():
+        wo_id, fo_id = row["id"], row["fo_id"]
+        latest = store.latest_validation_round(wo_id=wo_id)
+        if latest is not None and latest["outcome"] == "pending":
+            continue  # a round is judging it: let that settle first
+        if worker_session.busy(store, wo_id) is not None:
+            continue  # a worker turn in flight finishes on its own
+        detail = (f"work order {wo_id} is `validating` but its parent {fo_id} is "
+                  f"`completed`: the document it delivered was consumed, so no further "
+                  f"round can change anything and nothing would ever settle it.")
+        context = {"fo_id": fo_id}
+        if readonly:
+            yield Violation(invariant=INV_DOCUMENT_CONSUMED, wo_id=wo_id, detail=detail,
+                            repaired=True, repair="would set the status to `completed`",
+                            context=context)
+            continue
+
+        def settle(wo_id: str = wo_id, fo_id: str = fo_id) -> None:
+            store.set_status(wo_id, "completed", trigger=INV_DOCUMENT_CONSUMED)
+            store.clear_attention(wo_id)
+            store.add_event(wo_id, "document_consumed_settled", {"parent": fo_id})
+
+        if not store.repair_while(wo_id, "validating", settle):
+            continue  # it moved under the sweep: the writer that moved it owns the status
+        yield Violation(invariant=INV_DOCUMENT_CONSUMED, wo_id=wo_id, detail=detail,
+                        repaired=True, repair="status set to `completed`",
+                        context=context)
+
+
 INV_FEATURE_ORPHAN_CHILD = "INV-FEATURE-ORPHAN-CHILD"
 
 #: The marker that says a parent's flag was raised by INV-FEATURE-ORPHAN-CHILD
@@ -2812,6 +2912,24 @@ def check_pull_request_recorded(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+def check_closed_session_removed(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SESSION-KEPT — a closed order's background session must not outlive it (#1257)"""
+    for wo in store.closed_background_sessions():
+        kept = store.last_event_of_kind(wo["id"], SESSION_KEPT_EVENT)
+        if kept is None:
+            continue  # the next poll is its first attempt, not a leak
+        refusal = str((db.from_json(kept["payload"], {}) or {}).get("refusal") or "")
+        yield Violation(
+            invariant="INV-SESSION-KEPT",
+            wo_id=wo["id"],
+            detail=(f"{wo['status']}, and `claude rm {wo['bg_id']}` has been refusing to "
+                    f"take its session since {_stamp(float(kept['ts']))}: "
+                    f"{' '.join(refusal.split())[:200]}"),
+            repaired=False,
+            context={"bg_id": wo["bg_id"], "refusal": refusal[:500]},
+        )
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot (#134)"""
     counted = store.count_active()
@@ -3083,6 +3201,36 @@ def check_config_drift() -> Iterator[Violation]:
                 f"--reason \"...\"`."),
         context={"catalog": str(path), "on_disk": on_disk, "head": head["id"]},
     )
+
+
+def check_offboarded_activity() -> Iterator[Violation]:
+    """INV-OFFBOARDED-ACTIVITY — nothing the OS acts on names a project with no `projects` row (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
+    from .central_store import CentralStore
+    from .neo_store import OPEN_Q_STATUSES, NeoStore
+
+    central = CentralStore()
+    neo = NeoStore()
+    try:
+        # Archived projects keep their row, so their left-behind rows are by design, never a violation
+        known = {p["name"] for p in central.list_projects()} | {"", "os"}
+        found = central.live_rows_by_project()
+        asked: dict[str, int] = {}
+        for q in neo.list_questions(statuses=OPEN_Q_STATUSES, limit=-1):
+            asked[q["project"]] = asked.get(q["project"], 0) + 1
+        found += [("questions", name, n) for name, n in sorted(asked.items())]
+    finally:
+        neo.close()
+        central.close()
+    for table, project, count in found:
+        if project in known:
+            continue
+        yield Violation(
+            invariant="INV-OFFBOARDED-ACTIVITY",
+            detail=(f"{count} live {table} row(s) name project {project!r}, which the OS has "
+                    f"no record of. Finish the purge with `jarvis offboard {project} --purge "
+                    f"--yes`, or re-register it with `jarvis adopt <path>` and `jarvis start`."),
+            context={"project": project, "table": table, "rows": count},
+        )
 
 
 def check_service_path() -> Iterator[Violation]:
@@ -3522,11 +3670,67 @@ def check_morpheus_moves() -> Iterator[Violation]:
             context={"item": item["id"], "pr": item["pr_number"], "state": item["state"]})
 
 
+#: libsqlite3 releases that deadlock in-process on WAL close vs open (io-6fdf5c66); fixed in 3.51.2
+KNOWN_BAD_SQLITE = frozenset({"3.51.0", "3.51.1"})
+
+
+def check_sqlite_version() -> Iterator[Violation]:
+    """INV-SQLITE-VERSION — the runtime's libsqlite3 is not a known-deadlocking release"""
+    import sqlite3
+    import sys
+
+    version = sqlite3.sqlite_version
+    if version not in KNOWN_BAD_SQLITE:
+        return
+    yield Violation(
+        invariant="INV-SQLITE-VERSION",
+        detail=(f"{sys.executable} runs libsqlite3 {version}, which deadlocks two threads "
+                f"opening and closing a WAL database (fixed in 3.51.2). Rebuild the venv "
+                f"on an interpreter with SQLite 3.51.2+ or older than 3.51.0 (e.g. "
+                f"`uv venv --python-preference only-managed`, then `uv sync`)."),
+        level="critical", context={"sqlite_version": version, "python": sys.executable},
+    )
+
+
+def report_at_startup(who: str) -> list[Violation]:
+    """Run the startup post-conditions once and inbox each, deduped across daemon and UI"""
+    import logging
+
+    from . import schedule
+    from .project_store import ProjectStore
+
+    log = logging.getLogger(__name__)
+    found = list(check_sqlite_version())
+    for v in found:
+        log.critical("[%s startup] %s", who, v)
+    catalog = _live_catalog() if found else None
+    if catalog is None:
+        return found
+    try:
+        owner = schedule.os_project((p.name, p.path) for p in catalog.projects)
+        if owner is None:
+            return found
+        store = ProjectStore(Path(catalog.project(owner).path))
+    except Exception:  # noqa: BLE001 — the log line above already carries it
+        log.exception("startup check: cannot reach the OS project's store")
+        return found
+    try:
+        for v in found:
+            if store.open_violation_report(v.invariant, None, level=v.level, detail=v.detail):
+                store.add_notification(title=f"OS invariant violated: {v.invariant}",
+                                       body=v.detail, level=v.level, source="invariants")
+    finally:
+        store.close()
+    return found
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
+    check_sqlite_version,
     check_ui_healthy,
     check_ui_wedged,
     check_gate_canaries,
     check_config_drift,
+    check_offboarded_activity,
     check_service_path,
     check_production_clean,
     check_prod_cli,
@@ -3626,7 +3830,8 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
     central = None
     try:
         central = CentralStore()
-        fact = central.base_health(central.project_name_for_path(store.project_path))
+        name = central.project_name_for_path(store.project_path)
+        fact = central.base_health(name)
     except Exception:  # noqa: BLE001 — an unreadable central database is not a red base
         return
     finally:
@@ -3655,11 +3860,13 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
         remedy = f"The remedy is a commit on `{base}`, and {fix_wo_id} is producing it."
     else:
         remedy = (f"The remedy is a commit on `{base}`, and no work order is producing "
-                  f"it yet.")
+                  f"it yet — {_base_fix_order_command(name, base, url, issue_url)}")
     yield Violation(
         invariant=INV_BASE_RED,
         wo_id=None,
         repaired=False,
+        # Issue #1280: nobody producing the fix makes it the user's, so NEEDS YOU carries it
+        level="warning" if fix_wo_id else "critical",
         detail=(f"`{base}` is red — workflow `{workflow}`, run {url}, at "
                 f"{sha[:10] or 'an unknown commit'}{blamed}. Nothing merges onto a "
                 f"broken default branch, and every pull request built against it "
@@ -3700,6 +3907,17 @@ def _base_fix_decision(dead: str, fix_wo_id: str, issue_url: str) -> str:
     return f"{gone} — order a fix yourself."
 
 
+def _base_fix_order_command(project: str, base: str, run_url: str,
+                            issue_url: str) -> str:
+    """The command that orders the red base's missing fix"""
+    if issue_url:
+        return f"order it with `jarvis issues start {issue_url}`."
+    run = run_url or "the failing run"
+    return (f"order it with `jarvis bug report \"{base} is red in {project}\" -d \"CI "
+            f"fails on {run}\" -e \"{base} is green\" -a \"CI fails on {run}\" -p "
+            f"critical --project {project} --expedite`.")
+
+
 def _dead_base_fix(store: ProjectStore, fix_wo_id: str) -> str:
     """The terminal status of the red base's fix order, `""` while it can still fix it (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5.)"""
     from .project_store import TERMINAL_STATUSES as SETTLED_STATUSES
@@ -3731,11 +3949,15 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
         doc = str(plan.get("design_doc") or "").strip()
         if not doc:
             continue
-        found = landing.committed_exists(store.project_path, _planner_row(store, fo),
-                                         doc, fetched)
+        planner = _planner_row(store, fo)
+        found = landing.committed_exists(store.project_path, planner, doc, fetched)
         if found is None or found.present:
             continue
         fo_id = fo["id"]
+        unmerged = _unmerged_spec(store, fo, planner, doc, fetched)
+        if unmerged is not None:
+            yield from unmerged
+            continue
         matches = _tracked_with_basename(found.repo, found.ref, Path(doc).name)
         detail = (f"feature order {fo_id} stores its design document at `{doc}`, and no "
                   f"file is there. `jarvis fo show {fo_id}` and the work order pages "
@@ -3768,6 +3990,46 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
             subject_id=fo_id,           # per-feature dedupe identity — spec §2.3
             context={"fo_id": fo_id, "was": doc, "matches": matches[:10]},
         )
+
+
+def _unmerged_spec(store: ProjectStore, fo: dict[str, Any],
+                   planner: dict[str, Any] | None, doc: str,
+                   fetched: set[str]) -> list[Violation] | None:
+    """The design doc is on the planner's PUSHED branch and not the default one: the spec PR is unmerged (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §3)"""
+    from . import landing, ops
+    from .project_store import FO_OPEN_STATUSES, SPEC_PR_OPEN_STATUSES
+
+    if planner is None:
+        return None
+    work = landing.latest_authorship(
+        [(float(e["ts"]), db.from_json(e["payload"], {}))
+         for kind in landing.SETTLEMENT_EVENTS
+         for e in store.events_of_kind(planner["id"], kind)])
+    branch = work.branch if work is not None else ""
+    if not branch or not landing.pushed_exists(store.project_path, branch, doc, fetched):
+        return None
+    fo_id, planner_id = fo["id"], planner["id"]
+    pr_url = str(planner.get("pr_url") or "")
+    context = {"fo_id": fo_id, "was": doc, "planner": planner_id, "branch": branch,
+               "pr_url": pr_url}
+    if pr_url and planner["status"] in SPEC_PR_OPEN_STATUSES:
+        return []       # parked behind it: the OS is already driving that merge
+    detail = (f"feature order {fo_id}'s design document `{doc}` is committed on "
+              f"`origin/{branch}` and not on the default branch: its spec pull request "
+              f"{pr_url or '(none recorded)'} has not merged.")
+    if pr_url and planner["status"] == "completed" and fo["status"] in FO_OPEN_STATUSES:
+        now = ops.repark_spec_pull_request(planner_id)
+        return [Violation(
+            invariant=INV_SPEC_POINTER_REAL, detail=detail, repaired=True,
+            repair=f"put planner {planner_id} back behind {pr_url} ({now}); the OS "
+                   f"merges it like any delivered pull request",
+            subject_id=fo_id, context=context)]
+    remedy = (f"merge {pr_url}" if pr_url else
+              f"open a pull request on `{branch}` and record it with "
+              f"`jarvis wo pr {planner_id} <url>`")
+    owed = f"{detail} The children's spec_section references resolve nowhere on main until it does: {remedy}."
+    return [Violation(invariant=INV_SPEC_POINTER_REAL, detail=owed, owed=owed,
+                      subject_id=fo_id, context=context)]
 
 
 def _planner_row(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any] | None:
@@ -3825,6 +4087,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
                                     # request is a blocker they would otherwise believe
+    check_gate_requests_have_a_reviewer,  # ...and beside it, for the mirror reason: it
+                                    # RAISES the blocker the flag checks then surface
     check_repaired_work_rejoins_the_merge_queue,  # BEFORE the reason checks: it moves
                                    # the status they derive a reason from
     check_a_working_worker_is_not_waiting,  # BEFORE the reason checks: it moves the status
@@ -3843,6 +4107,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # no flag and writes no status, so nothing else in the tuple reads its output
     check_pull_request_recorded,   # order-free: a pure timeline read that repairs
                                    # nothing and touches no flag
+    check_closed_session_removed,  # ditto: a pure read of what the poll could not remove
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
     check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger
@@ -3863,6 +4128,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # and a `validating` row is invisible to all of them
     check_feature_failures_are_real,  # order-free: it reads and writes feature orders
                                    # only, which no work-order check looks at
+    check_consumed_documents_settle,  # before the orphan check: a settled child is no
+                                   # orphan to raise on its parent
     check_settled_parents_have_no_orphans,  # after it: a reopened feature is no longer
                                    # settled; it reads child flags and writes only the parent's
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
@@ -3912,6 +4179,8 @@ class _ReadOnly:
                 "clear_attention",
                 "add_assumption", "add_event",
                 "set_status", "update_work_order", "supersede_approval",
+                # INV-GATE-UNJUDGED's repair
+                "mark_approval_escalated",
                 # The bus
                 "mark_envelope", "bump_envelope_attempt", "deliver_envelope",
                 "queue_message", "flag_feature_attention",

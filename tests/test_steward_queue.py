@@ -261,10 +261,32 @@ def test_the_steward_page_shows_counts_then_each_queued_decision(enforcing, stor
     assert f"#{row['id']}" in waiting and f"#{old}" not in waiting
     assert "Find what moves the prompt prefix between calls." in waiting
     assert "a finding from before 0.12.15" in settled
-    assert steward.UNRECOVERABLE_NOTE in settled
-    # #1185's console: the sidebar link, a `g w` jump, and sections that reflow at width
+    # The note left the table for the decision's own page (fo-744c42a5 §5)
+    assert f'href="/steward/{old}"' in settled
+    assert steward.UNRECOVERABLE_NOTE in TestClient(create_app()).get(f"/steward/{old}").text
+    # #1185's console: the sidebar link and a `g w` jump; sections stack full width (fo-744c42a5 §2.1)
     assert 'href="/steward"' in html and "w: '/steward'" in html
-    assert 'class="flow"' in html
+    assert 'class="flow"' not in html
+
+
+def test_the_steward_page_lists_an_ask_with_where_to_act(jarvis_home, catalog_file):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    ops.start_os(str(catalog_file), foreground=True)
+    central = CentralStore()
+    try:
+        ask = _legacy(central, origin_kind="morpheus", outcome="ask", severity="critical",
+                      rule="critical-ceiling", subject="PR #1241 failed production validation",
+                      ts=db.now(), candidate_json=json.dumps({"payload": {"morpheus_item": "mv-1"}}))
+    finally:
+        central.close()
+    html = TestClient(create_app()).get("/steward").text
+    asks = html.split('id="steward-asks"', 1)[1].split('id="steward-waiting"', 1)[0]
+    # Its morpheus item opens its own detail page (fo-744c42a5 §5), not a scroll on /morpheus
+    assert f'id="decision-{ask}"' in asks and 'href="/morpheus/mv-1"' in asks
 
 
 def test_the_steward_page_renders_with_nothing_queued(jarvis_home, catalog_file):
@@ -277,3 +299,29 @@ def test_the_steward_page_renders_with_nothing_queued(jarvis_home, catalog_file)
     resp = TestClient(create_app()).get("/steward")
     assert resp.status_code == 200
     assert "nothing queued" in resp.text
+
+
+def test_a_decision_row_opens_its_detail_page_with_the_rule(jarvis_home, catalog_file):
+    """fo-744c42a5 §5 + Q2441: the NOTE leaves the table for /steward/<order or #n>"""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    ops.start_os(str(catalog_file), foreground=True)
+    central = CentralStore()
+    try:
+        bare = _legacy(central, reason="the weekly ceiling is spent")
+        about = _legacy(central, wo_id="wo-abc12345")
+        steward.settle_unrecoverable(central)
+    finally:
+        central.close()
+    client = TestClient(create_app())
+    page = client.get("/steward").text
+    assert f'href="/steward/{bare}"' in page
+    assert steward.UNRECOVERABLE_NOTE not in page
+    detail = client.get(f"/steward/{bare}").text
+    assert steward.UNRECOVERABLE_NOTE in detail and "the weekly ceiling is spent" in detail
+    assert f"#{about}" in client.get("/steward/wo-abc12345").text
+    assert client.get("/steward/wo-nothing0").status_code == 404
+    assert [r["id"] for r in ops.steward_why(f"#{bare}")] == [bare]

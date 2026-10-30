@@ -23,6 +23,15 @@ def client(jarvis_home, fake_claude, catalog_file):
     return TestClient(create_app(), follow_redirects=False)
 
 
+def cost_page(client, url: str = "/cost"):
+    """One visit to `/cost` — a window nothing has computed yet takes two (docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md)"""
+    page = client.get(url)
+    if "What the work cost — computing" not in page.text:
+        return page
+    assert _wait_for(lambda: not client.app.state.cost_cache.computing)
+    return client.get(url)
+
+
 @pytest.fixture()
 def transcript(tmp_path, monkeypatch):
     """Write a fake Claude Code transcript and point `usage` at it"""
@@ -74,6 +83,62 @@ def give_session(project, wo_id: str, session_id: str) -> None:
         store.close()
 
 
+def test_a_fresh_app_renders_both_current_windows_without_the_computing_state(
+        client, project, transcript):
+    """Round one is `lifespan`'s, so the FIRST request after a restart has it (kn-79da1c34)"""
+    wo = ops.create_work_order("proj_a", "an ask")
+    transcript("sess-fresh", write_tok=1_000, out=100)
+    give_session(project, wo["id"], "sess-fresh")
+    add_recorded_turn(project, wo["id"], 0.0, 1_000)
+
+    # `with` is what runs the lifespan, which is what the released service does
+    with TestClient(create_app(), follow_redirects=False) as fresh:
+        for url in ("/cost", "/cost?window=5h"):
+            page = fresh.get(url)
+            assert page.status_code == 200, url
+            assert "What the work cost — computing" not in page.text, url
+            assert "not a bill" in page.text, url
+
+
+def test_shutdown_waits_out_a_detached_cost_compute(monkeypatch):
+    """A strand would read transcripts and a DB nobody is holding open any more"""
+    import threading
+
+    from jarvis.ui import app as ui_app
+
+    cache = ui_app.CostCache()
+    release, ran = threading.Event(), []
+    monkeypatch.setattr(ui_app, "_cost_payloads",
+                        lambda picked, project: (release.wait(10),
+                                                 ran.append(1), {})[2])
+    cache.start(("k",), {"label": "w"}, "")
+    assert cache.computing
+
+    release.set()
+    cache.quiesce(timeout=10)
+
+    assert ran == [1]
+    assert not cache.computing
+
+
+def test_quiesce_gives_up_rather_than_blocking_a_shutdown_forever(monkeypatch):
+    import threading
+
+    from jarvis.ui import app as ui_app
+
+    cache = ui_app.CostCache()
+    release = threading.Event()
+    monkeypatch.setattr(ui_app, "_cost_payloads",
+                        lambda picked, project: (release.wait(10), {})[1])
+    cache.start(("k",), {"label": "w"}, "")
+
+    cache.quiesce(timeout=0.05)
+
+    assert cache.computing          # still running, and shutdown moved on anyway
+    release.set()
+    cache.quiesce(timeout=10)
+
+
 def test_cost_page_lists_work_orders_dearest_first(client, project, transcript):
     cheap = ops.create_work_order("proj_a", "a small ask")
     dear = ops.create_work_order("proj_a", "a large ask")
@@ -85,7 +150,7 @@ def test_cost_page_lists_work_orders_dearest_first(client, project, transcript):
     add_recorded_turn(project, cheap["id"], 0.0, 1_000)
     add_recorded_turn(project, dear["id"], 0.0, 1_000)
 
-    page = client.get("/cost")
+    page = cost_page(client, "/cost")
     assert page.status_code == 200
     assert page.text.index("a large ask") < page.text.index("a small ask")
     # Said on the page, not only in the docs: the user is on a subscription
@@ -99,7 +164,7 @@ def test_cost_page_says_when_a_transcript_is_gone_instead_of_saying_zero(
     give_session(project, wo["id"], "sess-that-was-pruned")
     add_recorded_turn(project, wo["id"], 0.0, 1_000)
 
-    page = client.get("/cost")
+    page = cost_page(client, "/cost")
     assert page.status_code == 200
     assert "no transcript left to measure" in page.text
     assert "1 whose transcript Claude Code has" in page.text
@@ -111,10 +176,19 @@ def test_cost_page_can_be_scoped_to_one_project(client, project, transcript):
     give_session(project, wo["id"], "sess-scoped")
     add_recorded_turn(project, wo["id"], 0.0, 1_000)
 
-    assert "scoped ask" in client.get("/cost?project=proj_a").text
-    unknown = client.get("/cost?project=nope")
+    assert "scoped ask" in cost_page(client, "/cost?project=proj_a").text
+    unknown = cost_page(client, "/cost?project=nope")
     assert unknown.status_code == 200
     assert "not registered" in unknown.text
+
+
+def test_an_unknown_project_is_refused_on_the_first_visit_not_after_computing(
+        client, project, transcript):
+    """A typo must not come back as a computing page nobody can clear"""
+    page = client.get("/cost?project=nope")
+    assert page.status_code == 200
+    assert "not registered" in page.text
+    assert "What the work cost — computing" not in page.text
 
 
 def test_the_work_order_page_shows_two_numbers_and_a_way_in(client, project,
@@ -223,7 +297,7 @@ def test_cost_page_links_each_work_order_to_its_turn_drilldown(client, project,
     give_session(project, wo["id"], "sess-drill")
     add_recorded_turn(project, wo["id"], 0.0, 1_000)
 
-    page = client.get("/cost")
+    page = cost_page(client, "/cost")
     assert page.status_code == 200
     assert f'/cost/proj_a/{wo["id"]}' in page.text
 
@@ -286,7 +360,7 @@ def test_the_cost_page_splits_the_fleet_total_into_workers_and_jarvis(
     give_session(project, wo["id"], "sess-split")
     add_os_calls(wo["id"], neo_calls=2, seats=5)
 
-    page = client.get("/cost")
+    page = cost_page(client, "/cost")
     assert page.status_code == 200
     assert "workers ~$" in page.text and "jarvis ~$" in page.text
     assert "7 calls" in page.text
@@ -301,7 +375,7 @@ def test_a_work_order_with_no_transcript_still_shows_what_jarvis_spent_on_it(
     give_session(project, wo["id"], "sess-long-gone")
     add_os_calls(wo["id"], neo_calls=3)
 
-    fleet = client.get("/cost")
+    fleet = cost_page(client, "/cost")
     # "$x+": the jarvis half is known, the worker half is not
     assert "+" in fleet.text and "no transcript left to measure" in fleet.text
     assert "jarvis ~$" in fleet.text
@@ -433,7 +507,7 @@ def test_the_bill_says_so_when_jarvis_spent_nothing(client, project):
 def test_the_cost_tab_is_reachable_from_every_page(client):
     """A surface nobody can find is the bug this work order was filed about"""
     assert '<a href="/cost"' in client.get("/").text
-    assert 'class="here"' in client.get("/cost").text
+    assert 'class="here"' in cost_page(client, "/cost").text
 
 
 def add_subprocess_calls(wo_id: str, n: int = 4, label: str = "pytest") -> None:
@@ -457,7 +531,7 @@ def test_the_cost_page_shows_subprocess_spend_as_its_own_class(client, project,
     add_os_calls(wo["id"], neo_calls=1)
     add_subprocess_calls(wo["id"], n=4)
 
-    page = client.get("/cost")
+    page = cost_page(client, "/cost")
     assert page.status_code == 200
     assert "subprocesses ~$" in page.text
     assert "4 claude processes" in page.text
@@ -482,7 +556,7 @@ def test_the_cost_page_shows_the_fleet_distribution(client, project):
     wo = ops.create_work_order("proj_a", "the typical one")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
-    page = client.get("/cost")
+    page = cost_page(client, "/cost")
 
     assert page.status_code == 200
     assert "cost_per_turn_usd" in page.text
@@ -496,7 +570,7 @@ def test_the_cost_page_survives_a_fleet_section_that_cannot_be_built(client, pro
     monkeypatch.setattr(ops, "fleet_cost",
                         lambda **_k: (_ for _ in ()).throw(ops.OpsError("no catalog")))
 
-    page = client.get("/cost")
+    page = cost_page(client, "/cost")
 
     assert page.status_code == 200
     assert "What the work cost" in page.text
@@ -514,7 +588,7 @@ def test_the_default_window_is_unchanged(client, project):
     wo = ops.create_work_order("proj_a", "ran this week")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
-    page = client.get("/cost")
+    page = cost_page(client, "/cost")
 
     assert page.status_code == 200
     assert "usage week" in page.text
@@ -529,8 +603,8 @@ def test_a_past_week_moves_both_halves(client, project):
                       at=last_week()["since"] + 3_600)
     add_recorded_turn(project, now["id"], 0.07, 50_000)
 
-    past = client.get("/cost?window=week&offset=-1")
-    current = client.get("/cost?window=week&offset=0")
+    past = cost_page(client, "/cost?window=week&offset=-1")
+    current = cost_page(client, "/cost?window=week&offset=0")
 
     assert past.status_code == 200 and current.status_code == 200
     assert before["id"] in past.text and now["id"] not in past.text
@@ -545,7 +619,7 @@ def test_a_past_5h_window(client, project):
     picked = ops.cost_window(window="5h", offset=-3)
     add_recorded_turn(project, wo["id"], 0.05, 48_000, at=picked["since"] + 60)
 
-    page = client.get("/cost?window=5h&offset=-3")
+    page = cost_page(client, "/cost?window=5h&offset=-3")
 
     assert page.status_code == 200
     assert picked["label"] in page.text
@@ -565,7 +639,7 @@ def test_a_custom_range(client, project):
     since = datetime.fromtimestamp(at - 600, zone).strftime(fmt)
     until = datetime.fromtimestamp(at + 600, zone).strftime(fmt)
 
-    page = client.get(f"/cost?since={since}&until={until}")
+    page = cost_page(client, f"/cost?since={since}&until={until}")
 
     assert page.status_code == 200
     assert wo["id"] in page.text
@@ -585,7 +659,7 @@ def test_invalid_params_refuse_rather_than_falling_back(client, project, query, 
     wo = ops.create_work_order("proj_a", "ran this week")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
-    page = client.get(f"/cost?{query}")
+    page = cost_page(client, f"/cost?{query}")
 
     assert page.status_code == 200
     assert message in page.text
@@ -602,7 +676,7 @@ def test_the_selector_survives_a_fleet_section_that_cannot_be_built(client, proj
     monkeypatch.setattr(ops, "fleet_cost",
                         lambda **_k: (_ for _ in ()).throw(ops.OpsError("no catalog")))
 
-    page = client.get("/cost?window=week&offset=-1")
+    page = cost_page(client, "/cost?window=week&offset=-1")
 
     assert page.status_code == 200
     assert wo["id"] in page.text
@@ -649,15 +723,15 @@ def test_the_default_window_survives_two_projects_with_os_calls(two_project_clie
     os_call_now("proj_a", a["id"])
     os_call_now("proj_b", b["id"])
 
-    page = client.get("/cost")
+    page = cost_page(client, "/cost")
 
     assert page.status_code == 200
     assert a["id"] in page.text and b["id"] in page.text
 
 
 def test_the_window_is_in_the_url(client, project):
-    current = client.get("/cost?project=proj_a")
-    past = client.get("/cost?project=proj_a&window=week&offset=-2")
+    current = cost_page(client, "/cost?project=proj_a")
+    past = cost_page(client, "/cost?project=proj_a&window=week&offset=-2")
 
     assert "/cost?window=week&offset=-1&project=proj_a" in current.text
     assert "next ›" not in current.text, "offset > 0 is refused, so there is no link"
@@ -671,7 +745,7 @@ def test_the_reader_can_pick_the_display_zone(client, project):
     berlin = ops.cost_window(window="week", tz="Europe/Berlin")
     default = ops.cost_window(window="week")
 
-    page = client.get("/cost?tz=Europe/Berlin")
+    page = cost_page(client, "/cost?tz=Europe/Berlin")
 
     assert page.status_code == 200
     assert berlin["local_label"] in page.text
@@ -681,7 +755,7 @@ def test_the_reader_can_pick_the_display_zone(client, project):
     assert default["label"] in page.text
     assert 'name="tz"' in page.text and 'value="Europe/Berlin"' in page.text
 
-    bad = client.get("/cost?tz=Mars/Olympus")
+    bad = cost_page(client, "/cost?tz=Mars/Olympus")
     assert bad.status_code == 200
     # The template escapes the quotes the sentence puts round the zone name
     assert "tz must be an IANA time zone name" in bad.text
@@ -691,7 +765,7 @@ def test_the_reader_can_pick_the_display_zone(client, project):
 
 
 def test_the_picked_zone_rides_on_every_window_link(client, project):
-    page = client.get("/cost?tz=Europe/Berlin")
+    page = cost_page(client, "/cost?tz=Europe/Berlin")
 
     assert "/cost?window=week&offset=-1&project=&tz=Europe/Berlin" in page.text
     assert "/cost?window=5h&offset=-1&project=&tz=Europe/Berlin" in page.text
@@ -700,8 +774,8 @@ def test_the_picked_zone_rides_on_every_window_link(client, project):
 
 def test_a_custom_range_is_parsed_in_the_picked_zone(client, project):
     """One clock: the form is rendered AND parsed in the zone the reader picked"""
-    page = client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00"
-                      "&tz=Europe/Berlin")
+    page = cost_page(client, "/cost?since=2026-10-20T10:00&until=2026-10-20T12:00"
+                             "&tz=Europe/Berlin")
 
     assert page.status_code == 200
     # Berlin was CEST (UTC+2) on that date, so 10:00 local is 08:00 UTC
@@ -710,8 +784,8 @@ def test_a_custom_range_is_parsed_in_the_picked_zone(client, project):
     assert 'name="until" value="2026-10-20T12:00"' in page.text
     assert "Europe/Berlin" in page.text and "UTC — the clock" not in page.text
     # An explicit offset submitted by hand is still honoured
-    explicit = client.get("/cost?since=2026-10-20T10:00:00%2B00:00"
-                          "&until=2026-10-20T12:00:00%2B00:00&tz=Europe/Berlin")
+    explicit = cost_page(client, "/cost?since=2026-10-20T10:00:00%2B00:00"
+                                 "&until=2026-10-20T12:00:00%2B00:00&tz=Europe/Berlin")
     assert "2026-10-20 10:00 to 2026-10-20 12:00 UTC" in explicit.text
 
 
@@ -721,7 +795,7 @@ def test_every_cost_surface_says_the_figure_is_a_floor(client, project):
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
     for url in ("/cost", f"/cost/proj_a/{wo['id']}"):
-        page = client.get(url)
+        page = cost_page(client, url)
         assert page.status_code == 200
         assert "is a floor" in page.text, url
 
@@ -782,13 +856,39 @@ def test_the_meter_sentence_and_the_sparkline_are_above_the_listing(client, proj
     meter_samples_in_the_current_5h_window()
     said = ops.cost_meter(resolved=ops.cost_window(window="5h"))["meter"]["sentence"]
 
-    page = client.get("/cost?window=5h")
+    page = cost_page(client, "/cost?window=5h")
 
     assert page.status_code == 200
     assert said in page.text, "re-worded in the template"
     assert "the 5h meter rose" in said
     assert page.text.index(said) < page.text.index("an order in this window")
     assert "<svg" in page.text and "<polyline" in page.text
+
+
+def test_the_meter_chart_endpoint_serves_any_span_and_refuses_a_bad_one(client, project):
+    """What the interactive chart fetches on wheel zoom and on an overlay"""
+    import json
+
+    from jarvis import db
+
+    meter_samples_in_the_current_5h_window()
+    now = db.now()
+
+    got = client.get(f"/api/cost/meter?since={now - 3600}&until={now}").json()
+    assert 50 <= len(got["timeline"]) <= 60
+    assert all(now - 3600 <= p["ts"] < now for p in got["timeline"])
+    assert client.get(f"/api/cost/meter?since={now}&until={now - 1}").status_code == 400
+    cap = ops.METER_TIMELINE_MAX_SECONDS
+    assert client.get(f"/api/cost/meter?since={now - cap}&until={now}").status_code == 200
+    assert client.get(f"/api/cost/meter?since={now - cap - 1}&until={now}").status_code == 400
+
+    page = cost_page(client, "/cost?window=5h")
+    embedded = json.loads(
+        page.text.split('id="meter-data">', 1)[1].split("</script>", 1)[0])
+    assert embedded["timeline"]
+    # The wheel refuses a span past the endpoint's cap rather than blanking the chart on a 400
+    assert embedded["max_span"] == cap
+    assert 'data-shift="span"' in page.text and 'data-series="seven_day_pct"' in page.text
 
 
 def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, project):
@@ -799,7 +899,7 @@ def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, p
     meter = ops.cost_meter(resolved=ops.cost_window(window="5h"))["meter"]
     assert meter["reliable"] is False
 
-    page = client.get("/cost?window=5h")
+    page = cost_page(client, "/cost?window=5h")
 
     assert page.status_code == 200
     assert "unreliable" in page.text
@@ -816,7 +916,7 @@ def test_a_broken_meter_leaves_the_listing_rendered(client, project, monkeypatch
         raise RuntimeError("os.db went away mid-read")
 
     monkeypatch.setattr(ops, "cost_meter", boom)
-    page = client.get("/cost?window=5h")
+    page = cost_page(client, "/cost?window=5h")
 
     assert page.status_code == 200
     assert "still listed" in page.text
@@ -841,7 +941,7 @@ def test_the_cost_page_writes_nothing(client, project):
             central.close()
 
     before = counts()
-    assert client.get("/cost?window=5h").status_code == 200
+    assert cost_page(client, "/cost?window=5h").status_code == 200
     assert counts() == before
 
 
@@ -896,15 +996,17 @@ def test_the_5h_window_is_served_from_cache(client, project, monkeypatch):
 
 @pytest.mark.parametrize("query", ["project=proj_a", "offset=-1", "since=2026-01-01T00:00",
                                    "tz=Asia/Tokyo"])
-def test_every_non_default_param_computes_live(client, project, monkeypatch, query):
-    seed_cache(client, project)
+def test_every_non_default_param_computes_off_the_request_path(client, project, monkeypatch,
+                                                              query):
+    cache = seed_cache(client, project)
     calls = count_live(monkeypatch)
 
-    page = client.get(f"/cost?{query}")
+    page = _computing_then_page(client, cache, f"/cost?{query}")
 
     assert page.status_code == 200
     assert len(calls) == 1
-    assert "s ago" not in page.text
+    # Computed for THIS request, off its path (docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md)
+    assert "computed 0s ago" in page.text
 
 
 def test_the_default_zone_spelled_out_still_hits(client, project, monkeypatch):
@@ -917,29 +1019,31 @@ def test_the_default_zone_spelled_out_still_hits(client, project, monkeypatch):
     assert calls == []
 
 
-def test_a_cached_entry_for_another_window_bound_computes_live(client, project, monkeypatch):
+def test_a_cached_entry_for_another_window_bound_computes_off_the_path(client, project,
+                                                                      monkeypatch):
     cache = seed_cache(client, project)
     cache.entries["week"]["window"] = dict(cache.entries["week"]["window"],
                                            since=cache.entries["week"]["window"]["since"] - 1)
     calls = count_live(monkeypatch)
 
-    page = client.get("/cost")
+    page = _computing_then_page(client, cache, "/cost")
 
     assert "added after refresh" in page.text
     assert len(calls) == 1
-    assert "s ago" not in page.text
+    assert "computed 0s ago" in page.text
 
 
-def test_an_empty_cache_computes_live_as_before(client, project, monkeypatch):
+def test_an_empty_cache_computes_off_the_path_too(client, project, monkeypatch):
     add_recorded_turn(project, ops.create_work_order("proj_a", "live one")["id"], 0.05, 48_000)
-    assert client.app.state.cost_cache.entries == {}
+    cache = client.app.state.cost_cache
+    assert cache.entries == {}
     calls = count_live(monkeypatch)
 
-    page = client.get("/cost")
+    page = _computing_then_page(client, cache, "/cost")
 
     assert "live one" in page.text
     assert len(calls) == 1
-    assert "s ago" not in page.text
+    assert "computed 0s ago" in page.text
 
 
 def test_a_failed_refresh_keeps_the_last_good_entry(client, project, monkeypatch):
@@ -964,3 +1068,152 @@ def test_a_failed_refresh_keeps_the_last_good_entry(client, project, monkeypatch
     assert cache.entries == good
     assert [(m, p) for m, p, _ in errors] == [("TASK", "cost/cache/week"),
                                               ("TASK", "cost/cache/5h")]
+
+
+# docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md
+
+
+def _blocked_report(monkeypatch, gate, real=None):
+    """`ops.cost_report` held open: every path that waits for it shows up as elapsed time"""
+    monkeypatch.setattr(ops, "cost_report",
+                        lambda **kw: (gate.wait(10), real and real(**kw))[1])
+
+
+def _elapsed(call):
+    # clock-exempt: class 3 — the point IS wall-clock latency, which no patched db.now moves
+    import time as real_time
+
+    t0 = real_time.monotonic()
+    value = call()
+    return value, real_time.monotonic() - t0
+
+
+def _computing_then_page(client, cache, url):
+    """What a cold window now costs a reader: `computing.html` at once, the page next visit"""
+    first = client.get(url)
+    assert first.status_code == 200
+    assert "What the work cost — computing" in first.text
+    assert _wait_for(lambda: not cache.computing)
+    return client.get(url)
+
+
+def test_the_request_path_never_waits_for_the_aggregation(client, project, monkeypatch):
+    """mv-d58a1b67: /cost took 6.8s because the request waited WAIT_SECONDS for the compute"""
+    import threading
+
+    add_recorded_turn(project, ops.create_work_order("proj_a", "slow to price")["id"],
+                      0.05, 48_000)
+    gate = threading.Event()
+    _blocked_report(monkeypatch, gate, ops.cost_report)
+
+    try:
+        page, elapsed = _elapsed(
+            lambda: client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00"))
+        assert page.status_code == 200
+        assert "What the work cost — computing" in page.text
+        assert 'http-equiv="refresh"' in page.text
+        assert "slow to price" not in page.text
+        assert elapsed < 1.0
+    finally:
+        gate.set()
+
+    # The compute lands behind the request, and the next visit is the page itself
+    cache = client.app.state.cost_cache
+    assert _wait_for(lambda: not cache.computing)
+    page = client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00")
+    assert "computed 0s ago" in page.text
+
+
+@pytest.mark.parametrize("window", ["week", "5h"])
+def test_a_current_window_renders_with_the_aggregation_blocked(client, project, monkeypatch,
+                                                               window):
+    """The user's bar: the 5h and the week window are instant, precomputed, never on the path"""
+    import threading
+
+    seed_cache(client, project, window)
+    gate = threading.Event()
+    _blocked_report(monkeypatch, gate)
+
+    try:
+        page, elapsed = _elapsed(lambda: client.get(f"/cost?window={window}"))
+    finally:
+        gate.set()
+
+    assert page.status_code == 200
+    assert "cached sentinel" in page.text
+    assert elapsed < 1.0
+
+
+def test_an_open_ended_window_is_computed_once_however_often_it_is_visited(
+        client, project, monkeypatch):
+    """`since=` with no `until` ends at NOW: without the bucketed key, `computing` never ends"""
+    add_recorded_turn(project, ops.create_work_order("proj_a", "open ended")["id"],
+                      0.05, 48_000)
+    cache = client.app.state.cost_cache
+    calls = count_live(monkeypatch)
+
+    page = _computing_then_page(client, cache, "/cost?since=2026-01-01T00:00")
+
+    assert "open ended" in page.text
+    # What the 2s meta refresh does, twice: no further compute, and no new thread
+    assert client.get("/cost?since=2026-01-01T00:00").status_code == 200
+    assert client.get("/cost?since=2026-01-01T00:00").status_code == 200
+    assert len(calls) == 1
+    assert not cache.computing
+
+
+def _wait_for(predicate, timeout: float = 15.0) -> bool:
+    # clock-exempt: class 3 — waits on a real compute thread, which no patched db.now releases
+    import time as real_time
+
+    deadline = real_time.time() + timeout
+    while real_time.time() < deadline:
+        if predicate():
+            return True
+        real_time.sleep(0.05)
+    return False
+
+
+def test_a_stale_on_demand_entry_is_served_while_it_is_recomputed(client, project,
+                                                                  monkeypatch):
+    """Nobody waits for a window that was computed once: the age is on the page"""
+    import time as real_time
+
+    from jarvis.ui import app as ui_app
+
+    add_recorded_turn(project, ops.create_work_order("proj_a", "priced once")["id"],
+                      0.05, 48_000)
+    cache = client.app.state.cost_cache
+    assert _computing_then_page(client, cache, "/cost?project=proj_a").status_code == 200
+    key, = cache.on_demand
+    # clock-exempt: class 3 — `computed_at` is stamped by the UI's own time.time(), so the age must be measured on that clock
+    cache.on_demand[key]["computed_at"] = real_time.time() - ui_app.REFRESH_SECONDS - 1
+    calls = count_live(monkeypatch)
+
+    page = client.get("/cost?project=proj_a")
+
+    assert page.status_code == 200
+    assert "priced once" in page.text                 # the stale entry, served
+    assert "computed 6" in page.text                  # and labelled 61s old
+    assert _wait_for(lambda: not cache.computing)
+    assert len(calls) == 1                            # the recompute ran behind it
+
+
+def test_an_on_demand_compute_that_raises_renders_the_error_and_keeps_the_last_entry(
+        client, project, monkeypatch):
+    add_recorded_turn(project, ops.create_work_order("proj_a", "priced once")["id"],
+                      0.05, 48_000)
+    cache = client.app.state.cost_cache
+    assert _computing_then_page(client, cache, "/cost?project=proj_a").status_code == 200
+    good = dict(cache.on_demand)
+    monkeypatch.setattr(ops, "cost_report",
+                        lambda **_kw: (_ for _ in ()).throw(RuntimeError("no transcripts")))
+
+    # A window with no entry to fall back on: `computing`, then the refusal the reader sees
+    assert client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00").status_code == 200
+    assert _wait_for(lambda: cache.failures)
+    page = client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00")
+
+    assert page.status_code == 200
+    assert "could not be computed" in page.text and "no transcripts" in page.text
+    assert cache.on_demand == good

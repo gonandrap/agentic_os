@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from itertools import zip_longest
 from typing import Any
 
-from . import specs
+from . import concision, sections, specs
+from .neo import MAX_REFINES, REFINE_INSTRUCTION, REFINE_PREFIX, refine_note
 from .catalog import (
     DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
     DEFAULT_VALIDATION_DECISION_RECORD_CHARS,
@@ -743,8 +744,17 @@ omission line: those are cases to escalate, not blanks to fill in.
 
 A SIBLING MARKED `(withheld — high-stakes …)` IS NOT A BLANK TO FILL IN. The OS holds
 those assumptions for the user and does not show you their text, deliberately. Do not
-guess at what one says, and do not treat its absence as permission: if your ruling would
-turn on what it contains, that is precisely a case to ESCALATE.
+guess at what one says, and do not treat its absence as permission.
+
+NEVER RULE ON PARTIAL DATA. When the assumption leans on something you cannot see — a
+reference marked `(cited by the text)` that is withheld, `(not shown)` or
+`(not answered)`, or a fact it names without stating — and your ruling would turn on it,
+ask for the missing data instead of deciding. On a RUNNING order that is an OBJECTION
+(`deny`) whose `reason` tells the worker to restate the assumption self-contained: name
+the reference you could not see and the fact you need from it. On a FINISHED order there
+is no worker to ask, so ESCALATE with cause `evidence-insufficient`. Either way, never
+accept, and never escalate a running order's assumption only because a reference was
+hidden from you.
 
 WHEN IN ANY DOUBT, ESCALATE. The cost of escalating wrongly is one review action the user
 was going to make anyway. The cost of accepting wrongly is a decision they never made,
@@ -995,11 +1005,10 @@ def _record_block(record: str) -> str:
 #: The spec block's heading and its two empty cases (#1035)
 SPEC_HEADING = "# THE SPEC SECTION THIS WORK ORDER WAS BUILT TO — authority you may CITE"
 NO_SPEC = "  (no spec section — this work order was not planned against one)"
-SPEC_INTRO = ("This section is what the work was supposed to be. Where it settles the "
-              "assumption, rule on it and cite the section.")
+SPEC_INTRO = "What the work was supposed to be."
 
 
-def _spec_block(spec: dict[str, str] | None, chars: int) -> str:
+def _spec_block(spec: dict[str, str] | None, chars: int, cites: str = "") -> str:
     """The section `specs.spec_of` resolved, bounded — or that there is none, in words (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md §2)"""
     if not spec:
         return f"{SPEC_HEADING}\n{NO_SPEC}"
@@ -1009,7 +1018,15 @@ def _spec_block(spec: dict[str, str] | None, chars: int) -> str:
     if not text:
         return (f"{SPEC_HEADING} — {ref}\n  (no spec section in the packet: the named "
                 f"section did not resolve in that document)")
-    return f"{SPEC_HEADING} — {ref}\n{SPEC_INTRO}\n{_bounded(text, chars, ref)}"
+    return f"{SPEC_HEADING} — {ref}\n{SPEC_INTRO}\n{_focused(text, cites, chars, ref)}"
+
+
+def _focused(text: str, cites: str, chars: int, ref: str) -> str:
+    """Only the items `cites` names, verbatim and never cut"""
+    excerpts = sections.cited_excerpts(text, cites)
+    if not excerpts:
+        return _bounded(text, chars, ref)
+    return "\n\n".join(excerpts) + "\n[the cited item(s) only — the rest is at the path above]"
 
 
 def _bounded(text: str, chars: int, ref: str) -> str:
@@ -1044,7 +1061,8 @@ def _cited_block(assumption: dict[str, Any], chars: int) -> str:
     """The sections the assumption cites, as `ops.assume` labelled them"""
     text = (assumption.get("spec_text") or "").strip()
     ref = _cited_ref(assumption)
-    return f"{CITED_HEADING} — {ref}\n{CITED_INTRO}\n{_bounded(text, chars, ref)}"
+    cites = str(assumption.get("content") or "")
+    return f"{CITED_HEADING} — {ref}\n{CITED_INTRO}\n{_focused(text, cites, chars, ref)}"
 
 
 def _spec_blocks(assumption: dict[str, Any], spec: dict[str, str] | None,
@@ -1052,12 +1070,13 @@ def _spec_blocks(assumption: dict[str, Any], spec: dict[str, str] | None,
     """The work order's spec block, then the sections the assumption cites if it cites any"""
     cited = (assumption.get("spec_text") or "").strip()
     built_to = ((spec or {}).get("section_text") or "").strip()
+    cites = str(assumption.get("content") or "")
     if not cited:
-        return [_spec_block(spec, chars)]
+        return [_spec_block(spec, chars, cites)]
     if not built_to:
-        return [_spec_block(spec, chars), _cited_block(assumption, chars)]
+        return [_spec_block(spec, chars, cites), _cited_block(assumption, chars)]
     a, b = _share(len(built_to), len(cited), chars)
-    return [_spec_block(spec, a), _cited_block(assumption, b)]
+    return [_spec_block(spec, a, cites), _cited_block(assumption, b)]
 
 
 def _share(a: int, b: int, chars: int) -> tuple[int, int]:
@@ -1078,27 +1097,29 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
                      spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) -> str:
     """What the reviewer reads (#832)"""
     n = assumption.get("n")
-    others = "\n".join(sibling_line(s) for s in siblings
-                       if s["id"] != assumption["id"]) or "  (none)"
+    # Pointers, not text: a sibling this one cites is in the decision record (wo-ea3c6f0c)
+    others = ", ".join(
+        sibling_line(s).strip() if high_stakes_marker(str(s.get("content") or ""))
+        else f"#{s['n']} [{s['status']}]"
+        for s in siblings if s["id"] != assumption["id"]) or "(none)"
     # THE REVIEWER IS TOLD WHICH PASS THIS IS: it decides which answers are open to it...
     delivered = (
-        "# THE WORK ORDER IS STILL RUNNING\nThe worker is mid-task: there is no diff and "
-        "no result summary yet, and you are ruling on an intention. Your `reason` reaches "
-        "that worker if you object, and an acceptance here is provisional — you will be "
-        "asked again once the work exists."
+        "# THE WORK ORDER IS STILL RUNNING\nNo result yet: you rule on an intention, "
+        "provisionally."
         if early else
         f"# What the worker says it delivered\n"
         f"{(wo.get('result_summary') or '(nothing recorded)')[:1500]}")
     answers = (
-        "Answer with `escalate`, `verdict` (`approve` to accept it, `deny` to OBJECT — "
-        "your `reason` goes to the worker), `stakes` (`routine` or `high`) and a one-line "
-        "`reason`. Set `escalate` true to leave it to the user instead."
+        "Answer with `escalate`, `verdict` (`approve`; `deny` OBJECTS, `reason` reaches "
+        "the worker), `stakes` (`routine`|`high`), one-line `reason`."
         if early else
-        "Answer with `escalate`, `verdict` (`approve` to accept it, `deny` to send it to "
-        "the user), `stakes` (`routine` or `high`) and a one-line `reason`.")
-    answers += (" When the decision record above settles it, say which id in `reason` "
-                "instead of escalating to ask for it again; when the spec section does, "
-                "cite the section.")
+        "Answer with `escalate`, `verdict` (`approve`; `deny` sends it to the user), "
+        "`stakes` (`routine`|`high`), one-line `reason`.")
+    answers += (" Where the record or spec settles it, cite the id, or cite the section "
+                "item, rather than escalate.")
+    if early:
+        # Only a running worker can re-file what a refine returns
+        answers += f" {REFINE_INSTRUCTION}"
     return "\n\n".join([
         f"ASSUMPTION REVIEW — rule on assumption #{n} of {wo['id']} in {project}, and on "
         f"nothing else.",
@@ -1107,8 +1128,7 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         f"{(wo.get('description') or '')[:2000]}",
         *_spec_blocks(assumption, spec, spec_chars),
         delivered,
-        f"# The work order's other assumptions, for context only — do not rule on these\n"
-        f"{others}",
+        f"# Other assumptions on this order — do not rule on these: {others}",
         _record_block(record),
         answers,
     ])
@@ -1182,8 +1202,7 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                                          # GitHub issue #1035
                                          spec=specs.spec_of(store, wo),
                                          spec_chars=_spec_chars(cfg)),
-                       context=f"{wo.get('title') or ''}\n"
-                               f"{(wo.get('description') or '')[:800]}",
+                       # No `context`: the packet carries the description already (wo-ea3c6f0c)
                        kind=QUESTION_KIND)
     store.link_assumption_confirmation(assumption["id"], question["id"])
     store.add_event(wo["id"], "autoreview_asked", {
@@ -1198,6 +1217,22 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
             assumption: dict[str, Any], siblings: list[dict[str, Any]], *,
             early: bool = False, cfg: Any = None) -> dict[str, Any]:
     """Put ONE assumption to Neo"""
+    # Only a running worker can re-file what a refine returns
+    note = refine_note(str(assumption.get("content") or ""),
+                       concision.DEFAULT_ASSUME_MAX_CHARS) if early else ""
+    if note and neo.refines(wo["id"], QUESTION_KIND) >= MAX_REFINES:
+        note = ""
+    if note:
+        # A row, so `neo stats` counts it; it holds what was returned and goes to no model
+        question = neo.ask(project, wo["id"],
+                           f"ASSUMPTION REVIEW — rule on assumption #{assumption.get('n')} "
+                           f"of {wo['id']} in {project}, and on nothing else.\n\n"
+                           f"# The assumption\n{assumption.get('content') or ''}",
+                           kind=QUESTION_KIND)
+        neo.mark(question["id"], "refined", reason=note)
+        store.link_assumption_question(assumption["id"], question["id"])
+        return_to_worker(store, wo["id"], assumption, note, question["id"])
+        return question
     question = neo.ask(project, wo["id"],
                        _ruling_question(
                            project, wo, assumption, siblings, early=early,
@@ -1207,8 +1242,7 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
                            # GitHub issue #1035: resolved here, so no caller changes
                            spec=specs.spec_of(store, wo),
                            spec_chars=_spec_chars(cfg)),
-                       context=f"{wo.get('title') or ''}\n"
-                               f"{(wo.get('description') or '')[:800]}",
+                       # No `context`: the packet carries the description already (wo-ea3c6f0c)
                        kind=QUESTION_KIND)
     store.link_assumption_question(assumption["id"], question["id"])
     store.add_event(wo["id"], "autoreview_asked", {
@@ -1217,3 +1251,16 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
     log.info("auto-review asked Neo about assumption #%s of %s as question %s",
              assumption.get("n"), wo["id"], question["id"])
     return question
+
+
+def return_to_worker(store: Any, wo_id: str, assumption: dict[str, Any], note: str,
+                     question_id: int) -> None:
+    """Neo's refine: the assumption leaves review as `refined` (per Q2402)"""
+    store.review_assumption(assumption["id"], "refined", decided_by=DECIDER, reason=note)
+    store.queue_message(wo_id, f"{REFINE_PREFIX} assumption #{assumption.get('n')}: {note}",
+                        source="neo")
+    store.add_event(wo_id, "autoreview_refined", {
+        "assumption_id": assumption["id"], "n": assumption.get("n"), "reason": note,
+        "neo_question_id": question_id})
+    log.info("auto-review returned assumption #%s of %s to its worker: %s",
+             assumption.get("n"), wo_id, note)

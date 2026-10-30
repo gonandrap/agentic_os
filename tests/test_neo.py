@@ -238,6 +238,10 @@ def test_correction_becomes_learning_and_reaches_worker(asked, project):
         assert len(learnings) == 1
         assert "Always default to CSV" in learnings[0]["content"]
         assert learnings[0]["source"] == "review"
+        # and WHERE it came from, so a stale ruling can be judged before it is retracted
+        assert learnings[0]["wo_id"] == wo["id"]
+        assert learnings[0]["origin_kind"] == "question"
+        assert learnings[0]["origin_id"] == "1"
     finally:
         neo.close()
     store = ProjectStore(project)
@@ -709,6 +713,28 @@ def test_learnings_print_when_they_were_recorded(jarvis_home, capsys):
     assert "Prefer CSV, always" in out
 
 
+def test_learnings_print_where_each_one_came_from(jarvis_home, capsys):
+    """Provenance on the listing is what makes a stale ruling judgeable before `neo retract`"""
+    from jarvis import cli
+
+    store = NeoStore()
+    try:
+        store.add_learning("Prefer CSV, always", project="proj_a", source="review",
+                           wo_id="wo-1234abcd", origin_kind="assumption",
+                           origin_id="7,9")
+        store.add_learning("the user typed this one", project="proj_a")
+    finally:
+        store.close()
+
+    capsys.readouterr()
+    assert cli.main(["neo", "learnings", "--project", "proj_a"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    traced = next(ln for ln in lines if "Prefer CSV" in ln)
+    assert "from wo-1234abcd assumption 7,9" in traced
+    # a row with no origin says nothing rather than 'from '
+    assert "from" not in next(ln for ln in lines if "the user typed this one" in ln)
+
+
 def test_learnings_json_is_documented_on_the_subcommand_and_round_trips(jarvis_home, capsys):
     """`--json` is accepted in either position ALREADY"""
     import json as _json
@@ -788,7 +814,9 @@ def test_parse_verdict_tolerates_fences():
                  # And a reply that rates no finding rates none
                  "severity": "",
                  # And a reply that asks for nothing asks for nothing (issue #1254)
-                 "action": ""}
+                 "action": "",
+                 # And a reply that returns nothing to its asker returns nothing
+                 "refine": False}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True
 

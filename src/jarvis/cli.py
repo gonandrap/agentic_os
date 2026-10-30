@@ -740,6 +740,10 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--reason", required=True)
     m = mo.add_parser("requeue", help="watch a settled PR again with a fresh deadline")
     m.add_argument("item_id")
+    m = mo.add_parser("confirm", help="rule a failed check real and file the work order "
+                                      "that fixes it")
+    m.add_argument("item_id")
+    m.add_argument("--fix", required=True, help="what needs fixing: the order's description")
     m = mo.add_parser("pause", help="hold Morpheus's session turns, whatever the fleet does "
                                     "(checks still run; they spend nothing)")
     m.add_argument("--reason", required=True)
@@ -769,7 +773,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--catalog", help="read this catalog instead of the registered one")
     sp.add_argument("--json", action="store_true")
 
-    sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, settings)")
+    sp = sub.add_parser("adopt", help="make a project OS-ready (README, OPERATION.md, "
+                                      "settings); to choose its settings in an interview "
+                                      "instead, `jarvis onboard start <path>`")
     sp.add_argument("path", help="project directory")
     sp.add_argument("--name", help="project name (default: directory name)")
     sp.add_argument("--catalog", help="catalog to take overrides/defaults from")
@@ -777,6 +783,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="overwrite manually-edited injected settings, and a committed "
                          "OPERATION.md the generator would otherwise leave alone")
     sp.add_argument("--dry-run", action="store_true")
+
+    sp = sub.add_parser("offboard", help="stop the OS doing anything for a project — "
+                                         "archive its record, cancel its orders, and "
+                                         "remove the OS's files from its repo")
+    sp.add_argument("name", help="project name")
+    sp.add_argument("--purge", action="store_true",
+                    help="delete its record and <project>/.jarvis/ too (needs --yes)")
+    sp.add_argument("--yes", action="store_true", help="confirm --purge")
+    sp.add_argument("--force", action="store_true", help="cancel its open orders")
+    sp.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
+    sp.add_argument("--reason", default="", help="goes on the config version row")
+    sp.add_argument("--catalog", help="rewrite this catalog instead of the registered one")
+    sp.add_argument("--json", action="store_true")
 
     # work orders
     wo = sub.add_parser("wo", help="work orders").add_subparsers(dest="wo_cmd", required=True)
@@ -927,6 +946,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="this work order wrote code that is deliberately NOT being "
                         "landed, and this is why. Without it, finishing over commits "
                         "that no pull request covers is refused (GitHub issue #232)")
+    f.add_argument("--superseded-by", dest="superseded_by", default="", metavar="WO_ID",
+                   help="another order carries this one's work (a duplicate): links "
+                        "follow it, e.g. Morpheus re-watches a confirmed failure when "
+                        "THAT order's fix reaches production")
 
     r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
     r.add_argument("wo_id")
@@ -1390,10 +1413,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="this project's rules AND the fleet-wide ones")
     r.add_argument("--status", choices=("dry_run", "armed", "retracted"))
     r.add_argument("--gap-class", dest="gap_class", default="")
+    r.add_argument("--days", type=int, default=30,
+                   help="window of each rule's cost line (default 30; 0 = all time)")
 
     r = ru.add_parser("show", help="one detector: its condition in prose, its remedy "
-                                   "rules, its provenance and its newest fires")
+                                   "rules, its provenance, what it cost and its newest "
+                                   "fires")
     r.add_argument("detector_id", metavar="dt-id")
+    r.add_argument("--days", type=int, default=30,
+                   help="window of the cost line (default 30; 0 = all time)")
 
     r = ru.add_parser("retract", help="retire a detector or one remedy rule: it stops "
                                       "applying, the record keeps that it once did")
@@ -1497,6 +1525,45 @@ def build_parser() -> argparse.ArgumentParser:
              "with the file")
     c.add_argument("--reason", default="")
     c.add_argument("--catalog")
+
+    # onboard: `questions` and `explain` are added to THIS group (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §0.2)
+    ob = sub.add_parser(
+        "onboard",
+        help="onboard a project: decide what the OS does for it automatically, then "
+             "apply that as one configuration version plus a bootstrap",
+    ).add_subparsers(dest="ob_cmd", required=True)
+
+    c = ob.add_parser("start", help="open the interview: an interactive greeting_agent "
+                                    "session in this terminal")
+    c.add_argument("path", help="the project's git repository")
+    c.add_argument("--name", help="project name (default: directory name)")
+    c.add_argument("--print-prompt", dest="print_prompt", action="store_true",
+                   help="print the persona root and the opening prompt instead of "
+                        "launching claude")
+
+    c = ob.add_parser(
+        "apply",
+        help="apply an interview's draft: ONE configuration version, then the bootstrap")
+    c.add_argument("--from", dest="draft", required=True, metavar="PATH",
+                   help="the draft file the interview wrote")
+    c.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="what it WOULD change, writing nothing — the confirmation diff")
+    c.add_argument("--catalog")
+    c.add_argument("--json", action="store_true", help="machine-readable output")
+
+    c = ob.add_parser("questions", help="the whole interview as data — every area, "
+                                        "its postures and its knobs; no model needed")
+    c.add_argument("--area", help="one area only")
+    c.add_argument("--json", action="store_true")
+
+    c = ob.add_parser("explain", help="what an area or one setting does and costs, "
+                                      "its current value, and how to change it later")
+    c.add_argument("target", help="an area (`validation`) or a setting "
+                                  "(`os.neo.enabled`, `validation.auto_merge`)")
+    c.add_argument("--project", help="read current values from this project "
+                                     "(default: the shipped defaults)")
+    c.add_argument("--catalog", help="a catalog file other than the registered one")
+    c.add_argument("--json", action="store_true")
 
     # backlog
     bl = sub.add_parser("backlog", help="unified deferred-work backlog").add_subparsers(
@@ -1672,9 +1739,20 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--level", default="info", choices=["info", "warning", "critical"])
     n.add_argument("--wo-id")
 
-    ib = sub.add_parser("inbox", help="central notification inbox").add_subparsers(
-        dest="ib_cmd", required=False)
-    ib.add_parser("list")
+    ibp = sub.add_parser("inbox", help="central notification inbox")
+    ib = ibp.add_subparsers(dest="ib_cmd", required=False)
+    ibl = ib.add_parser("list")
+    for ibx, sub_level in ((ibp, False), (ibl, True)):
+        # SUPPRESS on `list` so its defaults never overwrite flags given before it
+        d = (lambda v: argparse.SUPPRESS) if sub_level else (lambda v: v)
+        ibx.add_argument("--level", choices=["critical", "warning", "info"], default=d(""),
+                         help="only this criticality")
+        ibx.add_argument("--project", default=d(""), help="only this project")
+        ibx.add_argument("--search", "-s", default=d(""),
+                         help="words that must all appear in title, body or wo id")
+        ibx.add_argument("--sort", choices=["priority", "newest", "oldest"],
+                         default=d("priority"),
+                         help="priority (default) = critical first, newest first within a level")
     i = ib.add_parser("ack")
     i.add_argument("inbox_id", nargs="?", type=int, help="omit to ack everything")
 
@@ -2686,7 +2764,8 @@ def cmd_search(args: argparse.Namespace) -> int:
     print("  ".join(f"{kind} {n}" for kind, n in search_mod.counts(hits)))
     for hit in hits:
         status = f" [{hit['status']}]" if hit["status"] else ""
-        print(f"\n{hit['kind']}  {hit['id']}  ({hit['project']}){status}  "
+        archived = ", archived" if hit["archived"] else ""
+        print(f"\n{hit['kind']}  {hit['id']}  ({hit['project']}{archived}){status}  "
               f"{_age(hit['ts'])}")
         print(f"  {hit['title']}")
         if hit["snippet"]:
@@ -2789,7 +2868,7 @@ def cmd_steward(args: argparse.Namespace) -> int:
             print(f"fleet      ${book.fleet_usd:8.2f} (new self-work waits above "
                   f"${cfg.yield_above_usd:.2f})")
             return 0
-        rows = (central.steward_decisions(wo_id=args.wo_id) if args.steward_cmd == "why"
+        rows = (ops.steward_why(args.wo_id) if args.steward_cmd == "why"
                 else central.steward_decisions(limit=args.limit))
         if args.json:
             print(json.dumps(rows))
@@ -3297,6 +3376,41 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     return 0 if not report.warnings else 1
 
 
+def cmd_offboard(args: argparse.Namespace) -> int:
+    from . import ops
+    if args.purge and not args.yes:
+        raise SystemExit(
+            f"refusing to purge {args.name}: purging deletes <project>/.jarvis/ and with "
+            "it every work order, event and turn the project ever had, plus every row "
+            "the OS keeps for it. Re-run with --purge --yes, or drop --purge to archive "
+            "it and keep the history.")
+    res = ops.offboard_project(args.name, purge=args.purge, force=args.force,
+                               dry_run=args.dry_run, catalog_path=args.catalog,
+                               reason=args.reason)
+    if args.json:
+        _print(res, True)
+        return 0
+    verb = "would" if res["dry_run"] else "did"
+    purged = sum(n for counts in res["purged"].values() for n in counts.values())
+    print(f"{res['project']}: {res['mode']}{' (dry run — nothing changed)' if res['dry_run'] else ''}")
+    print(f"  orders: {len(res['open'])} open, {len(res['cancelled'])} cancelled, "
+          f"{res['sessions_stopped']} session(s) stopped")
+    print(f"  repo: {len(res['strip']['actions'])} action(s), "
+          f"{len(res['strip']['warnings'])} file(s) refused")
+    print(f"  registry: {res['registry']}" + (f" ({purged} row(s) deleted)" if purged else ""))
+    cat = res["catalog"]
+    print("  catalog: " + (f"{verb} remove its entry from {cat['path']}"
+                            if cat["in_catalog"] else f"no entry in {cat['path']}")
+          + (f" (version {cat['version']})" if cat["version"] else ""))
+    for o in res["open"]:
+        print(f"    {o['id']}  {o['status']}  {o['title']}")
+    for a in res["strip"]["actions"]:
+        print(f"    {a}")
+    for w in res["strip"]["warnings"]:
+        print(f"    warning: {w}")
+    return 0
+
+
 def _parse_budget_amount(raw: str) -> float:
     """A dollar amount off the command line, refused at the surface rather than deeper"""
     from . import budget, ops
@@ -3549,7 +3663,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                          project_name=args.project), args.json)
     elif args.wo_cmd == "finish":
         _print(ops.finish(args.wo_id, args.summary, pr_url=args.pr or None,
-                          evidence=args.evidence, abandon=args.abandon), args.json)
+                          evidence=args.evidence, abandon=args.abandon,
+                          superseded_by=args.superseded_by), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
                                      feedback=args.feedback,
@@ -4013,13 +4128,17 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             print(_morpheus_line(item))
         return 0
     if args.morpheus_cmd == "show":
-        item = ops.morpheus_item(args.item_id)
+        detail = ops.morpheus_detail(args.item_id)
+        item = detail["item"]
         if args.json:
             _print(item, True)
             return 0
         print(_morpheus_line(item))
-        print(f"{item['pr_url']}  release {item['release_tag'] or '—'}"
+        print(f"{item['pr_url']}  first release with this PR {item['release_tag'] or '—'}"
               f"  work order {item['wo_id'] or '—'}")
+        if item["last_check_ts"]:
+            print(f"last check {_stamp(item['last_check_ts'])}"
+                  f" on {item.get('last_check_version') or 'an unknown version'}")
         print(f"checks {item['checks']} · last exit {item['last_exit']}"
               f" · deadline {_stamp(item['deadline_ts'])}"
               + (f" · {item['auto_requeues']} automatic requeue(s)"
@@ -4030,6 +4149,17 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
         print(f"\nscript ({item['script_source'] or 'none yet'}):\n{item['script'] or '—'}")
         if item["last_output"]:
             print(f"\nlast output:\n{item['last_output']}")
+        print("\nruns:")
+        for r in detail["runs"][:10]:
+            print(f"  {_stamp(r['ts'])}  {r['kind']:<5}  exit {r['exit']}  {r['state_after']}")
+        if not detail["runs"]:
+            print("  (none recorded" + (" yet — history starts with this release)"
+                                        if item["checks"] else ")"))
+        if detail["questions"]:
+            print("\nquestions:")
+            for q in detail["questions"]:
+                print(f"  Q{q['id']} [{q['status']}] {q['question']}"
+                      + (f" — {q['answer']}" if q["answer"] else ""))
         return 0
     if args.morpheus_cmd == "enqueue-release":
         _print(ops.morpheus_enqueue_release(args.tag, args.from_ref, args.to_ref,
@@ -4061,6 +4191,11 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
     if args.morpheus_cmd == "requeue":
         item = ops.morpheus_requeue(args.item_id)
         _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
+    if args.morpheus_cmd == "confirm":
+        item = ops.morpheus_confirm(args.item_id, args.fix)
+        _print({"id": item["id"], "state": item["state"], "fix_order": item["fix_order"]},
+               args.json)
         return 0
     if args.morpheus_cmd in ("pause", "unpause", "follow-fleet"):
         mode = {"pause": "paused", "unpause": "running"}.get(args.morpheus_cmd)
@@ -4407,7 +4542,9 @@ def _print_rules_list(data: dict) -> None:
             hits, total = r["fires"]["hits"], r["fires"]["total"]
             print(f"      {hits} {'hit' if hits == 1 else 'hits'} of "
                   f"{total} {'fire' if total == 1 else 'fires'}")
+        print(f"      cost: {r['cost']['note']}")
     print(f"\n{data['note']}")
+    print(data["cost_unattributed"])
 
 
 def _print_rules_show(data: dict) -> None:
@@ -4432,6 +4569,11 @@ def _print_rules_show(data: dict) -> None:
     print("  provenance: " + ", ".join(f"{k}={v}" for k, v in prov.items() if v))
     if data["hit_rate"] is None:
         print(f"  {data['hit_rate_note']}")
+    cost = data["cost"]
+    print(f"  cost: {cost['note']}")
+    for rm, usd in sorted(cost["by_remedy"].items()):
+        print(f"    {rm or 'no remedy rule'}: ${usd:,.2f}")
+    print(f"    {data['cost_unattributed']}")
     for f in data["fires"]:
         print(f"  fire {f['id']} {f['outcome']} · {f['order_id']} · {f['mode']}"
               # A fire is one line: the stored detail stays at rules.FACTS_CHARS
@@ -4548,6 +4690,8 @@ def _print_rules_summary(data: dict) -> None:
                 print(f"      last fired {_stamp(rule_row['last_fired'])}"
                       + (f" · last cleared {_stamp(rule_row['last_cleared'])}"
                          if rule_row["last_cleared"] else ""))
+            print(f"      cost: {rule_row['cost']['note']}")
+        print(f"  {data['cost_unattributed']}")
 
     # The WEAKER HALF is printed as `ops`' own sentence and in no other form
     rec = data["recurrences"]
@@ -4587,10 +4731,10 @@ def cmd_rules(args) -> int:
 
     if args.rules_cmd == "list":
         data = ops.rules_list(project=args.project, status=args.status or "",
-                              gap_class=args.gap_class)
+                              gap_class=args.gap_class, days=args.days)
         _print(data, True) if args.json else _print_rules_list(data)
     elif args.rules_cmd == "show":
-        data = ops.rules_show(args.detector_id)
+        data = ops.rules_show(args.detector_id, days=args.days)
         _print(data, True) if args.json else _print_rules_show(data)
     elif args.rules_cmd == "retract":
         data = ops.rules_retract(args.rule_id, args.reason)
@@ -4688,6 +4832,51 @@ def _print_wiring(data: dict[str, Any]) -> None:
           "\nJarvis wires into a worker at dispatch. Change it on /config.")
 
 
+def _cmd_onboard_read(args: argparse.Namespace) -> int:
+    """`jarvis onboard questions | explain` — §4 of the onboarding-interview spec"""
+    from . import ops
+
+    if args.ob_cmd == "questions":
+        data = ops.onboard_questions(args.area)
+        if args.json:
+            _print(data, True)
+            return 0
+        for area in data["areas"]:
+            star = "*" if area["must_have"] else " "
+            print(f"{star} {area['area']:<14} {area['title']}")
+            if area["postures"]:
+                print(f"    postures: {', '.join(area['postures'])}")
+            print(f"    asked: {', '.join(k['tail'] for k in area['knobs']['asked']) or '—'}")
+        return 0
+
+    data = ops.onboard_explain(args.target, project=args.project, catalog_path=args.catalog)
+    if args.json:
+        _print(data, True)
+        return 0
+    if data["kind"] == "area":
+        print(f"{data['title']}  ({data['area']}, scope {data['scope']})")
+        print(f"\n{data['summary']}\n\nOn: {data['on_costs']}\nOff: {data['off_costs']}")
+        if data["enable"]:
+            print(f"\n{data['enable']['path']} = {_cfg_value(data['enable']['value'])}")
+        for name, rows in data["postures"].items():
+            print(f"\n{name}:")
+            for row in rows:
+                print(f"  {row['path']} = {_cfg_value(row['value'])} — {row['line']}")
+        for ref in data["grounding"]:
+            print(f"\n— {ref['path']} § {ref['section']}\n{ref['excerpt'] or '(unreadable)'}")
+        return 0
+    print(f"{data['path']} = {_cfg_value(data['current'])}   "
+          f"(default {_cfg_value(data['default'])}; area {data['area']})")
+    if data["line"]:
+        print(f"  {data['line']}")
+    if data["example"]:
+        print(f"  e.g. {data['example']}")
+    print(f"  {data['apply']} — {data['apply_note']}"
+          + ("  [safety: needs --reason]" if data["safety"] else ""))
+    print(f"  change it later: {data['command']}")
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     from . import ops
 
@@ -4782,6 +4971,54 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_onboard_start(args: argparse.Namespace) -> int:
+    """`jarvis onboard start` — §5 of the onboarding-interview spec"""
+    from . import ops
+
+    data = ops.onboard_session(args.path, args.name)
+    if args.print_prompt:
+        print(f"persona root: {data['persona_root']}\n\n{data['prompt']}")
+        return 0
+    os.chdir(data["cwd"])
+    os.execvp(data["argv"][0], data["argv"])
+    return 0
+
+
+def cmd_onboard(args: argparse.Namespace) -> int:
+    from . import ops
+
+    if args.ob_cmd == "start":
+        return cmd_onboard_start(args)
+    if args.ob_cmd in ("questions", "explain"):
+        return _cmd_onboard_read(args)
+    if args.ob_cmd != "apply":
+        return 0
+    data = ops.onboard_apply(args.draft, catalog_path=args.catalog,
+                             dry_run=args.dry_run)
+    if args.json:
+        _print(data, True)
+        return 0
+
+    head = "would onboard" if args.dry_run else "✓ onboarded"
+    print(f"{head} {data['project']}: {len(data['changes'])} setting(s)")
+    for change in data["changes"]:
+        print(f"  {_cfg_change(change)}")
+    if not data["changes"]:
+        print("  (every answer was the shipped default — the document stays silent)")
+    if args.dry_run:
+        print("\n(dry run — nothing was written)")
+        return 0
+    print(f"  {data['version']['id']}"
+          + ("" if data["changed"] else "  (the document was already this — "
+                                        "no new version)"))
+    for warning in data["bootstrap"]["warnings"]:
+        print(f"  ⚠ {warning}")
+    if data["restart_needed"]:
+        print(f"\nnext: jarvis start --catalog {data['catalog']}")
+        print(f"  {data['restart_why']}")
+    return 0
+
+
 def _backlog_origin(item: dict) -> str:
     """One line saying where a deferred item came from, or "" for one somebody typed"""
     bits = []
@@ -4808,8 +5045,8 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                                        origin_note=args.origin_note)
             _print(item, args.json)
         elif args.bl_cmd == "list":
-            items = central.list_backlog(project=args.project,
-                                         status=None if args.all else "open")
+            items = ops.list_backlog(project=args.project,
+                                     status=None if args.all else "open")
             if args.json:
                 _print(items, True)
             else:
@@ -4823,8 +5060,9 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                 if not items:
                     print("backlog empty")
         elif args.bl_cmd == "show":
-            item = central.get_backlog(args.item_id)
-            if not item:
+            try:
+                item = ops.show_backlog(args.item_id)
+            except OpsError:
                 print(f"backlog item {args.item_id!r} not found")
                 return 1
             if args.json:
@@ -4981,6 +5219,7 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     print(f"  unreachable       {q['failed']}  (Neo was never reached — NOT judged)")
     print(f"  still open        {q['open']}")
     print(f"  superseded        {q['superseded']}  (decided elsewhere, out of the rate)")
+    print(f"  refined           {q['refined']}  (returned to the asker to split, out of the rate)")
     print(f"  escalation rate   {_pct(q['escalation_rate'])}  "
           f"(over settled questions only)")
     # Its own figure, never blended into the escalation rate: a crash is not a decision
@@ -5137,13 +5376,8 @@ def cmd_learn(args: argparse.Namespace) -> int:
                       "(`chars` prices it first)")
             _print(index, args.json)
         elif args.kn_cmd == "show":
-            rows = [r for r in (central.get_knowledge(i) for i in args.ids) if r]
-            central.record_knowledge_read("show", rows, term=" ".join(args.ids),
-                                          project=reader_project, wo_id=acting_wo)
-            missing = set(args.ids) - {r["id"] for r in rows}
-            if missing:
-                raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
-            _print(rows, args.json)
+            _print(ops.show_knowledge(args.ids, project=reader_project, wo_id=acting_wo),
+                   args.json)
         elif args.kn_cmd == "graph":
             import sqlite3
 
@@ -5168,10 +5402,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
             _print_knowledge_usage(ops.knowledge_usage_report(
                 project=args.project, days=args.days), args.json)
         elif args.kn_cmd in ("pin", "unpin"):
-            row = central.pin_knowledge(args.kn_id, pinned=args.kn_cmd == "pin")
-            if row is None:
-                raise OpsError(f"unknown knowledge id {args.kn_id!r}")
-            _print(row, args.json)
+            _print(ops.pin_knowledge(args.kn_id, pinned=args.kn_cmd == "pin"), args.json)
         elif args.kn_cmd == "retract":
             try:
                 row = ops.learn_retract(args.knowledge_id, args.reason,
@@ -5308,14 +5539,17 @@ def cmd_neo(args: argparse.Namespace) -> int:
         if args.json:
             _print(rows, True)
         else:
+            from . import neo as neo_mod
             for r in rows:
                 scope = r["project"] or "global"
                 retired = (f" [retired: {r['retired_reason']}]"
                            if r["retired_at"] else "")
                 bullet = "⊘" if r["retired_at"] else "•"
                 seat = f" · {r['seat']} seat" if r["seat"] else ""
+                origin = neo_mod.learning_origin(r)
                 print(f"{bullet} #{r['id']} {_stamp(r['ts'])} [{scope}{seat}] "
-                      f"({r['source']}) {r['content']}{retired}")
+                      f"({r['source']}{f' from {origin}' if origin else ''}) "
+                      f"{r['content']}{retired}")
             if not rows:
                 print("Neo has no learnings yet — review its answers to teach it")
     elif args.neo_cmd == "stats":
@@ -5487,24 +5721,21 @@ INBOX_LIST_NOTE = ("a log of notifications; `jarvis inbox ack` marks them read �
 
 def cmd_inbox(args: argparse.Namespace) -> int:
     from . import ops
-    from .central_store import CentralStore
-    central = CentralStore()
-    try:
-        if args.ib_cmd == "ack":
-            _print(ops.ack_inbox(args.inbox_id), args.json)
-        else:
-            items = central.unacked_inbox()
-            if args.json:
-                _print(items, True)
-            else:
-                for it in items:
-                    print(f"[{it['id']}] {it['level'].upper()} [{it['project']}] "
-                          f"{it['title']} ({_age(it['ts'])})"
-                          + (f" — {it['body']}" if it["body"] else ""))
-                if not items:
-                    print("inbox empty ✨")
-    finally:
-        central.close()
+    if args.ib_cmd == "ack":
+        _print(ops.ack_inbox(args.inbox_id), args.json)
+        return 0
+    items = ops.select_inbox(ops.unacked_inbox(), level=args.level,
+                             project=args.project, q=args.search, sort=args.sort)
+    if args.json:
+        _print(items, True)
+        return 0
+    for it in items:
+        print(f"[{it['id']}] {it['level'].upper()} [{it['project']}] "
+              f"{it['title']} ({_age(it['ts'])})"
+              + (f" — {it['body']}" if it["body"] else ""))
+    if not items:
+        print("nothing matches these filters" if args.level or args.project
+              or args.search else "inbox empty ✨")
     return 0
 
 
@@ -5619,6 +5850,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_supervisor(args)
         if args.cmd == "adopt":
             return cmd_adopt(args)
+        if args.cmd == "offboard":
+            return cmd_offboard(args)
         if args.cmd == "wo":
             return cmd_wo(args)
         if args.cmd == "fo":
@@ -5635,6 +5868,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_rules(args)
         if args.cmd == "config":
             return cmd_config(args)
+        if args.cmd == "onboard":
+            return cmd_onboard(args)
         if args.cmd == "backlog":
             return cmd_backlog(args)
         if args.cmd == "brief":

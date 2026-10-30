@@ -196,7 +196,10 @@ def test_the_page_loads_no_script_from_another_host(client):
 
 def test_the_knowledge_page_links_to_the_review(client):
     page = client.get("/knowledge").text
-    assert 'action="/knowledge/review"' in page and "Validate knowledge graph" in page
+    assert 'href="/knowledge/review"' in page and "Validate knowledge graph" in page
+    # main's `/knowledge/{kn_id}` must not swallow the review's fixed routes
+    assert "cytoscape" in client.get("/knowledge/review").text
+    assert "nodes" in client.get("/knowledge/review.json").json()
 
 
 # -- `jarvis learn review`

@@ -7,6 +7,7 @@ import json
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -14,11 +15,27 @@ from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from .. import bill, db, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
+from .. import (
+    bill,
+    db,
+    fleet,
+    fleetcost,
+    github,
+    invariants,
+    ops,
+    rules,
+    specs,
+    transcript_cache,
+    uilog,
+    wiring,
+)
 from ..bill import OWN_LABEL
 from ..central_store import KB_LINK_RELS, CentralStore
 from ..daemon import daemon_running
@@ -154,9 +171,11 @@ def gate_display(g: dict) -> str:
 # How often the dashboard re-reads OS state
 REFRESH_SECONDS = 15
 
-# The open statuses worth a row of their own
+# The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
-                     "waiting_pr_merge")
+                     "validating", "waiting_pr_merge")
+# The work-order statuses that sort to the top of a list: each waits on the user
+NEEDS_YOU_STATUSES = ("failed", "budget_exhausted", "needs_review", "waiting_input")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
@@ -199,6 +218,48 @@ def fmt_ts(ts: float | None) -> str:
     if not ts:
         return "–"
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+# The list-page primitives: §2.2 of... (docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md)
+FREE_TEXT_MAX = 100
+
+
+def query_filters(request: Request, allowed: Mapping[str, Sequence[str]]) -> dict[str, str]:
+    """Named query params, capped; an unknown value is kept to match nothing (Q2361)"""
+    out: dict[str, str] = {}
+    for key in allowed:
+        text = (request.query_params.get(key) or "").strip()[:FREE_TEXT_MAX]
+        if text:
+            out[key] = text
+    return out
+
+
+def query_int(text: str, default: int | None) -> int | None:
+    """Blank or junk is the default, never a 422: filter_bar submits blanks (wo-522ea53a)"""
+    try:
+        return int(text.strip())
+    except ValueError:
+        return default
+
+
+def filter_rows(rows: Iterable[dict], filters: Mapping[str, str],
+                text_keys: Sequence[str] = ()) -> list[dict]:
+    """Rows equal on every non-empty filter; `q` is a case-insensitive substring over `text_keys`"""
+    q = (filters.get("q") or "").lower()
+    exact = {k: v for k, v in filters.items() if v and k != "q"}
+    return [r for r in rows
+            if all(str(r.get(k) or "") == v for k, v in exact.items())
+            and (not q or any(q in str(r.get(k) or "").lower() for k in text_keys))]
+
+
+def filter_options(rows: Iterable[dict], key: str) -> list[str]:
+    """Sorted distinct non-empty values of one column — a filter select's options"""
+    return sorted({str(r[key]) for r in rows if r.get(key)})
+
+
+def attention_first(rows: Iterable[dict], needs_you: Callable[[dict], bool]) -> list[dict]:
+    """Rows needing the user first; each group keeps its incoming order"""
+    return sorted(rows, key=lambda r: not needs_you(r))
 
 
 def _offset_param(raw: str) -> int:
@@ -291,6 +352,9 @@ class PoolProbe:
         # Routed requests in flight, keyed by a counter: a monotonic start time and a label
         self._inflight: dict[int, tuple[float, str]] = {}
         self._inflight_seq = 0
+        # Registered requests that came back: a wedge is nothing being SERVED, not one slow page (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+        self.served = 0
+        self._served_seen = 0
         self.probe_failure_reason = ""
         # Resolved once, here: `jarvis_version` shells out to git on its first call
         try:
@@ -320,8 +384,10 @@ class PoolProbe:
         self._inflight[key] = (time.monotonic(), f"{method} {path}")
         return key
 
-    def end(self, key: int) -> None:
+    def end(self, key: int, served: bool = True) -> None:
         self._inflight.pop(key, None)
+        if served:
+            self.served += 1
 
     def oldest_inflight(self) -> tuple[float, str] | None:
         """Age in seconds and label of the longest-running routed request, or None"""
@@ -369,7 +435,11 @@ class PoolProbe:
         except TimeoutError:
             return self._fail("pool_timeout", cfg)
         oldest = self.oldest_inflight()
-        if oldest is not None and oldest[0] > cfg.probe_timeout_seconds:
+        # A dashboard still serving other routed requests is slow, not wedged (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+        progressed = self.served != self._served_seen
+        self._served_seen = self.served
+        if (oldest is not None and oldest[0] > cfg.probe_timeout_seconds
+                and not progressed):
             return self._fail("inflight_stall", cfg)
         self.last_ok = time.time()
         self.consecutive_failures = 0
@@ -458,7 +528,7 @@ class LoopWatchdog:
         self._stop.set()
 
 
-def _cost_payloads(picked: dict, project: str, method: str = "TASK") -> dict:
+def _cost_payloads(picked: dict, project: str) -> dict:
     """The three /cost payloads for one resolved window (docs/superpowers/specs/2026-10-22-cost-tab-precompute.md)"""
     report = ops.cost_report(project=project or None, window=picked)
     # The distribution is a SECTION of this page
@@ -470,12 +540,19 @@ def _cost_payloads(picked: dict, project: str, method: str = "TASK") -> dict:
     try:
         meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
     except Exception as e:                              # noqa: BLE001
-        uilog.record_error(method, "cost/meter", e)
+        uilog.record_error("TASK", "cost/meter", e)
         meter = None
     return {"report": report, "fleet": fleet, "meter": meter}
 
 
 REFRESH_SECONDS = 60
+
+#: How long startup may spend on round one before it gives up and serves anyway (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)
+FIRST_ROUND_SECONDS = 30
+
+#: On-demand entries kept, and computes allowed to run at once
+MAX_ON_DEMAND = 8
+MAX_COMPUTING = 4
 
 
 class CostCache:
@@ -483,6 +560,12 @@ class CostCache:
 
     def __init__(self) -> None:
         self.entries: dict[str, dict] = {}
+        # The windows no refresh covers — a scope, an offset, a custom range (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+        self.on_demand: dict[tuple, dict] = {}
+        self.computing: dict[tuple, threading.Event] = {}
+        self.failures: dict[tuple, str] = {}
+        self._lock = threading.Lock()
+        self._threads: set[threading.Thread] = set()
 
     def compute(self, name: str) -> dict:
         picked = ops.cost_window(window=name)
@@ -495,6 +578,78 @@ class CostCache:
             return None
         return entry
 
+    @staticmethod
+    def key(picked: dict, project: str) -> tuple:
+        """The scope and the bounds, an open-ended `until` bucketed because it IS now (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)"""
+        until = picked["until"]
+        if picked.get("open_ended"):
+            until = ("now", int(until // REFRESH_SECONDS))
+        return (project, picked["since"], until)
+
+    def _compute_on_demand(self, key: tuple, picked: dict, project: str) -> None:
+        try:
+            entry = {"window": picked, **_cost_payloads(picked, project),
+                     "computed_at": time.time()}
+        except Exception as e:                          # noqa: BLE001
+            uilog.record_error("TASK", "cost/on-demand", e)
+            with self._lock:
+                # The last good entry is left where it is (kn-40db1828)
+                self.failures[key] = f"{type(e).__name__}: {e}"
+        else:
+            with self._lock:
+                self.failures.pop(key, None)
+                self.on_demand[key] = entry
+                while len(self.on_demand) > MAX_ON_DEMAND:
+                    self.on_demand.pop(next(iter(self.on_demand)))
+        finally:
+            with self._lock:
+                event = self.computing.pop(key, None)
+                self._threads.discard(threading.current_thread())
+            if event is not None:
+                event.set()
+
+    def start(self, key: tuple, picked: dict, project: str) -> None:
+        """The compute for one window, in its own thread; nothing when too many run already"""
+        with self._lock:
+            if key in self.computing or len(self.computing) >= MAX_COMPUTING:
+                return
+            self.computing[key] = threading.Event()
+        # A plain thread, NOT the anyio pool: it must not borrow the token a page needs
+        thread = threading.Thread(target=self._compute_on_demand,
+                                  args=(key, picked, project),
+                                  name="jarvis-ui-cost", daemon=True)
+        with self._lock:
+            self._threads.add(thread)
+        thread.start()
+
+    def quiesce(self, timeout: float = 10.0) -> None:
+        """Wait out the detached computes, so shutdown cannot strand one mid-query"""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                alive = [t for t in self._threads if t.is_alive()]
+            left = deadline - time.monotonic()
+            if not alive or left <= 0:
+                return
+            alive[0].join(left)
+
+    def serve(self, picked: dict, project: str) -> dict | None:
+        """One window's payloads, or None while they are still being computed"""
+        key = self.key(picked, project)
+        entry = self.on_demand.get(key)
+        if entry is not None and time.time() - entry["computed_at"] < REFRESH_SECONDS:
+            return entry
+        self.start(key, picked, project)
+        if entry is not None:
+            # Stale, and served as it is: the page already says how old it is
+            return entry
+        # No wait at all: the request path never holds for an aggregation (docs/superpowers/specs/2026-10-28-the-cost-page-never-waits.md)
+        if self.failures.get(key):
+            raise ops.OpsError(f"the cost report for {picked['label']} could not be "
+                               f"computed — {self.failures[key]}. The traceback is in "
+                               f"{uilog.ui_log_path()}.")
+        return None
+
     async def refresh(self) -> None:
         """One round over every named window; a failure keeps the last good entry"""
         import anyio
@@ -504,13 +659,19 @@ class CostCache:
                 self.entries[name] = await anyio.to_thread.run_sync(self.compute, name)
             except Exception as e:                      # noqa: BLE001
                 uilog.record_error("TASK", f"cost/cache/{name}", e)
+        try:
+            # The ONLY writer of the file, so a `jarvis cost` run can never lose entries
+            await anyio.to_thread.run_sync(transcript_cache.save)
+        except Exception as e:                          # noqa: BLE001
+            uilog.record_error("TASK", "cost/cache/save", e)
 
     async def run(self) -> None:
         import anyio
 
         while True:
-            await self.refresh()
+            # Round one is `lifespan`'s, before it yields; this loop only keeps it fresh
             await anyio.sleep(REFRESH_SECONDS)
+            await self.refresh()
 
 
 def _stale_link_hint(name: str, wo_id: str) -> str:
@@ -651,12 +812,16 @@ def nav_projects() -> list[str]:
 
 
 def _decorate_question(q: dict) -> dict:
-    """Add the two display-only fields the `/neo` question blocks render"""
-    from .. import digest, issues, neo
+    """Add the display-only fields the `/neo` question blocks render"""
+    from .. import digest, issues, morpheus, neo
     q["digest_view"] = digest.decode(q.get("digest"))
     q["full_context"] = neo.build_question_prompt(q)
     # `triage` only, and empty everywhere else: the one kind whose subject is a tracker issue rather than...
     q["issue_url"] = (issues.triage_payload(q) or {}).get("issue_url") or ""
+    # `validation` and `findings` are decided on their own record, so the block links to it
+    q["morpheus_item"] = morpheus.item_of_question(q) if q.get("kind") == "validation" else ""
+    located = ops._finding_for_question(q) if q.get("kind") == "findings" else None
+    q["io_url"] = f"/io/{located[0]}/{located[2]['id']}" if located else ""
     return q
 
 
@@ -905,14 +1070,24 @@ def create_app() -> FastAPI:
         """Owns the liveness probe task (spec §2) and the watchdog thread (issue #1221)"""
         import anyio
 
+        try:
+            invariants.report_at_startup("ui")
+        except Exception:  # noqa: BLE001 — a startup check must not stop the dashboard
+            import logging
+            logging.getLogger(__name__).exception("startup invariant check failed")
         watchdog.start()
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
+            # Round one before the first request, bounded (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)
+            with anyio.move_on_after(FIRST_ROUND_SECONDS):
+                await cost_cache.refresh()
             tg.start_soon(cost_cache.run)
             try:
                 yield
             finally:
                 watchdog.stop()
+                # Before the loop goes: a strand holds a SQLite read nobody will close
+                cost_cache.quiesce()
                 tg.cancel_scope.cancel()
 
     app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -978,6 +1153,7 @@ def create_app() -> FastAPI:
         fleet_held_statuses=invariants.FLEET_HELD_STATUSES,
         instance=instance_badge(),
         fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
+        filter_rows=filter_rows, filter_options=filter_options, attention_first=attention_first,
         # The bill's two explanations, taken from the module that computes the numbers rather than written...
         rate_note=bill.rate_note, tokens_mean=bill.TOKENS_MEAN,
         write_rate_of=bill.write_rate_of,
@@ -1012,6 +1188,9 @@ def create_app() -> FastAPI:
         ctx["nav_projects"] = nav_projects()
         here = ctx.get("project") or ctx.get("project_name")
         ctx["project_here"] = here if isinstance(here, str) else ""
+        ctx["project_archived"] = bool(
+            ctx["project_here"] and ctx["project_here"] not in ctx["nav_projects"]
+            and ctx["project_here"] in ops.registered_project_paths(include_archived=True))
         return templates.TemplateResponse(request, template, ctx,
                                           status_code=status_code)
 
@@ -1029,6 +1208,21 @@ def create_app() -> FastAPI:
             return HTMLResponse(f"<h1>Something went wrong</h1><p>{message}</p>",
                                 status_code=500)
 
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError):
+        """A page link the user followed gets the error page, never FastAPI's raw JSON; /api/*
+        and the knowledge review's JSON calls (its page prints the error) keep the 422"""
+        if request.url.path.startswith(("/api/", "/knowledge/review/")):
+            return await request_validation_exception_handler(request, exc)
+        errors = exc.errors()
+        # A junk id in the path names nothing, so 404; a bad form or query value is the request's fault
+        status = 404 if any(e.get("loc", ())[:1] == ("path",) for e in errors) else 400
+        detail = "; ".join(f"{'.'.join(str(p) for p in e.get('loc', ()))}: {e.get('msg', '')}"
+                           for e in errors)
+        message = f"{request.url.path} could not be read — {detail}"
+        return await run_in_threadpool(render, request, "error.html", message=message,
+                                       status_code=status)
+
     @app.middleware("http")
     async def access_log(request: Request, call_next):
         """One line per request in `$JARVIS_HOME/logs/ui-access.log`"""
@@ -1036,14 +1230,18 @@ def create_app() -> FastAPI:
         # Runs on the event loop, before `call_next` queues a sync handler onto the pool: the one place a...
         key = (probe.begin(request.method, request.url.path)
                if request.url.path != "/healthz" and _routed(request) else None)
+        # A cancellation is a BaseException, so a client that gave up never counts as served (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+        served = False
         try:
             try:
                 response = await call_next(request)
             except Exception:
                 # The handler above renders the page
+                served = True
                 uilog.record_access(request.method, _rel_url(request), 500,
                                     (time.perf_counter() - t0) * 1000)
                 raise
+            served = True
             if response.status_code >= 400 or not _quiet(request.url.path):
                 uilog.record_access(request.method, _rel_url(request),
                                     response.status_code,
@@ -1052,7 +1250,7 @@ def create_app() -> FastAPI:
         finally:
             # A 500 and a cancellation both clean up (spec §1)
             if key is not None:
-                probe.end(key)
+                probe.end(key, served=served)
 
     # -- pages
 
@@ -1060,42 +1258,65 @@ def create_app() -> FastAPI:
     def dashboard(request: Request, show: str = ""):
         """The pulse"""
         st = ops.os_status()
-        rows = [{**wo, "project": p["name"]}
-                for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        every = [{**wo, "project": p["name"]}
+                 for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        # §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
+        options = {"project": filter_options(every, "project"),
+                   "status": filter_options(every, "status")}
+        filters = query_filters(request, options)
+        rows = filter_rows(every, filters)
+        # A status filter reveals that status even when it is one that collapses into a count
+        show = show or filters.get("status", "")
         revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
             else ""
         featured, rest = group_open(rows, revealed)
+        # Same predicate as project(): a status that waits on the user, or a raised flag
+        shown = attention_first(featured + rest,
+                                lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                                or bool(wo.get("needs_attention")))
         rest_counts = _counts_by_status(
             wo["status"] for wo in rows if wo["status"] not in FEATURED_STATUSES)
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
-                      featured=featured, rest=rest, rest_counts=rest_counts,
+                      shown=shown, total=len(every), rest_counts=rest_counts,
+                      filters=filters, options=options,
                       revealed=revealed, model_ids=ops.suggested_model_ids())
 
     @app.get("/search", response_class=HTMLResponse)
-    def search_page(request: Request, q: str = "", project: str = "", kind: str = ""):
+    def search_page(request: Request):
         """Find an artifact again — across the fleet, or inside one project"""
         from .. import search as search_mod
 
-        projects = sorted(ops.registered_project_paths())
-        if project and project not in projects:
-            project = ""
-        kind = kind if kind in search_mod.KINDS else ""
-        hits = search_mod.search(q, project=project or None,
-                                 kinds=(kind,) if kind else None, limit=60)
+        options = {"q": (), "project": sorted(ops.registered_project_paths()),
+                   "kind": list(search_mod.KINDS)}
+        filters = query_filters(request, options)
+        # a hand-edited deep link widens to the fleet rather than matching nothing
+        filters = {k: v for k, v in filters.items() if k == "q" or v in options[k]}
+        q, project, kind = (filters.get(k, "") for k in ("q", "project", "kind"))
+        every = search_mod.search(q, project=project or None, limit=60)
+        # a kind search runs its own query so the cap of 60 applies within the kind
+        hits = (search_mod.search(q, project=project or None, kinds=(kind,), limit=60)
+                if kind else every)
         return render(request, "search.html", active="search", q=q, project=project,
-                      kind=kind, hits=hits, counts=search_mod.counts(hits),
-                      projects=projects, kinds=search_mod.KINDS)
+                      kind=kind, hits=hits, counts=search_mod.counts(every),
+                      filters=filters, options=options, total=len(every))
 
     @app.get("/project/{name}", response_class=HTMLResponse)
     def project(request: Request, name: str, hidden: str = "", show: str = "",
                 fo: str = ""):
         """A project's work orders — the ones that want the user, by default"""
-        paths = ops.registered_project_paths()
+        paths = ops.registered_project_paths(include_archived=True)
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
         show_hidden = hidden not in ("", "0", "false")
+        options = {"status": list(WO_STATUSES)}
+        filters = query_filters(request, options)
+        status = filters.get("status", "")
+        # A status filter reveals that status; an unknown one matches nothing (Q2361)
+        show = status or show
         revealed = show if show in WO_STATUSES else ("all" if show == "all" else "")
-        if revealed == "all":
+        if status:
+            statuses = (status,)
+        elif revealed == "all":
             statuses = None
         else:
             statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
@@ -1149,13 +1370,27 @@ def create_app() -> FastAPI:
             central.close()
         settled = [(s, counts[s]) for s in TERMINAL_STATUSES if counts.get(s)]
         featured, rest = group_open(wos, revealed)
+        rows = attention_first(featured + rest,
+                               lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                               or bool(wo.get("needs_attention")))
         # Counted in SQL rather than from `wos`
         other_open = [s for s in OPEN_STATUSES if s not in FEATURED_STATUSES]
         open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
         fo_settled = [(s, fo_counts[s]) for s in FO_TERMINAL_STATUSES
                       if fo_counts.get(s)]
+        flagged = lambda r: bool(r.get("needs_attention"))  # noqa: E731
+        features = attention_first(features, flagged)
+        improvements = attention_first(improvements, flagged)
+        investigations = attention_first(investigations, flagged)
         return render(request, "project.html", project_name=name, path=paths[name],
-                      featured=featured, rest=rest, open_counts=open_counts,
+                      # "of M": the open orders plus whatever the URL revealed, never every settled one
+                      total=sum(n for s, n in counts.items()
+                                if revealed == "all" or s in OPEN_STATUSES
+                                or s in (status, revealed)),
+                      rows=rows, filters=filters,
+                      # Parsed against every status, offered only where a row has it
+                      options={"status": [s for s in WO_STATUSES if counts.get(s)]},
+                      open_counts=open_counts,
                       backlog=backlog, show_hidden=show_hidden, blocked=blocked,
                       pauses=pauses,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
@@ -1173,11 +1408,15 @@ def create_app() -> FastAPI:
         if target != f"/fo/{name}/{fo_id}":
             return RedirectResponse(target, status_code=303)
         try:
-            detail = ops.show_feature_order(fo_id, name)
+            detail = ops.show_feature_order(fo_id, name, include_archived=True)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
         # The deliberation, for the fold
-        store = ProjectStore(ops.registered_project_paths()[detail["project"]])
+        paths = ops.registered_project_paths(include_archived=True)
+        if detail["project"] not in paths:
+            return render(request, "error.html",
+                          message=f"no project named {detail['project']!r} is registered")
+        store = ProjectStore(paths[detail["project"]])
         try:
             validation = ops.validation_detail(store, fo_id=fo_id)
             # Taken in the same block, for the same reason: one connection per page (spec §7)
@@ -1191,9 +1430,14 @@ def create_app() -> FastAPI:
             for c in (detail.get("plan") or {}).get("children", [])
             if c.get("spec_section")
         }
+        detail["children"] = attention_first(
+            detail.get("children") or [],
+            lambda c: not c.get("superseded") and (
+                c["status"] in NEEDS_YOU_STATUSES or bool(c.get("needs_attention"))))
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
                       states=states, child_anchors=child_anchors,
-                      cap=ops.feature_order_budget(fo_id, detail["project"]),
+                      cap=ops.feature_order_budget(fo_id, detail["project"],
+                                                   include_archived=True),
                       # Already on `detail` for `jarvis fo show`
                       issues=detail["issues"],
                       validation=validation, error=error)
@@ -1201,7 +1445,7 @@ def create_app() -> FastAPI:
     @app.get("/spec/{name}/{fo_id}", response_class=HTMLResponse)
     def spec_page(request: Request, name: str, fo_id: str):
         """THE FEATURE'S SPEC, RENDERED — §1 of... (docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md)"""
-        paths = ops.registered_project_paths()
+        paths = ops.registered_project_paths(include_archived=True)
         if name not in paths:
             return render(request, "error.html",
                           message=f"no project named {name!r} is registered")
@@ -1234,6 +1478,14 @@ def create_app() -> FastAPI:
             detail = ops.show_improvement_order(io_id, name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        report = detail.get("report") or {}
+        if report.get("findings"):
+            # Owed a decision first: pending and not held by Neo, or a filing that failed
+            report["findings"] = attention_first(
+                report["findings"],
+                lambda f: bool(f.get("filing_error")) or (
+                    (f.get("status") or "pending") == "pending"
+                    and not (f.get("neo_question_id") and not f.get("neo_verdict"))))
         return render(request, "improvement_order.html", io=detail,
                       project=detail["project"], error=error)
 
@@ -1275,7 +1527,7 @@ def create_app() -> FastAPI:
     def work_order(request: Request, name: str, wo_id: str, debug: str = "",
                    forced: str = "", retried: str = "", events: str = ""):
         try:
-            pname, path, wo = ops.find_work_order(wo_id, name)
+            pname, path, wo = ops.find_work_order(wo_id, name, include_archived=True)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e),
                           hint=_stale_link_hint(name, wo_id), status_code=404)
@@ -1339,13 +1591,22 @@ def create_app() -> FastAPI:
         show_debug = debug not in ("", "0", "false")
         bill = wo_bill(wo_id, pname)
         # The ceiling, what has gone against it
-        cap = ops.work_order_budget(wo_id, pname)
+        cap = ops.work_order_budget(wo_id, pname, include_archived=True)
+        # What this order wrote to, or retired from, the knowledge base
+        central = CentralStore()
+        try:
+            learnings = central.knowledge_by_work_order(wo_id)
+        finally:
+            central.close()
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
+                      learnings=learnings,
                       # What has already been dismissed here
                       seen=invariants.acknowledged(wo),
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec, spec_link=spec_link,
+                      # An analyst's sibling fix orders (issue 1323)
+                      siblings=ops.analyst_dispatched(wo),
                       auto_merge=auto_merge,
                       merge_state=merge_state,
                       issues=issue_index,
@@ -1404,6 +1665,14 @@ def create_app() -> FastAPI:
         """Any id the OS mints, to the page that shows it (2026-10-22 spec §1)"""
         return RedirectResponse(ops.resolve_ref(ref), status_code=303)
 
+    @app.get("/api/wo/{name}/{wo_id}/context/{seq}/{ingredient}")
+    def work_order_context_ingredient(name: str, wo_id: str, seq: int, ingredient: str):
+        """`ops.context_ingredient` as JSON — what the debug page's ingredient modal fetches"""
+        try:
+            return JSONResponse(ops.context_ingredient(wo_id, name, seq, ingredient))
+        except ops.OpsError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+
     @app.get("/api/wo/{name}/{wo_id}/live")
     def work_order_live(name: str, wo_id: str):
         """`ops.live_report` as JSON, nothing reshaped — what the debugging page polls"""
@@ -1411,6 +1680,15 @@ def create_app() -> FastAPI:
             return JSONResponse(ops.live_report(wo_id, name))
         except ops.OpsError as e:
             return JSONResponse({"error": str(e)}, status_code=404)
+
+    @app.get("/api/cost/meter")
+    def cost_meter_timeline(since: float, until: float):
+        """`ops.cost_meter_timeline` as JSON — what the /cost chart fetches on zoom and overlay"""
+        try:
+            return JSONResponse({"since": since, "until": until,
+                                 "timeline": ops.cost_meter_timeline(since, until)})
+        except ops.OpsError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
 
     @app.get("/cost", response_class=HTMLResponse)
     def cost_page(request: Request, project: str = "", window: str = "",
@@ -1424,23 +1702,34 @@ def create_app() -> FastAPI:
                                      offset=_offset_param(offset), tz=tz or None,
                                      since=_in_zone(since, zone) if since else None,
                                      until=_in_zone(until, zone) if until else None)
+            # Checked here because the aggregation that refuses a typo no longer runs on the request path
+            known = ops.registered_project_paths()
+            if project and project not in known:
+                raise ops.OpsError(
+                    f"project {project!r} not registered (known: {sorted(known)})")
             # docs/superpowers/specs/2026-10-22-cost-tab-precompute.md §Matching rule
             entry = None
             if (not project and offset in ("", "0") and not since and not until
                     and (not tz or tz == ops.cost_zone(None, None))):
                 entry = cost_cache.lookup(picked)
             if entry is not None:
-                picked, payloads = entry["window"], entry
+                picked = entry["window"]
             else:
-                payloads = _cost_payloads(picked, project, request.method)
+                # Never on the request path (docs/superpowers/specs/2026-10-22-a-slow-request-is-not-a-wedge.md)
+                entry = cost_cache.serve(picked, project)
+                if entry is None:
+                    return render(request, "computing.html", active="cost",
+                                  window=picked,
+                                  parsed=transcript_cache.stats()["files"])
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
-        report, fleet, meter = payloads["report"], payloads["fleet"], payloads["meter"]
-        cached_at = entry["computed_at"] if entry is not None else None
+        report, fleet, meter = entry["report"], entry["fleet"], entry["meter"]
+        cached_at = entry["computed_at"]
         # Its own variable and never read out of `fleet`: losing the section must not lose the window the...
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
                       project=project, fleet=fleet, meter=meter, window=picked,
+                      meter_max_span=ops.METER_TIMELINE_MAX_SECONDS,
                       cached_at=cached_at, now=time.time(),
                       window_inputs=_window_inputs(picked),
                       projects=sorted(ops.registered_project_paths()))
@@ -1461,58 +1750,76 @@ def create_app() -> FastAPI:
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):
-        central = CentralStore()
-        try:
-            items = central.unacked_inbox()
-        finally:
-            central.close()
-        return render(request, "inbox.html", active="inbox", items=items)
+        every = ops.unacked_inbox()
+        # "priority" is the default, so it is the select's empty choice rather than an option
+        options = {"level": list(ops.INBOX_LEVELS), "project": filter_options(every, "project"),
+                   "q": [], "sort": [s for s in ops.INBOX_SORTS if s != "priority"]}
+        filters = query_filters(request, options)
+        sort = filters.get("sort", "priority")
+        items = ops.select_inbox(every, level=filters.get("level", ""),
+                                 project=filters.get("project", ""), q=filters.get("q", ""),
+                                 sort=sort if sort in ops.INBOX_SORTS else "priority")
+        # A sort is not a filter: only the other three narrow what "Ack shown" acks
+        filtered = any(k in filters for k in ("level", "project", "q"))
+        return render(request, "inbox.html", active="inbox",
+                      critical=[it for it in items if it["level"] == "critical"],
+                      rest=[it for it in items if it["level"] != "critical"],
+                      items=items, total=len(every), filters=filters, options=options,
+                      filtered=filtered,
+                      back=str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""))
 
     @app.get("/backlog", response_class=HTMLResponse)
     def backlog(request: Request):
-        central = CentralStore()
+        """Intake, blocked items first (spec 2026-10-29 dashboard §6)"""
+        every = ops.list_backlog(status=None)
+        options = {"status": filter_options(every, "status"),
+                   "project": filter_options(every, "project")}
+        filters = query_filters(request, options)
+        rows = attention_first(filter_rows(every, filters), lambda i: bool(i["blockers"]))
+        return render(request, "backlog.html", active="backlog", rows=rows,
+                      attention=[i for i in rows if i["blockers"]],
+                      filters=filters, options=options, total=len(every))
+
+    @app.get("/backlog/{item_id}", response_class=HTMLResponse)
+    def backlog_item(request: Request, item_id: str):
+        """One intake item: its description, dependencies and the promote form"""
         try:
-            items = central.list_backlog(status=None)
-            open_ids = {i["id"] for i in items if i["status"] == "open"}
-            blockers = {i["id"]: central.unfinished_dependencies(i["id"])
-                        for i in items if i["id"] in open_ids}
-        finally:
-            central.close()
-        return render(request, "backlog.html", active="backlog", items=items,
-                      blockers=blockers)
+            item = ops.show_backlog(item_id)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="backlog", message=str(e),
+                          status_code=404)
+        return render(request, "backlog_item.html", active="backlog", item=item)
 
     @app.get("/knowledge", response_class=HTMLResponse)
-    def knowledge(request: Request, topic: str = "", q: str = ""):
+    def knowledge(request: Request):
         """The base, and what it costs against what it is used for"""
-        from ..central_store import PINNED_TAG, has_tag, headline
-        # An empty form field means every topic; "(none)" is how the page names untopicked rows
-        topic_filter = None if not topic else "" if topic == "(none)" else topic
-        central = CentralStore()
-        try:
-            rows = central.search_knowledge(q.strip(), limit=200, topic=topic_filter)
-            topics = central.knowledge_topics()
-            hits = central.knowledge_hit_counts()
-        finally:
-            central.close()
-        if not q.strip():  # a word search keeps its rank order
-            rows = sorted(rows, key=lambda r: (not has_tag(r["tags"], PINNED_TAG), -r["ts"]))
-        for r in rows:
-            r["pinned"] = has_tag(r["tags"], PINNED_TAG)
-            r["headline"] = headline(r["content"])
-            r["reads"] = hits.get(r["id"], 0)
+        options = {"q": (), "topic": (), "project": (), "pinned": ("pinned", "unpinned")}
+        filters = query_filters(request, options)
+        topic = filters.get("topic", "")
+        # "(none)" is how the page names untopicked rows
+        base = ops.list_knowledge(filters.get("q", ""),
+                                  topic=None if not topic else "" if topic == "(none)" else topic)
+        every = base["rows"]
+        for r in every:
+            r["scope"] = r["project"] or "global"
+            r["pin"] = "pinned" if r["pinned"] else "unpinned"
+        options["topic"] = [t or "(none)" for t, _ in base["topics"]]
+        options["project"] = filter_options(every, "scope")
+        rows = filter_rows(every, {"scope": filters.get("project", ""),
+                                   "pin": filters.get("pinned", "")})
         return render(request, "knowledge.html", active="knowledge", rows=rows,
-                      topics=topics, topic=topic, q=q,
-                      usage=ops.knowledge_usage_report(limit=8))
+                      topics=base["topics"], filters=filters, options=options,
+                      total=len(every), usage=ops.knowledge_usage_report(limit=8))
 
     @app.post("/knowledge/pin")
-    def knowledge_pin(kn_id: str = Form(...), pinned: str = Form("")):
+    def knowledge_pin(kn_id: str = Form(...), pinned: str = Form(""), next: str = Form("")):
         """Pinned entries ride in every worker prompt verbatim"""
-        central = CentralStore()
         try:
-            central.pin_knowledge(kn_id, pinned=pinned == "1")
-        finally:
-            central.close()
-        return RedirectResponse("/knowledge", status_code=303)
+            ops.pin_knowledge(kn_id, pinned=pinned == "1")
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/knowledge", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/knowledge"), status_code=303)
 
     # -- the knowledge review: domains, assignments and links over the base, drawn as a
     # graph the user edits by hand. Reads come from `ops.kb_review_payload`; every write
@@ -1589,8 +1896,20 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": f"no vendored file {name}"}, status_code=404)
         return FileResponse(VENDOR / name, media_type="text/javascript")
 
+    # after every fixed /knowledge/... route: this one matches any segment
+    @app.get("/knowledge/{kn_id}", response_class=HTMLResponse)
+    def knowledge_item(request: Request, kn_id: str):
+        """One entry in full, as `jarvis learn show` prints it"""
+        try:
+            k = ops.knowledge_detail(kn_id)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="knowledge", message=str(e),
+                          status_code=404)
+        return render(request, "knowledge_item.html", active="knowledge", k=k)
+
     @app.get("/neo", response_class=HTMLResponse)
     def neo_page(request: Request):
+        from .. import neo as neo_mod
         from ..neo_store import NeoStore
         neo = NeoStore()
         try:
@@ -1606,6 +1925,8 @@ def create_app() -> FastAPI:
                        and not (q["answered_by"] == "neo"
                                 and q["review_status"] == "unreviewed")]
             learnings = neo.all_learnings(limit=100)
+            for learning in learnings:
+                learning["origin"] = neo_mod.learning_origin(learning)
             # How the panel deliberated, for the questions this page already shows
             opinions = {}
             for q in (*in_flight, *escalated, *unreviewed, *history):
@@ -1616,14 +1937,23 @@ def create_app() -> FastAPI:
             neo.close()
         for q in escalated + unreviewed:
             _decorate_question(q)
+        # History's "status" is its review column: every row in it is answered (Neo, question 2442)
+        for q in history:
+            q["review"] = "" if q["review_status"] == "unreviewed" else q["review_status"]
+        options = {"project": filter_options(history, "project"),
+                   "review": filter_options(history, "review")}
+        filters = query_filters(request, options)
         return render(request, "neo.html", active="neo",
                       in_flight=in_flight, escalated=escalated,
-                      unreviewed=unreviewed, history=history, learnings=learnings,
+                      unreviewed=unreviewed, history=filter_rows(history, filters),
+                      history_total=len(history), filters=filters, options=options,
+                      learnings=learnings,
                       opinions=opinions, digest_credit=_digest_credit())
 
     @app.get("/neo/stats", response_class=HTMLResponse)
-    def neo_stats_page(request: Request, project: str = "", days: int | None = None):
+    def neo_stats_page(request: Request, project: str = "", days: str = ""):
         """Neo's own report — §6 of docs/superpowers/specs/2026-10-01-neo-observability.md"""
+        days = query_int(days, None)
         try:
             report = ops.neo_stats_report(project=project or None, days=days)
         except ops.OpsError as e:
@@ -1660,18 +1990,39 @@ def create_app() -> FastAPI:
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):
         """Privileged-action approvals"""
-        rows = ops.list_gates(include_request=True)
-        pending = [g for g in rows if g["status"] == "pending"]
-        held = [g for g in rows if g["status"] == "awaiting_case"]
-        dismissed = [g for g in rows if g["status"] == "dismissed"]
-        decided = [g for g in rows
-                   if g["status"] not in ("pending", "awaiting_case", "dismissed")]
-        return render(request, "gates.html", active="gates",
-                      escalated=[g for g in pending if g["escalated"]],
-                      with_neo=[g for g in pending if not g["escalated"]],
-                      held=held, decided=decided, dismissed=dismissed,
-                      false_positive_rate=_false_positive_rate(rows),
-                      abandoned=_abandoned(rows))
+        every = ops.list_gates()
+        for g in every:
+            g["state"] = (("escalated" if g["escalated"] else "with neo")
+                          if g["status"] == "pending" else gate_display(g))
+        # pending, then held for a case, then everything settled; newest first inside each
+        rank = {"escalated": 0, "with neo": 1, "awaiting_case": 2}
+        every.sort(key=lambda g: rank.get(g["state"], 3))
+        options = {"state": filter_options(every, "state"),
+                   "project": filter_options(every, "project"),
+                   "kind": filter_options(every, "kind")}
+        # `id` has no select: /gates/<n> lands here when n names a gate in several projects
+        filters = query_filters(request, {**options, "id": ()})
+        rows = filter_rows(every, filters)
+        return render(request, "gates.html", active="gates", rows=rows,
+                      attention=[g for g in rows if g["state"] == "escalated"],
+                      filters=filters, options=options, total=len(every),
+                      counts=Counter(g["state"] for g in every),
+                      false_positive_rate=_false_positive_rate(every),
+                      abandoned=_abandoned(every))
+
+    @app.get("/gates/{approval_id}", response_class=HTMLResponse)
+    def gate_page(request: Request, approval_id: int, project: str = ""):
+        """One privileged-action request: the case, Neo's review, the decision"""
+        try:
+            g = ops.show_gate(approval_id, project_name=project or None)
+        except ops.OpsError as e:
+            if not project and sum(g["id"] == approval_id for g in ops.list_gates()) > 1:
+                return RedirectResponse(f"/gates?id={approval_id}", status_code=303)
+            return render(request, "error.html", active="gates", message=str(e),
+                          status_code=404)
+        back = f"/gates/{approval_id}?project={g['project']}"
+        return render(request, "gate.html", active="gates", g=g, back=back,
+                      display=gate_display(g))
 
     @app.get("/config", response_class=HTMLResponse)
     def config_page(request: Request, a: str = "", b: str = "", scope: str = "",
@@ -1710,53 +2061,223 @@ def create_app() -> FastAPI:
 
     @app.get("/alarms", response_class=HTMLResponse)
     def alarms_page(request: Request):
-        """Turns the OS raised WHILE they were still costing money"""
+        """Turns the OS raised WHILE they were still costing money (spec 2026-10-29 dashboard §8)"""
         rows = ops.alarm_feed()
         live: dict[str, dict] = {}
         for a in (r for r in rows if r["live"]):
             group = live.setdefault(a["subject_id"], {**a, "alarms": []})
             group["alarms"].append(a)
+        every = [r for r in rows if not r["live"]]
+        for r in every:
+            r["state"] = r["alarm_status"]
+        options = {"state": filter_options(every, "state"),
+                   "kind": filter_options(every, "kind"),
+                   "project": filter_options(every, "project")}
+        filters = query_filters(request, options)
+        # Gates' order: what a person must decide first, newest first inside each group
+        history = attention_first(filter_rows(every, filters),
+                                  lambda r: r["state"] == "escalated")
+        queue = filter_rows(ops.alarm_review_queue(),
+                            {k: filters.get(k, "") for k in ("kind", "project")})
         return render(request, "alarms.html", active="alarms",
-                      live=list(live.values()),
-                      review_queue=ops.alarm_review_queue(),
-                      history=[r for r in rows if not r["live"]],
-                      kinds=ALARM_KINDS)
+                      live=list(live.values()), review_queue=queue,
+                      history=history, total=len(every),
+                      filters=filters, options=options, kinds=ALARM_KINDS)
 
     @app.get("/stuck", response_class=HTMLResponse)
     def stuck_page(request: Request):
         """Open orders judged on time in status (docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md)"""
-        rows = ops.stuck_report()
-        return render(request, "stuck.html", active="stuck",
-                      over=[r for r in rows if r["stuck"]],
-                      rest=[r for r in rows if not r["stuck"]])
+        # Spec 2026-10-29 dashboard §5: past-threshold first, one full-width table
+        every = [{**r, "kind": str(r["id"]).split("-", 1)[0]} for r in ops.stuck_report()]
+        options = {"project": filter_options(every, "project"), "kind": ["wo", "fo", "io"],
+                   "status": filter_options(every, "status")}
+        filters = query_filters(request, options)
+        rows = attention_first(filter_rows(every, filters), lambda r: r["stuck"])
+        return render(request, "stuck.html", active="stuck", rows=rows,
+                      attention=[r for r in rows if r["stuck"]], filters=filters,
+                      options=options, total=len(every))
 
     @app.get("/morpheus", response_class=HTMLResponse)
     def morpheus_page(request: Request):
-        """Shipped PRs watched in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)"""
-        return render(request, "morpheus.html", active="morpheus",
-                      report=ops.morpheus_report())
+        """Shipped PRs watched in production, failures first (spec 2026-10-29 dashboard §4.1)"""
+        report = ops.morpheus_report()
+        every = report["items"]
+        options = {"state": list(report["counts"]), "project": filter_options(every, "project")}
+        filters = query_filters(request, options)
+
+        def needs_you(i: dict) -> bool:
+            return (i["state"] in ("failed", "timedout")
+                    and not (i.get("resolution") or "").startswith("confirmed failed"))
+
+        newest = sorted(filter_rows(every, filters),
+                        key=lambda i: i.get("updated_ts") or 0, reverse=True)
+        rows = attention_first(newest, needs_you)
+        return render(request, "morpheus.html", active="morpheus", report=report,
+                      rows=rows, attention=[i for i in rows if needs_you(i)],
+                      filters=filters, options=options, total=len(every))
+
+    @app.get("/morpheus/{item_id}", response_class=HTMLResponse)
+    def morpheus_item_page(request: Request, item_id: str):
+        """One watched PR: its runs, retries, Neo questions and handoff (spec 2026-10-29 dashboard §4.2)"""
+        try:
+            detail = ops.morpheus_detail(item_id)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="morpheus", message=str(e),
+                          status_code=404)
+        return render(request, "morpheus_item.html", active="morpheus", d=detail,
+                      item=detail["item"], back=f"/morpheus/{item_id}")
+
+    @app.post("/morpheus/{item_id}/waive")
+    def morpheus_waive(item_id: str, reason: str = Form(""), next: str = Form("")):
+        """The user rules a shipped PR working in production"""
+        try:
+            ops.morpheus_waive(item_id, reason)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/morpheus", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
+
+    @app.post("/morpheus/{item_id}/requeue")
+    def morpheus_requeue(item_id: str, next: str = Form("")):
+        """Run a shipped PR's production check again, with a fresh deadline"""
+        try:
+            ops.morpheus_requeue(item_id)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/morpheus", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
+
+    @app.post("/morpheus/{item_id}/confirm")
+    def morpheus_confirm(item_id: str, fix: str = Form(""), next: str = Form("")):
+        """The user rules a failed check real and files its fix order"""
+        try:
+            ops.morpheus_confirm(item_id, fix)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/morpheus", str(e)),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
 
     @app.get("/steward", response_class=HTMLResponse)
     def steward_page(request: Request):
         """Self-work the steward queued: what still waits, what was re-offered, what expired (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)"""
-        return render(request, "steward.html", active="steward",
-                      report=ops.steward_queue_report())
+        report = ops.steward_queue_report()
+        # Spec 2026-10-29 dashboard §5: one table, three tabs; `tab` filters which ones show
+        every = ([{**i, "tab": "asks"} for i in report["asks"]]
+                 + [{**i, "tab": "waiting"} for i in report["waiting"]]
+                 + [{**i, "tab": "settled"} for i in report["settled"]])
+        options = {"project": filter_options(every, "project"),
+                   "tab": ["asks", "waiting", "settled"]}
+        filters = query_filters(request, options)
+        shown = filter_rows(every, filters)
+        tabs = {t: [i for i in shown if i["tab"] == t] for t in options["tab"]}
+        return render(request, "steward.html", active="steward", report=report,
+                      tabs=tabs, attention=tabs["asks"], filters=filters,
+                      options=options, shown=len(shown), total=len(every),
+                      open_tab=filters.get("tab") or ("asks" if tabs["asks"] else "waiting"))
 
-    @app.get("/evolution", response_class=HTMLResponse)
-    def evolution_page(request: Request, days: int = 90):
-        """Is the OS getting better at running itself — and where is it still weak? (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
-        return render(request, "evolution.html", active="evolution",
-                      report=ops.evolution_report(None, days=days))
+    @app.get("/steward/{ref}", response_class=HTMLResponse)
+    def steward_item_page(request: Request, ref: str):
+        """`jarvis steward why <ref>` as a page (spec 2026-10-29 dashboard §5)"""
+        decisions = ops.steward_why(ref)
+        if not decisions:
+            return render(request, "error.html", active="steward", status_code=404,
+                          message=f"no steward decision about {ref}")
+        return render(request, "steward_item.html", active="steward", ref=ref,
+                      decisions=decisions)
 
-    @app.get("/evolution/{project}", response_class=HTMLResponse)
-    def evolution_project_page(request: Request, project: str, days: int = 90):
-        """The same report scoped to one project — where each project page links"""
+    def _evolution(request: Request, project: str | None, days: int):
+        """/evolution[/<project>], failures first (spec 2026-10-29 dashboard §5)"""
         try:
             report = ops.evolution_report(project, days=days)
         except ops.OpsError as e:
             return render(request, "error.html", active="evolution",
                           message=str(e), status_code=404)
-        return render(request, "evolution.html", active="evolution", report=report)
+        every = [{**r, "firing": "firing" if r["hits"] or r["last_fired"] else "quiet"}
+                 for r in report["per_rule"]]
+        options = {"project": sorted(ops.registered_project_paths()),
+                   "days": ["7", "30", "90", "365"], "firing": ["firing", "quiet"]}
+        filters = query_filters(request, options)
+        if project:
+            filters["project"] = project
+        if days != 90:
+            filters["days"] = str(days)
+        shown = attention_first(filter_rows(every, {"firing": filters.get("firing", "")}),
+                                lambda r: not r["readable"])
+        return render(request, "evolution.html", active="evolution", report=report,
+                      rows=[r for r in shown if r["firing"] == "firing"],
+                      quiet=[r for r in shown if r["firing"] == "quiet"],
+                      attention=[r for r in shown if not r["readable"]],
+                      weeks_of={g["gap_class"]: g["weeks"] for g in report["by_gap_class"]},
+                      filters=filters, options=options, shown=len(shown), total=len(every))
+
+    @app.get("/evolution", response_class=HTMLResponse)
+    def evolution_page(request: Request, days: str = "", project: str = ""):
+        """Is the OS getting better at running itself — and where is it still weak? (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
+        return _evolution(request, project.strip() or None, query_int(days, 90))
+
+    @app.get("/evolution/rule/{key}", response_class=HTMLResponse)
+    def evolution_rule_page(request: Request, key: str, project: str = "", days: str = ""):
+        """One detector's history and what it filed (spec 2026-10-29 dashboard §5)"""
+        try:
+            report = ops.evolution_report(project.strip() or None, days=query_int(days, 90))
+        except ops.OpsError as e:
+            return render(request, "error.html", active="evolution",
+                          message=str(e), status_code=404)
+        rule = next((r for r in report["per_rule"] if str(r["id"]) == key), None)
+        if rule is None:
+            return render(request, "error.html", active="evolution", status_code=404,
+                          message=f"no detector {key!r} in this scope")
+        try:
+            detail = ops.rules_show(key)
+        except ops.OpsError:
+            detail = None  # the report named it but the registry no longer does: no actions
+        cfg = ops.rules_config((detail["detector"]["project"] or None) if detail else None)
+        return render(request, "evolution_rule.html", active="evolution", report=report,
+                      rule=rule, detail=detail,
+                      rules_enabled=None if cfg is None else cfg.enabled,
+                      undecided=(rules.UNREADABLE, rules.CLEARED),
+                      here=request.url.path + (f"?project={project}" if project else ""),
+                      weeks=next((g["weeks"] for g in report["by_gap_class"]
+                                  if g["gap_class"] == rule["gap_class"]), []),
+                      recurrences=[r for r in report["recurrences"]["rows"]
+                                   if r["gap_class"] == rule["gap_class"]],
+                      filed=[e for e in report["timeline"] if e["id"] == str(key)])
+
+    # The `jarvis rules arm|retract|false-positive` verbs, through the same ops calls
+    @app.post("/evolution/rule/{key}/arm")
+    def evolution_rule_arm(key: str, reason: str = Form(""), next: str = Form("")):
+        fallback = f"/evolution/rule/{key}"
+        try:
+            ops.rules_arm(key, reason)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, fallback, str(e)), status_code=303)
+        return RedirectResponse(_same_site_back(next, fallback), status_code=303)
+
+    @app.post("/evolution/rule/{key}/retract")
+    def evolution_rule_retract(key: str, rule_id: str = Form(""), reason: str = Form(""),
+                               next: str = Form("")):
+        """`rule_id` is the detector itself or one of its remedy rules"""
+        fallback = f"/evolution/rule/{key}"
+        try:
+            ops.rules_retract(rule_id or key, reason)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, fallback, str(e)), status_code=303)
+        return RedirectResponse(_same_site_back(next, fallback), status_code=303)
+
+    @app.post("/evolution/rule/{key}/fires/{fire_id}/false-positive")
+    def evolution_fire_false_positive(key: str, fire_id: int, reason: str = Form(""),
+                                      next: str = Form("")):
+        fallback = f"/evolution/rule/{key}"
+        try:
+            ops.rules_false_positive(fire_id, reason)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, fallback, str(e)), status_code=303)
+        return RedirectResponse(_same_site_back(next, fallback), status_code=303)
+
+    @app.get("/evolution/{project}", response_class=HTMLResponse)
+    def evolution_project_page(request: Request, project: str, days: str = ""):
+        """The same report scoped to one project — where each project page links"""
+        return _evolution(request, project, query_int(days, 90))
 
     @app.get("/alarms/{project}/{alarm_id}", response_class=HTMLResponse)
     def alarm_page(request: Request, project: str, alarm_id: str):
@@ -2129,9 +2650,15 @@ def create_app() -> FastAPI:
         return RedirectResponse(_same_site_back(next, "/"), status_code=303)
 
     @app.post("/inbox/ack")
-    def ack(inbox_id: str = Form("")):
-        ops.ack_inbox(int(inbox_id) if inbox_id else None)
-        return RedirectResponse("/inbox", status_code=303)
+    def ack(inbox_id: str = Form(""), shown: str | None = Form(None), next: str = Form("")):
+        if shown is not None:
+            # "Ack shown" under a filter acks only the rows the reader saw, never ack-all
+            for one in shown.split(","):
+                if one.strip().isdigit():
+                    ops.ack_inbox(int(one))
+        else:
+            ops.ack_inbox(int(inbox_id) if inbox_id else None)
+        return RedirectResponse(_same_site_back(next, "/inbox"), status_code=303)
 
     @app.post("/backlog/promote/{item_id}")
     def promote(item_id: str, force: str = Form("")):

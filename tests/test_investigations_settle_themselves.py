@@ -305,3 +305,59 @@ def test_a_report_stored_before_its_analyst_settles_says_so(started, store, monk
 
     assert store.get_feature_order(io["id"])["status"] == "plan_review"
     assert "IS stored" in out["warning"]
+
+
+# -- issue 1322: an analyst's evidence, its settled parent, and the panel's stale claim
+
+
+def test_an_analysts_refusal_gives_it_a_way_out_of_its_own():
+    wo = {"id": "wo-abc12345", "kind": "analyst", "parent_id": "io-1234abcd"}
+    work = landing.Authored(branch="b", base="origin/main", dirty=("repro.py",))
+
+    refusal = ops.unlanded_refusal(wo, "", work)
+
+    assert ops.NON_LANDING_EVIDENCE_RULE in refusal
+    assert "--abandon" in refusal
+    assert "user's call" not in refusal
+
+
+def _analyst_under(store, io_status: str):
+    io = ops.create_improvement_order("proj_a", "slow dispatch", "it is slow",
+                                      refs=["wo-11111111"])
+    analyst = store.create_work_order("analyse it", kind="analyst",
+                                      parent_id=io["id"])
+    store.update_feature_order(io["id"], plan_wo_id=analyst["id"])
+    store.set_feature_status(io["id"], io_status)
+    store.set_status(analyst["id"], "validating")
+    return io, analyst
+
+
+def test_a_validating_analyst_under_a_completed_io_is_settled(started, store):
+    _io, analyst = _analyst_under(store, "completed")
+
+    found = list(invariants.check_consumed_documents_settle(store))
+
+    assert [v.wo_id for v in found] == [analyst["id"]]
+    assert store.get_work_order(analyst["id"])["status"] == "completed"
+    kinds = [e["kind"] for e in store.list_events(analyst["id"])]
+    assert "document_consumed_settled" in kinds
+
+
+def test_a_validating_analyst_under_a_live_io_is_left_alone(started, store):
+    _io, analyst = _analyst_under(store, "plan_review")
+
+    assert list(invariants.check_consumed_documents_settle(store)) == []
+    assert store.get_work_order(analyst["id"])["status"] == "validating"
+
+
+def test_review_feedback_to_an_analyst_lists_what_its_io_filed_now(started, store):
+    io, analyst = _analyst_under(store, "plan_review")
+    report = a_report()
+    report["findings"][0]["created_orders"] = [{"id": "wo-9aa92369", "type": "work"}]
+    store.update_feature_order(io["id"], plan=ops.db.to_json(report))
+
+    note = ops.non_landing_review_note(store, store.get_work_order(analyst["id"]))
+
+    assert ops.NON_LANDING_EVIDENCE_RULE in note
+    assert "wo-9aa92369" in note
+    assert ops.non_landing_review_note(store, {"id": "wo-1", "kind": "worker"}) == ""

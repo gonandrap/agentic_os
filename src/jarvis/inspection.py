@@ -1064,7 +1064,8 @@ def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: 
     """The first (subagent, span) whose LAST span is an unfinished tool call older than `older_than`..."""
     for sub in subs:
         span = next((t.spans[-1] for t in reversed(sub.turns) if t.spans), None)
-        if span is None or span.finished or span.started < since:
+        # A zero start is a missing stamp, not 1970 (issue 1309)
+        if span is None or span.finished or not span.started or span.started < since:
             continue
         if now - span.started >= older_than:
             return sub, span
@@ -1116,8 +1117,9 @@ INFORMATIONAL_KINDS = frozenset({SLOW_RESPONSE_ALARM})
 REWRITE_PREFIX_ALARM = "rewrite-tax-prefix"
 REWRITE_TTL_ALARM = "rewrite-tax-ttl"
 
-#: THE OTHER AGGREGATE PAIR, and the only alarms in the OS about spend it did not make
+#: THE OTHER AGGREGATE PAIR
 CACHE_1H_DISPATCHED_ALARM = "cache-1h-dispatched"
+#: Historical, never raised now: it priced the 1h premium, not the reads saved (wo-10a5f151)
 CACHE_1H_FOREIGN_ALARM = "cache-1h-foreign"
 
 #: THE STAMP AGAINST THE RATE: an arm that never reached the CLI (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
@@ -1143,7 +1145,7 @@ ALARM_KINDS = {
     CACHE_1H_DISPATCHED_ALARM: "Jarvis's own turns bought the one-hour cache write — a "
                                "breach of the transport's 5-minute guarantee",
     CACHE_1H_FOREIGN_ALARM: "sessions Jarvis never dispatched bought the one-hour cache "
-                            "write — reportable, not fixable from inside the OS",
+                            "write (historical: nothing raises this now, wo-10a5f151)",
     CACHE_ARM_MISSED_ALARM: "a turn stamped with a cache-TTL arm paid the OTHER TTL — "
                             "the arm never reached the CLI, so the stamp records only "
                             "the intent",
@@ -1233,7 +1235,7 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
                 f"{held_note(wall, holding)} with nothing completed yet; the model is "
                 f"answering slowly, and this is not a stall{hint}")))
     for span in turn.spans:
-        if not span.is_join or span.finished or not now:
+        if not span.is_join or span.finished or not now or not span.started:
             continue
         # A DELEGATION is judged on HANG EVIDENCE and never on elapsed wait (spec §2b): at...
         if span.name in DELEGATION_TOOLS:
@@ -1362,8 +1364,7 @@ def one_hour_writes(since: float, *, root: Path | None = None,
         calls.sort(key=lambda c: c.ts)
         _attach_calls(turns, calls)
         for turn in turns:
-            dispatched = bool(turn.triggers) and all(
-                p.source == "sdk" for p in turn.triggers)
+            sdk = bool(turn.triggers) and all(p.source == "sdk" for p in turn.triggers)
             for call in turn.calls:
                 if not call.cache_1h or call.ts < since:
                     continue
@@ -1371,26 +1372,18 @@ def one_hour_writes(since: float, *, root: Path | None = None,
                 if entry is None:
                     entry = found[path.stem] = HourWrites(session_id=path.stem,
                                                           directory=path.parent.name)
-                if not dispatched:
-                    entry.foreign += call.cache_1h
-                elif _arm_of(arms, path.stem, call.ts) in DELIBERATE_ARMS:
+                # The record outranks promptSource: --bg worker prompts read "typed" (wo-10a5f151)
+                arm = _arm_of(arms, path.stem, call.ts)
+                if arm in DELIBERATE_ARMS:
                     entry.deliberate += call.cache_1h
-                else:
+                elif arm or sdk:
                     entry.dispatched += call.cache_1h
+                else:
+                    entry.foreign += call.cache_1h
                 entry.first_ts = min(entry.first_ts, call.ts) or call.ts
                 entry.last_ts = max(entry.last_ts, call.ts)
     return sorted(found.values(), key=lambda e: (-e.total, e.session_id))
 
-
-#: The one line that fixes the foreign half
-REMEDY_LINE = '"env": {"FORCE_PROMPT_CACHING_5M": "1"}  in ~/.claude/settings.json'
-
-#: Said on the foreign alarm and on nothing else
-NOT_OURS_TO_FIX = (
-    "JARVIS CANNOT FIX THIS AND MUST NOT TRY: the file is the user's own Claude "
-    "configuration, outside every project the OS manages. The deliverable is a work "
-    "order that tells a PERSON to add the line above, and a check that it took."
-)
 
 #: How many offending sessions the reason names before it stops
 NAMED_SESSIONS = 3
@@ -1413,9 +1406,8 @@ def _name_sessions(found: Sequence[HourWrites], attr: str) -> str:
 
 def hour_alarms(found: Sequence[HourWrites], cfg: InspectConfig, *,
                 days: int) -> list[Alarm]:
-    """What is standing-wrong with the fleet's cache TTL, one alarm per CAUSE"""
+    """Jarvis's own 5m-armed turns buying the one-hour cache write, fleet-wide"""
     dispatched = sum(e.dispatched for e in found)
-    foreign = sum(e.foreign for e in found)
     deliberate = sum(e.deliberate for e in found)
     window = f"in the last {days} days"
     raised: list[Alarm] = []
@@ -1433,15 +1425,6 @@ def hour_alarms(found: Sequence[HourWrites], cfg: InspectConfig, *,
             f"the hour ON PURPOSE on a 1h or cli arm {window}, which is not part of this "
             f"figure and is not a fault. Sessions: "
             f"{_name_sessions(found, 'dispatched')}.")))
-    if foreign >= cfg.alarm_cache_1h_tokens:
-        raised.append(Alarm(CACHE_1H_FOREIGN_ALARM, (
-            f"{foreign:,} tokens were written at the ONE-HOUR cache TTL {window} by "
-            f"sessions Jarvis never dispatched — about "
-            f"${_hour_premium_usd(foreign):,.2f} at Opus list above what the five-minute "
-            f"write would have cost. These are `claude` processes a person started, so "
-            f"the OS's own transport is not implicated. The fix is one line: "
-            f"{REMEDY_LINE}. {NOT_OURS_TO_FIX} Sessions: "
-            f"{_name_sessions(found, 'foreign')}.")))
     return raised
 
 

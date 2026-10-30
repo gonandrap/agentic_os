@@ -10,7 +10,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Union
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Union
 
 from . import db
 
@@ -337,6 +337,63 @@ def waive(central: CentralStore, item_id: str, reason: str) -> dict:
     return central.morpheus_item(item_id) or {}
 
 
+#: How a confirmed item's resolution starts: one fix order per item
+CONFIRMED = "confirmed failed by the user"
+
+
+def confirm(central: CentralStore, item_id: str, fix: str,
+            file: Callable[[dict[str, Any]], str]) -> tuple[dict, str]:
+    """The user rules the failure real; `file` opens the fix order. (item, order id)"""
+    item = _item_or_raise(central, item_id)
+    if item["state"] not in ACTION_STATES:
+        raise ValueError(f"{item_id} is {item['state']}: only a failed or timed-out check "
+                         f"can be confirmed")
+    if (item["resolution"] or "").startswith(CONFIRMED):
+        raise ValueError(f"{item_id} is already {item['resolution']}")
+    if not (fix or "").strip():
+        raise ValueError("say what needs fixing")
+    order = file(item)
+    central.update_morpheus_item(
+        item_id, resolution=f"{CONFIRMED}; fix filed as {order}: {fix.strip()}"[:1000])
+    return central.morpheus_item(item_id) or {}, order
+
+
+def fix_description(item: dict[str, Any], fix: str) -> str:
+    """A confirmed failure's fix order: the user's words, then what Morpheus saw"""
+    return (f"{fix.strip()}\n\nPR {item['pr_url']} {item['state']} its production "
+            f"validation ({item['resolution']}); the user confirmed the failure is real.\n"
+            f"The check: `jarvis morpheus show {item['id']}`. The OS watches it again "
+            f"once this order's fix reaches production.\n\n"
+            f"Last check output:\n{(item.get('last_output') or '—')[-1500:]}")
+
+
+_FIX_ORDER = re.compile(r"fix filed as (wo-[0-9a-f]{8})")
+
+
+def requeue_fixed(central: CentralStore, cfg: MorpheusConfig,
+                  carrier: Callable[[str], str]) -> list[str]:
+    """Re-watch each confirmed item whose fix order (via `carrier`) has a PR in production (#1307)"""
+    # An item exists for an order only once its PR reached production: released (the OS) or merged
+    shipped: dict[str, dict[str, Any]] = {}
+    for i in central.morpheus_items():
+        if i["wo_id"]:
+            shipped.setdefault(i["wo_id"], i)
+    requeued = []
+    for item in central.morpheus_items(ACTION_STATES):
+        m = _FIX_ORDER.search(item["resolution"] or "")
+        if not (item["resolution"] or "").startswith(CONFIRMED) or not m:
+            continue
+        fix = carrier(m.group(1))
+        landed = shipped.get(fix)
+        if not landed or landed["id"] == item["id"]:
+            continue
+        requeue(central, cfg, item["id"],
+                resolution=f"re-watched: its fix {fix} reached production in PR "
+                           f"#{landed['pr_number']}")
+        requeued.append(item["id"])
+    return requeued
+
+
 def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str, *,
             resolution: str = "") -> dict:
     """Watch it again with a fresh deadline (and a fresh action)"""
@@ -380,17 +437,28 @@ def run_script(script: str, cwd: Path, timeout: int) -> CheckResult:
     return CheckResult(proc.returncode, out[-OUTPUT_TAIL:])
 
 
+def checked_version(repo: Path) -> str:
+    """What production ran at a check: its tag, else tag-distance or commit; '' outside git"""
+    try:
+        return _git(repo, "describe", "--tags", "--always", "HEAD").strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
 def _cwd(cwd: CwdFor, item: dict[str, Any]) -> Path:
     return cwd(item) if callable(cwd) else cwd
 
 
 def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd: CwdFor,
           *, now: float | None = None,
-          run: Callable[[str, Path, int], CheckResult] = run_script) -> str:
+          run: Callable[[str, Path, int], CheckResult] = run_script,
+          version: Callable[[Path], str] | None = None) -> str:
     """Run an item's script once and move it by the exit codes alone; returns its state"""
     now = db.now() if now is None else now
-    result = run(item["script"], _cwd(cwd, item), cfg.script_timeout_seconds)
+    where = _cwd(cwd, item)
+    result = run(item["script"], where, cfg.script_timeout_seconds)
     fields: dict[str, Any] = {"last_check_ts": now, "checks": int(item["checks"]) + 1,
+                              "last_check_version": (version or checked_version)(where),
                               "last_exit": result.exit, "last_output": result.output,
                               "next_check_ts": now + cfg.check_every_minutes * 60}
     if result.exit == EXIT_VALIDATED:
@@ -402,8 +470,12 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
     elif now >= float(item["deadline_ts"]):
         fields.update(state="timedout", next_check_ts=None,
                       resolution=_timeout_reason(item, cfg, result.exit))
-    central.update_morpheus_item(item["id"], **fields)
-    return str(fields.get("state", item["state"]))
+    state = str(fields.get("state", item["state"]))
+    with db.write_transaction(central.conn):  # the run and the item move together: db.write_transaction
+        central.update_morpheus_item(item["id"], **fields)
+        central.add_morpheus_run(item["id"], exit=result.exit, output=result.output,
+                                 state_after=state, now=now)
+    return state
 
 
 def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig,
@@ -419,11 +491,15 @@ def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig,
 
 def sweep(central: CentralStore, cfg: MorpheusConfig, cwd: CwdFor, *,
           now: float | None = None,
-          run: Callable[[str, Path, int], CheckResult] = run_script) -> dict[str, int]:
+          run: Callable[[str, Path, int], CheckResult] = run_script,
+          skip: Collection[str] = ()) -> dict[str, int]:
     """Run every due script and expire every overdue item — no model, ever"""
     now = db.now() if now is None else now
     moved = {s: 0 for s in STATES}
     for item in central.morpheus_items(OPEN_STATES):
+        if (item["project"] or "") in skip:
+            # Offboarded: left as it is, never failed (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.2)
+            continue
         if item["state"] == "monitoring" and item["script"]:
             due = item["next_check_ts"]
             if due is None or float(due) <= now:
@@ -494,14 +570,15 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
         steward.Candidate("morpheus", "critical", project,
                           f"PR #{item['pr_number']} {item['state']} production validation",
                           evidence=(item.get("last_output") or item["resolution"],),
-                          parent_wo_id=wo_id),
+                          parent_wo_id=wo_id, payload={"morpheus_item": item["id"]}),
         catalog=catalog)
     if not decision.allowed:
         return "", f"the steward did not dispatch it ({decision.outcome}: {decision.reason})"
     live = ops.live_investigation(project, wo_id)
     if live:
         return live, ""
-    inv = ops.create_investigation_order(project, wo_id, why=_why(item), origin="jarvis")
+    inv = ops.create_investigation_order(project, wo_id, why=_why(item), origin="jarvis",
+                                         stamp=decision.stamp)
     return str(inv["id"]), ""
 
 
@@ -513,7 +590,8 @@ def _improve(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
     title = f"PR #{item['pr_number']} {item['state']} production validation"
     decision = steward.gate(
         steward.Candidate("morpheus", "critical", project, title,
-                          evidence=(item.get("last_output") or item["resolution"],)),
+                          evidence=(item.get("last_output") or item["resolution"],),
+                          payload={"morpheus_item": item["id"]}),
         catalog=catalog)
     if not decision.allowed:
         return "", f"the steward did not dispatch it ({decision.outcome}: {decision.reason})"
@@ -550,12 +628,13 @@ REQUEUE_OFFER = """If the failure was transient — production had not exercised
 environment hiccup — add `"action": "requeue"` to your JSON and the OS watches it again
 with a fresh deadline. That is available ONCE per item, and this item still has it.
 Ruling the change fine is the USER'S: recommend `jarvis morpheus waive {id} --reason "…"`,
-never a waive of your own."""
+never a waive of your own; ruling it broken is theirs too: `jarvis morpheus confirm {id} --fix "…"`."""
 
 #: It has spent it, so saying `requeue` would only look like an action
 REQUEUE_SPENT = """This item has already spent its one automatic requeue, so `"action": "requeue"` is
 refused and it stays {state}. The user re-watches it with `jarvis morpheus requeue {id}`
-or rules it fine with `jarvis morpheus waive {id} --reason "…"`."""
+rules it fine with `jarvis morpheus waive {id} --reason "…"`, or rules it broken and files
+the fix with `jarvis morpheus confirm {id} --fix "…"`."""
 
 
 def _ask_neo(catalog: Catalog, item: dict[str, Any], note: str = "") -> int:
@@ -587,6 +666,21 @@ def verdict_action(verdict: dict[str, Any]) -> str:
     """What a `validation` verdict asks the OS to do, or '' for anything else it said"""
     action = str(verdict.get("action") or "").strip().lower()
     return action if action in VERDICT_ACTIONS else ""
+
+
+def stale_question(item: dict[str, Any] | None,
+                   q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if the item this `validation` question asks about was decided elsewhere"""
+    item_id = item_of_question(q)
+    if not item_id:
+        return None
+    if item is None:
+        return ("SUPERSEDED — the Morpheus item is gone", f"{item_id} no longer exists")
+    # A requeue clears `action`, and a later failure asks a NEW question: either way not this one
+    if item["state"] not in ACTION_STATES or item.get("action") != f"neo:{q['id']}":
+        return (f"SUPERSEDED — {item_id} is {item['state']}",
+                f"{item_id} was already decided: it is {item['state']}")
+    return None
 
 
 def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, Any],
@@ -646,6 +740,11 @@ For each item you are given, spawn ONE subagent (Task tool), in parallel. Each s
      - exits 75 for everything else, including production not having exercised the
        change yet;
      - finishes in well under a minute;
+     - prints ONE line per hint it checks, starting `PASS`, `FAIL` or `UNKNOWN` (the
+       last for a check that exits 75), naming the hint in plain words a human reads
+       without the script — never a bare internal field name like `wedged=false`;
+     - never prints the release that first carried the PR on its own: the OS already
+       records that, and the check's own version, beside the output;
   3. registers it: `jarvis morpheus script <item id> --file /tmp/morpheus-<item id>.sh`.
 If the hints cannot be made mechanical, the subagent registers a script that exits 75 and
 prints why — the item then times out and a human decides.
@@ -673,12 +772,15 @@ def _forget_offer(central: CentralStore, item_id: str) -> None:
         _save_session(central, state)
 
 
-def wanting_scripts(central: CentralStore, *, now: float | None = None) -> list[dict]:
+def wanting_scripts(central: CentralStore, *, now: float | None = None,
+                    skip: Collection[str] = ()) -> list[dict]:
     """Queued items Morpheus should be asked about now"""
     now = db.now() if now is None else now
     offers = session_state(central).get("offers") or {}
     out = []
     for item in central.morpheus_items(("queued",)):
+        if (item["project"] or "") in skip:
+            continue
         seen = offers.get(item["id"]) or {}
         if int(seen.get("n") or 0) >= MAX_OFFERS:
             continue
@@ -719,7 +821,7 @@ def kill_hold(central: CentralStore, state: dict[str, Any], now: float) -> float
 
 def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = False,
          dirs: dict[str, Path] | None = None, now: float | None = None,
-         call: Callable[..., Any] | None = None) -> str:
+         call: Callable[..., Any] | None = None, skip: Collection[str] = ()) -> str:
     """One pass of Morpheus's session: compact if due, else write scripts if any are wanted"""
     from . import agent_usage, claude_cli
 
@@ -746,7 +848,7 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
         state.pop("kill_hold_until", None)
         state.pop("kill_hold_release", None)
         _save_session(central, state)
-    items = wanting_scripts(central, now=now)
+    items = wanting_scripts(central, now=now, skip=skip)
     if not state.get("compact_due") and not items:
         return "idle"
     session_id = state.get("session_id") or str(uuid.uuid4())

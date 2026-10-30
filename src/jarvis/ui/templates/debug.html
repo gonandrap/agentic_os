@@ -2,6 +2,8 @@
 {% import "_debug.html" as ui %}
 {% import "_order_nav.html" as nav %}
 {% block title %}debug — {{ wo.id }} — Jarvis{% endblock %}
+{# A row's prose drops under its label on a phone instead of one word per line — kn-fa085e88. #}
+{% block style %}.row { flex-wrap: wrap; } .row .grow { flex: 1 1 22ch; }{% endblock %}
 {% block content %}
 
 {# One page for all four readings of one order — spec §7 of
@@ -13,16 +15,11 @@
 {{ nav.order_nav(project, wo, 'debug') }}
 {{ nav.debug_jumps('') }}
 
-{# AT WIDTH — §3 of docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md.
-   Same blocks, same order in the document (the ranking above, which the tests read),
-   laid out side by side: the diagnosis spans the top band in its own columns, clearing
-   it and the live frame share the next one, and the two long readings — the anatomy and
-   the context ledger — take the full width with their turns folded. #}
+{# Full width, ranked order, no side-by-side grid — kn-fa085e88; §9 of
+   docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md. #}
 {% include "_debug_diagnosis.html" %}
-<div class="grid" style="--col: 640px;">
-<div>{% include "_debug_fix.html" %}</div>
-<div>{% include "_debug_live.html" %}</div>
-</div>
+{% include "_debug_fix.html" %}
+{% include "_debug_live.html" %}
 {% include "_debug_anatomy.html" %}
 {% include "_debug_context.html" %}
 

@@ -142,6 +142,18 @@ def test_an_escalated_alarm_is_not_asked_about_twice(started):
     assert [a["id"] for a in ops.alarm_review_queue()] == []
 
 
+def test_an_escalation_that_asks_nobody_else_heads_the_queue(started):
+    """A fleet alarm on a settled carrier: no flag, no Neo question — al-429dd161 (wo-10a5f151)"""
+    _, acked = _alarm("acked one", live=False, decided=True, status="acked")
+    _, orphan = _alarm("orphan", live=False, decided=True, status="escalated",
+                       verdict="escalate")
+
+    assert [a["id"] for a in ops.alarm_review_queue()] == [orphan, acked]
+    page = _client().get("/alarms?state=escalated").text
+    assert f'action="/alarms/proj_a/{orphan}/review"' in page
+    assert "/config?scope=os&amp;node=inspect" in page
+
+
 # -- the control is one macro, and this is the only observable form of that
 
 
