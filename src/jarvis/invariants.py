@@ -463,6 +463,24 @@ def release_base_red_blocker(said: dict[str, Any]) -> str:
         run_url=said.get("run_url") or "")
 
 
+def user_action_blocker(command: str) -> str:
+    """The no-change escalation that waits on a command only the user may run (#1352)"""
+    return (f"nothing was changed because the rest is yours to run: `{command}` — "
+            f"then close it with `jarvis wo done`")
+
+
+def escalated_user_action(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The user-only command the latest escalated round named, else ``""`` (#1352)"""
+    judged = store.last_judged_round(wo_id=wo["id"])
+    if not (judged and judged["outcome"] == "escalated"):
+        return ""
+    for event in reversed(store.events_of_kind(wo["id"], "validation_escalated")):
+        payload = db.from_json(event["payload"], {}) or {}
+        if int(payload.get("round_id") or 0) == int(judged["id"]):
+            return str(payload.get("user_action") or "")
+    return ""
+
+
 def pr_pending_blocker(wo_id: str, park: dict[str, Any]) -> str:
     """The pushed-branch-no-pull-request line, from the park payload only (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §5)"""
     branch = str(park.get("branch") or "its branch")
@@ -808,7 +826,9 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(PR_CLOSED_BLOCKER)
         # 2
         elif validation_escalated(store, wo):
-            if user_rework_unreviewed(store, wo):
+            if user_action := escalated_user_action(store, wo):
+                blockers.append(user_action_blocker(user_action))
+            elif user_rework_unreviewed(store, wo):
                 blockers.append(USER_REWORK_UNREVIEWED_BLOCKER)
             elif user_rework_refused(store, wo):
                 blockers.append(USER_REWORK_REFUSED_BLOCKER)
