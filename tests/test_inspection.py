@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import catalog, inspection, ops, usage
+from jarvis import catalog, inspection, navigation, ops, usage
 from jarvis.catalog import InspectConfig, load_catalog
 from jarvis.daemon import Daemon
 
@@ -286,6 +286,32 @@ def test_an_unfinished_tool_call_is_counted_but_not_timed(write_transcript):
 
     assert turn.unfinished == 1 and turn.tools == 0.0
     assert (row["calls"], row["unfinished"], row["mean"]) == (1, 1, 0.0)
+
+
+def test_a_jarvis_call_is_its_own_tool_profile_row(write_transcript):
+    """wo-5a894713: `jarvis` CLI calls never hide in the `Bash` row"""
+    commands = ["jarvis wo finish wo-1 --summary 'x'", "cd /w && jarvis learn show kn-1",
+                "jarvis status --json", "git status"]
+    session = write_transcript("verbs", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        {"type": "assistant", "timestamp": stamp(10),
+         "message": {"id": "m1", "model": "claude-opus-5",
+                     "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0, "output_tokens": 1},
+                     "content": [{"type": "tool_use", "id": f"t{i}", "name": "Bash",
+                                  "input": {"command": c}}
+                                 for i, c in enumerate(commands)]}},
+    ])
+
+    names = {r["name"] for r in inspection.read_session(session).tool_profile()}
+
+    assert names == {"jarvis wo finish", "jarvis learn show", "jarvis status", "Bash"}
+
+
+def test_jarvis_verb_reads_the_subcommand_only():
+    assert navigation.jarvis_verb("jarvis wo create jarvis_os 'title'") == "wo create"
+    assert navigation.jarvis_verb("/opt/bin/jarvis wo-1") == ""
+    assert navigation.jarvis_verb("echo 'jarvis wo send'") is None
 
 
 # -- a turn nothing was ever observed doing

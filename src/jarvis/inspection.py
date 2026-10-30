@@ -291,6 +291,15 @@ class ToolSpan:
     backgrounded: bool = False
     #: Does this Bash call read or search SOURCE?
     navigates_source: bool | None = None
+    #: The `jarvis` subcommand this Bash call ran (`wo finish`), None when it ran none
+    jarvis_verb: str | None = None
+
+    @property
+    def label(self) -> str:
+        """The tool profile's row: a `jarvis` call is its own row, never one more `Bash`"""
+        if self.jarvis_verb is None:
+            return self.name
+        return f"jarvis {self.jarvis_verb}".rstrip()
 
     @property
     def finished(self) -> bool:
@@ -654,8 +663,8 @@ class Anatomy:
         """Count, total and mean seconds per tool name, dearest total first"""
         by_name: dict[str, dict[str, Any]] = {}
         for span in self.spans:
-            row = by_name.setdefault(span.name, {"name": span.name, "calls": 0,
-                                                 "seconds": 0.0, "unfinished": 0})
+            row = by_name.setdefault(span.label, {"name": span.label, "calls": 0,
+                                                  "seconds": 0.0, "unfinished": 0})
             row["calls"] += 1
             row["seconds"] += span.seconds
             if not span.finished:
@@ -757,6 +766,13 @@ def _navigates(block: dict[str, Any]) -> bool | None:
     if not command:
         return None
     return navigation.navigates_source(command, navigation.SOURCE_SUFFIXES)
+
+
+def _jarvis_verb(block: dict[str, Any]) -> str | None:
+    """The `jarvis` subcommand of this `tool_use` block, from the RAW command like `_navigates`"""
+    if str(block.get("name") or "") != "Bash":
+        return None
+    return navigation.jarvis_verb(str((block.get("input") or {}).get("command") or ""))
 
 
 def _detail_of(payload: Any, limit: int) -> str:
@@ -868,7 +884,8 @@ def read_transcript(path: Path | str,
                             backgrounded=bool((block.get("input") or {}).get(
                                 "run_in_background")),
                             # §3: the RAW command, never `detail` (prose) or `params` (capped)
-                            navigates_source=_navigates(block))
+                            navigates_source=_navigates(block),
+                            jarvis_verb=_jarvis_verb(block))
             pending[tool_id] = span
             # Charged to the turn that ASKED for it
             if open_turn is not None:
