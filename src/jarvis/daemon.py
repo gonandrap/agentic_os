@@ -2179,6 +2179,17 @@ class Daemon:
                 log.info("[%s] %s: round %d voided — abandoned with nothing produced",
                          project.name, wo_id, n)
                 return
+            # NOTHING CHANGED BECAUSE THE REST IS THE USER'S TO RUN: name it (#1352)
+            finished = store.events_of_kind(wo_id, "finished")
+            needs_user = (str(db.from_json(finished[-1]["payload"], {}).get("needs_user")
+                              or "") if finished else "")
+            if empty == "escalate" and needs_user:
+                self._escalate(store, wo, round_id, n,
+                               f"this submission changes no files because the rest is "
+                               f"a command only you may run: `{needs_user}`. Nobody "
+                               f"has judged the work.",
+                               cause=ops.ESCALATION_USER_ACTION, user_action=needs_user)
+                return
             if empty == "escalate":
                 self._escalate(store, wo, round_id, n,
                                "this submission changes no files and records no other "
@@ -2411,11 +2422,12 @@ class Daemon:
 
     @staticmethod
     def _escalate(store: ProjectStore, wo: dict, round_id: int, n: int,
-                  reason: str, *, cause: str) -> None:
+                  reason: str, *, cause: str, user_action: str = "") -> None:
         """Give up on this unit and ask the user (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §2.)"""
         from . import ops
 
-        ops.escalate_validation_round(store, wo, round_id, n, reason, cause=cause)
+        ops.escalate_validation_round(store, wo, round_id, n, reason, cause=cause,
+                                      user_action=user_action)
 
     @staticmethod
     def _validation_held(store: ProjectStore, wo: dict, round_id: int, n: int,

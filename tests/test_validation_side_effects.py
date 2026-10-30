@@ -34,6 +34,33 @@ def test_a_submission_with_nothing_at_all_is_still_escalated_unjudged(fleet):
     assert "nothing to review" in rnd["reason"]
 
 
+def test_a_no_change_submission_waiting_on_the_user_names_the_command(fleet):
+    """#1352: wo-b677d9e4 escalated as 'nothing to review' with its `jarvis config set` buried"""
+    from jarvis import invariants
+
+    seen = Validator(passed())
+    fleet.daemon.validator = seen
+    wo = fleet.dispatch()
+    command = "jarvis config set shared_schedule rules.enabled true"
+    ops.finish(wo["id"], "only the user may set it", pr_url=PR,
+               evidence="read both catalogs", needs_user=command)
+    fleet.drain()
+
+    assert seen.calls == []
+    rnd = _round(fleet, wo["id"])
+    assert rnd["outcome"] == "escalated"
+    assert command in rnd["reason"]
+    store = fleet.store()
+    try:
+        row = store.get_work_order(wo["id"])
+        assert command in row["attention_reason"]
+        assert row["attention_reason"] == invariants.true_blockers(store, row)[0]
+        assert ops.escalation_cause(store, wo_id=wo["id"], round_id=rnd["id"]) == \
+            ops.ESCALATION_USER_ACTION
+    finally:
+        store.close()
+
+
 def test_a_knowledge_only_submission_reaches_the_panel(fleet):
     """Issue #200's live case, in one test: wo-28405ea1 retracted a fleet-wide instruction"""
     seen = Validator(passed())
