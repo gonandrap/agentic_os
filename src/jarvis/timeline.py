@@ -10,7 +10,7 @@ from typing import Any
 ESCALATION_HANDOVER = frozenset({
     "rounds_spent", "user_rework_ceiling", "rebinds_spent"})
 ESCALATION_NOT_REVIEWED = frozenset({
-    "bounce_exhausted", "nothing_to_judge", "repeat_submission"})
+    "bounce_exhausted", "nothing_to_judge", "user_action", "repeat_submission"})
 ESCALATION_UNJUDGED = frozenset({
     "no_verdict", "validator_unreachable", "prompt_refused", "panel_killed"})
 

@@ -578,6 +578,8 @@ CREATE TABLE IF NOT EXISTS morpheus_items (
     action_ts REAL,
     auto_requeues INTEGER NOT NULL DEFAULT 0,  -- requeues Neo's own verdict has spent (capped)
     last_check_version TEXT NOT NULL DEFAULT '',  -- what production ran at the last check (#1301)
+    script_rewrites INTEGER NOT NULL DEFAULT 0,  -- scripts Neo's verdict sent back to be rewritten (#1358)
+    rewrite_brief TEXT NOT NULL DEFAULT '',  -- why the last script was wrong, for the rewrite
     UNIQUE (repo, pr_number)
 );
 CREATE INDEX IF NOT EXISTS idx_morpheus_items_state ON morpheus_items(state);
@@ -645,6 +647,9 @@ ADDED_COLUMNS = {
         "auto_requeues": "INTEGER NOT NULL DEFAULT 0",
         # …and before a check recorded the version it ran on (issue #1301)
         "last_check_version": "TEXT NOT NULL DEFAULT ''",
+        # …and before a wrong script could be sent back to be rewritten (issue #1358)
+        "script_rewrites": "INTEGER NOT NULL DEFAULT 0",
+        "rewrite_brief": "TEXT NOT NULL DEFAULT ''",
     },
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
@@ -2308,7 +2313,7 @@ class CentralStore:
         """Write the named columns, stamping `updated_ts`"""
         allowed = {"script", "script_source", "state", "deadline_ts", "last_check_ts",
                    "next_check_ts", "checks", "last_exit", "last_output", "resolution",
-                   "last_check_version",
+                   "last_check_version", "rewrite_brief",
                    "action", "action_ts", "hints"}
         bad = set(fields) - allowed
         assert not bad, bad
@@ -2349,6 +2354,13 @@ class CentralStore:
         cur = self.conn.execute(
             "UPDATE morpheus_items SET auto_requeues=auto_requeues+1, updated_ts=? "
             "WHERE id=? AND auto_requeues<?", (db.now(), item_id, limit))
+        return cur.rowcount == 1
+
+    def claim_morpheus_script_rewrite(self, item_id: str, limit: int) -> bool:
+        """Spend one automatic script rewrite: False once the item has spent `limit` of them"""
+        cur = self.conn.execute(
+            "UPDATE morpheus_items SET script_rewrites=script_rewrites+1, updated_ts=? "
+            "WHERE id=? AND script_rewrites<?", (db.now(), item_id, limit))
         return cur.rowcount == 1
 
     # -- os state

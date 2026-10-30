@@ -509,6 +509,116 @@ def test_no_decision_owed_means_no_key_at_all(jarvis_home, catalog_file, project
     assert "review" not in doc
 
 
+# -- a pending assumption says WHO it is waiting on, and where it was raised (#1265)
+
+
+def test_a_pending_assumption_names_the_setting_that_left_it_with_the_user(
+        jarvis_home, catalog_file, project):
+    """The whole defect: auto-review off writes no event, so the card said nothing"""
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("nobody judged this")
+        ops.assume(wo["id"], "assumed the API is v2")
+        row = ops.assumptions_with_rulings(store, wo["id"])[0]
+    finally:
+        store.close()
+
+    # The shipped default, and the one the reporter was on
+    assert row["os_ruling"] is None
+    line = ops.assumption_routing_line(row)
+    assert "`validation.enabled` is off" in line
+    assert "nobody judged it before you" in line
+
+
+def test_a_row_the_os_ruled_on_keeps_its_ruling_and_gains_no_routing_line(
+        jarvis_home, catalog_file, project):
+    """Never both: `assumption_ruling_line` already says who looked"""
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("Neo escalated this one")
+        ops.assume(wo["id"], "assumed the API is v2")
+        row = store.all_assumptions(wo["id"])[0]
+        store.add_event(wo["id"], "autoreview_escalated",
+                        {"assumption_id": row["id"], "n": 1, "reason": "too big a call",
+                         "neo_question_id": 7})
+        ruled = ops.assumptions_with_rulings(store, wo["id"])[0]
+    finally:
+        store.close()
+
+    assert "Neo escalated (question 7)" in ops.assumption_ruling_line(ruled)
+    assert ops.assumption_routing_line(ruled) == ""
+
+
+def test_a_settled_assumption_has_no_routing_line(jarvis_home, catalog_file, project):
+    """It is not with anybody any more"""
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("already decided")
+        ops.assume(wo["id"], "assumed the API is v2")
+        row = store.all_assumptions(wo["id"])[0]
+        store.review_assumption(row["id"], "accepted", decided_by="user", reason="fine")
+        settled = ops.assumptions_with_rulings(store, wo["id"])[0]
+    finally:
+        store.close()
+
+    assert ops.assumption_routing_line(settled) == ""
+
+
+def test_an_assumption_points_at_the_turn_that_raised_it(jarvis_home, catalog_file,
+                                                         project):
+    """`jarvis wo assume` runs inside a turn, so the turn's reply is the FIRST one after it"""
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("two turns, one assumption")
+        earlier = store.record_agent_reply(wo["id"], "first turn, nothing assumed yet")
+        ops.assume(wo["id"], "assumed the API is v2")
+        raised_in = store.record_agent_reply(wo["id"], "recorded assumption #1 — why")
+        store.record_agent_reply(wo["id"], "a later turn, unrelated")
+        row = ops.assumptions_with_rulings(store, wo["id"])[0]
+    finally:
+        store.close()
+
+    assert row["source_ref"] == {"kind": "message", "id": raised_in,
+                                 "label": "the turn that raised it"}
+    assert row["source_ref"]["id"] != earlier
+
+
+def test_an_assumption_no_reply_follows_points_at_nothing(jarvis_home, catalog_file,
+                                                          project):
+    """A link that resolves to nothing is worse than no link"""
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("the turn never ended")
+        store.record_agent_reply(wo["id"], "a turn that preceded it")
+        ops.assume(wo["id"], "assumed the API is v2")
+        row = ops.assumptions_with_rulings(store, wo["id"])[0]
+    finally:
+        store.close()
+
+    assert row["source_ref"] is None
+
+
+def test_wo_show_carries_the_routing_line_so_the_cli_and_the_page_agree(
+        jarvis_home, catalog_file, project, capsys):
+    """§4 of the issue: one renderer, both surfaces"""
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("nobody judged this either")
+    finally:
+        store.close()
+    ops.assume(wo["id"], "assumed the API is v2")
+
+    out = _out(capsys, ["wo", "show", wo["id"]])
+    assert "`validation.enabled` is off" in out
+    assert "nobody judged it before you" in out
+
+
 # -- an escalated round says WHY, and what to run next
 
 #: Every cause a call site writes

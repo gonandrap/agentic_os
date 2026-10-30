@@ -740,6 +740,11 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--reason", required=True)
     m = mo.add_parser("requeue", help="watch a settled PR again with a fresh deadline")
     m.add_argument("item_id")
+    m = mo.add_parser("rewrite", help="rule the check script wrong, not the PR: Morpheus "
+                                      "writes a new one, then the OS watches it again")
+    m.add_argument("item_id")
+    m.add_argument("--why", required=True,
+                   help="what the script gets wrong and what the right check is")
     m = mo.add_parser("confirm", help="rule a failed check real and file the work order "
                                       "that fixes it")
     m.add_argument("item_id")
@@ -950,6 +955,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="another order carries this one's work (a duplicate): links "
                         "follow it, e.g. Morpheus re-watches a confirmed failure when "
                         "THAT order's fix reaches production")
+    f.add_argument("--needs-user", dest="needs_user", default="", metavar="COMMAND",
+                   help="the exact command only the user may run that the rest of "
+                        "this work waits on (e.g. `jarvis config set …`): a "
+                        "submission that changes nothing escalates naming it")
 
     r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
     r.add_argument("wo_id")
@@ -3664,7 +3673,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "finish":
         _print(ops.finish(args.wo_id, args.summary, pr_url=args.pr or None,
                           evidence=args.evidence, abandon=args.abandon,
-                          superseded_by=args.superseded_by), args.json)
+                          superseded_by=args.superseded_by,
+                          needs_user=args.needs_user), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
                                      feedback=args.feedback,
@@ -4233,6 +4243,10 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
         return 0
     if args.morpheus_cmd == "requeue":
         item = ops.morpheus_requeue(args.item_id)
+        _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
+    if args.morpheus_cmd == "rewrite":
+        item = ops.morpheus_rewrite(args.item_id, args.why)
         _print({"id": item["id"], "state": item["state"]}, args.json)
         return 0
     if args.morpheus_cmd == "confirm":

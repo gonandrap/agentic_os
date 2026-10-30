@@ -3602,7 +3602,14 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
     # Children of this plan that have already landed, for the rows that are still the user's
     over = (_overtaken(store, wo_id)
             if any(str(a.get("status") or "") == "pending" for a in rows) else None)
-    return [{**a, "overtaken": over if str(a.get("status") or "") == "pending" else None}
+    # WHY a pending row with no ruling is with the user — the catalog is read only if one is
+    off = (autoreview_off_because(store.project_path)
+           if any(str(a.get("status") or "") == "pending" and not a.get("os_ruling")
+                  for a in rows) else "")
+    replies = store.agent_replies(wo_id) if rows else []
+    return [{**a, "overtaken": over if str(a.get("status") or "") == "pending" else None,
+             "autoreview_off": off,
+             "source_ref": assumption_source_ref(a, replies)}
             for a in rows]
 
 
@@ -3754,6 +3761,32 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
     return ""
 
 
+def assumption_routing_line(a: dict[str, Any]) -> str:
+    """WHY a pending assumption is with the user when nothing judged it first (issue #1265)"""
+    # A row with a ruling already says who looked, through `assumption_ruling_line`
+    if str(a.get("status") or "") != "pending" or a.get("os_ruling"):
+        return ""
+    # ABSENT, not empty: a row `assumptions_with_rulings` never enriched carries no answer
+    off = a.get("autoreview_off")
+    if off is None:
+        return ""
+    if off:
+        return f"With you because {off} for this project, so nobody judged it before you"
+    return "With you because the automatic review has not reached it yet"
+
+
+def assumption_source_ref(a: dict[str, Any],
+                          replies: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The worker turn this assumption was recorded during, as a `timeline` ref, or None"""
+    # `jarvis wo assume` always runs BEFORE the reply that ends its turn (#1265)
+    ts = float(a.get("ts") or 0.0)
+    for m in replies:
+        if float(m.get("ts") or 0.0) >= ts:
+            return {"kind": "message", "id": int(m["id"]),
+                    "label": "the turn that raised it"}
+    return None
+
+
 def overtaken_line(a: dict[str, Any]) -> str:
     """CHILDREN OF THIS PLAN THAT ALREADY MERGED, in one line, or `''`"""
     over = a.get("overtaken") or {}
@@ -3809,9 +3842,9 @@ def assumption_line(a: dict[str, Any]) -> str:
     n, status = a.get("n"), str(a.get("status") or "")
     content = str(a.get("content") or "")
     if status == "pending":
-        parts = [p for p in (assumption_ruling_line(a), provisional_line(a),
-                             objection_line(a), objection_response_line(a),
-                             overtaken_line(a)) if p]
+        parts = [p for p in (assumption_ruling_line(a), assumption_routing_line(a),
+                             provisional_line(a), objection_line(a),
+                             objection_response_line(a), overtaken_line(a)) if p]
         return (f"#{n} pending your review: {content}"
                 f"{' — ' + '; '.join(parts) if parts else ''}")
     reason = str(a.get("decided_reason") or "").strip()
@@ -4346,18 +4379,21 @@ BOUNCE_EXHAUSTED = (
 
 
 def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id: int,
-                              n: int, reason: str, *, cause: str) -> None:
+                              n: int, reason: str, *, cause: str,
+                              user_action: str = "") -> None:
     """Give up on this unit and ask the user (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §2)"""
     from .daemon import escalation_body
-    from .invariants import VALIDATION_STUCK_BLOCKER
+    from .invariants import VALIDATION_STUCK_BLOCKER, user_action_blocker
 
     wo_id = wo["id"]
     store.settle_validation_round(
         round_id, "escalated",
-        {"round": n, "round_id": round_id, "reason": reason, "cause": cause},
+        {"round": n, "round_id": round_id, "reason": reason, "cause": cause,
+         **({"user_action": user_action} if user_action else {})},
         wo_id=wo_id, reason=reason)
     store.set_status(wo_id, "needs_review")
-    store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
+    store.flag_attention(wo_id, user_action_blocker(user_action) if user_action
+                         else VALIDATION_STUCK_BLOCKER)
     store.add_notification(
         # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §3
         title=ESCALATION_TITLE.format(
@@ -5183,8 +5219,8 @@ def unlanded_refusal(wo: dict[str, Any], summary: str, work: landing.Authored) -
 
 
 def finish(wo_id: str, summary: str, pr_url: str | None = None,
-           evidence: str = "", abandon: str = "", superseded_by: str = ""
-           ) -> dict[str, Any]:
+           evidence: str = "", abandon: str = "", superseded_by: str = "",
+           needs_user: str = "") -> dict[str, Any]:
     """The worker reporting its own result (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §1)"""
     name, path, _wo = find_work_order(wo_id)
     superseded_by = (superseded_by or "").strip()
@@ -5221,6 +5257,8 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                         {"summary": summary,
                          **({"pr_url": pr_url} if pr_url else {}),
                          **({"evidence": evidence} if evidence else {}),
+                         **({"needs_user": needs_user.strip()}
+                            if needs_user.strip() else {}),
                          **({"authored": work.record()} if work.base else {})})
         if superseded_by:
             # Morpheus follows it to the order that carries a confirmed failure's fix (#1307)
@@ -5702,6 +5740,8 @@ ESCALATION_VALIDATOR_UNREACHABLE = "validator_unreachable"
 ESCALATION_PROMPT_REFUSED = "prompt_refused"
 #: A KILL IS NOT AN OUTAGE: the seats were reached and were killed by a signal (docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md §4)
 ESCALATION_PANEL_KILLED = "panel_killed"
+#: Nothing to judge BECAUSE what is left is a command only the user may run (#1352)
+ESCALATION_USER_ACTION = "user_action"
 #: READ-TIME FALLBACK, never written by any call site: every `validation_escalated` event written...
 ESCALATION_CAUSE_UNRECORDED = "unrecorded"
 
@@ -5712,6 +5752,7 @@ ESCALATION_FAMILY: dict[str, str] = {
     ESCALATION_REBINDS_SPENT: "handover",
     ESCALATION_BOUNCE_EXHAUSTED: "not_reviewed",
     ESCALATION_NOTHING_TO_JUDGE: "not_reviewed",
+    ESCALATION_USER_ACTION: "not_reviewed",
     ESCALATION_REPEAT_SUBMISSION: "not_reviewed",
     ESCALATION_NO_VERDICT: "unjudged",
     ESCALATION_VALIDATOR_UNREACHABLE: "unjudged",
@@ -5738,6 +5779,9 @@ ESCALATION_WHY: dict[str, str] = {
     ESCALATION_NOTHING_TO_JUDGE:
         "the submission changed no files and recorded no other durable effect, so no "
         "seat judged it.",
+    ESCALATION_USER_ACTION:
+        "the submission changed no files because what is left is a command only you "
+        "may run, so no seat judged it.",
     ESCALATION_REPEAT_SUBMISSION:
         "the submission was identical to the preceding round, so the panel had nothing "
         "new to judge.",
@@ -13230,21 +13274,30 @@ def inspect_config_at(project_path: Path) -> Any:
         return InspectConfig()
 
 
-def auto_review_at(project_path: Path) -> bool:
-    """Will the OS decide this project's assumptions ITSELF, rather than the user?"""
+def autoreview_off_because(project_path: Path) -> str:
+    """WHICH setting leaves this project's assumptions with the user, or `''` when the OS judges them"""
     try:
         catalog = resolve_catalog()
         if not catalog.os.neo.enabled:
-            return False
+            return "`os.neo.enabled` is off"
         target = Path(project_path).resolve()
         cfg = catalog.os.validation
         for spec in catalog.projects:
             if Path(spec.path).resolve() == target:
                 cfg = spec.validation
                 break
-        return bool(cfg.enabled and cfg.auto_review)
+        if not cfg.enabled:
+            return "`validation.enabled` is off"
+        if not cfg.auto_review:
+            return "`validation.auto_review` is off"
+        return ""
     except (OpsError, CatalogError, OSError, ValueError):
-        return False
+        return "the catalog could not be read"
+
+
+def auto_review_at(project_path: Path) -> bool:
+    """Will the OS decide this project's assumptions ITSELF, rather than the user?"""
+    return not autoreview_off_because(project_path)
 
 
 def schedule_config_at(project_path: Path, catalog: Catalog | None = None) -> Any:
@@ -15449,5 +15502,22 @@ def morpheus_requeue(item_id: str) -> dict[str, Any]:
     finally:
         central.close()
     _close_validation_questions(item_id, f"The user put {item_id} back on the watch list",
+                                f"decided by the user on {item_id} itself")
+    return item
+
+
+def morpheus_rewrite(item_id: str, why: str) -> dict[str, Any]:
+    """The user rules the script wrong: Morpheus writes a new one from `why` (#1358)"""
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        item = morpheus.rewrite(central, _morpheus_catalog().os.morpheus, item_id, why)
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+    _close_validation_questions(item_id, f"The user sent {item_id}'s script back to be "
+                                         f"rewritten: {why.strip()}",
                                 f"decided by the user on {item_id} itself")
     return item
