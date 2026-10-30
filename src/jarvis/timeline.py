@@ -377,6 +377,9 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
             return (f"Assumption #{p.get('n')}: the OS dropped its ruling when the work "
                     f"order changed, and will ask Neo again",
                     p.get("reason") or "no reason recorded")
+        if p.get("advisory"):
+            return (f"Assumption #{p.get('n')} left with you (high-stakes) — Neo advised",
+                    p.get("reason") or "no reason recorded")
         return (f"Assumption #{p.get('n')} left with you{why}",
                 p.get("reason") or "no reason recorded")
     if kind == "autoreview_held":

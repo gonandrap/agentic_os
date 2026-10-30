@@ -6028,11 +6028,17 @@ class Daemon:
                     # The store refused to hold the question, so nothing was asked and nothing was linked (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
                     self._note_confirmation_refused(project, store, wo, a, e)
                 continue
-            def judge(stakes_verdict=None, a=a):
+            linked = int(a.get("neo_question_id") or 0)
+            # Advice on a hold is not a ruling in flight: the hold stays the row's state (wo-6d90354c)
+            advised = linked if linked and not early and autoreview.is_advisory(
+                neo_store.get(linked)) else 0
+
+            def judge(stakes_verdict=None, a=a, advised=advised):
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
                             round_reason=round_reason,
                             refusal_answered=answered,
                             undeclared_delivery=undeclared,
+                            asked_question_id=advised,
                             unreachable_question_ids=dead_questions,
                             stakes=stakes_verdict)
 
@@ -6040,6 +6046,13 @@ class Daemon:
             if not decision.armed:
                 self._note_autoreview_held(store, wo["id"], decision,
                                            suppress=suppress)
+                if (not early and decision.code == autoreview.HELD_HIGH_STAKES
+                        and (not linked or linked in dead_questions)):
+                    # Neo ADVISES on a high-stakes hold; the user still decides (wo-6d90354c)
+                    if autoreview.decide_evidence(
+                            a, summary=str(wo.get("result_summary") or "")).armed:
+                        autoreview.propose(store, neo_store, project.name, wo, a,
+                                           assumptions, cfg=cfg, advisory=True)
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
                                early=early, cfg=cfg)
@@ -6166,6 +6179,9 @@ class Daemon:
         # `n` is a position in the work order's list and is derived
         numbered = next((a for a in pstore.all_assumptions(wo["id"])
                          if a["id"] == assumption["id"]), assumption)
+        if autoreview.is_advisory(q):
+            self._record_advice(neo_store, pstore, wo, numbered, q, verdict)
+            return
         if verdict.get("refine"):
             if self._asked_early(pstore, wo["id"], int(q["id"])):
                 autoreview.return_to_worker(pstore, wo["id"], numbered,
@@ -6295,6 +6311,30 @@ class Daemon:
             if int(payload.get("neo_question_id") or 0) == question_id:
                 return bool(payload.get("early"))
         return False
+
+    def _record_advice(self, neo_store: Any, pstore: ProjectStore, wo: dict,
+                       assumption: dict, q: dict, verdict: dict) -> None:
+        """Neo's ADVICE on a high-stakes hold: recorded for the user, never acted on (wo-6d90354c)"""
+        from . import autoreview, db
+
+        ruling = autoreview.read_ruling(verdict, default_model=self.catalog.os.neo.model)
+        advice = (f"Neo would approve it: {ruling.reason}" if ruling.accept
+                  else ruling.reason)
+        if not verdict.get("escalate"):
+            neo_store.mark(q["id"], "escalated", reason=advice, cause="high-stakes")
+        # WHY it was held rides with the advice: the user reads both on one line
+        held = [p for p in (db.from_json(e["payload"], {})
+                            for e in pstore.events_of_kind(wo["id"], "autoreview_held"))
+                if int(p.get("assumption_id") or 0) == int(assumption["id"])
+                and p.get("code") == autoreview.HELD_HIGH_STAKES]
+        pstore.add_event(wo["id"], "autoreview_escalated", {
+            "assumption_id": assumption["id"], "n": assumption.get("n"),
+            "reason": advice, "stakes": ruling.stakes, "model": ruling.model,
+            "neo_question_id": q["id"], "overridden": False, "advisory": True,
+            "code": autoreview.HELD_HIGH_STAKES,
+            "held": str(held[-1].get("reason") or "") if held else ""})
+        log.info("Neo advised on high-stakes assumption #%s of %s: %s",
+                 assumption.get("n"), wo["id"], advice)
 
     def _record_early_assumption_verdict(self, neo_store: Any, pstore: ProjectStore,
                                          wo: dict, assumption: dict, q: dict,

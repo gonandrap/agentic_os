@@ -3758,6 +3758,10 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
                 f"{' — ' + reason if reason else ''}")
     if kind == "autoreview_escalated":
         asked = f" (question {question})" if question else ""
+        if ruling.get("advisory"):
+            held = re.sub(r"^assumption #\d+ ", "", str(ruling.get("held") or ""))
+            return (f"Held by the OS — {held or 'high-stakes'}; "
+                    f"Neo's advice{asked}: {reason}")
         return f"Neo escalated{asked}{': ' + reason if reason else ''}"
     if kind == "autoreview_held":
         held = re.sub(r"^assumption #\d+ ", "", reason)
@@ -3891,6 +3895,9 @@ def _autoreview_line(state: dict[str, Any]) -> str:
     if kind == "autoreview_escalated" and state.get("re_asked") and not since:
         return (f"assumption #{n} goes back to Neo — the OS dropped its ruling: "
                 f"{state.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_escalated" and state.get("advisory"):
+        return (f"assumption #{n} left with you (high-stakes) — Neo's advice: "
+                f"{state.get('reason') or 'no reason recorded'}{since}")
     if kind == "autoreview_escalated":
         return (f"assumption #{n} left with you — "
                 f"{state.get('reason') or 'no reason recorded'}{since}")
