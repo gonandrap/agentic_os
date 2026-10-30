@@ -131,6 +131,24 @@
   <p class="kv">handed to: {{ mv.handoff(item.action) }}</p>
   {% if item.resolution %}<p class="kv">{{ item.resolution }}</p>{% endif %}
 </div>
+{% if d.investigations %}
+{# Forward links: investigation -> issue -> fix order (#1344) #}
+<h3>Investigations</h3>
+<div class="panel">
+  {% for inv in d.investigations %}
+  <div class="row"><div class="grow">
+    <a href="/inv/{{ inv.project }}/{{ inv.id }}">{{ inv.id }}</a> ({{ inv.status }})
+    {{ inv.classification or "no verdict" }}
+    {% if inv.issue_url %}→ <a href="{{ inv.issue_url }}">{{ inv.issue_url }}</a>{% endif %}
+    {% if inv.fix %}→ <a href="/wo/{{ inv.project }}/{{ inv.fix.wo_id }}">{{ inv.fix.wo_id }}</a>
+      ({{ inv.fix.status }}){% if inv.fix.pr_url %} · <a href="{{ inv.fix.pr_url }}">PR</a>{% endif %}
+      {% if inv.fix.production %} · in production (PR #{{ inv.fix.production.pr_number }}){% endif %}
+    {% endif %}
+    {% if inv.dispatch %}<div class="sub">{{ inv.dispatch }}</div>{% endif %}
+  </div></div>
+  {% endfor %}
+</div>
+{% endif %}
 </section>
 </div>
 

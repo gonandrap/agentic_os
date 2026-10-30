@@ -1557,5 +1557,73 @@ def test_the_cli_prints_the_work_order_it_expedited(fleet, capsys):
     assert fleet.wo_id() in out and "expedited" in out
 
 
+# -- an investigation's GAP closes its own loop (#1344) --------------------------
+
+INV = {"investigation": "fo-1a2b3c4d", "morpheus_item": "mv-0000aaaa"}
+
+
+@pytest.fixture()
+def gap(fleet, monkeypatch):
+    """A `high` bug filed by an investigation; what settle_triage writes back is captured"""
+    from jarvis import ops
+
+    recorded = []
+    monkeypatch.setattr(ops, "record_investigation_dispatch",
+                        lambda inv, wo, note, project=None: recorded.append((inv, wo, note)))
+    pickup = bugreport.report_bug(title="gap", description="d", expected="e", actual="a",
+                                  priority="high", investigation=dict(INV))["pickup"]
+    return pickup, recorded
+
+
+def test_an_investigation_gap_at_high_asks_neo_and_carries_its_links(fleet, gap):
+    pickup, _ = gap
+    assert pickup["neo_question_id"] and not pickup["wo_id"]
+    assert INV["investigation"] in pickup["reason"]
+    context = json.loads(fleet._last_triage()["context"])
+    assert {k: context[k] for k in INV} == INV
+
+
+def test_neo_agreeing_and_the_steward_allowing_starts_the_fix_at_once(fleet, gap, monkeypatch):
+    from jarvis import db, steward
+
+    seen = []
+    real = steward.gate
+    monkeypatch.setattr(steward, "gate",
+                        lambda c, **kw: seen.append(c.origin_kind) or real(c, **kw))
+    fleet.triage(approve=True)
+    wo_id = fleet.wo_id()
+    assert wo_id and seen == ["investigation"]
+    store = fleet.store()
+    try:
+        metadata = db.from_json(store.get_work_order(wo_id)["metadata"], {})
+    finally:
+        store.close()
+    assert {k: metadata[k] for k in INV} == INV, "the fix order points back at its chain"
+    _, recorded = gap
+    assert recorded and recorded[-1][:2] == (INV["investigation"], wo_id)
+    assert "started at once" in recorded[-1][2]
+
+
+def test_a_steward_refusal_is_recorded_with_the_command_to_start_it(fleet, gap, monkeypatch):
+    from jarvis import steward
+
+    monkeypatch.setattr(steward, "gate", lambda c, **kw: steward.Decision(
+        "queue", "ledger", "the evolution ledger is spent", "high", "high", 0, "enforce"))
+    fleet.triage(approve=True)
+    assert not fleet.wo_id()
+    _, recorded = gap
+    note = recorded[-1][2]
+    assert "steward refused" in note and "ledger is spent" in note
+    assert "jarvis issues start" in note
+
+
+def test_neo_disagreeing_starts_nothing_and_says_so(fleet, gap):
+    fleet.triage(approve=False, answer="medium", reason="has a workaround")
+    assert not fleet.wo_id()
+    _, recorded = gap
+    note = recorded[-1][2]
+    assert "Neo did not agree" in note and "jarvis issues start" in note
+
+
 # Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
 pytestmark = pytest.mark.usefixtures("self_dispatch_on")

@@ -270,11 +270,13 @@ def _rubric() -> str:
 
 
 def _route(url: str, title: str, body: str, priority: str,
-           expedite: bool = False) -> dict[str, Any]:
+           expedite: bool = False,
+           investigation: dict[str, str] | None = None) -> dict[str, Any]:
     """Put the freshly filed issue on the OS's rails"""
     from .issues import route_filing
     try:
-        return route_filing(url, title, body, priority, expedite=expedite)
+        return route_filing(url, title, body, priority, expedite=expedite,
+                            investigation=investigation)
     except Exception as e:  # noqa: BLE001 — see the docstring: the issue is already filed
         return {"wo_id": "", "backlog_id": "", "project": "", "priority": priority,
                 "reason": f"the OS could not route it ({e}) — it is filed and untracked"}
@@ -329,7 +331,8 @@ AGENT_EXPEDITE_NOTE = ("--expedite ignored: filed from a work-order session, so 
 
 def report_bug(*, title: str, description: str, expected: str, actual: str,
                priority: str = "", steps: str = "", project: str = "",
-               wo_id: str = "", expedite: bool = False) -> dict[str, Any]:
+               wo_id: str = "", expedite: bool = False,
+               investigation: dict[str, str] | None = None) -> dict[str, Any]:
     """File a Jarvis OS bug, put it on the OS's rails, and tell the user about it"""
     from .issues import checked_priority
 
@@ -372,7 +375,8 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
         return out
     url = create_issue(title, body, repo)
     # Between creating the issue and telling anyone about it (#240)
-    pickup = _route(url, title, body, priority, expedite=expedite)
+    pickup = _route(url, title, body, priority, expedite=expedite,
+                    investigation=investigation)
     _notify(project, title, url, version, wo_id, pickup)
     out = {"url": url, "title": title, "repo": repo, "version": version,
            "project": project, "wo_id": wo_id, "pickup": pickup}

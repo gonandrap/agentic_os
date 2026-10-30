@@ -700,6 +700,25 @@ def test_a_gap_is_filed_by_ops_as_an_unexpedited_bug(started, store):
     assert store.events_of_kind(investigator, "verdict_submitted")
 
 
+def test_a_gap_asks_neo_and_its_view_follows_the_fix_order(started, store):
+    """#1344: the GAP is triaged at any level, and the chain reads forward to the fix"""
+    inv_id, _, out = _submitted(started, store, "GAP")
+    assert out["filed"]["neo_question_id"], "Neo is asked even below `critical`"
+    assert inv_id in out["filed"]["dispatch"]
+    assert ops.investigation_fix_order(inv_id) == ""
+    # Started by hand: the issue's own work order is the fix all the same
+    fix = store.create_work_order("the fix", description="d")
+    store.update_work_order(fix["id"], issue_url=started.issue_url)
+    assert ops.investigation_fix_order(inv_id) == fix["id"]
+    ops.record_investigation_dispatch(inv_id, fix["id"], "started by hand")
+    shown = ops.show_investigation_order(inv_id)
+    assert shown["filed"]["wo_id"] == fix["id"]
+    assert shown["filed"]["dispatch"] == "started by hand"
+    chain = shown["chain"]
+    assert chain["issue_url"] == started.issue_url
+    assert chain["fix"]["wo_id"] == fix["id"] and chain["fix"]["production"] is None
+
+
 def test_a_gap_whose_duplicate_ops_finds_is_downgraded_honestly(started, store):
     """§2.5: the record must never read as though the investigator classified it that way"""
     subject = _subject(store)

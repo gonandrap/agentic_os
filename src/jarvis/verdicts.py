@@ -299,6 +299,8 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
     if filed:
         lines.append(f"  filed: {filed.get('issue_url', '')} "
                      f"({filed.get('wo_id') or 'no work order'})")
+        if filed.get("dispatch"):
+            lines.append(f"    {filed['dispatch']}")
     elif verdict.get("filing_error"):
         lines.append(f"  NOT filed: {verdict['filing_error']}")
     return lines

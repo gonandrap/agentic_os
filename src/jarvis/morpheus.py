@@ -58,6 +58,8 @@ OUTPUT_TAIL = 2000
 VERDICT_ACTIONS = ("requeue",)
 #: How many times Neo's own verdict may put one item back on the watch list
 MAX_AUTO_REQUEUES = 1
+#: Investigate -> fix -> re-validate cycles one item may run before the user decides (#1344)
+MAX_FIX_CYCLES = 3
 
 SECONDS_PER_DAY = 86400
 
@@ -371,8 +373,13 @@ _FIX_ORDER = re.compile(r"fix filed as (wo-[0-9a-f]{8})")
 
 
 def requeue_fixed(central: CentralStore, cfg: MorpheusConfig,
-                  carrier: Callable[[str], str]) -> list[str]:
-    """Re-watch each confirmed item whose fix order (via `carrier`) has a PR in production (#1307)"""
+                  carrier: Callable[[str], str],
+                  investigation_fix: Callable[[str], str] | None = None) -> list[str]:
+    """Re-watch each item whose fix order (via `carrier`) has a PR in production (#1307, #1344)
+
+    The fix is the one `confirm` filed, or the one the item's investigation filed
+    (`investigation_fix` maps an inv- id to it).
+    """
     # An item exists for an order only once its PR reached production: released (the OS) or merged
     shipped: dict[str, dict[str, Any]] = {}
     for i in central.morpheus_items():
@@ -381,14 +388,22 @@ def requeue_fixed(central: CentralStore, cfg: MorpheusConfig,
     requeued = []
     for item in central.morpheus_items(ACTION_STATES):
         m = _FIX_ORDER.search(item["resolution"] or "")
-        if not (item["resolution"] or "").startswith(CONFIRMED) or not m:
+        kind, _, inv_id = (item.get("action") or "").partition(":")
+        via = ""
+        if (item["resolution"] or "").startswith(CONFIRMED) and m:
+            fix = m.group(1)
+        elif kind == "investigation" and inv_id and investigation_fix:
+            fix, via = investigation_fix(inv_id), f" (filed by {inv_id})"
+        else:
             continue
-        fix = carrier(m.group(1))
+        if not fix:
+            continue
+        fix = carrier(fix)
         landed = shipped.get(fix)
         if not landed or landed["id"] == item["id"]:
             continue
         requeue(central, cfg, item["id"],
-                resolution=f"re-watched: its fix {fix} reached production in PR "
+                resolution=f"re-watched: its fix {fix}{via} reached production in PR "
                            f"#{landed['pr_number']}")
         requeued.append(item["id"])
     return requeued
@@ -566,6 +581,24 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
         project, _path, _wo = ops.find_work_order(wo_id, item.get("project") or None)
     except Exception as e:  # noqa: BLE001
         return "", f"its work order {wo_id} could not be found ({e})"
+    cycles = ops.morpheus_investigations(project, item["id"])
+    if len(cycles) >= MAX_FIX_CYCLES:
+        # The loop guard: fixes keep landing and the validation keeps failing
+        from .central_store import CentralStore
+
+        note = (f"{len(cycles)} investigate-fix-revalidate cycles ({', '.join(cycles)}) "
+                f"did not make it pass — the user decides: `jarvis morpheus waive "
+                f"{item['id']} --reason \"…\"`, `jarvis morpheus confirm {item['id']} "
+                f"--fix \"…\"`, or `jarvis morpheus requeue {item['id']}`")
+        central = CentralStore()
+        try:
+            central.add_inbox(project=project, level="critical",
+                              title=f"PR #{item['pr_number']} still fails production "
+                                    f"validation after {len(cycles)} fixes",
+                              body=f"{item['pr_url']}\n{note}")
+        finally:
+            central.close()
+        return "", note
     decision = steward.gate(
         steward.Candidate("morpheus", "critical", project,
                           f"PR #{item['pr_number']} {item['state']} production validation",
@@ -577,8 +610,8 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
     live = ops.live_investigation(project, wo_id)
     if live:
         return live, ""
-    inv = ops.create_investigation_order(project, wo_id, why=_why(item), origin="jarvis",
-                                         stamp=decision.stamp)
+    inv =ops.create_investigation_order(project, wo_id, why=_why(item), origin="jarvis",
+                                         stamp=decision.stamp, morpheus_item=item["id"])
     return str(inv["id"]), ""
 
 

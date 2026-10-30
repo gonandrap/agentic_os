@@ -4099,6 +4099,42 @@ def _morpheus_line(item: dict) -> str:
             f"{item['state']}{action} — {item['pr_title'][:70]}")
 
 
+def _fix_lines(fix: dict | None, dispatch: str) -> list[str]:
+    """The fix order on a filed GAP and how far it got (#1344)"""
+    lines = [dispatch] if dispatch else []
+    if fix:
+        lines.append(f"fix {fix['wo_id']} [{fix['status']}]"
+                     + (f" {fix['pr_url']}" if fix["pr_url"] else "")
+                     + (f" (carried by {fix['carrier']})"
+                        if fix["carrier"] != fix["wo_id"] else ""))
+        landed = fix["production"]
+        lines.append(f"in production: PR #{landed['pr_number']}"
+                     + (f" in {landed['release_tag']}" if landed["release_tag"] else "")
+                     + f", its own validation {landed['item']} {landed['state']}"
+                     if landed else "not in production yet")
+    return lines
+
+
+def _chain_lines(chain: dict, inv_id: str) -> list[str]:
+    """validation -> investigation -> issue -> fix -> production -> re-validation (#1344)"""
+    v = chain["validation"]
+    lines = []
+    if v:
+        lines.append(f"validation {v['id']} (PR #{v['pr_number']})")
+    lines.append(f"investigation {inv_id}"
+                 + (f" (cycle {chain['cycle']} of {chain['max_cycles']})"
+                    if chain["cycle"] else ""))
+    if chain["issue_url"]:
+        lines.append(f"issue {chain['issue_url']}")
+    lines += _fix_lines(chain["fix"], chain["dispatch"])
+    if v:
+        lines.append(f"re-validation: {v['id']} is {v['state']}"
+                     + (f" — {v['resolution']}" if v["resolution"] else ""))
+    for nxt in chain["next_investigations"]:
+        lines.append(f"failed again -> {nxt}")
+    return lines
+
+
 def cmd_morpheus(args: argparse.Namespace) -> int:
     """`jarvis morpheus …` — a thin wrapper over `ops.morpheus_*`"""
     from . import ops
@@ -4160,6 +4196,13 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             for q in detail["questions"]:
                 print(f"  Q{q['id']} [{q['status']}] {q['question']}"
                       + (f" — {q['answer']}" if q["answer"] else ""))
+        if detail["investigations"]:
+            print("\ninvestigations (oldest first):")
+            for inv in detail["investigations"]:
+                print(f"  {inv['id']} [{inv['status']}] {inv['classification'] or 'no verdict'}"
+                      + (f" -> {inv['issue_url']}" if inv["issue_url"] else ""))
+                for line in _fix_lines(inv["fix"], inv["dispatch"]):
+                    print(f"    {line}")
         return 0
     if args.morpheus_cmd == "enqueue-release":
         _print(ops.morpheus_enqueue_release(args.tag, args.from_ref, args.to_ref,
@@ -4295,6 +4338,11 @@ def cmd_investigate(args: argparse.Namespace) -> int:
                 print()
                 for line in verdicts.render_verdict(detail["verdict"]):
                     print(line)
+            chain = detail["chain"]
+            if chain["validation"] or chain["fix"]:
+                print("\nchain:")
+                for line in _chain_lines(chain, detail["id"]):
+                    print(f"  {line}")
             if detail["assumptions"]:
                 print("\nthe investigator's calls (on record, for nobody's review):")
                 for a in detail["assumptions"]:

@@ -77,11 +77,12 @@
   {% elif inv.filed %}
   <div class="row">
     <div class="grow">
-      filed as an EXPEDITED bug — it ships a release when the fix lands:
+      filed as a bug:
       <a href="{{ inv.filed.issue_url }}">{{ inv.filed.issue_url }}</a>
       {% if inv.filed.wo_id %}
       · {{ ui.row_id(inv.filed.wo_id, '/wo/' ~ project ~ '/' ~ inv.filed.wo_id) }}
       {% endif %}
+      {% if inv.filed.dispatch %}<div class="sub">{{ inv.filed.dispatch }}</div>{% endif %}
     </div>
   </div>
   {% elif v.duplicate_of %}
@@ -104,6 +105,47 @@
   </div>
   {% endif %}
 </div>
+{% set c = inv.chain %}
+{% if c and (c.validation or c.fix) %}
+{# One chain, end to end (#1344) #}
+<h3>The chain</h3>
+<div class="panel">
+  {% if c.validation %}
+  <div class="row"><div class="grow">validation
+    <a href="/morpheus/{{ c.validation.id }}">{{ c.validation.id }}</a>
+    (PR #{{ c.validation.pr_number }})</div></div>
+  {% endif %}
+  <div class="row"><div class="grow">this investigation
+    {% if c.cycle %}— cycle {{ c.cycle }} of {{ c.max_cycles }}{% endif %}</div></div>
+  {% if c.issue_url %}
+  <div class="row"><div class="grow">issue <a href="{{ c.issue_url }}">{{ c.issue_url }}</a></div></div>
+  {% endif %}
+  {% if c.fix %}
+  <div class="row"><div class="grow">fix
+    {{ ui.row_id(c.fix.wo_id, '/wo/' ~ project ~ '/' ~ c.fix.wo_id) }} ({{ c.fix.status }})
+    {% if c.fix.pr_url %}· <a href="{{ c.fix.pr_url }}">{{ c.fix.pr_url }}</a>{% endif %}
+    {% if c.fix.carrier != c.fix.wo_id %}· carried by <span class="mono">{{ c.fix.carrier }}</span>{% endif %}
+  </div></div>
+  <div class="row"><div class="grow">
+    {% if c.fix.production %}in production: PR #{{ c.fix.production.pr_number }}
+      {% if c.fix.production.release_tag %}in {{ c.fix.production.release_tag }}{% endif %}
+      · its own validation <a href="/morpheus/{{ c.fix.production.item }}">{{ c.fix.production.item }}</a>
+      {{ c.fix.production.state }}
+    {% else %}not in production yet{% endif %}
+  </div></div>
+  {% endif %}
+  {% if c.validation %}
+  <div class="row"><div class="grow">re-validation: {{ c.validation.id }} is
+    <strong>{{ c.validation.state }}</strong>
+    {% if c.validation.resolution %}<div class="sub">{{ c.validation.resolution }}</div>{% endif %}
+  </div></div>
+  {% endif %}
+  {% for nxt in c.next_investigations %}
+  <div class="row"><div class="grow">failed again →
+    <a href="/inv/{{ project }}/{{ nxt }}">{{ nxt }}</a></div></div>
+  {% endfor %}
+</div>
+{% endif %}
 {% else %}
 <div class="panel"><div class="empty">
   no verdict yet — the investigator is still reading, and an investigation in progress

@@ -7893,12 +7893,16 @@ SUBJECT_KEY = "subject"
 #: `feature_orders.metadata` key: `stuck.fingerprint` of the situation this investigation was opened... (docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md)
 STUCK_FINGERPRINT_KEY = "stuck_fingerprint"
 
+#: `feature_orders.metadata` key: the Morpheus item whose failed validation opened it (#1344)
+MORPHEUS_ITEM_KEY = "morpheus_item"
+
 
 def create_investigation_order(project_name: str | None, subject: str, why: str,
                                budget_usd: float | None = None,
                                origin: str = "jarvis",
                                fingerprint: str = "",
-                               stamp: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                               stamp: Mapping[str, Any] | None = None,
+                               morpheus_item: str = "") -> dict[str, Any]:
     """Open an investigation into one stuck order; `stamp` is the steward's provenance, when it decided"""
     from . import steward
     paths = registered_project_paths()
@@ -7935,6 +7939,7 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
             origin=origin, kind="investigation",
             metadata={SUBJECT_KEY: subject,
                       **({STUCK_FINGERPRINT_KEY: fingerprint} if fingerprint else {}),
+                      **({MORPHEUS_ITEM_KEY: morpheus_item} if morpheus_item else {}),
                       **({steward.STAMP_KEY: dict(stamp)} if stamp else {})},
             # The family is this order plus its one investigator, so the family arithmetic is already correct
             budget_usd=(budget_usd if budget_usd is not None
@@ -7967,6 +7972,121 @@ def live_investigation(project_name: str, subject: str) -> str:
     finally:
         store.close()
     return ""
+
+
+def morpheus_investigations(project_name: str, item_id: str) -> list[str]:
+    """Every investigation a Morpheus item's failed validations opened, oldest first (#1344)"""
+    paths = registered_project_paths()
+    if project_name not in paths:
+        return []
+    store = ProjectStore(paths[project_name])
+    try:
+        rows = store.list_feature_orders(kind="investigation", limit=1000)
+    finally:
+        store.close()
+    rows = [r for r in rows
+            if (db.from_json(r.get("metadata"), {}) or {}).get(MORPHEUS_ITEM_KEY) == item_id]
+    return [str(r["id"]) for r in sorted(rows, key=lambda r: r.get("created_at") or 0)]
+
+
+def _investigation_verdict(fo: Mapping[str, Any]) -> dict[str, Any]:
+    verdict = db.from_json(fo.get("plan"), None) or {}
+    return verdict if isinstance(verdict, dict) else {}
+
+
+def record_investigation_dispatch(inv_id: str, wo_id: str, note: str,
+                                  project_name: str | None = None) -> None:
+    """Write who started the investigation's fix, or who refused and why, onto its verdict (#1344)"""
+    _name, path, fo = find_feature_order(inv_id, project_name)
+    verdict = _investigation_verdict(fo)
+    filed = verdict.get("filed")
+    if not isinstance(filed, dict):
+        return  # nothing filed, so nothing to start
+    filed.update({"wo_id": wo_id or filed.get("wo_id") or "", "dispatch": note})
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(inv_id, plan=db.to_json(verdict))
+    finally:
+        store.close()
+
+
+def _fix_order_of(store: ProjectStore, filed: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The work order carrying a filed GAP: the one dispatched, else the newest on its issue"""
+    wo_id = str(filed.get("wo_id") or "")
+    if wo_id:
+        try:
+            return store.get_work_order(wo_id)
+        except KeyError:
+            pass
+    url = str(filed.get("issue_url") or "")
+    rows = store.work_orders_for_issue(url) if url else []
+    return rows[0] if rows else None
+
+
+def investigation_fix_order(inv_id: str) -> str:
+    """The fix order an investigation's GAP filed, `""` if none yet — `requeue_fixed`'s carrier (#1344)"""
+    try:
+        _name, path, fo = find_feature_order(inv_id)
+    except OpsError:
+        return ""
+    filed = _investigation_verdict(fo).get("filed")
+    if not isinstance(filed, dict):
+        return ""
+    store = ProjectStore(path)
+    try:
+        wo = _fix_order_of(store, filed)
+    finally:
+        store.close()
+    return str(wo["id"]) if wo else ""
+
+
+def investigation_chain(name: str, path: Path, fo: Mapping[str, Any]) -> dict[str, Any]:
+    """validation -> investigation -> issue -> fix order -> production -> re-validation (#1344)"""
+    from . import morpheus
+
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    filed = _investigation_verdict(fo).get("filed")
+    filed = filed if isinstance(filed, dict) else {}
+    central = CentralStore()
+    try:
+        item_id = str(metadata.get(MORPHEUS_ITEM_KEY) or "")
+        if not item_id:
+            # Opened before the key existed: the item's own handoff still names it
+            item_id = next((str(i["id"]) for i in central.morpheus_items()
+                            if (i.get("action") or "").endswith(f":{fo['id']}")), "")
+        item = central.morpheus_item(item_id) if item_id else None
+        fix = None
+        if filed:
+            store = ProjectStore(path)
+            try:
+                wo = _fix_order_of(store, filed)
+            finally:
+                store.close()
+            if wo:
+                carrier = fix_carrier(str(wo["id"]))
+                landed = next((i for i in central.morpheus_items()
+                               if i["wo_id"] == carrier), None)
+                fix = {"wo_id": wo["id"], "status": wo["status"],
+                       "pr_url": wo.get("pr_url") or "", "carrier": carrier,
+                       "production": ({"item": landed["id"], "pr_number": landed["pr_number"],
+                                       "release_tag": landed.get("release_tag") or "",
+                                       "state": landed["state"]} if landed else None)}
+    finally:
+        central.close()
+    cycles = morpheus_investigations(name, item_id) if item_id else []
+    later = cycles[cycles.index(fo["id"]) + 1:] if fo["id"] in cycles else []
+    return {
+        "validation": ({"id": item["id"], "pr_number": item["pr_number"],
+                        "state": item["state"], "resolution": item["resolution"] or "",
+                        "action": item["action"] or ""} if item else None),
+        "issue_url": filed.get("issue_url") or "",
+        "dispatch": filed.get("dispatch") or "",
+        "fix": fix,
+        # Each failed re-validation opens the next one, until it passes or the cap stops it
+        "next_investigations": later,
+        "cycle": (cycles.index(fo["id"]) + 1) if fo["id"] in cycles else 0,
+        "max_cycles": morpheus.MAX_FIX_CYCLES,
+    }
 
 
 #: The name every caller before §6a used
@@ -8262,6 +8382,7 @@ def show_investigation_order(inv_id: str, project_name: str | None = None
         "assumptions": calls,
         "status_label": feature_status_label("investigation", fo["status"]),
         "alarms": alarms,
+        "chain": investigation_chain(name, path, fo),
     }
 
 
@@ -8336,14 +8457,20 @@ def submit_verdict(inv_id: str, doc: Any,
                     actual=verdict["proposed_fix"]["actual"],
                     priority=verdict["proposed_fix"]["priority"],
                     project=name, wo_id=fo.get("plan_wo_id") or "",
-                    expedite=False)  # file only: the user picks it up (os.autonomy)
+                    # Neo agreeing plus the steward starts it, through the triage question (#1344)
+                    expedite=False, investigation={
+                        "investigation": inv_id,
+                        "morpheus_item": str(metadata.get(MORPHEUS_ITEM_KEY) or "")})
             except Exception as e:  # noqa: BLE001 — same case, one step later
                 filing_error = f"the bug could not be filed: {e}"
             else:
+                pickup = filed.get("pickup") or {}
                 verdict["filed"] = {
                     "issue_url": filed.get("url"),
-                    "wo_id": (filed.get("pickup") or {}).get("wo_id"),
+                    "wo_id": pickup.get("wo_id"),
                     "expedited": False,
+                    "neo_question_id": pickup.get("neo_question_id") or 0,
+                    "dispatch": pickup.get("reason") or "",
                 }
 
     if filing_error:
@@ -15128,8 +15255,25 @@ def morpheus_detail(item_id: str) -> dict[str, Any]:
     finally:
         neo.close()
     kind, _, rest = str(item.get("action") or "").partition(":")
+    # Forward links: each investigation, the issue it filed and the fix order on it (#1344)
+    inv_ids = morpheus_investigations(item.get("project") or "", item_id)
+    if kind == "investigation" and rest not in inv_ids:
+        inv_ids.append(rest)
+    investigations = []
+    for inv_id in inv_ids:
+        try:
+            name, path, fo = find_feature_order(inv_id, item.get("project") or None)
+        except OpsError:
+            continue
+        chain = investigation_chain(name, path, fo)
+        investigations.append({
+            "id": inv_id, "project": name, "status": fo["status"],
+            "classification": _investigation_verdict(fo).get("classification") or "",
+            "issue_url": chain["issue_url"], "dispatch": chain["dispatch"],
+            "fix": chain["fix"]})
     return {
         "item": item,
+        "investigations": investigations,
         "runs": runs,
         "questions": [{"id": q["id"], "status": q["status"], "kind": q["kind"],
                        "question": headline(q["question"] or ""),
