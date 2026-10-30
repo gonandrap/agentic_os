@@ -60,6 +60,9 @@ HELD_DRAFT = "draft"
 HELD_CHECKS_FAILED = "checks_failed"
 HELD_CHECKS_RUNNING = "checks_running"
 HELD_CHECKS_NONE = "checks_none"
+#: What the merge request says when it arms with no check at all (#1347)
+NO_CI = ("repo has no CI: it has no GitHub Actions workflow, so no check will ever "
+         "report on this commit")
 HELD_MERGE_STATE_UNCLEAN = "merge_state_unclean"
 #: A check was cancelled, not failed, and GitHub blocks on it (#1123)
 HELD_CHECKS_CANCELLED = "checks_cancelled"
@@ -216,6 +219,8 @@ class Decision:
     catch_up: str = ""
     #: `ops.CATCH_UP_DEFER_*` beside it: which wait a deferral is (#1188)
     catch_up_cause: str = ""
+    #: Armed with no check at all because the repository has no workflow (#1347)
+    no_ci: bool = False
 
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
@@ -283,7 +288,8 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
            spec_unmerged: str = "",
            drift: DriftAlarm | None = None,
            base_red: BaseRed | None = None,
-           base_behind: BaseBehind | None = None) -> Decision:
+           base_behind: BaseBehind | None = None,
+           no_ci: bool = False) -> Decision:
     """May the OS merge this pull request right now? (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4)"""
     if not (getattr(cfg, "enabled", False) and getattr(cfg, "auto_merge", False)):
         return _held(HELD_DISABLED,
@@ -375,7 +381,9 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
     if not pr.mergeable_now:
         return _held(HELD_NOT_MERGEABLE,
                      "GitHub does not (yet) say the branch merges cleanly", **fields)
-    if not pr.checks_green:
+    # #1347: zero checks on a repository with zero workflows is nothing to wait for
+    vacuous = no_ci and not pr.checks
+    if not pr.checks_green and not vacuous:
         if pr.failing:
             return _held(HELD_CHECKS_FAILED,
                          f"CI failed: {', '.join(pr.failing)}", **fields)
@@ -403,20 +411,22 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      **fields)
     return Decision(armed=True, code="armed",
                     reason=f"round {n} passed on the commit at the head ({judged[:10]}) "
-                           f"and CI is green",
-                    **fields)
+                           + (f"and {NO_CI}" if vacuous else "and CI is green"),
+                    no_ci=vacuous, **fields)
 
 
 def only_the_head_moved(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any,
                         cfg: Any, *, pending_assumptions: bool = False,
-                        plan_assumptions: str = "", spec_unmerged: str = "") -> bool:
+                        plan_assumptions: str = "", spec_unmerged: str = "",
+                        no_ci: bool = False) -> bool:
     """Would this pull request merge right now if a round had judged the head it has? (docs/superpowers/specs/2026-10-16-a-verdict-bound-to-no-commit-re-judges-itself.md §2)"""
     head = str(pr.head_oid or "")
     if not head:
         return False
     return decide(round_row, wo, pr, cfg, validated_head=head,
                   pending_assumptions=pending_assumptions,
-                  plan_assumptions=plan_assumptions, spec_unmerged=spec_unmerged).armed
+                  plan_assumptions=plan_assumptions, spec_unmerged=spec_unmerged,
+                  no_ci=no_ci).armed
 
 
 def merge_command(pr_url: str, sha: str) -> str:
@@ -524,7 +534,8 @@ def _request_question(project: str, wo: dict[str, Any], decision: Decision,
         f"`--match-head-commit` makes GitHub refuse the merge if the head moves before "
         f"it runs, and the OS re-reads `{base}` immediately before merging and refuses "
         f"on its own if it has moved since you read this.\n"
-        f"CI on that commit: {checks_evidence(checks)}.\n"
+        f"CI on that commit: {checks_evidence(checks)}"
+        + (f" — {NO_CI}" if decision.no_ci else "") + ".\n"
         f"Read the deliberation with: jarvis validation show {wo['id']}",
     ]
     # Spec 2026-09-24 fix 1: the OS-authored header above precedes every borrowed block
@@ -563,7 +574,8 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
         justification=decision.reason,
         # The body's CI line and this string come from the one renderer — fix 2
         evidence=f"round {decision.round_n} passed on {decision.judged_sha}; "
-                 f"checks: {checks_evidence(checks)}",
+                 f"checks: {checks_evidence(checks)}"
+                 + (f"; {NO_CI}" if decision.no_ci else ""),
         max_uses=GRANT_USES,
         base_oid=base_oid,
     )

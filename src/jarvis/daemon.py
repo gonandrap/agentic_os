@@ -5597,12 +5597,13 @@ class Daemon:
                        if ops.catch_up_needed(pr, repo=project.path) else None)
         # #1063
         drift = self._drift_hold(store, wo)
+        no_ci = self._repo_has_no_ci(project, pr)
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
                     spec_unmerged=spec_unmerged,
-            drift=drift, base_red=base_red, base_behind=base_behind)
+            drift=drift, base_red=base_red, base_behind=base_behind, no_ci=no_ci)
         if not decision.armed:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec... (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.5)
             outcome = CarryOutcome(False, False)
@@ -5617,7 +5618,7 @@ class Daemon:
                     validated_head=store.validated_head(round_row),
                     pending_assumptions=pending, plan_assumptions=plan_assumptions,
                     spec_unmerged=spec_unmerged,
-                    drift=drift)
+                    drift=drift, no_ci=no_ci)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
                 # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2
@@ -5650,7 +5651,7 @@ class Daemon:
                         validated_head=store.validated_head(round_row),
                         pending_assumptions=pending, plan_assumptions=plan_assumptions,
                     spec_unmerged=spec_unmerged,
-                        drift=drift, base_red=base_red)
+                        drift=drift, base_red=base_red, no_ci=no_ci)
                     # #1141: the moved head the base hold was hiding gets the carry too
                     if not decision.armed and decision.code == automerge.HELD_SHA_MOVED:
                         outcome = self._carry_catch_up(
@@ -5664,7 +5665,7 @@ class Daemon:
                                 pending_assumptions=pending,
                                 plan_assumptions=plan_assumptions,
                     spec_unmerged=spec_unmerged, drift=drift,
-                                base_red=base_red)
+                                base_red=base_red, no_ci=no_ci)
                 else:
                     # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a base that has moved
                     moved = bool(caught.base_tip) and ops.catch_up_needed(
@@ -5695,7 +5696,7 @@ class Daemon:
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
                             plan_assumptions=plan_assumptions,
-                    spec_unmerged=spec_unmerged)):
+                    spec_unmerged=spec_unmerged, no_ci=no_ci)):
                     # `rebind` is the carry's reading of the two proofs
                     self._rejudge_moved_head(project, store, wo, decision,
                                              rebind=outcome.rebind)
@@ -6556,6 +6557,21 @@ class Daemon:
             log.info("[%s] %s: the head moved from %s to %s — re-judging it as round %s",
                      project.name, wo["id"], out["judged_sha"][:10],
                      out["head_sha"][:10], out["round"])
+
+    def _repo_has_no_ci(self, project: ProjectSpec, pr: Any) -> bool:
+        """Zero checks AND zero workflows, read this tick; unreadable is not "none" (#1347)"""
+        from . import github
+
+        if pr.checks:
+            return False
+        owner_repo = github.origin_repo(project.path)
+        if owner_repo is None:
+            return False
+        try:
+            return github.workflow_count(owner_repo, cwd=project.path) == 0
+        except github.GitHubError as exc:
+            log.info("[%s] workflows unreadable: %s", project.name, exc)
+            return False
 
     def _protection_fact(self, project: ProjectSpec, pr: Any) -> str:
         """What the merge request may say about branch protection (docs/superpowers/specs/2026-09-24-an-auto-merge-request-that-proves-itself.md)"""
