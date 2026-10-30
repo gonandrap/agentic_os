@@ -1396,9 +1396,14 @@ elif argv[:2] == ["issue", "comment"]:
     save(rows)
 elif argv[:2] == ["issue", "close"]:
     rows, r = row(argv[2] if len(argv) > 2 else "")
-    r["state"] = "CLOSED"
     if "--comment" in argv:
         r.setdefault("comments", []).append(argv[argv.index("--comment") + 1])
+    # Real `gh` posts `--comment` BEFORE the close, so a refused close keeps it (#1257)
+    if os.environ.get("FAKE_GH_REFUSE_ISSUE_CLOSE"):
+        save(rows)
+        sys.stderr.write(os.environ["FAKE_GH_REFUSE_ISSUE_CLOSE"] + "\n")
+        sys.exit(1)
+    r["state"] = "CLOSED"
     save(rows)
 elif argv[:2] == ["repo", "view"]:
     # THE PRIVACY READ that decides whether a validation follow-up may carry the seat's
@@ -2037,6 +2042,11 @@ def fake_gh(tmp_path, monkeypatch):
         def fail_pr_reopen(self, message: str) -> None:
             """Fail `gh pr reopen` alone: the pull request really does end up CLOSED"""
             monkeypatch.setenv("FAKE_GH_FAIL_PR_REOPEN", message)
+
+        def refuse_issue_close(self, message: str = "GraphQL: Resource not accessible "
+                               "by integration (closeIssue)") -> None:
+            """Refuse `gh issue close` alone, as an account without triage rights is (#1257)"""
+            monkeypatch.setenv("FAKE_GH_REFUSE_ISSUE_CLOSE", message)
 
         def works(self) -> None:
             """Undo `fail` — a test that proves the lifecycle RETRIES has to"""

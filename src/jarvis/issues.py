@@ -274,8 +274,9 @@ def reopen(url: str, body: str) -> None:
 
 
 def close(url: str, body: str) -> None:
-    """Close the issue, carrying `body` as the closing comment"""
-    _run(["issue", "close", checked_issue_url(url), "--comment", body], url=url)
+    """Close the issue, then say why — never `--comment`, which posts before a refused close (#1257)"""
+    _run(["issue", "close", checked_issue_url(url)], url=url)
+    comment(url, body)
 
 
 # -- what the tracker should say, given what the work order is doing
