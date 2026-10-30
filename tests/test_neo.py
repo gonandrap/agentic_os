@@ -14,6 +14,8 @@ from jarvis.daemon import Daemon
 from jarvis.neo_store import SEATS, NeoStore
 from jarvis.project_store import ProjectStore
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):

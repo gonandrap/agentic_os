@@ -16,6 +16,8 @@ from jarvis.hooks import preflight_decision
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 ALL_GATES = gates.GateConfig(enabled=frozenset(gates.KIND_NAMES))
 
 # A classifier false positive that survives `reads_only`

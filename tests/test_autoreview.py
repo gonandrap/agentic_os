@@ -13,6 +13,8 @@ from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 PR = "https://github.com/acme/proj/pull/7"
 JUDGED = "a1b2c3d4e5f6000000000000000000000000aaaa"
 

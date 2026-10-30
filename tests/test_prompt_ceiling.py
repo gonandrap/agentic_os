@@ -9,6 +9,8 @@ from jarvis.central_store import CentralStore
 from jarvis.neo_store import NeoStore
 from tests.test_validation_loop import fleet  # noqa: F401 — the booted-OS fixture
 
+pytestmark = pytest.mark.usefixtures("neo_projects")
+
 MARKER = "SECRET-PAYLOAD-MARKER-9f3a"
 
 
