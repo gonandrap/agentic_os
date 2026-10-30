@@ -78,7 +78,6 @@
 <div class="panel open-work">
   {% for wo in shown %}
     {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
-    {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
     <div class="row" data-status="{{ wo.status }}">
       <span class="st tone-{{ m.tone }} {{ 'pulse' if wo.status == 'running' }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
       <div class="grow">
@@ -100,8 +99,7 @@
           </div>
         {% endif %}
       </div>
-      <span class="badge {{ 'framework' if o.framework else 'outside' }}">
-        {{ '⚙ ' if o.framework else '⚠ ' }}{{ o.word }}</span>
+      <span>{{ ui.wo_tags(wo.tags) }}</span>
     </div>
   {% else %}
     <div class="empty">

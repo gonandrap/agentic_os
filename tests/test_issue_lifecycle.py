@@ -1525,6 +1525,20 @@ def test_an_expedited_order_records_that_it_was_expedited(fleet):
     plain = issues.start_work(third_url)
     _name, _path, other = ops.find_work_order(plain["wo_id"])
     assert not issues.was_expedited(other)
+    # wo-776ac037: both were asked for by the user, so both are `manual`
+    assert ops.wo_tags(wo, "p")[1:] == ["bug", "expedite", "manual"]
+    assert ops.wo_tags(other, "p")[1:] == ["bug", "manual"]
+
+
+def test_tags_name_the_project_and_who_launched_the_order():
+    """wo-776ac037: `os` is exact; a legacy `jarvis` row is read from its provenance"""
+    from jarvis import ops
+    assert ops.wo_tags({"origin": "os"}, "painforwisdom") == ["painforwisdom", "automatic"]
+    assert ops.wo_tags({"origin": "jarvis"}, "p") == ["p", "manual"]
+    assert ops.wo_tags({"origin": "ui"}, "p") == ["p", "manual"]
+    assert ops.wo_tags({"origin": "jarvis", "parent_id": "fo-1"}, "p")[-1] == "automatic"
+    assert ops.wo_tags({"origin": "jarvis", "kind": "planner"}, "p")[-1] == "automatic"
+    assert ops.wo_tags({"origin": "ui", "parent_id": "fo-1"}, "p")[-1] == "manual"
 
 
 def test_the_issue_survives_a_work_order_that_could_not_be_created(monkeypatch, fleet):

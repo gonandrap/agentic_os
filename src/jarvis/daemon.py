@@ -1273,7 +1273,7 @@ class Daemon:
                     title=f"Plan: {fo['title']}"[:200],
                     # The ask verbatim
                     description=fo["description"],
-                    origin="jarvis", kind="planner", parent_id=fo["id"],
+                    origin="os", kind="planner", parent_id=fo["id"],
                 )
             except Exception:  # noqa: BLE001 — one bad feature order must not stop the rest
                 log.exception("[%s] could not open a planner for %s", project.name,
@@ -1289,7 +1289,7 @@ class Daemon:
                     title=f"Analyse: {fo['title']}"[:200],
                     # The observation verbatim — the analyst CONTRACT is composed at dispatch (dispatch._analyst_prompt)
                     description=fo["description"],
-                    origin="jarvis", kind="analyst", parent_id=fo["id"],
+                    origin="os", kind="analyst", parent_id=fo["id"],
                 )
             except Exception:  # noqa: BLE001 — one bad improvement order must not stop the rest
                 log.exception("[%s] could not open an analyst for %s", project.name,
@@ -1307,7 +1307,7 @@ class Daemon:
                     title=f"Investigate: {fo['title']}"[:200],
                     # The `why` verbatim; the investigator CONTRACT is composed at dispatch...
                     description=fo["description"],
-                    origin="jarvis", kind="investigator", parent_id=fo["id"],
+                    origin="os", kind="investigator", parent_id=fo["id"],
                 )
             except Exception:  # noqa: BLE001 — one bad investigation must not stop the rest
                 log.exception("[%s] could not open an investigator for %s", project.name,
@@ -5209,7 +5209,7 @@ class Daemon:
                 issue_os_filed = bool(issue_url)
             if issue_url and decision.allowed:
                 fix_wo_id = str(issues.start_work(
-                    issue_url, project=project.name,
+                    issue_url, project=project.name, origin="os",
                     metadata=steward.stamped({}, decision),
                     budget_usd=decision.budget_usd).get("wo_id") or "")
             elif not cleared and not issue_url:
@@ -7192,7 +7192,7 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
             self_dispatch=self.self_dispatch)
         fresh = store.create_work_order(
             title=f"Ship the fix for {wo.get('title') or url}",
-            description="", origin="jarvis",
+            description="", origin="os",
             metadata=steward.stamped({self.RELEASE_BATCH_KEY: [url]}, decision))
         steward.linked(decision, fresh["id"])
         store.update_work_order(

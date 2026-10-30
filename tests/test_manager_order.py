@@ -92,7 +92,7 @@ def test_a_released_plan_creates_a_manager_only_when_validation_is_enabled(boot,
     assert manager is not None
     assert manager["kind"] == "manager"
     assert manager["parent_id"] == on
-    assert manager["origin"] == "jarvis"
+    assert manager["origin"] == "os"
     assert manager["status"] == "pending"
     managers = [w for w in store.list_work_orders(limit=500, include_hidden=True)
                 if w["kind"] == "manager"]

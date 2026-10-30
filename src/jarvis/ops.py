@@ -676,7 +676,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # Same rule, for the other reason a work order can be sitting still: the transport dropped its turn
                          "pause": invariants.pause_note(store, wo),
                          # And the whole answer in one string
-                         "status_label": invariants.status_label(store, wo, fleet_state)}
+                         "status_label": invariants.status_label(store, wo, fleet_state),
+                         "tags": wo_tags(wo, p["name"])}
                         for wo in open_wos
                     ],
                     "settings_drift": drift,
@@ -10656,8 +10657,36 @@ def _evolution_knowledge(central: CentralStore, scope: str) -> list[dict[str, An
                                     project=scope or None)
 
 
-#: Origins of an order the OS opened for itself, with no user asking (Neo q2514)
-_SELF_ORIGINS = ("fleet_health", "morpheus", "neo", "schedule")
+#: Origins of an order the OS opened for itself, with no user asking (Neo q2514, q2585)
+_SELF_ORIGINS = ("fleet_health", "morpheus", "neo", "os", "schedule")
+
+
+def launched_by_os(wo: dict[str, Any]) -> bool:
+    """Did the OS open this order with no user asking? (Neo q2585)"""
+    from . import steward
+
+    origin = wo.get("origin")
+    if origin in _SELF_ORIGINS:
+        return True
+    if origin != "jarvis":
+        return False
+    # Rows from before `os` existed carry `jarvis` whoever opened them: read their provenance
+    return bool(wo.get("parent_id") or (wo.get("kind") or "worker") != "worker"
+                or wo.get("detector_id") or wo.get("remedy_rule_id")
+                or wo.get("trigger_wo_id") or steward.stamp_of(wo))
+
+
+def wo_tags(wo: dict[str, Any], project: str) -> list[str]:
+    """The chips on an order's row: project, bug, expedite, automatic|manual"""
+    from . import issues
+
+    tags = [project]
+    if wo.get("issue_url"):
+        tags.append("bug")
+    if issues.was_expedited(wo):
+        tags.append("expedite")
+    tags.append("automatic" if launched_by_os(wo) else "manual")
+    return tags
 
 #: A chain longer than this is cut, never looped: `seen` stops cycles, this stops depth
 _LINEAGE_MAX_HOPS = 12
