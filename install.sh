@@ -97,6 +97,18 @@ die()  { printf '%s✗ %s%s\n' "$C_ERR" "$*" "$C_OFF" >&2; exit 1; }
 run()  { if [ "$DRY_RUN" = 1 ]; then printf '  %s[dry-run] %s%s\n' "$C_DIM" "$*" "$C_OFF"; else eval "$*"; fi; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# --- 0. never on a production machine -------------------------------------------------
+# install.sh owns fresh installs; scripts/shipit.sh owns production. Overwriting the prod
+# wrapper left the shell's `jarvis` on ~/.jarvis while the services kept the old tag (issue 1348).
+if [ -f "$BIN_DIR/jarvis" ] && grep -q '^export JARVIS_ENV=production' "$BIN_DIR/jarvis" 2>/dev/null; then
+  die "$BIN_DIR/jarvis is the PRODUCTION wrapper — this machine runs Jarvis production, and
+     install.sh would replace it with a copy that reads dev state (~/.jarvis).
+     install.sh is for fresh installs only. Production is upgraded by shipit, from a dev clone:
+       scripts/shipit.sh --deploy jarvis-X.Y.Z    # move prod to an existing release
+       scripts/shipit.sh                          # cut a new release from main and deploy it
+     See docs/DEPLOYMENT.md, 'Upgrading production to an existing release'."
+fi
+
 # --- 1. prerequisites -----------------------------------------------------------------
 say "checking prerequisites"
 
