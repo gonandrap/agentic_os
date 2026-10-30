@@ -15360,3 +15360,20 @@ def morpheus_requeue(item_id: str) -> dict[str, Any]:
     _close_validation_questions(item_id, f"The user put {item_id} back on the watch list",
                                 f"decided by the user on {item_id} itself")
     return item
+
+
+def morpheus_rewrite(item_id: str, why: str) -> dict[str, Any]:
+    """The user rules the script wrong: Morpheus writes a new one from `why` (#1358)"""
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        item = morpheus.rewrite(central, _morpheus_catalog().os.morpheus, item_id, why)
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+    _close_validation_questions(item_id, f"The user sent {item_id}'s script back to be "
+                                         f"rewritten: {why.strip()}",
+                                f"decided by the user on {item_id} itself")
+    return item
