@@ -465,7 +465,9 @@ reports `INV-OFFBOARDED-ACTIVITY` as above. A name with neither a `projects` row
 tombstone is a typo and reports `INV-UNKNOWN-PROJECT`. `jarvis doctor --repair` re-points
 its rows when exactly one registered name matches it, ignoring case and `-` versus `_`.
 Commands that take a project name typed by the user (`backlog add`, `bug report --project`,
-`notify --project`) refuse a name the OS does not know.
+`notify --project`) refuse a name the OS does not know, and so does `NeoStore.ask`. A row
+about the OS itself carries the OS project's registered name, and `os` only when no catalog
+is loaded.
 
 Finally, `ops.start_os` must not `bootstrap_project` or `upsert_project` an offboarded
 project. With section 7 removing the catalog entry this should already hold by construction —
