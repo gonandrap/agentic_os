@@ -623,8 +623,8 @@ def test_each_assumption_gets_its_own_question_never_one_verdict_over_a_list(sta
         assert "do not rule on these" in q["question"]
 
 
-def test_no_question_the_os_files_carries_a_high_stakes_assumptions_text(started):
-    """THE SAME GUARANTEE THROUGH THE DAEMON"""
+def test_a_high_stakes_text_reaches_only_its_own_advisory_question(started):
+    """THE SAME GUARANTEE THROUGH THE DAEMON, narrowed by wo-6d90354c: no OTHER question carries it"""
     store, wo = park(started, auto_review=True,
                      assumptions=(ROUTINE, SECRET, "used tabs in the fixture"))
 
@@ -632,7 +632,7 @@ def test_no_question_the_os_files_carries_a_high_stakes_assumptions_text(started
 
     filed = questions()
     # Two routine assumptions are ruled on; the high-stakes one is asked for ADVICE only (wo-6d90354c)
-    (advice,) = [q for q in filed if autoreview.ADVISORY_INTRO in q["question"]]
+    (advice,) = [q for q in filed if autoreview.is_advisory(q)]
     assert SECRET in advice["question"]
     filed = [q for q in filed if q is not advice]
     assert len(filed) == 2
@@ -645,6 +645,23 @@ def test_no_question_the_os_files_carries_a_high_stakes_assumptions_text(started
     # The held one is on the record with its reason, exactly as before
     (held,) = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_HIGH_STAKES
+
+
+def test_a_secret_shaped_high_stakes_hold_is_not_sent_even_for_advice(started):
+    """The advisory ask's only guard on what reaches Neo is `decide_evidence` (wo-6d90354c review)"""
+    value = "q7Lw2pX9vR4tK8mN3bZ6cY1d"
+    text = f'pointed it at the production database:\napi_key = "{value}"'
+    assert autoreview.decide_evidence({"content": text}).code == \
+        autoreview.HELD_EVIDENCE_SECRET
+    store, wo = park(started, auto_review=True, assumptions=(text,))
+
+    ask(started, store)
+    ask(started, store)
+
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_HIGH_STAKES
+    assert questions() == []
+    assert not any(value in q["question"] for q in questions())
 
 
 def test_asking_twice_asks_once(started):

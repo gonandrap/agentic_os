@@ -1213,15 +1213,17 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
     return question
 
 
-#: Heads a question on a HIGH-STAKES hold: the user asked for Neo's view before deciding (wo-6d90354c)
-ADVISORY_INTRO = ("ADVISORY — the OS held this assumption as high-stakes, so your verdict is "
-                  "NOT acted on: the user decides it, and reads your answer first. Rule as "
-                  "you would, and make `reason` the advice they need.")
+#: PERSISTED in stored questions and matched by `is_advisory`: never change it, or old advice is ruled on (wo-6d90354c)
+ADVISORY_MARKER = "[ADVISORY-ONLY]"
+#: Heads a question on a HIGH-STAKES hold: the user asked for Neo's view before deciding; free to reword
+ADVISORY_INTRO = (f"{ADVISORY_MARKER} The OS held this assumption as high-stakes, so your "
+                  "verdict is NOT acted on: the user decides it, and reads your answer first. "
+                  "Rule as you would, and make `reason` the advice they need.")
 
 
 def is_advisory(question: dict[str, Any] | None) -> bool:
     """Was this question filed by `propose(advisory=True)`?"""
-    return str((question or {}).get("question") or "").startswith(ADVISORY_INTRO)
+    return str((question or {}).get("question") or "").startswith(ADVISORY_MARKER)
 
 
 def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
