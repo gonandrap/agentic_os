@@ -63,8 +63,7 @@ TEMPLATES = Path(__file__).parent / "templates"
 # Third-party browser code, shipped in the package so no page loads a CDN (vendor/README.md)
 VENDOR = Path(__file__).parent / "vendor"
 VENDORED = frozenset(p.name for p in VENDOR.glob("*.js"))
-# `?v=<content hash>` on every vendored URL: `/vendor/` is cached for an hour, and an
-# upgraded library must reach a browser that still holds the old one
+# `?v=<content hash>` on every vendored URL: `/vendor/` is cached for an hour
 VENDOR_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
                   for p in VENDOR.glob("*.js")}
 
@@ -1210,8 +1209,7 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
-        """A page link the user followed gets the error page, never FastAPI's raw JSON; /api/*
-        and the knowledge review's JSON calls (its page prints the error) keep the 422"""
+        """Error page for a followed link; /api/* and the review's JSON calls keep the 422"""
         if request.url.path.startswith(("/api/", "/knowledge/review/")):
             return await request_validation_exception_handler(request, exc)
         errors = exc.errors()
@@ -1822,8 +1820,6 @@ def create_app() -> FastAPI:
         return RedirectResponse(_same_site_back(next, "/knowledge"), status_code=303)
 
     # -- the knowledge review: domains, assignments and links over the base, drawn as a
-    # graph the user edits by hand. Reads come from `ops.kb_review_payload`; every write
-    # is one `ops.kb_*` call, and its refusal comes back as JSON the page prints.
 
     @app.get("/knowledge/review", response_class=HTMLResponse)
     def knowledge_review(request: Request):
@@ -1877,8 +1873,7 @@ def create_app() -> FastAPI:
 
     @app.post("/knowledge/review/assign")
     def kb_assign(body: AssignIn) -> JSONResponse:
-        """Entries into a domain ('' = unassigned); re-assigning to the same domain is how
-        a machine proposal becomes a human-reviewed one"""
+        """Entries into a domain ('' = unassigned); the same domain again = proposal accepted"""
         return kb_write(ops.kb_assign, body.kn_ids, body.domain_id)
 
     @app.post("/knowledge/review/link")

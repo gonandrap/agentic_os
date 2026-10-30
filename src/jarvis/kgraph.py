@@ -1,21 +1,4 @@
-"""The knowledge base as a graph: typed edges derived mechanically, and arm B of the A/B.
-
-PROTOTYPE. Nothing in the running OS calls this module. It exists so two questions can be
-answered before anybody commits to a refactor:
-
-1. Does expanding a `learn search` hit set along the graph surface the entry a worker went
-   on to open, more often than BM25 alone? `scripts/kb_graph_ab.py` replays the real query
-   log against both arms; arm A is `CentralStore.search_knowledge` untouched.
-2. Is a picture of what the OS learned worth having? `to_gexf` writes a file Gephi Lite
-   (or desktop Gephi) opens as is — no viewer code of our own.
-
-Every edge is read off columns and text that already exist; no model is called and nothing
-is written. Three kinds, between knowledge entries:
-
-  * `cites`      — A's text names B's id (`kn-xxxxxxxx`). Directed A -> B.
-  * `supersedes` — the work order that WROTE A is the one that RETIRED B. Directed A -> B.
-  * `same_wo`    — A and B were written by the same work order. Undirected.
-"""
+"""The knowledge base as a graph: typed edges derived mechanically, and arm B of the A/B"""
 
 from __future__ import annotations
 
@@ -30,7 +13,7 @@ from .central_store import headline
 
 KN_ID_RE = re.compile(r"\bkn-[0-9a-f]{8}\b")
 
-#: Expansion order: the strongest claim that B matters to whoever found A comes first.
+#: Expansion order: the strongest claim that B matters to whoever found A comes first
 REL_PRIORITY = {"supersedes": 0, "superseded_by": 0, "cites": 1, "cited_by": 2, "same_wo": 3}
 
 
@@ -84,13 +67,7 @@ def graph_search(store: Any, term: str, limit: int = 20, project: str | None = N
                  adj: dict[str, list[tuple[str, str]]] | None = None,
                  visible: Callable[[dict[str, Any]], bool] | None = None,
                  ) -> list[dict[str, Any]]:
-    """Arm B: BM25 hits, with up to `reserve` slots given to neighbours of the top `seeds`.
-
-    Same `limit` as arm A, so the two cost the same number of index rows; a neighbour can
-    only displace the weakest BM25 hits. Each neighbour carries `via` (`<rel> <seed id>`).
-    `visible` filters both hits and neighbours (the replay uses it to see the base as it
-    stood when the query was asked).
-    """
+    """Arm B: BM25 hits, with up to `reserve` slots given to neighbours of the top `seeds`"""
     ok = visible or (lambda _row: True)
     pool = store.search_knowledge(term, limit=limit * 10 if visible else limit,
                                   project=project, topic=topic)
@@ -118,17 +95,11 @@ def graph_search(store: Any, term: str, limit: int = 20, project: str | None = N
     return hits[:keep] + extra
 
 
-# -- the review tool's payload --------------------------------------------------------
+# -- the review tool's payload
 
 
 def review_payload(store: Any, include_retired: bool = False) -> dict[str, Any]:
-    """Everything the knowledge-review page draws, as one JSON-ready dict.
-
-    `nodes` are knowledge entries (`domain_id` '' = unassigned, `assigned_by` the actor
-    of the current assignment, so a page can tell a proposal from a decision); `domains`
-    the live tree; `edges` the derived ones (`manual: false`, no id) plus live `kb_links`
-    (`manual: true`, with the id a removal needs).
-    """
+    """Everything the knowledge-review page draws, as one JSON-ready dict"""
     rows = store.search_knowledge("", limit=1_000_000)
     assigned = store.domain_assignments(with_by=True)
     reads = store.knowledge_hit_counts()
@@ -153,14 +124,13 @@ def review_payload(store: Any, include_retired: bool = False) -> dict[str, Any]:
     return {"nodes": nodes, "domains": domains, "edges": edges}
 
 
-# -- the picture ----------------------------------------------------------------------
+# -- the picture
 
 
 def graph_nodes_edges(central: sqlite3.Connection, neo: sqlite3.Connection | None = None,
                       reads: dict[str, int] | None = None,
                       ) -> tuple[list[dict[str, Any]], list[tuple[str, str, str]]]:
-    """Nodes and edges for the viewer: knowledge, the work orders that wrote and retired it,
-    learned gate rules, and (given `neo`) Neo learnings tied to their work order"""
+    """Nodes and edges for the GEXF export: knowledge entries, plus Neo learnings when neo.db is given"""
     central.row_factory = sqlite3.Row
     reads = reads or {}
     nodes: dict[str, dict[str, Any]] = {}

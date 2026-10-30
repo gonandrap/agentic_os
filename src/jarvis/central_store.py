@@ -87,7 +87,7 @@ def fts_query(term: str) -> str:
     return " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
 
 
-#: The relationships a person may assert between two entries (`kb_links.rel`).
+#: The relationships a person may assert between two entries (`kb_links.rel`)
 KB_LINK_RELS = ("relates_to", "supersedes", "depends_on", "duplicates")
 
 

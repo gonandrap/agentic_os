@@ -1,9 +1,4 @@
-"""Screenshot `/knowledge/review` — and drive it: a drag-assign and a drag-link must land in os.db
-
-    uv run python scripts/screenshot_knowledge_review.py [--from-db PATH]
-
-`--from-db` copies a real os.db (never touched) into the temp home instead of seeding.
-"""
+"""Screenshot `/knowledge/review` — and drive it: a drag-assign and a drag-link must land in os.db"""
 
 from __future__ import annotations
 
@@ -103,14 +98,13 @@ def shoot() -> list[Path]:
         page = browser.new_page(viewport={"width": 1600, "height": 1000})
         errors: list[str] = []
         page.on("pageerror", lambda e: errors.append(str(e)))
-        # Canvas renderer: headless Chromium's WebGL is software (SwiftShader) and too slow
-        # to drive; hit-testing and the drag/drop code are the same under either renderer.
+        # Canvas renderer: headless Chromium's WebGL is software (SwiftShader) and too slow to drive
         page.goto(f"http://127.0.0.1:{PORT}/knowledge/review?webgl=0")
         drawn(page)
         out.append(SHOTS / "knowledge-review.png")
         page.screenshot(path=out[-1])
 
-        # 1. DRAG-ASSIGN: a loose entry onto the deepest domain, then check os.db agrees
+        # Drag-assign: a loose entry onto a leaf domain must land in os.db
         data = payload(page)
         loose = next(n["id"] for n in data["nodes"] if not n["domain_id"])
         domain = page.evaluate(
@@ -126,7 +120,7 @@ def shoot() -> list[Path]:
         assert after["assigned_by"] == "human:user", after
         print(f"drag-assign ok: {loose} -> {domain}")
 
-        # 2. DRAG-LINK: link mode, entry to entry, choose a rel
+        # Drag-link: link mode, entry to entry, then pick the relationship
         nodes = [n["id"] for n in data["nodes"] if n["id"] != loose]
         a, b = nodes[10], nodes[20]
         page.keyboard.press("l")

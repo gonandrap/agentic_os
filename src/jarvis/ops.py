@@ -13885,7 +13885,7 @@ def learn_add(content: str, *, project: str = "", topic: str = "", tags: str = "
 
 # -- knowledge domains: the reviewable structure over the base (kgraph.review_payload)
 
-#: Who a person at the dashboard or a terminal is, in OKF's actor convention.
+#: Who a person at the dashboard or a terminal is, in OKF's actor convention
 KB_HUMAN_ACTOR = "human:user"
 
 
@@ -13937,10 +13937,7 @@ def kb_link_retire(link_id: str, reason: str) -> dict[str, Any]:
 
 def kb_group(name: str, kn_ids: Sequence[str], *, description: str = "",
              parent_id: str = "", by: str = KB_HUMAN_ACTOR) -> dict[str, Any]:
-    """A new domain holding these entries — the review page's "group the selection".
-
-    One transaction: a bad id leaves no empty domain behind.
-    """
+    """A new domain holding these entries — the review page's "group the selection\""""
     def group(c: CentralStore) -> dict[str, Any]:
         with db.write_transaction(c.conn):
             domain = c.add_domain(name, description=description, parent_id=parent_id,

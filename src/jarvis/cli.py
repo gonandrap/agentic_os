@@ -5784,11 +5784,7 @@ def _free_port(host: str) -> int:
 
 
 def cmd_learn_review(args: argparse.Namespace) -> int:
-    """`jarvis learn review`: the dashboard's knowledge-review page, on its own port.
-
-    The same app as `jarvis ui` — one implementation — against whatever `JARVIS_HOME`
-    names, so it runs whether or not the OS (or its dashboard) is up.
-    """
+    """`jarvis learn review`: the dashboard's knowledge-review page, on its own port"""
     port = args.port or _free_port(args.host)
     print(f"knowledge review: http://{args.host}:{port}/knowledge/review  (Ctrl-C to stop)",
           flush=True)

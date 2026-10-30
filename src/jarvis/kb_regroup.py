@@ -1,24 +1,4 @@
-"""A deterministic first proposal of knowledge DOMAINS, for a person to review.
-
-PROTOTYPE. 122 free-text topics over ~800 entries (median two entries a topic, 52 of one)
-are too many to browse and too few per bucket to be worth opening. This groups topics
-into a handful of domains with no model call, so the proposal costs nothing and runs the
-same way twice:
-
-1. A topic's TOKENS: its name lower-cased, split on non-letters, stop words dropped,
-   plurals folded (`privileged-action-gates`, `ui gates` and `gates neo` share `gate`).
-2. Topic AFFINITY: entry-to-entry edges between the two topics (`kgraph.knowledge_edges`:
-   cites, supersedes, same_wo), normalised by the smaller topic, plus a bonus for shared
-   tokens.
-3. Greedy agglomeration: merge the most-affine pair of groups until `target` groups
-   remain or nothing affine is left, never past `max_share` of the base in one group.
-4. An entry with no topic joins the group most of its edges point into; else stays
-   unassigned.
-
-A group's NAME is its largest topic and its description lists its biggest topics. The
-proposal is written with actor `process:kb-regroup`; every assignment a person makes in
-the review tool supersedes it as `human:…`.
-"""
+"""A deterministic first proposal of knowledge DOMAINS, for a person to review"""
 
 from __future__ import annotations
 
@@ -95,8 +75,7 @@ def propose(rows: Sequence[dict[str, Any]], *, target: int = 12, max_share: floa
         groups[i] = Group(a.topics + b.topics, a.size + b.size, a.toks + b.toks)
         del groups[j]
 
-    # A group still under `min_size` folds into the group it is most affine to; with no
-    # affinity at all it folds into one "unfiled" group a person sorts by hand.
+    # A group still under `min_size` folds into the group it is most affine to
     groups.sort(key=lambda g: (-g.size, g.topics[0]))
     big = [g for g in groups if g.size >= min_size]
     unfiled = Group([], 0)
