@@ -502,6 +502,11 @@ def record_section(wo_id: str = WO_PLACEHOLDER,
         f"recording and nothing worth merging. What the OS will not accept is "
         f"silence, because silence is indistinguishable from work that was lost.",
         "",
+        "When what is left is a command only the user may run (`jarvis config "
+        "set …` and the like), pass it verbatim as `--needs-user \"<command>\"`: "
+        "a finish that changed nothing then escalates naming that command, "
+        "instead of as 'nothing to review' (GitHub issue #1352).",
+        "",
         "Nobody executes a list of next steps written into a summary: this OS runs "
         "itself, and the user does not keep a to-do list for it. When you abandon "
         "because another order or pull request already covers the work, name that "

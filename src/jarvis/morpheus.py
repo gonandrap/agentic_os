@@ -55,9 +55,11 @@ KILL_HOLD_SECONDS = 6 * 3600
 #: How much of a script's output is kept
 OUTPUT_TAIL = 2000
 #: What a `validation` verdict may ask the OS to do — a waive stays the user's (issue #1254)
-VERDICT_ACTIONS = ("requeue",)
+VERDICT_ACTIONS = ("requeue", "rewrite")
 #: How many times Neo's own verdict may put one item back on the watch list
 MAX_AUTO_REQUEUES = 1
+#: How many times Neo's own verdict may send one item's script back to be rewritten (#1358)
+MAX_SCRIPT_REWRITES = 1
 
 SECONDS_PER_DAY = 86400
 
@@ -408,6 +410,26 @@ def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str, *,
     return central.morpheus_item(item_id) or {}
 
 
+def rewrite(central: CentralStore, cfg: MorpheusConfig, item_id: str, why: str, *,
+            resolution: str = "") -> dict:
+    """The script is wrong, not the PR: back to Morpheus for a new one, `why` as its brief (#1358)"""
+    item = _item_or_raise(central, item_id)
+    why = (why or "").strip()
+    if not why:
+        raise ValueError("say what is wrong with the script")
+    now = db.now()
+    # last_exit goes too: the old script's exit 1 must not count toward the new one's two-in-a-row
+    central.update_morpheus_item(
+        item_id, state="queued", script="", script_source="", last_exit=None,
+        rewrite_brief=(f"{why[:1500]}\n\nThe rejected script:\n"
+                       f"{item['script'][:3000] or '(none)'}"),
+        deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY, next_check_ts=None,
+        resolution=resolution or f"script sent back to be rewritten: {why[:600]}",
+        action="", action_ts=None)
+    _forget_offer(central, item_id)
+    return central.morpheus_item(item_id) or {}
+
+
 def _item_or_raise(central: CentralStore, item_id: str) -> dict[str, Any]:
     item = central.morpheus_item(item_id)
     if not item:
@@ -636,6 +658,18 @@ refused and it stays {state}. The user re-watches it with `jarvis morpheus reque
 rules it fine with `jarvis morpheus waive {id} --reason "…"`, or rules it broken and files
 the fix with `jarvis morpheus confirm {id} --fix "…"`."""
 
+#: The item still has its automatic script rewrite (#1358)
+REWRITE_OFFER = """If the SCRIPT is wrong rather than the PR — it keys on the wrong field, counts the wrong
+thing, or cannot see what the hints describe — add `"action": "rewrite"` instead: Morpheus
+writes a new script with your answer as its brief, and the OS watches it with a fresh
+deadline. Your answer must then say what the script got wrong and what the right check is.
+That is available ONCE per item, and this item still has it."""
+
+#: It has spent it
+REWRITE_SPENT = """This item has already spent its one automatic script rewrite, so `"action": "rewrite"` is
+refused. If the new script is wrong too, ESCALATE: the user sends it back with
+`jarvis morpheus rewrite {id} --why "…"`."""
+
 
 def _ask_neo(catalog: Catalog, item: dict[str, Any], note: str = "") -> int:
     from .neo_store import NeoStore
@@ -643,7 +677,9 @@ def _ask_neo(catalog: Catalog, item: dict[str, Any], note: str = "") -> int:
     why = _why(item) + (f"\n\nNo investigation was filed: {note}." if note else "")
     spent = int(item.get("auto_requeues") or 0) >= MAX_AUTO_REQUEUES
     offer = REQUEUE_SPENT if spent else REQUEUE_OFFER
-    actions = offer.format(id=item["id"], state=item["state"])
+    rewritten = int(item.get("script_rewrites") or 0) >= MAX_SCRIPT_REWRITES
+    actions = "\n\n".join(text.format(id=item["id"], state=item["state"]) for text in
+                          (offer, REWRITE_SPENT if rewritten else REWRITE_OFFER))
     neo = NeoStore()
     try:
         q = neo.ask(item.get("project") or _os_project(catalog), "",
@@ -694,22 +730,32 @@ def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, 
     reading = (verdict.get("answer") or verdict.get("reason") or "").strip()
     resolution = f"{item['resolution']} — Neo: {reading[:600]}".strip(" —")
     escalated = bool(verdict.get("escalate"))
+    action = "" if escalated else verdict_action(verdict)
     # The state guard catches the user waiving between the question and the verdict
-    requeued = (not escalated and verdict_action(verdict) == "requeue"
-                and item["state"] in ACTION_STATES
+    live = item["state"] in ACTION_STATES
+    requeued = (action == "requeue" and live
                 and central.claim_morpheus_auto_requeue(item_id, MAX_AUTO_REQUEUES))
+    rewritten = (action == "rewrite" and live and bool(reading)
+                 and central.claim_morpheus_script_rewrite(item_id, MAX_SCRIPT_REWRITES))
     if requeued:
         requeue(central, cfg, item_id, resolution=f"re-watched by Neo: {resolution}")
+    elif rewritten:
+        rewrite(central, cfg, item_id, reading,
+                resolution=f"script sent back to be rewritten by Neo: {resolution}")
     else:
         central.update_morpheus_item(item_id, resolution=resolution)
     central.add_inbox(
         project=q.get("project") or "os", level="warning" if escalated else "info",
         title=(f"PR #{item['pr_number']} {item['state']} production validation"
                + (" — Neo escalated" if escalated else
-                  " — Neo is watching it again" if requeued else " — Neo's reading")),
+                  " — Neo is watching it again" if requeued else
+                  " — Neo sent its script back to be rewritten" if rewritten else
+                  " — Neo's reading")),
         body=f"{item['pr_url']}\n{reading[:600]}\n"
              + ("the OS is validating it again — its one automatic requeue is now spent\n"
                 if requeued else "")
+             + ("Morpheus writes a new script, then the OS watches it again — its one "
+                "automatic rewrite is now spent\n" if rewritten else "")
              + (f"{question_url}\n" if question_url else "")
              + f"jarvis morpheus show {item_id}")
 
@@ -795,6 +841,8 @@ def build_prompt(items: list[dict[str, Any]], dirs: dict[str, Path]) -> str:
               f"{i['pr_title']}\n{i['pr_url']}\nproduction directory: "
               f"{dirs.get(i.get('project') or '', '(unknown)')}\n\n"
               f"{(i['hints'] or '(the PR gave no hints at all: read the PR)')[:4000]}"
+              + (f"\n\nA REWRITE: its previous script was ruled wrong, not the PR. Write one "
+                 f"that avoids this:\n{i['rewrite_brief']}" if i.get("rewrite_brief") else "")
               for i in items]
     return (f"{len(items)} shipped PR(s) need a validation script.\n\n"
             + "\n\n".join(blocks))

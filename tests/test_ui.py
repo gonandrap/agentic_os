@@ -202,6 +202,32 @@ def test_wo_page_anchors_pending_at_what_needs_the_user(client, daemon):
     assert '<h2 id="pending">Assumptions pending your review</h2>' in review
 
 
+def test_a_pending_assumption_says_who_it_waits_on_and_links_its_turn(client, project):
+    """Issue #1265: the card carried the text and an age, and nothing else"""
+    wo = ops.create_work_order("proj_a", "risky change")
+    store = ProjectStore(project)
+    try:
+        ops.assume(wo["id"], "assumed the API is v2")
+        raised_in = store.record_agent_reply(wo["id"], "recorded assumption #1 — why")
+    finally:
+        store.close()
+    ops.finish(wo["id"], "done-ish")
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    card = page.split("Assumptions pending your review", 1)[1].split("</div></div>", 1)[0]
+    flat = html.unescape(" ".join(card.split()))
+
+    # WHY it is with the user, naming the setting that put it there
+    assert "`validation.enabled` is off" in flat
+    assert "nobody judged it before you" in flat
+    # WHERE it was raised, as the anchor the Conversation tab already resolves
+    assert f'href="#msg-{raised_in}"' in card
+    assert f'id="msg-{raised_in}"' in page
+    # And the placeholder no longer implies Neo ruled on it first
+    assert "teaches Neo" not in page
+    assert "recorded as a rule for Neo" in html.unescape(page)
+
+
 # -- the work order page reads as three alternatives, not one long scroll
 
 

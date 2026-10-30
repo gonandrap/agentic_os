@@ -638,6 +638,39 @@ def test_a_verdict_never_pulls_a_waived_item_back_into_validation(central):
     assert (after["state"], after["auto_requeues"]) == ("validated", 0)
 
 
+def test_neo_s_rewrite_verdict_sends_the_script_back_to_morpheus(central):
+    item = monitoring(central, script="echo old; exit 1")
+    central.update_morpheus_item(item["id"], state="failed", resolution="script exited 1",
+                                 last_exit=1, next_check_ts=None, action="neo:5")
+    _verdict(central, item["id"], action="rewrite", answer="keys on resolution; use state")
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["script"], after["last_exit"], after["action"],
+            after["script_rewrites"]) == ("queued", "", None, "", 1)
+    assert "keys on resolution; use state" in after["rewrite_brief"]
+    assert "echo old; exit 1" in after["rewrite_brief"]
+    assert [i["id"] for i in morpheus.wanting_scripts(central)] == [item["id"]]
+    assert "A REWRITE" in morpheus.build_prompt([after], {})
+    assert morpheus.set_script(central, item["id"], "exit 0", "agent")["state"] == "monitoring"
+
+
+def test_the_second_automatic_rewrite_is_refused_and_neo_is_told(central):
+    item = monitoring(central, script="exit 1")
+    for _ in range(2):
+        central.update_morpheus_item(item["id"], state="failed", script="exit 1")
+        _verdict(central, item["id"], action="rewrite")
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["script_rewrites"]) == ("failed", 1)
+    qid = morpheus._ask_neo(catalog(), after, "")
+    from jarvis.neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        question = neo.get(qid)["question"]
+    finally:
+        neo.close()
+    assert f"jarvis morpheus rewrite {item['id']}" in question
+
+
 def test_a_validation_question_cannot_be_answered_like_a_worker_question(central):
     from jarvis import ops
 

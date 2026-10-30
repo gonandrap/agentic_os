@@ -1318,3 +1318,15 @@ def test_the_dashboard_names_what_the_window_hid(fleet_fixture):
     assert "1 tool results outside the window, excluded" in render(UNTIL)
     assert ("tool results outside the window, excluded"
             not in render(stamp("2027-10-06T04:00:00+00:00")))
+
+
+def test_a_neo_db_without_its_schema_yet_counts_no_questions(jarvis_home):
+    """The file exists before Neo writes its tables: a race, not an error (issue 1355)"""
+    import sqlite3
+
+    from jarvis import paths
+
+    paths.neo_db_path().parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(paths.neo_db_path()).close()
+
+    assert fleetcost._neo_questions(0.0, 1e12, None) == {}

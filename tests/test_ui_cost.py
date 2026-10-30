@@ -1151,6 +1151,9 @@ def test_an_open_ended_window_is_computed_once_however_often_it_is_visited(
                       0.05, 48_000)
     cache = client.app.state.cost_cache
     calls = count_live(monkeypatch)
+    # One frozen NOW: visits straddling a REFRESH_SECONDS bucket edge key twice (kn-a3d67b6c)
+    frozen = db.now()
+    monkeypatch.setattr(db, "now", lambda: frozen)
 
     page = _computing_then_page(client, cache, "/cost?since=2026-01-01T00:00")
 
