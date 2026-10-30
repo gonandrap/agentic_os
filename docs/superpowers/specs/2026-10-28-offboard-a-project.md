@@ -459,6 +459,14 @@ reports it. They cost nothing — the daemon skips them — and they are what ma
 pick up where it left off. The archived project's own page already says `archived` (section
 2); if the counts ever need surfacing, that page is where they belong, not `jarvis doctor`.
 
+**Amended 2026-10-30 (issue #1333).** "Purged, or never registered" are now two findings.
+`offboard --purge` writes a tombstone to `offboarded_projects`; a name with a tombstone
+reports `INV-OFFBOARDED-ACTIVITY` as above. A name with neither a `projects` row nor a
+tombstone is a typo and reports `INV-UNKNOWN-PROJECT`. `jarvis doctor --repair` re-points
+its rows when exactly one registered name matches it, ignoring case and `-` versus `_`.
+Commands that take a project name typed by the user (`backlog add`, `bug report --project`,
+`notify --project`) refuse a name the OS does not know.
+
 Finally, `ops.start_os` must not `bootstrap_project` or `upsert_project` an offboarded
 project. With section 7 removing the catalog entry this should already hold by construction —
 prove it with a test rather than assuming, because "a removed project is not re-bootstrapped

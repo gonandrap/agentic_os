@@ -5038,6 +5038,7 @@ def cmd_backlog(args: argparse.Namespace) -> int:
     try:
         if args.bl_cmd == "add":
             deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
+            ops.require_registered_project(args.project)
             item = central.add_backlog(args.project, args.title,
                                        description=args.description, depends_on=deps,
                                        origin_wo_id=args.origin_wo,
@@ -5662,6 +5663,9 @@ def cmd_notify(args: argparse.Namespace) -> int:
 
     project = args.project or os.environ.get("JARVIS_PROJECT")
     root = None
+    if args.project:
+        from .ops import require_registered_project
+        require_registered_project(args.project)
     if project:
         from .ops import registered_project_paths
         root = registered_project_paths().get(project)
@@ -5681,17 +5685,20 @@ def cmd_notify(args: argparse.Namespace) -> int:
     else:
         central = CentralStore()
         try:
-            central.add_inbox(project or "unknown", args.title, body=args.body,
+            central.add_inbox(project or "os", args.title, body=args.body,
                               level=args.level, wo_id=args.wo_id)
         finally:
             central.close()
-        _print({"queued": True, "project": project or "unknown",
+        _print({"queued": True, "project": project or "os",
                 "via": "central inbox"}, args.json)
     return 0
 
 
 def cmd_bug(args: argparse.Namespace) -> int:
+    from . import ops
     from .bugreport import pickup_note, report_bug
+    if args.project:
+        ops.require_registered_project(args.project)
     result = report_bug(title=args.title, description=args.description,
                         expected=args.expected, actual=args.actual, steps=args.steps,
                         priority=args.priority, expedite=args.expedite,

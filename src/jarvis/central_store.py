@@ -6,7 +6,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import db
 from .paths import central_db_path, ensure_home
@@ -126,6 +126,12 @@ CREATE TABLE IF NOT EXISTS projects (
     status TEXT NOT NULL DEFAULT 'active',  -- active | stopped
     last_seen REAL,
     catalog_json TEXT
+);
+-- A purged project's tombstone: tells "offboarded" from "never registered" once its projects row is gone
+CREATE TABLE IF NOT EXISTS offboarded_projects (
+    name TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    reason TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS inbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -700,6 +706,17 @@ CREATE INDEX IF NOT EXISTS idx_steward_decisions_queue ON steward_decisions(queu
 #: Tables whose `project` is provenance, not scope: purge clears or retracts, never deletes (docs/superpowers/specs/2026-10-28-offboard-a-project.md §3)
 PROVENANCE_TABLES = ("detectors", "gate_rules")
 
+#: Project names the OS writes for itself; never a registered project, never a typo
+OS_PROJECT_NAMES = frozenset({"", "os"})
+
+
+def spelled_like(name: str, registered: Iterable[str]) -> str | None:
+    """The one registered name `name` mistypes (case, '-' for '_'), or None when none or several do"""
+    def key(s: str) -> str:
+        return s.lower().replace("-", "_")
+    hits = [r for r in registered if key(r) == key(name)]
+    return hits[0] if len(hits) == 1 else None
+
 
 class CentralStore:
     def __init__(self, path: Path | None = None):
@@ -925,6 +942,24 @@ class CentralStore:
                 self.retract_detector(detector_id, f"project {name} purged from the OS")
             counts["detectors_retracted"] = len(live)
         return counts
+
+    def record_offboard(self, name: str, reason: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO offboarded_projects (name, ts, reason) VALUES (?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET ts=excluded.ts, reason=excluded.reason",
+            (name, db.now(), reason))
+
+    def offboarded_names(self) -> set[str]:
+        return {r["name"] for r in self.conn.execute("SELECT name FROM offboarded_projects")}
+
+    def repoint_project(self, old: str, new: str) -> dict[str, int]:
+        """Move every scope row filed under a mistyped `old` to `new`; provenance tables untouched"""
+        scope = [t for t in db.tables_with_column(self.conn, "project")
+                 if t not in PROVENANCE_TABLES]
+        with db.write_transaction(self.conn):
+            counts = {t: self.conn.execute(f"UPDATE {t} SET project=? WHERE project=?",
+                                           (new, old)).rowcount for t in scope}
+        return {t: n for t, n in counts.items() if n}
 
     def live_rows_by_project(self) -> list[tuple[str, str, int]]:
         """(table, project, count) of rows the OS would still act on (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""

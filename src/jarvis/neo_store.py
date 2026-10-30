@@ -210,6 +210,14 @@ class NeoStore:
             return db.delete_where(self.conn, db.tables_with_column(self.conn, "project"),
                                    "project", name)
 
+    def repoint_project(self, old: str, new: str) -> dict[str, int]:
+        """Move every row filed under a mistyped `old` to `new`"""
+        with db.write_transaction(self.conn):
+            counts = {t: self.conn.execute(f"UPDATE {t} SET project=? WHERE project=?",
+                                           (new, old)).rowcount
+                      for t in db.tables_with_column(self.conn, "project")}
+        return {t: n for t, n in counts.items() if n}
+
     def _migrate(self) -> None:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
 

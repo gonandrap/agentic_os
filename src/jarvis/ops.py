@@ -46,7 +46,7 @@ from .agent_usage import (
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import (ARCHIVED, MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES,
-                            CentralStore)
+                            CentralStore, spelled_like)
 from .daemon import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
@@ -309,7 +309,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
             raise OpsError(f"unknown project: {project}")
 
     # OS-level checks first: they are about the OS itself (is the dashboard alive?)
-    os_found = check_os() if include_os else []
+    os_found = check_os(repair=repair) if include_os else []
     results, total = [], len(os_found)
     for p in rows:
         if p["status"] != "active":
@@ -822,6 +822,17 @@ def registered_project_paths(*, include_archived: bool = False) -> dict[str, Pat
                 if p["status"] in wanted}
     finally:
         central.close()
+
+
+def require_registered_project(name: str) -> str:
+    """Refuse a row under a project the OS does not know (issue #1333)"""
+    known = registered_project_paths(include_archived=True)
+    if name in known:
+        return name
+    guess = spelled_like(name, known)
+    hint = f" Did you mean {guess!r}?" if guess else ""
+    raise OpsError(f"unknown project {name!r}.{hint} Registered projects: "
+                   f"{', '.join(sorted(known)) or '(none)'}")
 
 
 MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
@@ -11781,6 +11792,7 @@ def offboard_project(name: str, *, purge: bool = False, force: bool = False,
             finally:
                 neo.close()
             central.delete_project(name)
+            central.record_offboard(name, reason)
             plan["registry"] = "deleted"
         else:
             central.set_project_status(name, ARCHIVED)
