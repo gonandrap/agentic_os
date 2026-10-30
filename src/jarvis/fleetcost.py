@@ -516,6 +516,10 @@ def _neo_questions(since: float, until: float, project: str | None) -> dict[str,
         return {}
     conn = connect_ro(path)
     try:
+        # The file lands before Neo writes its schema: no table yet is no question yet (issue 1355)
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'questions'").fetchone() is None:
+            return {}
         sql = ("SELECT wo_id, COUNT(*) AS n FROM questions "
                "WHERE ts >= ? AND ts < ? AND wo_id != ''")
         args: list[Any] = [since, until]
