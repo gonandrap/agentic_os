@@ -3204,7 +3204,7 @@ def check_config_drift() -> Iterator[Violation]:
 
 
 def check_offboarded_activity(repair: bool = False) -> Iterator[Violation]:
-    """INV-OFFBOARDED-ACTIVITY / INV-UNKNOWN-PROJECT — nothing the OS acts on names a project with no `projects` row (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3; issue #1333)"""
+    """INV-OFFBOARDED-ACTIVITY / INV-UNKNOWN-PROJECT (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
     from .central_store import OS_PROJECT_NAMES, CentralStore, spelled_like
     from .neo_store import OPEN_Q_STATUSES, NeoStore
 

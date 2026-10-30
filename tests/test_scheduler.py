@@ -625,7 +625,7 @@ def test_skip_os_drops_the_fleet_wide_checks_and_keeps_the_project_ones(started,
     """BOTH OS-level sources are faked into failing first"""
     marker = invariants.Violation(invariant="INV-FAKE-OS", detail="the dashboard is down")
     stranded = invariants.Violation(invariant="INV-FAKE-MARKER", detail="release stuck")
-    monkeypatch.setattr(invariants, "check_os", lambda: [marker])
+    monkeypatch.setattr(invariants, "check_os", lambda **kw: [marker])
     monkeypatch.setattr(invariants, "check_release_marker", lambda: [stranded])
 
     everything = ops.run_doctor()
