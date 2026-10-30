@@ -3,8 +3,10 @@
 {% block title %}Knowledge — Jarvis{% endblock %}
 {% block content %}
 
-{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6 #}
-{{ ui.page_head("Knowledge base", total ~ " entries · " ~ (topics | length) ~ " topics") }}
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6.
+   Domains and links between entries are reviewed by hand on their own page;
+   `jarvis learn review` opens the same one. #}
+{% call ui.page_head("Knowledge base", total ~ " entries · " ~ (topics | length) ~ " topics") %}<a href="/knowledge/review" title="group entries into domains, accept or move the machine's proposals, link entries">Validate knowledge graph →</a>{% endcall %}
 
 {{ ui.filter_bar("/knowledge", filters, options, rows | length, total,
                  labels={"q": "words in the entry", "project": "every scope"}) }}

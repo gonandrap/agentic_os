@@ -87,6 +87,10 @@ def fts_query(term: str) -> str:
     return " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
 
 
+#: The relationships a person may assert between two entries (`kb_links.rel`)
+KB_LINK_RELS = ("relates_to", "supersedes", "depends_on", "duplicates")
+
+
 def headline(content: str, limit: int = HEADLINE_CHARS) -> str:
     """One-line gist of an entry: its first line, truncated"""
     text = " ".join((content or "").strip().split("\n", 1)[0].split())
@@ -250,6 +254,42 @@ CREATE TABLE IF NOT EXISTS agent_calls (
 );
 -- What the OS believes is a privileged action, and what it has LEARNED is not.
 --
+-- The knowledge base's DOMAINS: the browsable tree an OKF-style index renders, above the
+-- free-text `topic`. Append-only throughout: a domain is retired with a reason, an
+-- assignment is superseded by a newer row, a link is retired with a reason. `by` is an
+-- OKF actor (`human:<id>`, `process:<id>`), so a machine proposal and a person's decision
+-- stay distinguishable — the person's is the human-reviewed tier.
+CREATE TABLE IF NOT EXISTS kb_domains (
+    id TEXT PRIMARY KEY,                    -- dom-xxxxxxxx
+    ts REAL NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    parent_id TEXT NOT NULL DEFAULT '',     -- '' = top level
+    by TEXT NOT NULL DEFAULT '',
+    retired_at REAL,
+    retired_reason TEXT NOT NULL DEFAULT ''
+);
+-- Which domain an entry sits in: the NEWEST row per kn_id wins; domain_id '' = unassigned.
+CREATE TABLE IF NOT EXISTS kb_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    kn_id TEXT NOT NULL,
+    domain_id TEXT NOT NULL DEFAULT '',
+    by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_kb_assignments_kn ON kb_assignments(kn_id, id);
+-- A relationship a person (or process) asserted between two entries. The mechanical
+-- edges (`kgraph.knowledge_edges`) are derived and never stored; these are the rest.
+CREATE TABLE IF NOT EXISTS kb_links (
+    id TEXT PRIMARY KEY,                    -- kl-xxxxxxxx
+    ts REAL NOT NULL,
+    src TEXT NOT NULL,
+    rel TEXT NOT NULL,                      -- one of KB_LINK_RELS
+    dst TEXT NOT NULL,
+    by TEXT NOT NULL DEFAULT '',
+    retired_at REAL,
+    retired_reason TEXT NOT NULL DEFAULT ''
+);
 -- The recognisers behind the gates used to be regex tuples in `gates.KINDS`, and the
 -- problem with that was not the regexes — it was that the table had no writer. Every
 -- false positive was reviewed by Neo, correctly identified, dismissed, and forgotten;
@@ -1035,6 +1075,138 @@ class CentralStore:
         )
         return {"id": kid, "project": project, "topic": topic, "content": content,
                 "tags": tags, "wo_id": wo_id}
+
+    # -- domains, assignments, links (the reviewable structure over the base)
+
+    def add_domain(self, name: str, *, description: str = "", parent_id: str = "",
+                   by: str = "") -> dict[str, Any]:
+        name = name.strip()
+        if not name:
+            raise ValueError("a domain needs a name")
+        if parent_id and not self._is_live_domain(parent_id):
+            raise KeyError(f"no live domain {parent_id!r}")
+        if self._live_domain_named(name, parent_id):
+            raise ValueError(f"a domain named {name!r} already exists there")
+        did = db.new_id("dom")
+        self.conn.execute(
+            "INSERT INTO kb_domains (id, ts, name, description, parent_id, by)"
+            " VALUES (?,?,?,?,?,?)", (did, db.now(), name, description, parent_id, by))
+        return self.get_domain(did) or {}
+
+    def get_domain(self, domain_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM kb_domains WHERE id=?",
+                                (domain_id,)).fetchone()
+        return dict(row) if row else None
+
+    def _is_live_domain(self, domain_id: str) -> bool:
+        row = self.get_domain(domain_id)
+        return row is not None and row["retired_at"] is None
+
+    def _live_domain_named(self, name: str, parent_id: str, exclude: str = "") -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM kb_domains WHERE name=? AND parent_id=? AND id<>?"
+            " AND retired_at IS NULL", (name, parent_id, exclude)).fetchone() is not None
+
+    def update_domain(self, domain_id: str, *, name: str | None = None,
+                      description: str | None = None,
+                      parent_id: str | None = None) -> dict[str, Any]:
+        row = self.get_domain(domain_id)
+        if row is None or row["retired_at"] is not None:
+            raise KeyError(f"no live domain {domain_id!r}")
+        name = row["name"] if name is None else name.strip()
+        description = row["description"] if description is None else description
+        parent_id = row["parent_id"] if parent_id is None else parent_id
+        if not name:
+            raise ValueError("a domain needs a name")
+        walk = parent_id  # a domain may not become its own ancestor
+        while walk:
+            if walk == domain_id:
+                raise ValueError("that would make the domain its own ancestor")
+            if not self._is_live_domain(walk):
+                raise KeyError(f"no live domain {walk!r}")
+            walk = (self.get_domain(walk) or {}).get("parent_id", "")
+        if self._live_domain_named(name, parent_id, exclude=domain_id):
+            raise ValueError(f"a domain named {name!r} already exists there")
+        self.conn.execute(
+            "UPDATE kb_domains SET name=?, description=?, parent_id=? WHERE id=?",
+            (name, description, parent_id, domain_id))
+        return self.get_domain(domain_id) or {}
+
+    def retire_domain(self, domain_id: str, reason: str, *, by: str = "") -> dict[str, Any]:
+        """Retire a domain; its entries and child domains move up to its parent"""
+        if not reason.strip():
+            raise ValueError("retiring a domain needs a reason")
+        row = self.get_domain(domain_id)
+        if row is None or row["retired_at"] is not None:
+            raise KeyError(f"no live domain {domain_id!r}")
+        members = [k for k, d in self.domain_assignments().items() if d == domain_id]
+        if members:
+            self.assign_domain(members, row["parent_id"], by=by)
+        self.conn.execute("UPDATE kb_domains SET parent_id=? WHERE parent_id=?"
+                          " AND retired_at IS NULL", (row["parent_id"], domain_id))
+        self.conn.execute("UPDATE kb_domains SET retired_at=?, retired_reason=? WHERE id=?",
+                          (db.now(), reason.strip(), domain_id))
+        return self.get_domain(domain_id) or {}
+
+    def list_domains(self, include_retired: bool = False) -> list[dict[str, Any]]:
+        q = "SELECT * FROM kb_domains"
+        if not include_retired:
+            q += " WHERE retired_at IS NULL"
+        return db.rows_to_dicts(self.conn.execute(q + " ORDER BY name").fetchall())
+
+    def assign_domain(self, kn_ids: Sequence[str], domain_id: str, *,
+                      by: str = "") -> int:
+        """Put entries in a domain ('' = unassigned); a newer row supersedes, none is erased"""
+        if domain_id and not self._is_live_domain(domain_id):
+            raise KeyError(f"no live domain {domain_id!r}")
+        missing = [k for k in kn_ids if self.get_knowledge(k) is None]
+        if missing:
+            raise KeyError(f"unknown knowledge id(s): {', '.join(missing)}")
+        now = db.now()
+        self.conn.executemany(
+            "INSERT INTO kb_assignments (ts, kn_id, domain_id, by) VALUES (?,?,?,?)",
+            [(now, k, domain_id, by) for k in kn_ids])
+        return len(kn_ids)
+
+    def domain_assignments(self, with_by: bool = False) -> dict[str, Any]:
+        """kn_id -> current domain_id (or (domain_id, by) with `with_by`)"""
+        rows = self.conn.execute(
+            "SELECT a.kn_id, a.domain_id, a.by FROM kb_assignments a"
+            " JOIN (SELECT kn_id, MAX(id) AS id FROM kb_assignments GROUP BY kn_id) m"
+            " ON m.id = a.id").fetchall()
+        return {r["kn_id"]: (r["domain_id"], r["by"]) if with_by else r["domain_id"]
+                for r in rows}
+
+    def add_kb_link(self, src: str, rel: str, dst: str, *, by: str = "") -> dict[str, Any]:
+        if rel not in KB_LINK_RELS:
+            raise ValueError(f"rel must be one of {', '.join(KB_LINK_RELS)}")
+        if src == dst:
+            raise ValueError("an entry cannot link to itself")
+        for k in (src, dst):
+            if self.get_knowledge(k) is None:
+                raise KeyError(f"unknown knowledge id {k!r}")
+        lid = db.new_id("kl")
+        self.conn.execute(
+            "INSERT INTO kb_links (id, ts, src, rel, dst, by) VALUES (?,?,?,?,?,?)",
+            (lid, db.now(), src, rel, dst, by))
+        return dict(self.conn.execute("SELECT * FROM kb_links WHERE id=?", (lid,)).fetchone())
+
+    def retire_kb_link(self, link_id: str, reason: str) -> dict[str, Any]:
+        if not reason.strip():
+            raise ValueError("removing a link needs a reason")
+        cur = self.conn.execute(
+            "UPDATE kb_links SET retired_at=?, retired_reason=? WHERE id=?"
+            " AND retired_at IS NULL", (db.now(), reason.strip(), link_id))
+        if cur.rowcount == 0:
+            raise KeyError(f"no live link {link_id!r}")
+        return dict(self.conn.execute("SELECT * FROM kb_links WHERE id=?",
+                                      (link_id,)).fetchone())
+
+    def list_kb_links(self, include_retired: bool = False) -> list[dict[str, Any]]:
+        q = "SELECT * FROM kb_links"
+        if not include_retired:
+            q += " WHERE retired_at IS NULL"
+        return db.rows_to_dicts(self.conn.execute(q + " ORDER BY ts").fetchall())
 
     def retract_knowledge(self, knowledge_id: str, reason: str,
                           wo_id: str = "") -> dict[str, Any]:

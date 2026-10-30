@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -17,8 +18,9 @@ from fastapi import FastAPI, Form, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from .. import (
     bill,
@@ -35,7 +37,7 @@ from .. import (
     wiring,
 )
 from ..bill import OWN_LABEL
-from ..central_store import CentralStore
+from ..central_store import KB_LINK_RELS, CentralStore
 from ..daemon import daemon_running
 from ..inspection import ALARM_KINDS, PARTS
 from ..paths import PRODUCTION, deployment_env
@@ -58,6 +60,42 @@ from ..timeline import build_conversation, build_timeline, count_debug
 from . import markdown
 
 TEMPLATES = Path(__file__).parent / "templates"
+# Third-party browser code, shipped in the package so no page loads a CDN (vendor/README.md)
+VENDOR = Path(__file__).parent / "vendor"
+VENDORED = frozenset(p.name for p in VENDOR.glob("*.js"))
+# `?v=<content hash>` on every vendored URL: `/vendor/` is cached for an hour
+VENDOR_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+                  for p in VENDOR.glob("*.js")}
+
+
+# -- the knowledge review's JSON bodies (`/knowledge/review/*`)
+
+class DomainIn(BaseModel):
+    name: str
+    description: str = ""
+    parent_id: str = ""
+    kn_ids: list[str] = []
+
+
+class DomainEdit(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    parent_id: str | None = None
+
+
+class Reason(BaseModel):
+    reason: str = ""
+
+
+class AssignIn(BaseModel):
+    kn_ids: list[str]
+    domain_id: str = ""
+
+
+class LinkIn(BaseModel):
+    src: str
+    rel: str
+    dst: str
 
 
 def _fleet_if_held(wos: list[dict]) -> "fleet.Fleet | None":
@@ -1066,7 +1104,9 @@ def create_app() -> FastAPI:
     async def no_store(request: Request, call_next):
         # Every page reflects live OS state (inbox acks, work order status)
         response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
+        # Except the vendored libraries: they change only with a release
+        response.headers["Cache-Control"] = ("max-age=3600" if request.url.path.startswith("/vendor/")
+                                             else "no-store")
         return response
 
     # Inside the factory, like every other same-tier import in this file: `cli` and `ui` are one tier and...
@@ -1169,8 +1209,8 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
-        """A page link the user followed gets the error page, never FastAPI's raw JSON; /api/* keeps the 422"""
-        if request.url.path.startswith("/api/"):
+        """Error page for a followed link; /api/* and the review's JSON calls keep the 422"""
+        if request.url.path.startswith(("/api/", "/knowledge/review/")):
             return await request_validation_exception_handler(request, exc)
         errors = exc.errors()
         # A junk id in the path names nothing, so 404; a bad form or query value is the request's fault
@@ -1769,16 +1809,6 @@ def create_app() -> FastAPI:
                       topics=base["topics"], filters=filters, options=options,
                       total=len(every), usage=ops.knowledge_usage_report(limit=8))
 
-    @app.get("/knowledge/{kn_id}", response_class=HTMLResponse)
-    def knowledge_item(request: Request, kn_id: str):
-        """One entry in full, as `jarvis learn show` prints it"""
-        try:
-            k = ops.knowledge_detail(kn_id)
-        except ops.OpsError as e:
-            return render(request, "error.html", active="knowledge", message=str(e),
-                          status_code=404)
-        return render(request, "knowledge_item.html", active="knowledge", k=k)
-
     @app.post("/knowledge/pin")
     def knowledge_pin(kn_id: str = Form(...), pinned: str = Form(""), next: str = Form("")):
         """Pinned entries ride in every worker prompt verbatim"""
@@ -1788,6 +1818,89 @@ def create_app() -> FastAPI:
             return RedirectResponse(_same_site_back(next, "/knowledge", str(e)),
                                     status_code=303)
         return RedirectResponse(_same_site_back(next, "/knowledge"), status_code=303)
+
+    # -- the knowledge review: domains, assignments and links over the base, drawn as a
+
+    @app.get("/knowledge/review", response_class=HTMLResponse)
+    def knowledge_review(request: Request):
+        """The graph editor; it draws from `/knowledge/review.json`"""
+        return render(request, "knowledge_review.html", active="knowledge",
+                      link_rels=KB_LINK_RELS, vendor_v=VENDOR_VERSION)
+
+    @app.get("/knowledge/review.json")
+    def knowledge_review_json(retired: str = "") -> JSONResponse:
+        return JSONResponse(ops.kb_review_payload(include_retired=retired == "1"))
+
+    @app.get("/knowledge/review/entry/{kn_id}")
+    def knowledge_review_entry(kn_id: str) -> JSONResponse:
+        """One entry's full text — fetched when the side panel opens, not with the graph"""
+        central = CentralStore()
+        try:
+            row = central.get_knowledge(kn_id)
+        finally:
+            central.close()
+        if row is None:
+            return JSONResponse({"error": f"no knowledge entry {kn_id}"}, status_code=404)
+        return JSONResponse({k: row.get(k) for k in (
+            "id", "content", "topic", "project", "tags", "wo_id", "ts", "retired_at",
+            "retired_reason")})
+
+    def kb_write(fn, *args, **kwargs) -> JSONResponse:
+        """One `ops.kb_*` call; an OpsError is the user's to read, so it comes back as a 400"""
+        try:
+            return JSONResponse({"ok": True, "result": fn(*args, **kwargs)})
+        except ops.OpsError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    @app.post("/knowledge/review/domain")
+    def kb_domain_create(body: DomainIn) -> JSONResponse:
+        """A new domain; with `kn_ids` it is "new domain from selection" (`ops.kb_group`)"""
+        if body.kn_ids:
+            return kb_write(ops.kb_group, body.name, body.kn_ids,
+                            description=body.description, parent_id=body.parent_id)
+        return kb_write(ops.kb_domain_add, body.name, description=body.description,
+                        parent_id=body.parent_id)
+
+    @app.post("/knowledge/review/domain/{domain_id}")
+    def kb_domain_edit(domain_id: str, body: DomainEdit) -> JSONResponse:
+        """Rename, describe or re-parent — a field left out is left as it is"""
+        return kb_write(ops.kb_domain_update, domain_id, name=body.name,
+                        description=body.description, parent_id=body.parent_id)
+
+    @app.post("/knowledge/review/domain/{domain_id}/retire")
+    def kb_domain_retire(domain_id: str, body: Reason) -> JSONResponse:
+        return kb_write(ops.kb_domain_retire, domain_id, body.reason)
+
+    @app.post("/knowledge/review/assign")
+    def kb_assign(body: AssignIn) -> JSONResponse:
+        """Entries into a domain ('' = unassigned); the same domain again = proposal accepted"""
+        return kb_write(ops.kb_assign, body.kn_ids, body.domain_id)
+
+    @app.post("/knowledge/review/link")
+    def kb_link_create(body: LinkIn) -> JSONResponse:
+        return kb_write(ops.kb_link_add, body.src, body.rel, body.dst)
+
+    @app.post("/knowledge/review/link/{link_id}/retire")
+    def kb_link_remove(link_id: str, body: Reason) -> JSONResponse:
+        return kb_write(ops.kb_link_retire, link_id, body.reason)
+
+    @app.get("/vendor/{name}")
+    def vendor(name: str):
+        """The page's vendored libraries — listed, never a path walk (see vendor/README.md)"""
+        if name not in VENDORED:
+            return JSONResponse({"error": f"no vendored file {name}"}, status_code=404)
+        return FileResponse(VENDOR / name, media_type="text/javascript")
+
+    # after every fixed /knowledge/... route: this one matches any segment
+    @app.get("/knowledge/{kn_id}", response_class=HTMLResponse)
+    def knowledge_item(request: Request, kn_id: str):
+        """One entry in full, as `jarvis learn show` prints it"""
+        try:
+            k = ops.knowledge_detail(kn_id)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="knowledge", message=str(e),
+                          status_code=404)
+        return render(request, "knowledge_item.html", active="knowledge", k=k)
 
     @app.get("/neo", response_class=HTMLResponse)
     def neo_page(request: Request):

@@ -13883,6 +13883,70 @@ def learn_add(content: str, *, project: str = "", topic: str = "", tags: str = "
     return row
 
 
+# -- knowledge domains: the reviewable structure over the base (kgraph.review_payload)
+
+#: Who a person at the dashboard or a terminal is, in OKF's actor convention
+KB_HUMAN_ACTOR = "human:user"
+
+
+def _kb(fn: Callable[[CentralStore], Any]) -> Any:
+    """Run one domain/link write; a store refusal becomes an OpsError the surfaces print"""
+    central = CentralStore()
+    try:
+        return fn(central)
+    except (KeyError, ValueError) as exc:
+        raise OpsError(str(exc).strip("'\"")) from exc
+    finally:
+        central.close()
+
+
+def kb_review_payload(include_retired: bool = False) -> dict[str, Any]:
+    from .kgraph import review_payload
+    return _kb(lambda c: review_payload(c, include_retired=include_retired))
+
+
+def kb_domain_add(name: str, *, description: str = "", parent_id: str = "",
+                  by: str = KB_HUMAN_ACTOR) -> dict[str, Any]:
+    return _kb(lambda c: c.add_domain(name, description=description, parent_id=parent_id,
+                                      by=by))
+
+
+def kb_domain_update(domain_id: str, *, name: str | None = None,
+                     description: str | None = None,
+                     parent_id: str | None = None) -> dict[str, Any]:
+    return _kb(lambda c: c.update_domain(domain_id, name=name, description=description,
+                                         parent_id=parent_id))
+
+
+def kb_domain_retire(domain_id: str, reason: str, *,
+                     by: str = KB_HUMAN_ACTOR) -> dict[str, Any]:
+    return _kb(lambda c: c.retire_domain(domain_id, reason, by=by))
+
+
+def kb_assign(kn_ids: Sequence[str], domain_id: str, *, by: str = KB_HUMAN_ACTOR) -> int:
+    return _kb(lambda c: c.assign_domain(list(kn_ids), domain_id, by=by))
+
+
+def kb_link_add(src: str, rel: str, dst: str, *, by: str = KB_HUMAN_ACTOR) -> dict[str, Any]:
+    return _kb(lambda c: c.add_kb_link(src, rel, dst, by=by))
+
+
+def kb_link_retire(link_id: str, reason: str) -> dict[str, Any]:
+    return _kb(lambda c: c.retire_kb_link(link_id, reason))
+
+
+def kb_group(name: str, kn_ids: Sequence[str], *, description: str = "",
+             parent_id: str = "", by: str = KB_HUMAN_ACTOR) -> dict[str, Any]:
+    """A new domain holding these entries — the review page's "group the selection\""""
+    def group(c: CentralStore) -> dict[str, Any]:
+        with db.write_transaction(c.conn):
+            domain = c.add_domain(name, description=description, parent_id=parent_id,
+                                  by=by)
+            c.assign_domain(list(kn_ids), domain["id"], by=by)
+            return domain
+    return _kb(group)
+
+
 def learn_retract(knowledge_id: str, reason: str, *, wo_id: str = "") -> dict[str, Any]:
     """Retire a knowledge entry AND record on the work order that it did (#200)"""
     from .central_store import headline

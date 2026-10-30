@@ -1623,6 +1623,16 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--project", help="this project + global entries")
     k.add_argument("--topic")
     k.add_argument("--limit", type=int, default=20)
+    k = kn.add_parser("graph", help="(prototype) export the knowledge graph as GEXF for "
+                                    "Gephi Lite: entries, the orders that wrote and "
+                                    "retired them, learned gate rules, Neo learnings")
+    k.add_argument("-o", "--output", default="knowledge.gexf")
+    k = kn.add_parser("review", help="review the base by hand: domains, assignments and "
+                                     "links, drawn as a graph in the browser")
+    k.add_argument("--port", type=int, help="default: a free port")
+    k.add_argument("--host", default="127.0.0.1")
+    k.add_argument("--no-browser", dest="no_browser", action="store_true",
+                   help="print the address instead of opening it")
     k = kn.add_parser("show", help="full text of specific entries, by id")
     k.add_argument("ids", nargs="+")
     k = kn.add_parser("topics", help="topics and how many entries each holds")
@@ -5368,6 +5378,20 @@ def cmd_learn(args: argparse.Namespace) -> int:
         elif args.kn_cmd == "show":
             _print(ops.show_knowledge(args.ids, project=reader_project, wo_id=acting_wo),
                    args.json)
+        elif args.kn_cmd == "graph":
+            import sqlite3
+
+            from . import kgraph
+            from .paths import neo_db_path
+
+            neo_path = neo_db_path()
+            neo = (sqlite3.connect(f"file:{neo_path}?mode=ro", uri=True)
+                   if neo_path.exists() else None)
+            nodes, edges = kgraph.graph_nodes_edges(
+                central.conn, neo, reads=central.knowledge_hit_counts())
+            Path(args.output).write_bytes(kgraph.to_gexf(nodes, edges))
+            print(f"{len(nodes)} nodes, {len(edges)} edges -> {args.output} "
+                  f"(open it in Gephi Lite: gephi.org/gephi-lite)")
         elif args.kn_cmd == "topics":
             topics = central.knowledge_topics(args.project)
             central.record_knowledge_read("topics", [{"topic": t} for t, _ in topics],
@@ -5716,21 +5740,56 @@ def cmd_inbox(args: argparse.Namespace) -> int:
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
-    try:
-        import uvicorn
-    except ImportError:
-        print("the web UI needs extras: pip install 'jarvis-os[ui]'", file=sys.stderr)
-        return 1
     from . import ops
-    from .ui.app import create_app
     port = args.port
     if port is None:
         try:
             port = ops.resolve_catalog().os.ui_port
         except Exception:  # noqa: BLE001
             port = 8787
-    uvicorn.run(create_app(), host=args.host, port=port, log_level="warning")
+    return _serve_dashboard(args.host, port)
+
+
+def _serve_dashboard(host: str, port: int, open_path: str | None = None) -> int:
+    """The dashboard, in the foreground; `open_path` is opened in a browser once it listens"""
+    try:
+        import uvicorn
+    except ImportError:
+        print("the web UI needs extras: pip install 'jarvis-os[ui]'", file=sys.stderr)
+        return 1
+    from .ui.app import create_app
+    server = uvicorn.Server(uvicorn.Config(create_app(), host=host, port=port,
+                                           log_level="warning"))
+    if open_path is not None:
+        import threading
+        import time
+        import webbrowser
+
+        def open_when_up() -> None:
+            for _ in range(100):  # 10s: the app factory is quick, the browser is not ours
+                if server.started:
+                    webbrowser.open(f"http://{host}:{port}{open_path}")
+                    return
+                time.sleep(0.1)
+        threading.Thread(target=open_when_up, daemon=True).start()
+    server.run()
     return 0
+
+
+def _free_port(host: str) -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def cmd_learn_review(args: argparse.Namespace) -> int:
+    """`jarvis learn review`: the dashboard's knowledge-review page, on its own port"""
+    port = args.port or _free_port(args.host)
+    print(f"knowledge review: http://{args.host}:{port}/knowledge/review  (Ctrl-C to stop)",
+          flush=True)
+    return _serve_dashboard(args.host, port,
+                            open_path=None if args.no_browser else "/knowledge/review")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5812,6 +5871,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "brief":
             return cmd_brief(args)
         if args.cmd == "learn":
+            if args.kn_cmd == "review":
+                return cmd_learn_review(args)
             return cmd_learn(args)
         if args.cmd == "neo":
             return cmd_neo(args)
