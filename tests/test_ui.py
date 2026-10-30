@@ -3508,6 +3508,26 @@ def test_a_dashboard_status_filter_reveals_a_collapsed_status(client):
     assert "not started yet" in page and "1 of 1 shown" in page
 
 
+def test_the_dashboard_lists_every_kind_of_open_order_and_filters_by_type(client, project):
+    wo = ops.create_work_order("proj_a", "plain work")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "running")
+        fo = store.create_feature_order("big feature", description="d")
+        io = store.create_feature_order("root cause", description="d", kind="improvement")
+        inv = store.create_feature_order("why slow", description="d", kind="investigation")
+    finally:
+        store.close()
+    page = client.get("/").text
+    for title in ("plain work", "big feature", "root cause", "why slow"):
+        assert title in page
+    assert f'href="/io/proj_a/{io["id"]}"' in page and f'href="/inv/proj_a/{inv["id"]}"' in page
+    assert '<option value="investigation"' in page
+    only = client.get("/?type=investigation").text
+    assert "why slow" in only and "1 of 4 shown" in only
+    assert "plain work" not in only and fo["id"] not in only
+
+
 def test_the_project_filter_counts_only_what_the_view_draws_from(client, project):
     open_wo = ops.create_work_order("proj_a", "still going")
     done = ops.create_work_order("proj_a", "old and finished")

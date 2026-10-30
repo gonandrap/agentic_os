@@ -1248,20 +1248,26 @@ def create_app() -> FastAPI:
     def dashboard(request: Request, show: str = ""):
         """The pulse"""
         st = ops.os_status()
-        every = [{**wo, "project": p["name"]}
-                 for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        wos = [{**wo, "project": p["name"], "type": "work"}
+               for p in st["projects"] for wo in p.get("open_work_orders", [])]
+        # Every open order of every kind, one list; `type` is the row's kind
+        families = [{**fo, "project": p["name"], "type": fo["kind"]}
+                    for p in st["projects"] for fo in p.get("feature_orders", [])]
+        every = families + wos
         # §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
-        options = {"project": filter_options(every, "project"),
+        options = {"type": filter_options(every, "type"),
+                   "project": filter_options(every, "project"),
                    "status": filter_options(every, "status")}
         filters = query_filters(request, options)
-        rows = filter_rows(every, filters)
+        families = filter_rows(families, filters)
+        rows = filter_rows(wos, filters)
         # A status filter reveals that status even when it is one that collapses into a count
         show = show or filters.get("status", "")
         revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
             else ""
         featured, rest = group_open(rows, revealed)
-        # Same predicate as project(): a status that waits on the user, or a raised flag
-        shown = attention_first(featured + rest,
+        # Same predicate as project(); a family never collapses into the count (not a WO status)
+        shown = attention_first(families + featured + rest,
                                 lambda wo: wo["status"] in NEEDS_YOU_STATUSES
                                 or bool(wo.get("needs_attention")))
         rest_counts = _counts_by_status(

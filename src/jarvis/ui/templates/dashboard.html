@@ -54,9 +54,10 @@
 </div>
 {% endif %}
 
-<h2>Open work orders</h2>
+<h2>Open orders</h2>
 {{ ui.filter_bar("/", filters, options, shown | length, total,
-                 labels={"project": "every project", "status": "every status"}) }}
+                 labels={"type": "every type", "project": "every project",
+                         "status": "every status"}) }}
 {# The decisions you owe first, then what is running, then what waits for a merge. Only the
    statuses the OS has not started yet collapse into a count: they wait on the OS, not you. #}
 {% if rest_counts %}
@@ -77,7 +78,22 @@
 {% endif %}
 <div class="panel open-work">
   {% for wo in shown %}
-    {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
+    {% if wo.type != 'work' %}
+    {# A feature, improvement or investigation order: kind-aware label, its own page #}
+    {% set fm = fo_status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
+    <div class="row" data-status="{{ wo.status }}" data-type="{{ wo.type }}">
+      <span class="st tone-{{ fm.tone }}"><span class="i">{{ fm.icon }}</span>{{ wo.status_label }}</span>
+      <div class="grow">
+        {{ ui.row_id(wo.id, order_path(wo.project, wo.id)) }}
+        {{ wo.title }}
+        <span class="sub">· {{ wo.project }}</span>
+        {% if wo.type == 'feature' and wo.progress %}<div class="sub">{{ wo.progress.label }}</div>{% endif %}
+        {% if wo.needs_attention and wo.attention_reason %}<div class="sub">⚑ {{ wo.attention_reason }}</div>{% endif %}
+      </div>
+      <span><span class="badge">{{ wo.type }}</span></span>
+    </div>
+    {% else %}
+    {% set m =status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
     <div class="row" data-status="{{ wo.status }}">
       <span class="st tone-{{ m.tone }} {{ 'pulse' if wo.status == 'running' }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
       <div class="grow">
@@ -101,11 +117,12 @@
       </div>
       <span>{{ ui.wo_tags(wo.tags) }}</span>
     </div>
+    {% endif %}
   {% else %}
     <div class="empty">
       {% if filters %}nothing matches these filters
       {% elif rest_counts %}nothing running and nothing waiting on you — the rest is counted above
-      {% else %}no open work orders{% endif %}
+      {% else %}no open orders{% endif %}
     </div>
   {% endfor %}
 </div>
