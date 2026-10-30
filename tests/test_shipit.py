@@ -893,3 +893,68 @@ def test_an_unknown_service_manager_refuses_to_ship(tmp_path):
         del os.environ["TEST_SERVICE_MANAGER"]
     assert r.returncode != 0
     assert "JARVIS_SERVICE_MANAGER" in r.stderr
+
+
+# --- argument parsing and --deploy (issue 1348)
+
+@pytest.mark.parametrize("args, says", [
+    (["--deploy-now", "patch"], "unknown option: --deploy-now"),
+    (["v0.2.0"], "did you mean 0.2.0?"),
+    (["0.2.0", "patch"], "one version only"),
+    (["--deploy", "v0.13.8"], "did you mean jarvis-0.13.8?"),
+    (["--deploy", "latest"], "is not a release tag"),
+    (["--deploy"], "--deploy needs a release tag"),
+    (["--deploy", "jarvis-0.2.0", "patch"], "--deploy takes no version"),
+])
+def test_bad_arguments_exit_2_with_usage_and_cut_nothing(tmp_path, args, says):
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", *args)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert says in r.stderr
+    assert "usage: scripts/shipit.sh" in r.stderr
+    assert "git branch" not in r.stdout
+
+
+def _released(repo: Path, version: str) -> None:
+    _tag_like_shipit(repo, version)
+    _git(repo, "push", "-q", "origin", f"refs/tags/jarvis-{version}")
+
+
+@pytest.mark.parametrize("tag", ["jarvis-0.2.0", "0.2.0"])
+def test_deploy_moves_prod_to_an_existing_tag_without_cutting(tmp_path, tag):
+    repo = _make_repo(tmp_path)
+    _released(repo, "0.2.0")
+    _commit(repo, "unreleased work")  # HEAD ahead of origin/main: --deploy must not care
+    (repo / "README.md").write_text("dirty\n")
+    r = _dry_run(repo, _deployed(tmp_path), "--deploy", tag)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    assert "checkout -f 'jarvis-0.2.0'" in out
+    assert "uv sync --frozen --extra ui" in out
+    assert "install_prod_cli.sh" in out
+    assert "--version reports 0.2.0" in out
+    assert "systemctl --user restart 'jarvis-ui.service'" in out
+    assert "systemctl --user restart jarvis.service" in out
+    for cut in ("git branch", "git push", "commit -m", "tag -a", "gh release create",
+                "morpheus enqueue-release"):
+        assert cut not in out
+
+
+def test_deploy_refuses_a_tag_that_is_not_on_origin(tmp_path):
+    repo = _make_repo(tmp_path)
+    _tag_like_shipit(repo, "0.2.0")  # local only
+    r = _dry_run(repo, tmp_path / "prod", "--deploy", "jarvis-0.2.0")
+    assert r.returncode == 1
+    assert "not on origin" in r.stderr
+    assert "checkout -f" not in r.stdout
+
+
+def test_refuses_to_run_from_productions_own_checkout(tmp_path):
+    """Step 5's checkout would rewrite the script bash is still reading"""
+    repo = _make_repo(tmp_path)
+    prod = tmp_path / "prod"
+    prod.mkdir()
+    (prod / "jarvis_os").symlink_to(repo)
+    r = _dry_run(repo, prod, "0.2.0")
+    assert r.returncode == 1
+    assert "not from production's own checkout" in r.stderr

@@ -740,6 +740,11 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--reason", required=True)
     m = mo.add_parser("requeue", help="watch a settled PR again with a fresh deadline")
     m.add_argument("item_id")
+    m = mo.add_parser("rewrite", help="rule the check script wrong, not the PR: Morpheus "
+                                      "writes a new one, then the OS watches it again")
+    m.add_argument("item_id")
+    m.add_argument("--why", required=True,
+                   help="what the script gets wrong and what the right check is")
     m = mo.add_parser("confirm", help="rule a failed check real and file the work order "
                                       "that fixes it")
     m.add_argument("item_id")
@@ -4195,6 +4200,10 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
         return 0
     if args.morpheus_cmd == "requeue":
         item = ops.morpheus_requeue(args.item_id)
+        _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
+    if args.morpheus_cmd == "rewrite":
+        item = ops.morpheus_rewrite(args.item_id, args.why)
         _print({"id": item["id"], "state": item["state"]}, args.json)
         return 0
     if args.morpheus_cmd == "confirm":

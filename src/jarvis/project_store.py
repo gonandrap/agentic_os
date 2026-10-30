@@ -3406,6 +3406,13 @@ class ProjectStore:
     def mark_notification_routed(self, notif_id: int) -> None:
         self.conn.execute("UPDATE notifications SET status='routed' WHERE id=?", (notif_id,))
 
+    def revise_unrouted(self, title: str, wo_id: str | None, *, body: str, level: str) -> int:
+        """`CentralStore.revise_inbox` for a notice not routed yet"""
+        cur = self.conn.execute(
+            "UPDATE notifications SET body=?, level=? WHERE title=? AND wo_id IS ?"
+            " AND status='new'", (body, level, title, wo_id or None))
+        return cur.rowcount
+
     # -- invariant violation reports
 
     def open_violation_report(self, invariant: str, wo_id: str | None = None,
