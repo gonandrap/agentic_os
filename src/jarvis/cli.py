@@ -697,7 +697,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = alarms.add_parser(
         "review", help="approve or correct the supervisor's verdict on one alarm")
-    sp.add_argument("alarm_id")
+    sp.add_argument("alarm_id", nargs="?",
+                    help="the al-… id; with --approve-all, an optional PROJECT instead")
+    sp.add_argument("--approve-all", action="store_true",
+                    help="approve every alarm awaiting your feedback (the /alarms "
+                         "review queue), fleet-wide or in one project")
     sp.add_argument("--reject", action="store_true",
                     help="the supervisor got it wrong; --feedback says what it should "
                          "have decided")
@@ -3029,6 +3033,20 @@ def cmd_alarms_review(args: argparse.Namespace) -> int:
     """Approve or correct the supervisor"""
     from . import ops
 
+    if args.approve_all:
+        if args.reject:
+            raise ops.OpsError("--approve-all approves; correct an alarm one at a time "
+                               "with `jarvis alarms review <al-id> --reject --feedback …`")
+        bulk = ops.approve_alarm_queue(args.alarm_id or args.project)
+        if args.json:
+            _print(bulk, True)
+            return 0
+        print(f"approved {len(bulk['approved'])} alarm(s)")
+        for f in bulk["failed"]:
+            print(f"  {f['alarm_id']}: {f['error']}")
+        return 1 if bulk["failed"] else 0
+    if not args.alarm_id:
+        raise ops.OpsError("give an al-… id, or --approve-all [project]")
     res = ops.review_alarm(args.alarm_id, approved=not args.reject,
                            feedback=args.feedback, project_name=args.project)
     if args.json:

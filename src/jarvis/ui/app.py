@@ -2088,7 +2088,9 @@ def create_app() -> FastAPI:
             group["alarms"].append(a)
         every = [r for r in rows if not r["live"]]
         for r in every:
-            r["state"] = r["alarm_status"]
+            # Current standing: a reviewed escalation asks nothing more (wo-b6e2ddda, Neo Q2673)
+            r["state"] = ("reviewed" if r["review_status"] != "unreviewed"
+                          else r["alarm_status"])
         options = {"state": filter_options(every, "state"),
                    "kind": filter_options(every, "kind"),
                    "project": filter_options(every, "project")}
@@ -2591,6 +2593,14 @@ def create_app() -> FastAPI:
             return RedirectResponse(_same_site_back(next, "/neo#tab-escalated", str(e)),
                                     status_code=303)
         return RedirectResponse(_same_site_back(next, "/neo#tab-escalated"), status_code=303)
+
+    @app.post("/alarms/approve")
+    def alarms_approve_shown(shown: str = Form(...), next: str = Form("")):
+        """Approve exactly the queue rows the page showed, never the whole fleet's (Neo Q2674)"""
+        ids = [i.strip() for i in shown.split(",") if i.strip()]
+        res = ops.approve_alarm_queue(alarm_ids=ids)
+        error = "; ".join(f"{f['alarm_id']}: {f['error']}" for f in res["failed"])
+        return RedirectResponse(_same_site_back(next, "/alarms", error), status_code=303)
 
     @app.post("/alarms/{project}/{alarm_id}/review")
     def alarm_review(project: str, alarm_id: str, decision: str = Form(...),
