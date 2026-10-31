@@ -815,7 +815,7 @@ class WiringConfig:
     disabled_plugins: tuple[str, ...] = ()
     #: Skill names — user and project skills only
     disabled_skills: tuple[str, ...] = ()
-    # Off adds `--no-chrome`: the user's global config, not settings, turns Claude in Chrome on (issue 1370)
+    # Off adds `--no-chrome`; no settings key reaches it (issue 1370)
     chrome: bool = True
 
 
