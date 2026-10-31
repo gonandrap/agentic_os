@@ -1249,6 +1249,27 @@ def test_a_decision_the_os_took_is_not_credited_to_the_user(started):
     assert ops.assumption_decider(row) == "the OS (neo, claude-opus-5)"
 
 
+def test_an_escalation_names_every_other_assumption_left_with_you(started):
+    """wo-57c7f94b: #1 escalated, #2 held, #3 escalated last — the banner named only #3"""
+    wo = ops.create_work_order("proj_a", "three owed")
+    for text in ("one", "two", "three"):
+        ops.assume(wo["id"], text)
+    store = ProjectStore(started.catalog.project("proj_a").path)
+    a1, a2, a3 = store.pending_assumptions(wo["id"])
+    store.add_event(wo["id"], "autoreview_escalated",
+                    {"assumption_id": a1["id"], "n": 1, "reason": "r1"})
+    store.add_event(wo["id"], "autoreview_held",
+                    {"assumption_id": a2["id"], "n": 2, "reason": "r2"})
+    store.add_event(wo["id"], "autoreview_escalated",
+                    {"assumption_id": a3["id"], "n": 3, "reason": "r3"})
+
+    assert _line(store, wo["id"]) == (
+        "assumption #3 left with you — r3; also left with you: #1, #2")
+
+    store.review_assumption(a1["id"], "accepted")
+    assert _line(store, wo["id"]).endswith("r3; also left with you: #2")
+
+
 def test_an_event_written_before_the_payload_carried_the_id_is_unchanged(started):
     """Unresolvable, and a banner is not the place to guess"""
     wo = ops.create_work_order("proj_a", "older event")

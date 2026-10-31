@@ -3285,7 +3285,36 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
         if status and status != "pending":
             newest = {**newest, "resolved_status": status,
                       "resolved_decider": assumption_decider(row or {})}
-    return {**newest, "line": _autoreview_line(newest)}
+    line = _autoreview_line(newest)
+    # The newest event names ONE assumption: name every other pending one still owed by the user too
+    if newest["kind"] in (*_AUTOREVIEW_OWED_BY_USER, "autoreview_held"):
+        held = newest.get("held") if isinstance(newest.get("held"), list) else []
+        named = {int(h.get("n") or 0) for h in held} | {int(newest.get("n") or 0)}
+        others = [n for n in _owed_pending(store, wo["id"], stale) if n not in named]
+        if others:
+            line += "; also left with you: " + ", ".join(f"#{n}" for n in others)
+    return {**newest, "line": line}
+
+
+def _owed_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[int]:
+    """`n` of each pending assumption whose newest live ruling leaves it with the user, in order"""
+    from . import db
+
+    pending = {int(a["id"]): a for a in store.pending_assumptions(wo_id)}
+    newest: dict[int, tuple[float, int, str, dict[str, Any]]] = {}
+    for kind in AUTOREVIEW_EVENTS:
+        for row in store.events_of_kind(wo_id, kind):
+            payload = db.from_json(row["payload"], {})
+            aid = int(payload.get("assumption_id") or 0)
+            if aid not in pending or stale(kind, payload):
+                continue
+            key = (float(row["ts"]), _RULING_RANK.get(kind, 0), kind, payload)
+            if aid not in newest or key[:2] > newest[aid][:2]:
+                newest[aid] = key
+    owed = [int(pending[aid].get("n") or 0) for aid, (_, _, kind, payload) in newest.items()
+            if (kind == "autoreview_held" or kind in _AUTOREVIEW_OWED_BY_USER)
+            and not payload.get("re_asked")]
+    return sorted(owed)
 
 
 def _held_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[dict[str, Any]]:
