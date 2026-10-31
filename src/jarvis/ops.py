@@ -14707,10 +14707,16 @@ def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     }]
 
 
+#: Kinds whose stored `plan` is a plan; a decision report is not (decision-orders spec §4.1)
+PLAN_EFFECT_KINDS = ("feature", "improvement", "investigation")
+
+
 def _plan_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     """The plan this work order submitted, if it submitted one (docs/superpowers/specs/2026-09-25-a-plan-submission-is-not-an-empty-packet.md §5-)"""
     fo = store.feature_order_for_planner(wo_id) if wo_id else None
-    plan = db.from_json(fo.get("plan"), {}) if fo else {}
+    if not fo or (fo.get("kind") or "feature") not in PLAN_EFFECT_KINDS:
+        return []
+    plan = db.from_json(fo.get("plan"), {})
     if not plan:
         return []
     children = len(plan.get("children") or [])
@@ -14729,6 +14735,26 @@ def _plan_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     }]
 
 
+def _decision_report_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """The report this researcher stored, beside its ask (decision-orders spec §4.1)"""
+    from . import decision_report
+
+    fo = store.feature_order_for_planner(wo_id) if wo_id else None
+    if not fo or fo.get("kind") != "decision" or fo.get("plan_wo_id") != wo_id:
+        return []
+    report = db.from_json(fo.get("plan"), {})
+    if not report:
+        return []
+    return [{
+        "kind": "decision_report", "id": fo["id"],
+        "summary": f"stored the decision report for {fo['id']}: "
+                   f"{decision_report.headline(fo, report)}",
+        "detail": (f"THE ASK (the decision order's description):\n"
+                   f"{fo.get('description') or '(none)'}\n\n"
+                   f"THE REPORT:\n{decision_report.render_report(report)}"),
+    }]
+
+
 @dataclass(frozen=True)
 class SideEffectCollector:
     """One kind of durable change no diff can show, and whether a reviewer can judge it"""
@@ -14743,6 +14769,8 @@ SIDE_EFFECT_COLLECTORS = (
     SideEffectCollector("knowledge", _knowledge_effects),
     SideEffectCollector("release", _release_effects, attested=True),
     SideEffectCollector("plan", _plan_effects, attested=True),
+    # Unattested, so the round is judged rather than voided (decision-orders spec §4.1)
+    SideEffectCollector("decision_report", _decision_report_effects),
 )
 
 

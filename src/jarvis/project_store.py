@@ -59,7 +59,9 @@ OS_PROMPT_REFUSAL_CLEARED_BY = ("neo_answered", "validation_passed",
 FORCEABLE_STATUSES = ("waiting_pr_merge", "needs_review")
 
 # The seat names a validation panel may be rostered with
-VALIDATOR_SEATS = ("tester", "security", "architect", "maintainer", "chair")
+VALIDATOR_SEATS = ("tester", "security", "architect", "maintainer", "chair", "deliverable")
+# Seated only by a kind's own roster, never by a project's (decision-orders spec §4.2)
+KIND_ONLY_SEATS = ("deliverable",)
 
 # How a round ended (docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §3)
 VALIDATION_OUTCOMES = ("pending", "passed", "rejected", "escalated", "failed", "void")
@@ -222,6 +224,8 @@ class KindContract:
     lands_code: bool = True
     #: Are its assumptions the user's to review?
     assumptions_reviewed: bool = True
+    #: The panel that judges it, in place of the project's (decision-orders spec §4.2)
+    roster: tuple[str, ...] | None = None
 
 
 #: ONE ROW PER KIND, read by every submit path, `landing.authored`'s dirty set and the refusals
@@ -241,7 +245,7 @@ WO_KIND_CONTRACTS: dict[str, KindContract] = {
     # By FINISH: an in-session kind skips the panel, and decision-orders spec §4 needs a round
     "researcher": KindContract(SETTLE_BY_FINISH, artifact="report.json",
                                submit="jarvis do report {fo_id} --from-file report.json",
-                               lands_code=False),
+                               lands_code=False, roster=("deliverable", "chair")),
 }
 
 

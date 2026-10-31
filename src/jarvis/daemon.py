@@ -46,6 +46,7 @@ from .project_store import (
     VALIDATION_HELD_CAUSE,
     WORKER_CHILDREN,
     ProjectStore,
+    kind_contract,
     resume_spends_slot,
     validation_hold_until,
 )
@@ -2231,8 +2232,12 @@ class Daemon:
                          project.name, wo_id, n, ", ".join(failing))
                 return
 
+            # A kind with its own panel replaces the project's (decision-orders spec §4.2)
+            kind_roster = kind_contract(wo).roster
             validator = (self.validator if self.validator is not None
-                         else self._validator(cfg))
+                         else self._validator(
+                             dataclasses.replace(cfg, roster=kind_roster) if kind_roster
+                             else cfg))
             if validator is None:
                 # Nothing to judge with — the panel is not wired in
                 store.settle_validation_round(
