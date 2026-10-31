@@ -13518,7 +13518,8 @@ def _resolve_report_target(target: str, project: str | None = None, *,
     try:
         name, path, wo = find_work_order(target, project)
     except OpsError:
-        if not project_fallback or target.startswith(_ORDER_ID_PREFIXES):
+        if (not project_fallback or target.startswith(_ORDER_ID_PREFIXES)
+                or is_feature_order_id(target)):
             raise
         return _TARGET_PROJECT, None, None, None
     return _TARGET_WORK, name, path, wo

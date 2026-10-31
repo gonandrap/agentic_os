@@ -1354,6 +1354,11 @@ def create_app() -> FastAPI:
                  "status_label": feature_status_label("investigation", row["status"])}
                 for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
                                                      kind="investigation")]
+            # A fourth, same rule (docs/superpowers/specs/2026-10-31-decision-orders.md §7)
+            decisions = [
+                {**row, "status_label": feature_status_label("decision", row["status"])}
+                for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
+                                                     kind="decision")]
             fo_counts = store.feature_status_counts()
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
             # Inside the store's lifetime: the label reads the dependencies' own rows
@@ -1394,6 +1399,7 @@ def create_app() -> FastAPI:
         features = attention_first(features, flagged)
         improvements = attention_first(improvements, flagged)
         investigations = attention_first(investigations, flagged)
+        decisions = attention_first(decisions, flagged)
         return render(request, "project.html", project_name=name, path=paths[name],
                       # "of M": the open orders plus whatever the URL revealed, never every settled one
                       total=sum(n for s, n in counts.items()
@@ -1409,6 +1415,7 @@ def create_app() -> FastAPI:
                       features=features, fo_settled=fo_settled,
                       improvements=improvements,
                       investigations=investigations,
+                      decisions=decisions,
                       issue_board=issue_board,
                       fo_revealed=fo_revealed)
 
@@ -1510,6 +1517,61 @@ def create_app() -> FastAPI:
             return render(request, "error.html", message=str(e))
         return render(request, "investigation_order.html", inv=detail,
                       project=detail["project"], error=error)
+
+    @app.get("/do/{name}/{do_id}", response_class=HTMLResponse)
+    def decision_order(request: Request, name: str, do_id: str, error: str = "",
+                       note: str = ""):
+        """A decision order's page — §7 of docs/superpowers/specs/2026-10-31-decision-orders.md"""
+        try:
+            detail = ops.show_decision_order(do_id, name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        return render(request, "decision_order.html", do=detail,
+                      project=detail["project"], error=error, note=note)
+
+    def _back_to_decision(name: str, do_id: str, **query: str) -> RedirectResponse:
+        q = urlencode({k: v for k, v in query.items() if v}, quote_via=quote)
+        return RedirectResponse(f"/do/{name}/{do_id}" + (f"?{q}" if q else ""),
+                                status_code=303)
+
+    @app.post("/do/{name}/{do_id}/follow-up")
+    def decision_follow_up(name: str, do_id: str, key: str = Form(...)):
+        """One proposal filed — `jarvis do follow-up <id> <key>`"""
+        try:
+            out = ops.file_decision_followups(do_id, (key,), project_name=name)
+        except ops.OpsError as e:
+            return _back_to_decision(name, do_id, error=str(e))
+        failed = "; ".join(f"{e['key']}: {e['error']}" for e in out["errors"])
+        filed = ", ".join(f"{f['key']} as {f['id']}" for f in out["filed"])
+        return _back_to_decision(name, do_id, error=failed,
+                                 note=f"filed {filed}" if filed else "")
+
+    @app.post("/do/{name}/{do_id}/done")
+    def decision_done(name: str, do_id: str, note: str = Form("")):
+        """`jarvis do done` — the user's verb, the same ops function"""
+        try:
+            ops.complete_decision_order(do_id, note=note.strip(), project_name=name)
+        except ops.OpsError as e:
+            return _back_to_decision(name, do_id, error=str(e))
+        return _back_to_decision(name, do_id)
+
+    @app.post("/do/{name}/{do_id}/cancel")
+    def decision_cancel(name: str, do_id: str):
+        """`jarvis do cancel`"""
+        try:
+            ops.cancel_decision_order(do_id, project_name=name)
+        except ops.OpsError as e:
+            return _back_to_decision(name, do_id, error=str(e))
+        return _back_to_decision(name, do_id)
+
+    @app.post("/do/{name}/{do_id}/send")
+    def decision_send(name: str, do_id: str, content: str = Form(...)):
+        """`jarvis do send` — to the researcher; the order stays open"""
+        try:
+            out = ops.send_decision_message(do_id, content, project_name=name, relay=True)
+        except ops.OpsError as e:
+            return _back_to_decision(name, do_id, error=str(e))
+        return _back_to_decision(name, do_id, note=f"sent — {out['delivery']}")
 
     @app.post("/io/{name}/{io_id}/review")
     def review_findings(name: str, io_id: str, key: str = Form(...),

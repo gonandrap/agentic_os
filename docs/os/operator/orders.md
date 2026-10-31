@@ -1,7 +1,7 @@
 ---
 type: Jarvis Operator Reference
 title: Orders
-description: Work, feature, improvement and investigation orders: creating, ordering, unblocking, retrying and closing them.
+description: Work, feature, improvement, investigation and decision orders: creating, ordering, unblocking, retrying and closing them.
 tags: [operator, cli]
 ---
 # Orders
@@ -80,6 +80,14 @@ an INVESTIGATION order: one order is not moving and you want the cause. A read-o
 ## `jarvis investigate list / show <inv-id> / cancel <inv-id>`
 
 (no further notes)
+
+## `jarvis do create <project> "title" -d "<the decision; what data settles it>"`
+
+a DECISION order ("do"): the deliverable is information for YOUR decision, not code. Route here, never to `jarvis wo create`, any ask like "find out…", "compare…", "gather data so I can decide". A read-only researcher gathers the data into a report on the record — summary, findings with evidence, options, a recommendation, proposed orders — and you are notified once it is validated. It NEVER COMPLETES ON ITS OWN: no daemon pass, budget path, Neo verdict or gate settles it, and Neo never picks an option. It waits, flagged, in `awaiting your decision` until you run `jarvis do done` or `jarvis do cancel`. -d is REQUIRED: the researcher sees only that text.
+
+## `jarvis do show|send|follow-up|done|cancel <id>`
+
+show renders the report and the orders already filed from it. send asks the researcher for more; the order stays open and flagged. follow-up <id> <key>|--all files proposed orders as ordinary independent orders with a back-link, and leaves the order open. done [--note "what you decided"] and cancel are the only two closes, and only from your own session — an agent session is refused. The dashboard page `/do/<project>/<id>` has the same buttons, calling the same functions.
 
 ## `jarvis backlog promote <id> --as feature`
 

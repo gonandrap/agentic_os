@@ -298,8 +298,11 @@ def test_delivery_reaches_the_users_sinks(started, store, catalog_file, monkeypa
         notify.route_new_inbox(central, d.catalog)
     finally:
         central.close()
-    assert [i["title"] for i in seen if i["title"].startswith(do["id"])] == [
-        f"{do['id']} report ready: which cache"]
+    mine = [i for i in seen if i["title"].startswith(do["id"])]
+    assert [i["title"] for i in mine] == [f"{do['id']} report ready: which cache"]
+    # §7: the deep link opens the order's own page, not a work-order page that 404s
+    assert mine[0]["wo_link_problem"] == ""
+    assert mine[0]["wo_link"].endswith(f"/do/proj_a/{do['id']}")
 
 
 @pytest.mark.parametrize("status", ["failed", "cancelled", "completed"])
@@ -404,3 +407,17 @@ def test_the_non_daemon_routes_leave_the_order_open(started, store, catalog_file
         assert not row["needs_attention"]  # the researcher is still running
     else:
         assert row["needs_attention"] and len(_decision_notes(store, do["id"])) == 1
+
+
+# -- §7: the surfaces that read the kind
+
+
+def test_cost_and_inspect_bill_the_order_plus_its_researcher(started, store):
+    do = _decision(store, researcher="running")
+    for report in (ops.cost_report(target=do["id"]), ops.inspect_report(do["id"])):
+        assert report["scope"] == do["id"]
+        assert [u.get("wo_id") or u.get("id") for u in report["units"]] == [
+            do["plan_wo_id"]]
+    # A mistyped do- id is refused, never read as a project name
+    with pytest.raises(ops.OpsError):
+        ops._resolve_report_target("do-00000000", None, project_fallback=True)

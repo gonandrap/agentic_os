@@ -2236,6 +2236,73 @@ def test_the_project_page_lists_live_investigations_beside_the_other_kinds(clien
     assert subject in page   # the subject is what the line is about
 
 
+@pytest.fixture()
+def decision(client, project, monkeypatch):
+    """A delivered decision order — §7 of docs/superpowers/specs/2026-10-31-decision-orders.md"""
+    from jarvis import db
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    do = ops.create_decision_order("proj_a", "which cache", "compare redis and memcached")
+    store = ProjectStore(project)
+    try:
+        researcher = store.create_work_order("research it", kind="researcher",
+                                             parent_id=do["id"], status="completed")
+        store.update_feature_order(do["id"], plan_wo_id=researcher["id"], plan=db.to_json({
+            "summary": "redis is 30% cheaper",
+            "findings": [{"key": "f1", "title": "eviction rate", "detail": "memcached evicts",
+                          "evidence": ["jarvis cost proj_a: $12"]}],
+            "options": [{"key": "a", "title": "move to redis", "pros": ["cheaper"],
+                         "cons": ["migration"], "cost": "2 days"}],
+            "recommendation": {"option": "a", "why": "the eviction rate"},
+            "proposed_orders": [{"key": "p1", "as": "wo", "project": "",
+                                 "title": "migrate the cache", "description": "to redis"}]}))
+        store.set_feature_status(do["id"], "awaiting_decision")
+    finally:
+        store.close()
+    return client, ops.show_decision_order(do["id"])
+
+
+def test_the_decision_page_renders_the_report_and_every_action(decision):
+    client, do = decision
+    page = client.get(f"/do/proj_a/{do['id']}").text
+    for text in ("awaiting your decision", "redis is 30% cheaper", "eviction rate",
+                 "jarvis cost proj_a: $12", "move to redis", "the eviction rate",
+                 "migrate the cache", f"/wo/proj_a/{do['plan_wo_id']}"):
+        assert html.escape(text) in page, text
+    for verb in ("follow-up", "done", "cancel", "send"):
+        assert f'action="/do/proj_a/{do["id"]}/{verb}"' in page, verb
+    # The generic feature page hands a do- id to its own page
+    res = client.get(f"/fo/proj_a/{do['id']}", follow_redirects=False)
+    assert res.headers["location"] == f"/do/proj_a/{do['id']}"
+
+
+def test_the_decision_buttons_go_through_ops(decision):
+    client, do = decision
+    res = client.post(f"/do/proj_a/{do['id']}/follow-up", data={"key": "p1"},
+                      follow_redirects=False)
+    assert res.status_code == 303 and "note=filed" in res.headers["location"]
+    after = ops.show_decision_order(do["id"])
+    assert [f["key"] for f in after["followups"]] == ["p1"]
+    assert after["status"] == "awaiting_decision"     # filing never closes it
+    # A second File is refused by ops, and the refusal reaches the page
+    res = client.post(f"/do/proj_a/{do['id']}/follow-up", data={"key": "p1"},
+                      follow_redirects=False)
+    assert "already%20filed" in res.headers["location"]
+
+    client.post(f"/do/proj_a/{do['id']}/send", data={"content": "and the p99?"})
+    assert ops.show_decision_order(do["id"])["status"] == "awaiting_decision"
+
+    client.post(f"/do/proj_a/{do['id']}/done", data={"note": "redis"})
+    assert ops.show_decision_order(do["id"])["status"] == "completed"
+    page = client.get(f"/do/proj_a/{do['id']}").text
+    assert f'action="/do/proj_a/{do["id"]}/done"' not in page   # nothing left to close
+
+
+def test_the_project_page_and_api_status_list_decision_orders(decision):
+    client, do = decision
+    page = client.get("/project/proj_a").text
+    assert "Decision orders" in page and page.count(f"/do/proj_a/{do['id']}") == 1
+
+
 def _settle_feature(project, title, status):
     """A feature order in a terminal status, with no ceremony about how it got there"""
     fo = ops.create_feature_order("proj_a", title, description="the whole ask, at "
@@ -2976,12 +3043,17 @@ def test_api_status_carries_every_feature_order_kind(client, project):
         io = store.create_feature_order("slow first turns", description="three in a row",
                                         kind="improvement")
         store.set_feature_status(io["id"], "planning")
+        do = store.create_feature_order("which cache", description="compare them",
+                                        kind="decision")
+        store.set_feature_status(do["id"], "awaiting_decision")
     finally:
         store.close()
     rows = client.get("/api/status").json()["projects"][0]["feature_orders"]
     row = next(r for r in rows if r["id"] == io["id"])
     assert row["kind"] == "improvement"
     assert row["status_label"] == "analysing"
+    row = next(r for r in rows if r["id"] == do["id"])
+    assert (row["kind"], row["status_label"]) == ("decision", "awaiting your decision")
 
 
 def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):

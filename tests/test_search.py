@@ -104,6 +104,7 @@ def _one_of_every_kind():
     store = ProjectStore(path)
     try:
         fo = store.create_feature_order("rebuild the login spinner", "a big one")
+        do = store.create_feature_order("which login spinner", "compare", kind="decision")
         alarm = store.add_alarm(wo_id, "long-turn", 1, "login spinner turn is burning")
         store.conn.execute(
             "INSERT INTO approvals (wo_id, ts, kind, command, justification) "
@@ -126,7 +127,8 @@ def _one_of_every_kind():
         neo.record_answer(qid, "no, the spinner is cosmetic")
     finally:
         neo.close()
-    return {"work_order": wo_id, "feature_order": fo["id"], "alarm": alarm["id"],
+    return {"work_order": wo_id, "feature_order": fo["id"], "decision": do["id"],
+            "alarm": alarm["id"],
             "gate": gate_id, "backlog": item["id"], "neo_question": str(qid),
             "knowledge": kn["id"]}
 
@@ -158,6 +160,7 @@ def test_every_hit_is_actionable_from_either_surface(started):
     ("feature", "fo", "jarvis fo show"),
     ("improvement", "io", "jarvis io show"),
     ("investigation", "inv", "jarvis investigate show"),
+    ("decision", "do", "jarvis do show"),
 ])
 def test_a_feature_orders_hit_points_at_its_own_kind(started, project, kind, segment,
                                                      verb):
@@ -176,6 +179,31 @@ def test_a_feature_orders_hit_points_at_its_own_kind(started, project, kind, seg
     assert hits[0]["ref"] == f"{verb} {row['id']}"
     parser = build_parser()
     parser.parse_args(hits[0]["ref"].split()[1:])
+
+
+def test_a_decision_is_found_by_its_reports_answer_under_its_own_kind(started, project):
+    """Decision-orders spec §7: `--kind decision`, the summary and recommendation indexed"""
+    from jarvis import db
+    store = ProjectStore(project)
+    try:
+        do = store.create_feature_order("which cache", "compare them", kind="decision")
+        store.update_feature_order(do["id"], plan=db.to_json({
+            "summary": "redis is 30% cheaper", "findings": [],
+            "recommendation": {"option": "a", "why": "memcached evictions hurt"}}))
+        store.create_feature_order("a redis feature", "redis everywhere")
+    finally:
+        store.close()
+
+    for word in ("cheaper", "evictions"):
+        hits = search.search(word, kinds=("decision",))
+        assert [(h["kind"], h["id"]) for h in hits] == [("decision", do["id"])], word
+    assert hits[0]["url"] == f"/do/proj_a/{do['id']}"
+    assert hits[0]["ref"] == f"jarvis do show {do['id']}"
+    # Once, under its own kind, when every kind is searched
+    assert [h["kind"] for h in search.search("which cache")] == ["decision"]
+    # Only its own kind: a feature order never comes back as a decision
+    assert search.search("redis", kinds=("decision",))[0]["id"] == do["id"]
+    assert len(search.search("redis", kinds=("decision",))) == 1
 
 
 def test_kind_filter_and_unknown_kind(started):

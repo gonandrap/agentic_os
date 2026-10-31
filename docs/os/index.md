@@ -22,7 +22,7 @@ them. Links are bundle-relative (`/` = `docs/os/`).
 
 - [Codebase map](/architecture/codebase-map.md) — modules, layering, the three SQLite DBs.
 - [Work-order lifecycle](/architecture/work-order-lifecycle.md) — states, turns, settlement, retries.
-- [Feature orders](/architecture/feature-orders.md) — planner, plan review, children, manager.
+- [Feature orders](/architecture/feature-orders.md) — planner, plan review, children, manager; the io/inv/do kinds.
 - [Privileged-action gates](/architecture/gates.md) — how a worker merges, releases, restarts.
 - [Neo and the panels](/architecture/neo-and-panels.md) — the answerer, its seats, the validation panel.
 - [Worker context](/architecture/worker-context.md) — what a worker starts with, and its 10K budget.
@@ -48,7 +48,7 @@ them. Links are bundle-relative (`/` = `docs/os/`).
 
 ## Operating the OS
 
-- [Orders](/operator/orders.md) — work, feature, improvement and investigation orders in depth.
+- [Orders](/operator/orders.md) — work, feature, improvement, investigation and decision orders in depth.
 - [Reviews, gates and Neo](/operator/reviews.md) — assumptions, validation, gates, Neo's ledgers.
 - [Spend and time](/operator/spend.md) — pause/resume, budgets, cost, inspect, alarms.
 - [Records, bugs and knowledge](/operator/records.md) — search, issues, bug reports, learnings, wiring.
