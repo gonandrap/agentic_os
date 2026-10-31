@@ -181,6 +181,9 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "investigation_verdict":
         return (f"Investigated: {p.get('classification') or 'no classification'}",
                 " · ".join(x for x in (p.get("investigation"), p.get("filed")) if x))
+    if kind == "decision_closed_by_user":
+        return (f"You {'decided' if p.get('status') == 'completed' else 'cancelled'} "
+                f"{p.get('do_id') or 'the decision order'}", p.get("note") or "")
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
     # docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §1

@@ -218,7 +218,9 @@ def test_validating_sits_between_the_worker_and_the_review(project):
     """The INDEX, not mere membership"""
     assert WO_STATUSES.index("validating") == WO_STATUSES.index("needs_review") - 1
     assert FO_STATUSES.index("validating") == FO_STATUSES.index("executing") + 1
-    assert FO_STATUSES.index("validating") == FO_STATUSES.index("completed") - 1
+    # A decision order's `awaiting_decision` sits between them (2026-10-31 decision-orders spec §2)
+    assert FO_STATUSES.index("validating") == FO_STATUSES.index("awaiting_decision") - 1
+    assert FO_STATUSES.index("awaiting_decision") == FO_STATUSES.index("completed") - 1
     # A unit under validation holds a live session (#134)
     assert "validating" in OPEN_STATUSES and "validating" in ACTIVE_STATUSES
     assert "validating" not in SLOT_STATUSES
@@ -356,7 +358,8 @@ def test_only_the_documented_outcomes_and_statuses_are_accepted(project):
 
 def test_the_manager_the_analyst_and_the_investigator_are_the_other_kinds(project):
     store = ProjectStore(project)
-    assert WO_KINDS == ("worker", "planner", "manager", "analyst", "investigator")
+    assert WO_KINDS == ("worker", "planner", "manager", "analyst", "investigator",
+                        "researcher")
 
     manager = store.create_work_order("own the feature", kind="manager")
     analyst = store.create_work_order("plan the improvement", kind="analyst")

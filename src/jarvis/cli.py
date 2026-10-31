@@ -1321,6 +1321,52 @@ def build_parser() -> argparse.ArgumentParser:
     for v in inv.choices.values():
         v.add_argument("--json", action="store_true", help="machine-readable output")
 
+    # decision orders (docs/superpowers/specs/2026-10-31-decision-orders.md §2)
+    dec = sub.add_parser(
+        "do",
+        help="decision orders: a researcher gathers data into a report; only you close it",
+    ).add_subparsers(dest="do_cmd", required=True)
+
+    d = dec.add_parser("create", help="file a decision order — a researcher gathers the "
+                                      "data, then it waits for your decision")
+    d.add_argument("project")
+    d.add_argument("title", help="the question you must decide")
+    d.add_argument("--description", "-d", default="",
+                   help="what to find out and what you will decide. Required: the "
+                        "researcher sees only this text")
+    d.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
+    d.add_argument("--budget", metavar="USD",
+                   help="cap the whole order — it and its researcher — at N dollars. "
+                        "Omit for no ceiling")
+
+    d = dec.add_parser("list", help="decision orders and where each one stands")
+    d.add_argument("project", nargs="?")
+    d.add_argument("--all", action="store_true", help="include settled ones")
+
+    d = dec.add_parser("show", help="one decision order: its report and its researcher")
+    d.add_argument("do_id")
+    d.add_argument("--project")
+
+    d = dec.add_parser("done", help="you have decided: close the order")
+    d.add_argument("do_id")
+    d.add_argument("--note", default="", help="what you decided, for the record")
+    d.add_argument("--project")
+
+    d = dec.add_parser("cancel", help="stop a decision order and its researcher")
+    d.add_argument("do_id")
+    d.add_argument("--project")
+
+    d = dec.add_parser("budget", help="show, set, raise or clear a decision order's "
+                                      "family budget")
+    d.add_argument("do_id")
+    d.add_argument("amount", nargs="?", metavar="USD",
+                   help="the new ceiling, in dollars. Omit to just show it")
+    d.add_argument("--clear", action="store_true", help="remove the ceiling")
+    d.add_argument("--project")
+
+    for d in dec.choices.values():
+        d.add_argument("--json", action="store_true", help="machine-readable output")
+
     # gates (privileged-action approvals)
     ga = sub.add_parser(
         "gate",
@@ -3851,7 +3897,7 @@ def _print_fix(f: dict[str, Any]) -> None:
 
 
 FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
-           "validating": "🔎", "budget_exhausted": "💸", "completed": "✅",
+           "validating": "🔎", "awaiting_decision": "🤔", "budget_exhausted": "💸", "completed": "✅",
            "failed": "❌", "cancelled": "🚫"}
 
 
@@ -4315,6 +4361,83 @@ def _morpheus_activity_text(act: dict) -> str:
                         if h["exhausted"]
                         else f"held back{why} until {_stamp(h['next_offer_ts'])}"))
     return " · ".join(parts)
+
+
+def cmd_do(args: argparse.Namespace) -> int:
+    """`jarvis do …` — a thin wrapper (docs/superpowers/specs/2026-10-31-decision-orders.md §2)"""
+    from . import ops
+
+    if args.do_cmd == "create":
+        row = ops.create_decision_order(args.project, args.title, args.description,
+                                        budget_usd=_budget_arg(args), origin=args.origin)
+        _print({"created": row["id"], "project": args.project, "status": row["status"],
+                **({"budget_usd": row["budget_usd"]} if row.get("budget_usd") else {}),
+                "note": "a researcher gathers the data into a report; the order then "
+                        f"waits for you — only `jarvis do done {row['id']}` or "
+                        f"`jarvis do cancel {row['id']}` closes it"}, args.json)
+
+    elif args.do_cmd == "list":
+        rows = ops.list_decision_orders(args.project, include_settled=args.all)
+        if args.json:
+            _print(rows, True)
+        elif not rows:
+            print("no decision orders")
+        else:
+            for row in rows:
+                icon = FO_ICON.get(row["status"], "•")
+                att = " ⚠" if row["needs_attention"] else ""
+                print(f"{icon} {row['id']} [{row['project']}] {row['title']} "
+                      f"({row['status_label']}, {_age(row['created_at'])}){att}")
+
+    elif args.do_cmd == "show":
+        detail = ops.show_decision_order(args.do_id, args.project)
+        detail["budget"] = ops.feature_order_budget(args.do_id, detail["project"])
+        if args.json:
+            _print(detail, True)
+        else:
+            print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
+                  f"[{detail['project']}] {detail['title']} ({detail['status_label']})")
+            print(f"\n{detail['description']}\n")
+            if detail["attention_reason"]:
+                print(f"⚠ {detail['attention_reason']}\n")
+            if detail["budget"]["budget_usd"]:
+                b = detail["budget"]
+                print(f"budget: ${b['spent_usd']:.2f} of ${b['budget_usd']:.2f}")
+            if detail["researcher"]:
+                r = detail["researcher"]
+                print(f"researcher: {r['id']} ({r['status']})")
+            report = detail["report"]
+            if not report:
+                print("\nno report yet")
+            else:
+                # Plain on purpose: §3 replaces this with the full renderer
+                print(f"\nsummary: {report.get('summary') or ''}")
+                rec = report.get("recommendation") or {}
+                if isinstance(rec, dict):
+                    print(f"recommendation: {rec.get('option') or '(none)'} — "
+                          f"{rec.get('why') or ''}")
+                for key in ("findings", "options", "proposed_orders"):
+                    items = [i for i in (report.get(key) or []) if isinstance(i, dict)]
+                    if items:
+                        print(f"{key.replace('_', ' ')}: "
+                              + ", ".join(f"{i.get('key')} {i.get('title') or ''}".strip()
+                                          for i in items))
+
+    elif args.do_cmd == "done":
+        _print(ops.complete_decision_order(args.do_id, note=args.note,
+                                           project_name=args.project), args.json)
+
+    elif args.do_cmd == "cancel":
+        _print(ops.cancel_decision_order(args.do_id, args.project), args.json)
+
+    elif args.do_cmd == "budget":
+        if args.amount is None and not args.clear:
+            _print(ops.decision_order_budget(args.do_id, args.project), args.json)
+        else:
+            amount = None if args.clear else _parse_budget_amount(args.amount)
+            _print(ops.set_decision_budget(args.do_id, amount, args.project), args.json)
+
+    return 0
 
 
 def cmd_investigate(args: argparse.Namespace) -> int:
@@ -5947,6 +6070,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_io(args)
         if args.cmd == "investigate":
             return cmd_investigate(args)
+        if args.cmd == "do":
+            return cmd_do(args)
         if args.cmd == "morpheus":
             return cmd_morpheus(args)
         if args.cmd == "gate":

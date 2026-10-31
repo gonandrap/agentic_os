@@ -229,8 +229,9 @@ def test_every_decide_command_is_accepted_by_the_cli(started, store, capsys):
     io = ops.create_improvement_order("proj_a", "slow dispatch", "it is slow",
                                       refs=["wo-11111111"])
     inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    do = ops.create_decision_order("proj_a", "which cache", "compare the two caches")
     rows = {"feature": fo["id"], "improvement": io["id"],
-            "investigation": inv["id"]}
+            "investigation": inv["id"], "decision": do["id"]}
     assert set(rows) == set(project_store.FO_KINDS)
     for kind, fo_id in rows.items():
         argv = project_store.decide_command(kind, fo_id).split()[1:]
