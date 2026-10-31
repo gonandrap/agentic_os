@@ -573,6 +573,10 @@ the work is yours to do now."""
 #: THE ROUTE OUT, written once
 START_COMMAND = "jarvis issues start {url}"
 
+#: Keys a triage question's context carries when an investigation GAP filed the bug (#1344)
+INVESTIGATION_KEY = "investigation"
+MORPHEUS_ITEM_KEY = "morpheus_item"
+
 def self_dispatch(catalog: Any) -> bool:
     """`os.autonomy.self_dispatch`: may a confirmed claim dispatch work nobody typed?"""
     autonomy = getattr(getattr(catalog, "os", None), "autonomy", None)
@@ -589,7 +593,8 @@ def self_dispatch_configured() -> bool:
 
 
 def route_filing(issue_url: str, title: str, body: str, priority: str,
-                 repo: str | None = None, expedite: bool = False) -> dict[str, Any]:
+                 repo: str | None = None, expedite: bool = False,
+                 investigation: dict[str, str] | None = None) -> dict[str, Any]:
     """Everything that happens to a freshly filed bug, before anyone is told about it"""
     from .catalog import CatalogError
     from .central_store import CentralStore
@@ -638,7 +643,8 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
                              f"created ({e}) — start it yourself with "
                              f"`{START_COMMAND.format(url=issue_url)}`")
 
-    if not dispatches(priority):
+    # An investigation's GAP is triaged at ANY level: Neo agreeing plus the steward starts it (#1344)
+    if not dispatches(priority) and not investigation:
         if not expedite:
             out["reason"] = (f"`{priority}` is on the tracker for the user to pick up: "
                              f"`{START_COMMAND.format(url=issue_url)}`")
@@ -646,8 +652,13 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
 
     # `expedite` appends to the sentence above; a plain filing has none and writes its own
     try:
-        out["neo_question_id"] = ask_triage(spec.name, issue_url, title, body, priority)
-        if expedite:
+        out["neo_question_id"] = ask_triage(spec.name, issue_url, title, body, priority,
+                                            extra=investigation)
+        if investigation and not expedite:
+            out["reason"] = (f"`{priority}` filed by {investigation.get(INVESTIGATION_KEY)} "
+                             f"— Neo is re-assessing it; the fix starts at once if Neo "
+                             f"agrees and the steward allows it")
+        elif expedite:
             out["reason"] += (f"; Neo is re-assessing the `{priority}` claim in "
                               f"parallel and can still move the rating, not the work")
         elif not self_dispatch(catalog):
@@ -708,14 +719,15 @@ Title: {title}
 
 
 def ask_triage(project: str, issue_url: str, title: str, body: str,
-               priority: str) -> int:
-    """Queue the re-assessment"""
+               priority: str, extra: dict[str, str] | None = None) -> int:
+    """Queue the re-assessment; `extra` rides in the context back to `settle_triage`"""
     from .neo_store import NeoStore
     from .provenance import TITLE_LIMIT, Borrowed, borrowed_block
 
     # The title is bounded in the JSON record too: it rides to Neo as `context=`
-    context = json.dumps({"issue_url": issue_url, "title": title[:TITLE_LIMIT],
-                          "priority": priority, "body": body[:4000]})
+    context = json.dumps({**(extra or {}), "issue_url": issue_url,
+                          "title": title[:TITLE_LIMIT], "priority": priority,
+                          "body": body[:4000]})
     # Decision #11: the title is borrowed text
     quoted_title = borrowed_block(Borrowed(
         label="the tracker issue's title", whose="the agent that filed the bug",
@@ -798,11 +810,42 @@ def read_triage_verdict(claimed: str, verdict: dict[str, Any]) -> tuple[str, str
 def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
                   ) -> dict[str, Any]:
     """Route a bug now that Neo has ruled on its priority"""
-    from .central_store import CentralStore
-
     payload = triage_payload(q)
     if not payload:
         return {"outcome": "not-a-triage"}
+    out = _settle_triage(catalog, q, verdict, payload)
+    inv_id = str(payload.get(INVESTIGATION_KEY) or "")
+    if inv_id:
+        from .ops import record_investigation_dispatch
+
+        out["dispatch"] = investigation_dispatch_note(out)
+        try:
+            record_investigation_dispatch(inv_id, out.get("existing_wo_id") or "",
+                                          out["dispatch"], q.get("project") or None)
+        except Exception:  # noqa: BLE001 — the settlement stands; only its echo is lost
+            log.exception("could not record the dispatch on %s", inv_id)
+    return out
+
+
+def investigation_dispatch_note(out: dict[str, Any]) -> str:
+    """Who let an investigation's fix start, or who refused it and why (#1344)"""
+    start = f"start it by hand: `{START_COMMAND.format(url=out['issue_url'])}`"
+    if out.get("wo_id"):
+        return (f"started at once as {out['wo_id']}: Neo confirmed `{out['settled']}` "
+                f"and the steward allowed it")
+    if out.get("existing_wo_id"):
+        return f"{out['existing_wo_id']} was already on it"
+    if out["outcome"] != "confirmed":
+        why = (out.get("reason") or "no reason given").strip()[:300]
+        return (f"NOT started — Neo did not agree ({out['outcome']}, "
+                f"`{out['claimed']}` -> `{out['settled']}`: {why}); {start}")
+    return f"NOT started — the steward refused ({out.get('steward') or 'no decision'}); {start}"
+
+
+def _settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any],
+                   payload: dict[str, Any]) -> dict[str, Any]:
+    from .central_store import CentralStore
+
     claimed = payload.get("priority") or ""
     url = payload["issue_url"]
     out: dict[str, Any] = {"outcome": "", "claimed": claimed, "settled": claimed,
@@ -831,22 +874,28 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
     from .project_store import ProjectStore
 
     decision = None
+    # The fix order points back at the investigation and the validation it came from (#1344)
+    links = {k: payload[k] for k in (INVESTIGATION_KEY, MORPHEUS_ITEM_KEY) if payload.get(k)}
     if out["outcome"] == "confirmed":
         # The steward's call (spec 2026-10-21 §3.2): Neo's confirmation IS the evidence a...
 
         store = ProjectStore(spec.path)
         try:
             decision = steward.gate(
-                steward.Candidate("bug_agent", out["settled"], spec.name,
+                steward.Candidate("investigation" if links else "bug_agent",
+                                  out["settled"], spec.name,
                                   payload.get("title") or url,
                                   evidence=(f"neo question {q.get('id')} confirmed",),
                                   parent_wo_id=str(q.get("wo_id") or "")),
                 catalog=catalog, store=store, self_dispatch=self_dispatch(catalog))
         finally:
             store.close()
+        out["steward"] = f"{decision.outcome}, {decision.rule}: {decision.reason}"
+        if decision.outcome == "dispatch" and not decision.allowed:
+            out["steward"] += "; os.autonomy.self_dispatch is off"
     if decision is not None and decision.allowed:
         out["wo_id"] = promote_confirmed(
-            spec, payload, metadata=steward.stamped({}, decision),
+            spec, payload, metadata=steward.stamped(links, decision),
             budget_usd=decision.budget_usd)
         steward.linked(decision, out["wo_id"])
         if out["backlog_id"]:

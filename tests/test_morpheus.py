@@ -304,6 +304,39 @@ def test_a_confirmed_item_is_watched_again_once_its_superseding_fix_reaches_prod
     assert morpheus.requeue_fixed(central, cfg, follow) == []
 
 
+def test_an_item_settled_by_an_investigation_is_watched_again_once_its_fix_ships(
+        central, cfg):
+    """#1344: the investigation's filed fix is the item's fix carrier too"""
+    item = monitoring(central)
+    central.update_morpheus_item(item["id"], state="failed", action="investigation:fo-1nv00001")
+    fixes = {"fo-1nv00001": "wo-cccc0003"}
+    same = lambda wo: wo  # noqa: E731
+    assert morpheus.requeue_fixed(central, cfg, same, lambda inv: "") == []
+    assert morpheus.requeue_fixed(central, cfg, same, fixes.get) == [], "not shipped yet"
+    queued(central, 9, title="[wo-cccc0003] the fix the investigation filed")
+    assert morpheus.requeue_fixed(central, cfg, same, fixes.get) == [item["id"]]
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "monitoring" and after["action"] == ""
+    assert "wo-cccc0003" in after["resolution"] and "fo-1nv00001" in after["resolution"]
+    assert "PR #9" in after["resolution"]
+
+
+def test_the_fix_loop_stops_at_its_cap_and_asks_the_user(central, monkeypatch):
+    from jarvis import ops
+
+    item = queued(central)
+    central.update_morpheus_item(item["id"], state="failed")
+    candidates = _allowed(monkeypatch)
+    monkeypatch.setattr(ops, "find_work_order", lambda wo, p=None: ("proj_a", None, {}))
+    cycles = [f"fo-c{i:07d}" for i in range(morpheus.MAX_FIX_CYCLES)]
+    monkeypatch.setattr(ops, "morpheus_investigations", lambda p, i: cycles)
+    order_id, note = morpheus._investigate(catalog(), central.morpheus_item(item["id"]))
+    assert order_id == "" and "the user decides" in note and cycles[-1] in note
+    assert candidates == [], "the cap is checked before the steward spends a decision"
+    assert any("still fails production validation" in (i["title"] or "")
+               for i in central.unacked_inbox())
+
+
 # -- 4. the mechanical half: the exit code and nothing else
 
 
@@ -551,7 +584,8 @@ def test_morpheus_detail_gathers_runs_questions_retries_and_handoff(central):
     morpheus._ask_neo(catalog(), central.morpheus_item(other["id"]), "")
     central.claim_morpheus_action(item["id"], f"neo:{qid}")
     detail = ops.morpheus_detail(item["id"])
-    assert set(detail) == {"item", "runs", "questions", "next_check_ts", "retries", "handoff"}
+    assert set(detail) == {"item", "runs", "questions", "next_check_ts", "retries", "handoff",
+                           "investigations"}
     assert detail["runs"] == [] and detail["item"]["id"] == item["id"]
     assert [(q["id"], q["kind"]) for q in detail["questions"]] == [(qid, "validation")]
     assert set(detail["questions"][0]) == {"id", "status", "kind", "question", "answer", "ts"}

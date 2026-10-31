@@ -3110,9 +3110,10 @@ class Daemon:
                 finally:
                     store.close()
             try:
-                from .ops import fix_carrier
+                from .ops import fix_carrier, investigation_fix_order
 
-                for item_id in morpheus.requeue_fixed(central, cfg, fix_carrier):
+                for item_id in morpheus.requeue_fixed(central, cfg, fix_carrier,
+                                                      investigation_fix_order):
                     log.info("morpheus %s: its fix reached production, watching again", item_id)
             except Exception:  # noqa: BLE001 — the rest of the pass still runs
                 log.exception("morpheus: could not requeue fixed items")
