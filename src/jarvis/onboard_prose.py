@@ -516,6 +516,7 @@ LINES: dict[str, str] = {
     "bugs.label": "The tracker label that says the OS picked an issue up.",
     "wiring.bundled_skills": "Whether the skills Claude Code itself ships reach workers.",
     "wiring.claude_ai_connectors": "Whether your claude.ai connectors reach workers.",
+    "wiring.chrome": "Whether Claude in Chrome browser automation reaches workers.",
     "worker.require_crew": "Whether the lead must delegate file edits to its crew.",
 }
 
@@ -647,6 +648,8 @@ EXAMPLES: dict[str, str] = {
                              "start-up context; on, they ride in every start.",
     "wiring.claude_ai_connectors": "On, your claude.ai connectors reach every worker in "
                                    "scope; off, they stay out of its sessions.",
+    "wiring.chrome": "Off, workers launch with --no-chrome and carry no Claude in Chrome "
+                     "prompt section or tools; on, your own Claude config decides.",
     "worker.require_crew": "On, a lead that tries to edit a file itself is refused and "
                            "delegates to jarvis-implementer; off, it edits directly.",
 }

@@ -331,12 +331,29 @@ def test_every_source_gets_the_lever_that_can_actually_unwire_it(monkeypatch, tm
     assert levers["anthropic-skills:docx"] == f"{wiring.LEVER_SKILL}anthropic-skills:docx"
     assert "synced" not in levers
     assert levers["Claude Code's bundled skills"] == wiring.LEVER_BUNDLED
+    assert levers["Claude in Chrome"] == wiring.LEVER_CHROME
     # A plugin the USER has turned off is not Jarvis's to list as wired
     assert "off@m" not in levers
     # Unwiring the plugin unwires the server it provides — one lever, both rows
     applied = wiring.applied(WiringConfig(bundled_skills=True,
                                           disabled_plugins=(SERENA,)), inv)
     assert {i.name for i in applied.unwired} == {SERENA, "plugin:serena:serena"}
+
+
+def test_unwiring_chrome_adds_no_chrome_to_every_worker_launch():
+    """Chrome lives in the global config, not settings: only the CLI flag reaches it (issue 1370)"""
+    from jarvis.claude_cli import turn_args
+
+    assert wiring.launch_flags(WiringConfig()) == []
+    flags = wiring.launch_flags(WiringConfig(chrome=False))
+    assert flags == ["--no-chrome"]
+    assert "--no-chrome" in turn_args("hi", "sid", False, wiring_flags=flags)
+    assert wiring.lever_setting(wiring.LEVER_CHROME, False, WiringConfig()) == (
+        "wiring.chrome", False)
+    assert not wiring.lever_wired(WiringConfig(chrome=False), wiring.LEVER_CHROME)
+    raw = {"version": 1, "projects": [{"name": "p", "path": "/tmp/p",
+                                       "wiring": {"chrome": False}}]}
+    assert parse_catalog(raw).projects[0].wiring.chrome is False
 
 
 def test_a_source_that_cannot_be_read_is_a_line_rather_than_an_exception(monkeypatch):

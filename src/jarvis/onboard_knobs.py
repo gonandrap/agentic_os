@@ -177,7 +177,7 @@ _OPINION_LEAVES = frozenset({
     "investigation_effort", "weekly_usd", "critical_weekly_usd", "order_budget_usd",
     "yield_above_usd", "max_depth", "stakes_classifier", "on_failed", "on_timeout",
     "chair_model", "digest_model", "label", "bundled_skills", "claude_ai_connectors",
-    "false_positive_disarm",
+    "false_positive_disarm", "chrome",
 })
 
 _LONGEST_FIRST: tuple[tuple[str, str], ...] = tuple(sorted(
