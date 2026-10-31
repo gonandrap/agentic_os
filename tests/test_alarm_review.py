@@ -154,6 +154,48 @@ def test_an_escalation_that_asks_nobody_else_heads_the_queue(started):
     assert "/config?scope=os&amp;node=inspect" in page
 
 
+def test_a_reviewed_escalation_no_longer_reads_escalated(started):
+    """The filter is the alarm's CURRENT standing (wo-b6e2ddda, Neo Q2673)"""
+    _, done = _alarm("reviewed one", live=False, decided=True, status="escalated",
+                     verdict="escalate")
+    _, open_ = _alarm("open one", live=False, decided=True, status="escalated",
+                      verdict="escalate")
+    ops.review_alarm(done, approved=True, project_name="proj_a")
+
+    record = _client().get("/alarms?state=escalated").text.split("On the record")[1]
+    assert open_ in record and done not in record
+    assert done in _client().get("/alarms?state=reviewed").text
+
+
+def test_approve_shown_approves_only_the_rows_shown(started):
+    """Like inbox's "Ack shown": never the whole fleet's queue (Neo Q2674)"""
+    _, shown = _alarm("shown", live=False, decided=True, status="acked")
+    _, other = _alarm("other", live=False, decided=True, status="acked")
+
+    page = _client().get("/alarms").text
+    assert "Approve 2 shown" in page
+    posted = _client().post("/alarms/approve", data={"shown": shown, "next": "/alarms"})
+
+    assert posted.status_code == 303
+    assert [a["id"] for a in ops.alarm_review_queue()] == [other]
+    assert ops.approve_alarm_queue("proj_a")["approved"] == [other]
+    assert ops.alarm_review_queue() == []
+
+
+def test_a_fleet_wide_alarm_says_its_order_is_only_the_carrier(started):
+    """al-9c89fd13 read as blaming a release order (wo-b6e2ddda)"""
+    from jarvis import inspection
+
+    wo = ops.create_work_order("proj_a", "ship version 0.13.11")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        store.add_alarm(wo["id"], inspection.CACHE_1H_DISPATCHED_ALARM, -1, FIRED)
+    finally:
+        store.close()
+
+    assert "fleet-wide · filed on" in _client().get("/alarms").text
+
+
 # -- the control is one macro, and this is the only observable form of that
 
 

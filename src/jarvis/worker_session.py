@@ -14,7 +14,7 @@ from . import (background, budget, claude_cli, context, db, session_dispatch,
                systemd_units, usage)
 from .catalog import ProjectSpec
 from .project_store import (COMPACT_TURN, COST_FROM_TRANSCRIPT, SESSION_KEPT_EVENT,
-                            TERMINAL_STATUSES, ProjectStore)
+                            TERMINAL_STATUSES, ProjectStore, submission_artifacts)
 
 log = logging.getLogger("jarvisd")
 
@@ -700,7 +700,13 @@ def _prune_worktree_caches(store: ProjectStore, wo: dict[str, Any]) -> None:
     tree = Path(store.project_path) / ".claude" / "worktrees" / str(wo["worktree"])
     if not tree.is_dir():
         return
-    pruned = disk.prune_build_caches(tree)
+    # Completed means its contract command already read the file; a cancelled one may not have
+    consumed = submission_artifacts(wo) if wo["status"] == "completed" else ()
+    pruned = disk.prune_build_caches(tree, consumed)
+    kept = store.last_event_of_kind(wo["id"], SESSION_KEPT_EVENT)
+    # Walk once, and again only after an EACCES refusal — not every poll of a kept tree
+    if kept is None or "EACCES" in str(kept.get("payload") or ""):
+        disk.make_dirs_writable(tree)
     if pruned:
         log.info("pruned %d regenerable cache(s) from %s's worktree", len(pruned),
                  wo["id"])

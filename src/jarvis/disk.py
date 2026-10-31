@@ -37,8 +37,25 @@ REGENERABLE_NAMES = frozenset({
 REGENERABLE_SUFFIXES = (".pyc", ".pyo", ".egg-info")
 
 
-def prune_build_caches(worktree: Path) -> list[str]:
-    """Delete the worktree's UNTRACKED regenerable caches, which otherwise read as work (#1257)"""
+def make_dirs_writable(worktree: Path) -> int:
+    """Owner-write on read-only dirs, whose files a removal cannot unlink (EACCES, wo-b6e2ddda)"""
+    fixed = 0
+    for path in [worktree, *worktree.rglob("*")]:
+        try:
+            if path.is_symlink() or not path.is_dir():
+                continue
+            mode = path.stat().st_mode
+            if not mode & 0o200:
+                path.chmod(mode | 0o200)
+                fixed += 1
+        except OSError as exc:
+            log.debug("could not make %s writable: %s", path, exc)
+    return fixed
+
+
+def prune_build_caches(worktree: Path, artifacts: Iterable[str] = ()) -> list[str]:
+    """Delete UNTRACKED regenerable caches and consumed `artifacts`, which read as work (#1257)"""
+    consumed = set(artifacts)
     # `=all` so an untracked DIRECTORY cannot hide what it holds behind its own name
     status = branchproof.run(worktree, "--no-optional-locks", "status", "--porcelain",
                              "-z", "--untracked-files=all")
@@ -48,7 +65,7 @@ def prune_build_caches(worktree: Path) -> list[str]:
     for entry in status.split("\0"):
         if not entry.startswith("??"):
             continue
-        rel = _regenerable_root(entry[3:])
+        rel = entry[3:] if entry[3:] in consumed else _regenerable_root(entry[3:])
         if rel is None or rel in pruned:
             continue
         target = worktree / rel
@@ -126,6 +143,7 @@ def _reclaim_one(project_path: Path,
         return None, authored.unreadable
     if authored.dirty:
         return None, f"{len(authored.dirty)} uncommitted file(s): {authored.describe()}"
+    make_dirs_writable(path)
     out, stderr = branchproof.attempt(project_path, "worktree", "remove", "--force",
                                       str(path))
     if out is None:

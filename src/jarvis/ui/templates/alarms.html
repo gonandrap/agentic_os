@@ -70,6 +70,12 @@
 {# Absent when empty: with the supervisor off, as it ships, this half never has a row. #}
 {% if review_queue %}
 <h2>Addressed by the supervisor, awaiting your feedback</h2>
+{# Acts on the rows shown, never the whole fleet's queue: inbox's "Ack shown" (Neo Q2674) #}
+<form class="inline" method="post" action="/alarms/approve">
+  <input type="hidden" name="shown" value="{{ review_queue | map(attribute='id') | join(',') }}">
+  <input type="hidden" name="next" value="/alarms">
+  <button class="accept">✓ Approve {{ review_queue|length }} shown</button>
+</form>
 <div class="panel">
   {% for a in review_queue %}
   <div class="msg" id="alarm-{{ a.id }}">

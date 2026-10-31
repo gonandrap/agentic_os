@@ -13870,6 +13870,9 @@ def _reviewable(name: str, row: dict[str, Any],
     })
     # The frozen dict carries the probe ID; every review surface renders its TITLE
     view["kind_label"] = alarm_kind_label(view, titles or {})
+    from .inspection import FLEET_WIDE_KINDS
+
+    view["fleet_wide"] = view["kind"] in FLEET_WIDE_KINDS
     return view
 
 
@@ -14057,6 +14060,25 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
             neo.close()
     return {"alarm_id": alarm_id, "project": name, "wo_id": row["wo_id"],
             "review": review, "neo_question_closed": closed}
+
+
+def approve_alarm_queue(project_name: str | None = None,
+                        alarm_ids: Sequence[str] | None = None) -> dict[str, Any]:
+    """Approve the review queue in bulk; with `alarm_ids`, only those rows of it (wo-b6e2ddda, Neo Q2674)"""
+    queue = alarm_review_queue(project_name, limit=10_000)
+    if alarm_ids is not None:
+        wanted = set(alarm_ids)
+        queue = [r for r in queue if r["id"] in wanted]
+    approved: list[str] = []
+    failed: list[dict[str, str]] = []
+    for row in queue:
+        try:
+            review_alarm(row["id"], approved=True, project_name=row["project"])
+        except OpsError as e:
+            failed.append({"alarm_id": row["id"], "error": str(e)})
+            continue
+        approved.append(row["id"])
+    return {"approved": approved, "failed": failed}
 
 
 def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
