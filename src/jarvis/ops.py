@@ -6924,6 +6924,8 @@ def evidence_refs(fo: dict[str, Any]) -> list[str]:
 
 #: `work_orders.metadata`/`feature_orders.metadata` key on an order FILED FROM a finding: the...
 ORIGIN_IO_KEY = "origin_io"
+#: The same back-link on an order filed from a decision report's proposal (docs/superpowers/specs/2026-10-31-decision-orders.md §6)
+ORIGIN_DO_KEY = "origin_do"
 
 
 def _require_kind(fo: dict[str, Any], kind: str, verb: str) -> None:
@@ -9353,8 +9355,13 @@ def show_decision_order(do_id: str, project_name: str | None = None) -> dict[str
                 researcher = None  # deleted out from under it; the link was released
     finally:
         store.close()
+    report = decision_report(fo)
+    # The back-link from this end (§6): every order filed from a proposal
+    followups = [{"key": p.get("key"), **mark}
+                 for p in report.get("proposed_orders") or [] if isinstance(p, dict)
+                 for mark in p.get("filed") or [] if isinstance(mark, dict)]
     return {"project": name, **fo, "researcher": researcher,
-            "report": decision_report(fo),
+            "report": report, "followups": followups,
             "status_label": feature_status_label("decision", fo["status"])}
 
 
@@ -9477,6 +9484,105 @@ def submit_decision_report(do_id: str, doc: Any,
         except OpsError as e:
             out["warning"] = submitter_unsettled("report", do_id, fo["plan_wo_id"], e)
     return out
+
+
+#: On the researcher's timeline: one order filed from a proposal (§6)
+DECISION_FOLLOWUP_EVENT = "decision_followup_filed"
+#: Where filing is allowed: a delivered report, before or after the user decided (§6)
+_FOLLOWUP_STATUSES = ("awaiting_decision", "completed")
+_FOLLOWUP_AS = ("wo", "fo", "backlog")
+
+
+def decision_origin(row: Mapping[str, Any]) -> str:
+    """The decision order an order was filed from, "" for none"""
+    metadata = db.from_json(row.get("metadata"), {}) or {}
+    return str(metadata.get(ORIGIN_DO_KEY) or "") if isinstance(metadata, dict) else ""
+
+
+def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | None = None,
+                            project_name: str | None = None, *, all_: bool = False,
+                            again: bool = False) -> dict[str, Any]:
+    """`jarvis do follow-up` — file proposals as orders; NEVER touches the order's status (§6)"""
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", show_verb(fo.get("kind")))
+    if fo["status"] not in _FOLLOWUP_STATUSES:
+        raise OpsError(
+            f"{do_id} is {feature_status_label('decision', fo['status'])}, and follow-ups "
+            f"are filed only from a delivered report — run `jarvis do show {do_id}` and "
+            f"file them once it is awaiting your decision")
+    if as_ is not None and as_ not in _FOLLOWUP_AS:
+        raise OpsError(f"--as must be one of {', '.join(_FOLLOWUP_AS)}, not {as_!r}")
+    report = decision_report(fo)
+    proposals = [p for p in (report.get("proposed_orders") or []) if isinstance(p, dict)]
+    by_key = {p.get("key"): p for p in proposals}
+    if not proposals:
+        raise OpsError(f"{do_id}'s report proposes no orders — file one yourself with "
+                       f"`jarvis wo create`")
+    if all_ == bool(keys):
+        raise OpsError(f"name the proposals to file, or pass --all: "
+                       f"`jarvis do follow-up {do_id} {' '.join(map(str, by_key))}`")
+    unknown = [k for k in keys if k not in by_key]
+    if unknown:
+        raise OpsError(f"{do_id} has no proposal {', '.join(unknown)} "
+                       f"(known: {', '.join(map(str, by_key))})")
+    # Explicit keys are refused up front; --all quietly skips what is already filed
+    wanted = list(dict.fromkeys(keys)) if keys else [p.get("key") for p in proposals]
+    skipped = [k for k in wanted if by_key[k].get("filed") and not again]
+    if keys and skipped:
+        raise OpsError(f"{', '.join(skipped)} already filed from {do_id} — pass --again "
+                       f"to file another")
+    paths = registered_project_paths()
+    filed: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for key in (k for k in wanted if k not in skipped):
+        p = by_key[key]
+        kind = as_ or p.get("as") or "wo"
+        target = (p.get("project") or "").strip() or name
+        # FIRST LINE names the decision order: the worker sees this description and nothing else
+        description = (f"Filed from decision order {do_id} — run `jarvis do show {do_id}` "
+                       f"for the data behind it.\n\n{p.get('description') or ''}")
+        title = p.get("title") or ""
+        try:
+            if kind not in _FOLLOWUP_AS:
+                raise OpsError(f"proposal {key} has `as` {kind!r}; pass --as "
+                               f"{'|'.join(_FOLLOWUP_AS)}")
+            if kind == "fo":
+                row = create_feature_order(target, title, description=description,
+                                           metadata={ORIGIN_DO_KEY: do_id})
+            elif kind == "backlog":
+                if target not in paths:
+                    raise OpsError(f"project {target!r} not registered (known: "
+                                   f"{sorted(paths)})")
+                central = CentralStore()
+                try:
+                    # A backlog row has no metadata: origin_fo_id is its back-link
+                    row = central.add_backlog(target, title, description=description,
+                                              origin_fo_id=do_id,
+                                              origin_note=f"decision order {do_id}")
+                finally:
+                    central.close()
+            else:
+                row = create_work_order(target, title, description=description,
+                                        parent_id=None, metadata={ORIGIN_DO_KEY: do_id})
+        except (OpsError, KeyError) as e:
+            errors.append({"key": key, "error": str(e)})
+            continue
+        mark = {"id": row["id"], "as": kind, "at": db.now()}
+        p.setdefault("filed", []).append(mark)
+        filed.append({"key": key, "project": target, "title": title, **mark})
+    if filed:
+        store = ProjectStore(path)
+        try:
+            # `decision_report_sha` ignores `filed`, so this never reads as a revised report
+            store.update_feature_order(do_id, plan=db.to_json(report))
+            if fo.get("plan_wo_id"):
+                for f in filed:
+                    store.add_event(fo["plan_wo_id"], DECISION_FOLLOWUP_EVENT,
+                                    {"do_id": do_id, "key": f["key"], "order_id": f["id"]})
+        finally:
+            store.close()
+    return {"project": name, "do_id": do_id, "status": fo["status"], "filed": filed,
+            "skipped": skipped, "errors": errors}
 
 
 OFFBOARDED_EVENT = "offboarded"

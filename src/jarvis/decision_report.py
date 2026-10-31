@@ -207,9 +207,11 @@ def render_report(report: Mapping[str, Any]) -> str:
         lines.append(f"Proposed follow-up orders ({len(orders)}), yours to file:")
         for p in orders:
             where = f" [{p['project']}]" if p.get("project") else ""
-            filed = f" — filed as {p['filed']}" if p.get("filed") else ""
+            # §6 keeps `filed` as a list of marks; show the order ids
+            filed = ", ".join(str(m.get("id")) for m in p.get("filed") or []
+                              if isinstance(m, dict))
             lines.append(f"  {p.get('key')}. ({p.get('as')}){where} {p.get('title') or ''}"
-                         f"{filed}")
+                         + (f" — filed as {filed}" if filed else ""))
         lines.append("")
     return "\n".join(lines).rstrip()
 
