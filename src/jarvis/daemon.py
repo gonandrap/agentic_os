@@ -154,6 +154,8 @@ _FAMILY_RUNNING_STATUS = {
     "feature": "executing",
     "improvement": "planning",
     "investigation": "planning",
+    # Never `awaiting_decision`: the user is not spending money by thinking
+    "decision": "planning",
 }
 
 #: Which statuses `Daemon.settle_turns` sweeps (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)

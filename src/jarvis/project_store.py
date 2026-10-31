@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import sqlite3
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -196,7 +199,7 @@ WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo", "schedule",
 UNGOVERNED_ORIGINS = ("adhoc", "injected")
 
 # What a work order IS to the OS, which is not the same question as what it is about (docs/superpowers/specs/2026-09-27-investigation-orders.md)
-WO_KINDS = ("worker", "planner", "manager", "analyst", "investigator")
+WO_KINDS = ("worker", "planner", "manager", "analyst", "investigator", "researcher")
 
 #: How a kind's work order settles: through `ops.finish`'s join (assumptions, panel, landing)
 SETTLE_BY_FINISH = "finish"
@@ -235,6 +238,10 @@ WO_KIND_CONTRACTS: dict[str, KindContract] = {
         SETTLE_IN_SESSION, artifact="verdict.json",
         submit="jarvis investigate verdict {fo_id} --from-file verdict.json",
         lands_code=False, assumptions_reviewed=False),
+    # By FINISH: an in-session kind skips the panel, and decision-orders spec §4 needs a round
+    "researcher": KindContract(SETTLE_BY_FINISH, artifact="report.json",
+                               submit="jarvis do report {fo_id} --from-file report.json",
+                               lands_code=False),
 }
 
 
@@ -291,27 +298,35 @@ FO_STATUSES = (
     "plan_review",  # a plan was submitted; Neo is reviewing it, or it is escalated
     "executing",    # children dispatching / running
     "validating",   # every child is done and the panel is judging the feature as a whole
-    "completed",    # every child settled successfully
+    # A decision order's report is delivered; only the user leaves it (docs/superpowers/specs/2026-10-31-decision-orders.md §1.3)
+    "awaiting_decision",
+    "completed",   # every child settled successfully
     # The FAMILY budget is gone — planner
     "budget_exhausted",
     "failed",       # a child failed or was cancelled
     "cancelled",    # the user stopped it
 )
 FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing", "validating",
-                    "budget_exhausted")
+                    "awaiting_decision", "budget_exhausted")
 FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
+
+class DecisionOrderGuard(RuntimeError):
+    """A terminal status on a decision order from anything but the user's verb (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
+
 # What a `feature_orders` row IS (docs/superpowers/specs/2026-09-23-improvement-orders.md)
-FO_KINDS = ("feature", "improvement", "investigation")
+FO_KINDS = ("feature", "improvement", "investigation", "decision")
 
 # The id prefix each kind mints, defaulting to `fo`
-FO_ID_PREFIXES = {"improvement": "io", "investigation": "inv"}
+FO_ID_PREFIXES = {"improvement": "io", "investigation": "inv", "decision": "do"}
 
 # Kind-aware status LABELS
 FO_STATUS_LABELS: dict[str, dict[str, str]] = {
     "improvement": {"planning": "analysing", "plan_review": "findings awaiting you"},
     # No `plan_review` entry: an investigation never enters that status (§2.1 of... (docs/superpowers/specs/2026-09-27-investigation-orders.md)
     "investigation": {"planning": "investigating"},
+    "decision": {"planning": "researching", "awaiting_decision": "awaiting your decision",
+                 "completed": "decided"},
 }
 
 
@@ -325,6 +340,7 @@ FO_DECIDE_COMMANDS = {
     "feature": "jarvis fo show {fo_id}",
     "improvement": "jarvis io review {fo_id}",
     "investigation": "jarvis investigate show {fo_id}",
+    "decision": "jarvis do show {fo_id}",
 }
 
 
@@ -338,6 +354,7 @@ FAMILY_CHILD_KINDS: dict[str, tuple[str, ...]] = {
     "feature": ("worker",),
     "improvement": ("analyst",),
     "investigation": ("investigator",),
+    "decision": ("researcher",),
 }
 
 #: `feature_children(kinds=…)` for the callers that mean a feature's planned work orders
@@ -346,7 +363,19 @@ WORKER_CHILDREN: tuple[str, ...] = ("worker",)
 
 def is_feature_order_id(unit_id: str) -> bool:
     """Does this id name a `feature_orders` row?"""
-    return unit_id.startswith(("fo-", "io-", "inv-"))
+    return unit_id.startswith(("fo-", "io-", "inv-", "do-"))
+
+
+def decision_report_sha(plan: str | dict | None) -> str:
+    """The report's identity, blind to `filed` marks; "" for none (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
+    if not plan:
+        return ""
+    doc = json.loads(plan) if isinstance(plan, str) else copy.deepcopy(plan)
+    if isinstance(doc, dict):
+        for item in doc.get("proposed_orders") or []:
+            if isinstance(item, dict):
+                item.pop("filed", None)
+    return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()
 
 
 #: The URL segment each order id prefix is rendered under
@@ -2390,9 +2419,18 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
-    def update_feature_order(self, fo_id: str, **fields: Any) -> None:
+    def update_feature_order(self, fo_id: str, *, decided_by_user: bool = False,
+                             **fields: Any) -> None:
         if not fields:
             return
+        # The never-auto-complete rule: only the user's `jarvis do done|cancel` settles a decision order (§2)
+        if fields.get("status") in FO_TERMINAL_STATUSES and not decided_by_user:
+            row = self.conn.execute("SELECT kind FROM feature_orders WHERE id=?",
+                                    (fo_id,)).fetchone()
+            if row is not None and row["kind"] == "decision":
+                raise DecisionOrderGuard(
+                    f"refusing to write status {fields['status']!r} on decision order "
+                    f"{fo_id}: only the user settles it (jarvis do done|cancel {fo_id})")
         fields["updated_at"] = db.now()
         cols = ", ".join(f"{k}=?" for k in fields)
         self.conn.execute(
@@ -2400,13 +2438,14 @@ class ProjectStore:
         )
 
     def set_feature_status(self, fo_id: str, status: str, *, trigger: str = "",
-                           **extra: Any) -> None:
+                           decided_by_user: bool = False, **extra: Any) -> None:
         """Move a feature order, and retire its agent type when it settles (docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md)"""
         from . import specs
 
         assert status in FO_STATUSES, status
         was = self._status_of("feature_orders", fo_id)
-        self.update_feature_order(fo_id, status=status, **extra)
+        self.update_feature_order(fo_id, status=status, decided_by_user=decided_by_user,
+                                  **extra)
         if status in FO_TERMINAL_STATUSES:
             specs.remove_agent(self.project_path, fo_id)
         if was == status:

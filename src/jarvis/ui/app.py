@@ -128,6 +128,7 @@ FO_STATUS_META = {
     "executing":   {"word": "executing",    "icon": "●", "tone": "active"},
     # A feature order validates as a whole once every child is done
     "validating":  {"word": "under review",  "icon": "◑", "tone": "active"},
+    "awaiting_decision": {"word": "awaiting your decision", "icon": "◐", "tone": "warn"},
     "budget_exhausted": {"word": "budget spent", "icon": "◒", "tone": "warn"},
     "completed":   {"word": "completed",    "icon": "✓", "tone": "ok"},
     "failed":      {"word": "failed",       "icon": "✗", "tone": "bad"},

@@ -935,6 +935,12 @@ def create_work_order(project_name: str, title: str, description: str = "",
             except KeyError as e:
                 raise OpsError(f"no feature order {parent_id!r} in {project_name!r} — "
                                f"a child is filed under a feature of its own project") from e
+            # Files only a `worker`; other families open their own child (decision-orders spec §2)
+            if "worker" not in FAMILY_CHILD_KINDS[parent.get("kind") or "feature"]:
+                raise OpsError(
+                    f"{parent_id} is {_KIND_PHRASES.get(parent.get('kind'), 'not a feature order')}"
+                    f", and only a feature order takes work orders filed under it — file this "
+                    f"work order on its own, without `--parent`")
             if parent["status"] not in FO_OPEN_STATUSES:
                 raise OpsError(
                     f"{parent_id} is {parent['status']}, so nothing more can be filed "
@@ -6936,6 +6942,7 @@ _KIND_PHRASES = {
     "feature": "a feature order",
     "improvement": "an improvement order",
     "investigation": "an investigation order",
+    "decision": "a decision order",
 }
 
 #: Per kind: how the FAMILY reads in prose, and the command that raises its budget (docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md)
@@ -6943,6 +6950,7 @@ _KIND_FAMILY = {
     "feature": ("feature", "jarvis fo budget"),
     "improvement": ("improvement order", "jarvis io budget"),
     "investigation": ("investigation", "jarvis investigate budget"),
+    "decision": ("decision order", "jarvis do budget"),
 }
 
 
@@ -6951,6 +6959,7 @@ _KIND_SHOW_VERBS = {
     "feature": "jarvis fo show",
     "improvement": "jarvis io show",
     "investigation": "jarvis investigate show",
+    "decision": "jarvis do show",
 }
 
 
@@ -9109,7 +9118,8 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
     from .neo_store import NeoStore
 
     name, path, fo = find_feature_order(fo_id, project_name)
-    _require_kind(fo, "feature", "jarvis io review")
+    _require_kind(fo, "feature", "jarvis do show" if fo.get("kind") == "decision"
+                  else "jarvis io review")
     if fo["status"] != "plan_review":
         raise OpsError(f"{fo_id} is {fo['status']}, not awaiting a plan review")
     if not accept and not feedback.strip():
@@ -9242,6 +9252,15 @@ def rebuild_feature_agent(fo_id: str,
 def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """The user stopping a feature order, and everything it has running"""
     name, path, fo = find_feature_order(fo_id, project_name)
+    if fo.get("kind") == "decision":
+        _require_kind(fo, "feature", "jarvis do cancel")
+    return _stop_family(name, path, fo)
+
+
+def _stop_family(name: str, path: Path, fo: dict[str, Any], *, status: str = "cancelled",
+                 decided_by_user: bool = False, trigger: str = "") -> dict[str, Any]:
+    """Settle one `feature_orders` row as `status` and stop every order it has running"""
+    fo_id = fo["id"]
     if fo["status"] in FO_TERMINAL_STATUSES:
         raise OpsError(f"{fo_id} is already {fo['status']}")
     store = ProjectStore(path)
@@ -9257,7 +9276,8 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
         if manager:
             owned.append(manager)
         stop_ids = [w["id"] for w in owned if w["status"] in OPEN_STATUSES]
-        store.set_feature_status(fo_id, "cancelled")
+        store.set_feature_status(fo_id, status, trigger=trigger,
+                                 decided_by_user=decided_by_user)
         store.clear_feature_attention(fo_id)
     finally:
         store.close()
@@ -9275,7 +9295,130 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
     for wo_id in stop_ids:
         cancel(wo_id)
     return {"project": name, "fo_id": fo_id, "title": fo["title"],
-            "status": "cancelled", "cancelled_work_orders": stop_ids}
+            "status": status, "cancelled_work_orders": stop_ids}
+
+
+# -- decision orders (docs/superpowers/specs/2026-10-31-decision-orders.md §2)
+
+
+def create_decision_order(project_name: str, title: str, description: str,
+                          budget_usd: float | None = None,
+                          origin: str = "jarvis") -> dict[str, Any]:
+    """`jarvis do create` — the researcher sees only `description`"""
+    paths = registered_project_paths()
+    if project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    if not (title or "").strip():
+        raise OpsError("a decision order needs a title: the question you must decide")
+    if not (description or "").strip():
+        raise OpsError(
+            f"a decision order needs a description: the researcher is a fresh session "
+            f"that sees only it. Say what to find out and what you will decide — "
+            f"`jarvis do create {project_name} \"{title}\" -d \"...\"`.")
+    store = ProjectStore(paths[project_name])
+    try:
+        return store.create_feature_order(title=title, description=description,
+                                          origin=origin, kind="decision",
+                                          budget_usd=budget_usd)
+    finally:
+        store.close()
+
+
+def list_decision_orders(project_name: str | None = None,
+                         include_settled: bool = False) -> list[dict[str, Any]]:
+    """`jarvis do list`"""
+    return list_feature_orders(project_name, include_settled=include_settled,
+                               kind="decision")
+
+
+def decision_report(fo: Mapping[str, Any]) -> dict[str, Any]:
+    """The stored report off one row, `{}` before one is submitted"""
+    report = db.from_json(fo.get("plan"), None) or {}
+    return report if isinstance(report, dict) else {}
+
+
+def show_decision_order(do_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do show` — the row, its researcher and the report as stored"""
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", show_verb(fo.get("kind")))
+    store = ProjectStore(path)
+    try:
+        researcher = None
+        if fo.get("plan_wo_id"):
+            try:
+                row = store.get_work_order(fo["plan_wo_id"])
+                researcher = {k: row[k] for k in ("id", "status", "result_summary")}
+            except KeyError:
+                researcher = None  # deleted out from under it; the link was released
+    finally:
+        store.close()
+    return {"project": name, **fo, "researcher": researcher,
+            "report": decision_report(fo),
+            "status_label": feature_status_label("decision", fo["status"])}
+
+
+#: On the researcher's timeline: the user settled the decision order (§1.3)
+DECISION_CLOSED_EVENT = "decision_closed_by_user"
+
+
+def _user_closes_decision(do_id: str, status: str, note: str,
+                          project_name: str | None) -> dict[str, Any]:
+    """The ONE path to a decision order's terminal status: the user's verb (§2)"""
+    verb = "done" if status == "completed" else "cancel"
+    if os.environ.get("JARVIS_WO_ID"):
+        raise OpsError(
+            f"refusing `jarvis do {verb} {do_id}` from inside a work-order session "
+            f"({os.environ['JARVIS_WO_ID']}): closing a decision order is the user's "
+            f"verb, never an agent's. Tell the user it is ready — they run "
+            f"`jarvis do {verb} {do_id}`.")
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", f"jarvis fo {'cancel' if verb == 'cancel' else 'show'}")
+    if (status == "completed" and fo["status"] in ("pending", "planning")
+            and not decision_report(fo)):
+        raise OpsError(
+            f"{do_id} is {feature_status_label('decision', fo['status'])} and has no "
+            f"report yet, so there is nothing to decide on. To stop it instead, run "
+            f"`jarvis do cancel {do_id}`.")
+    # The one site in src/ that passes the user's keyword — tests/test_decision_orders.py pins it
+    out = _stop_family(name, path, fo, status=status, decided_by_user=True,
+                       trigger=DECISION_CLOSED_EVENT)
+    # `wo_events` keys on a work order: with no researcher, the span's trigger is the record
+    if fo.get("plan_wo_id"):
+        store = ProjectStore(path)
+        try:
+            store.add_event(fo["plan_wo_id"], DECISION_CLOSED_EVENT,
+                            {"do_id": do_id, "status": status, "note": note})
+        finally:
+            store.close()
+    return {**out, "note": note,
+            "status_label": feature_status_label("decision", status)}
+
+
+def complete_decision_order(do_id: str, note: str = "",
+                            project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do done` — the user has decided"""
+    return _user_closes_decision(do_id, "completed", note, project_name)
+
+
+def cancel_decision_order(do_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do cancel`"""
+    return _user_closes_decision(do_id, "cancelled", "", project_name)
+
+
+def decision_order_budget(do_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do budget`, read-only"""
+    _, _, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", "jarvis fo budget")
+    return feature_order_budget(do_id, project_name)
+
+
+def set_decision_budget(do_id: str, amount: float | None,
+                        project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do budget <amount>`"""
+    _, _, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", "jarvis fo budget")
+    return set_feature_budget(do_id, amount, project_name)
 
 
 OFFBOARDED_EVENT = "offboarded"
@@ -9301,8 +9444,10 @@ def quiesce_project(name: str, apply: bool = False,
                            "backlog_dropped": 0, "inbox_acked": 0, "reason": reason}
     if not apply:
         return out
+    # A decision order through the user's own verb: offboarding is the user's call
     cancellers = {"improvement": cancel_improvement_order,
-                  "investigation": cancel_investigation_order}
+                  "investigation": cancel_investigation_order,
+                  "decision": cancel_decision_order}
     store = ProjectStore(paths[name])
     try:
         # Work orders first: a feature's manager and children stopped before the feature cannot re-dispatch
@@ -9381,7 +9526,7 @@ def resume_feature_order(fo_id: str, fix: str = "",
 
     name, path, fo = find_feature_order(fo_id, project_name)
     # An improvement order has no children to revive — §2.4 of the improvement-orders spec
-    _require_kind(fo, "feature", "jarvis io show")
+    _require_kind(fo, "feature", show_verb(fo.get("kind")))
     if fo["status"] != "failed":
         raise OpsError(
             f"{fo_id} is {fo['status']}, not failed — `fo resume` revives a feature a "
