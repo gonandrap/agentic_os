@@ -307,6 +307,10 @@ def test_every_source_gets_the_lever_that_can_actually_unwire_it(monkeypatch, tm
     (tmp_path / "skills" / "mine").mkdir(parents=True)
     (tmp_path / "skills" / "mine" / "SKILL.md").write_text(
         "---\nname: mine\ndescription: a skill of my own\n---\nbody")
+    synced = tmp_path / "skills" / "synced" / "org_user"
+    synced.mkdir(parents=True)
+    (synced / "manifest.json").write_text(json.dumps(
+        {"skills": [{"skillId": "docx", "name": "docx", "description": "Word files"}]}))
     monkeypatch.setattr(wiring, "claude_home", lambda: tmp_path)
     monkeypatch.setattr(wiring, "read_plugins", lambda **k: [
         {"id": SERENA, "enabled": True, "scope": "user", "installPath": str(tmp_path)},
@@ -323,6 +327,9 @@ def test_every_source_gets_the_lever_that_can_actually_unwire_it(monkeypatch, tm
     assert levers["plugin:serena:serena"] == f"{wiring.LEVER_PLUGIN}{SERENA}"
     assert levers["hand-added"] == ""
     assert levers["mine"] == f"{wiring.LEVER_SKILL}mine"
+    # claude.ai synced skills: skillOverrides takes the qualified name (probed on 2.1.316)
+    assert levers["anthropic-skills:docx"] == f"{wiring.LEVER_SKILL}anthropic-skills:docx"
+    assert "synced" not in levers
     assert levers["Claude Code's bundled skills"] == wiring.LEVER_BUNDLED
     # A plugin the USER has turned off is not Jarvis's to list as wired
     assert "off@m" not in levers
