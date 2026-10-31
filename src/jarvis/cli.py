@@ -1364,6 +1364,16 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--clear", action="store_true", help="remove the ceiling")
     d.add_argument("--project")
 
+    d = dec.add_parser("follow-up", help="file the report's proposed orders; the decision "
+                                         "order stays open until `jarvis do done`")
+    d.add_argument("do_id")
+    d.add_argument("keys", nargs="*", help="proposal keys from `jarvis do show`")
+    d.add_argument("--all", action="store_true", help="every proposal not filed yet")
+    d.add_argument("--as", dest="as_", choices=["wo", "fo", "backlog"],
+                   help="file as this instead of each proposal's own `as`")
+    d.add_argument("--again", action="store_true", help="file a proposal already filed")
+    d.add_argument("--project")
+
     for d in dec.choices.values():
         d.add_argument("--json", action="store_true", help="machine-readable output")
 
@@ -3713,6 +3723,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
         # WHAT A FIX ORDER CARRIES (§7.1)
         if (evolution := ops.self_evolution_state(wo)):
             detail["self_evolution"] = evolution
+        if (origin_do := ops.decision_origin(wo)):
+            detail["origin_do"] = origin_do
         _print(_readable_spec(_readable_config(_readable_review(_readable_autoreview(
             _readable_automerge(_readable_harvest(_readable_alarms(
                 _readable_time_in_state(_readable_rounds(_readable_issues(
@@ -4422,6 +4434,12 @@ def cmd_do(args: argparse.Namespace) -> int:
                         print(f"{key.replace('_', ' ')}: "
                               + ", ".join(f"{i.get('key')} {i.get('title') or ''}".strip()
                                           for i in items))
+            for f in detail["followups"]:
+                print(f"filed: {f['key']} as {f['as']} {f['id']} ({_age(f['at'])})")
+
+    elif args.do_cmd == "follow-up":
+        _print(ops.file_decision_followups(args.do_id, args.keys, args.as_, args.project,
+                                           all_=args.all, again=args.again), args.json)
 
     elif args.do_cmd == "done":
         _print(ops.complete_decision_order(args.do_id, note=args.note,
