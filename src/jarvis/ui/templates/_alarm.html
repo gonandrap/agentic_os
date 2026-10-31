@@ -14,6 +14,7 @@
    single work order that is merely where the finding was filed. §1 of
    docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. #}
 {% macro subject_link(a) -%}
+{%- if a.fleet_wide %}<span title="about the whole fleet; this order only carries the record">fleet-wide · filed on</span> {% endif -%}
 <a href="/{{ 'fo' if a.subject_kind == 'feature_order' else 'wo' }}/{{ a.project }}/{{ a.subject_id }}"
    class="mono">{{ a.subject_id }}</a>
 {%- endmacro %}

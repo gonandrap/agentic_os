@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from contextlib import contextmanager
@@ -2937,6 +2938,18 @@ def check_pull_request_recorded(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+def _session_kept_ask(refusal: str) -> str:
+    """What the user must do, when the CLI says only a person can (wo-b6e2ddda, Neo Q2675)"""
+    lines = [ln.strip() for ln in refusal.splitlines() if ln.strip()]
+    found = re.search(r"worktree is still at “([^”]+)”", refusal)
+    if found and ("remove it by hand" in refusal or "remove the directory yourself" in refusal):
+        # Never automated: git dropped its registration, so nothing can vet it for unsaved work
+        return (f" — YOURS TO DECIDE: if nothing in it is needed, `rm -rf {found[1]}` "
+                f"(the order's branches stay in the repository), and the next poll "
+                f"removes the session")
+    return f" — the CLI says: {lines[-1][:300]}" if len(lines) > 1 else ""
+
+
 def check_closed_session_removed(store: ProjectStore) -> Iterator[Violation]:
     """INV-SESSION-KEPT — a closed order's background session must not outlive it (#1257)"""
     for wo in store.closed_background_sessions():
@@ -2949,7 +2962,7 @@ def check_closed_session_removed(store: ProjectStore) -> Iterator[Violation]:
             wo_id=wo["id"],
             detail=(f"{wo['status']}, and `claude rm {wo['bg_id']}` has been refusing to "
                     f"take its session since {_stamp(float(kept['ts']))}: "
-                    f"{' '.join(refusal.split())[:200]}"),
+                    f"{' '.join(refusal.split())[:200]}{_session_kept_ask(refusal)}"),
             repaired=False,
             context={"bg_id": wo["bg_id"], "refusal": refusal[:500]},
         )
