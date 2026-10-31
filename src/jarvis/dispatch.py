@@ -957,7 +957,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"printed it, and keep it over {verdicts.MIN_QUOTE_CHARS} characters, which the "
         f"validator enforces — under that it is a fragment nobody can find again.",
         "",
-        "# The four classifications",
+        "# The five classifications",
         "A classification is a decision about THE SUBJECT, not about the codebase in "
         "general. Exactly one:",
         # kn-4fb740a9: a stuck subject is the common case, never the test
@@ -976,8 +976,13 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "classification.",
         "- **ALREADY_TRACKED** — the cause is already on the tracker or already has a live "
         "order. Put the issue (`#790` or its URL) or the order id in `duplicate_of`.",
+        "- **SCRIPT_WRONG** — ONLY when Morpheus opened this investigation on a failed "
+        "production validation, and the PR behaves as its hints describe but the "
+        "validation SCRIPT checks the wrong thing. Say in `script_fix` what the script got "
+        "wrong and what the right check is: the OS sends the item back to Morpheus with it "
+        "as the brief for a new script, once per item.",
         "",
-        "# Name the gap class — required on all four",
+        "# Name the gap class — required on all five",
         gaps.render_registry(),
         "",
         "",
@@ -1022,13 +1027,14 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "  },",
         '  "user_owes": "…",          // WAITING_ON_USER only, naming an id',
         '  "unsticks": {"what": "…", "when": "…"},   // TRANSIENT only',
-        '  "duplicate_of": "#790"     // ALREADY_TRACKED only',
+        '  "duplicate_of": "#790",    // ALREADY_TRACKED only',
+        '  "script_fix": "…"          // SCRIPT_WRONG only: what it got wrong, the right check',
         "}",
         "```",
         "",
         "`subject`, `classification`, `gap_class`, `root_cause` and at least one "
         "`evidence` entry are "
-        "required for all four. CARRY ONLY YOUR CLASSIFICATION'S FIELD: the validator "
+        "required for all five. CARRY ONLY YOUR CLASSIFICATION'S FIELD: the validator "
         "refuses a GAP with no `proposed_fix`, and a TRANSIENT that also says the user "
         "owes something. It names every problem at once, so one revision fixes all of "
         "them. Comments are not JSON — the `//` notes above are for you, not for the file.",

@@ -685,6 +685,73 @@ def _submitted(started, store, classification: str, **over):
     return inv["id"], investigator, out
 
 
+def _failed_item(script_rewrites: int = 0) -> str:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        item = central.add_morpheus_item(
+            project="proj_a", repo="o/r", pr_number=1360, pr_url="https://x/pull/1360",
+            pr_title="t", wo_id="wo-1", release_tag="", hints="h", script="exit 1",
+            script_source="agent", state="failed", deadline_ts=db.now() + 60)
+        central.update_morpheus_item(item["id"], action="inv:x", last_exit=1)
+        for _ in range(script_rewrites):
+            central.claim_morpheus_script_rewrite(item["id"], script_rewrites)
+        return item["id"]
+    finally:
+        central.close()
+
+
+def _script_wrong(store, item_id: str):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY, morpheus_item=item_id)
+    _investigating(store, inv)
+    return inv["id"], ops.submit_verdict(inv["id"], a_verdict("SCRIPT_WRONG", subject=subject))
+
+
+def test_script_wrong_sends_the_script_back_to_morpheus(started, store):
+    """#1374: the investigation route reaches morpheus.rewrite, its reading as the brief"""
+    from jarvis.central_store import CentralStore
+
+    item_id = _failed_item()
+    inv_id, out = _script_wrong(store, item_id)
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id)
+    finally:
+        central.close()
+    assert (item["state"], item["script"], item["script_rewrites"]) == ("queued", "", 1)
+    assert "is producing it" in item["rewrite_brief"] and inv_id in item["rewrite_brief"]
+    row = store.get_feature_order(inv_id)
+    assert row["status"] == "completed" and not row["needs_attention"]
+    assert "sent back to Morpheus" in json.loads(row["plan"])["rewrite"]
+
+
+def test_script_wrong_past_its_cap_asks_the_user(started, store):
+    from jarvis.central_store import CentralStore
+
+    item_id = _failed_item(script_rewrites=1)
+    inv_id, _ = _script_wrong(store, item_id)
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id)
+    finally:
+        central.close()
+    assert (item["state"], item["script"]) == ("failed", "exit 1")
+    row = store.get_feature_order(inv_id)
+    assert row["needs_attention"]
+    assert f"jarvis morpheus rewrite {item_id}" in json.loads(row["plan"])["rewrite"]
+
+
+def test_script_wrong_is_refused_off_a_morpheus_item(started, store):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+    with pytest.raises(ops.OpsError, match="SCRIPT_WRONG is only for"):
+        ops.submit_verdict(inv["id"], a_verdict("SCRIPT_WRONG", subject=subject))
+    assert store.get_feature_order(inv["id"])["status"] == "planning"
+
+
 def test_a_gap_is_filed_by_ops_as_an_unexpedited_bug(started, store):
     inv_id, investigator, out = _submitted(started, store, "GAP")
     assert out["classification"] == "GAP"
