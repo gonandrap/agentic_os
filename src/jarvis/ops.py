@@ -8142,6 +8142,22 @@ def investigation_fix_order(inv_id: str) -> str:
     return str(wo["id"]) if wo else ""
 
 
+def _script_wrong_rewrite(item_id: str, inv_id: str,
+                          verdict: Mapping[str, Any]) -> tuple[bool, str]:
+    """Settle a SCRIPT_WRONG verdict through `morpheus.rewrite` (#1374); False = user owes it"""
+    from . import morpheus
+
+    brief = f"{verdict['script_fix']}\n\nInvestigation {inv_id}: {verdict['root_cause']}"
+    central = CentralStore()
+    try:
+        return morpheus.rewrite_from_investigation(
+            central, _morpheus_catalog().os.morpheus, item_id, inv_id, brief)
+    except KeyError:
+        return True, f"nothing sent back: {item_id} no longer exists"
+    finally:
+        central.close()
+
+
 def investigation_chain(name: str, path: Path, fo: Mapping[str, Any]) -> dict[str, Any]:
     """validation -> investigation -> issue -> fix order -> production -> re-validation (#1344)"""
     from . import morpheus
@@ -8535,6 +8551,13 @@ def submit_verdict(inv_id: str, doc: Any,
             f"resubmit:\n  - " + "\n  - ".join(e.problems)
         ) from e
 
+    morpheus_item_id = str(metadata.get(MORPHEUS_ITEM_KEY) or "")
+    if verdict["classification"] == "SCRIPT_WRONG" and not morpheus_item_id:
+        raise OpsError(
+            f"the verdict was not accepted, and nothing was stored: SCRIPT_WRONG is only for "
+            f"an investigation Morpheus opened on a failed production validation, and "
+            f"{inv_id} was not. Pick one of the other four classifications and resubmit.")
+
     verdict["classified_by"] = "investigator"
     verdict["filed"] = None
     filing_error = ""
@@ -8561,8 +8584,7 @@ def submit_verdict(inv_id: str, doc: Any,
                     project=name, wo_id=fo.get("plan_wo_id") or "",
                     # Neo agreeing plus the steward starts it, through the triage question (#1344)
                     expedite=False, investigation={
-                        "investigation": inv_id,
-                        "morpheus_item": str(metadata.get(MORPHEUS_ITEM_KEY) or "")})
+                        "investigation": inv_id, "morpheus_item": morpheus_item_id})
             except Exception as e:  # noqa: BLE001 — same case, one step later
                 filing_error = f"the bug could not be filed: {e}"
             else:
@@ -8578,13 +8600,18 @@ def submit_verdict(inv_id: str, doc: Any,
     if filing_error:
         return _verdict_filing_failed(name, path, fo, inv_id, verdict, filing_error)
 
+    escalate = verdict["classification"] == "WAITING_ON_USER"
+    if verdict["classification"] == "SCRIPT_WRONG":
+        settled, verdict["rewrite"] = _script_wrong_rewrite(morpheus_item_id, inv_id, verdict)
+        escalate = not settled
+
     classification = verdict["classification"]
     store = ProjectStore(path)
     try:
         store.update_feature_order(inv_id, plan=db.to_json(verdict))
         store.set_feature_status(inv_id, "completed")
         # THE ONE CLASSIFICATION THAT SPENDS ATTENTION
-        if classification == "WAITING_ON_USER":
+        if escalate:
             store.flag_feature_attention(inv_id,
                                          verdicts.settle_headline(inv_id, verdict))
         else:

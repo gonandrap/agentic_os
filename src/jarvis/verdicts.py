@@ -12,8 +12,8 @@ from . import findings, gaps
 if TYPE_CHECKING:  # pragma: no cover
     from .project_store import ProjectStore
 
-#: The four decisions an investigation can reach about its subject
-CLASSIFICATIONS = ("GAP", "WAITING_ON_USER", "TRANSIENT", "ALREADY_TRACKED")
+#: The five decisions an investigation can reach; SCRIPT_WRONG only on a Morpheus item (#1374)
+CLASSIFICATIONS = ("GAP", "WAITING_ON_USER", "TRANSIENT", "ALREADY_TRACKED", "SCRIPT_WRONG")
 
 #: Shared with `findings`, never re-declared: two floors for one rule drift
 MIN_QUOTE_CHARS = findings.MIN_QUOTE_CHARS
@@ -30,6 +30,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "WAITING_ON_USER": ("user_owes",),
     "TRANSIENT": ("unsticks",),
     "ALREADY_TRACKED": ("duplicate_of",),
+    "SCRIPT_WRONG": ("script_fix",),
 }
 
 #: Forbidden per classification — the other half of the same rule
@@ -38,6 +39,7 @@ FORBIDDEN_FIELDS: dict[str, tuple[str, ...]] = {
     "WAITING_ON_USER": ("proposed_fix", "unsticks"),
     "TRANSIENT": ("proposed_fix", "user_owes"),
     "ALREADY_TRACKED": ("proposed_fix",),
+    "SCRIPT_WRONG": ("proposed_fix", "user_owes", "unsticks", "duplicate_of"),
 }
 
 #: Every field of a `proposed_fix`
@@ -159,6 +161,15 @@ def _payload(classification: str, raw: dict[str, Any],
                     f"link the user can follow"
                 )
             out["duplicate_of"] = ref
+        elif name == "script_fix":
+            value = str(value or "").strip()
+            if len(value) < MIN_FIELD_CHARS:
+                problems.append(
+                    f"a SCRIPT_WRONG verdict must carry `script_fix`, at least "
+                    f"{MIN_FIELD_CHARS} characters: what the validation script got wrong "
+                    f"and the right check — it is Morpheus's brief for the new script"
+                )
+            out[name] = value
         else:
             value = str(value or "").strip()
             if not value:
@@ -255,9 +266,11 @@ def verdict_landed(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 
 def settle_headline(inv_id: str, verdict: dict[str, Any]) -> str:
-    """The attention line a WAITING_ON_USER verdict raises — §2.5, step 6"""
+    """The attention line a WAITING_ON_USER verdict, or a SCRIPT_WRONG past its cap, raises"""
+    owes = verdict.get("user_owes") or (
+        f"its validation script is wrong and {verdict.get('rewrite', '')}")
     return (f"{inv_id}: {verdict.get('subject', '')} is waiting on you — "
-            f"{verdict.get('user_owes', '')} (`jarvis investigate show {inv_id}`)")
+            f"{owes} (`jarvis investigate show {inv_id}`)")
 
 
 def render_verdict(verdict: dict[str, Any]) -> list[str]:
@@ -280,6 +293,10 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
     if unsticks:
         lines.append(f"  unsticks: {unsticks.get('what', '')} "
                      f"({unsticks.get('when', '')})")
+    if verdict.get("script_fix"):
+        lines.append(f"  script fix: {verdict['script_fix']}")
+    if verdict.get("rewrite"):
+        lines.append(f"    {verdict['rewrite']}")
     if verdict.get("duplicate_of"):
         lines.append(f"  duplicate of: {verdict['duplicate_of']}")
     fix = verdict.get("proposed_fix") or {}

@@ -2823,6 +2823,9 @@ def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
                            "when": "next reconcile tick, within two minutes"}
     elif classification == "ALREADY_TRACKED":
         doc["duplicate_of"] = "#790"
+    elif classification == "SCRIPT_WRONG":
+        doc["script_fix"] = ("the substring 'is producing it' also matches 'no work order is "
+                             "producing it yet'; key on the fix order id instead")
     doc.update(overrides)
     return doc
 
