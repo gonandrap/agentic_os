@@ -732,6 +732,8 @@ class BugsConfig:
     """How the tracker is labelled while the OS works on a bug it filed"""
 
     label: str = DEFAULT_BUGS_LABEL
+    #: `owner/name` of the project's issue tracker; empty means its git `origin`
+    repo: str = ""
 
 
 #: How far back `Daemon.refile_dropped_fixes` looks
@@ -1874,7 +1876,12 @@ def _parse_bugs(raw: Any, base: BugsConfig | None = None,
     if not LABEL_RE.match(label):
         raise _err(f"{where}.label must start with a letter or digit and use only "
                    f"letters, digits, spaces and ._:/- (got {label!r})")
-    return BugsConfig(label=label)
+    from .issues import REPO_RE
+    repo = str(raw.get("repo", base.repo) or "").strip()
+    if repo and not REPO_RE.match(repo):
+        raise _err(f"{where}.repo must be `owner/name`, or empty for the git origin "
+                   f"(got {repo!r})")
+    return BugsConfig(label=label, repo=repo)
 
 
 def _parse_release(raw: Any, base: ReleaseConfig | None = None,

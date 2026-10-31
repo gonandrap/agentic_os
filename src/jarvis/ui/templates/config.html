@@ -170,25 +170,7 @@
         <td class="mono">{{ k.label }}{% if k.safety %}
           <span class="tone-warn" title="a safety setting — it changes what a worker is
                 allowed to do, so a reason is required">⚠</span>{% endif %}</td>
-        <td>
-          <form method="post" action="/config/set" class="cfg-edit">
-            <input type="hidden" name="path" value="{{ k.path }}">
-            <input type="hidden" name="back" value="{{ here }}">
-            {% if k.widget == 'bool' %}
-            <span class="cfg-val">{{ k.value|tojson }}</span>
-            <input type="hidden" name="value" value="{{ 'false' if k.value else 'true' }}">
-            {% elif k.widget == 'json' %}
-            <textarea class="val mono" name="value" rows="2">{{ k.text }}</textarea>
-            {% elif k.widget == 'number' %}
-            <input class="val" type="number" step="any" name="value" value="{{ k.text }}">
-            {% else %}
-            <input class="val" type="text" name="value" value="{{ k.text }}">
-            {% endif %}
-            <input class="reason" type="text" name="reason"
-                   placeholder="{{ 'reason — required' if k.safety else 'reason — optional' }}">
-            <button>{{ ('turn off' if k.value else 'turn on') if k.widget == 'bool' else 'Save' }}</button>
-          </form>
-        </td>
+        <td>{% include "_cfg_edit.html" %}</td>
         <td class="sub">
           {%- if k.version %}set by <a href="#{{ k.version }}" class="mono">{{ k.version }}</a>
           {%- elif k.written %}set in the catalog file, by no recorded version

@@ -514,6 +514,8 @@ LINES: dict[str, str] = {
     "inspect.enabled": "Whether the OS raises a turn still running past its thresholds.",
     "observability.level": "How much debug data each order keeps: off, normal or full.",
     "bugs.label": "The tracker label that says the OS picked an issue up.",
+    "bugs.repo": "The GitHub repository (owner/name) this project's issues live on; "
+                 "empty means its git origin.",
     "wiring.bundled_skills": "Whether the skills Claude Code itself ships reach workers.",
     "wiring.claude_ai_connectors": "Whether your claude.ai connectors reach workers.",
     "wiring.chrome": "Whether Claude in Chrome browser automation reaches workers.",

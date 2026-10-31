@@ -332,3 +332,34 @@ def test_the_long_parts_are_disclosures_and_nothing_is_behind_a_tab(client):
     # `.tabbed` is the container the shared script hides panels inside
     assert 'class="tabbed' not in page and 'class="tabpanel' not in page
     assert "the whole document, as it was written" in page
+
+
+# -- the project contract page: the config, grouped as the onboarding interview asks it
+
+def test_the_contract_page_groups_a_project_s_settings_by_area(client):
+    page = client.get("/project/proj_a/contract")
+    assert page.status_code == 200
+    assert 'id="area-delivery"' in page.text and 'id="area-model"' in page.text
+    delivery = page.text.partition('id="area-delivery"')[2].partition("<h3")[0]
+    assert "bugs.repo" in delivery and "bugs.label" in delivery
+
+
+def test_the_issue_tracker_is_changed_from_the_contract_page(client):
+    back = "/project/proj_a/contract"
+    r = client.post("/config/set", data={"path": "projects.proj_a.bugs.repo",
+                                         "value": "acme/tracker", "back": back})
+    assert r.headers["location"] == back
+    assert ops.config_show()["resolved"]["projects.proj_a.bugs.repo"] == "acme/tracker"
+
+    r = client.post("/config/set", data={"path": "projects.proj_a.bugs.repo",
+                                         "value": "not a repo", "back": back})
+    assert r.headers["location"].startswith(f"{back}?error=")
+
+
+def test_an_unknown_project_s_contract_is_a_404(client):
+    assert client.get("/project/nope/contract").status_code == 404
+
+
+def test_bugs_repo_overrides_the_origin_as_the_project_s_tracker(tmp_path):
+    assert ops.follow_up_repo(tmp_path, "acme/tracker") == "acme/tracker"
+    assert ops.follow_up_repo(tmp_path) == ""   # no git origin, no override

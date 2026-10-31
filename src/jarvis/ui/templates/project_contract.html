@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}contract — {{ project }} — Jarvis{% endblock %}
+
+{% block head %}
+<style>
+  .cfg-table { table-layout: fixed; }
+  .cfg-table td, .cfg-table th { overflow-wrap: anywhere; padding: 7px 12px; }
+  @media (max-width: 600px) {
+    .cfg-table, .cfg-table tbody, .cfg-table tr, .cfg-table td { display: block;
+                                                                  width: auto !important; }
+    .cfg-table tr:has(th) { display: none; }
+    .cfg-table tr { border-bottom: 1px solid var(--line); }
+  }
+  .cfg-edit { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .cfg-edit .val { flex: 1 1 11ch; min-width: 9ch; font-family: var(--mono); font-size: 12.5px; }
+  .cfg-edit textarea.val { min-height: 3.4em; resize: vertical; flex-basis: 100%; }
+  .cfg-edit .reason { flex: 1 1 12ch; min-width: 10ch; font-size: 12.5px; }
+  .cfg-edit button { flex: none; white-space: nowrap; }
+  .cfg-val { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); }
+  .contract-area { overflow: hidden; margin-bottom: 14px; }
+</style>
+{% endblock %}
+
+{% block content %}
+{# The onboarding interview's areas (onboard_knobs.AREA_KEYS), each setting saved through /config/set #}
+<h2><a href="/project/{{ project }}">{{ project }}</a> / contract</h2>
+<div class="jumps">
+  <a href="/project/{{ project }}">the project</a>
+  <a href="/project/{{ project }}/prompt#operation">OPERATION.md</a>
+  <a href="/config?scope={{ ('projects.' ~ project)|urlencode }}#cfg-history">history</a>
+</div>
+<p class="sub">What this project was onboarded with, grouped as the onboarding interview
+  asks it. Each save is <code>jarvis config set</code>, recorded as a version.
+  <span class="tone-warn">⚠</span> marks a safety setting: it needs a reason.</p>
+<div class="jumps">
+  {% for a in areas %}<a href="#area-{{ a.key }}">{{ a.title }}</a>{% endfor %}
+</div>
+
+{% for a in areas %}
+<h3 id="area-{{ a.key }}">{{ a.title }}</h3>
+<div class="panel contract-area">
+  <table class="cfg-table">
+    <tr><th style="width:34%">setting</th><th style="width:66%">value</th></tr>
+    {% for k in a.rows %}
+    <tr>
+      <td><span class="mono">{{ k.label }}</span>{% if k.safety %}
+        <span class="tone-warn" title="a safety setting — a reason is required">⚠</span>{% endif %}
+        {% if k.line %}<div class="sub">{{ k.line }}</div>{% endif %}</td>
+      <td>{% include "_cfg_edit.html" %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endfor %}
+{% endblock %}
