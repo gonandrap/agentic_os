@@ -16,7 +16,7 @@ from typing import Any, Callable
 from .catalog import Catalog
 from .central_store import CentralStore
 from .paths import logs_dir
-from .project_store import ProjectStore
+from .project_store import ProjectStore, is_feature_order_id, order_path
 
 LEVEL_EMOJI = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}
 
@@ -58,13 +58,20 @@ def check_wo_link(central: CentralStore, catalog: Catalog, project: str,
     path = paths[project]
     if not path.is_dir():
         return None, f"project {project!r} has no directory at {path}"
+    # A decision order's notification names the order itself (decision-orders spec §7)
+    is_fo = is_feature_order_id(wo_id)
     store = ProjectStore(path)
     try:
-        store.get_work_order(wo_id)
+        if is_fo:
+            store.get_feature_order(wo_id)
+        else:
+            store.get_work_order(wo_id)
     except KeyError:
-        return None, f"work order {wo_id} does not exist in {project!r}"
+        return None, f"{'order' if is_fo else 'work order'} {wo_id} does not exist in {project!r}"
     finally:
         store.close()
+    if is_fo:
+        return ui_base_url(catalog) + urllib.parse.quote(order_path(project, wo_id)), ""
     return wo_url(catalog, project, wo_id), ""
 
 

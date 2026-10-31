@@ -63,6 +63,8 @@ jarvis io ask-neo <id>                     # put findings awaiting you (back) to
 jarvis io cancel <id>                      # filed orders from accepted findings stay
 jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settles itself; a GAP files an issue, dispatches nothing
 jarvis investigate list / show <inv-id> / cancel <inv-id>
+jarvis do create <project> "title" -d "<the decision; what data settles it>"  # "do" = decision order: data for YOUR call; never self-closes
+jarvis do show|send|follow-up|done|cancel <id>
 jarvis morpheus status / show|waive|requeue <mv-id> / pause|unpause|follow-fleet   # PRs validated in prod; own brake
 jarvis backlog promote <id> --as feature   # intake -> feature order
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
@@ -119,6 +121,9 @@ Rules that cost the user if forgotten:
   typed only with `os.autonomy.self_dispatch: true` (default off; `jarvis config show`
   says what this fleet runs); releases go out via the user's shipit. Never close a
   picked-up issue by hand.
+- An ask whose deliverable is information for the user's own decision ("find out…",
+  "compare…", "gather data so I can decide") goes to `jarvis do create`, never
+  `jarvis wo create`. Only the user's `jarvis do done|cancel` closes it.
 - When the user reverses an earlier ruling, retract the old one (`neo retract` /
   `learn retract`) so both do not stay in every prompt.
 

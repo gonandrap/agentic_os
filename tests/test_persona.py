@@ -129,15 +129,32 @@ def test_investigation_order_block_is_shorter_than_the_improvement_order_block(
         persona: str) -> None:
     io_at = persona.index("jarvis io create")
     investigate_at = persona.index("jarvis investigate")
-    backlog_at = persona.index("jarvis backlog promote")
+    # The investigate block ENDS where the decision-order block starts
+    do_at = persona.index("jarvis do create")
     io_block = persona[io_at:investigate_at]
-    investigate_block = persona[investigate_at:backlog_at]
+    investigate_block = persona[investigate_at:do_at]
     assert len(investigate_block) < len(io_block), (
         f"investigate block ({len(investigate_block)} chars) must stay shorter than the "
         f"io block ({len(io_block)} chars): evals/llm/test_jarvis_judgment.py loads "
         "CLAUDE.md as a bare system prompt and a longer crib sheet buries the prime "
         "directives"
     )
+
+
+# decision orders: docs/superpowers/specs/2026-10-31-decision-orders.md §7
+def test_decision_order_block_is_shorter_than_the_investigation_order_block(
+        persona: str) -> None:
+    investigate_at = persona.index("jarvis investigate")
+    do_at = persona.index("jarvis do create")
+    morpheus_at = persona.index("jarvis morpheus status")
+    investigate_block = persona[investigate_at:do_at]
+    do_block = persona[do_at:morpheus_at]
+    assert investigate_at < do_at < persona.index(DEV_MODE_HEADING)
+    assert len(do_block) < len(investigate_block), (
+        f"do block ({len(do_block)} chars) must stay shorter than the investigate block "
+        f"({len(investigate_block)} chars): a longer crib sheet buries the prime directives"
+    )
+    assert "jarvis do show|send|follow-up|done|cancel <id>" in do_block
 
 
 def test_investigation_orders_sit_with_the_other_order_types(persona: str) -> None:

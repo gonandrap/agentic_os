@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 KINDS = (
     "work_order",
     "feature_order",
+    "decision",
     "neo_question",
     "alarm",
     "gate",
@@ -82,12 +83,26 @@ def _from_project(store: "ProjectStore", name: str, words: list[str], kinds: set
         from . import ops
         from .project_store import order_path
         for row in store.search_feature_orders(words, limit=limit):
+            # Listed once, under its own kind, when that kind is asked for too
+            if row.get("kind") == "decision" and "decision" in kinds:
+                continue
             out.append(_hit("feature_order", id=row["id"], project=name,
                             title=row["title"], status=row["status"],
                             ts=row["created_at"], score=row["_score"],
                             body=row["description"], words=words,
                             url=order_path(name, row["id"]),
                             ref=f"{ops.show_verb(row.get('kind'))} {row['id']}"))
+    if "decision" in kinds:
+        from . import ops
+        from .project_store import order_path
+        for row in store.search_feature_orders(words, limit=limit, kind="decision"):
+            report = ops.decision_report(row)
+            out.append(_hit("decision", id=row["id"], project=name,
+                            title=row["title"], status=row["status"],
+                            ts=row["created_at"], score=row["_score"],
+                            body=report.get("summary") or row["description"],
+                            words=words, url=order_path(name, row["id"]),
+                            ref=f"jarvis do show {row['id']}"))
     if "alarm" in kinds:
         for row in store.search_alarms(words, limit=limit):
             out.append(_hit("alarm", id=row["id"], project=name,
@@ -129,7 +144,7 @@ def search(query: str, *, project: str | None = None,
                 - set(ops.registered_project_paths()))
 
     hits: list[dict[str, Any]] = []
-    if wanted & {"work_order", "feature_order", "alarm", "gate"}:
+    if wanted & {"work_order", "feature_order", "decision", "alarm", "gate"}:
         for name, path in _project_paths(project).items():
             if not path.is_dir():
                 continue

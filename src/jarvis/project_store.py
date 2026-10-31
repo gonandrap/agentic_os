@@ -1877,15 +1877,20 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
-    def search_feature_orders(self, words: Sequence[str],
-                              limit: int = 50) -> list[dict[str, Any]]:
-        expr, params = db.score_sql(words, {
-            "id": 3, "title": 3, "description": 1, "attention_reason": 1,
-        })
+    def search_feature_orders(self, words: Sequence[str], limit: int = 50,
+                              kind: str | None = None) -> list[dict[str, Any]]:
+        weights = {"id": 3, "title": 3, "description": 1, "attention_reason": 1}
+        if kind == "decision":
+            # The report's answer is what a decision is found again by (decision-orders spec §7)
+            for field in ("$.summary", "$.recommendation.why"):
+                weights[f"(CASE WHEN json_valid(plan) THEN "
+                        f"json_extract(plan, '{field}') END)"] = 1
+        expr, params = db.score_sql(words, weights)
+        where, extra = ("AND kind = ? ", (kind,)) if kind else ("", ())
         rows = self.conn.execute(
             f"SELECT *, {expr} AS _score FROM feature_orders "
-            "WHERE _score > 0 ORDER BY _score DESC, created_at DESC LIMIT ?",
-            (*params, limit),
+            f"WHERE _score > 0 {where}ORDER BY _score DESC, created_at DESC LIMIT ?",
+            (*params, *extra, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
 
@@ -2479,8 +2484,9 @@ class ProjectStore:
                                         trigger=DECISION_DELIVERED_EVENT)
                 self.add_event(delivered[0], DECISION_DELIVERED_EVENT, delivered[1])
             self.flag_feature_attention(do_id, reason)
+            # `wo_id` carries the do- id so the sinks' deep link opens its page (spec §7)
             self.add_notification(title=title, body=body, level="warning",
-                                  source="decision")
+                                  wo_id=do_id, source="decision")
         return True
 
     def last_decision_delivery(self, researcher_id: str) -> dict[str, Any] | None:

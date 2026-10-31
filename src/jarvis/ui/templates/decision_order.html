@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% block title %}{{ do.id }} — Jarvis{% endblock %}
+{% block style %}
+  @media (max-width: 640px) { main .row { flex-wrap: wrap; } main .row > .grow { flex-basis: 100%; } }
+{% endblock %}
+{% block content %}
+{# §7 of docs/superpowers/specs/2026-10-31-decision-orders.md. The report first, then what
+   the user can do with it. Every form posts to a route that calls the same `ops` function
+   as `jarvis do …`; only Done and Cancel ever close the order. #}
+{% set m = fo_status_meta.get(do.status, {'word': do.status, 'icon': '•', 'tone': 'muted'}) %}
+{% set r = do.report or {} %}
+{% set open = do.status not in ('completed', 'cancelled') %}
+
+{{ ui.page_head(do.id ~ " " ~ do.title) }}
+<p class="sub">
+  <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ do.status_label }}</span>
+  · <a href="/project/{{ project }}">{{ project }}</a>
+  · {{ fmt_age(do.created_at) }}
+  · <a href="/cost/{{ project }}/{{ do.id }}">its bill →</a>
+</p>
+
+{% if error %}<div class="panel"><div class="row tone-bad">✗ {{ error }}</div></div>{% endif %}
+{% if note %}<div class="panel"><div class="row tone-ok">✓ {{ note }}</div></div>{% endif %}
+
+{% if do.needs_attention %}
+<div class="panel"><div class="row tone-warn">◭ {{ do.attention_reason }}</div></div>
+{% endif %}
+
+{% call ui.explain("What it was asked") %}
+<div class="panel"><div class="row"><div class="grow" style="white-space: pre-wrap;">{{ do.description }}</div></div></div>
+{% endcall %}
+
+{% if do.researcher %}
+<p class="sub">researcher:
+  {{ ui.row_id(do.researcher.id, order_path(project, do.researcher.id)) }}
+  ({{ do.researcher.status }})
+  {% if do.researcher.result_summary %}— {{ do.researcher.result_summary }}{% endif %}
+</p>
+{% endif %}
+
+{% if r %}
+<h3>Summary</h3>
+<div class="panel"><div class="row"><div class="grow" style="white-space: pre-wrap;">{{ r.summary }}</div></div></div>
+
+<h3>Findings</h3>
+<div class="panel">
+  {% for f in r.findings or [] %}
+  <div class="row">
+    <div class="grow">
+      <strong>{{ f.title }}</strong> <span class="sub mono">{{ f.key }}</span>
+      <div style="white-space: pre-wrap;">{{ f.detail }}</div>
+      {% for e in f.evidence or [] %}<div class="sub mono">{{ e }}</div>{% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{% if r.options %}
+<h3>Options</h3>
+<div class="panel">
+  {% for o in r.options %}
+  <div class="row">
+    <div class="grow">
+      <strong>{{ o.key }} — {{ o.title }}</strong>
+      {% if r.recommendation and r.recommendation.option == o.key %}<span class="tone-ok">recommended</span>{% endif %}
+      {% for p in o.pros or [] %}<div class="sub">+ {{ p }}</div>{% endfor %}
+      {% for c in o.cons or [] %}<div class="sub">− {{ c }}</div>{% endfor %}
+      {% if o.cost %}<div class="sub">cost: {{ o.cost }}</div>{% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<h3>Recommendation</h3>
+<div class="panel"><div class="row"><div class="grow">
+  {% if r.recommendation.option %}<strong>{{ r.recommendation.option }}</strong> — {% endif %}{{ r.recommendation.why }}
+  <div class="sub">the researcher's recommendation; the decision is yours</div>
+</div></div></div>
+
+{% if r.proposed_orders %}
+<h3>Proposed orders</h3>
+<div class="panel">
+  {% for p in r.proposed_orders %}
+  <div class="row">
+    <div class="grow">
+      <strong>{{ p.title }}</strong> <span class="sub mono">{{ p.key }} · {{ p.as }}{% if p.project %} · {{ p.project }}{% endif %}</span>
+      <div class="sub" style="white-space: pre-wrap;">{{ p.description }}</div>
+      {% for mark in p.filed or [] %}
+      <div class="sub">filed as <a href="{{ '/backlog/' ~ mark.id if mark.as == 'backlog' else order_path(p.project or project, mark.id) }}" class="mono">{{ mark.id }}</a></div>
+      {% endfor %}
+    </div>
+    {% if do.status in ('awaiting_decision', 'completed') and not p.filed %}
+    <form class="inline" method="post" action="/do/{{ project }}/{{ do.id }}/follow-up">
+      <input type="hidden" name="key" value="{{ p.key }}">
+      <button>File</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% else %}
+<div class="panel"><div class="empty">
+  no report yet — the researcher is still gathering data
+</div></div>
+{% endif %}
+
+{% if open %}
+<h3>Your decision</h3>
+<div class="panel">
+  <div class="row">
+    <form method="post" action="/do/{{ project }}/{{ do.id }}/done" style="display: flex; gap: 8px; width: 100%;">
+      <textarea name="note" rows="2" placeholder="what you decided (optional)"></textarea>
+      <button>Done</button>
+    </form>
+  </div>
+  <div class="row">
+    <form class="inline" method="post" action="/do/{{ project }}/{{ do.id }}/cancel">
+      <button>Cancel</button>
+    </form>
+    <span class="sub">the order stays open until you press one of these; nothing else closes it</span>
+  </div>
+  {% if do.researcher %}
+  <div class="row">
+    <form method="post" action="/do/{{ project }}/{{ do.id }}/send" style="display: flex; gap: 8px; width: 100%;">
+      <textarea name="content" rows="2" required placeholder="ask the researcher for more"></textarea>
+      <button>Send</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

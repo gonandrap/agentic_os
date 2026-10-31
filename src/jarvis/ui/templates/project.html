@@ -124,6 +124,7 @@
     {{ tab('tab-features', 'Feature orders', features) }}
     {{ tab('tab-improvements', 'Improvement orders', improvements) }}
     {{ tab('tab-investigations', 'Investigations', investigations) }}
+    {{ tab('tab-decisions', 'Decision orders', decisions) }}
   </div>
 
 {# Improvements: "counts, not trees" (§6.1 of the improvement-orders spec); the label is
@@ -169,6 +170,28 @@
 </div>
 {% else %}
 <p class="empty">no open investigations</p>
+{% endif %}
+</div>
+
+{# Decision orders, same rule (§7 of docs/superpowers/specs/2026-10-31-decision-orders.md): the report is on its page. #}
+<div class="tabpanel" id="tab-decisions">
+<h2>Decision orders</h2>
+{% if decisions %}
+<div class="panel">
+  {% for d in decisions %}
+    {% set dm = fo_status_meta.get(d.status, {'word': d.status, 'icon': '•', 'tone': 'muted'}) %}
+    <div class="row">
+      <span class="st tone-{{ dm.tone }}"><span class="i">{{ dm.icon }}</span>{{ d.status_label }}</span>
+      <div class="grow">
+        {{ ui.row_id(d.id, order_path(project_name, d.id)) }} {{ d.title }}
+        {% if d.needs_attention %}<div class="sub tone-warn">◭ {{ d.attention_reason }}</div>{% endif %}
+      </div>
+      <span class="sub mono">{{ fmt_age(d.created_at) }}</span>
+    </div>
+  {% endfor %}
+</div>
+{% else %}
+<p class="empty">no open decision orders</p>
 {% endif %}
 </div>
 

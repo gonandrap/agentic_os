@@ -57,6 +57,9 @@ ROUTING = [
     ("capture-preference", "For future reference: I always prefer squash merges.",
      ["jarvis learn add", "jarvis neo learn"]),
     ("shutdown", "Shut the whole OS down please.", ["jarvis stop"]),
+    # Decision orders (docs/superpowers/specs/2026-10-31-decision-orders.md §7)
+    ("decision-data", "In jarvis_os, gather the cost data so I can decide whether to "
+     "drop the validation panel.", ["jarvis do create jarvis_os"]),
 ]
 
 
