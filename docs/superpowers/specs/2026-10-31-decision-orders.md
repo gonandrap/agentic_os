@@ -79,7 +79,9 @@ a record id, a file:line, a URL. Keys are unique slugs within their list.
 manager-only): `decision_report_submitted` {do_id, sha} (§3), `decision_delivered`
 {do_id, sha, revised: bool} (§5), `decision_followup_filed` {do_id, key, order_id} (§6),
 `decision_closed_by_user` {do_id, status, note} (§2). Each needs a label in
-`timeline._describe` (`kn-3f133363`). `sha` is `sha256` of the stored `plan` text.
+`timeline._describe` (`kn-3f133363`). `sha` is `project_store.decision_report_sha(plan)`
+(§2): sha256 of the report JSON with every `proposed_orders[].filed` key removed and keys
+sorted — so filing a follow-up (§6) never reads as a revised report (§5).
 
 **Commands:** `jarvis do create|list|show|done|cancel|budget` (§2), `jarvis do report`
 (§3), `jarvis do send` (§5), `jarvis do follow-up` (§6).
@@ -122,6 +124,8 @@ per kn-97fc3024's list:
   red: `ui/app.py` `FO_STATUS_META` and `cli.py` `FO_ICON`, and the FO_STATUSES-ordered
   status sort in `ops.py` (~1657). `test_a_validating_feature_order_renders_everywhere_it_appears`
   is the model for a new pinning test.
+* `decision_report_sha(plan: str | dict | None) -> str` — the §1.3 hash, a pure helper
+  beside the constants ("" for an empty plan), so §3, §5 and §6 share one definition.
 * `ops._require_kind`'s phrase table gains `decision` -> "a decision order".
 * `Daemon._FAMILY_RUNNING_STATUS` (daemon.py:~152) gains `"decision": "planning"`, so the
   family-budget pass can escalate a researching order but never touches one in
@@ -282,7 +286,7 @@ Owns the transition to `awaiting_decision`, the notification, the attention line
 **5.1 The delivery pass** `Daemon.deliver_decisions(project, store)` on every reconcile
 tick, positive filter `kind="decision"`, statuses `planning` and `awaiting_decision`:
 
-* Researcher `completed`, `plan` non-empty, and `sha(plan)` differs from the `sha` of the
+* Researcher `completed`, `plan` non-empty, and `decision_report_sha(plan)` differs from the `sha` of the
   latest `decision_delivered` event (none = first delivery): in ONE call set
   `awaiting_decision` (if not already), `flag_feature_attention(do_id, "decision awaiting
   you: " + decision_report.headline(...) + " — jarvis do show <id>")`,
@@ -349,9 +353,8 @@ proposal's description. `metadata[ORIGIN_DO_KEY] = do_id` (new constant beside
 `docs/superpowers/specs/2026-09-23-improvement-orders.md`).
 
 Record what was filed in the stored report: `proposed_orders[i]["filed"] = [{"id",
-"as", "at"}]`, written back with `update_feature_order(plan=…)` — this changes `sha(plan)`,
-so §5.1 must hash the report WITHOUT `filed` keys; `decision_report` (§3) exports
-`content_sha(report)` for that and §5.1 uses it. A key already filed is refused unless
+"as", "at"}]`, written back with `update_feature_order(plan=…)`; `decision_report_sha` ignores `filed`,
+so §5.1 does not re-deliver it as a revision. A key already filed is refused unless
 `--again`. A failed filing reports the error and files nothing further for that key; the
 decision order is untouched either way. Event `decision_followup_filed` per order.
 Allowed in `awaiting_decision` and after `completed` (the user may decide first and file
