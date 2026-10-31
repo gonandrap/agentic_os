@@ -68,7 +68,7 @@ from .invariants import (
     pr_pending_blocker,
     true_blockers,
 )
-from .paths import daemon_pidfile, ensure_home, logs_dir
+from .paths import daemon_pidfile, ensure_home, logs_dir, project_db_path
 from .worker_brief import MODEL_ATTRIBUTION_NAMES
 # `ops.IDLE_MANAGER_CAUSE` is an ALIAS: `stuck.IDLE_MANAGER_CAUSE` is the one definition of the cause... (#1008)
 from .stuck import IDLE_MANAGER_CAUSE  # noqa: F401
@@ -98,7 +98,6 @@ from .project_store import (
     is_feature_order_id,
     kind_contract,
     order_path,
-    project_db_path,
     submission_artifacts,
     validation_standing,
 )
@@ -8079,7 +8078,7 @@ def live_investigation(project_name: str, subject: str) -> str:
 def morpheus_investigations(project_name: str, item_id: str) -> list[str]:
     """Every investigation a Morpheus item's failed validations opened, oldest first (#1344)"""
     paths = registered_project_paths()
-    # A read: never create a project's database (or its directory) to answer it (#1372)
+    # A read view: never create a database for a project that has none (issue 1372)
     if project_name not in paths or not project_db_path(Path(paths[project_name])).exists():
         return []
     store = ProjectStore(paths[project_name])
