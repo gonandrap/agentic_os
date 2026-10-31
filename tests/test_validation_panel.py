@@ -7,7 +7,7 @@ import json
 import pytest
 
 from jarvis import claude_cli, validation
-from jarvis.catalog import ValidationConfig
+from jarvis.catalog import DEFAULT_VALIDATION_ROSTER, ValidationConfig
 from jarvis.daemon import Daemon
 from jarvis.evidence import EvidencePacket
 from jarvis.project_store import VALIDATOR_SEATS, ProjectStore
@@ -127,7 +127,7 @@ def test_decide_records_one_opinion_per_seat_and_returns_the_contract_keys(
     result = validation.decide(store, round_row, packet(), cfg())
 
     rows = store.validation_opinions(round_row["id"])
-    assert {r["seat"] for r in rows} == set(VALIDATOR_SEATS)
+    assert {r["seat"] for r in rows} == set(DEFAULT_VALIDATION_ROSTER)
     assert len(rows) == 5, "one row per seat, and never two for one"
     assert all(r["reply"] for r in rows), "the raw reply is stored verbatim"
     assert all(r["latency_ms"] >= 0 for r in rows)
@@ -135,7 +135,7 @@ def test_decide_records_one_opinion_per_seat_and_returns_the_contract_keys(
     assert set(result) == {"outcome", "reason", "seats", "follow_ups"}
     assert result["outcome"] == "passed"
     assert result["reason"] == "", "a pass carries no feedback"
-    assert {s["seat"] for s in result["seats"]} == set(VALIDATOR_SEATS)
+    assert {s["seat"] for s in result["seats"]} == set(DEFAULT_VALIDATION_ROSTER)
     assert all(s["reply"] for s in result["seats"]), (
         "the round machine re-records these rows and asserts the reply is not empty")
 
@@ -461,8 +461,20 @@ def test_the_validator_is_the_real_panel_when_enabled(store, round_row, jarvis_h
 
     assert result["outcome"] == "passed"
     assert {r["seat"] for r in store.validation_opinions(round_row["id"])} == set(
-        VALIDATOR_SEATS)
+        DEFAULT_VALIDATION_ROSTER)
     assert len(headless(fake_claude)) == 5
+
+
+def test_the_deliverable_roster_runs_two_real_seats(store, round_row, jarvis_home,
+                                                    fake_claude):
+    """Decision-orders spec §4.2: the researcher's panel, through the real seam"""
+    validator = Daemon._validator(cfg(roster=("deliverable", "chair")))
+
+    result = validator(store, dict(round_row), packet())
+
+    assert result["outcome"] == "passed"
+    assert {r["seat"] for r in store.validation_opinions(round_row["id"])} == {
+        "deliverable", "chair"}
 
 
 def test_the_validator_carries_the_catalogs_settings(store, round_row, jarvis_home,
