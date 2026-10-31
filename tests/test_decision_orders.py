@@ -207,7 +207,7 @@ def test_the_cli_drives_the_whole_surface(started, store, capsys):
     store.update_feature_order(do_id, plan=project_store.db.to_json(REPORT))
     assert cli.main(["do", "show", do_id]) == 0
     out = capsys.readouterr().out
-    assert "B is 30% cheaper" in out and "recommendation: b" in out and "p1 migrate" in out
+    assert "B is 30% cheaper" in out and "Recommendation: b" in out and "p1. (wo) migrate" in out
     assert cli.main(["do", "budget", do_id, "5"]) == 0
     assert cli.main(["do", "done", do_id, "--note", "B"]) == 0
     assert store.get_feature_order(do_id)["status"] == "completed"
