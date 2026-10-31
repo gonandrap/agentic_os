@@ -9,6 +9,7 @@ from jarvis.catalog import (
     DEFAULT_AUTOCOMPACT_WINDOW,
     DEFAULT_COLD_PREFIX_FLOOR,
     DEFAULT_COLD_PREFIX_FLOOR_MAX,
+    DEFAULT_VALIDATION_ROSTER,
     CatalogError,
     load_catalog,
     parse_catalog,
@@ -389,7 +390,8 @@ def test_validation_ships_disabled_with_every_default_spelled_out():
 
 def test_a_validator_roster_naming_an_unknown_seat_is_rejected_and_the_five_are_not():
     """Paired on purpose"""
-    assert validation_of({"roster": list(VALIDATOR_SEATS)}).roster == VALIDATOR_SEATS
+    assert validation_of({"roster": list(DEFAULT_VALIDATION_ROSTER)}).roster \
+        == DEFAULT_VALIDATION_ROSTER
     with pytest.raises(CatalogError, match="tetser"):
         validation_of({"roster": ["tetser", "chair"]})
     with pytest.raises(CatalogError, match="scurity"):
@@ -402,7 +404,16 @@ def test_a_roster_naming_a_seat_whose_markdown_has_not_shipped_still_parses(monk
     monkeypatch.setattr(jarvis.validation, "SEAT_ASSETS", tmp_path / "no-seats")
     assert jarvis.validation.shipped_seats() == ()
 
-    assert validation_of({"enabled": True}).roster == VALIDATOR_SEATS
+    assert validation_of({"enabled": True}).roster == DEFAULT_VALIDATION_ROSTER
+
+
+def test_the_default_roster_is_the_five_project_seats_and_a_kind_only_seat_is_refused():
+    """Decision-orders spec §4.2: a regular work order's panel is unchanged"""
+    assert DEFAULT_VALIDATION_ROSTER == ("tester", "security", "architect", "maintainer",
+                                         "chair")
+    assert "deliverable" in VALIDATOR_SEATS
+    with pytest.raises(CatalogError, match=r"\['deliverable'\], which only a work-order"):
+        validation_of({"roster": ["deliverable", "chair"]})
 
 
 def test_the_validation_block_must_be_an_object():

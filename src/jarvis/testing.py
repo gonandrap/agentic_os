@@ -780,7 +780,8 @@ elif "-p" in argv and "--resume" not in argv:
     if prompt == "Reply with the single word ok.":
         emit_headless("ok")
         sys.exit(0)
-    vseat = next((s for s in ("tester", "security", "architect", "maintainer", "chair")
+    vseat = next((s for s in ("tester", "security", "architect", "maintainer", "chair",
+                              "deliverable")
                   if ("# Jarvis validation seat: " + s) in prompt), None)
     if vseat:
         if vseat in [s for s in

@@ -22,7 +22,7 @@ from .session_dispatch import Launcher, parse_launcher
 from .navigation import (DOC_DIRS, DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
                          SOURCE_SUFFIXES, SYMBOL_TOOLS, TEXT_SEARCH_TOOLS)
 from .neo_store import Q_KINDS, SEATS
-from .project_store import VALIDATOR_SEATS
+from .project_store import KIND_ONLY_SEATS, VALIDATOR_SEATS
 
 # Dotted-path globs (fnmatch) over a resolved config map naming the settings that are SAFETY rather... (docs/superpowers/specs/2026-08-27-the-config-console.md §7)
 SAFETY_KEYS = (
@@ -268,8 +268,8 @@ class WorkerDefaults:
     denied_tools: tuple[str, ...] = DEFAULT_WORKER_DENIED_TOOLS
 
 
-# The validation panel's default roster: every seat in the vocabulary
-DEFAULT_VALIDATION_ROSTER = VALIDATOR_SEATS
+# The validation panel's default roster: every seat a project may seat
+DEFAULT_VALIDATION_ROSTER = tuple(s for s in VALIDATOR_SEATS if s not in KIND_ONLY_SEATS)
 
 # Per-seat call timeout, seconds
 DEFAULT_VALIDATION_TIMEOUT = 300
@@ -1393,6 +1393,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     if unknown:
         raise _err(f"{where}.roster names unknown seat(s) {unknown} "
                    f"(known: {list(VALIDATOR_SEATS)})")
+    kind_only = [s for s in roster if s in KIND_ONLY_SEATS]
+    if kind_only:
+        raise _err(f"{where}.roster names seat(s) {kind_only}, which only a work-order "
+                   f"kind's own roster seats; remove them (project seats: "
+                   f"{list(DEFAULT_VALIDATION_ROSTER)})")
     seat_models = raw.get("seat_models", base.seat_models) or {}
     if not isinstance(seat_models, dict):
         raise _err(f'"{where}.seat_models" must be an object')
