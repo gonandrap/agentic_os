@@ -162,6 +162,9 @@ def cancel_decision_order(do_id, project_name=None) -> dict              # `jarv
   child kind is that order's own child kind (the daemon opening the researcher). Today
   `--parent do-…` would be accepted because `awaiting_decision` is open.
 * `jarvis do budget <id> [<usd>] [--clear]` is `fo budget`'s function with `_require_kind`.
+* The generic feature-order verbs (`fo cancel`, `fo resume`, `fo approve`, the dashboard
+  `/fo/` cancel route) given a `do-` id refuse cleanly via `_require_kind`, naming the
+  `jarvis do` verb — never a `DecisionOrderGuard` traceback.
 
 **CLI** (`cli.py`): a `do` subparser with `create <project> "title" -d "..." [--budget]`,
 `list [project] [--all]`, `show <id> [--json]`, `done <id> [--note "..."]`,
@@ -260,7 +263,12 @@ order's description, so the round has something to judge and seats are asked.
 work order's contract has one, use `dataclasses.replace(cfg, roster=contract.roster)`.
 Set `WO_KIND_CONTRACTS["researcher"].roster = ("deliverable", "chair")`.
 
-**The `deliverable` seat**: `VALIDATOR_SEATS` += `"deliverable"`, asset
+**The `deliverable` seat**: `VALIDATOR_SEATS` += `"deliverable"` — but
+`catalog.DEFAULT_VALIDATION_ROSTER` (catalog.py:~272) is `VALIDATOR_SEATS` today, which
+would put the seat on every regular work order's panel and break §1.2 item 1. Keep the
+default roster to the current five seats (e.g. a `KIND_ONLY_SEATS = ("deliverable",)`
+excluded from it, and refused in a project's configured roster), and pin that a regular
+work order's roster is unchanged. Asset
 `src/jarvis/assets/validator-seats/deliverable.md` in the existing seat format. Its
 mandate, and nothing more: (1) the diff is empty — any changed tracked file is a BLOCKER
 (the finish refusal should have caught it; the seat states it if not); (2) the report
@@ -335,7 +343,10 @@ could plausibly settle an order active — PR poll, settle_features, invariants 
 repair, family budget, stuck sweep, fleet health, landed-investigator retirement — and
 assert status stays `awaiting_decision`, flag stays up, exactly one notification exists;
 then `complete_decision_order` and assert `completed` + flag down + event. Plus: a
-researcher dying leaves the order open and flagged; a revision notifies once.
+researcher dying leaves the order open and flagged; a revision notifies once; and the
+non-daemon routes leave the ORDER open — `jarvis wo done` / `ops.close_out` on the
+researcher, `fo budget` raise and clear on the do row, `wo hide`/`wo delete` of the
+researcher (each then handled by §5.3 like a dead researcher).
 
 ## 6. Follow-ups from the recommendation
 
