@@ -238,7 +238,7 @@ WO_KIND_CONTRACTS: dict[str, KindContract] = {
         SETTLE_IN_SESSION, artifact="verdict.json",
         submit="jarvis investigate verdict {fo_id} --from-file verdict.json",
         lands_code=False, assumptions_reviewed=False),
-    # By FINISH, not in session: an in-session kind skips the panel, and §4 of docs/superpowers/specs/2026-10-31-decision-orders.md needs a round
+    # By FINISH: an in-session kind skips the panel, and decision-orders spec §4 needs a round
     "researcher": KindContract(SETTLE_BY_FINISH, artifact="report.json",
                                submit="jarvis do report {fo_id} --from-file report.json",
                                lands_code=False),
@@ -312,7 +312,7 @@ FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 
 class DecisionOrderGuard(RuntimeError):
-    """A terminal status written on a decision order by anything but the user's verb (§2, docs/superpowers/specs/2026-10-31-decision-orders.md)"""
+    """A terminal status on a decision order from anything but the user's verb (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
 
 # What a `feature_orders` row IS (docs/superpowers/specs/2026-09-23-improvement-orders.md)
 FO_KINDS = ("feature", "improvement", "investigation", "decision")
@@ -367,7 +367,7 @@ def is_feature_order_id(unit_id: str) -> bool:
 
 
 def decision_report_sha(plan: str | dict | None) -> str:
-    """The report's identity, blind to `proposed_orders[].filed` (§1.3, docs/superpowers/specs/2026-10-31-decision-orders.md); "" for none"""
+    """The report's identity, blind to `filed` marks; "" for none (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
     if not plan:
         return ""
     doc = json.loads(plan) if isinstance(plan, str) else copy.deepcopy(plan)

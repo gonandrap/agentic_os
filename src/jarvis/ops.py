@@ -935,7 +935,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
             except KeyError as e:
                 raise OpsError(f"no feature order {parent_id!r} in {project_name!r} — "
                                f"a child is filed under a feature of its own project") from e
-            # This path files a `worker`; any other family opens its own child (§2 of the 2026-10-31 decision-orders spec)
+            # Files only a `worker`; other families open their own child (decision-orders spec §2)
             if "worker" not in FAMILY_CHILD_KINDS[parent.get("kind") or "feature"]:
                 raise OpsError(
                     f"{parent_id} is {_KIND_PHRASES.get(parent.get('kind'), 'not a feature order')}"
@@ -9383,7 +9383,7 @@ def _user_closes_decision(do_id: str, status: str, note: str,
     # The one site in src/ that passes the user's keyword — tests/test_decision_orders.py pins it
     out = _stop_family(name, path, fo, status=status, decided_by_user=True,
                        trigger=DECISION_CLOSED_EVENT)
-    # No researcher, no timeline (`wo_events` keys on a work order): the status span's trigger is the record
+    # `wo_events` keys on a work order: with no researcher, the span's trigger is the record
     if fo.get("plan_wo_id"):
         store = ProjectStore(path)
         try:
