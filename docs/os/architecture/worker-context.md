@@ -38,8 +38,9 @@ The real tokenizer counts ~1.3x chars/4 on this content (tool JSON is dense), so
 - One [playbook](/index.md) per order replaces the "read everything" posture.
 - CLAUDE.md is one line per command; the detail moved to `/operator/*.md`.
 
-**Outside Jarvis's levers:** Claude Code's base prompt and core tool schemas (~36K chars),
-and claude.ai synced skills (`anthropic-skills:*`, ~10.5K chars): neither `skillOverrides`,
-`enabledPlugins` nor `CLAUDE_CODE_DISABLE_POLICY_SKILLS` removed them on 2.1.304. The user's
+**Outside Jarvis's levers:** Claude Code's base prompt and core tool schemas (~36K chars).
+claude.ai synced skills (`anthropic-skills:*`, ~10.5K chars) were too on 2.1.304; on 2.1.316
+`skillOverrides` drops one by its qualified name, so `jarvis config wiring` lists each one
+(read from `~/.claude/skills/synced/*/manifest.json`) and `wiring.disabled_skills` unwires it. The user's
 own plugins (superpowers: ~3.4K-char hook + ~2.9K listing) stay wired by the opt-out
 ruling; deselect them per project on /config to save ~1.6K tokens per start.
