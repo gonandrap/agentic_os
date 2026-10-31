@@ -961,7 +961,9 @@ def create_work_order(project_name: str, title: str, description: str = "",
         if backlog_hold:                                    # §2.4.1
             store.add_precondition(wo["id"], backlog_hold[0], note=backlog_hold[1])
         # AT CREATION, from the brief the order is actually given
-        record_issue_references(store, paths[project_name], wo)
+        spec = _spec_or_none(project_name)
+        record_issue_references(store, paths[project_name], wo,
+                                spec.bugs.repo if spec is not None else "")
         return wo
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured
@@ -2639,10 +2641,12 @@ def follow_up_title(key: str, digest: str) -> str:
     return f"{key} [{digest}]"
 
 
-def follow_up_repo(project_path: Path) -> str:
-    """`owner/name` of the repository a follow-up for this project belongs on, or "\""""
+def follow_up_repo(project_path: Path, tracker: str = "") -> str:
+    """`owner/name` of the project's issue tracker: `bugs.repo` when set, else its origin, or "\""""
     from . import github
 
+    if tracker:
+        return tracker
     pair = github.origin_repo(project_path)
     return f"{pair[0]}/{pair[1]}" if pair else ""
 
@@ -2767,7 +2771,7 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     cap = int(getattr(cfg, "max_follow_ups", DEFAULT_VALIDATION_FOLLOW_UP_CAP))
     room = max(0, cap - raised)
 
-    repo = follow_up_repo(project.path)
+    repo = follow_up_repo(project.path, project.bugs.repo)
     # ONE privacy read, and it fails closed: anything but a positive "this repository is private"...
     private = bool(repo) and issues.repo_is_private(repo)
     if not private:
@@ -2958,11 +2962,11 @@ def issue_citations(text: str, repo: str, known: Collection[str]) -> list[str]:
 
 
 def record_issue_references(store: ProjectStore, project_path: Path,
-                            wo: Mapping[str, Any]) -> list[str]:
+                            wo: Mapping[str, Any], tracker: str = "") -> list[str]:
     """Link a freshly created work order to the issues its brief points at"""
     from . import issues
 
-    repo = follow_up_repo(project_path)
+    repo = follow_up_repo(project_path, tracker)
     if not repo:
         return []
     linked: list[str] = []

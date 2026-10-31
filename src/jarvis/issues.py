@@ -524,12 +524,12 @@ def apply(store: Any, wo: dict[str, Any], label: str) -> str:
 
 def tracker_project(catalog: Any, repo: str | None = None) -> Any:
     """The project that would FIX a bug on `repo`, or None if none would"""
-    from . import github
+    from .ops import follow_up_repo
 
     want = (repo or bug_repo()).lower()
     for spec in getattr(catalog, "projects", []):
-        origin = github.origin_repo(spec.path)
-        if origin and f"{origin[0]}/{origin[1]}" == want:
+        bugs = getattr(spec, "bugs", None)
+        if follow_up_repo(spec.path, getattr(bugs, "repo", "")).lower() == want:
             return spec
     return None
 
@@ -1039,8 +1039,7 @@ def start_work(target: str, project: str | None = None, *,
                budget_usd: float | None = None,
                origin: str = "jarvis") -> dict[str, Any]:
     """Open a work order on a tracker issue"""
-    from . import github
-    from .ops import OpsError, registered_project_paths, resolve_catalog
+    from .ops import OpsError, follow_up_repo, registered_project_paths, resolve_catalog
 
     catalog = resolve_catalog()
     if project:
@@ -1048,11 +1047,10 @@ def start_work(target: str, project: str | None = None, *,
                      if p.name == project), None)
         if spec is None:
             raise OpsError(f"project {project!r} is not in the catalog")
-        remote = github.origin_repo(spec.path)
-        if remote is None:
-            raise OpsError(f"project {project!r} has no git `origin`, so it owns no "
-                           f"tracker to start an issue from")
-        repo = f"{remote[0]}/{remote[1]}"
+        repo = follow_up_repo(spec.path, spec.bugs.repo)
+        if not repo:
+            raise OpsError(f"project {project!r} has no git `origin` and no `bugs.repo`, "
+                           f"so it owns no tracker to start an issue from")
     else:
         repo = bug_repo()
         spec = tracker_project(catalog, repo)

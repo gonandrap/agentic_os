@@ -999,6 +999,21 @@ def config_rows(show: dict, setters: dict[str, str], scope: str,
     return rows
 
 
+def contract_areas(show: dict, setters: dict[str, str], project: str) -> list[dict]:
+    """One project's settings grouped by the onboarding interview's areas, in its order"""
+    from .. import onboard_knobs, onboard_prose
+
+    titles = {a.key: a.title for a in onboard_prose.AREAS}
+    groups: dict[str, list[dict]] = {}
+    for row in config_rows(show, setters, f"projects.{project}"):
+        hit = onboard_knobs.area_of(row["path"])
+        key, tail = hit if hit else ("other", row["label"])
+        groups.setdefault(key, []).append({**row, "line": onboard_prose.LINES.get(tail, "")})
+    order = [*onboard_knobs.AREA_KEYS, "other"]
+    return [{"key": k, "title": titles.get(k, "Unclassified"), "rows": groups[k]}
+            for k in order if k in groups]
+
+
 #: Which of the user's own MCP servers, skills and plugins reach this scope's workers
 WIRING_GROUPS = (
     ("mcp", "MCP servers",
@@ -1655,6 +1670,17 @@ def create_app() -> FastAPI:
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e), status_code=404)
         return render(request, "project_prompt.html", project=name, preview=preview)
+
+    @app.get("/project/{name}/contract", response_class=HTMLResponse)
+    def project_contract(request: Request, name: str):
+        """The project's onboarding contract, area by area, each setting editable in place"""
+        show = ops.config_show()
+        if f"projects.{name}" not in {s["key"] for s in config_scopes(show["resolved"])}:
+            return render(request, "error.html", message=f"no project {name!r} in the catalog",
+                          status_code=404)
+        areas = contract_areas(show, config_setters(ops.config_history(limit=50)), name)
+        return render(request, "project_contract.html", project=name, areas=areas,
+                      here=f"/project/{quote(name)}/contract")
 
     @app.get("/go/{ref:path}")
     def go(ref: str):
@@ -2610,7 +2636,7 @@ def create_app() -> FastAPI:
     def config_set(path: str = Form(...), value: str = Form(""),
                    reason: str = Form(""), back: str = Form("/config")):
         """The page's only write, and it is `jarvis config set` under another name"""
-        back = back if back.startswith("/config") else "/config"
+        back = back if back.startswith(("/config", "/project/")) else "/config"
         try:
             current = ops.config_get(path)["value"]
             new = config_value_of(current, value)
