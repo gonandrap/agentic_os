@@ -77,6 +77,10 @@ def tool_search_env(tool_search: str) -> dict[str, str]:
     return {TOOL_SEARCH_ENV: "true"}
 
 
+# Claude Code's "hasn't heard from you" nudge; env beats the server flag (#1369)
+SILENT_TURN_REMINDER_ENV = "CLAUDE_CODE_SILENT_TURN_REMINDER"
+
+
 def serena_allow_rules() -> list[str]:
     """`permissions.allow` entries for every read-only Serena tool, under both prefixes"""
     return [f"{prefix}{tool}"
@@ -227,6 +231,8 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         **bash_first_env(project.worker.bash_first),
         # WHETHER THIS WORKER'S SYMBOL TOOLS ARE LISTED OR DEFERRED (spec 2026-10-02-serena-the-cheap-path.md...
         **tool_search_env(project.worker.tool_search),
+        # Nobody reads a daemon worker's progress chatter (#1369)
+        SILENT_TURN_REMINDER_ENV: "0",
         # Whether the lead must delegate its file edits to the crew (§7 of that spec)
         "JARVIS_REQUIRE_CREW": "1" if project.worker.require_crew else "0",
         # The crew is the ordinary worker's; a planner has its own team prose
