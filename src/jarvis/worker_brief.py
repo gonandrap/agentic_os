@@ -193,12 +193,13 @@ def crew_block(require_crew: bool) -> list[str]:
     ]
 
 
-def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
+def core_contract(wo_id: str, title: str, project: str, knowledge_pointer: bool,
                   gate_names: tuple[str, ...] = (),
                   kind: str = "worker",
                   transport: str = TRANSPORT_BACKGROUND,
                   require_crew: bool = False) -> list[str]:
     """The compressed operating contract: only the invariants a worker cannot be allowed to discover by..."""
+    # knowledge_pointer: off when the knowledge index block follows, which says the same (issue 1368)
     from .sections import QUESTION_MAX_CHARS
 
     lines = [
@@ -224,7 +225,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         *([
             "  - But LOOK IT UP FIRST when a headline in the knowledge-base index "
             "below names the area you are unsure about — a lookup is not a doubt.",
-        ] if has_knowledge else []),
+        ] if knowledge_pointer else []),
         assume_shape(wo_id, cite_spec=False,
                      tail=" It should be RARE and self-contained. Record EVERY "
                           "such call, including "
@@ -234,7 +235,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"is INDEXED at the end of this prompt, not pasted into it: "
             f"`jarvis learn show <id>` for a body, `jarvis learn search \"<term>\" "
             f"--project {project}` to find which entries match.",
-        ] if has_knowledge else []),
+        ] if knowledge_pointer else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project} --topic \"<topic>\"`. Your "
         f"own notes and memory files are invisible to everyone else.",

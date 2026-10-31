@@ -2282,7 +2282,7 @@ def worker_brief_core(wo_id: str, title: str, project: str,
     from .worker_brief import core_contract
     # The worker's own env is the declaration when the row predates the column
     return core_contract(
-        wo_id, title, project, has_knowledge=True,
+        wo_id, title, project, knowledge_pointer=True,
         transport=transport or os.environ.get(TURN_TRANSPORT_ENV) or TRANSPORT_HEADLESS,
         require_crew=os.environ.get(REQUIRE_CREW_ENV) == "1")
 
