@@ -77,6 +77,7 @@ from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     COUNTED_VALIDATION_OUTCOMES,
+    DECISION_CLOSED_EVENT,
     FAMILY_CHILD_KINDS,
     FORCEABLE_STATUSES,
     FO_OPEN_STATUSES,
@@ -636,8 +637,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                             + ", ".join(_child_note(k, parked_by_id) for k in kids)
                         )
                     progress = feature_progress(store, fo)
-                    # §6.2 of docs/superpowers/specs/2026-09-23-improvement-orders.md: an improvement order's reason is...
-                    improvement = (fo.get("kind") or "feature") == "improvement"
+                    # An improvement or decision order's reason is its own, unprefixed (docs/superpowers/specs/2026-10-31-decision-orders.md)
+                    bare = (fo.get("kind") or "feature") in ("improvement", "decision")
                     body = "; ".join(reasons)
                     attention.append({
                         "project": p["name"], "wo_id": None, "fo_id": fo_id,
@@ -645,7 +646,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         # Kind-aware through the ONE mapping in project_store (docs/superpowers/specs/2026-09-23-improvement-orders.md)
                         "status": (f"{fo.get('kind') or 'feature'}:"
                                    f"{feature_status_label(fo.get('kind'), fo['status'])}"),
-                        "reason": body if improvement
+                        "reason": body if bare
                                   else f"{progress['label']} — {body}",
                         "rolled_up": [k["id"] for k in kids],
                         "decide": decide_command(fo.get("kind"), fo_id),
@@ -9365,8 +9366,27 @@ def show_decision_order(do_id: str, project_name: str | None = None) -> dict[str
             "status_label": feature_status_label("decision", fo["status"])}
 
 
-#: On the researcher's timeline: the user settled the decision order (§1.3)
-DECISION_CLOSED_EVENT = "decision_closed_by_user"
+def send_decision_message(do_id: str, content: str, project_name: str | None = None,
+                          relay: bool = False) -> dict[str, Any]:
+    """`jarvis do send` — to the researcher; the order and its flag stay as they are (§5.2)"""
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", "jarvis fo show")
+    if fo["status"] in FO_TERMINAL_STATUSES:
+        raise OpsError(
+            f"{do_id} is {feature_status_label('decision', fo['status'])}, so it has no "
+            f"researcher to talk to. To ask again, file a new one: `jarvis do create "
+            f"{name} \"<question>\" -d \"...\"`.")
+    researcher = fo.get("plan_wo_id")
+    if not researcher:
+        why = "not opened yet" if fo["status"] == "pending" else "it was deleted"
+        raise OpsError(
+            f"{do_id} has no researcher ({why}), so there is nobody to send to. Wait for "
+            f"the daemon to open one, or run `jarvis do cancel {do_id}`.")
+    out = send_message(researcher, content, source="jarvis", project_name=name, relay=relay)
+    return {**out, "do_id": do_id, "status": fo["status"],
+            "status_label": feature_status_label("decision", fo["status"]),
+            "order_note": "the order stays open and flagged: only `jarvis do done` or "
+                          "`jarvis do cancel` closes it"}
 
 
 def _user_closes_decision(do_id: str, status: str, note: str,

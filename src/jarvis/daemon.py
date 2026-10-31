@@ -1074,6 +1074,8 @@ class Daemon:
                     self.clear_answered_investigations(project, store)
                     # Beside it: the investigator's half of a settled investigation
                     self.settle_landed_investigators(project, store)
+                    # A researcher's validated report reaches the user; the order itself stays open
+                    self.deliver_decisions(project, store)
                     # A report filed before Neo decided findings still owes Neo its questions
                     self.offer_findings_to_neo(project)
                     # The agents roster holds ONLY the user's own sessions: workers are headless and never enter it
@@ -1338,6 +1340,61 @@ class Daemon:
             # LAST, so a crashed tick re-files rather than strands
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] researching %s: opened %s", project.name, fo["id"], wo["id"])
+
+    def deliver_decisions(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Deliver a validated report, or flag a dead researcher; never settles the order (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
+        for fo in store.list_feature_orders(statuses=("planning", "awaiting_decision"),
+                                            kind="decision"):
+            try:
+                self._deliver_decision(project, store, fo)
+            except Exception:  # noqa: BLE001 — one bad decision order must not stop the rest
+                log.exception("[%s] could not deliver %s", project.name, fo["id"])
+
+    def _deliver_decision(self, project: ProjectSpec, store: ProjectStore,
+                          fo: dict[str, Any]) -> None:
+        from . import decision_report
+        from .ops import decision_report as stored_report
+        from .project_store import decision_report_sha
+
+        try:
+            wo = store.get_work_order(fo["plan_wo_id"]) if fo.get("plan_wo_id") else None
+        except KeyError:
+            wo = None
+        report = stored_report(fo)
+        if wo is not None and wo["status"] == "completed" and report:
+            sha = decision_report_sha(fo["plan"])
+            last = store.last_decision_delivery(wo["id"])
+            if last is not None and last.get("sha") == sha:
+                return  # delivery-once by construction: this report already reached the user
+            revised = last is not None
+            if store.raise_decision(
+                    fo["id"], fo["status"], decision_report.awaiting_reason(fo, report),
+                    title=(f"{fo['id']} report {'revised' if revised else 'ready'}: "
+                           f"{fo['title']}"),
+                    body=decision_report.render_brief(report),
+                    delivered=(wo["id"], {"do_id": fo["id"], "sha": sha,
+                                          "revised": revised})):
+                log.info("[%s] %s: report delivered%s", project.name, fo["id"],
+                         " (revised)" if revised else "")
+            return
+        # §5.3: only a `planning` order owes this — an awaiting one is flagged already
+        if fo["status"] != "planning" or fo["needs_attention"]:
+            return
+        if wo is None:
+            reason = (f"researcher deleted — {fo['id']} has nobody researching it; "
+                      f"jarvis do cancel {fo['id']}")
+        elif wo["status"] in ("failed", "cancelled", "completed"):
+            # `completed` with no report: `jarvis wo done` / `close_out` on the researcher (§5.6)
+            ended = ("completed without a report" if wo["status"] == "completed"
+                     else wo["status"])
+            reason = (f"researcher {wo['id']} {ended} — jarvis do send {fo['id']} "
+                      f"\"retry\" or jarvis do cancel {fo['id']}")
+        else:
+            return
+        if store.raise_decision(fo["id"], "planning", reason,
+                                title=f"{fo['id']} researcher stopped: {fo['title']}",
+                                body=reason):
+            log.info("[%s] %s: %s", project.name, fo["id"], reason)
 
     def refresh_plan_specs(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Re-ask any plan review whose spec has been committed over"""
