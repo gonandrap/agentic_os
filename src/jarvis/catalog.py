@@ -815,6 +815,8 @@ class WiringConfig:
     disabled_plugins: tuple[str, ...] = ()
     #: Skill names — user and project skills only
     disabled_skills: tuple[str, ...] = ()
+    # Off adds `--no-chrome`: the user's global config, not settings, turns Claude in Chrome on (issue 1370)
+    chrome: bool = True
 
 
 #: Tracked files an installed TOOL owns and rewrites
@@ -1947,6 +1949,7 @@ def _parse_wiring(raw: Any, base: WiringConfig | None = None,
         bundled_skills=bool(raw.get("bundled_skills", base.bundled_skills)),
         disabled_plugins=_names("disabled_plugins", base.disabled_plugins),
         disabled_skills=_names("disabled_skills", base.disabled_skills),
+        chrome=bool(raw.get("chrome", base.chrome)),
     )
 
 

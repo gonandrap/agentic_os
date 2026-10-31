@@ -26,9 +26,9 @@ def _tails(resolved: dict) -> set[str]:
 
 def test_the_fixture_is_pinned_to_the_real_schema(resolved):
     """An empty `coverage()` proves nothing unless the resolved map is the whole schema (§1)"""
-    assert len(resolved) == 380
-    assert sum(1 for p in resolved if p.startswith("os.")) == 205
-    assert sum(1 for p in resolved if p.startswith("projects.")) == 175
+    assert len(resolved) == 382
+    assert sum(1 for p in resolved if p.startswith("os.")) == 206
+    assert sum(1 for p in resolved if p.startswith("projects.")) == 176
 
 
 def test_every_resolved_path_is_classified(resolved):

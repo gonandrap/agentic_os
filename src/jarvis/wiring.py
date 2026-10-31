@@ -20,6 +20,7 @@ PLUGIN_SERVER_PREFIX = "plugin:"
 
 LEVER_CONNECTORS = "connectors"
 LEVER_BUNDLED = "bundled_skills"
+LEVER_CHROME = "chrome"
 LEVER_PLUGIN = "plugin:"
 LEVER_SKILL = "skill:"
 
@@ -53,6 +54,11 @@ def settings_patch(w: WiringConfig) -> dict[str, Any]:
         # "off" hides the skill from the model AND from `/name`
         patch["skillOverrides"] = {name: "off" for name in w.disabled_skills}
     return patch
+
+
+def launch_flags(w: WiringConfig) -> list[str]:
+    """The CLI flags that carry what no settings key can reach"""
+    return [] if w.chrome else ["--no-chrome"]
 
 
 def serena_wired(w: WiringConfig) -> bool:
@@ -238,6 +244,10 @@ def discover(*, refresh: bool = False, timeout: int = 90) -> Inventory:
         source="Claude Code", lever=LEVER_BUNDLED,
         detail="the skills and workflows the CLI ships (code review, dataviz, …)",
         note="they wire as one block"))
+    inv.items.append(Item(
+        kind="mcp", name="Claude in Chrome", source="Claude Code", lever=LEVER_CHROME,
+        detail="browser automation: a system-prompt section plus the mcp__claude-in-chrome__* tools",
+        note="unwiring it launches workers with --no-chrome"))
 
     inv.ts = db.now()  # stamped when the read FINISHED: that is what goes stale
     with _LOCK:
@@ -265,6 +275,8 @@ def lever_wired(w: WiringConfig, lever: str) -> bool:
         return w.claude_ai_connectors
     if lever == LEVER_BUNDLED:
         return w.bundled_skills
+    if lever == LEVER_CHROME:
+        return w.chrome
     if lever.startswith(LEVER_PLUGIN):
         return lever[len(LEVER_PLUGIN):] not in w.disabled_plugins
     if lever.startswith(LEVER_SKILL):
@@ -279,6 +291,8 @@ def lever_setting(lever: str, wired: bool,
         return "wiring.claude_ai_connectors", bool(wired)
     if lever == LEVER_BUNDLED:
         return "wiring.bundled_skills", bool(wired)
+    if lever == LEVER_CHROME:
+        return "wiring.chrome", bool(wired)
     for prefix, key, current in (
         (LEVER_PLUGIN, "wiring.disabled_plugins", w.disabled_plugins),
         (LEVER_SKILL, "wiring.disabled_skills", w.disabled_skills),

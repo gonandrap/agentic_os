@@ -110,6 +110,7 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any],
                                           serena=wiring.serena_wired(project.wiring))
                      + ([agent_dir] if agent_dir else [])),
         "autocompact_window": project.worker.autocompact_window,
+        "wiring_flags": wiring.launch_flags(project.wiring),
         # Never negative: `_launch` refuses a spent order outright
         "max_budget_usd": max(0.0, cap.remaining_usd) if cap else None,
     }

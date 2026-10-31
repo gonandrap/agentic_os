@@ -31,6 +31,8 @@ The real tokenizer counts ~1.3x chars/4 on this content (tool JSON is dense), so
   `ListAgents`, `Agent(statusline-setup)`) goes into `permissions.deny`. A bare-name deny
   removes the schema from the request (~14K chars); verified on 2.1.304.
 - `wiring.bundled_skills` now defaults to off (`disableBundledSkills`, ~6.6K chars).
+- `wiring.chrome: false` launches workers with `--no-chrome` (~1.6K tokens per call). Chrome
+  is enabled from the user's global config, which no settings key reaches (issue 1370).
 - Pinned knowledge renders at most `os.knowledge_pinned_chars` (360) per entry plus its id;
   the index is `knowledge_digest_limit` 8 / `_chars` 1000; the topic roll-call names the 12
   largest topics.

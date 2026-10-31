@@ -319,9 +319,10 @@ def _briefing_args(
     add_dirs: list[Path] | None = None,
     autocompact_window: int | None = None,
     agent: str | None = None,
+    wiring_flags: list[str] | None = None,
 ) -> list[str]:
     """The flags that constitute a worker's briefing, in one place"""
-    args: list[str] = []
+    args: list[str] = list(wiring_flags or [])
     if model:
         args += ["--model", model]
     if effort:
@@ -790,6 +791,7 @@ def turn_args(
     agent: str | None = None,
     max_budget_usd: float | None = None,
     prompt_via_stdin: bool = False,
+    wiring_flags: list[str] | None = None,
 ) -> list[str]:
     """argv for one worker turn"""
     args = ["-p", "--output-format", "json",
@@ -799,7 +801,8 @@ def turn_args(
     if worktree:
         args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
-                           settings_file, add_dirs, autocompact_window, agent)
+                           settings_file, add_dirs, autocompact_window, agent,
+                           wiring_flags)
     if max_budget_usd is not None:
         # THE ENFORCEMENT POINT for a per-order budget (src/jarvis/budget.py
         args += ["--max-budget-usd", f"{max_budget_usd:.6f}"]
