@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -148,6 +149,11 @@ SHIPS = [
     "git commit -m 'x'", "git push origin HEAD", "git -C /w commit -am x",
     "FOO=1 git push", "gh pr create --title t --body b", "gh pr merge 12 --squash",
     "cd /w && git commit -m x", "ls; git push",
+    # Wrapped: one per wrapper form
+    "env git push", "env -i FOO=1 git push", "env -u JARVIS_WO_ID git commit -m x",
+    "command git push", "sudo -u root git push", "nohup git push", "time git commit -m x",
+    "bash -c 'git push'", "sh -c 'cd /w && git commit -m x'", "zsh -lc \"gh pr create -t t\"",
+    "env -i bash -c 'nohup git push'",
 ]
 READS = [
     "git log --oneline -5", "git diff main", "gh pr view 12", "python3 scripts/measure.py",
@@ -167,8 +173,30 @@ def test_a_researcher_may_not_commit_push_or_open_a_pull_request():
 
 
 def test_a_researcher_may_run_any_read_or_analysis_command():
-    for command in READS:
+    for command in READS + ["bash -c 'git log -1'", "env -u X git status"]:
         assert hooks.researcher_bash_decision(_bash(command), _env()) is None, command
+
+
+CLOSES = ["jarvis do done do-1", "jarvis do cancel do-1",
+          "env -u JARVIS_WO_ID jarvis do done do-1", "env -i jarvis do cancel do-1",
+          "command jarvis do done do-1", "sudo jarvis do done do-1", "nohup jarvis do done do-1",
+          "time jarvis do done do-1", "bash -c 'jarvis do done do-1'",
+          "ls && sh -c \"env -u JARVIS_WO_ID jarvis do cancel do-1\""]
+
+
+def test_no_work_order_session_may_close_a_decision_order():
+    """The model can strip JARVIS_WO_ID from its shell, not from the hook's env (§2)"""
+    for kind in ("researcher", "worker", "investigator"):
+        for command in CLOSES:
+            refusal = hooks.preflight_decision(_bash(command), _env(kind))
+            assert _decision(refusal) == "deny", (kind, command)
+            assert "user's verb" in refusal["hookSpecificOutput"]["permissionDecisionReason"]
+    # Controls: the user's own session, and the verbs that do not close
+    for command in CLOSES:
+        assert hooks.decision_close_decision(_bash(command), {}) is None
+    for command in ("jarvis do show do-1", "jarvis do report do-1 --from-file report.json",
+                    "jarvis wo done wo-1"):
+        assert hooks.decision_close_decision(_bash(command), _env()) is None, command
 
 
 def _write(path: str, cwd: str, tool: str = "Write") -> dict:
@@ -176,15 +204,41 @@ def _write(path: str, cwd: str, tool: str = "Write") -> dict:
 
 
 def test_a_researcher_writes_only_its_report_and_its_scratch_tree(tmp_path):
-    cwd = str(tmp_path)
-    for ok in ("report.json", ".jarvis/scratch/notes.md", ".jarvis/scratch/a/b.py"):
-        assert hooks.researcher_write_decision(_write(f"{cwd}/{ok}", cwd), _env()) is None
-    assert hooks.researcher_write_decision(_write("/elsewhere/x.py", cwd), _env()) is None
+    cwd = str(tmp_path / "wt")
+    temp = hooks.researcher_temp_dir("wo-1")
+    for ok in (f"{cwd}/report.json", f"{cwd}/.jarvis/scratch/notes.md",
+               f"{cwd}/.jarvis/scratch/a/b.py", ".jarvis/scratch/rel.md", f"{temp}/m.py"):
+        assert hooks.researcher_write_decision(_write(ok, cwd), _env()) is None, ok
+    (tmp_path / "wt" / ".jarvis" / "scratch").mkdir(parents=True)
+    (tmp_path / "wt" / ".jarvis" / "scratch" / "out").symlink_to(tmp_path / "other_project")
+    bad = [f"{cwd}/src/app.py", f"{cwd}/.jarvis/state.db", f"{cwd}/sub/report.json",
+           str(Path.home() / ".claude" / "settings.json"),
+           str(tmp_path / "other_project" / "x.py"),
+           f"{cwd}/.jarvis/scratch/out/x.py",  # symlink out of scratch
+           f"{cwd}/.jarvis/scratch/../../x.py", "/elsewhere/x.py",
+           f"{hooks.researcher_temp_dir('wo-2')}/m.py"]  # another researcher's temp dir
     for tool in ("Write", "Edit", "NotebookEdit"):
-        for bad in ("src/app.py", ".jarvis/state.db", "sub/report.json"):
-            payload = _write(f"{cwd}/{bad}", cwd, tool)
-            assert _decision(hooks.researcher_write_decision(payload, _env())) == "deny"
+        for path in bad:
+            payload = _write(path, cwd, tool)
+            assert _decision(hooks.researcher_write_decision(payload, _env())) == "deny", path
             assert hooks.researcher_write_decision(payload, _env("worker")) is None
+        # Missing cwd or file path fails CLOSED
+        for payload in ({"tool_name": tool, "tool_input": {"file_path": f"{cwd}/report.json"}},
+                        {"tool_name": tool, "cwd": cwd, "tool_input": {}}):
+            assert _decision(hooks.researcher_write_decision(payload, _env())) == "deny"
+    # Reachable through the chain, ahead of the worktree auto-allow
+    settings = _write(str(Path.home() / ".claude" / "settings.json"), cwd, "Edit")
+    assert _decision(hooks.preflight_decision(settings, _env())) == "deny"
+
+
+def test_the_prompt_and_the_refusal_name_the_same_temp_dir(store, project_spec):
+    researcher = _prompt(store, "researcher", project_spec)
+    wo_id = re.search(r"running as work order `(wo-[0-9a-f]+)`", researcher).group(1)
+    temp = str(hooks.researcher_temp_dir(wo_id))
+    assert f"`{temp}/`" in researcher and "outside the worktree." not in researcher
+    refusal = hooks.researcher_write_decision(_write("/elsewhere/x", "/w"),
+                                              {**_env(), "JARVIS_WO_ID": wo_id})
+    assert f"`{temp}/`" in refusal["hookSpecificOutput"]["permissionDecisionReason"]
 
 
 def test_every_command_a_refusal_suggests_is_accepted_by_the_same_hook(tmp_path):
