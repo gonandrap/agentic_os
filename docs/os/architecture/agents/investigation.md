@@ -48,6 +48,9 @@ sequenceDiagram
         end
     else WAITING_ON_USER (user_owes)
         O-->>U: attention on the investigation<br/>(cleared once the subject is clear)
+    else SCRIPT_WRONG (script_fix; Morpheus-opened only)
+        O->>O: morpheus.rewrite under MAX_SCRIPT_REWRITES,<br/>script_fix + root_cause as the brief
+        O-->>U: cap spent: attention + inbox naming jarvis morpheus rewrite
     else TRANSIENT (unsticks) / ALREADY_TRACKED (duplicate_of)
         O->>O: nothing further
     end

@@ -441,6 +441,30 @@ def rewrite(central: CentralStore, cfg: MorpheusConfig, item_id: str, why: str, 
     return central.morpheus_item(item_id) or {}
 
 
+def rewrite_from_investigation(central: CentralStore, cfg: MorpheusConfig, item_id: str,
+                               inv_id: str, brief: str) -> tuple[bool, str]:
+    """SCRIPT_WRONG verdict: rewrite under the cap; (False, …) = cap spent, user owes it (#1374)"""
+    item = _item_or_raise(central, item_id)
+    if item["state"] not in ACTION_STATES:
+        return True, f"nothing sent back: {item_id} is {item['state']}, decided elsewhere"
+    if not central.claim_morpheus_script_rewrite(item_id, MAX_SCRIPT_REWRITES):
+        command = f'jarvis morpheus rewrite {item_id} --why "…"'
+        central.add_inbox(
+            project=item.get("project") or "os", level="warning",
+            title=f"PR #{item['pr_number']} {item['state']} production validation — its "
+                  f"script is wrong and its one automatic rewrite is spent",
+            body=f"{item['pr_url']}\n{inv_id}: {brief[:600]}\n{command}")
+        return False, f"its one automatic rewrite is spent — `{command}`"
+    rewrite(central, cfg, item_id, brief,
+            resolution=f"script sent back to be rewritten by {inv_id}: {brief[:600]}")
+    central.add_inbox(
+        project=item.get("project") or "os", level="info",
+        title=f"PR #{item['pr_number']} — {inv_id} found its validation script wrong; "
+              f"Morpheus is rewriting it",
+        body=f"{item['pr_url']}\n{brief[:600]}\njarvis morpheus show {item_id}")
+    return True, f"{item_id} sent back to Morpheus for a new script; its one rewrite is spent"
+
+
 def _item_or_raise(central: CentralStore, item_id: str) -> dict[str, Any]:
     item = central.morpheus_item(item_id)
     if not item:
