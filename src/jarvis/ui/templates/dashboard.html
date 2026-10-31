@@ -133,6 +133,8 @@
   <div class="tabs" role="tablist">
     <button role="tab" data-panel="tab-new-wo" aria-selected="true" aria-controls="tab-new-wo">New work order</button>
     <button role="tab" data-panel="tab-new-fo" aria-selected="false" aria-controls="tab-new-fo">New feature order</button>
+    <button role="tab" data-panel="tab-new-io" aria-selected="false" aria-controls="tab-new-io">New improvement order</button>
+    <button role="tab" data-panel="tab-new-inv" aria-selected="false" aria-controls="tab-new-inv">New investigation</button>
     {% if not (brake and brake.paused) %}
     <button role="tab" data-panel="tab-brake" aria-selected="false" aria-controls="tab-brake">Fleet brake</button>
     {% endif %}
@@ -187,6 +189,52 @@
       <textarea name="description" required
                 placeholder="the whole ask — the planner sees only this text, and the plan is built from it"></textarea>
       <button type="submit" class="primary">Plan it</button>
+    </div>
+  </form>
+</div>
+</div>
+
+{# `jarvis io create`: observation and evidence are both required — see `ops.create_improvement_order`. #}
+<div class="tabpanel" id="tab-new-io">
+<h2>New improvement order</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <form method="post" action="/io/create">
+    <div class="form-line">
+      <select name="project" required style="max-width: 220px;">
+        {% for p in st.projects %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}
+      </select>
+      <input type="text" name="title" placeholder="what keeps going wrong" required>
+      <input type="text" name="budget" placeholder="budget $ (default: none)"
+             pattern="\s*\$?\s*[0-9,]*\.?[0-9]+\s*" style="max-width: 200px;"
+             title="A ceiling on the order and its analyst. e.g. 10 or $10.00.">
+    </div>
+    <div class="form-line">
+      <textarea name="description" required
+                placeholder="what you saw — the analyst sees only this text"></textarea>
+      <textarea name="refs" required
+                placeholder="evidence, one per line: wo-/fo-/io-/al- id, #issue, URL, or free text"></textarea>
+      <button type="submit" class="primary">File it</button>
+    </div>
+  </form>
+</div>
+</div>
+
+{# `jarvis investigate`: the subject's own project is used, so no project picker. #}
+<div class="tabpanel" id="tab-new-inv">
+<h2>New investigation</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <form method="post" action="/inv/create">
+    <div class="form-line">
+      <input type="text" name="subject" placeholder="wo-/fo-/io- id that is not progressing"
+             required style="max-width: 320px;">
+      <input type="text" name="budget" placeholder="budget $ (default: catalog)"
+             pattern="\s*\$?\s*[0-9,]*\.?[0-9]+\s*" style="max-width: 200px;"
+             title="A ceiling on the investigation and its investigator. e.g. 5 or $5.00.">
+    </div>
+    <div class="form-line">
+      <textarea name="why" required
+                placeholder="what you saw — the investigator sees only this text"></textarea>
+      <button type="submit" class="primary">Investigate</button>
     </div>
   </form>
 </div>
