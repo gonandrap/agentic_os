@@ -1,6 +1,7 @@
 """A worker conversation as ONE background session (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
 
 import json
+import shutil
 import subprocess
 import time
 
@@ -423,6 +424,42 @@ def test_a_session_kept_over_real_work_is_recorded_once(bg_fleet, fake_claude,
     # …and it is surfaced for as long as it lasts
     assert [v.invariant for v in invariants.check_closed_session_removed(store)] == [
         "INV-SESSION-KEPT"]
+
+
+@pytest.mark.parametrize("status,removed", [("completed", True), ("cancelled", False)])
+def test_a_consumed_verdict_does_not_keep_an_investigator_session(
+        bg_fleet, fake_claude, settle_turns, status, removed):
+    """verdict.json was read by `jarvis investigate verdict`; a cancelled one maybe never was (wo-b6e2ddda)"""
+    store = bg_fleet["store"]
+    wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {"verdict.json": "{}"})
+    store.conn.execute("UPDATE work_orders SET kind='investigator' WHERE id=?", (wo["id"],))
+    store.conn.commit()
+    store.set_status(wo["id"], status)
+
+    worker_session.poll(store)
+
+    assert (store.get_work_order(wo["id"])["bg_id"] is None) is removed
+    assert (tree / "verdict.json").exists() is not removed
+
+
+def test_read_only_directories_are_made_removable(tmp_path):
+    """A read-only __pycache__ failed the removal half-way with EACCES (wo-b6e2ddda)"""
+    from jarvis import disk
+
+    locked = tmp_path / "pkg" / "__pycache__"
+    locked.mkdir(parents=True)
+    (locked / "m.pyc").write_text("x")
+    locked.chmod(0o555)
+
+    assert disk.make_dirs_writable(tmp_path) == 1
+    shutil.rmtree(tmp_path / "pkg")
+
+
+def test_a_tree_only_a_person_may_delete_names_the_command():
+    refusal = ("claude rm 267c11ef... failed (rc=1): kept 267c11ef — its worktree is "
+               "still at “/w/.claude/worktrees/wo-x”\n  Worktree not removed. Refused "
+               "before anything was deleted; remove it by hand.")
+    assert "`rm -rf /w/.claude/worktrees/wo-x`" in invariants._session_kept_ask(refusal)
 
 
 def test_a_failed_order_keeps_its_session(bg_fleet, fake_claude, settle_turns):

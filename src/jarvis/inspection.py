@@ -1142,6 +1142,9 @@ CACHE_1H_FOREIGN_ALARM = "cache-1h-foreign"
 #: THE STAMP AGAINST THE RATE: an arm that never reached the CLI (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
 CACHE_ARM_MISSED_ALARM = "cache-arm-missed"
 
+#: About the whole fleet: the work order they hang off carries the foreign key only (supervisor.py)
+FLEET_WIDE_KINDS = frozenset({CACHE_1H_DISPATCHED_ALARM, CACHE_ARM_MISSED_ALARM})
+
 #: What each kind IS, for a surface listing alarms rather than raising one
 ALARM_KINDS = {
     TURN_ALARM: "a turn still running, still being billed",
