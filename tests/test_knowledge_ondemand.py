@@ -133,7 +133,16 @@ def test_empty_base_also_removes_the_instructions_to_read_it(jarvis_home):
     central.add_knowledge("something worth knowing", project="p1", topic="ci")
     stocked = build_worker_prompt(wo, SPEC, central.knowledge_brief("p1"))
     assert "jarvis learn search" in stocked     # negative control
-    assert "LOOK IT UP FIRST" in stocked
+    assert "before you ask Neo" in stocked
+    assert "LOOK IT UP FIRST" not in stocked    # issue 1368: the index block says it
+
+
+def test_compaction_brief_keeps_the_knowledge_pointer():
+    """No index follows the re-asserted core after compaction, so it still points"""
+    from jarvis.hooks import worker_brief_core
+    core = "\n".join(worker_brief_core("wo-1", "t", "p1"))
+    assert "jarvis learn show" in core
+    assert "LOOK IT UP FIRST" in core
 
 
 # -- the prompt tells the worker to go and read
@@ -145,9 +154,10 @@ def test_prompt_teaches_on_demand_retrieval(jarvis_home):
     assert "jarvis learn search" in prompt
     assert "jarvis learn show <id>" in prompt
     assert "INDEX, not the knowledge" in prompt
-    # and the contract itself must carry the read verb, not only the write verb
+    # Issue 1368: the read verb lives in the index block only; the contract keeps the write verb
     contract = prompt[prompt.index("# Operating contract"):prompt.index("# Full briefings")]
-    assert "jarvis learn search" in contract
+    assert "jarvis learn search" not in contract
+    assert "LOOK IT UP FIRST" not in contract
     assert "jarvis learn add" in contract
 
 
