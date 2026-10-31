@@ -130,9 +130,12 @@
       for (var i = 0; i < STEPS.length; i++) {
         if ((view.b - view.a) / STEPS[i] <= want) { step = STEPS[i]; break; }
       }
+      // Stepped in zone-local seconds, each tick re-offset: a DST change mid-view keeps midnights.
       var off = zoneOffset(view.a), out = [];
-      for (var t = Math.ceil((view.a + off) / step) * step - off; t <= view.b; t += step) {
-        out.push({ t: t, label: step >= 86400 || (t + off) % 86400 === 0
+      for (var L = Math.ceil((view.a + off) / step) * step; ; L += step) {
+        var t = L - zoneOffset(L - off);
+        if (t > view.b) break;
+        out.push({ t: t, label: step >= 86400 || L % 86400 === 0
                                  ? fmtDay.format(new Date(t * 1000))
                                  : fmtTime.format(new Date(t * 1000)) });
       }
@@ -264,10 +267,13 @@
       }, 250);
     }
 
+    // The page a chart gesture opened this one from (per Neo Q2663); reset returns to it.
+    var back = new URLSearchParams(window.location.search).get('back');
+
     function viewChanged() {
       var zoomed = view.a !== data.since || view.b !== data.until;
       controls.querySelector('[data-act=apply]').disabled = !zoomed;
-      controls.querySelector('[data-act=reset]').disabled = !zoomed;
+      controls.querySelector('[data-act=reset]').disabled = !zoomed && back === null;
       // The custom-dates form follows the chart; `apply range` submits it.
       var since = document.querySelector('form input[name=since]');
       var until = document.querySelector('form input[name=until]');
@@ -276,20 +282,25 @@
 
     function open(a, b) {
       var q = new URLSearchParams({ since: localInput(a), until: localInput(b),
-                                    project: data.project, tz: data.zone });
+                                    project: data.project, tz: data.zone,
+                                    back: window.location.search.slice(1) });
       window.location.href = '/cost?' + q.toString();
     }
 
     svg.addEventListener('wheel', function (e) {
+      if (!e.deltaY) return;   // a sideways swipe is not a zoom; let the page have it
       e.preventDefault();
       var rect = svg.getBoundingClientRect();
-      var t = tAt(e.clientX - rect.left), f = e.deltaY > 0 ? 1.25 : 0.8;
+      // Scaled by the delta: one gesture is dozens of small events, 25% each slammed the limit.
+      var px = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? H : 1);
+      var t = tAt(e.clientX - rect.left), f = Math.pow(1.25, Math.max(-3, Math.min(3, px / 100)));
+      // The endpoint's bounds (`ops.METER_TIMELINE_MAX_SECONDS`), clamped before asking.
+      f = Math.max(600 / (view.b - view.a), Math.min(MAX_SPAN / (view.b - view.a), f));
       var a = t - (t - view.a) * f, b = t + (view.b - t) * f;
       // A current window ends at its reset, ahead of now; zoom-out never runs past either.
       var now = Math.max(Date.now() / 1000, data.until);
-      // The endpoint's bounds (`ops.METER_TIMELINE_MAX_SECONDS`), enforced before asking.
-      if (b - a < 600 || b - a > MAX_SPAN) return;
       if (b > now) { a -= b - now; b = now; }
+      if (a === view.a && b === view.b) return;
       view = { a: a, b: b };
       viewChanged();
       draw();
@@ -342,6 +353,10 @@
       var act = e.target.dataset && e.target.dataset.act;
       if (act === 'apply') open(view.a, view.b);
       if (act === 'reset') {
+        if (view.a === data.since && view.b === data.until && back !== null) {
+          window.location.href = '/cost?' + back;
+          return;
+        }
         view = { a: data.since, b: data.until };
         main = data.timeline;
         seq++;
@@ -351,6 +366,7 @@
       }
     });
     window.addEventListener('resize', draw);
+    viewChanged();
     draw();
   })();
   </script>

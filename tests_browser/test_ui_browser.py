@@ -1499,6 +1499,85 @@ def test_the_meter_chart_hovers_toggles_overlays_and_zooms(page, server, project
     assert page.is_enabled("[data-act=apply]")
 
 
+def _meter_page(page, url):
+    page.goto(url)
+    chart = page.locator(".meter-chart svg")
+    chart.wait_for()
+    chart.scroll_into_view_if_needed()
+    box = chart.bounding_box()
+    page.mouse.move(box["x"] + box["width"] * 0.6, box["y"] + 80)
+    return box
+
+
+def _form_span(page) -> float:
+    from datetime import datetime
+    a, b = (datetime.fromisoformat(page.input_value(f"form input[name={k}]"))
+            for k in ("since", "until"))
+    return (b - a).total_seconds()
+
+
+def test_the_meter_wheel_zooms_by_the_delta_and_reset_restores(page, server, project):
+    _cost_rows(project)
+    _meter_samples(900)
+    _meter_page(page, f"{server}/cost?window=5h&project=proj_a")
+    assert not page.is_enabled("[data-act=reset]")
+    span = _form_span(page)
+    # One trackpad gesture is many small events: ten 10px ticks are one 100px notch, not ten
+    for _ in range(10):
+        page.mouse.wheel(0, -10)
+    page.wait_for_timeout(100)
+    assert 0.7 * span < _form_span(page) < 0.9 * span
+    page.click("[data-act=reset]")
+    assert _form_span(page) == span
+    assert not page.is_enabled("[data-act=reset]")
+
+
+def test_reset_after_a_drag_select_returns_to_the_window_it_came_from(page, server, project):
+    _cost_rows(project)
+    _meter_samples(900)
+    origin = f"{server}/cost?window=5h&project=proj_a"
+    box = _meter_page(page, origin)
+    page.mouse.move(box["x"] + box["width"] * 0.3, box["y"] + 80)
+    page.mouse.down()
+    page.mouse.move(box["x"] + box["width"] * 0.6, box["y"] + 80, steps=5)
+    with page.expect_navigation():
+        page.mouse.up()
+    page.locator(".meter-chart svg").wait_for()
+    assert "back=" in page.url
+    _shot(page, "cost-meter-reset-after-drag")
+    assert page.is_enabled("[data-act=reset]")   # view equals this page's window, yet a way back
+    with page.expect_navigation():
+        page.click("[data-act=reset]")
+    assert page.url == origin
+
+
+def test_meter_day_ticks_stay_on_midnight_across_a_dst_change(page, server, project):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from jarvis import usage_meter
+    from jarvis.central_store import CentralStore
+
+    la = ZoneInfo("America/Los_Angeles")
+    start = datetime(2026, 10, 30, tzinfo=la).timestamp()
+    central = CentralStore()
+    try:
+        for i in range(0, 4 * 86_400, 1800):   # PDT ends 2026-11-01 02:00
+            usage_meter.record(central, usage_meter.Sample(
+                ts=start + i, ok=True, five_hour_pct=10.0, five_hour_resets_at=start + i + 3600,
+                seven_day_pct=5.0, seven_day_resets_at=start + i + 86_400))
+        central.conn.commit()
+    finally:
+        central.close()
+    _cost_rows(project)
+    _meter_page(page, f"{server}/cost?since=2026-10-30T00:00&until=2026-11-03T00:00"
+                      "&tz=America/Los_Angeles&project=proj_a")
+    _shot(page, "cost-meter-dst-ticks")
+    labels = page.locator(".meter-chart svg > text").all_text_contents()[5:]
+    assert "Nov 2" in labels and len(set(labels)) == len(labels), labels
+    assert all(":" not in s or s == "12:00" for s in labels), labels
+
+
 def test_config_reads_and_stacks_history_over_diff(page, server, readable):
     ops.adopt_config(reason="the file as it shipped")
     ops.set_config("os.ui.port", 9999)
