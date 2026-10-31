@@ -60,3 +60,22 @@ def test_report_writes_nothing_and_apply_stops_everything(started, fake_claude, 
     assert central.get_inbox(mine)["status"] == "acked"
     assert central.get_inbox(other)["status"] != "acked"
     assert ops.quiesce_project("proj_a")["open"] == []
+
+
+def test_open_decision_order_refuses_before_any_cancel_inside_a_work_order(
+        started, project, monkeypatch):
+    wo = ops.create_work_order("proj_a", "open task")
+    do = ops.create_decision_order("proj_a", "pick a vendor", "compare prices")
+    store = ProjectStore(project)
+
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-deadbeef")
+    with pytest.raises(ops.OpsError, match=do["id"]):
+        ops.quiesce_project("proj_a", apply=True)
+    assert store.get_work_order(wo["id"])["status"] != "cancelled"
+    assert store.get_feature_order(do["id"])["status"] != "cancelled"
+
+    monkeypatch.delenv("JARVIS_WO_ID")
+    out = ops.quiesce_project("proj_a", apply=True)
+    assert {wo["id"], do["id"]} <= set(out["cancelled"])
+    assert store.get_work_order(wo["id"])["status"] == "cancelled"
+    assert store.get_feature_order(do["id"])["status"] == "cancelled"

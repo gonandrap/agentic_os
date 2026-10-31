@@ -9628,6 +9628,15 @@ def quiesce_project(name: str, apply: bool = False,
                            "backlog_dropped": 0, "inbox_acked": 0, "reason": reason}
     if not apply:
         return out
+    # Before any side effect: _user_closes_decision would raise halfway through
+    open_dos = [f["id"] for f in fos if f["kind"] == "decision"]
+    if open_dos and os.environ.get("JARVIS_WO_ID"):
+        raise OpsError(
+            f"refusing to offboard {name!r} from inside a work-order session "
+            f"({os.environ['JARVIS_WO_ID']}): it has open decision order(s) "
+            f"{', '.join(open_dos)}, and closing one is the user's call, never an "
+            f"agent's. Nothing was cancelled. The user runs `jarvis offboard {name}` "
+            f"from their own terminal.")
     # A decision order through the user's own verb: offboarding is the user's call
     cancellers = {"improvement": cancel_improvement_order,
                   "investigation": cancel_investigation_order,
