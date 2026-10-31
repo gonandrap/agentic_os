@@ -138,6 +138,20 @@ def read_user_skills(home: Path | None = None) -> list[tuple[str, str]]:
     return out
 
 
+def read_synced_skills(home: Path | None = None) -> list[tuple[str, str]]:
+    """`(anthropic-skills:<name>, description)` for every claude.ai synced skill"""
+    out = []
+    for manifest in sorted(((home or claude_home()) / "skills" / "synced").glob("*/manifest.json")):
+        try:
+            skills = json.loads(manifest.read_text()).get("skills") or []
+        except (OSError, ValueError, AttributeError):
+            continue
+        for s in skills:
+            if isinstance(s, dict) and s.get("name"):
+                out.append((f"anthropic-skills:{s['name']}", str(s.get("description") or "")))
+    return sorted(set(out))
+
+
 def _plugin_detail(entry: dict[str, Any]) -> str:
     """What a plugin contributes, read from the copy on disk"""
     path = Path(str(entry.get("installPath") or ""))
@@ -232,6 +246,9 @@ def discover(*, refresh: bool = False, timeout: int = 90) -> Inventory:
 
     for name, detail in read_user_skills():
         inv.items.append(Item(kind="skill", name=name, source="your skills directory",
+                              detail=detail, lever=f"{LEVER_SKILL}{name}"))
+    for name, detail in read_synced_skills():
+        inv.items.append(Item(kind="skill", name=name, source="claude.ai synced",
                               detail=detail, lever=f"{LEVER_SKILL}{name}"))
     inv.items.append(Item(
         kind="skill", name="Claude Code's bundled skills",
