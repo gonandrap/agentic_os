@@ -418,12 +418,12 @@ def test_the_subagent_block_says_not_to_watch_a_seat():
 def test_worker_core_keeps_git_the_pr_and_the_record_with_the_lead():
     from jarvis import worker_brief
     core = "\n".join(worker_brief.core_contract("wo-crew01", "t", "p1",
-                                                has_knowledge=False))
+                                                knowledge_pointer=False))
     for kept in ("git", "pr", "`jarvis", "review"):
         assert kept in core.lower()
     # the lead's own editing is refused by a hook, so the block states the mechanism
     crew = "\n".join(worker_brief.core_contract("wo-crew01", "t", "p1",
-                                                has_knowledge=False, require_crew=True))
+                                                knowledge_pointer=False, require_crew=True))
     assert "refused by a hook" in crew
 
 
@@ -478,7 +478,7 @@ def test_core_contract_carries_the_poll_rhythm():
     from jarvis import worker_brief
 
     core = "\n".join(worker_brief.core_contract("wo-brief01", "t", "p1",
-                                               has_knowledge=False,
+                                               knowledge_pointer=False,
                                                transport="headless"))
     bullet = [line for line in core.split("\n")
               if line.startswith("- **A turn is one-shot")]
@@ -500,7 +500,7 @@ def test_core_contract_no_longer_says_re_run_in_the_foreground():
     from jarvis import worker_brief
 
     core = "\n".join(worker_brief.core_contract("wo-brief01", "t", "p1",
-                                                has_knowledge=False))
+                                                knowledge_pointer=False))
 
     assert "re-run it in the FOREGROUND and wait" not in core
     assert "in the FOREGROUND and wait" not in core
@@ -650,7 +650,7 @@ def test_a_background_worker_is_told_it_is_woken_and_never_to_poll():
     from jarvis import worker_brief
 
     core = "\n".join(worker_brief.core_contract("wo-bg01", "t", "p1",
-                                                has_knowledge=False,
+                                                knowledge_pointer=False,
                                                 transport="background"))
     assert "it wakes you" in core and "NEVER poll it" in core
     for gone in ("3-4 minutes", "240 seconds", "one-shot", "Stop hook refuses"):
@@ -680,5 +680,5 @@ def test_assume_guidance_says_a_citation_does_not_carry_the_argument():
     """Neo Q2290: a cited sibling may be withheld from Neo, so the assumption must stand alone"""
     from jarvis import worker_brief
     assert "Neo may not be shown what you cite" in worker_brief.assume_shape("wo-x")
-    core = "\n".join(worker_brief.core_contract("wo-x", "t", "p", has_knowledge=False))
+    core = "\n".join(worker_brief.core_contract("wo-x", "t", "p", knowledge_pointer=False))
     assert "RARE and self-contained" in core

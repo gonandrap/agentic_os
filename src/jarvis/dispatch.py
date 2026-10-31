@@ -445,7 +445,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         *(["", *_dependency_block(dependencies)] if dependencies else []),
         "",
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
-                                    bool(knowledge), live_gates,
+                                    False, live_gates,  # the knowledge block below says it (issue 1368)
                                     kind=str(wo.get("kind") or "worker"),
                                     transport=worker_session.transport_of(project, wo),
                                     require_crew=project.worker.require_crew),
