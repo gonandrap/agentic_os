@@ -271,6 +271,12 @@ def _what_it_is(wo: dict[str, Any]) -> str:
                 f"in a verdict; a long GENERATING stretch, or a run of DENIED tool calls "
                 f"it keeps retrying (its writes and mutating commands are refused by a "
                 f"hook), is not")
+    if kind == "researcher":
+        # §3 of docs/superpowers/specs/2026-10-31-decision-orders.md
+        owns = f" of decision order {parent}" if parent else ""
+        return (f"the RESEARCHER{owns} — one read-and-measure session gathering data for "
+                f"a decision the user takes, ending by submitting a report; long reads and "
+                f"many commands are normal; a commit or a pull request is NOT")
     if kind == "planner":
         return (f"the PLANNER{belongs} — one session reading the codebase to decompose "
                 f"a single ask into work orders, so it is expected to be long and "

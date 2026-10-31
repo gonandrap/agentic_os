@@ -1321,6 +1321,24 @@ class Daemon:
             log.info("[%s] investigating %s: opened %s", project.name, fo["id"],
                      wo["id"])
 
+        # docs/superpowers/specs/2026-10-31-decision-orders.md §3: a fourth sibling loop
+        for fo in store.list_feature_orders(statuses=("pending",), kind="decision"):
+            try:
+                wo = store.create_work_order(
+                    title=f"Research: {fo['title']}"[:200],
+                    # The ask verbatim; the researcher CONTRACT is composed at dispatch
+                    description=fo["description"],
+                    origin="os", kind="researcher", parent_id=fo["id"],
+                )
+            except Exception:  # noqa: BLE001 — one bad decision order must not stop the rest
+                log.exception("[%s] could not open a researcher for %s", project.name,
+                              fo["id"])
+                continue
+            store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
+            # LAST, so a crashed tick re-files rather than strands
+            store.set_feature_status(fo["id"], "planning")
+            log.info("[%s] researching %s: opened %s", project.name, fo["id"], wo["id"])
+
     def refresh_plan_specs(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Re-ask any plan review whose spec has been committed over"""
         from . import ops

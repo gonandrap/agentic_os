@@ -376,14 +376,14 @@ def _dependency_block(dependencies: list[dict[str, Any]]) -> list[str]:
 
 def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """The parent order a MANAGER or an ANALYST needs"""
-    if (wo.get("kind") not in ("manager", "analyst", "investigator")
+    if (wo.get("kind") not in ("manager", "analyst", "investigator", "researcher")
             or not wo.get("parent_id")):
         return None
     try:
         fo = store.get_feature_order(wo["parent_id"])
     except KeyError:
         return None  # a briefing is not the place to raise on a deleted parent
-    if wo.get("kind") in ("analyst", "investigator"):
+    if wo.get("kind") in ("analyst", "investigator", "researcher"):
         # Neither has children: an improvement order and an investigation are one row plus one session
         return {"fo": fo, "children": []}
     return {"fo": fo, "children": store.feature_children(fo["id"], kinds=WORKER_CHILDREN)}
@@ -418,6 +418,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         return _analyst_prompt(wo, project, knowledge, feature)
     if wo.get("kind") == "investigator":
         return _investigator_prompt(wo, project, knowledge, feature)
+    if wo.get("kind") == "researcher":
+        return _researcher_prompt(wo, project, knowledge, feature)
     from . import os_map, wiring, worker_brief, worker_session
     from .gates import KINDS
 
@@ -486,7 +488,7 @@ def _navigation_briefing(serena: bool = True, tool_search: str = "cli") -> list[
 
 
 #: Kinds whose hooks refuse every write, so they never reach a gate
-READ_ONLY_KINDS = ("investigator", "analyst")
+READ_ONLY_KINDS = ("investigator", "analyst", "researcher")
 
 
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
@@ -1093,6 +1095,93 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "are unsure about, and absolute paths.",
         "",
         "Work autonomously toward a submitted verdict. User feedback may arrive as new "
+        "user turns; treat it as authoritative.",
+    ]
+    return "\n".join(_common_briefing(parts, wo, project, knowledge))
+
+
+def _researcher_prompt(wo: dict[str, Any], project: ProjectSpec,
+                       knowledge: KnowledgeBrief | None = None,
+                       feature: dict[str, Any] | None = None) -> str:
+    """The briefing for a decision order's researcher (docs/superpowers/specs/2026-10-31-decision-orders.md §3)"""
+    from . import decision_report, worker_brief
+    from .hooks import RESEARCHER_REPORT, RESEARCHER_SCRATCH
+
+    do_id = wo.get("parent_id") or "?"
+    fo = (feature or {}).get("fo") or {}
+    submit = f"jarvis do report {do_id} --from-file {RESEARCHER_REPORT}"
+    parts = [
+        f"You are the RESEARCHER for Jarvis decision order `{do_id}` in project "
+        f"`{project.name}`, running as work order `{wo['id']}`.",
+        "",
+        "# Your job: gather the data for a decision the USER will take",
+        "The user files a decision order when they must choose and want the facts first. "
+        "You find out, measure and compare; the user decides. You never decide for them "
+        "and never act on the decision.",
+        "",
+        f"# The ask: {fo.get('title') or wo['title']}",
+        "",
+        wo.get("description") or "(no further description — the title is the ask)",
+        "",
+        "# Read-only, except your scratch space",
+        f"- Run any read command, query or analysis script you need: `jarvis … show|list"
+        f"|cost|inspect`, `gh … view|list`, `git log|show|diff`, your own throwaway "
+        f"scripts. Long reads and many commands are normal.",
+        f"- Write scratch files ONLY under `{RESEARCHER_SCRATCH}/` or outside the "
+        f"worktree. Never edit a tracked file of the project.",
+        "- Never commit, never push, never open or merge a pull request. A hook refuses "
+        "all of these.",
+        "",
+        "# Deliver the report — that IS your finish",
+        f"Write it with the `Write` tool to `{RESEARCHER_REPORT}` in your worktree root and "
+        f"submit it with the command below, then END YOUR TURN. Do not call "
+        f"`jarvis wo finish`: the submission settles this work order. The validator names "
+        f"every problem at once, so one revision fixes all of them.",
+        "",
+        f"    {submit}",
+        "",
+        "```json",
+        decision_report.SCHEMA_TEXT,
+        "```",
+        "",
+        f"`summary`, `findings` (at least one) and `recommendation` are required; `options` "
+        f"and `proposed_orders` may be empty. Keys are unique lowercase slugs within their "
+        f"list. `evidence` items are free text: a command and its output, a record id, a "
+        f"file:line, a URL. `proposed_orders[].project` empty means `{project.name}`. Caps: "
+        f"`summary` {decision_report.MAX_SUMMARY_CHARS} characters, at most "
+        f"{decision_report.MAX_FINDINGS} findings, {decision_report.MAX_OPTIONS} options "
+        f"and {decision_report.MAX_PROPOSED_ORDERS} proposed orders.",
+        "",
+        "# Present, never act",
+        "- Lay out the options and recommend one, with why. Never act on any option.",
+        "- `proposed_orders` are PROPOSALS the user may file. You file nothing — no "
+        "`jarvis wo create`, `jarvis fo create` or `jarvis backlog add`.",
+        "- If the user asks for more, their message arrives as a new turn: revise and "
+        "submit the report again with the same command.",
+        "",
+        "# Operating contract",
+        f"- **Neo is your first responder for doubts about the RESEARCH** — how to measure, "
+        f"where a record lives: `jarvis wo ask {wo['id']} \"<your question>\"`, then END "
+        f"YOUR TURN; the answer arrives as your next user turn.",
+        "- WHICH OPTION TO TAKE is the user's question, never Neo's. Do not ask Neo to "
+        "choose, to approve, or whether to proceed: say it in the report's "
+        "`recommendation` and leave the choice to the user.",
+        worker_brief.assume_shape(wo["id"],
+                                  tail=" Record every one, including the small ones."),
+        "- Work only inside your worktree (you start in it).",
+        *([f"- The OS knowledge base is indexed at the end of this prompt: `jarvis learn "
+           f"search \"<term>\" --project {project.name}` ranks entries, `jarvis learn show "
+           f"<id>` returns a body."] if knowledge else []),
+        f"- The OS knowledge base is the ONLY memory that survives you: "
+        f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
+        "",
+        "# What the outside world sees",
+        "The work order record IS this conversation, as far as anyone else is concerned. "
+        "The last message of every turn you take is captured verbatim into it. End every "
+        "turn with the complete answer: what you found, what you could not measure, what "
+        "you are unsure about, and absolute paths.",
+        "",
+        "Work autonomously toward a submitted report. User feedback may arrive as new "
         "user turns; treat it as authoritative.",
     ]
     return "\n".join(_common_briefing(parts, wo, project, knowledge))

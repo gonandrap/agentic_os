@@ -181,6 +181,9 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "investigation_verdict":
         return (f"Investigated: {p.get('classification') or 'no classification'}",
                 " · ".join(x for x in (p.get("investigation"), p.get("filed")) if x))
+    if kind == "decision_report_submitted":
+        return (f"Decision report submitted for {p.get('do_id') or 'the decision order'}",
+                f"report {str(p.get('sha') or '')[:12]}")
     if kind == "decision_followup_filed":
         return (f"Filed {p.get('order_id') or 'an order'} from proposal {p.get('key') or '?'}",
                 p.get("do_id") or "")
