@@ -2312,6 +2312,54 @@ def test_a_feature_order_with_no_description_is_refused_by_the_browser_too(clien
     assert res.headers["location"].startswith("/project/proj_a?error=")
 
 
+def test_the_dashboard_offers_every_create_form(client):
+    page = client.get("/").text
+    for action in ("/wo/create", "/fo/create", "/io/create", "/inv/create"):
+        assert f'action="{action}"' in page
+
+
+def test_the_dashboard_takes_an_improvement_order(client):
+    res = client.post("/io/create", data={
+        "project": "proj_a", "title": "flaky retries",
+        "description": "retries keep failing the same way",
+        "refs": "wo-abc12345\n\n#42\n", "budget": "10"})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/io/proj_a/io-")
+    io = ops.show_improvement_order(res.headers["location"].rsplit("/", 1)[-1], "proj_a")
+    assert io["evidence_refs"] == ["wo-abc12345", "#42"]
+
+
+def test_an_improvement_order_with_no_evidence_is_refused_by_the_browser_too(client):
+    res = client.post("/io/create", data={"project": "proj_a", "title": "t",
+                                          "description": "saw it", "refs": " \n"})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/?error=")
+    assert ops.list_improvement_orders("proj_a") == []
+
+
+def test_the_dashboard_opens_an_investigation_in_the_subjects_project(client, project):
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+
+    res = client.post("/inv/create", data={"subject": subject,
+                                           "why": "no turn in six hours"})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/inv/proj_a/inv-")
+
+
+def test_an_investigation_of_an_unknown_order_is_refused_by_the_browser(client):
+    res = client.post("/inv/create", data={"subject": "wo-nope0000", "why": "stuck"})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/?error=")
+
+
 def test_cancelling_a_feature_order_from_the_browser(feature):
     client, fo = feature
 
