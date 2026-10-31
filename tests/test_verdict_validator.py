@@ -10,9 +10,15 @@ from jarvis import findings, gaps, verdicts
 from jarvis.testing import a_verdict
 
 
-def test_the_four_classifications_are_the_whole_vocabulary():
+def test_the_five_classifications_are_the_whole_vocabulary():
     assert verdicts.CLASSIFICATIONS == ("GAP", "WAITING_ON_USER", "TRANSIENT",
-                                        "ALREADY_TRACKED")
+                                        "ALREADY_TRACKED", "SCRIPT_WRONG")
+
+
+def test_script_wrong_needs_its_corrected_check():
+    with pytest.raises(verdicts.VerdictError) as e:
+        verdicts.parse_verdict(a_verdict("SCRIPT_WRONG", script_fix="wrong"))
+    assert any("script_fix" in p for p in e.value.problems)
 
 
 def test_each_classification_is_accepted_with_its_own_payload():
