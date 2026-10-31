@@ -2478,6 +2478,39 @@ def create_app() -> FastAPI:
             return RedirectResponse(f"/project/{project}?error={e}", status_code=303)
         return RedirectResponse(f"/fo/{project}/{fo['id']}", status_code=303)
 
+    @app.post("/io/create")
+    def create_io(project: str = Form(...), title: str = Form(...),
+                  description: str = Form(""), refs: str = Form(""),
+                  budget: str = Form("")):
+        from .. import budget as budget_mod
+
+        try:
+            io = ops.create_improvement_order(
+                project, title, description=description, origin="ui",
+                # One per line: a free-text ref may hold commas or spaces
+                refs=refs.splitlines(),
+                budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
+        except (ValueError, ops.OpsError) as e:
+            return RedirectResponse(f"/?{urlencode({'error': str(e)}, quote_via=quote)}",
+                                    status_code=303)
+        return RedirectResponse(f"/io/{project}/{io['id']}", status_code=303)
+
+    @app.post("/inv/create")
+    def create_inv(subject: str = Form(...), why: str = Form(""),
+                   budget: str = Form("")):
+        from .. import budget as budget_mod
+
+        try:
+            inv = ops.create_investigation_order(
+                None, subject, why, origin="ui",
+                budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
+            # The subject decides the project, so the form never asks for one
+            project = ops.show_investigation_order(inv["id"])["project"]
+        except (ValueError, ops.OpsError) as e:
+            return RedirectResponse(f"/?{urlencode({'error': str(e)}, quote_via=quote)}",
+                                    status_code=303)
+        return RedirectResponse(f"/inv/{project}/{inv['id']}", status_code=303)
+
     @app.post("/fo/{name}/{fo_id}/review")
     def review_plan(name: str, fo_id: str, decision: str = Form(...),
                     feedback: str = Form("")):
