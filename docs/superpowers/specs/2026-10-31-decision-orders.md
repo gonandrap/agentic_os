@@ -286,7 +286,7 @@ finish, which is what §5 keys on.
 `deliverable`+`chair` (not void, not the project roster); a feature planner's
 `plan_submitted` effect is unchanged; a dirty tracked file still refuses at finish.
 
-## 5. Delivery: from a validated report to the user
+## 5. Delivery and doctor: from a validated report to the user, and the post-conditions that hold it
 
 Owns the transition to `awaiting_decision`, the notification, the attention line, the
 `send` verb, what happens when the researcher dies, and the doctor post-conditions.
@@ -328,7 +328,8 @@ list an `awaiting_decision` order on every tick until done/cancel —
 `invariants.check_settled_parents_have_no_orphans` (invariants.py:~2628) touches flags on
 any kind; cover it.
 
-**5.5 Doctor post-conditions** (`invariants.INVARIANTS`):
+**5.5 Doctor post-conditions** (`invariants.INVARIANTS`). The ask's "doctor must know
+the kind" is owned HERE: `jarvis doctor` runs these, and §7 adds none:
 
 * `INV-DECISION-USER-CLOSED` — a `kind='decision'` row in a terminal status with no
   `decision_closed_by_user` event. Never repairable; reports critical. This is the
