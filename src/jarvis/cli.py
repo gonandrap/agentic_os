@@ -1347,6 +1347,15 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("do_id")
     d.add_argument("--project")
 
+    d = dec.add_parser("report", help="(researchers) submit the decision report — the "
+                                      "researcher's finish; the order stays open for you")
+    d.add_argument("do_id")
+    d.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
+                   help="the report, as JSON; `-` reads stdin. A file rather than an "
+                        "argument: a report full of quoted output trips the "
+                        "privileged-action classifier")
+    d.add_argument("--project")
+
     d = dec.add_parser("done", help="you have decided: close the order")
     d.add_argument("do_id")
     d.add_argument("--note", default="", help="what you decided, for the record")
@@ -4406,22 +4415,24 @@ def cmd_do(args: argparse.Namespace) -> int:
             if detail["researcher"]:
                 r = detail["researcher"]
                 print(f"researcher: {r['id']} ({r['status']})")
-            report = detail["report"]
-            if not report:
-                print("\nno report yet")
-            else:
-                # Plain on purpose: §3 replaces this with the full renderer
-                print(f"\nsummary: {report.get('summary') or ''}")
-                rec = report.get("recommendation") or {}
-                if isinstance(rec, dict):
-                    print(f"recommendation: {rec.get('option') or '(none)'} — "
-                          f"{rec.get('why') or ''}")
-                for key in ("findings", "options", "proposed_orders"):
-                    items = [i for i in (report.get(key) or []) if isinstance(i, dict)]
-                    if items:
-                        print(f"{key.replace('_', ' ')}: "
-                              + ", ".join(f"{i.get('key')} {i.get('title') or ''}".strip()
-                                          for i in items))
+            from . import decision_report
+
+            print(f"\n{decision_report.render_report(detail['report'])}")
+
+    elif args.do_cmd == "report":
+        if args.from_file == "-":
+            text, where = sys.stdin.read(), "stdin"
+        else:
+            path = Path(args.from_file)
+            if not path.is_file():
+                raise ops.OpsError(f"no such report file: {path}")
+            text, where = path.read_text(), str(path)
+        try:
+            doc = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ops.OpsError(f"{where} is not valid JSON: {e}") from e
+        _print(ops.submit_decision_report(args.do_id, doc, project_name=args.project),
+               args.json)
 
     elif args.do_cmd == "done":
         _print(ops.complete_decision_order(args.do_id, note=args.note,

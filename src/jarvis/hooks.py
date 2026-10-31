@@ -1187,6 +1187,78 @@ def investigator_bash_decision(payload: dict[str, Any],
     )
 
 
+#: The report a researcher writes, and the only scratch tree it may write in its worktree (docs/superpowers/specs/2026-10-31-decision-orders.md §3)
+RESEARCHER_REPORT = WO_KIND_CONTRACTS["researcher"].artifact
+RESEARCHER_SCRATCH = Path(".jarvis") / "scratch"
+
+#: Shared tail of each researcher refusal: what it may do instead
+_RESEARCHER_INSTEAD = (
+    f"You are a RESEARCHER: you gather data for a decision the user takes, and you ship "
+    f"nothing. Write notes and analysis scripts under `{RESEARCHER_SCRATCH}/` or outside "
+    f"the worktree, write the report to `{RESEARCHER_REPORT}`, and deliver it with "
+    f"`jarvis do report <do-id> --from-file {RESEARCHER_REPORT}`, which is your finish. A "
+    f"change worth making goes in the report's `proposed_orders` for the user to file.")
+
+
+def _researcher_ships(segment: str) -> str:
+    """The shipping verb one shell SEGMENT runs (`git commit` …), or `""`"""
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        words = segment.split()
+    while words and "=" in words[0] and not words[0].startswith("-"):
+        words = words[1:]  # `VAR=x git push`
+    if not words:
+        return ""
+    program = Path(words[0].lstrip("\\")).name
+    rest = words[1:]
+    if program == "git":
+        while rest and rest[0].startswith("-"):
+            # `-C dir` / `-c k=v` carry an argument; `--git-dir=x` does not
+            rest = rest[2:] if rest[0] in ("-C", "-c") else rest[1:]
+        if rest and rest[0] in ("commit", "push"):
+            return f"git {rest[0]}"
+    if program == "gh" and len(rest) >= 2 and rest[0] == "pr" and rest[1] in ("create",
+                                                                              "merge"):
+        return f"gh pr {rest[1]}"
+    return ""
+
+
+def researcher_bash_decision(payload: dict[str, Any],
+                             env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a RESEARCHER's commit, push and pull request; every other command is its job"""
+    if env.get(WO_KIND_ENV) != "researcher" or payload.get("tool_name") != "Bash":
+        return None
+    from . import gate_rules
+
+    command = ((payload.get("tool_input") or {}).get("command") or "").strip()
+    for start, end, _name in gate_rules.segments(command):
+        verb = _researcher_ships(command[start:end].strip())
+        if verb:
+            return _deny(f"Refused: `{verb}`. {_RESEARCHER_INSTEAD}")
+    return None
+
+
+def researcher_write_decision(payload: dict[str, Any],
+                              env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a RESEARCHER's edit to a worktree file other than its report and its scratch tree"""
+    if env.get(WO_KIND_ENV) != "researcher":
+        return None
+    tool_input = payload.get("tool_input") or {}
+    file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+    cwd = payload.get("cwd") or ""
+    if not file_path or not cwd:
+        return None
+    try:
+        rel = Path(file_path).resolve().relative_to(Path(cwd).resolve())
+    except ValueError:
+        return None  # outside the worktree: scratch space, which is allowed
+    if rel == Path(RESEARCHER_REPORT) or rel.is_relative_to(RESEARCHER_SCRATCH):
+        return None
+    return _deny(f"Refused: `{rel}` is a file of the project, and a researcher edits none. "
+                 f"{_RESEARCHER_INSTEAD}")
+
+
 #: The refusal IS the mitigation, so it names the call to make instead and the activation fallback
 _PY_NAV_DENY = (
     "Refused: read Python with SYMBOLS, not text. Call "
@@ -1802,6 +1874,10 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         heredoc = heredoc_write_decision(payload, env)
         if heredoc is not None:
             return heredoc
+        # Before the gate, for the heredoc's reason: it never allows, and a refused ship files no gate request
+        shipping = researcher_bash_decision(payload, env)
+        if shipping is not None:
+            return shipping
         gated = gate_decision(payload, env)
         if gated is not None:
             return gated
@@ -1884,6 +1960,9 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         read_only = investigator_write_decision(payload, env)
         if read_only is not None:
             return read_only
+        researching = researcher_write_decision(payload, env)
+        if researching is not None:
+            return researching
         shapeless = spec_shape_decision(payload, env)
         if shapeless is not None:
             return shapeless

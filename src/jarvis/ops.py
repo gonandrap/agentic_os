@@ -9421,6 +9421,64 @@ def set_decision_budget(do_id: str, amount: float | None,
     return set_feature_budget(do_id, amount, project_name)
 
 
+#: On the researcher's timeline: a report was stored (§1.3)
+DECISION_REPORT_EVENT = "decision_report_submitted"
+
+
+def submit_decision_report(do_id: str, doc: Any,
+                           project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do report` — store the report; status and attention are delivery's (§3, §5)"""
+    from . import decision_report
+    from .project_store import decision_report_sha
+
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", show_verb(fo.get("kind")))
+    if fo["status"] not in ("planning", "awaiting_decision"):
+        raise OpsError(
+            f"{do_id} is {feature_status_label('decision', fo['status'])}, so it takes no "
+            f"report: a report is accepted while it is researching, or as a revision while "
+            f"it is awaiting the user's decision. See `jarvis do show {do_id}`.")
+    try:
+        report = decision_report.parse_report(doc)
+    except decision_report.DecisionReportError as e:
+        raise OpsError(
+            "the report was not accepted, and nothing was stored. Fix all of these and "
+            "resubmit:\n  - " + "\n  - ".join(e.problems)) from e
+    plan = db.to_json(report)
+    sha = decision_report_sha(plan)
+    researcher_open = False
+    store = ProjectStore(path)
+    try:
+        # The WHOLE document, replacing any earlier one; status stays put — delivery moves it after validation
+        store.update_feature_order(do_id, plan=plan)
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], DECISION_REPORT_EVENT,
+                            {"do_id": do_id, "sha": sha})
+            try:
+                researcher_open = (store.get_work_order(fo["plan_wo_id"])["status"]
+                                   in OPEN_STATUSES)
+            except KeyError:
+                researcher_open = False  # deleted out from under it; the link was released
+    finally:
+        store.close()
+    out: dict[str, Any] = {
+        "project": name, "do_id": do_id, "status": fo["status"], "sha": sha,
+        "findings": len(report["findings"]), "options": len(report["options"]),
+        "note": "stored — the OS validates it, then delivers it to the user, who alone "
+                "decides. End your turn.",
+    }
+    if researcher_open:
+        try:
+            out["researcher"] = _settle_submitter(
+                path, fo["plan_wo_id"],
+                f"submitted the decision report for {do_id}: "
+                f"{decision_report.headline(fo, report)}",
+                "decision_report_settled", {"do_id": do_id, "sha": sha})
+        except OpsError as e:
+            out["warning"] = submitter_unsettled("report", do_id, fo["plan_wo_id"], e)
+    return out
+
+
 OFFBOARDED_EVENT = "offboarded"
 
 
@@ -9699,6 +9757,10 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
         )
 
     context = f"{wo['title']}\n{(wo.get('description') or '')[:800]}"
+    if wo.get("kind") == "researcher":
+        from .neo import RESEARCHER_RULE
+
+        context = f"{RESEARCHER_RULE}\n\n{context}"
     for ref_path, which, section in _section_blocks(path, wo, question):
         context += f"\n\nReferenced artifact — {ref_path} § {which}:\n{section}"
     cited = _cited_blocks(name, path, wo, question)
