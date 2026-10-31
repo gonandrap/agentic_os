@@ -213,3 +213,194 @@ def test_the_cli_drives_the_whole_surface(started, store, capsys):
     assert store.get_feature_order(do_id)["status"] == "completed"
     assert cli.main(["do", "list", "--all"]) == 0
     assert "decided" in capsys.readouterr().out
+
+
+# -- delivery and doctor (§5)
+
+
+def _daemon(catalog_file):
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    return Daemon(load_catalog(catalog_file))
+
+
+def _deliver(catalog_file, store):
+    d = _daemon(catalog_file)
+    d.deliver_decisions(d.catalog.project("proj_a"), store)
+
+
+def _decision_notes(store, do_id):
+    return [dict(n) for n in store.conn.execute("SELECT * FROM notifications").fetchall()
+            if n["title"].startswith(do_id)]
+
+
+def _delivered(store, catalog_file):
+    do = _decision(store, researcher="completed", report=True)
+    _deliver(catalog_file, store)
+    return store.get_feature_order(do["id"])
+
+
+def test_a_validated_report_is_delivered_once(started, store, catalog_file):
+    do = _delivered(store, catalog_file)
+    assert do["status"] == "awaiting_decision" and do["needs_attention"]
+    assert do["attention_reason"].startswith("decision awaiting you: ")
+    assert do["attention_reason"].endswith(f"jarvis do show {do['id']}")
+    for _ in range(3):
+        _deliver(catalog_file, store)
+    notes = _decision_notes(store, do["id"])
+    assert len(notes) == 1 and notes[0]["level"] == "warning"
+    assert notes[0]["title"] == f"{do['id']} report ready: which cache"
+    assert "B is 30% cheaper" in notes[0]["body"] and "Recommendation: b" in notes[0]["body"]
+    ev = store.events_of_kind(do["plan_wo_id"], "decision_delivered")
+    assert len(ev) == 1
+    assert project_store.db.from_json(ev[0]["payload"]) == {
+        "do_id": do["id"], "sha": decision_report_sha(REPORT), "revised": False}
+    title, _ = timeline._describe("decision_delivered", {"do_id": do["id"], "revised": True})
+    assert title == f"Decision report revision delivered to you for {do['id']}"
+
+
+def test_a_running_researcher_is_not_delivered(started, store, catalog_file):
+    do = _decision(store, researcher="running", report=True)
+    _deliver(catalog_file, store)
+    row = store.get_feature_order(do["id"])
+    assert row["status"] == "planning" and not row["needs_attention"]
+
+
+def test_a_revision_notifies_once_and_filing_is_not_a_revision(started, store, catalog_file):
+    do = _delivered(store, catalog_file)
+    marked = {**REPORT, "proposed_orders": [{**REPORT["proposed_orders"][0],
+                                             "filed": [{"id": "wo-1"}]}]}
+    store.update_feature_order(do["id"], plan=project_store.db.to_json(marked))
+    _deliver(catalog_file, store)
+    assert len(_decision_notes(store, do["id"])) == 1
+    store.update_feature_order(do["id"], plan=project_store.db.to_json(
+        {**REPORT, "summary": "A wins after all"}))
+    for _ in range(2):
+        _deliver(catalog_file, store)
+    notes = _decision_notes(store, do["id"])
+    assert sorted(n["title"] for n in notes) == [f"{do['id']} report ready: which cache",
+                                                f"{do['id']} report revised: which cache"]
+    assert store.get_feature_order(do["id"])["status"] == "awaiting_decision"
+
+
+def test_delivery_reaches_the_users_sinks(started, store, catalog_file, monkeypatch):
+    from jarvis import notify
+    from jarvis.central_store import CentralStore
+
+    do = _delivered(store, catalog_file)
+    d = _daemon(catalog_file)
+    d.route_outbox(d.catalog.project("proj_a"), store)
+    seen = []
+    monkeypatch.setitem(notify.SINKS, "log", lambda item, catalog: seen.append(item) or "ok")
+    central = CentralStore()
+    try:
+        notify.route_new_inbox(central, d.catalog)
+    finally:
+        central.close()
+    assert [i["title"] for i in seen if i["title"].startswith(do["id"])] == [
+        f"{do['id']} report ready: which cache"]
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "completed"])
+def test_a_dead_researcher_leaves_the_order_open_and_flagged_once(started, store,
+                                                                  catalog_file, status):
+    do = _decision(store, researcher=status)
+    for _ in range(3):
+        _deliver(catalog_file, store)
+    row = store.get_feature_order(do["id"])
+    assert row["status"] == "planning" and row["needs_attention"]
+    assert row["attention_reason"].startswith(f"researcher {do['plan_wo_id']} ")
+    assert f'jarvis do send {do["id"]} "retry"' in row["attention_reason"]
+    assert len(_decision_notes(store, do["id"])) == 1
+
+
+def test_send_reaches_the_researcher_and_leaves_the_order(started, store, catalog_file):
+    do = _delivered(store, catalog_file)
+    out = ops.send_decision_message(do["id"], "dig into option a")
+    assert out["wo_id"] == do["plan_wo_id"] and out["status"] == "awaiting_decision"
+    row = store.get_feature_order(do["id"])
+    assert row["status"] == "awaiting_decision" and row["needs_attention"]
+    assert cli.main(["do", "send", do["id"], "and option b", "--json"]) == 0
+    ops.cancel_decision_order(do["id"])
+    with pytest.raises(ops.OpsError, match="jarvis do create"):
+        ops.send_decision_message(do["id"], "again")
+
+
+def test_the_doctor_detects_a_bypassed_guard_and_restores_the_flag(started, store,
+                                                                   catalog_file):
+    do = _delivered(store, catalog_file)
+    store.clear_feature_attention(do["id"])
+    found = [v for v in invariants.check_project(store) if v.subject_id == do["id"]]
+    assert [(v.invariant, v.repaired) for v in found] == [
+        ("INV-DECISION-AWAITING-FLAGGED", True)]
+    row = store.get_feature_order(do["id"])
+    assert row["needs_attention"] and row["attention_reason"].startswith("decision awaiting")
+    assert not [v for v in invariants.check_project(store) if v.subject_id == do["id"]]
+    # The user's close carries its record; a bypass does not
+    ops.complete_decision_order(do["id"])
+    assert not list(invariants.check_decisions_closed_by_user(store))
+    other = _decision(store, researcher=None)
+    store.update_feature_order(other["id"], status="cancelled", decided_by_user=True)
+    found = list(invariants.check_decisions_closed_by_user(store))
+    assert [(v.invariant, v.subject_id, v.level) for v in found] == [
+        ("INV-DECISION-USER-CLOSED", other["id"], "critical")]
+
+
+def test_status_attention_lists_an_awaiting_order_without_feature_progress(
+        started, store, catalog_file):
+    do = _delivered(store, catalog_file)
+    for _ in range(2):
+        invariants.check_project(store)
+        items = [a for a in ops.os_status()["attention"] if a.get("fo_id") == do["id"]]
+        assert len(items) == 1
+        assert items[0]["reason"] == store.get_feature_order(do["id"])["attention_reason"]
+        assert items[0]["decide"] == f"jarvis do show {do['id']}"
+
+
+def test_nothing_but_the_user_ever_completes_a_decision_order(started, store, catalog_file):
+    do = _decision(store, researcher="completed", report=True)
+    ops.set_decision_budget(do["id"], 0.01)
+    d = _daemon(catalog_file)
+    for _ in range(12):
+        # Tick 1 runs every `% N == 1` cadence: PR poll, reconcile, landing sweep, schedule
+        d.tick_count = 0
+        d.tick()
+        d.stuck_tick(None)
+        d.health_tick(None)
+        invariants.check_project(store, repair=True, slow=True)
+    row = store.get_feature_order(do["id"])
+    assert row["status"] == "awaiting_decision" and row["needs_attention"]
+    assert len(_decision_notes(store, do["id"])) == 1
+    ops.complete_decision_order(do["id"], note="B")
+    row = store.get_feature_order(do["id"])
+    assert row["status"] == "completed" and not row["needs_attention"]
+    assert store.events_of_kind(do["plan_wo_id"], "decision_closed_by_user")
+
+
+@pytest.mark.parametrize("route", ["wo_done", "close_out", "budget_raise", "budget_clear",
+                                   "hide", "delete"])
+def test_the_non_daemon_routes_leave_the_order_open(started, store, catalog_file, route):
+    do = _decision(store, researcher="running")
+    wo_id = do["plan_wo_id"]
+    if route == "wo_done":
+        ops.mark_done(wo_id)
+    elif route == "close_out":
+        ops.close_out(store, store.get_work_order(wo_id), "closed_by_test", why="test")
+    elif route == "budget_raise":
+        ops.set_decision_budget(do["id"], 50.0)
+    elif route == "budget_clear":
+        ops.set_decision_budget(do["id"], None)
+    elif route == "hide":
+        store.set_status(wo_id, "failed")
+        ops.hide_work_order(wo_id)
+    else:
+        ops.delete_work_order(wo_id)
+    for _ in range(2):
+        _deliver(catalog_file, store)
+    row = store.get_feature_order(do["id"])
+    assert row["status"] == "planning"
+    if route.startswith("budget"):
+        assert not row["needs_attention"]  # the researcher is still running
+    else:
+        assert row["needs_attention"] and len(_decision_notes(store, do["id"])) == 1

@@ -168,10 +168,7 @@ def _recommended(report: Mapping[str, Any]) -> dict[str, Any] | None:
                  if isinstance(o, dict) and o.get("key") == key), None)
 
 
-def render_report(report: Mapping[str, Any]) -> str:
-    """Plain text for `jarvis do show` and the inbox body"""
-    if not report:
-        return "no report yet"
+def _brief_lines(report: Mapping[str, Any]) -> list[str]:
     lines = [str(report.get("summary") or ""), ""]
     rec = report.get("recommendation") or {}
     chosen = _recommended(report)
@@ -179,6 +176,25 @@ def render_report(report: Mapping[str, Any]) -> str:
         head = f"{chosen['key']}: {chosen['title']}" if chosen else (rec.get("option") or "")
         lines += [f"Recommendation: {head or '(no option named)'}",
                   f"  why: {rec.get('why') or ''}", ""]
+    return lines
+
+
+def render_brief(report: Mapping[str, Any]) -> str:
+    """The summary and the recommendation only: the inbox body (spec §5.1)"""
+    return "\n".join(_brief_lines(report)).rstrip() if report else "no report yet"
+
+
+def awaiting_reason(fo: Mapping[str, Any], report: Mapping[str, Any]) -> str:
+    """The attention reason a delivered report raises, and INV-DECISION-AWAITING-FLAGGED restores"""
+    return f"decision awaiting you: {headline(fo, report)} — jarvis do show {fo.get('id')}"
+
+
+def render_report(report: Mapping[str, Any]) -> str:
+    """Plain text for `jarvis do show`"""
+    if not report:
+        return "no report yet"
+    lines = _brief_lines(report)
+    chosen = _recommended(report)
     findings = [f for f in report.get("findings") or [] if isinstance(f, dict)]
     if findings:
         lines.append(f"Findings ({len(findings)}):")

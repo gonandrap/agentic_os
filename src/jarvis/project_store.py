@@ -315,6 +315,11 @@ FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing", "validati
 FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 
+#: Researcher-timeline events (docs/superpowers/specs/2026-10-31-decision-orders.md §1.3)
+DECISION_CLOSED_EVENT = "decision_closed_by_user"
+DECISION_DELIVERED_EVENT = "decision_delivered"
+
+
 class DecisionOrderGuard(RuntimeError):
     """A terminal status on a decision order from anything but the user's verb (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
 
@@ -2461,6 +2466,40 @@ class ProjectStore:
 
     def clear_feature_attention(self, fo_id: str) -> None:
         self.update_feature_order(fo_id, needs_attention=0, attention_reason=None)
+
+    def raise_decision(self, do_id: str, while_status: str, reason: str, *, title: str,
+                       body: str, delivered: tuple[str, dict[str, Any]] | None = None) -> bool:
+        """Flag + warning notification, and on `delivered` the status and the event, as ONE unit (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
+        with db.write_transaction(self.conn):
+            # Re-read inside the lock: the user's `jarvis do done` may have landed since the caller's read
+            if self._status_of("feature_orders", do_id) != while_status:
+                return False
+            if delivered is not None:
+                self.set_feature_status(do_id, "awaiting_decision",
+                                        trigger=DECISION_DELIVERED_EVENT)
+                self.add_event(delivered[0], DECISION_DELIVERED_EVENT, delivered[1])
+            self.flag_feature_attention(do_id, reason)
+            self.add_notification(title=title, body=body, level="warning",
+                                  source="decision")
+        return True
+
+    def last_decision_delivery(self, researcher_id: str) -> dict[str, Any] | None:
+        """The payload of the newest `decision_delivered` event, None before the first"""
+        rows = self.events_of_kind(researcher_id, DECISION_DELIVERED_EVENT)
+        return db.from_json(rows[-1]["payload"], {}) if rows else None
+
+    def decisions_closed_without_user(self) -> list[dict[str, Any]]:
+        """Terminal decision orders the user's verb did not close: neither event nor span trigger (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
+        marks = ",".join("?" * len(FO_TERMINAL_STATUSES))
+        rows = self.conn.execute(
+            f"""SELECT f.* FROM feature_orders f
+                WHERE f.kind='decision' AND f.status IN ({marks})
+                  AND NOT EXISTS (SELECT 1 FROM wo_state_spans s WHERE s.order_id=f.id
+                                  AND s.to_status=f.status AND s.trigger=?)
+                  AND NOT EXISTS (SELECT 1 FROM wo_events e WHERE e.wo_id=f.plan_wo_id
+                                  AND e.kind=?)""",
+            (*FO_TERMINAL_STATUSES, DECISION_CLOSED_EVENT, DECISION_CLOSED_EVENT)).fetchall()
+        return db.rows_to_dicts(rows)
 
     def feature_children(self, fo_id: str, *,
                          kinds: tuple[str, ...] | None) -> list[dict[str, Any]]:

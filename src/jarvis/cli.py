@@ -1356,6 +1356,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "privileged-action classifier")
     d.add_argument("--project")
 
+    d = dec.add_parser("send", help="message the researcher (revives it); the order stays "
+                                    "open until `jarvis do done`")
+    d.add_argument("do_id")
+    d.add_argument("message")
+    d.add_argument("--project")
+
     d = dec.add_parser("done", help="you have decided: close the order")
     d.add_argument("do_id")
     d.add_argument("--note", default="", help="what you decided, for the record")
@@ -4451,6 +4457,10 @@ def cmd_do(args: argparse.Namespace) -> int:
             raise ops.OpsError(f"{where} is not valid JSON: {e}") from e
         _print(ops.submit_decision_report(args.do_id, doc, project_name=args.project),
                args.json)
+
+    elif args.do_cmd == "send":
+        _print(ops.send_decision_message(args.do_id, args.message, args.project,
+                                         relay=True), args.json)
 
     elif args.do_cmd == "done":
         _print(ops.complete_decision_order(args.do_id, note=args.note,

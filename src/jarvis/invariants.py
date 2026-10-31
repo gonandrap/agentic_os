@@ -2598,7 +2598,7 @@ ORPHAN_CHILD_BLOCKER = ("{wo_id} still needs you, and its {noun} {fo_id} is {sta
 
 #: What each `feature_orders` kind is called on that line
 ORPHAN_PARENT_NOUN = {"feature": "feature order", "improvement": "improvement order",
-                      "investigation": "investigation"}
+                      "investigation": "investigation", "decision": "decision order"}
 
 
 def _orphaned_children(store: ProjectStore) -> dict[str, list[dict[str, Any]]]:
@@ -2671,6 +2671,40 @@ def check_settled_parents_have_no_orphans(store: ProjectStore) -> Iterator[Viola
             store.repair_while(fo["id"], str(fo["status"] or ""),
                                lambda: store.clear_feature_attention(fo["id"]),
                                kind="fo")
+
+
+def check_decisions_closed_by_user(store: ProjectStore) -> Iterator[Violation]:
+    """INV-DECISION-USER-CLOSED — the detector for the decision-order guard ever being bypassed (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
+    for fo in store.decisions_closed_without_user():
+        yield Violation(
+            invariant="INV-DECISION-USER-CLOSED", subject_id=fo["id"], level="critical",
+            detail=(f"decision order {fo['id']} is `{fo['status']}` but carries no "
+                    f"`decision_closed_by_user` record: something other than the user's "
+                    f"`jarvis do done|cancel` settled it. Not repairable — find the writer "
+                    f"that bypassed `ProjectStore.update_feature_order`'s guard."),
+            context={"fo_id": fo["id"], "status": fo["status"]},
+        )
+
+
+def check_awaiting_decisions_flagged(store: ProjectStore) -> Iterator[Violation]:
+    """INV-DECISION-AWAITING-FLAGGED — a delivered report the user is not being asked about (docs/superpowers/specs/2026-10-31-decision-orders.md)"""
+    from . import decision_report
+
+    for fo in store.list_feature_orders(statuses=("awaiting_decision",), kind="decision"):
+        if fo["needs_attention"]:
+            continue
+        report = db.from_json(fo.get("plan"), None) or {}
+        reason = decision_report.awaiting_reason(fo, report if isinstance(report, dict) else {})
+        repaired = not getattr(store, "readonly", False) and store.repair_while(
+            fo["id"], "awaiting_decision",
+            lambda: store.flag_feature_attention(fo["id"], reason), kind="fo")
+        yield Violation(
+            invariant="INV-DECISION-AWAITING-FLAGGED", subject_id=fo["id"],
+            detail=(f"decision order {fo['id']} is awaiting your decision but carries no "
+                    f"attention flag, so `jarvis status --attention` does not list it"),
+            repaired=repaired, repair="re-raised the delivery's reason" if repaired else "",
+            context={"fo_id": fo["id"]},
+        )
 
 
 def _validation_timeout() -> int:
@@ -4202,6 +4236,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # orphan to raise on its parent
     check_settled_parents_have_no_orphans,  # after it: a reopened feature is no longer
                                    # settled; it reads child flags and writes only the parent's
+    check_decisions_closed_by_user,  # order-free: a pure read that repairs nothing
+    check_awaiting_decisions_flagged,  # after the orphan check: it raises only where no flag is up
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
                                    # touches no flag any other check reads
     check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one

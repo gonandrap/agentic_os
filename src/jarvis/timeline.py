@@ -184,6 +184,10 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "decision_report_submitted":
         return (f"Decision report submitted for {p.get('do_id') or 'the decision order'}",
                 f"report {str(p.get('sha') or '')[:12]}")
+    if kind == "decision_delivered":
+        return (f"Decision report {'revision ' if p.get('revised') else ''}delivered to you "
+                f"for {p.get('do_id') or 'the decision order'}",
+                f"report {str(p.get('sha') or '')[:12]}")
     if kind == "decision_followup_filed":
         return (f"Filed {p.get('order_id') or 'an order'} from proposal {p.get('key') or '?'}",
                 p.get("do_id") or "")
