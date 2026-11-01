@@ -92,7 +92,7 @@ def test_the_evidence_re_finish_rule_survived_the_cut_into_the_record_section():
 
 
 def test_record_section_bounds_targeted_tests_in_time():
-    """Issue 963: 'targeted' with no bound grew to ~590 tests over four overlapping commands."""
+    """Issue 963: unbounded 'targeted' grew to ~590 tests"""
     from jarvis import worker_brief
     record = worker_brief.render_section("record")
     assert "UNDER TWO MINUTES" in record and "-n auto" in record
