@@ -4111,6 +4111,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     # Spec §C of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md
     store.set_status(wo_id, status, trigger="landed")
     store.clear_attention(wo_id)
+    if status == "completed":
+        notify_completed(store, wo, "finished")
     if wo.get("backlog_id") and status == "completed":
         central = CentralStore()
         try:
@@ -5518,6 +5520,30 @@ def settle_in_session(store: ProjectStore, wo: dict[str, Any], event: str, *,
                                       "session_stopped": False})
 
 
+COMPLETED_TAIL_CHARS = 1200
+
+
+def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int | None:
+    """Tell the user an order THEY opened settled, with its result and final-message tail (issue 1385)"""
+    from .project_store import UNGOVERNED_ORIGINS
+
+    if launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS:
+        return None
+    fresh = store.get_work_order(wo["id"]) or wo
+    said = [str(fresh.get("result_summary") or "No summary on record.")]
+    if fresh.get("pr_url"):
+        said.append(f"Pull request: {fresh['pr_url']}")
+    replies = store.agent_replies(wo["id"])
+    last = str(replies[-1]["content"] or "").strip() if replies else ""
+    if last:
+        tail = last if len(last) <= COMPLETED_TAIL_CHARS else "…" + last[-COMPLETED_TAIL_CHARS:]
+        # Open offers and gaps in the final message die with the session unless they reach the user
+        said.append(f"Worker's final message (end):\n{tail}")
+    return store.add_notification(
+        title=f"{wo['id']} completed ({how}): {fresh.get('title') or 'untitled'}",
+        body="\n\n".join(said), level="info", wo_id=wo["id"], source="completion")
+
+
 def mark_backlog_done(wo: dict[str, Any]) -> None:
     """Close the backlog item a work order was promoted from, if it came from one"""
     if not wo.get("backlog_id"):
@@ -5558,6 +5584,7 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
                                  **({"merge_commit": merge_commit}
                                     if merge_commit else {})})
     mark_backlog_done(wo)
+    notify_completed(store, wo, "its pull request merged")
     return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
             "pr_url": wo.get("pr_url"), "merged_at": merged_at,
             "session_stopped": stopped["stopped"]}
