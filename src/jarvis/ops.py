@@ -559,6 +559,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         # Read Neo's questions BEFORE the project loop
         neo_counts, escalated_questions = _neo_attention()
         neo_held = {q["wo_id"] for q in escalated_questions}
+        fixes_parked = 0  # investigations whose GAP fix the steward held (#1404)
         for p in central.list_projects():
             if p["status"] != "active":
                 continue
@@ -628,6 +629,9 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                             if k["id"] in owed]
                     if not fo or not (fo["needs_attention"] or kids):
                         continue
+                    if (fo["needs_attention"] and fo.get("kind") == "investigation"
+                            and str(fo["attention_reason"] or "").startswith(PARKED_FIX_PREFIX)):
+                        fixes_parked += 1
                     reasons = []
                     if fo["needs_attention"] and fo["attention_reason"]:
                         reasons.append(fo["attention_reason"])
@@ -796,6 +800,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "items": inbox[:10],
             },
             "backlog": {"open": len(backlog_open)},
+            "investigations": {"fixes_parked": fixes_parked},
             "neo": neo_counts,
             "gates": {"awaiting_you": len(gate_items),
                       "false_positives": false_positives,
@@ -971,6 +976,11 @@ def create_work_order(project_name: str, title: str, description: str = "",
         spec = _spec_or_none(project_name)
         record_issue_references(store, paths[project_name], wo,
                                 spec.bugs.repo if spec is not None else "")
+        if issue_url:
+            try:
+                release_parked_fix(store, issue_url, str(wo["id"]))
+            except Exception:  # noqa: BLE001 — the order stands; the flag clears on the next one
+                log.exception("could not un-park the investigations on %s", issue_url)
         return wo
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured
@@ -6905,7 +6915,9 @@ def list_feature_orders(project_name: str | None = None,
                 rows.sort(key=lambda fo: fo["created_at"], reverse=True)
             for fo in rows:
                 out.append({"project": name, **fo,
-                            "status_label": feature_status_label(kind, fo["status"]),
+                            "status_label": (investigation_status_label(fo)
+                                             if fo.get("kind") == "investigation"
+                                             else feature_status_label(kind, fo["status"])),
                             "progress": feature_progress(store, fo)})
         finally:
             store.close()
@@ -8112,20 +8124,77 @@ def _investigation_verdict(fo: Mapping[str, Any]) -> dict[str, Any]:
     return verdict if isinstance(verdict, dict) else {}
 
 
+#: An investigation flagged because the steward held its GAP's fix (#1404); `release_parked_fix` clears it
+PARKED_FIX_PREFIX = "fix parked: "
+
+
+def parked_fix_reason(filed: Mapping[str, Any]) -> str:
+    """The attention line of a GAP whose fix the steward held: the rule and the start command"""
+    from .issues import START_COMMAND
+
+    return (f"{PARKED_FIX_PREFIX}{filed['parked']}; start it: "
+            f"`{START_COMMAND.format(url=filed.get('issue_url') or '')}`")
+
+
+def investigation_status_label(fo: Mapping[str, Any]) -> str:
+    """`completed`, or `completed — fix parked: <rule>` while the steward holds its fix (#1404)"""
+    label = feature_status_label("investigation", fo["status"])
+    filed = _investigation_verdict(fo).get("filed")
+    if isinstance(filed, dict) and filed.get("parked"):
+        label += f" — {PARKED_FIX_PREFIX}{filed['parked']}"
+    return label
+
+
 def record_investigation_dispatch(inv_id: str, wo_id: str, note: str,
-                                  project_name: str | None = None) -> None:
-    """Write who started the investigation's fix, or who refused and why, onto its verdict (#1344)"""
-    _name, path, fo = find_feature_order(inv_id, project_name)
+                                  project_name: str | None = None,
+                                  parked: str = "") -> None:
+    """Write who started the investigation's fix, or who refused and why, onto its verdict (#1344)
+
+    `parked` (#1404): the steward held the fix, so flag the investigation and tell the user once.
+    """
+    name, path, fo = find_feature_order(inv_id, project_name)
     verdict = _investigation_verdict(fo)
     filed = verdict.get("filed")
     if not isinstance(filed, dict):
         return  # nothing filed, so nothing to start
     filed.update({"wo_id": wo_id or filed.get("wo_id") or "", "dispatch": note})
+    parked = "" if filed["wo_id"] else parked
+    if parked:
+        filed["parked"] = parked
     store = ProjectStore(path)
     try:
         store.update_feature_order(inv_id, plan=db.to_json(verdict))
+        if parked:
+            store.flag_feature_attention(inv_id, parked_fix_reason(filed))
     finally:
         store.close()
+    if parked:
+        central = CentralStore()
+        try:
+            central.add_inbox(name, f"{inv_id}: GAP fix not started — {parked}",
+                              f"{fo['title']}\n\n{note}", level="warning")
+        finally:
+            central.close()
+
+
+def release_parked_fix(store: ProjectStore, issue_url: str, wo_id: str) -> list[str]:
+    """A work order now carries the issue: un-park every investigation whose fix it is (#1404)"""
+    released = []
+    for fo in store.flagged_feature_orders():
+        if (fo.get("kind") or "") != "investigation":
+            continue
+        verdict = _investigation_verdict(fo)
+        filed = verdict.get("filed")
+        if not (isinstance(filed, dict) and filed.get("parked")
+                and filed.get("issue_url") == issue_url):
+            continue
+        filed.pop("parked")
+        filed.update({"wo_id": wo_id, "dispatch": f"started later as {wo_id}"})
+        store.update_feature_order(fo["id"], plan=db.to_json(verdict))
+        if str(fo.get("attention_reason") or "").startswith(PARKED_FIX_PREFIX):
+            store.clear_feature_attention(fo["id"])
+        released.append(str(fo["id"]))
+    return released
 
 
 def _fix_order_of(store: ProjectStore, filed: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -8514,7 +8583,7 @@ def show_investigation_order(inv_id: str, project_name: str | None = None
         "filing_error": verdict.get("filing_error") or "",
         "investigator": investigator,
         "assumptions": calls,
-        "status_label": feature_status_label("investigation", fo["status"]),
+        "status_label": investigation_status_label(fo),
         "alarms": alarms,
         "chain": investigation_chain(name, path, fo),
     }

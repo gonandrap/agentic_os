@@ -1994,6 +1994,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                   f"({wo.get('status_label') or wo['status']}){att}")
     if st["backlog"]["open"]:
         print(f"\n🗂 backlog: {st['backlog']['open']} open items — `jarvis backlog list`")
+    parked = st.get("investigations", {}).get("fixes_parked")
+    if parked:
+        print(f"\n🅿 {parked} investigation fix(es) parked by the steward — `jarvis investigate list`")
     return 0
 
 

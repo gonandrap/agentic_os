@@ -786,6 +786,36 @@ def test_a_gap_asks_neo_and_its_view_follows_the_fix_order(started, store):
     assert chain["fix"]["wo_id"] == fix["id"] and chain["fix"]["production"] is None
 
 
+def test_a_gap_whose_fix_the_steward_parked_says_so_until_a_fix_starts(started, store):
+    """#1404: flagged, labelled, in the inbox and counted — and un-parked by the fix order"""
+    from jarvis.central_store import CentralStore
+
+    inv_id, _, _ = _submitted(started, store, "GAP")
+    ops.record_investigation_dispatch(inv_id, "", "NOT started — the steward refused",
+                                      parked="steward `queue` (yield)")
+    row = store.get_feature_order(inv_id)
+    assert row["needs_attention"]
+    assert row["attention_reason"].startswith("fix parked: steward `queue` (yield)")
+    assert f"jarvis issues start {started.issue_url}" in row["attention_reason"]
+    assert ops.show_investigation_order(inv_id)["status_label"].endswith(
+        "fix parked: steward `queue` (yield)")
+    assert [r["id"] for r in ops.list_investigation_orders()] == [inv_id]
+    central = CentralStore()
+    try:
+        assert any(i["title"].startswith(f"{inv_id}: GAP fix not started")
+                   and i["level"] == "warning" for i in central.unacked_inbox())
+    finally:
+        central.close()
+    assert ops.os_status()["investigations"]["fixes_parked"] == 1
+
+    fix = ops.create_work_order("proj_a", "the fix", "d", issue_url=started.issue_url)
+    row = store.get_feature_order(inv_id)
+    assert not row["needs_attention"]
+    assert json.loads(row["plan"])["filed"]["wo_id"] == fix["id"]
+    assert "fix parked" not in ops.show_investigation_order(inv_id)["status_label"]
+    assert ops.os_status()["investigations"]["fixes_parked"] == 0
+
+
 def test_a_gap_whose_duplicate_ops_finds_is_downgraded_honestly(started, store):
     """§2.5: the record must never read as though the investigator classified it that way"""
     subject = _subject(store)
