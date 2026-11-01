@@ -5013,7 +5013,7 @@ class Daemon:
             if invariants_mod.reviewable_assumptions(store, fresh):
                 if fresh["status"] != "needs_review":
                     store.set_status(wo["id"], "needs_review")
-                    store.flag_attention(wo["id"], "assumptions pending review")
+                    ops_mod.flag_assumptions_pending(store, wo["id"])
             elif ops_mod.routes_on_pull_request(store, fresh):
                 # Finished behind a pull request: it is the user's merge that ends this work order (#224)
 
