@@ -442,6 +442,24 @@ def test_a_consumed_verdict_does_not_keep_an_investigator_session(
     assert (tree / "verdict.json").exists() is not removed
 
 
+def test_a_consumed_artifact_tracked_on_main_does_not_keep_a_planner_session(
+        bg_fleet, fake_claude, settle_turns):
+    """Planner PRs committed plan.json, so each planner left it modified, not untracked (#1292)"""
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    (project.path / "plan.json").write_text('{"old": true}\n')
+    subprocess.run(["git", "add", "plan.json"], cwd=project.path, check=True)
+    subprocess.run(["git", "commit", "-qm", "stale plan"], cwd=project.path, check=True)
+    wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {"plan.json": '{"new": true}\n'})
+    store.conn.execute("UPDATE work_orders SET kind='planner' WHERE id=?", (wo["id"],))
+    store.conn.commit()
+    store.set_status(wo["id"], "completed")
+
+    worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] is None
+    assert (tree / "plan.json").read_text() == '{"old": true}\n'
+
+
 def test_read_only_directories_are_made_removable(tmp_path):
     """A read-only __pycache__ failed the removal half-way with EACCES (wo-b6e2ddda)"""
     from jarvis import disk
