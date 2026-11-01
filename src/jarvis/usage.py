@@ -663,7 +663,7 @@ def last_compaction(session_id: str, *, since: float = 0.0,
 
 def compaction_envelope(compaction: dict[str, Any], model: str, *, schema: int,
                         session_id: str = "") -> dict[str, Any]:
-    """An ESTIMATED envelope for a `/compact` that wrote no assistant row, off its `compact_boundary` (issue 1296)"""
+    """An ESTIMATED envelope for a `/compact` that wrote no assistant row"""
     # kn-f5fb467e: billed as plain input over the old conversation; the summary is the output
     pre, post = int(compaction.get("pre") or 0), int(compaction.get("post") or 0)
     cost = round(priced(model, input=pre, output=post).list_cost_usd, 6)
