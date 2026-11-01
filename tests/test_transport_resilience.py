@@ -196,6 +196,47 @@ def test_a_held_question_is_not_claimed_before_it_is_due(asked):
         store.close()
 
 
+def test_an_unreadable_reply_is_re_asked_and_kept_whole(asked):
+    """Issue #1401: question 2843 escalated at attempts=0 with 120 chars of the reply"""
+    garbage = "I think yes, approve it. " * 20   # no JSON at all, well past 120 chars
+    deliver = T.Recorder()
+    store = NeoStore()
+    try:
+        results = neo_mod.drain_queue(store, model="sonnet", deliver=deliver,
+                                      answer=lambda *a, **k: neo_mod.parse_verdict(garbage))
+        assert results[0]["outcome"] == "queued"
+        assert store.claim_next() is None, "re-claimed inside its own backoff"
+    finally:
+        store.close()
+    assert not deliver.calls, "an unreadable reply was delivered as a ruling"
+    q = _q()
+    assert (q["status"], q["attempts"], q["answer"]) == ("queued", 1, None)
+    assert q["answer_reason"] == neo_mod.UNPARSEABLE_PREFIX + garbage
+
+
+def test_an_unreadable_reply_reaches_the_user_only_once_attempts_are_spent(asked):
+    garbage = "not json " * 30
+    deliver = T.Recorder()
+    store = NeoStore()
+    try:
+        for attempt in range(1, MAX_ANSWER_ATTEMPTS + 1):
+            _unhold()
+            neo_mod.drain_queue(store, model="sonnet", deliver=deliver,
+                                answer=lambda *a, **k: neo_mod.parse_verdict(garbage))
+            assert (_q()["status"], _q()["attempts"]) == ("queued", attempt)
+            assert not deliver.calls, f"the user was asked on attempt {attempt}"
+        _unhold()
+        neo_mod.drain_queue(store, model="sonnet", deliver=deliver,
+                            answer=lambda *a, **k: neo_mod.parse_verdict(garbage))
+    finally:
+        store.close()
+    assert len(deliver) == 1
+    q = _q()
+    assert (q["status"], q["escalation_cause"]) == ("escalated", "unparseable-reply")
+    assert q["answer"] is None
+    assert q["answer_reason"] == neo_mod.UNPARSEABLE_PREFIX + garbage
+
+
 def test_a_real_escalation_still_escalates(asked):
     """The fix must not pass by making the OS never escalate at all"""
     deliver, unreachable = T.Recorder(), T.Recorder()
