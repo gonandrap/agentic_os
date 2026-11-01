@@ -398,6 +398,26 @@ def test_reviewing_an_alarm_leaves_a_real_blocker_standing(escalated):
     assert reason and "alarm" not in reason
 
 
+def test_reviewing_one_of_two_alarms_hands_the_flag_to_the_other(escalated):
+    """Issue 1064's own order carried two escalated alarms"""
+    daemon, wo_id = escalated(extra="FORCE_ALARM_NEO_ESCALATE")
+    daemon._neo_drain()
+    first = _alarm(wo_id)["id"]
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        second = store.add_alarm(wo_id, "long-turn", 99, "another long turn",
+                                 status="escalated")["id"]
+    finally:
+        store.close()
+    assert _attention(wo_id) == (1, supervisor.ALARM_BLOCKER.format(alarm_id=first))
+
+    ops.review_alarm(first, approved=True)
+    assert _attention(wo_id) == (1, supervisor.ALARM_BLOCKER.format(alarm_id=second))
+
+    ops.review_alarm(second, approved=True)
+    assert _attention(wo_id) == (0, None)
+
+
 def test_reviewing_an_alarm_leaves_a_flag_naming_something_else(escalated):
     """Only the flag naming THIS alarm is the review's to settle"""
     daemon, wo_id = escalated(extra="FORCE_ALARM_NEO_ESCALATE")

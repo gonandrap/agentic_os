@@ -14425,7 +14425,7 @@ def _settle_alarm_attention(name: str, path: Path, wo_id: str, alarm_id: str) ->
             return  # the flag names something else: not this review's to touch
         owed = [a for a in store.alarms_of(wo_id)
                 if a["id"] != alarm_id and a["status"] in ("escalated", "failed")
-                and not a["review_status"]]
+                and a["review_status"] == "unreviewed"]
     finally:
         store.close()
     settled = ack_os_flag(wo_id, name)
