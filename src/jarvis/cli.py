@@ -1009,6 +1009,13 @@ def build_parser() -> argparse.ArgumentParser:
     uh.add_argument("wo_id")
     uh.add_argument("--project")
 
+    ex = wo.add_parser("expedite", help="once its pull request merges, ship it ALONE: "
+                                        "a release of the latest tag plus this one "
+                                        "cherry-picked commit, not main's head")
+    ex.add_argument("wo_id")
+    ex.add_argument("--off", action="store_true", help="clear the flag")
+    ex.add_argument("--project")
+
     dl = wo.add_parser("delete", help="permanently delete a work order and its whole "
                                       "history — this cannot be undone")
     dl.add_argument("wo_id")
@@ -3786,6 +3793,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "ack":
         _print(ops.ack_attention(args.wo_id, all_projects=args.all,
                                  project_name=args.project), args.json)
+    elif args.wo_cmd == "expedite":
+        _print(ops.expedite_work_order(args.wo_id, on=not args.off,
+                                       project_name=args.project), args.json)
     elif args.wo_cmd in ("hide", "unhide"):
         _print(ops.hide_work_order(args.wo_id, hidden=args.wo_cmd == "hide",
                                    project_name=args.project), args.json)

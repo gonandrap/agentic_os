@@ -1504,6 +1504,21 @@ def test_hide_and_unhide_from_the_work_order_page(client, project):
     assert wo["id"] in client.get("/project/proj_a").text
 
 
+def test_expedite_and_unexpedite_from_the_work_order_page(client, project):
+    wo = ops.create_work_order("proj_a", "urgent task")
+    store = ProjectStore(project)
+    store.set_status(wo["id"], "running")
+    store.close()
+    page = f"/wo/proj_a/{wo['id']}"
+    assert "Un-expedite" not in client.get(page).text
+
+    r = client.post(f"{page}/expedite")
+    assert r.status_code == 303 and r.headers["location"] == page
+    assert "Un-expedite" in client.get(page).text
+    client.post(f"{page}/expedite", data={"off": "1"})
+    assert "Un-expedite" not in client.get(page).text
+
+
 def test_delete_from_the_work_order_page_removes_it(client, project):
     wo = ops.create_work_order("proj_a", "doomed task")
     store = ProjectStore(project)

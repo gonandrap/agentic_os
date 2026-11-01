@@ -2556,6 +2556,15 @@ def create_app() -> FastAPI:
         ops.hide_work_order(wo_id, hidden=True, project_name=name)
         return RedirectResponse(f"/project/{name}", status_code=303)
 
+    @app.post("/wo/{name}/{wo_id}/expedite")
+    def expedite_wo(name: str, wo_id: str, off: str = Form("")):
+        page = f"/wo/{name}/{wo_id}"
+        try:
+            ops.expedite_work_order(wo_id, on=not off, project_name=name)
+        except ops.OpsError as e:
+            return RedirectResponse(f"{page}?error={quote(str(e))}", status_code=303)
+        return RedirectResponse(page, status_code=303)
+
     @app.post("/wo/{name}/{wo_id}/unhide")
     def unhide_wo(name: str, wo_id: str):
         ops.hide_work_order(wo_id, hidden=False, project_name=name)

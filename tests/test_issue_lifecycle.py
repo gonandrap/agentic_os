@@ -110,10 +110,14 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, mon
         def land(self, wo_id, pr_url=PR):
             """The work order's code reaches `main`, and the tracker is reconciled"""
             from jarvis import ops
+            from jarvis.catalog import load_catalog
+            from jarvis.daemon import Daemon
             store = ProjectStore(project)
             try:
                 store.update_work_order(wo_id, pr_url=pr_url)
                 ops.complete_merged(store, store.get_work_order(wo_id))
+                Daemon(load_catalog(catalog)).ship_expedited(
+                    self.spec(), store, store.get_work_order(wo_id))
             finally:
                 store.close()
             self.sweep()
@@ -1509,6 +1513,65 @@ def test_two_expedited_fixes_landing_make_one_release(fleet):
         assert len(store.events_of_kind(rel[0]["id"], "release_batched")) == 2
     finally:
         store.close()
+
+
+# -- an expedited merge ships alone (2026-10-31 spec)
+
+
+def _plain_order(fleet, title="tweak the dashboard"):
+    store = fleet.store()
+    try:
+        return store.create_work_order(title=title, status="running")["id"]
+    finally:
+        store.close()
+
+
+def test_an_order_flagged_on_the_fly_ships_alone_on_merge(fleet):
+    """§1-§2: no issue behind it, the pr url batches; the release cherry-picks"""
+    from jarvis import db, ops
+    from jarvis.daemon import Daemon
+    wo_id = _plain_order(fleet)
+    assert ops.expedite_work_order(wo_id, project_name="proj_a")["expedited"]
+    fleet.land(wo_id, pr_url=PR)
+
+    rel = fleet.releases()
+    assert len(rel) == 1
+    meta = db.from_json(rel[0]["metadata"], {})
+    assert meta[Daemon.RELEASE_BATCH_KEY] == [PR]
+    assert meta[Daemon.CHERRY_PICK_KEY] is True
+    assert "--cherry-pick" in rel[0]["description"]
+
+
+def test_a_cherry_pick_release_never_batches_with_a_main_release(fleet):
+    """§3: a blocker fix ships main; an expedited one ships alone, in its own order"""
+    from jarvis import db, ops
+    from jarvis.daemon import Daemon
+    fleet.land(fleet.blocker_wo(), pr_url=PR)
+    wo_id = _plain_order(fleet)
+    ops.expedite_work_order(wo_id, project_name="proj_a")
+    fleet.land(wo_id, pr_url=PR_2)
+
+    kinds = sorted(bool(db.from_json(r["metadata"], {}).get(Daemon.CHERRY_PICK_KEY))
+                   for r in fleet.releases())
+    assert kinds == [False, True]
+
+
+def test_unexpediting_before_merge_ships_nothing_alone(fleet):
+    from jarvis import ops
+    wo_id = _plain_order(fleet)
+    ops.expedite_work_order(wo_id, project_name="proj_a")
+    ops.expedite_work_order(wo_id, on=False, project_name="proj_a")
+    fleet.land(wo_id, pr_url=PR)
+    assert fleet.releases() == []
+
+
+def test_expediting_a_settled_order_is_refused(fleet):
+    """§1: the trigger is the merge; a closed order's merge is behind it"""
+    from jarvis import ops
+    wo_id = _plain_order(fleet)
+    fleet.land(wo_id, pr_url=PR)
+    with pytest.raises(ops.OpsError, match="completed"):
+        ops.expedite_work_order(wo_id, project_name="proj_a")
 
 
 def test_a_landed_fix_never_widens_a_user_cut_release(fleet):

@@ -6543,6 +6543,29 @@ def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
             else None, "blockers": blockers}
 
 
+def expedite_work_order(wo_id: str, on: bool = True,
+                        project_name: str | None = None) -> dict[str, Any]:
+    """Flag an order so its merge ships ALONE as a cherry-picked release (docs/superpowers/specs/2026-10-31-an-expedited-merge-ships-alone.md)"""
+    from . import issues
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    if wo["status"] in ("completed", "failed", "cancelled"):
+        raise OpsError(f"{wo_id} is {wo['status']} — expediting acts on its merge, "
+                       "which is already behind it")
+    if release.is_release_order(wo):
+        raise OpsError(f"{wo_id} is itself a release order")
+    store = ProjectStore(path)
+    try:
+        meta = db.from_json(wo.get("metadata"), {}) or {}
+        if bool(meta.get(issues.EXPEDITED_KEY)) != on:
+            store.update_work_order(
+                wo_id, metadata=db.to_json({**meta, issues.EXPEDITED_KEY: on}))
+            store.add_event(wo_id, "expedited" if on else "unexpedited", {})
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "title": wo["title"], "expedited": on}
+
+
 def hide_work_order(wo_id: str, hidden: bool = True,
                     project_name: str | None = None) -> dict[str, Any]:
     """Hide a work order from listings, summaries and the attention list"""
