@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-from . import claude_cli
+from . import claude_cli, paths
 from .central_store import CentralStore
 
 log = logging.getLogger(__name__)
@@ -63,10 +65,48 @@ KIND_LABELS = {
 SPEND_HOME_ENV = "JARVIS_SPEND_HOME"
 
 
+#: The dispatching OS's state home and code dir, exported to every worker tree (#754)
+LIVE_HOME_ENV = "JARVIS_LIVE_HOME"
+LIVE_CODE_ENV = "JARVIS_LIVE_CODE"
+
+#: This process's own `jarvis` package
+CODE_DIR = Path(__file__).resolve().parent
+
+_scratch_home: Path | None = None
+_warned: set[Path] = set()
+
+
+def bills_real_tokens() -> bool:
+    """Is this run spending real money that a real work order will be charged for? (#103)"""
+    return bool(os.environ.get("JARVIS_EVALS_LLM") and os.environ.get("JARVIS_WO_ID"))
+
+
+def _same(a: str | Path, b: str | Path) -> bool:
+    return Path(a).expanduser().resolve() == Path(b).expanduser().resolve()
+
+
 def spend_db_path() -> Path | None:
     """The `os.db` accounting rows go to, or None to use the ambient `$JARVIS_HOME`"""
     home = os.environ.get(SPEND_HOME_ENV, "").strip()
-    return Path(home).expanduser() / "os.db" if home else None
+    path = Path(home).expanduser() / "os.db" if home else None
+    live = os.environ.get(LIVE_HOME_ENV, "").strip()
+    code = os.environ.get(LIVE_CODE_ENV, "").strip()
+    if (not live or not code or _same(code, CODE_DIR) or bills_real_tokens()
+            or not _same(path.parent if path else paths.jarvis_home(), live)):
+        return path
+    # Code from another checkout (a dev worktree) aiming at the live fleet's books (#754)
+    global _scratch_home
+    if not _same(paths.jarvis_home(), live):
+        target = paths.jarvis_home()
+    else:
+        _scratch_home = _scratch_home or Path(tempfile.mkdtemp(prefix="jarvis-spend-"))
+        target = _scratch_home
+    if target not in _warned:
+        _warned.add(target)
+        print(f"jarvis: agent_usage from {CODE_DIR} is not the live fleet's code "
+              f"({code}); accounting rows go to {target}/os.db, not {live} (#754)",
+              file=sys.stderr)
+    return target / "os.db"
 
 
 def describe(kind: str) -> str:
