@@ -2244,10 +2244,23 @@ class CentralStore:
 
     def wo_call_cost(self, wo_id: str) -> float:
         """What the OS ITSELF has spent on one work order, in dollars"""
+        from . import usage as usage_mod
+
         row = self.conn.execute(
             "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM agent_calls WHERE wo_id=?",
             (wo_id,)).fetchone()
-        return float(row["c"] or 0.0)
+        total = float(row["c"] or 0.0)
+        # Absent is not zero: no CLI figure is priced at list, as the bill does (issue #960)
+        for r in self.conn.execute(
+                "SELECT model, input, cache_write, cache_read, output, usage_json "
+                "FROM agent_calls WHERE wo_id=? AND cost_usd IS NULL", (wo_id,)):
+            env = db.from_json(r["usage_json"], {}) or {}
+            total += sum(usage_mod.class_costs(
+                r["model"] or "unknown", input=r["input"] or 0,
+                cache_write=r["cache_write"] or 0, cache_read=r["cache_read"] or 0,
+                output=r["output"] or 0, cache_1h=env.get("cache_1h") or 0,
+                cache_5m=env.get("cache_5m") or 0).values())
+        return total
 
     def agent_call_totals(self, project: str | None = None, *,
                           since: float | None = None,
