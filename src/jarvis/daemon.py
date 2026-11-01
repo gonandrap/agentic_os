@@ -7166,6 +7166,21 @@ class Daemon:
                 log.info("[%s] carried round %s's verdict from %s to %s on %s",
                          project.name, carried["round"], judged[:10],
                          carried["carried_head_sha"][:10], wo["id"])
+        elif pr.head_oid and pr.head_oid != head_before:
+            # A red_ci return has no verdict to carry: resubmit for the worker (#1065)
+            try:
+                out = ops.resubmit_healed_red_ci(
+                    store, project.path, wo, project=project.name,
+                    cfg=project.validation, base=base_ref, base_sha=base_sha,
+                    head=pr.head_oid)
+            except Exception:  # noqa: BLE001 — the heal itself already landed
+                log.exception("[%s] could not resubmit %s after the base heal",
+                              project.name, wo["id"])
+                out = None
+            if out:
+                log.info("[%s] %s: its red_ci return was the base's — resubmitted it "
+                         "on %s as round %s", project.name, wo["id"],
+                         pr.head_oid[:10], out["round"])
         return True, pr
 
     def heal_pull_request(self, project: ProjectSpec, store: ProjectStore, wo: dict,
