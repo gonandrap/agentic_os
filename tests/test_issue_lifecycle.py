@@ -1715,7 +1715,8 @@ def gap(fleet, monkeypatch):
 
     recorded = []
     monkeypatch.setattr(ops, "record_investigation_dispatch",
-                        lambda inv, wo, note, project=None: recorded.append((inv, wo, note))
+                        lambda inv, wo, note, project=None, parked="": recorded.append(
+                            (inv, wo, note, parked))
                         if project is None else pytest.fail(
                             f"#1402: scoped to {project!r}; the investigation lives elsewhere"))
     pickup = bugreport.report_bug(title="gap", description="d", expected="e", actual="a",
@@ -1763,6 +1764,7 @@ def test_a_steward_refusal_is_recorded_with_the_command_to_start_it(fleet, gap, 
     note = recorded[-1][2]
     assert "steward refused" in note and "ledger is spent" in note
     assert "jarvis issues start" in note
+    assert recorded[-1][3] == "steward `queue` (ledger)", "#1404: the investigation is parked"
 
 
 def test_neo_disagreeing_starts_nothing_and_says_so(fleet, gap):
@@ -1771,6 +1773,7 @@ def test_neo_disagreeing_starts_nothing_and_says_so(fleet, gap):
     _, recorded = gap
     note = recorded[-1][2]
     assert "Neo did not agree" in note and "jarvis issues start" in note
+    assert recorded[-1][3] == "", "Neo's ruling is not a steward hold"
 
 
 # Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)

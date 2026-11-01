@@ -889,7 +889,7 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
         try:
             # By id alone: the investigation lives in the investigated project, not the tracker's (#1402)
             record_investigation_dispatch(inv_id, out.get("existing_wo_id") or "",
-                                          out["dispatch"])
+                                          out["dispatch"], parked=out.get("parked") or "")
         except Exception:  # noqa: BLE001 — the settlement stands; INV-INVESTIGATION-DISPATCH re-derives the echo
             log.exception("could not record the dispatch on %s", inv_id)
     return out
@@ -961,6 +961,11 @@ def _settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any],
         out["steward"] = f"{decision.outcome}, {decision.rule}: {decision.reason}"
         if decision.outcome == "dispatch" and not decision.allowed:
             out["steward"] += "; os.autonomy.self_dispatch is off"
+        if not decision.allowed:
+            # What the investigation's own status and the user's inbox say (#1404)
+            out["parked"] = (f"steward `{decision.outcome}` ({decision.rule})"
+                             if decision.outcome != "dispatch"
+                             else "os.autonomy.self_dispatch is off")
     if decision is not None and decision.allowed:
         out["wo_id"] = promote_confirmed(
             spec, payload, metadata=steward.stamped(links, decision),
