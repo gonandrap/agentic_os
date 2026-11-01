@@ -576,6 +576,8 @@ START_COMMAND = "jarvis issues start {url}"
 #: Keys a triage question's context carries when an investigation GAP filed the bug (#1344)
 INVESTIGATION_KEY = "investigation"
 MORPHEUS_ITEM_KEY = "morpheus_item"
+#: The pre-triage dispatch line's tail; still on the record after Neo answered = a lost echo (#1402)
+INVESTIGATION_PENDING_MARK = "Neo is re-assessing it; the fix starts at once"
 
 def self_dispatch(catalog: Any) -> bool:
     """`os.autonomy.self_dispatch`: may a confirmed claim dispatch work nobody typed?"""
@@ -656,7 +658,7 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
                                             extra=investigation)
         if investigation and not expedite:
             out["reason"] = (f"`{priority}` filed by {investigation.get(INVESTIGATION_KEY)} "
-                             f"— Neo is re-assessing it; the fix starts at once if Neo "
+                             f"— {INVESTIGATION_PENDING_MARK} if Neo "
                              f"agrees and the steward allows it")
         elif expedite:
             out["reason"] += (f"; Neo is re-assessing the `{priority}` claim in "
@@ -820,10 +822,10 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
 
         out["dispatch"] = investigation_dispatch_note(out)
         try:
+            # By id alone: the investigation lives in the investigated project, not the tracker's (#1402)
             record_investigation_dispatch(inv_id, out.get("existing_wo_id") or "",
-                                          out["dispatch"], q.get("project") or None,
-                                          parked=out.get("parked") or "")
-        except Exception:  # noqa: BLE001 — the settlement stands; only its echo is lost
+                                          out["dispatch"], parked=out.get("parked") or "")
+        except Exception:  # noqa: BLE001 — the settlement stands; INV-INVESTIGATION-DISPATCH re-derives the echo
             log.exception("could not record the dispatch on %s", inv_id)
     return out
 
