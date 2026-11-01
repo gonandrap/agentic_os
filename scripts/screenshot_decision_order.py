@@ -85,7 +85,8 @@ def main() -> int:
         page.screenshot(path=SHOTS / "decision-order-project-tab.png")
         page.goto(f"http://127.0.0.1:{PORT}/")
         page.click("button[data-panel=tab-new-do]")
-        page.locator("#tab-new-do").screenshot(path=SHOTS / "decision-order-create-form.png")
+        # Tab strip included, so the form reads in context beside its siblings
+        page.locator("#dash-tabs").screenshot(path=SHOTS / "decision-order-create-form.png")
         browser.close()
     print(SHOTS)
     return 0
