@@ -1030,6 +1030,8 @@ class Daemon:
                 # Before delivery, not after: an envelope BECOMES a queued message
                 self.deliver_envelopes(project, store)
                 self.deliver_messages(project, store, state)
+                # After delivery: an order with a message queued is the delivery path's to compact
+                self.compact_parked(project, store, state)
                 # After delivery, not before: an envelope this round machine posted on an earlier tick is already on...
                 self.validation_tick(project, store, state)
                 # Beside its twin and for the same reason: an envelope a feature round posted on an earlier tick has...
@@ -2074,6 +2076,38 @@ class Daemon:
                     continue
                 budget -= 1
             if self._deliver(project, store, wo, msgs) and state is not None:
+                state.launched()
+
+    def compact_parked(self, project: ProjectSpec, store: ProjectStore,
+                       state: fleet.Fleet | None = None) -> None:
+        """Compact parked conversations BEFORE their cache expires, at the read rate (issue #1179)"""
+        floor = self.catalog.os.compact_min_context
+        if floor is None:
+            return
+        budget = project.max_concurrent - store.count_active()
+        for wo in store.list_work_orders(statuses=worker_session.WARM_COMPACT_STATUSES):
+            if wo["origin"] in UNGOVERNED_ORIGINS:
+                continue
+            due = worker_session.warm_compaction_due(store, wo, floor)
+            if due is None:
+                continue
+            if state is not None and state.blocked(wo["id"]):
+                continue
+            if resume_spends_slot(wo):
+                if budget <= 0:
+                    continue
+                budget -= 1
+            try:
+                turn = worker_session.compact(store, project, wo, due)
+            except budget_mod.BudgetExhausted:
+                continue  # an order with no money left is not worth a bet
+            except Exception:  # noqa: BLE001 — the cold path is the fallback
+                log.exception("[%s] could not compact %s before its cache expired",
+                              project.name, wo["id"])
+                continue
+            log.info("[%s] compacting parked %s while warm (turn %s)",
+                     project.name, wo["id"], turn["seq"])
+            if state is not None:
                 state.launched()
 
     def deliver_envelopes(self, project: ProjectSpec, store: ProjectStore) -> None:

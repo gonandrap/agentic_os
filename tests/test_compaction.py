@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -895,3 +896,73 @@ def test_the_cohort_script_classifies_boundaries_exactly_as_the_bill_does(transc
         ours.cache_write, ours.rewrite_ttl_write, ours.rewrite_prefix_write,
         ours.rewrite_compact_write)
     assert ours.rewrite_ttl_write == 120_000  # the uncompacted cold boundary
+
+
+# -- before the cache expires (issue #1179)
+
+
+def _parked(fleet, settle_turns, status: str, before_ttl: float) -> dict:
+    """An order parked in `status`, its last turn ended `before_ttl` seconds short of the TTL"""
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    store.set_status(wo["id"], status)
+    turn = store.latest_turn(wo["id"])
+    store.conn.execute("UPDATE wo_turns SET ended_at=? WHERE id=?",
+                       (time.time() - usage.WRITE_TTL_SECONDS + before_ttl, turn["id"]))
+    return store.get_work_order(wo["id"])
+
+
+@pytest.mark.parametrize("status", worker_session.WARM_COMPACT_STATUSES)
+def test_a_parked_order_compacts_while_its_cache_is_still_warm(
+        fleet, settle_turns, status):
+    store = fleet["store"]
+    wo = _parked(fleet, settle_turns, status, before_ttl=60)
+
+    fleet["daemon"].compact_parked(fleet["project"], store)
+
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    assert store.get_work_order(wo["id"])["status"] == status
+    # …and once compacted it is never compacted again
+    assert worker_session.warm_compaction_due(
+        store, store.get_work_order(wo["id"]), BIG) is None
+
+
+@pytest.mark.parametrize("status, before_ttl", [
+    ("needs_review", 120),       # too early: another turn may still come warm
+    ("needs_review", 10),        # too late: it would land cold
+    ("waiting_pr_merge", 60),    # P(another turn) under break-even (Q2882)
+    ("completed", 60),
+])
+def test_a_parked_order_outside_the_window_or_the_statuses_is_left_alone(
+        fleet, settle_turns, status, before_ttl):
+    store = fleet["store"]
+    wo = _parked(fleet, settle_turns, status, before_ttl)
+
+    fleet["daemon"].compact_parked(fleet["project"], store)
+
+    assert _turns(store, wo["id"])[-1][0] != COMPACT_TURN
+
+
+def test_a_warm_compaction_respects_the_floor_and_a_queued_message(fleet, settle_turns):
+    store = fleet["store"]
+    wo = _parked(fleet, settle_turns, "needs_review", before_ttl=60)
+    assert worker_session.warm_compaction_due(store, wo, HUGE) is None
+    assert worker_session.warm_compaction_due(store, wo, None) is None
+    ops.send_message(wo["id"], "a review came in")
+    assert worker_session.warm_compaction_due(store, wo, BIG) is None
+
+
+def test_an_hour_arm_order_compacts_before_the_hour_not_at_five_minutes(
+        fleet, settle_turns):
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    store.set_status(wo["id"], "needs_review")
+    store.conn.execute("UPDATE wo_turns SET cache_ttl='1h' WHERE id=?",
+                       (store.latest_turn(wo["id"])["id"],))
+    ended = store.latest_turn(wo["id"])["ended_at"]
+    fresh = store.get_work_order(wo["id"])
+
+    assert worker_session.warm_compaction_due(
+        store, fresh, BIG, now=ended + usage.WRITE_TTL_SECONDS - 60) is None
+    assert worker_session.warm_compaction_due(
+        store, fresh, BIG, now=ended + usage.WRITE_TTL_1H_SECONDS - 60) is not None
