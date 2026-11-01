@@ -422,6 +422,58 @@ def test_a_dispatched_worker_carries_the_spend_home(jarvis_home, project):
     env = json.loads(path.read_text())["env"]
     assert env[agent_usage.SPEND_HOME_ENV] == str(home_of())
     assert env["JARVIS_WO_ID"] == "wo-abc123"
+    assert env[agent_usage.LIVE_HOME_ENV] == str(home_of())
+    assert env[agent_usage.LIVE_CODE_ENV] == str(agent_usage.CODE_DIR)
+
+
+# -- code from another checkout never writes the live fleet's books (#754)
+
+
+@pytest.fixture()
+def live(tmp_path, monkeypatch):
+    """A dispatched worker tree whose live fleet runs code from ANOTHER checkout"""
+    home = tmp_path / "live-home"
+    monkeypatch.setenv(agent_usage.LIVE_HOME_ENV, str(home))
+    monkeypatch.setenv(agent_usage.LIVE_CODE_ENV, str(tmp_path / "production" / "jarvis"))
+    monkeypatch.setenv(agent_usage.SPEND_HOME_ENV, str(home))
+    monkeypatch.delenv("JARVIS_EVALS_LLM", raising=False)
+    monkeypatch.setattr(agent_usage, "_scratch_home", None)
+    monkeypatch.setattr(agent_usage, "_warned", set())
+    return home
+
+
+def test_a_script_with_its_own_home_records_there_not_in_the_live_one(live, jarvis_home,
+                                                                       capsys):
+    """The issue's case: a temp JARVIS_HOME, JARVIS_SPEND_HOME inherited from dispatch"""
+    agent_usage.record("neo_answer", wo_id="io-x")
+    agent_usage.record("neo_answer", wo_id="io-x")
+
+    assert calls(home=live) == []
+    assert len(calls(home=jarvis_home, wo_id="io-x")) == 2
+    assert capsys.readouterr().err.count("#754") == 1
+
+
+def test_a_script_aimed_wholly_at_the_live_home_records_in_a_scratch_home(live, monkeypatch):
+    monkeypatch.setenv("JARVIS_HOME", str(live))
+
+    agent_usage.record("neo_answer", wo_id="io-x")
+
+    assert calls(home=live) == []
+    assert len(calls(home=agent_usage._scratch_home, wo_id="io-x")) == 1
+
+
+@pytest.mark.parametrize("why", ["same code", "real tokens"])
+def test_the_live_fleets_own_code_and_real_eval_tokens_still_reach_the_live_home(
+        live, monkeypatch, why):
+    if why == "same code":
+        monkeypatch.setenv(agent_usage.LIVE_CODE_ENV, str(agent_usage.CODE_DIR))
+    else:
+        monkeypatch.setenv("JARVIS_EVALS_LLM", "1")
+        monkeypatch.setenv("JARVIS_WO_ID", "wo-abc123")
+
+    agent_usage.record("neo_answer", wo_id="wo-abc123")
+
+    assert len(calls(home=live, wo_id="wo-abc123")) == 1
 
 
 # -- what the report does with it
