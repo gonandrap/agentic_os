@@ -63,6 +63,40 @@ OBJECTION_ALARM_MIN_SENT = 3
 #: Why an objection was taken back
 
 
+def read_base_red(central: Any, project_name: str) -> Any:
+    """The stored red-base fact as `automerge.BaseRed`, or None — on whichever thread's `central`"""
+    from . import automerge
+    from .central_store import BASE_HEALTH_FRESH_SECONDS
+
+    try:
+        fact = central.base_health(project_name)
+    except Exception:  # noqa: BLE001 — an unreadable fact is not a red base
+        return None
+    if not fact.get("red"):
+        return None
+    checked_at = fact.get("checked_at")
+    if not isinstance(checked_at, (int, float)):
+        return None
+    if db.now() - float(checked_at) > BASE_HEALTH_FRESH_SECONDS:
+        return None
+    return automerge.BaseRed(
+        base=str(fact.get("base") or ""), workflow=str(fact.get("workflow") or ""),
+        run_url=str(fact.get("run_url") or ""),
+        head_sha=str(fact.get("head_sha") or ""),
+        wo_id=str(fact.get("wo_id") or ""),
+        # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5
+        fix_wo_id=str(fact.get("fix_wo_id") or ""),
+        issue_url=str(fact.get("issue_url") or ""),
+        issue_os_filed=bool(fact.get("issue_os_filed")))
+
+
+#: What the seats read when a head's red checks are the base's (spec 2026-10-13 §9)
+BASE_RED_PANEL_NOTE = (
+    "`{base}` itself is red in workflow `{workflow}` (run {run_url}, at {sha}), and every "
+    "red check on this pull request is in that workflow. The OS tracks the broken base "
+    "separately{fixing}. Do not reject over these checks; judge the change.")
+
+
 def fetch_healthz(url: str, timeout: float) -> dict[str, Any] | None:
     """`GET /healthz` as a dict, or None when the dashboard did not answer"""
     import urllib.error
@@ -1459,6 +1493,12 @@ class Daemon:
             except Exception:  # noqa: BLE001 — one feature must not stop the rest
                 log.exception("[%s] could not refresh the spec under review for %s",
                               project.name, fo["id"])
+        for fo in store.list_feature_orders(statuses=("executing",)):
+            try:
+                ops.refresh_held_spec(fo["id"], project_name=project.name)
+            except Exception:  # noqa: BLE001 — one feature must not stop the rest
+                log.exception("[%s] could not re-read the held spec of %s",
+                              project.name, fo["id"])
 
     def settle_features(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close out feature orders whose children have all landed, or one of which has not (docs/superpowers/specs/2026-08-29-feature-order-resume.md)"""
@@ -2281,6 +2321,7 @@ class Daemon:
             try:
                 refusal = ops.fix_order_precheck(store, project.path, wo,
                                                  central=central, unproven=unproven)
+                base_red = read_base_red(central, project.name)
             finally:
                 central.close()
             packet = evidence_mod.collect_work_order(
@@ -2307,9 +2348,22 @@ class Daemon:
 
             # A HEAD GITHUB HAS ALREADY CALLED RED IS SENT BACK, not judged (docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md)
             failing = evidence_mod.ci_failing(packet)
+            # RED ONLY WHERE THE BASE IS RED is the base's failure: judged, not returned (spec 2026-10-13 §9)
+            inherited = bool(failing and base_red is not None
+                             and evidence_mod.ci_inherited(packet, base_red.workflow))
+            if inherited:
+                packet = dataclasses.replace(packet, base_red=BASE_RED_PANEL_NOTE.format(
+                    base=base_red.base or "the base", workflow=base_red.workflow,
+                    run_url=base_red.run_url or "unknown",
+                    sha=base_red.head_sha[:10] or "an unknown commit",
+                    fixing=(f"; {base_red.fix_wo_id} is fixing it" if base_red.fix_wo_id
+                            else "")))
+                log.info("[%s] %s: round %d red only where `%s` is red — judged",
+                         project.name, wo_id, n, base_red.base)
             returns = store.uncounted_validation_rounds(
                 wo_id=wo_id, cause=ops.RED_CI_CAUSE)
-            if not pending and failing and returns < int(cfg.red_ci_returns):
+            if (not pending and failing and not inherited
+                    and returns < int(cfg.red_ci_returns)):
                 self._validation_red_ci(store, wo, round_id, n, max_rounds, failing)
                 log.info("[%s] %s: round %d returned unjudged — CI is red (%s)",
                          project.name, wo_id, n, ", ".join(failing))
@@ -2381,7 +2435,7 @@ class Daemon:
             # A REPEAT of the IMMEDIATELY PRECEDING round only
             previous = self._preceding_round(store, n, wo_id=wo_id)
             # A SUBMISSION SENT BACK FOR RED CI MAY COME BACK UNCHANGED (#1023)
-            after_red_ci = (previous is not None and not failing
+            after_red_ci = (previous is not None and (not failing or inherited)
                             and str(previous["uncounted_cause"] or "")
                             == ops.RED_CI_CAUSE)
             if self._repeat_submission(round_row, previous,
@@ -5504,29 +5558,7 @@ class Daemon:
 
     def _base_red(self, project: ProjectSpec) -> Any:
         """The stored red-base fact as `automerge.BaseRed`, or None"""
-        from . import automerge
-        from .central_store import BASE_HEALTH_FRESH_SECONDS
-
-        try:
-            fact = self.central.base_health(project.name)
-        except Exception:  # noqa: BLE001 — an unreadable fact is not a red base
-            return None
-        if not fact.get("red"):
-            return None
-        checked_at = fact.get("checked_at")
-        if not isinstance(checked_at, (int, float)):
-            return None
-        if db.now() - float(checked_at) > BASE_HEALTH_FRESH_SECONDS:
-            return None
-        return automerge.BaseRed(
-            base=str(fact.get("base") or ""), workflow=str(fact.get("workflow") or ""),
-            run_url=str(fact.get("run_url") or ""),
-            head_sha=str(fact.get("head_sha") or ""),
-            wo_id=str(fact.get("wo_id") or ""),
-            # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5
-            fix_wo_id=str(fact.get("fix_wo_id") or ""),
-            issue_url=str(fact.get("issue_url") or ""),
-            issue_os_filed=bool(fact.get("issue_os_filed")))
+        return read_base_red(self.central, project.name)
 
     def poll_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what happened to the pull requests this project is parked behind (docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md)"""
