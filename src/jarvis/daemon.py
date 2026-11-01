@@ -800,6 +800,37 @@ class Daemon:
         if not sample.ok:
             log.warning("usage meter unreadable: %s", sample.reason)
         self.notice_meter_gap()
+        try:
+            self.notice_burn_rate()
+        except Exception:  # noqa: BLE001 — an early warning must not take the tick down
+            log.exception("usage burn-rate notice failed")
+
+    def notice_burn_rate(self, now: float | None = None) -> None:
+        """One `warning` inbox row while the 5h window will run dry well before it resets (issue #878)"""
+        b = usage_meter.burn(self.central, now=db.now() if now is None else now)
+        if b is None:
+            return  # unknown is not recovered: a standing warning stays up
+        marked = self.central.get_state(usage_meter.BURN_NOTICE_KEY) or ""
+        lead = self.catalog.os.cost.meter_burn_warn_lead_minutes * 60
+        if b.lead_seconds() < lead:
+            if marked:
+                self.central.revise_inbox("", usage_meter.BURN_NOTICE_TITLE, None, ack=True)
+                self.central.set_state(usage_meter.BURN_NOTICE_KEY, "")
+                self.central.conn.commit()
+            return
+        running = [f"{t['wo_id']} ({name})" for name, store in self._fleet_stores().items()
+                   for t in store.running_turns()]
+        body = usage_meter.burn_sentence(b, running)
+        window = str(int(b.resets_at))
+        if marked == window:
+            self.central.revise_inbox("", usage_meter.BURN_NOTICE_TITLE, None,
+                                      body=body, level="warning")
+        else:
+            # A new window is a new episode: the last one's row is history, not news
+            self.central.revise_inbox("", usage_meter.BURN_NOTICE_TITLE, None, ack=True)
+            self.central.add_inbox("", usage_meter.BURN_NOTICE_TITLE, body, level="warning")
+            self.central.set_state(usage_meter.BURN_NOTICE_KEY, window)
+        self.central.conn.commit()
 
     def notice_meter_gap(self) -> None:
         """One `warning` inbox row per failure STREAK, marked in `os_state` (§8)"""
