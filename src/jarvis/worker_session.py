@@ -881,7 +881,7 @@ def _poll_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
             claude_cli.stop_bg(entry.id)
             return _reap_bg(store, wo, turn, entry, project_name, budget_cap=cap)
         if _parked_on_message(store, wo, turn):
-            # ...unless the worker ended its turn and a queued message waits on it (issue #1400)
+            # ...unless parked on a queued message; `_reap_bg` stops it (issue #1400)
             return _reap_bg(store, wo, turn, entry, project_name)
         return None
     answered = _bg_answered(wo, turn)
@@ -910,10 +910,9 @@ def _parked_on_message(store: ProjectStore, wo: dict[str, Any],
 
 def _last_stop_at(store: ProjectStore, wo_id: str, turn: dict[str, Any]) -> float | None:
     """When the `Stop` hook last fired in this turn, or None"""
-    for event in reversed(store.list_events(wo_id, limit=200, newest=True)):
-        if event["kind"] == "hook:Stop" and event["ts"] >= turn["started_at"]:
-            return float(event["ts"])
-    return None
+    stops = [float(event["ts"]) for event in store.list_events(wo_id, limit=200, newest=True)
+             if event["kind"] == "hook:Stop" and event["ts"] >= turn["started_at"]]
+    return max(stops, default=None)
 
 
 def _bg_answered(wo: dict[str, Any], turn: dict[str, Any]) -> bool:

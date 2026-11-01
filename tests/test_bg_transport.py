@@ -223,13 +223,38 @@ def test_a_turn_parked_on_a_queued_message_is_reaped(bg_fleet, fake_claude, monk
 
     store.queue_message(wo["id"], "[Neo] go with (a)", source="neo")
     worker_session.poll(store)
+    sid = store.get_work_order(wo["id"])["session_id"]
+    # Stopped by poll itself, while the task still holds it: a live session would fork on resume (fact 5)
+    assert not claude_cli.bg_roster()[sid].alive
     gate.unlink()
 
     turn = store.latest_turn(wo["id"])
     assert turn["state"] == "done" and turn["result"] == "Waiting on Neo."
-    sid = store.get_work_order(wo["id"])["session_id"]
-    assert not claude_cli.bg_roster()[sid].alive
     assert worker_session.delivery_hold(store, store.get_work_order(wo["id"])) is None
+
+
+def test_a_parked_turn_that_called_the_api_after_its_stop_stays_open(bg_fleet, fake_claude,
+                                                                     monkeypatch):
+    """A finishing task wakes the session (fact 9): that is work, not a park"""
+    from jarvis import usage
+
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    gate = fake_claude.hold_turns()
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    store.add_event(wo["id"], "hook:Stop", {"last_assistant_message": "Waiting on Neo."})
+    store.queue_message(wo["id"], "[Neo] go with (a)", source="neo")
+    monkeypatch.setattr(worker_session, "BG_PARKED_QUIET", 0.0)
+    woke = usage.Call(ts=time.time() + 1, model="claude-fake-1", input=1, cache_write=0,
+                      cache_read=0, output=1, cache_1h=0, cache_5m=0, sealed=True)
+    monkeypatch.setattr(usage, "session_calls", lambda *a, **k: [woke])
+
+    worker_session.poll(store)
+
+    sid = store.get_work_order(wo["id"])["session_id"]
+    assert worker_session.busy(store, wo["id"])
+    assert not claude_cli.bg_roster()[sid].idle and claude_cli.bg_roster()[sid].alive
+    gate.unlink()
 
 
 def test_a_session_that_dies_mid_turn_is_a_transport_pause(bg_fleet, fake_claude,
