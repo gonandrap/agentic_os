@@ -4002,12 +4002,9 @@ class Daemon:
         future = self.health_pool.submit(self._health_sweep, due, state)
         future.add_done_callback(lambda f: setattr(self, "health_sweeping", False))
 
-    def _health_candidates(self, pstore: ProjectStore,
-                           cfg: Any) -> list[tuple[float, dict, str]]:
-        """Every open unit due for a look, LONGEST-UNREVIEWED FIRST"""
-        from . import health
-
-        now = db.now()
+    @staticmethod
+    def _health_subjects(pstore: ProjectStore) -> list[dict]:
+        """Every open unit the health sweep covers"""
         subjects = [{"kind": "work_order", "row": wo}
                     for wo in pstore.list_work_orders(statuses=OPEN_STATUSES)
                     if wo["origin"] not in UNGOVERNED_ORIGINS]
@@ -4015,6 +4012,17 @@ class Daemon:
                      for fo in pstore.list_feature_orders(statuses=FO_OPEN_STATUSES)
                      # A feature with no carrier has no session at all and nothing to record a finding on
                      if pstore.carrier_for_feature(fo["id"]) is not None]
+        return subjects
+
+    def _health_candidates(self, pstore: ProjectStore, cfg: Any,
+                           subjects: list[dict] | None = None
+                           ) -> list[tuple[float, dict, str]]:
+        """Every open unit due for a look, LONGEST-UNREVIEWED FIRST"""
+        from . import health
+
+        now = db.now()
+        if subjects is None:
+            subjects = self._health_subjects(pstore)
         out = []
         for subject in subjects:
             row = subject["row"]
@@ -4053,7 +4061,16 @@ class Daemon:
                         log.debug("[%s] health sweep held until %s: %s",
                                   project.name, hold[0], hold[1])
                         continue
-                    candidates = self._health_candidates(pstore, cfg)
+                    subjects = self._health_subjects(pstore)
+                    pause = state.pause if state is not None else None
+                    if pause is not None:
+                        # The user's own hold: no look, and a stall already raised is moot (issue 855)
+                        held = [s for s in subjects if health.paused(pstore, s, pause)]
+                        for subject in held:
+                            supervisor_mod.settle_paused(pstore, neo_store,
+                                                         project.name, subject)
+                        subjects = [s for s in subjects if s not in held]
+                    candidates = self._health_candidates(pstore, cfg, subjects)
                     # THE CAP BOUNDS SPEND, so it bounds the PAID triggers only and every due re-assertion is processed
                     free = [c for c in candidates if c[2] == health.REASSERT]
                     paid = [c for c in candidates
