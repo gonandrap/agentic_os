@@ -484,6 +484,44 @@ def test_a_work_order_whose_worker_is_still_typing_is_refused(fleet, project, fa
     assert store.get_work_order(wo["id"])["status"] == status
 
 
+def red_ci_returned(fleet, project, *, cause: str = ops.RED_CI_CAUSE):
+    """Issue 1065's resting state: `validating`, newest round a settled rejection"""
+    store, wo = parked(fleet, project, outcome="pending")
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if cause:
+        store.mark_validation_round_uncounted(row["id"], cause)
+    store.settle_validation_round(row["id"], "rejected", {"round": 1}, wo_id=wo["id"],
+                                  reason="red")
+    store.set_status(wo["id"], "validating")
+    return store, store.get_work_order(wo["id"])
+
+
+def test_a_validating_order_resting_on_a_red_ci_return_can_be_forced(fleet, project,
+                                                                     fake_gh):
+    """Issue 1065: nothing else ever moves it"""
+    store, wo = red_ci_returned(fleet, project)
+    out = ops.force_validation(wo["id"], reason="main is green again")
+    assert out["round"] == 2 and out["was"] == "validating"
+
+
+def test_a_validating_order_on_a_judged_rejection_is_still_refused(fleet, project,
+                                                                    fake_gh):
+    """The worker is reworking a verdict; the floor is red_ci only"""
+    store, wo = red_ci_returned(fleet, project, cause="")
+    with pytest.raises(ops.OpsError, match="is validating, and a round can only be"):
+        ops.force_validation(wo["id"], reason="re-judge it")
+
+
+def test_a_red_ci_return_whose_worker_is_typing_is_refused(fleet, project, fake_gh,
+                                                           monkeypatch):
+    from jarvis import worker_session
+
+    store, wo = red_ci_returned(fleet, project)
+    monkeypatch.setattr(worker_session, "busy", lambda *_: {"state": "running"})
+    with pytest.raises(ops.OpsError, match="is validating"):
+        ops.force_validation(wo["id"], reason="re-judge it")
+
+
 def test_the_allowlist_is_what_the_refusal_names_so_the_two_cannot_drift(fleet, project,
                                                                         fake_gh):
     """The message quotes `FORCEABLE_STATUSES`"""
