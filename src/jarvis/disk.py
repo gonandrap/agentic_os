@@ -54,8 +54,7 @@ def make_dirs_writable(worktree: Path) -> int:
 
 
 def prune_build_caches(worktree: Path, artifacts: Iterable[str] = ()) -> list[str]:
-    """Delete UNTRACKED regenerable caches and consumed `artifacts`, which read as work (#1257);
-    a consumed artifact tracked on the branch is restored to HEAD instead (#1292)"""
+    """Clear caches and consumed `artifacts` that read as work (#1257, #1292)"""
     consumed = set(artifacts)
     # `=all` so an untracked DIRECTORY cannot hide what it holds behind its own name
     status = branchproof.run(worktree, "--no-optional-locks", "status", "--porcelain",

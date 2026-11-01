@@ -448,7 +448,8 @@ def test_a_consumed_artifact_tracked_on_main_does_not_keep_a_planner_session(
     store, project = bg_fleet["store"], bg_fleet["project"]
     (project.path / "plan.json").write_text('{"old": true}\n')
     subprocess.run(["git", "add", "plan.json"], cwd=project.path, check=True)
-    subprocess.run(["git", "commit", "-qm", "stale plan"], cwd=project.path, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm",
+                    "stale plan"], cwd=project.path, check=True)
     wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {"plan.json": '{"new": true}\n'})
     store.conn.execute("UPDATE work_orders SET kind='planner' WHERE id=?", (wo["id"],))
     store.conn.commit()
