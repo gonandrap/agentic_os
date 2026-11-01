@@ -1057,9 +1057,10 @@ def _stderr_tail(turn: dict[str, Any]) -> str:
         return ""
 
 
-def is_stalled(turn: dict[str, Any] | None) -> bool:
+def is_stalled(turn: dict[str, Any] | None, now: float | None = None) -> bool:
     return bool(turn and turn["state"] == "running"
-                and time.time() - turn["started_at"] > TURN_STALL_SECONDS)
+                and (time.time() if now is None else now) - turn["started_at"]
+                > TURN_STALL_SECONDS)
 
 
 # -- parked, and coming back by itself

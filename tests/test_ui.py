@@ -1741,6 +1741,20 @@ def test_got_it_button_puts_the_flag_down(client, project):
     assert "all quiet" in client.get("/").text
 
 
+def test_open_work_row_shows_the_attention_reason_of_a_running_order(client, project):
+    """Issue 245: running AND owing a decision must read differently from just running"""
+    wo = ops.create_work_order("proj_a", "busy but blocked on you")
+    store = ProjectStore(project)
+    store.set_status(wo["id"], "running")
+    store.flag_attention(wo["id"], "3 assumptions pending your review")
+
+    page = client.get("/").text
+    open_work = page[page.index('class="panel open-work"'):]
+    row = open_work[open_work.index(wo["id"]):]
+    row = row[:row.index('<div class="row"') if '<div class="row"' in row else None]
+    assert "◭ 3 assumptions pending your review" in row
+
+
 def test_got_it_is_not_offered_when_a_decision_is_owed(client, project):
     """Assumptions need accept/reject — dismissing one would drop the work silently"""
     wo = ops.create_work_order("proj_a", "task with a judgement call")
