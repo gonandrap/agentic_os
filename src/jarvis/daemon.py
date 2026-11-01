@@ -435,6 +435,15 @@ REVIEW_FEEDBACK = """REVIEW FEEDBACK (round {n} of {max})
 Address this and then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
 again. Re-submitting without changed code or new evidence will end the review."""
 
+#: THE SAME REJECTION ON A ROUND PAST THE BUDGET: the findings still reach the worker (issue 239)
+POST_BUDGET_FEEDBACK = """REVIEW FEEDBACK (round {n}, no review round left)
+{reason}
+
+The panel rejected this and the review budget is spent, so the work order is with the
+user to decide. Fix what is above on your branch, then run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."`: no panel judges it again,
+the user decides what lands."""
+
 #: THE SAME REJECTION ON A ROUND NOBODY WAS CHARGED FOR (docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.4)
 REBIND_FEEDBACK = """REVIEW FEEDBACK (re-judgement {used} of {max}, no round spent)
 {reason}
@@ -2395,9 +2404,16 @@ class Daemon:
                          else ops.ESCALATION_USER_REWORK_CEILING
                          if uncounted and cause == ops.USER_REWORK_CAUSE
                          else ops.ESCALATION_ROUNDS_SPENT)
-                self._escalate(store, wo, round_id, n, reason or (
-                    f"the review was not satisfied after {max_rounds} rounds."),
-                    cause=spent)
+                reason = reason or (
+                    f"the review was not satisfied after {max_rounds} rounds.")
+                self._escalate(store, wo, round_id, n, reason, cause=spent)
+                # A round that ran must reach whoever can act on it (issue 239)
+                bus.post(store, subject=bus.Subject(wo_id=wo_id),
+                         from_role="reviewer", to_role="implementor",
+                         payload=bus.ReviewFeedback(
+                             round=n, outcome="rejected",
+                             reason=POST_BUDGET_FEEDBACK.format(
+                                 n=n, reason=reason, wo_id=wo_id)))
             else:
                 # `escalated`, or anything the validator returned that is not a verdict this machine knows
                 self._escalate(store, wo, round_id, n, reason or (

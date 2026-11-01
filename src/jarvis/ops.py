@@ -4447,6 +4447,13 @@ BOUNCE_EXHAUSTED = (
     "judged the latest submission: decide whether the review's list is right before "
     "spending another round on it.")
 
+#: The refusal of a counted submission once `validation.max_rounds` are spent (issue 239)
+BUDGET_SPENT_REASON = (
+    "all {max_rounds} review rounds are spent (validation.max_rounds), so this "
+    "re-submission was not judged and no panel sat. The last round's findings were sent "
+    "to the worker. You decide: accept it with `jarvis wo review`, send guidance with "
+    "`jarvis wo send`, or re-judge it with `jarvis validation force`.")
+
 
 def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id: int,
                               n: int, reason: str, *, cause: str,
@@ -4569,6 +4576,20 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         unproven=tuple(unproven))
     # The NUMBER, not the budget position: a rebind spends one without spending the other (spec...
     nxt = store.numbered_validation_rounds(wo_id=wo["id"]) + 1
+    # THE BUDGET GATES A COUNTED ROUND: past it no panel sits, the user decides (issue 239)
+    if (not (forced_reason.strip() or uncounted)
+            and store.counted_validation_rounds(wo_id=wo["id"]) >= int(cfg.max_rounds)):
+        round_row = store.open_validation_round(
+            wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
+            summary=str(wo.get("result_summary") or ""), evidence=declared,
+            pr_url=wo.get("pr_url"), round=nxt,
+            config_version=current_config_version())
+        store.set_validation_file_shas(int(round_row["id"]), packet.file_shas)
+        escalate_validation_round(
+            store, wo, int(round_row["id"]), nxt,
+            BUDGET_SPENT_REASON.format(max_rounds=int(cfg.max_rounds)),
+            cause=ESCALATION_BUDGET_SPENT)
+        return store.get_validation_round(int(round_row["id"]))
     unanswered = (None if forced_reason.strip()
                   else unanswered_paths(store, str(wo["id"]), packet,
                                         project_path=project_path, wo=wo))
@@ -5884,6 +5905,8 @@ ESCALATION_REPEAT_SUBMISSION = "repeat_submission"
 ESCALATION_NO_VERDICT = "no_verdict"
 ESCALATION_VALIDATOR_UNREACHABLE = "validator_unreachable"
 ESCALATION_PROMPT_REFUSED = "prompt_refused"
+#: A counted submission after the budget is spent: refused before the panel (issue 239)
+ESCALATION_BUDGET_SPENT = "budget_spent"
 #: A KILL IS NOT AN OUTAGE: the seats were reached and were killed by a signal (docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md §4)
 ESCALATION_PANEL_KILLED = "panel_killed"
 #: Nothing to judge BECAUSE what is left is a command only the user may run (#1352)
@@ -5900,6 +5923,7 @@ ESCALATION_FAMILY: dict[str, str] = {
     ESCALATION_NOTHING_TO_JUDGE: "not_reviewed",
     ESCALATION_USER_ACTION: "not_reviewed",
     ESCALATION_REPEAT_SUBMISSION: "not_reviewed",
+    ESCALATION_BUDGET_SPENT: "not_reviewed",
     ESCALATION_NO_VERDICT: "unjudged",
     ESCALATION_VALIDATOR_UNREACHABLE: "unjudged",
     ESCALATION_PROMPT_REFUSED: "unjudged",
@@ -5931,6 +5955,9 @@ ESCALATION_WHY: dict[str, str] = {
     ESCALATION_REPEAT_SUBMISSION:
         "the submission was identical to the preceding round, so the panel had nothing "
         "new to judge.",
+    ESCALATION_BUDGET_SPENT:
+        "the review budget was already spent (validation.max_rounds), so no seat "
+        "judged this re-submission; the last round's findings went to the worker.",
     ESCALATION_NO_VERDICT: "the panel reached no verdict. Nobody has judged the work.",
     ESCALATION_VALIDATOR_UNREACHABLE:
         "the panel could not be reached, so nobody has judged the work.",
