@@ -8191,48 +8191,99 @@ def _investigation_verdict(fo: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def record_investigation_dispatch(inv_id: str, wo_id: str, note: str,
-                                  project_name: str | None = None) -> None:
+                                  project_name: str | None = None, *,
+                                  only_if_pending: bool = False) -> bool:
     """Write who started the investigation's fix, or who refused and why, onto its verdict (#1344)"""
+    from .issues import INVESTIGATION_PENDING_MARK
+
     _name, path, fo = find_feature_order(inv_id, project_name)
     verdict = _investigation_verdict(fo)
     filed = verdict.get("filed")
     if not isinstance(filed, dict):
-        return  # nothing filed, so nothing to start
+        return False  # nothing filed, so nothing to start
+    if only_if_pending and INVESTIGATION_PENDING_MARK not in str(filed.get("dispatch") or ""):
+        return False  # the settlement's own echo landed first: it is the exact one
     filed.update({"wo_id": wo_id or filed.get("wo_id") or "", "dispatch": note})
     store = ProjectStore(path)
     try:
         store.update_feature_order(inv_id, plan=db.to_json(verdict))
     finally:
         store.close()
+    return True
 
 
-def _fix_order_of(store: ProjectStore, filed: Mapping[str, Any]) -> dict[str, Any] | None:
+def _fix_order_of(filed: Mapping[str, Any]) -> dict[str, Any] | None:
     """The work order carrying a filed GAP: the one dispatched, else the newest on its issue"""
+    # In the TRACKER's project, not the investigation's (#1402)
     wo_id = str(filed.get("wo_id") or "")
     if wo_id:
         try:
-            return store.get_work_order(wo_id)
-        except KeyError:
+            return find_work_order(wo_id)[2]
+        except OpsError:
             pass
     url = str(filed.get("issue_url") or "")
-    rows = store.work_orders_for_issue(url) if url else []
-    return rows[0] if rows else None
+    if not url:
+        return None
+    rows: list[dict[str, Any]] = []
+    for path in registered_project_paths().values():
+        if not project_db_path(Path(path)).exists():
+            continue
+        store = ProjectStore(path)
+        try:
+            rows += store.work_orders_for_issue(url)
+        finally:
+            store.close()
+    return max(rows, key=lambda r: r.get("created_at") or "") if rows else None
+
+
+#: How long after Neo's answer a pending dispatch line counts as a LOST echo, not a late one (#1402)
+DISPATCH_ECHO_GRACE_SECONDS = 600
+
+
+def heal_investigation_dispatch(inv_id: str) -> str:
+    """INV-INVESTIGATION-DISPATCH's repair: the dispatch line from durable facts, `""` if none owed (#1402)"""
+    from .issues import INVESTIGATION_PENDING_MARK, START_COMMAND
+    from .neo_store import NeoStore
+
+    _name, _path, fo = find_feature_order(inv_id)
+    filed = _investigation_verdict(fo).get("filed")
+    if not isinstance(filed, dict) or INVESTIGATION_PENDING_MARK not in str(
+            filed.get("dispatch") or ""):
+        return ""
+    qid = int(filed.get("neo_question_id") or 0)
+    neo = NeoStore()
+    try:
+        q = neo.get(qid) if qid else None
+    finally:
+        neo.close()
+    if not q or q.get("status") != "answered":
+        return ""  # Neo has not ruled: the pre-triage sentence is still true
+    if db.now() - float(q.get("answered_at") or 0) < DISPATCH_ECHO_GRACE_SECONDS:
+        return ""  # settle_triage runs right after the answer: let its exact note land first
+    wo = _fix_order_of(filed)
+    if wo:
+        note = f"{wo['id']} is on it"
+    else:
+        answer = " ".join(str(q.get("answer") or "").split())[:120] or "no answer recorded"
+        start = START_COMMAND.format(url=filed.get("issue_url") or "<issue-url>")
+        note = (f"NOT started — Neo answered question {qid} ({answer}) and no fix order "
+                f"exists; start it by hand: `{start}`")
+    if not record_investigation_dispatch(inv_id, str(wo["id"]) if wo else "", note,
+                                         only_if_pending=True):
+        return ""
+    return note
 
 
 def investigation_fix_order(inv_id: str) -> str:
     """The fix order an investigation's GAP filed, `""` if none yet — `requeue_fixed`'s carrier (#1344)"""
     try:
-        _name, path, fo = find_feature_order(inv_id)
+        _name, _path, fo = find_feature_order(inv_id)
     except OpsError:
         return ""
     filed = _investigation_verdict(fo).get("filed")
     if not isinstance(filed, dict):
         return ""
-    store = ProjectStore(path)
-    try:
-        wo = _fix_order_of(store, filed)
-    finally:
-        store.close()
+    wo = _fix_order_of(filed)
     return str(wo["id"]) if wo else ""
 
 
@@ -8269,11 +8320,7 @@ def investigation_chain(name: str, path: Path, fo: Mapping[str, Any]) -> dict[st
         item = central.morpheus_item(item_id) if item_id else None
         fix = None
         if filed:
-            store = ProjectStore(path)
-            try:
-                wo = _fix_order_of(store, filed)
-            finally:
-                store.close()
+            wo = _fix_order_of(filed)
             if wo:
                 carrier = fix_carrier(str(wo["id"]))
                 landed = next((i for i in central.morpheus_items()
