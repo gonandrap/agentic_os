@@ -8602,8 +8602,11 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                  or not bus.nothing_queued_to_manager(pstore, str(wo["parent_id"]),
                                                       str(wo["id"]))))
         # §6 of docs/superpowers/specs/2026-10-14-a-worker-turn-in-flight-is-not-stuck.md
-        turn_in_flight = bool(wo["status"] == "running"
-                              and worker_session.busy(pstore, wo["id"]))
+        turn = (worker_session.busy(pstore, wo["id"])
+                if wo["status"] == "running" else None)
+        # Issue 1451: a stalled turn lapses the exclusion and is judged stuck outright
+        stalled = worker_session.is_stalled(turn, now)
+        turn_in_flight = bool(turn) and not stalled
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
@@ -8626,7 +8629,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,
-            turn_in_flight=turn_in_flight)
+            turn_in_flight=turn_in_flight,
+            stalled_turn_seconds=(now - float(turn["started_at"])) if stalled else 0.0)
         if stuck_only and not verdict.stuck:
             continue
         blocker = true_blockers(pstore, wo, now=now)
@@ -8701,6 +8705,16 @@ def stuck_report(project_name: str | None = None,
             })
     rows.sort(key=lambda r: r["threshold_seconds"] - r["active_seconds"])
     return rows
+
+
+def stuck_unjudged(project_name: str | None = None) -> list[dict[str, str]]:
+    """Registered projects `stuck_report` skips: not judged is not 'nothing stuck' (issue 1450)"""
+    paths = registered_project_paths()
+    return [{"project": spec.name,
+             "enable": f"jarvis config set {spec.name} os.fleet_health.enabled true"}
+            for spec in resolve_catalog().projects
+            if spec.name in paths and not spec.fleet_health.enabled
+            and (not project_name or spec.name == project_name)]
 
 
 def _stuck_investigation(project_name: str, wo_id: str) -> dict[str, Any] | None:
@@ -9360,6 +9374,62 @@ def refresh_plan_spec(fo_id: str,
              source, q2["id"])
     return {**out, "refreshed": True, "source": source, "neo_question_id": q2["id"],
             "superseded": qid}
+
+
+def refresh_held_spec(fo_id: str,
+                      project_name: str | None = None) -> dict[str, Any]:
+    """Re-read a released feature's spec while its spec PR is unmerged (docs/superpowers/specs/2026-11-01-a-held-spec-is-re-read-until-it-merges.md §2)"""
+    from . import landing, plans, sections, specs
+    from .project_store import SPEC_PR_OPEN_STATUSES, WORKER_CHILDREN
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    out: dict[str, Any] = {"project": name, "fo_id": fo_id, "refreshed": False}
+    if fo["status"] != "executing":
+        return {**out, "reason": f"{fo_id} is {fo['status']}"}
+    plan = db.from_json(fo.get("plan"), {}) or {}
+    planner = _planner_work_order(path, fo)
+    if not (plan.get("design_doc") and plan.get("design_doc_content")):
+        return {**out, "reason": "no spec snapshot"}
+    if not (planner and planner.get("pr_url")
+            and planner["status"] in SPEC_PR_OPEN_STATUSES):
+        return {**out, "reason": "the spec is not held"}
+
+    found = landing.committed_text(path, planner, plan["design_doc"])
+    if found is None:
+        return {**out, "reason": "nothing readable"}
+    text, source = found
+    old = str(plan["design_doc_content"])
+    if text == old:
+        return {**out, "reason": "unchanged"}
+
+    problems = list(plans.spec_problems(plan, text))
+    store = ProjectStore(path)
+    try:
+        if not problems:
+            # A started child keeps the section it was dispatched with
+            for kid in store.feature_children(fo_id, kinds=WORKER_CHILDREN):
+                which = str(kid.get("spec_section") or "").strip()
+                if (kid["status"] not in ("pending", "cancelled") and which
+                        and sections.extract_section(old, which)
+                        != sections.extract_section(text, which)):
+                    problems.append(f"{kid['id']} is {kid['status']} and its section "
+                                    f"{which!r} changed")
+        if problems:
+            reason = (f"the spec was revised on {source} but the children keep the "
+                      f"snapshot: " + "; ".join(problems))
+            if fo.get("attention_reason") != reason:
+                store.flag_feature_attention(fo_id, reason)
+                log.warning("[%s] %s: %s", name, fo_id, reason)
+            return {**out, "reason": "kept", "problems": problems}
+        plan["design_doc_content"], plan["design_doc_source"] = text, source
+        store.update_feature_order(fo_id, plan=db.to_json(plan))
+        store.add_event(planner["id"], "plan_spec_refreshed", {
+            "feature_order": fo_id, "source": source, "released": True})
+    finally:
+        store.close()
+    specs.install_agent(path, fo_id, str(plan.get("summary") or fo["title"]), text)
+    log.info("[%s] %s: released spec re-read from %s", name, fo_id, source)
+    return {**out, "refreshed": True, "source": source}
 
 
 def review_plan(fo_id: str, accept: bool = True, feedback: str = "",

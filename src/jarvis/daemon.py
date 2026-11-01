@@ -1020,6 +1020,8 @@ class Daemon:
         # First, so everything below runs under one configuration — and the same one
         self.reload_catalog()
         self.evict_offboarded()
+        # Before the project loop's invariants judge INV-STUCK-SWEEP-DARK against it (#1452)
+        self.note_stuck_enablement()
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
         poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
@@ -1454,6 +1456,12 @@ class Daemon:
                 ops.refresh_plan_spec(fo["id"], project_name=project.name)
             except Exception:  # noqa: BLE001 — one feature must not stop the rest
                 log.exception("[%s] could not refresh the spec under review for %s",
+                              project.name, fo["id"])
+        for fo in store.list_feature_orders(statuses=("executing",)):
+            try:
+                ops.refresh_held_spec(fo["id"], project_name=project.name)
+            except Exception:  # noqa: BLE001 — one feature must not stop the rest
+                log.exception("[%s] could not re-read the held spec of %s",
                               project.name, fo["id"])
 
     def settle_features(self, project: ProjectSpec, store: ProjectStore) -> None:
@@ -4147,6 +4155,16 @@ class Daemon:
 
     #: The run row, newest only
     STUCK_RUN_KEY = "stuck_sweep_run"
+    #: `{"enabled": bool, "ts": <when the daemon last saw it flip>}` — the dark clock's other start (#1452)
+    STUCK_ENABLED_KEY = "stuck_sweep_enabled"
+
+    def note_stuck_enablement(self) -> None:
+        """Record the moment the daemon sees the stuck sweep switch on or off"""
+        enabled = any(p.fleet_health.enabled for p in self.catalog.projects)
+        seen = db.from_json(self.central.get_state(self.STUCK_ENABLED_KEY), None)
+        if not seen or bool(seen.get("enabled")) != enabled:
+            self.central.set_state(self.STUCK_ENABLED_KEY,
+                                   db.to_json({"enabled": enabled, "ts": db.now()}))
 
     def stuck_cadence(self) -> int:
         """Ticks between two entries into `stuck_tick`"""
