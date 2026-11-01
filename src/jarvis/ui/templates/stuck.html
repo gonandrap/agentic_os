@@ -5,13 +5,23 @@
 
 {# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §5;
    the sweep itself is §7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md #}
-{{ ui.page_head("Stuck", attention | length ~ " past its threshold · " ~ total ~ " on the record") }}
+{{ ui.page_head("Stuck", attention | length ~ " past its threshold · " ~ total ~ " on the record"
+                ~ (" · " ~ unjudged | length ~ " project(s) not judged" if unjudged else "")) }}
 
 {% call(r) ui.needs_you(attention, "past its threshold") %}
   {{ ui.row_id(r.id, order_path(r.project, r.id)) }}
   <span class="mono tone-warn">{{ r.status_label }} · {{ fmt_dur(r.seconds_in_status) }}</span>
   <span class="sub">{{ r.blocker }}</span>
 {% endcall %}
+
+{# issue 1450: a project the sweep skips says so; its silence is never "nothing stuck" #}
+{% for u in unjudged %}
+<section class="attention needs-you" id="unjudged-{{ u.project }}">
+  <div class="strip-head tone-warn"><span class="mono">{{ u.project }}</span>&nbsp;is not judged —
+    <span class="mono">os.fleet_health.enabled</span> is off</div>
+  <p class="sub">enable it: <span class="mono">{{ u.enable }}</span></p>
+</section>
+{% endfor %}
 
 {% call ui.explain("how an order is judged stuck") %}
 <p class="kv">
@@ -60,7 +70,7 @@
 </div>
 {% elif filters %}
 <p class="empty">nothing matches these filters</p>
-{% else %}
-<p class="empty">no project has `fleet_health` enabled</p>
+{% elif not unjudged %}
+<p class="empty">no open order on any judged project</p>
 {% endif %}
 {% endblock %}
