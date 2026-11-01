@@ -8756,6 +8756,16 @@ def stuck_report(project_name: str | None = None,
     return rows
 
 
+def stuck_unjudged(project_name: str | None = None) -> list[dict[str, str]]:
+    """Registered projects `stuck_report` skips: not judged is not 'nothing stuck' (issue 1450)"""
+    paths = registered_project_paths()
+    return [{"project": spec.name,
+             "enable": f"jarvis config set {spec.name} os.fleet_health.enabled true"}
+            for spec in resolve_catalog().projects
+            if spec.name in paths and not spec.fleet_health.enabled
+            and (not project_name or spec.name == project_name)]
+
+
 def _stuck_investigation(project_name: str, wo_id: str) -> dict[str, Any] | None:
     """The live or last investigation of this subject, with its verdict when settled"""
     live = live_investigation(project_name, wo_id)
