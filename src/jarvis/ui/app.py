@@ -2266,8 +2266,11 @@ def create_app() -> FastAPI:
         if not decisions:
             return render(request, "error.html", active="steward", status_code=404,
                           message=f"no steward decision about {ref}")
+        from .. import steward
+
+        decisions = [{**d, "step": steward.next_step(d)} for d in decisions]
         return render(request, "steward_item.html", active="steward", ref=ref,
-                      decisions=decisions)
+                      decisions=decisions, yours=[d for d in decisions if d["step"]["yours"]])
 
     def _evolution(request: Request, project: str | None, days: int):
         """/evolution[/<project>], failures first (spec 2026-10-29 dashboard §5)"""
