@@ -915,6 +915,47 @@ def reassert_health(pstore: Any, project: str, subject: dict[str, Any]) -> dict[
     return {"outcome": prior["outcome"], "trigger": health.REASSERT}
 
 
+#: The settled alarm's reason, and the superseded Neo question's answer (issue 855)
+PAUSE_HELD_REASON = "held by jarvis pause"
+
+
+def settle_paused(pstore: Any, neo_store: Any, project: str,
+                  subject: dict[str, Any]) -> list[str]:
+    """Skip the open stall findings on a unit the user's pause holds, ids returned (issue 855)"""
+    from .invariants import true_blockers
+    from .project_store import ALARM_OPEN_STATUSES
+
+    kind, row = subject["kind"], subject["row"]
+    alarms = (pstore.alarms_for_feature(row["id"]) if kind == "feature_order"
+              else [a for a in pstore.alarms_of(row["id"])
+                    if a.get("subject_kind") == "work_order"])
+    settled = []
+    for alarm in alarms:
+        if (alarm.get("source") != "health" or alarm["status"] not in ALARM_OPEN_STATUSES
+                or alarm.get("probe") not in health.PAUSE_MOOT_PROBES):
+            continue
+        pstore.update_alarm(alarm["id"], status="skipped", decided_at=db.now(),
+                            verdict_reason=PAUSE_HELD_REASON)
+        if alarm.get("neo_question_id"):
+            neo_store.supersede(int(alarm["neo_question_id"]), PAUSE_HELD_REASON,
+                                reason=f"{alarm['id']} settled: {PAUSE_HELD_REASON}")
+        settled.append(alarm["id"])
+    carriers = {a["wo_id"] for a in alarms if a["id"] in settled}
+    for wo_id in carriers:
+        # `ops.ack_os_flag`'s rule, on the store already open
+        wo = pstore.get_work_order(wo_id)
+        blockers = true_blockers(pstore, wo)
+        if blockers:
+            if not wo["needs_attention"] or wo.get("attention_reason") != blockers[0]:
+                pstore.flag_attention(wo_id, blockers[0])
+        elif wo["needs_attention"]:
+            pstore.lower_attention(wo_id)
+    if settled:
+        log.info("[%s] %s held by jarvis pause: skipped %s", project, row["id"],
+                 ", ".join(settled))
+    return settled
+
+
 def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
     """What Neo is handed with the question"""
     # Decision #11: packet and model reasoning are both borrowed text, both bounded
