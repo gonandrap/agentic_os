@@ -46,6 +46,17 @@
     <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/cancel">
       <button class="danger">Cancel</button>
     </form>
+    <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/expedite">
+    {% if 'expedite' in wo_tags(wo, project) %}
+      <input type="hidden" name="off" value="1">
+      <button title="Stop shipping this order alone when its pull request merges">
+        Un-expedite</button>
+    {% else %}
+      <button title="When its pull request merges, release ONLY this order to production:
+the latest release tag plus its one commit cherry-picked, not whatever else is on main">
+        Expedite</button>
+    {% endif %}
+    </form>
     {% endif %}
     {% if wo.hidden %}
     <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/unhide">

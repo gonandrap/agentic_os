@@ -5510,6 +5510,7 @@ class Daemon:
                     ops.complete_merged(store, wo, merged_at=pr.merged_at,
                                         head_oid=pr.head_oid,
                                         merge_commit=pr.merge_commit_oid)
+                    self.ship_expedited(project, store, wo)
                 elif pr.closed_unmerged:
                     # ONCE PER CLOSURE
                     if pr_resync_unreopened(store, wo):
@@ -5894,6 +5895,7 @@ class Daemon:
                                        "round_id": decision.round_id,
                                        "round": decision.round_n,
                                        "head_sha": decision.judged_sha})
+        self.ship_expedited(project, store, wo)
 
     def auto_review(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Put this project's pending assumptions to Neo, one question each (docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md)"""
@@ -7189,8 +7191,9 @@ class Daemon:
             # TWO ROUTES TO A RELEASE, and expediting is the user's own: an expedited order carries an honest... (#961)
             if (applied == issues.CLOSED and was != issues.CLOSED
                     and ops_mod.routes_on_pull_request(store, wo)
-                    and (issues.dispatches(wo.get("issue_priority") or "")
-                         or issues.was_expedited(wo))):
+                    and issues.dispatches(wo.get("issue_priority") or "")
+                    # An expedited order shipped ALONE on its merge (ship_expedited)
+                    and not issues.was_expedited(wo)):
                 self.ensure_release(project, store, wo)
 
     #: How long a cached issue state is good for
@@ -7263,6 +7266,47 @@ newest commit on `origin/main` that carries every fix listed above and whose CI 
 green, written out in full (40 characters). If that base is red, or you cannot read \
 CI's verdict on it, say so and stop — a release is not the place to fix a red build."""
 
+    #: Marks a release order that ships its fixes ALONE, cherry-picked onto the latest tag
+    CHERRY_PICK_KEY = "cherry_pick"
+
+    #: What a cherry-pick release order is told to do (docs/superpowers/specs/2026-10-31-an-expedited-merge-ships-alone.md)
+    HOTFIX_BRIEF = """\
+Ship a release carrying ONLY these fixes. They have LANDED on `main` and the user \
+expedited them, so production gets the latest release tag plus their commits \
+cherry-picked onto it — NOT main's head:
+
+{fixes}
+
+Run the ordinary release path in its cherry-pick mode and nothing else:
+
+    scripts/shipit.sh --stage --wo {wo_id} --cherry-pick <sha>[,<sha>...]
+
+That is a PRIVILEGED ACTION and it will be gated — that is correct and expected. Make \
+your case first (`jarvis gate request`), and read `jarvis brief gates` before you do. Do \
+NOT invent a second release path, do not restart any service by hand, and do not drop \
+`--stage`: an inline restart kills your own session mid-turn. Changing the shas after \
+approval invalidates the grant: the approved string names the commits.
+
+Resolve each `<sha>` BEFORE you ask: the commit each pull request's squash merge put on \
+`main` (`gh pr view <url> --json mergeCommit`), written out in full (40 characters), \
+oldest first. If a pull request did not land as ONE squash commit, or a cherry-pick \
+conflicts, shipit refuses: report its reason and stop. Never fall back to releasing \
+`main`."""
+
+    def ship_expedited(self, project: ProjectSpec, store: ProjectStore,
+                       wo: dict) -> str:
+        """An expedited order's pull request merged: ship it alone (spec 2026-10-31 §2)"""
+        from . import issues
+
+        if not issues.was_expedited(wo):
+            return ""
+        try:
+            return self.ensure_release(project, store, store.get_work_order(wo["id"]))
+        except Exception:  # noqa: BLE001 — a release filing must never stall the merge sweep
+            log.exception("[%s] filing the release for expedited %s failed",
+                          project.name, wo["id"])
+            return ""
+
     def ensure_release(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> str:
         """Make sure a release carrying this landed fix is on its way (#945)"""
@@ -7273,9 +7317,13 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
             return ""  # releases only via the user's shipit unless os.autonomy is on
         if self._already_live(project, store, wo):
             return ""
-        url = wo.get("issue_url") or ""
+        # An expedited order may track no issue: its pull request names it (spec 2026-10-31 §3)
+        url = wo.get("issue_url") or wo.get("pr_url") or ""
+        if not url:
+            return ""
+        alone = issues.was_expedited(wo)
         # Expedited first: an order can be both
-        reason = ("expedited by the filer" if issues.was_expedited(wo)
+        reason = ("expedited" if alone
                   else f"confirmed `{wo.get('issue_priority')}` by Neo")
         line = (f"- {url} — fixed by `{wo['id']}`"
                 + (f" ({wo['pr_url']})" if wo.get("pr_url") else "")
@@ -7285,7 +7333,8 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
                                                 include_hidden=True):
             meta = db.from_json(candidate.get("metadata"), {}) or {}
             batch = meta.get(self.RELEASE_BATCH_KEY)
-            if isinstance(batch, list):
+            # A cherry-pick release never batches with a release of main's head
+            if isinstance(batch, list) and bool(meta.get(self.CHERRY_PICK_KEY)) == alone:
                 candidates.append((candidate, meta, batch))
         # §1.3, pass one over the one read: an url already batched anywhere is never added twice and never...
         for candidate, _meta, batch in candidates:
@@ -7313,14 +7362,16 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
                               parent_wo_id=str(wo["id"])),
             catalog=self.catalog, store=store,
             self_dispatch=self.self_dispatch)
+        meta = {self.RELEASE_BATCH_KEY: [url], **({self.CHERRY_PICK_KEY: True} if alone else {})}
         fresh = store.create_work_order(
-            title=f"Ship the fix for {wo.get('title') or url}",
+            title=(f"Ship {wo.get('title') or url} alone" if alone
+                   else f"Ship the fix for {wo.get('title') or url}"),
             description="", origin="os",
-            metadata=steward.stamped({self.RELEASE_BATCH_KEY: [url]}, decision))
+            metadata=steward.stamped(meta, decision))
         steward.linked(decision, fresh["id"])
+        brief = self.HOTFIX_BRIEF if alone else self.RELEASE_BRIEF
         store.update_work_order(
-            fresh["id"],
-            description=self.RELEASE_BRIEF.format(wo_id=fresh["id"], fixes=line))
+            fresh["id"], description=brief.format(wo_id=fresh["id"], fixes=line))
         store.add_event(fresh["id"], "release_batched",
                         {"issue_url": url, "wo_id": wo["id"]})
         log.info("[%s] %s landed — filed release %s", project.name, url, fresh["id"])
