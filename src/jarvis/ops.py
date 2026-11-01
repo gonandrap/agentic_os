@@ -4454,6 +4454,13 @@ BOUNCE_EXHAUSTED = (
     "judged the latest submission: decide whether the review's list is right before "
     "spending another round on it.")
 
+#: The refusal of a counted submission once `validation.max_rounds` are spent (issue 239)
+BUDGET_SPENT_REASON = (
+    "all {max_rounds} review rounds are spent (validation.max_rounds), so this "
+    "re-submission was not judged and no panel sat. The last round's findings were sent "
+    "to the worker. You decide: accept it with `jarvis wo review`, send guidance with "
+    "`jarvis wo send`, or re-judge it with `jarvis validation force`.")
+
 
 def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id: int,
                               n: int, reason: str, *, cause: str,
@@ -4580,7 +4587,21 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     if packet.pr_behind and not forced_reason.strip():
         _pr_behind_refused(store, wo, packet.pr_behind, nxt)
         return None
-    unanswered =(None if forced_reason.strip()
+    # THE BUDGET GATES A COUNTED ROUND: past it no panel sits, the user decides (issue 239)
+    if (not (forced_reason.strip() or uncounted)
+            and store.counted_validation_rounds(wo_id=wo["id"]) >= int(cfg.max_rounds)):
+        round_row = store.open_validation_round(
+            wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
+            summary=str(wo.get("result_summary") or ""), evidence=declared,
+            pr_url=wo.get("pr_url"), round=nxt,
+            config_version=current_config_version())
+        store.set_validation_file_shas(int(round_row["id"]), packet.file_shas)
+        escalate_validation_round(
+            store, wo, int(round_row["id"]), nxt,
+            BUDGET_SPENT_REASON.format(max_rounds=int(cfg.max_rounds)),
+            cause=ESCALATION_BUDGET_SPENT)
+        return store.get_validation_round(int(round_row["id"]))
+    unanswered = (None if forced_reason.strip()
                   else unanswered_paths(store, str(wo["id"]), packet,
                                         project_path=project_path, wo=wo))
     if unanswered is not None:
@@ -5861,6 +5882,8 @@ ESCALATION_REPEAT_SUBMISSION = "repeat_submission"
 ESCALATION_NO_VERDICT = "no_verdict"
 ESCALATION_VALIDATOR_UNREACHABLE = "validator_unreachable"
 ESCALATION_PROMPT_REFUSED = "prompt_refused"
+#: A counted submission after the budget is spent: refused before the panel (issue 239)
+ESCALATION_BUDGET_SPENT = "budget_spent"
 #: A KILL IS NOT AN OUTAGE: the seats were reached and were killed by a signal (docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md §4)
 ESCALATION_PANEL_KILLED = "panel_killed"
 #: Nothing to judge BECAUSE what is left is a command only the user may run (#1352)
@@ -5877,6 +5900,7 @@ ESCALATION_FAMILY: dict[str, str] = {
     ESCALATION_NOTHING_TO_JUDGE: "not_reviewed",
     ESCALATION_USER_ACTION: "not_reviewed",
     ESCALATION_REPEAT_SUBMISSION: "not_reviewed",
+    ESCALATION_BUDGET_SPENT: "not_reviewed",
     ESCALATION_NO_VERDICT: "unjudged",
     ESCALATION_VALIDATOR_UNREACHABLE: "unjudged",
     ESCALATION_PROMPT_REFUSED: "unjudged",
@@ -5908,6 +5932,9 @@ ESCALATION_WHY: dict[str, str] = {
     ESCALATION_REPEAT_SUBMISSION:
         "the submission was identical to the preceding round, so the panel had nothing "
         "new to judge.",
+    ESCALATION_BUDGET_SPENT:
+        "the review budget was already spent (validation.max_rounds), so no seat "
+        "judged this re-submission; the last round's findings went to the worker.",
     ESCALATION_NO_VERDICT: "the panel reached no verdict. Nobody has judged the work.",
     ESCALATION_VALIDATOR_UNREACHABLE:
         "the panel could not be reached, so nobody has judged the work.",
@@ -8168,48 +8195,99 @@ def _investigation_verdict(fo: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def record_investigation_dispatch(inv_id: str, wo_id: str, note: str,
-                                  project_name: str | None = None) -> None:
+                                  project_name: str | None = None, *,
+                                  only_if_pending: bool = False) -> bool:
     """Write who started the investigation's fix, or who refused and why, onto its verdict (#1344)"""
+    from .issues import INVESTIGATION_PENDING_MARK
+
     _name, path, fo = find_feature_order(inv_id, project_name)
     verdict = _investigation_verdict(fo)
     filed = verdict.get("filed")
     if not isinstance(filed, dict):
-        return  # nothing filed, so nothing to start
+        return False  # nothing filed, so nothing to start
+    if only_if_pending and INVESTIGATION_PENDING_MARK not in str(filed.get("dispatch") or ""):
+        return False  # the settlement's own echo landed first: it is the exact one
     filed.update({"wo_id": wo_id or filed.get("wo_id") or "", "dispatch": note})
     store = ProjectStore(path)
     try:
         store.update_feature_order(inv_id, plan=db.to_json(verdict))
     finally:
         store.close()
+    return True
 
 
-def _fix_order_of(store: ProjectStore, filed: Mapping[str, Any]) -> dict[str, Any] | None:
+def _fix_order_of(filed: Mapping[str, Any]) -> dict[str, Any] | None:
     """The work order carrying a filed GAP: the one dispatched, else the newest on its issue"""
+    # In the TRACKER's project, not the investigation's (#1402)
     wo_id = str(filed.get("wo_id") or "")
     if wo_id:
         try:
-            return store.get_work_order(wo_id)
-        except KeyError:
+            return find_work_order(wo_id)[2]
+        except OpsError:
             pass
     url = str(filed.get("issue_url") or "")
-    rows = store.work_orders_for_issue(url) if url else []
-    return rows[0] if rows else None
+    if not url:
+        return None
+    rows: list[dict[str, Any]] = []
+    for path in registered_project_paths().values():
+        if not project_db_path(Path(path)).exists():
+            continue
+        store = ProjectStore(path)
+        try:
+            rows += store.work_orders_for_issue(url)
+        finally:
+            store.close()
+    return max(rows, key=lambda r: r.get("created_at") or "") if rows else None
+
+
+#: How long after Neo's answer a pending dispatch line counts as a LOST echo, not a late one (#1402)
+DISPATCH_ECHO_GRACE_SECONDS = 600
+
+
+def heal_investigation_dispatch(inv_id: str) -> str:
+    """INV-INVESTIGATION-DISPATCH's repair: the dispatch line from durable facts, `""` if none owed (#1402)"""
+    from .issues import INVESTIGATION_PENDING_MARK, START_COMMAND
+    from .neo_store import NeoStore
+
+    _name, _path, fo = find_feature_order(inv_id)
+    filed = _investigation_verdict(fo).get("filed")
+    if not isinstance(filed, dict) or INVESTIGATION_PENDING_MARK not in str(
+            filed.get("dispatch") or ""):
+        return ""
+    qid = int(filed.get("neo_question_id") or 0)
+    neo = NeoStore()
+    try:
+        q = neo.get(qid) if qid else None
+    finally:
+        neo.close()
+    if not q or q.get("status") != "answered":
+        return ""  # Neo has not ruled: the pre-triage sentence is still true
+    if db.now() - float(q.get("answered_at") or 0) < DISPATCH_ECHO_GRACE_SECONDS:
+        return ""  # settle_triage runs right after the answer: let its exact note land first
+    wo = _fix_order_of(filed)
+    if wo:
+        note = f"{wo['id']} is on it"
+    else:
+        answer = " ".join(str(q.get("answer") or "").split())[:120] or "no answer recorded"
+        start = START_COMMAND.format(url=filed.get("issue_url") or "<issue-url>")
+        note = (f"NOT started — Neo answered question {qid} ({answer}) and no fix order "
+                f"exists; start it by hand: `{start}`")
+    if not record_investigation_dispatch(inv_id, str(wo["id"]) if wo else "", note,
+                                         only_if_pending=True):
+        return ""
+    return note
 
 
 def investigation_fix_order(inv_id: str) -> str:
     """The fix order an investigation's GAP filed, `""` if none yet — `requeue_fixed`'s carrier (#1344)"""
     try:
-        _name, path, fo = find_feature_order(inv_id)
+        _name, _path, fo = find_feature_order(inv_id)
     except OpsError:
         return ""
     filed = _investigation_verdict(fo).get("filed")
     if not isinstance(filed, dict):
         return ""
-    store = ProjectStore(path)
-    try:
-        wo = _fix_order_of(store, filed)
-    finally:
-        store.close()
+    wo = _fix_order_of(filed)
     return str(wo["id"]) if wo else ""
 
 
@@ -8246,11 +8324,7 @@ def investigation_chain(name: str, path: Path, fo: Mapping[str, Any]) -> dict[st
         item = central.morpheus_item(item_id) if item_id else None
         fix = None
         if filed:
-            store = ProjectStore(path)
-            try:
-                wo = _fix_order_of(store, filed)
-            finally:
-                store.close()
+            wo = _fix_order_of(filed)
             if wo:
                 carrier = fix_carrier(str(wo["id"]))
                 landed = next((i for i in central.morpheus_items()
@@ -14460,8 +14534,36 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
                 )
         finally:
             neo.close()
+    if row["wo_id"]:
+        _settle_alarm_attention(name, path, row["wo_id"], alarm_id)
     return {"alarm_id": alarm_id, "project": name, "wo_id": row["wo_id"],
             "review": review, "neo_question_closed": closed}
+
+
+def _settle_alarm_attention(name: str, path: Path, wo_id: str, alarm_id: str) -> None:
+    """A review is the user's answer, so the flag naming this alarm comes down (#1064)"""
+    from .supervisor import ALARM_BLOCKER
+
+    store = ProjectStore(path)
+    try:
+        try:
+            wo = store.get_work_order(wo_id)
+        except KeyError:
+            return
+        if wo.get("attention_reason") != ALARM_BLOCKER.format(alarm_id=alarm_id):
+            return  # the flag names something else: not this review's to touch
+        owed = [a for a in store.alarms_of(wo_id)
+                if a["id"] != alarm_id and a["status"] in ("escalated", "failed")
+                and a["review_status"] == "unreviewed"]
+    finally:
+        store.close()
+    settled = ack_os_flag(wo_id, name)
+    if not settled["blockers"] and owed:
+        store = ProjectStore(path)
+        try:
+            store.flag_attention(wo_id, ALARM_BLOCKER.format(alarm_id=owed[0]["id"]))
+        finally:
+            store.close()
 
 
 def approve_alarm_queue(project_name: str | None = None,
