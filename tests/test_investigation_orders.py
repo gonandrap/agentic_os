@@ -786,6 +786,30 @@ def test_a_gap_asks_neo_and_its_view_follows_the_fix_order(started, store):
     assert chain["fix"]["wo_id"] == fix["id"] and chain["fix"]["production"] is None
 
 
+def test_a_lost_dispatch_echo_is_re_derived_once_neo_has_ruled(started, store):
+    """#1402: the pending sentence outliving Neo's answer is a lost echo the sweep heals"""
+    from jarvis import invariants
+    from jarvis.neo_store import NeoStore
+
+    inv_id, _, out = _submitted(started, store, "GAP")
+    qid = out["filed"]["neo_question_id"]
+    assert list(invariants.check_investigation_dispatch_recorded(store)) == [], \
+        "Neo has not ruled: the pending sentence is still true"
+    neo = NeoStore()
+    try:
+        neo.record_answer(qid, "approve", reason="r")
+    finally:
+        neo.close()
+    fix = store.create_work_order("the fix", description="d")
+    store.update_work_order(fix["id"], issue_url=started.issue_url)
+
+    [v] = invariants.check_investigation_dispatch_recorded(store)
+    assert v.invariant == invariants.INV_INVESTIGATION_DISPATCH and v.subject_id == inv_id
+    filed = ops.show_investigation_order(inv_id)["filed"]
+    assert (filed["wo_id"], filed["dispatch"]) == (fix["id"], f"{fix['id']} is on it")
+    assert list(invariants.check_investigation_dispatch_recorded(store)) == []
+
+
 def test_a_gap_whose_duplicate_ops_finds_is_downgraded_honestly(started, store):
     """§2.5: the record must never read as though the investigator classified it that way"""
     subject = _subject(store)
