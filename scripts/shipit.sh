@@ -257,9 +257,10 @@ elif [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
 fi
 
 cur_version()   { grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/'; }
-latest_tagged() {  # highest X.Y.Z among jarvis-* tags, empty if none
+latest_tagged() {  # latest_tagged [<exclude>] — highest X.Y.Z among jarvis-* tags, empty if none
   git tag -l 'jarvis-*' | sed -E 's/^jarvis-//' \
-    | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1
+    | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+    | { grep -vxF "${1:-}" || true; } | sort -V | tail -1
 }
 
 bump() {  # bump <X.Y.Z> <major|minor|patch>
@@ -320,6 +321,11 @@ case "$BUMP_OR_VERSION" in
   *) die "invalid version/bump: '$BUMP_OR_VERSION' (want X.Y.Z or major|minor|patch)" ;;
 esac
 
+# A resumed cut already holds its own tag; the previous release is the one below it (issue 1180)
+if [ -z "$DEPLOY_TAG" ] && [ "$BASE" = "$VERSION" ]; then
+  BASE="$(latest_tagged "$VERSION")"; BASE="${BASE:-$(cur_version)}"
+fi
+
 TAG="jarvis-$VERSION"
 REL_BRANCH="release/jarvis-$VERSION"
 SHIP_SHA="$(git rev-parse "${BASE_SHA:-HEAD}")"
@@ -330,8 +336,28 @@ if [ -n "$DEPLOY_TAG" ]; then
   say "Deploying existing release $TAG to production — nothing is cut, tagged or pushed"
   say "  deploy: $PROD_DIR"
 else
-git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG already exists"
-git rev-parse -q --verify "refs/heads/$REL_BRANCH" >/dev/null && die "branch $REL_BRANCH already exists"
+# >>> release-resume (sliced verbatim by tests/test_shipit.py — keep both markers)
+# A cut that died after step 3 (issue 1180: origin refused the tag) left refs behind.
+# Re-running at the same version and base reuses them instead of refusing; anything
+# else holding those names is not this release and still stops the script.
+resume_commit() {  # resume_commit <tag> <branch> <base-sha> <version> — bump commit to reuse, empty if none
+  local tag="$1" branch="$2" base="$3" version="$4" ref c found="" pyproject
+  for ref in "refs/tags/$tag" "refs/heads/$branch" "refs/remotes/origin/$branch"; do
+    c="$(git rev-parse -q --verify "$ref^{commit}" 2>/dev/null)" || continue
+    [ -z "$found" ] || [ "$c" = "$found" ] \
+      || die "$ref is at ${c:0:9} but another ref of $tag is at ${found:0:9} — not one release cut; remove the stale refs by hand"
+    found="$c"
+  done
+  [ -n "$found" ] || return 0
+  [ "$(git rev-parse -q --verify "$found^" 2>/dev/null)" = "$base" ] \
+    || die "$tag / $branch already exist on ${found:0:9}, which was not cut from ${base:0:9} — release a new version"
+  pyproject="$(git show "$found:pyproject.toml" 2>/dev/null)" || pyproject=""
+  grep -qE "^version *= *\"$version\"" <<<"$pyproject" \
+    || die "$tag / $branch already exist on ${found:0:9}, which does not bump pyproject.toml to $version — release a new version"
+  echo "$found"
+}
+# <<< release-resume
+RESUME_SHA="$(resume_commit "$TAG" "$REL_BRANCH" "$SHIP_SHA" "$VERSION")" || exit 1
 
 # The single ref the rest of the script hangs off. Not "main's sha" since §3: the branch,
 # the bump commit, the tag and production's checkout all descend from this one commit, so
@@ -340,6 +366,13 @@ say "Releasing Jarvis OS $VERSION  (base tag: ${BASE}, base: ${SHIP_SHA:0:9})"
 say "  branch: $REL_BRANCH   tag: $TAG"
 say "  deploy: $PROD_DIR"
 
+if [ -n "$RESUME_SHA" ]; then
+say "resuming $TAG: reusing bump commit ${RESUME_SHA:0:9}, cut from ${SHIP_SHA:0:9} by an earlier run"
+git rev-parse -q --verify "refs/heads/$REL_BRANCH" >/dev/null \
+  || run "git branch '$REL_BRANCH' '$RESUME_SHA'"
+git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+  || run "git tag -a '$TAG' -m 'Jarvis OS $VERSION' '$RESUME_SHA'"
+else
 # --- 2. cut the release branch from the shipped commit ---------------------------
 say "cutting release branch $REL_BRANCH from ${SHIP_SHA:0:9}"
 run "git branch '$REL_BRANCH' '$SHIP_SHA'"
@@ -368,13 +401,26 @@ run "git -C '$WT' commit -m 'Release jarvis-$VERSION'"
 say "tagging $TAG on $REL_BRANCH"
 run "git -C '$WT' tag -a '$TAG' -m 'Jarvis OS $VERSION'"
 run "git worktree remove --force '$WT'"
+fi
 
 # --- 4. push to origin (git is the source of truth) ------------------------------
 # Do this BEFORE deploying: production pulls from the remote, so an unpushed ref
 # would mean shipping something no one else can reproduce.
+# >>> push-retry (sliced verbatim by tests/test_shipit.py — keep both markers)
+# Origin's refusal can be transient (issue 1180); pushing an unchanged ref again is a no-op.
+push_ref() {  # push_ref <refspec>
+  local attempt=1
+  until run "git push origin '$1'"; do
+    [ "$attempt" -lt 3 ] || die "origin refused $1 $attempt times — re-run the same shipit command: it resumes this release from the refs already cut"
+    say "origin refused $1 (attempt $attempt/3) — retrying in $((attempt * 5))s"
+    sleep $((attempt * 5))
+    attempt=$((attempt + 1))
+  done
+}
+# <<< push-retry
 say "pushing $REL_BRANCH and $TAG to origin"
-run "git push origin 'refs/heads/$REL_BRANCH:refs/heads/$REL_BRANCH'"
-run "git push origin 'refs/tags/$TAG'"
+push_ref "refs/heads/$REL_BRANCH:refs/heads/$REL_BRANCH"
+push_ref "refs/tags/$TAG"
 
 # --- 4a. publish the GitHub release — this version's changelog page --------------
 #

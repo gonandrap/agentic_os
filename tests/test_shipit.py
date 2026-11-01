@@ -958,3 +958,80 @@ def test_refuses_to_run_from_productions_own_checkout(tmp_path):
     r = _dry_run(repo, prod, "0.2.0")
     assert r.returncode == 1
     assert "not from production's own checkout" in r.stderr
+
+
+# --- issue 1180: a release half-published by a refused push is re-runnable ----------
+
+def _half_cut(repo: Path, version: str) -> str:
+    """What step 4 left behind when origin refused the tag: refs cut, only the branch pushed"""
+    base = _sha(repo, "HEAD")
+    _tag_like_shipit(repo, version)
+    _git(repo, "push", "-q", "origin", f"refs/heads/release/jarvis-{version}")
+    return base
+
+
+def test_a_half_published_release_resumes_at_the_same_version_and_base(tmp_path):
+    repo = _make_repo(tmp_path)
+    _released(repo, "0.1.5")
+    base = _half_cut(repo, "0.2.0")
+    r = _dry_run(repo, tmp_path / "prod", "--base", base, "0.2.0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "resuming jarvis-0.2.0" in r.stdout
+    assert "git branch 'release/jarvis-0.2.0'" not in r.stdout
+    assert "commit -m 'Release jarvis-0.2.0'" not in r.stdout
+    assert "push origin 'refs/tags/jarvis-0.2.0'" in r.stdout
+    # the previous release is the one below the resumed tag, not the tag itself
+    assert "base tag: 0.1.5" in r.stdout
+
+
+def test_a_resume_rebuilds_local_refs_from_the_branch_on_origin(tmp_path):
+    repo = _make_repo(tmp_path)
+    base = _half_cut(repo, "0.2.0")
+    bump = _sha(repo, "release/jarvis-0.2.0")
+    _git(repo, "tag", "-d", "jarvis-0.2.0")
+    _git(repo, "branch", "-D", "release/jarvis-0.2.0")
+    r = _dry_run(repo, tmp_path / "prod", "--base", base, "0.2.0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"git branch 'release/jarvis-0.2.0' '{bump}'" in r.stdout
+    assert f"git tag -a 'jarvis-0.2.0' -m 'Jarvis OS 0.2.0' '{bump}'" in r.stdout
+
+
+def test_existing_refs_from_another_base_still_refuse(tmp_path):
+    repo = _make_repo(tmp_path)
+    _half_cut(repo, "0.2.0")
+    _commit(repo, "landed later")
+    _git(repo, "push", "-q", "origin", "main")
+    r = _dry_run(repo, tmp_path / "prod", "--base", _sha(repo, "HEAD"), "0.2.0")
+    assert r.returncode == 1
+    assert "was not cut from" in r.stderr
+
+
+def _run_push_ref(tmp_path: Path, refusals: int) -> subprocess.CompletedProcess[str]:
+    """push_ref against a bare origin whose hook refuses the first `refusals` pushes"""
+    repo = _make_repo(tmp_path)
+    hook = tmp_path / "origin.git" / "hooks" / "pre-receive"
+    count = tmp_path / "pushes"
+    hook.write_text(f"#!/bin/sh\nn=$(cat {count} 2>/dev/null || echo 0); echo $((n+1)) > {count}\n"
+                    f"[ \"$n\" -ge {refusals} ]\n")
+    hook.chmod(0o755)
+    text = SHIPIT.read_text()
+    start, end = text.find("# >>> push-retry"), text.find("# <<< push-retry")
+    assert 0 <= start < end, "push-retry markers missing from scripts/shipit.sh"
+    script = ("set -euo pipefail\nDRY_RUN=0\n"
+              "run() { eval \"$*\"; }\nsay() { printf '%s\\n' \"$*\"; }\n"
+              "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\nsleep() { :; }\n"
+              + text[start:end] + "\npush_ref 'refs/heads/main:refs/heads/release/x'\n")
+    return subprocess.run([BASH, "-c", script], cwd=str(repo), capture_output=True, text=True)
+
+
+def test_a_transient_push_refusal_is_retried(tmp_path):
+    r = _run_push_ref(tmp_path, refusals=1)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "attempt 1/3" in r.stdout
+
+
+def test_a_persistent_push_refusal_gives_up_with_the_way_back(tmp_path):
+    r = _run_push_ref(tmp_path, refusals=99)
+    assert r.returncode == 1
+    assert "refused refs/heads/main:refs/heads/release/x 3 times" in r.stderr
+    assert "re-run the same shipit command" in r.stderr
