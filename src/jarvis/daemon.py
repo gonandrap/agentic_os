@@ -1172,7 +1172,9 @@ class Daemon:
 
         pending = store.unsealed_terminal_orders()
         features = store.unsealed_terminal_features()
-        if not pending and not features:
+        reopened = [(o, False) for o in store.resettled_sealed_orders()] + [
+            (f, True) for f in store.resettled_sealed_orders(feature=True)]
+        if not pending and not features and not reopened:
             return
         # One index of Claude Code's transcript tree for the whole batch: it walks every project directory...
         index = usage.index_sessions()
@@ -1193,6 +1195,12 @@ class Daemon:
                 store.seal_bill(feature["id"], db.to_json(
                     {"error": "this bill could not be computed when the order settled"}),
                     feature=True)
+        for order, feature in reopened:
+            try:
+                bill_mod.reseal_settled(project.name, project.path, order,
+                                        feature=feature, index=index)
+            except Exception:  # noqa: BLE001
+                log.exception("re-sealing the bill for %s failed", order["id"])
 
     def seal_autopsies(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Freeze the ANATOMY of every settled order that has none yet (docs/superpowers/specs/2026-09-27-order-autopsy-durability.md)"""
