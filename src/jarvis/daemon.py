@@ -5820,6 +5820,13 @@ class Daemon:
                     and base_behind is not None):
                 self._supersede_stale_request(store, approval, pr)
                 return
+            if approval["status"] == "denied":
+                # #873: a denial that lost the race with another merge is caught up, not parked
+                caught = self._catch_up_with_base(project, store, wo, pr)
+                if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
+                    self._note_automerge_held(
+                        store, wo_id,
+                        automerge.held_base_moved(caught, pr, caught.base_tip))
             # Filed and not granted: pending with Neo, escalated to the user, denied, expired
             return
         if approval is None:
