@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import time
 from contextlib import contextmanager
@@ -2592,6 +2593,39 @@ def check_consumed_documents_settle(store: ProjectStore) -> Iterator[Violation]:
                         context=context)
 
 
+INV_INVESTIGATION_DISPATCH = "INV-INVESTIGATION-DISPATCH"
+
+
+def check_investigation_dispatch_recorded(store: ProjectStore) -> Iterator[Violation]:
+    """INV-INVESTIGATION-DISPATCH — Neo ruled on a GAP's triage, its dispatch line unwritten (issue 1402)"""
+    from .issues import INVESTIGATION_PENDING_MARK
+
+    rows = store.conn.execute(
+        "SELECT id FROM feature_orders WHERE kind='investigation' AND instr(plan, ?) > 0",
+        (INVESTIGATION_PENDING_MARK,)).fetchall()
+    if not rows:
+        return
+    from .ops import OpsError, heal_investigation_dispatch
+
+    readonly = getattr(store, "readonly", False)
+    for row in rows:
+        inv_id = str(row["id"])
+        if readonly:
+            continue  # the repair writes through ops; a read-only sweep has nothing to say yet
+        try:
+            note = heal_investigation_dispatch(inv_id)
+        except (OpsError, sqlite3.Error):
+            continue  # next sweep retries; the pending sentence stays visible meanwhile
+        if not note:
+            continue  # Neo has not ruled yet: the pending sentence is still true
+        yield Violation(
+            invariant=INV_INVESTIGATION_DISPATCH, subject_id=inv_id,
+            detail=(f"investigation {inv_id}: Neo answered the triage of the bug it filed, "
+                    f"but the dispatch line still said Neo was re-assessing it"),
+            repaired=True, repair=f"dispatch line re-derived: {note}",
+            context={"fo_id": inv_id})
+
+
 INV_FEATURE_ORPHAN_CHILD = "INV-FEATURE-ORPHAN-CHILD"
 
 #: The marker that says a parent's flag was raised by INV-FEATURE-ORPHAN-CHILD
@@ -4239,6 +4273,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # only, which no work-order check looks at
     check_consumed_documents_settle,  # before the orphan check: a settled child is no
                                    # orphan to raise on its parent
+    check_investigation_dispatch_recorded,  # order-free: writes a verdict nothing else reads
     check_settled_parents_have_no_orphans,  # after it: a reopened feature is no longer
                                    # settled; it reads child flags and writes only the parent's
     check_decisions_closed_by_user,  # order-free: a pure read that repairs nothing
