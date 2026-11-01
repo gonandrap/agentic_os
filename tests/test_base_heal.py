@@ -265,6 +265,56 @@ def test_the_heal_waits_while_the_panel_is_reading_the_branch(started, project,
     assert store.pr_repair_attempts(wo["id"], "checks") == 0
 
 
+def red_ci_returned(project_path, *, cause: str = ops.RED_CI_CAUSE):
+    """Issue 1065: round 1 sent back unjudged on the inherited red, nothing to carry"""
+    store = ProjectStore(project_path)
+    wo = ops.create_work_order("proj_a", "add feature X")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    store.update_work_order(wo["id"], session_id="sess-" + wo["id"])
+    row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp-" + wo["id"])
+    store.set_validation_head(row["id"], JUDGED)
+    if cause:
+        store.mark_validation_round_uncounted(row["id"], cause)
+    store.settle_validation_round(row["id"], "rejected", {"round": 1}, wo_id=wo["id"],
+                                  reason="red")
+    store.set_status(wo["id"], "needs_review")
+    return store, store.get_work_order(wo["id"])
+
+
+def test_a_healed_red_ci_return_is_resubmitted_on_the_rebuilt_head(started, project,
+                                                                   fake_gh):
+    """ISSUE 1065: the OS opens the round the worker was told to wait to open"""
+    started.catalog.project("proj_a").validation.enabled = True
+    store, wo = red_ci_returned(project)
+    fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+    fake_gh.updated_head(UPDATED)
+
+    poll(started, store)
+
+    assert fake_gh.updates == [PR]
+    latest = store.latest_validation_round(wo_id=wo["id"])
+    assert int(latest["round"]) == 2 and latest["outcome"] == "pending"
+    forced = store.events_of_kind(wo["id"], "validation_forced")
+    payload = db.from_json(forced[0]["payload"], {})
+    assert payload["by"] == ops.REJUDGE_BY_OS and payload["head_sha"] == UPDATED
+    assert "cause" not in payload                       # counted if judged
+    assert store.get_work_order(wo["id"])["status"] == "validating"
+
+
+def test_a_judged_rejection_is_not_resubmitted_by_the_heal(started, project, fake_gh):
+    """THE CONTROL: a verdict the seats meant is the worker's to answer"""
+    started.catalog.project("proj_a").validation.enabled = True
+    store, wo = red_ci_returned(project, cause="")
+    fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+
+    poll(started, store)
+
+    assert fake_gh.updates == [PR]
+    assert int(store.latest_validation_round(wo_id=wo["id"])["round"]) == 1
+
+
 # -- the fleet
 
 
