@@ -341,7 +341,7 @@ else
 # Re-running at the same version and base reuses them instead of refusing; anything
 # else holding those names is not this release and still stops the script.
 resume_commit() {  # resume_commit <tag> <branch> <base-sha> <version> — bump commit to reuse, empty if none
-  local tag="$1" branch="$2" base="$3" version="$4" ref c found="" pyproject
+  local tag="$1" branch="$2" base="$3" version="$4" ref c found="" pyproject lock
   for ref in "refs/tags/$tag" "refs/heads/$branch" "refs/remotes/origin/$branch"; do
     c="$(git rev-parse -q --verify "$ref^{commit}" 2>/dev/null)" || continue
     [ -z "$found" ] || [ "$c" = "$found" ] \
@@ -351,9 +351,16 @@ resume_commit() {  # resume_commit <tag> <branch> <base-sha> <version> — bump 
   [ -n "$found" ] || return 0
   [ "$(git rev-parse -q --verify "$found^" 2>/dev/null)" = "$base" ] \
     || die "$tag / $branch already exist on ${found:0:9}, which was not cut from ${base:0:9} — release a new version"
-  pyproject="$(git show "$found:pyproject.toml" 2>/dev/null)" || pyproject=""
-  grep -qE "^version *= *\"$version\"" <<<"$pyproject" \
-    || die "$tag / $branch already exist on ${found:0:9}, which does not bump pyproject.toml to $version — release a new version"
+  # Only step 3's own bump may be reused: anything else under these names ships unreviewed code
+  local not_bump="$tag / $branch already exist on ${found:0:9}, which is not exactly step 3's bump to $version — release a new version"
+  ! git diff --name-only "$base" "$found" | grep -qvxE 'pyproject\.toml|uv\.lock' || die "$not_bump"
+  pyproject="$(git show "$base:pyproject.toml" 2>/dev/null \
+    | awk -v v="$version" '!done && /^version *= *"[^"]+"/ { sub(/"[^"]+"/, "\"" v "\""); done = 1 } { print }')" \
+    || die "$not_bump"
+  [ "$pyproject" = "$(git show "$found:pyproject.toml" 2>/dev/null)" ] || die "$not_bump"
+  lock="$(git show "$base:uv.lock" 2>/dev/null \
+    | sed -E "/^name = \"jarvis-os\"\$/{n;s/^version = \"[^\"]+\"\$/version = \"$version\"/;}")" || lock=""
+  [ "$lock" = "$(git show "$found:uv.lock" 2>/dev/null || true)" ] || die "$not_bump"
   echo "$found"
 }
 # <<< release-resume

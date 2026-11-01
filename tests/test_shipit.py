@@ -1006,6 +1006,22 @@ def test_existing_refs_from_another_base_still_refuse(tmp_path):
     assert "was not cut from" in r.stderr
 
 
+def test_a_bump_commit_carrying_more_than_the_bump_is_not_resumed(tmp_path):
+    repo = _make_repo(tmp_path)
+    base = _sha(repo, "HEAD")
+    _git(repo, "checkout", "-q", "-b", "release/jarvis-0.2.0")
+    (repo / "pyproject.toml").write_text('[project]\nname = "jarvis-os"\nversion = "0.2.0"\n')
+    (repo / "README.md").write_text("# unreviewed\n")
+    _git(repo, "commit", "-qam", "Release jarvis-0.2.0")
+    _git(repo, "push", "-q", "origin", "release/jarvis-0.2.0")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "branch", "-D", "release/jarvis-0.2.0")
+    r = _dry_run(repo, tmp_path / "prod", "--base", base, "0.2.0")
+    assert r.returncode == 1
+    assert "not exactly step 3's bump" in r.stderr
+    assert "resuming" not in r.stdout
+
+
 def _run_push_ref(tmp_path: Path, refusals: int) -> subprocess.CompletedProcess[str]:
     """push_ref against a bare origin whose hook refuses the first `refusals` pushes"""
     repo = _make_repo(tmp_path)
