@@ -492,7 +492,7 @@ def test_no_seeded_pattern_can_reach_across_a_newline():
 def test_check_canaries_catches_a_retracted_recogniser(central):
     """The other way a gate goes quiet: not a bad exemption, a missing recogniser"""
     shipit = [r for r in central.gate_rules(role="match")
-              if r["pattern"] == "shipit"][0]
+              if r["pattern"] == gate_rules.SHIPIT_PATTERN][0]
     central.retract_gate_rule(shipit["id"], "testing")
 
     failures = gate_rules.RuleSet.load(central).check_canaries()
@@ -505,7 +505,7 @@ def test_the_invariant_reports_a_disarmed_gate(central):
 
     assert list(check_gate_canaries()) == []
     shipit = [r for r in central.gate_rules(role="match")
-              if r["pattern"] == "shipit"][0]
+              if r["pattern"] == gate_rules.SHIPIT_PATTERN][0]
     central.retract_gate_rule(shipit["id"], "testing")
 
     violations = list(check_gate_canaries())
@@ -525,7 +525,7 @@ def test_retracting_an_exemption_re_arms_the_gate(central):
 
 def test_seeding_is_idempotent_and_does_not_resurrect_a_retracted_rule(jarvis_home):
     first = CentralStore()
-    shipit = [r for r in first.gate_rules(role="match") if r["pattern"] == "shipit"][0]
+    shipit = [r for r in first.gate_rules(role="match") if r["pattern"] == gate_rules.SHIPIT_PATTERN][0]
     first.retract_gate_rule(shipit["id"], "deliberate")
     seeded = len(first.gate_rules(include_retired=True))
     first.close()
@@ -535,6 +535,49 @@ def test_seeding_is_idempotent_and_does_not_resurrect_a_retracted_rule(jarvis_ho
     try:
         assert len(second.gate_rules(include_retired=True)) == seeded
         assert second.get_gate_rule(shipit["id"])["retired_at"] is not None
+    finally:
+        second.close()
+
+
+# Issue #252: the release recogniser fires on running the script, not on its name in a path
+@pytest.mark.parametrize("command", [
+    "uv run pytest tests/test_shipit.py -q",
+    "timeout 560 uv run pytest tests/test_gate_rules.py tests/test_shipit.py -q",
+    "ls .claude/skills/shipit/",
+    "rg -n release .claude/skills/shipit/SKILL.md",
+    "python -m pytest tests/test_shipit.py::test_stage -x",
+])
+def test_the_release_recogniser_ignores_the_word_in_a_path(central, command):
+    assert classify(command, gate_rules.RuleSet.load(central)) is None
+
+
+@pytest.mark.parametrize("command", [
+    "./scripts/shipit.sh",
+    "bash scripts/shipit.sh --dry-run",
+    "sh /home/u/agentic_os/scripts/shipit.sh --deploy jarvis-1.2.3",
+    "shipit --deploy jarvis-1.2.3",
+    "cd repo && shipit",
+])
+def test_the_release_recogniser_still_gates_running_the_script(central, command):
+    match = classify(command, gate_rules.RuleSet.load(central))
+    assert match is not None and match.kind == "release"
+
+
+def test_reseeding_retires_the_bare_substring_recogniser(jarvis_home):
+    old_id = gate_rules.seed_id(gate_rules.MATCH, "release", gate_rules.REGEX, "shipit")
+    first = CentralStore()
+    first.conn.execute(
+        "INSERT OR IGNORE INTO gate_rules (id, ts, role, kind, test, pattern, source)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (old_id, db.now(), gate_rules.MATCH, "release", gate_rules.REGEX, "shipit", "builtin"))
+    first.set_state("gate_rules_seed", "6")
+    first.close()
+
+    second = CentralStore()
+    try:
+        assert second.get_gate_rule(old_id)["retired_at"] is not None
+        live = [r["pattern"] for r in second.gate_rules(role="match", kind="release")]
+        assert "shipit" not in live and gate_rules.SHIPIT_PATTERN in live
     finally:
         second.close()
 

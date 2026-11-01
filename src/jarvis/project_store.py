@@ -2165,6 +2165,21 @@ class ProjectStore:
             " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def resettled_sealed_orders(self, *, feature: bool = False,
+                                limit: int = 2) -> list[dict[str, Any]]:
+        """Settled orders whose bill was sealed BEFORE their last settlement — reopened since (#870)"""
+        table, kind = ("feature_orders", "fo") if feature else ("work_orders", "wo")
+        terminal = FO_TERMINAL_STATUSES if feature else TERMINAL_STATUSES
+        marks = ", ".join("?" for _ in terminal)
+        rows = self.conn.execute(
+            f"SELECT o.* FROM {table} o WHERE o.status IN ({marks})"
+            " AND o.bill_json IS NOT NULL AND o.bill_sealed_at < ("
+            "   SELECT MAX(s.ts) FROM wo_state_spans s WHERE s.order_id=o.id"
+            f"  AND s.order_kind=? AND s.to_status IN ({marks}))"
+            " ORDER BY o.updated_at LIMIT ?",
+            (*terminal, kind, *terminal, limit)).fetchall()
+        return [dict(r) for r in rows]
+
     def settled_release_orders(self, since: float,
                                limit: int = 20) -> list[dict[str, Any]]:
         """Settled orders carrying a release batch, newest settlement first (#945)"""

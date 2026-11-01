@@ -4847,6 +4847,18 @@ def _precheck_refused(store: ProjectStore, wo: Mapping[str, Any], reason: str,
                  reason=PRECHECK_FEEDBACK.format(reason=reason, wo_id=wo_id)))
 
 
+def red_ci_return_idle(store: ProjectStore, wo: Mapping[str, Any]) -> bool:
+    """`validating` on a settled red_ci return with no worker typing (docs/superpowers/specs/2026-11-01-a-healed-red-ci-return-resubmits-itself.md §3)"""
+    from . import worker_session
+
+    if str(wo.get("status") or "") != "validating":
+        return False
+    latest = store.latest_validation_round(wo_id=str(wo["id"]))
+    return (latest is not None and latest["outcome"] == "rejected"
+            and str(latest["uncounted_cause"] or "") == RED_CI_CAUSE
+            and not worker_session.busy(store, str(wo["id"])))
+
+
 def force_validation_refusal(store: ProjectStore, wo: dict[str, Any], *,
                              project: str, cfg: Any) -> str | None:
     """Why a round CANNOT be forced on this work order, in the sentence that refuses it"""
@@ -4856,7 +4868,7 @@ def force_validation_refusal(store: ProjectStore, wo: dict[str, Any], *,
                 f"validation.enabled true`) before forcing a round")
     wo_id = str(wo["id"])
     status = str(wo["status"] or "")
-    if status not in FORCEABLE_STATUSES:
+    if status not in FORCEABLE_STATUSES and not red_ci_return_idle(store, wo):
         return (f"{wo_id} is {status}, and a round can only be forced on a work order "
                 f"that has DELIVERED and whose worker is not typing — "
                 f"{' or '.join(FORCEABLE_STATUSES)}. A settled order would be reopened "
@@ -5060,6 +5072,45 @@ def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, An
     return {"wo_id": wo_id, "declined": False, "round": round_row["round"],
             "round_id": round_row["id"], "head_sha": head, "judged_sha": judged,
             "reason": reason, "was": was}
+
+
+#: The `forced_reason` of the round the OS opens after healing a red base under a red_ci return
+RED_CI_HEALED_FORCED_REASON = (
+    "the OS resubmitted this itself: round {n} was sent back unjudged because CI was "
+    "red, the red was inherited from {base}, and the OS rebuilt the pull request on "
+    "{base_sha} — this round judges the new head {head}")
+
+
+def resubmit_healed_red_ci(store: ProjectStore, project_path: Path, wo: dict[str, Any],
+                           *, project: str, cfg: Any, base: str, base_sha: str,
+                           head: str) -> dict[str, Any] | None:
+    """Open the round a red_ci return asked the worker for, once the OS healed the red itself (docs/superpowers/specs/2026-11-01-a-healed-red-ci-return-resubmits-itself.md §2)"""
+    wo_id = str(wo["id"])
+    latest = store.latest_validation_round(wo_id=wo_id)
+    if (latest is None or latest["outcome"] != "rejected"
+            or str(latest["uncounted_cause"] or "") != RED_CI_CAUSE or not head
+            or str(latest["head_sha"] or "") == head
+            or head in rejudged_heads(store, wo_id)):
+        return None
+    # A queued envelope will reach the worker, whose own resubmission is then the answer
+    if store.queued_messages(wo_id):
+        return None
+    if force_validation_refusal(store, wo, project=project, cfg=cfg) is not None:
+        return None
+    was = str(wo["status"] or "")
+    reason = RED_CI_HEALED_FORCED_REASON.format(n=latest["round"], base=base,
+                                                base_sha=base_sha[:10], head=head[:10])
+    # Counted if judged: it is exactly the resubmission RED_CI_FEEDBACK asked for (Neo question 2889)
+    round_row = submit_for_validation(store, project_path, wo,
+                                      declared=declared_evidence(store, wo_id),
+                                      cfg=cfg, forced_reason=reason)
+    store.add_event(wo_id, "validation_forced",
+                    {"round": round_row["round"], "round_id": round_row["id"],
+                     # No `cause`: the timeline reads any cause as "no round spent"
+                     "reason": reason, "was": was, "by": REJUDGE_BY_OS,
+                     "head_sha": head})
+    return {"wo_id": wo_id, "round": round_row["round"], "round_id": round_row["id"],
+            "head_sha": head, "reason": reason, "was": was}
 
 
 def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: str,
