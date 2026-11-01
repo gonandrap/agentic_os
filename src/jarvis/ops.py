@@ -8574,8 +8574,11 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                  or not bus.nothing_queued_to_manager(pstore, str(wo["parent_id"]),
                                                       str(wo["id"]))))
         # §6 of docs/superpowers/specs/2026-10-14-a-worker-turn-in-flight-is-not-stuck.md
-        turn_in_flight = bool(wo["status"] == "running"
-                              and worker_session.busy(pstore, wo["id"]))
+        turn = (worker_session.busy(pstore, wo["id"])
+                if wo["status"] == "running" else None)
+        # Issue 1451: a stalled turn lapses the exclusion and is judged stuck outright
+        stalled = worker_session.is_stalled(turn, now)
+        turn_in_flight = bool(turn) and not stalled
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
@@ -8598,7 +8601,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,
-            turn_in_flight=turn_in_flight)
+            turn_in_flight=turn_in_flight,
+            stalled_turn_seconds=(now - float(turn["started_at"])) if stalled else 0.0)
         if stuck_only and not verdict.stuck:
             continue
         blocker = true_blockers(pstore, wo, now=now)
