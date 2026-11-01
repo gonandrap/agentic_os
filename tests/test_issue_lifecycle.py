@@ -1652,7 +1652,9 @@ def gap(fleet, monkeypatch):
 
     recorded = []
     monkeypatch.setattr(ops, "record_investigation_dispatch",
-                        lambda inv, wo, note, project=None: recorded.append((inv, wo, note)))
+                        lambda inv, wo, note, project=None: recorded.append((inv, wo, note))
+                        if project is None else pytest.fail(
+                            f"#1402: scoped to {project!r}; the investigation lives elsewhere"))
     pickup = bugreport.report_bug(title="gap", description="d", expected="e", actual="a",
                                   priority="high", investigation=dict(INV))["pickup"]
     return pickup, recorded
