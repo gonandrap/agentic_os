@@ -111,7 +111,7 @@ def test_review_clears(fleet):
     d = fleet["daemon"]
     wo = ops.create_work_order("proj_a", "task")
     d.tick()
-    ops.assume(wo["id"], "assumed X")
+    ops.assume(wo["id"], "assumed the API is v2")
     ops.finish(wo["id"], "done")
     ops.review_work_order(wo["id"], accept=True)
     st = ops.os_status()
