@@ -894,7 +894,7 @@ def _poll_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
 
 def _parked_on_message(store: ProjectStore, wo: dict[str, Any],
                        turn: dict[str, Any]) -> bool:
-    """Busy only on a task it left behind, quiet since its `Stop`, while a queued message waits on it — spec 2026-10-22 'A turn parked on a message'"""
+    """Quiet since its `Stop` with a message queued: busy only on a leftover task (#1400)"""
     if not store.queued_messages(wo["id"]):
         return False
     stopped_at = _last_stop_at(store, wo["id"], turn)
