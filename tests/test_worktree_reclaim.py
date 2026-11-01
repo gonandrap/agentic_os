@@ -73,6 +73,20 @@ def test_a_completed_order_past_the_grace_period_loses_its_checkout(store, proje
     assert len(events(store, wo_id)) == 1
 
 
+def test_the_reclaim_also_removes_the_orders_pytest_temproot(store, project, tmp_path,
+                                                             monkeypatch):
+    """Per-order pytest roots must not pile up in the temp dir (#723)"""
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    wo_id, _ = settled(store, project)
+    root = disk.pytest_temproot(wo_id)
+    (root / "pytest-of-u" / "pytest-0").mkdir(parents=True)
+
+    assert disk.sweep(store, spec(project))[0] == [wo_id]
+    assert not root.exists()
+
+
 def test_the_branch_survives_the_removal(store, project):
     """Committed work is never what a reclaim risks"""
     wo_id, path = settled(store, project)
