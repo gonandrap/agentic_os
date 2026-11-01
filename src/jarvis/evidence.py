@@ -356,7 +356,7 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
 
 
 def _pr_behind(worktree: Path | None, pr_head: str) -> tuple[str, ...]:
-    """`(pr_head, worktree_head)` when the worktree has commits the pull request lacks, else `()` (issue #704)"""
+    """`(pr_head, worktree_head)` when the worktree has commits the PR lacks, else `()` (#704)"""
     if worktree is None or not pr_head:
         return ()
     wt_head = _git(worktree, "rev-parse", "HEAD").strip()
