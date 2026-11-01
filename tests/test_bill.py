@@ -13,7 +13,7 @@ from jarvis.project_store import ProjectStore
 # The fixtures and builders are shared with the cost-report suite rather than copied: two divergent...
 from tests.test_cost_report import (  # noqa: F401
     add_turn, assistant_row, give_session, placeholder_rows, recorded_usage, registered,
-    store, transcripts,
+    seal_pass, store, transcripts,
 )
 
 
@@ -998,6 +998,46 @@ def test_the_daemon_seals_every_settled_order_and_only_once(store, wo, project,
     was = sealed["bill_sealed_at"]
     daemon.seal_bills(project, store)
     assert store.get_work_order(wo["id"])["bill_sealed_at"] == was
+
+
+def _settle_reopen_settle(store, wo, tmp_path, transcripts):
+    """Sealed at turn 1, then resumed and settled again with turn 2 spent (#870)"""
+    give_session(store, wo["id"], "sess-again")
+    first = assistant_row("m1", write=1_000, out=10)
+    transcripts("sess-again", [first])
+    add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0, cache_write=1_000,
+                                   cache_read=0, output=10))
+    store.set_status(wo["id"], "failed")
+    seal_pass(tmp_path, store)
+    store.set_status(wo["id"], "running")
+    transcripts("sess-again", [first, assistant_row("m2", write=500, out=5)])
+    add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0, cache_write=500,
+                                   cache_read=0, output=5))
+    store.set_status(wo["id"], "completed")
+
+
+def test_a_seal_taken_before_the_last_settlement_is_re_derived(store, wo, tmp_path,
+                                                               transcripts):
+    _settle_reopen_settle(store, wo, tmp_path, transcripts)
+    assert ops.bill(wo["id"])["total"]["tokens"]["cache_write"] == 1_000
+
+    seal_pass(tmp_path, store)
+
+    assert ops.bill(wo["id"])["total"]["tokens"]["cache_write"] == 1_500
+    assert store.resettled_sealed_orders() == []
+
+
+def test_a_resettled_seal_whose_evidence_is_gone_is_kept_not_retried(
+        store, wo, tmp_path, transcripts, monkeypatch):
+    _settle_reopen_settle(store, wo, tmp_path, transcripts)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(store.project_path / "gone"))
+    store.conn.execute("UPDATE wo_turns SET usage_json=NULL, outfile=''")
+    store.conn.commit()
+
+    seal_pass(tmp_path, store)
+
+    assert ops.bill(wo["id"])["total"]["tokens"]["cache_write"] == 1_000
+    assert store.resettled_sealed_orders() == []
 
 
 def test_an_unsealed_old_order_is_costed_live_and_says_what_it_lost(store, wo):

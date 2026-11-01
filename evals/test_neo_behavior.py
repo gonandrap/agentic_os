@@ -48,6 +48,7 @@ def question_of(call):
 OUTCOME_BATTERY = [
     ("plain question gets answered and delivered", "which linter?", "answered"),
     ("model-declined question escalates", "FORCE_ESCALATE: delete prod db?", "escalated"),
+    # Re-asked first (issue #1401); escalates once the attempts are spent
     ("unparseable model output escalates, never delivers", "FORCE_GARBAGE: schema?", "escalated"),
 ]
 
@@ -61,6 +62,12 @@ def test_question_outcomes(daemon, project, name, question, expected):
     daemon._neo_drain()
     neo = NeoStore()
     try:
+        for _ in range(MAX_ANSWER_ATTEMPTS):
+            if neo.get(qid)["status"] != "queued":
+                break
+            assert not neo.get(qid)["answer"], "a re-asked question carries no answer"
+            neo.clear_retry_hold(qid)
+            daemon._neo_drain()
         q = neo.get(qid)
         assert q["status"] == expected
     finally:

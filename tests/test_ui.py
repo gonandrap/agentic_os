@@ -1504,6 +1504,21 @@ def test_hide_and_unhide_from_the_work_order_page(client, project):
     assert wo["id"] in client.get("/project/proj_a").text
 
 
+def test_expedite_and_unexpedite_from_the_work_order_page(client, project):
+    wo = ops.create_work_order("proj_a", "urgent task")
+    store = ProjectStore(project)
+    store.set_status(wo["id"], "running")
+    store.close()
+    page = f"/wo/proj_a/{wo['id']}"
+    assert "Un-expedite" not in client.get(page).text
+
+    r = client.post(f"{page}/expedite")
+    assert r.status_code == 303 and r.headers["location"] == page
+    assert "Un-expedite" in client.get(page).text
+    client.post(f"{page}/expedite", data={"off": "1"})
+    assert "Un-expedite" not in client.get(page).text
+
+
 def test_delete_from_the_work_order_page_removes_it(client, project):
     wo = ops.create_work_order("proj_a", "doomed task")
     store = ProjectStore(project)
@@ -1739,6 +1754,20 @@ def test_got_it_button_puts_the_flag_down(client, project):
 
     check_project(ProjectStore(project), repair=True)  # the daemon's next tick
     assert "all quiet" in client.get("/").text
+
+
+def test_open_work_row_shows_the_attention_reason_of_a_running_order(client, project):
+    """Issue 245: running AND owing a decision must read differently from just running"""
+    wo = ops.create_work_order("proj_a", "busy but blocked on you")
+    store = ProjectStore(project)
+    store.set_status(wo["id"], "running")
+    store.flag_attention(wo["id"], "3 assumptions pending your review")
+
+    page = client.get("/").text
+    open_work = page[page.index('class="panel open-work"'):]
+    row = open_work[open_work.index(wo["id"]):]
+    row = row[:row.index('<div class="row"') if '<div class="row"' in row else None]
+    assert "◭ 3 assumptions pending your review" in row
 
 
 def test_got_it_is_not_offered_when_a_decision_is_owed(client, project):
@@ -3396,6 +3425,25 @@ def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
 
     page = " ".join(client.get("/stuck").text.split())
     assert wo["id"] in page and "jarvis rules list" in page
+
+
+def test_an_unjudged_project_is_a_banner_never_an_empty_table(client, project, capsys):
+    """Issue 1450: `fleet_health.enabled` off reads as 'not judged', never as 'nothing stuck'"""
+    from jarvis import cli
+
+    ops.create_work_order("proj_a", "open, but nobody judges it")
+    enable = "jarvis config set proj_a os.fleet_health.enabled true"
+    assert ops.stuck_report() == []
+    assert ops.stuck_unjudged() == [{"project": "proj_a", "enable": enable}]
+    assert ops.stuck_unjudged("proj_b") == []
+
+    page = " ".join(client.get("/stuck").text.split())
+    assert 'id="unjudged-proj_a"' in page and enable in page
+    assert "<table>" not in page and "no open order on any judged project" not in page
+
+    assert cli.main(["stuck"]) == 0
+    assert f"proj_a is not judged — os.fleet_health.enabled is off; enable it: {enable}" \
+        in capsys.readouterr().out
 
 
 @pytest.mark.usefixtures("self_dispatch_on")
