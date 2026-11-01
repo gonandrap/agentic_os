@@ -216,6 +216,10 @@ CARRY_UNPROVEN_BLOCKER = ("the head of this pull request is not the commit the p
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
                             "judgement")
 
+#: The status label of the same give-up: the decision owed is a judgement on the delivery (#756)
+VALIDATION_GAVE_UP_LABEL = ("the panel gave up: judge the delivery — `jarvis wo review` "
+                            "to land it, `--reject --feedback` to send it back")
+
 #: THE SAME GIVE-UP, ONE STATUS LATER
 PARKED_GIVE_UP_BLOCKER = ("the panel gave up on this and no commit was ever accepted, so "
                           "the automatic merge will never arm — merge it yourself, "
@@ -1402,6 +1406,14 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
         note = parallel_round_note(store, wo["id"])
         if note:
             return f"{wo['status']}{note}"
+        # Name WHICH decision is owed: assumption ruling vs judging the delivery (#756)
+        notes = []
+        if n := len(reviewable_assumptions(store, wo)):
+            notes.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
+        if wo.get("pr_state") != "CLOSED" and validation_escalated(store, wo):
+            notes.append(VALIDATION_GAVE_UP_LABEL)
+        if notes:
+            return f"{wo['status']} — {'; '.join(notes)}"
     # WHY NOTHING IS BEING NUDGED
     if wo["status"] in PR_REPAIR_STATUSES and wo.get("pr_url"):
         note = base_red_note(store, wo["id"])
