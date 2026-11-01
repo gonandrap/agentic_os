@@ -7293,7 +7293,8 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
                 return str(candidate["id"])
         # §1.1-1.2: `finished` is written by `jarvis wo finish`, which every delivery goes through
         for candidate, meta, batch in candidates:
-            if store.events_of_kind(candidate["id"], "finished"):
+            # A user-cut release ships one pinned commit (docs/superpowers/specs/2026-11-01-release-console.md §2)
+            if meta.get(release.BASE_KEY) or store.events_of_kind(candidate["id"], "finished"):
                 continue
             store.update_work_order(
                 candidate["id"],

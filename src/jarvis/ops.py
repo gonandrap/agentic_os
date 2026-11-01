@@ -16032,3 +16032,205 @@ def morpheus_rewrite(item_id: str, why: str) -> dict[str, Any]:
                                          f"rewritten: {why.strip()}",
                                 f"decided by the user on {item_id} itself")
     return item
+
+
+# -- the release console (docs/superpowers/specs/2026-11-01-release-console.md)
+
+def _release_repo() -> tuple[str, Path]:
+    """The OS project's name and checkout; production's clone when no catalog names one"""
+    from . import schedule
+
+    catalog = _morpheus_catalog()
+    name = schedule.os_project((p.name, p.path) for p in catalog.projects) or ""
+    for p in catalog.projects:
+        if p.name == name and (p.path / ".git").exists():
+            return name, p.path
+    return name, _morpheus_repo(None)
+
+
+def _release_hop(store: ProjectStore, ref: str, via: str) -> dict[str, Any]:
+    """One linked step of a commit's provenance; a ref this store cannot read stays a bare link"""
+    hop: dict[str, Any] = {"id": ref, "via": via, "kind": "", "title": "", "status": "",
+                           "href": ref if ref.startswith("http") else f"/go/{quote(ref)}"}
+    try:
+        row = (store.get_feature_order(ref) if is_feature_order_id(ref)
+               else store.get_work_order(ref) if ref.startswith("wo-") else None)
+    except KeyError:
+        row = None
+    if row:
+        hop.update(kind=str(row.get("kind") or ""), title=str(row.get("title") or ""),
+                   status=str(row.get("status") or ""))
+    return hop
+
+
+def _release_trace(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """Where a work order came from: its parent order and that order's evidence, then its own links"""
+    hops: list[dict[str, Any]] = []
+    parent = str(wo.get("parent_id") or "")
+    if parent:
+        hop = _release_hop(store, parent, "parent")
+        hops.append(hop)
+        try:
+            meta = db.from_json(store.get_feature_order(parent).get("metadata"), {}) or {}
+        except KeyError:
+            meta = {}
+        for ref in [meta.get(SUBJECT_KEY), *(meta.get(EVIDENCE_REFS_KEY) or [])]:
+            if ref and _REF_ID.match(str(ref).lower()):
+                hops.append(_release_hop(store, str(ref), f"{hop['kind'] or 'parent'} from"))
+    for key, via in (("trigger_wo_id", "triggered by"), ("backlog_id", "backlog"),
+                     ("issue_url", "issue")):
+        if wo.get(key):
+            hops.append(_release_hop(store, str(wo[key]), via))
+    return hops
+
+
+def _release_rows(rows: list[dict[str, Any]], project: str, repo: Path) -> list[dict[str, Any]]:
+    """Commits joined to their work order, provenance and morpheus verdict"""
+    from . import morpheus, release_view
+
+    slug = morpheus.repo_slug(repo)
+    central = CentralStore()
+    try:
+        items = {int(i["pr_number"]): i for i in central.morpheus_items()
+                 if not slug or not i.get("repo") or i.get("repo") == slug}
+    finally:
+        central.close()
+    paths = registered_project_paths()
+    store = ProjectStore(paths[project]) if project in paths else None
+    try:
+        for r in rows:
+            item = items.get(r["pr"]) if r["pr"] is not None else None
+            r["morpheus"] = item
+            r["validation"] = release_view.validation_of(item)
+            r["wo_id"] = r["wo_id"] or str((item or {}).get("wo_id") or "")
+            r["wo"], r["trace"], r["origin"] = None, [], "no work order"
+            wo = None
+            if r["wo_id"] and store is not None:
+                try:
+                    wo = store.get_work_order(r["wo_id"])
+                except KeyError:
+                    wo = None
+            if wo:
+                r["wo"] = {"id": r["wo_id"], "title": wo.get("title") or "",
+                           "status": wo.get("status") or "",
+                           "href": order_path(project, r["wo_id"])}
+                r["trace"] = _release_trace(store, wo)
+                r["origin"] = next((h["kind"] for h in r["trace"]
+                                    if h["via"] == "parent" and h["kind"]), "work order")
+    finally:
+        if store is not None:
+            store.close()
+    return rows
+
+
+def _open_release_orders(project: str) -> list[dict[str, Any]]:
+    from . import release
+    from .project_store import OPEN_STATUSES
+
+    paths = registered_project_paths()
+    if project not in paths:
+        return []
+    store = ProjectStore(paths[project])
+    try:
+        return [w for w in store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True)
+                if release.is_release_order(w)]
+    finally:
+        store.close()
+
+
+def release_overview() -> dict[str, Any]:
+    """Pending work since the newest tag, and every release with its validation verdict"""
+    from . import release_view
+
+    project, repo = _release_repo()
+    try:
+        tags = release_view.tags(repo)
+        ref = release_view.main_ref(repo)
+        newest = tags[0]["tag"] if tags else ""
+        pending = _release_rows(release_view.commits(repo, newest, ref), project, repo)
+        for i, r in enumerate(pending):
+            r["rides"] = len(pending) - i  # what a cut at this commit ships (Q2850)
+        contents = [release_view.release_commits(repo, t["tag"], t["previous"]) for t in tags]
+        # One join over every release: a store opened per tag costs a page load seconds
+        _release_rows([r for rows in contents for r in rows], project, repo)
+        releases = []
+        for t, rows in zip(tags, contents):
+            counts = {s: sum(r["validation"] == s for r in rows)
+                      for s in ("validated", "pending", "failed", "unwatched")}
+            releases.append({**t, "prs": len(rows), "counts": counts,
+                             "status": release_view.summarize(rows)})
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OpsError(f"cannot read the release history in {repo}: {e}") from e
+    return {"project": project, "repo": str(repo), "main_ref": ref, "newest": newest,
+            "pending": pending, "releases": releases,
+            "in_flight": [{"id": w["id"], "title": w["title"], "status": w["status"],
+                           "href": order_path(project, w["id"])}
+                          for w in _open_release_orders(project)]}
+
+
+def release_detail(tag: str) -> dict[str, Any]:
+    """One release's commits, each traced to its orders and its morpheus verdict"""
+    from . import release_view
+
+    project, repo = _release_repo()
+    try:
+        known = {t["tag"]: t for t in release_view.tags(repo)}
+        if tag not in known:
+            raise OpsError(f"no release {tag!r} in {repo} — /release lists them")
+        rows = release_view.release_commits(repo, tag, known[tag]["previous"])
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OpsError(f"cannot read {tag} in {repo}: {e}") from e
+    return {**known[tag], "project": project, "rows": _release_rows(rows, project, repo)}
+
+
+RELEASE_CUT_BRIEF = """\
+Ship a release the user cut from the dashboard (/release). It carries exactly the pending \
+commits on `main` up to and including the base below — the user chose that commit:
+
+{lines}
+
+Run the ordinary release path, with this exact base and nothing else:
+
+    scripts/shipit.sh --stage --wo {wo_id} --base {base}
+
+That is a PRIVILEGED ACTION and it will be gated — correct and expected. Read `jarvis \
+brief gates` and make your case first (`jarvis gate request`). Do not move the base to a \
+newer commit, do not drop `--stage`, and do not restart any service by hand. If CI on \
+{base} is red, or a `jarvis-*` tag already contains it, stop and say so.
+"""
+
+
+def release_cut(base: str) -> dict[str, Any]:
+    """File the release work order that ships pending work up to `base` (spec 2026-11-01 §2)"""
+    from . import release, release_view
+
+    base = (base or "").strip().lower()
+    overview = release_overview()
+    project = overview["project"]
+    if not project:
+        raise OpsError("no catalog project runs the OS itself, so there is nowhere to file "
+                       "the release order")
+    if overview["in_flight"]:
+        busy = overview["in_flight"][0]
+        raise OpsError(f"{busy['id']} is already shipping a release ({busy['status']}) — "
+                       f"let it settle or cancel it first")
+    shipped = release_view.prefix(overview["pending"], base)
+    if not shipped:
+        raise OpsError(f"{base[:12] or 'no commit'} is not pending on "
+                       f"{overview['main_ref']} — reload /release and pick again")
+    lines = "\n".join(
+        f"- `{r['short']}` {r['subject']}" + (f" — `{r['wo_id']}`" if r["wo_id"] else "")
+        for r in shipped)
+    # Usable even if dispatch reads it before the id is filled in below
+    wo = create_work_order(
+        project, f"Ship a release: {len(shipped)} commit(s) up to {base[:8]}",
+        description=RELEASE_CUT_BRIEF.format(lines=lines, wo_id="<your work-order id>",
+                                             base=base),
+        origin="ui", metadata={release.BATCH_KEY: [], release.BASE_KEY: base})
+    store = ProjectStore(registered_project_paths()[project])
+    try:
+        store.update_work_order(wo["id"], description=RELEASE_CUT_BRIEF.format(
+            lines=lines, wo_id=wo["id"], base=base))
+    finally:
+        store.close()
+    return {**wo, "project": project, "commits": len(shipped)}
