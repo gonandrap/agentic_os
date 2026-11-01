@@ -21,6 +21,10 @@ ARGV = [
     (["gate", "request", "wo-1", "ship it", "--why-file"], "why"),
     (["gate", "request", "wo-1", "ship it", "--evidence-file"], "evidence"),
     (["learn", "add", "--content-file"], "content"),
+    (["wo", "create", "p", "t", "--description-file"], "description"),
+    (["fo", "create", "p", "t", "--description-file"], "description"),
+    (["io", "create", "p", "t", "--description-file"], "description"),
+    (["do", "create", "p", "t", "--description-file"], "description"),
 ]
 
 

@@ -385,6 +385,7 @@ _PROSE_FILE_SLOTS = {
     "feedback_file": "feedback",
     "why_file": "why",
     "evidence_file": "evidence",
+    "description_file": "description",
 }
 # The slots whose argparse requirement this mechanism relaxed; one of the two must arrive
 _PROSE_SLOT_REQUIRED = {"question", "content", "message", "summary"}
@@ -813,6 +814,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("project")
     c.add_argument("title")
     c.add_argument("--description", "-d", default="")
+    c.add_argument("--description-file", dest="description_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     c.add_argument("--model")
     c.add_argument("--effort")
     c.add_argument("--permission-mode")
@@ -1097,6 +1100,8 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("title")
     f.add_argument("--description", "-d", default="",
                    help="the whole ask. Required: the planner sees only this text")
+    f.add_argument("--description-file", dest="description_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     f.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
     f.add_argument("--max-parallel", dest="max_parallel", type=int, metavar="N",
                    help="run at most N of this feature's children at once. Omit for no "
@@ -1191,6 +1196,8 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("title")
     i.add_argument("--description", "-d", default="",
                    help="what you observed. Required: the analyst sees only this text")
+    i.add_argument("--description-file", dest="description_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     i.add_argument("--ref", dest="refs", action="append", default=[], metavar="REF",
                    help="evidence, repeatable and REQUIRED: a wo-/fo-/io-/al- id, "
                         "#<issue>, a URL, or free text. Stored verbatim and resolved by "
@@ -1334,6 +1341,8 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--description", "-d", default="",
                    help="what to find out and what you will decide. Required: the "
                         "researcher sees only this text")
+    d.add_argument("--description-file", dest="description_file", metavar="PATH",
+                   help=_PROSE_FILE_HELP)
     d.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
     d.add_argument("--budget", metavar="USD",
                    help="cap the whole order — it and its researcher — at N dollars. "
