@@ -8124,7 +8124,7 @@ def _investigation_verdict(fo: Mapping[str, Any]) -> dict[str, Any]:
     return verdict if isinstance(verdict, dict) else {}
 
 
-#: An investigation flagged because the steward held its GAP's fix (#1404); `release_parked_fix` clears it
+#: Attention prefix of a GAP whose fix the steward held (#1404)
 PARKED_FIX_PREFIX = "fix parked: "
 
 
@@ -8148,10 +8148,7 @@ def investigation_status_label(fo: Mapping[str, Any]) -> str:
 def record_investigation_dispatch(inv_id: str, wo_id: str, note: str,
                                   project_name: str | None = None,
                                   parked: str = "") -> None:
-    """Write who started the investigation's fix, or who refused and why, onto its verdict (#1344)
-
-    `parked` (#1404): the steward held the fix, so flag the investigation and tell the user once.
-    """
+    """Write who started the fix, or who refused and why (#1344); `parked` flags it"""
     name, path, fo = find_feature_order(inv_id, project_name)
     verdict = _investigation_verdict(fo)
     filed = verdict.get("filed")
