@@ -148,13 +148,19 @@ GATE_META = {
     "abandoned": {"word": "abandoned, never reviewed", "icon": "⊗", "tone": "muted"},
     # Same treatment, opposite outcome: `expired` with `closed_as='spent'` was approved and then USED
     "spent": {"word": "spent", "icon": "✓", "tone": "ok"},
+    # `closed_as='lapsed'` with uses > 0: approved, used, then timed out (#1388)
+    "used": {"word": "approved, used, lapsed", "icon": "✓", "tone": "ok"},
+    "superseded": {"word": "superseded, never decided", "icon": "⊘", "tone": "muted"},
 }
 
 
 def gate_display(g: dict) -> str:
     """The key this gate renders under, which is not always its status: `expired` splits by `closed_as`"""
-    if g["status"] == "expired" and g["closed_as"] in ("spent", "abandoned"):
-        return g["closed_as"]
+    if g["status"] == "expired":
+        if g["closed_as"] in ("spent", "abandoned", "superseded"):
+            return g["closed_as"]
+        if g["closed_as"] == "lapsed" and g["uses"]:
+            return "used"
     return g["status"]
 
 
