@@ -904,6 +904,9 @@ BG_DEAD_GRACE = 10.0
 #: How often a running background turn's spend is read against its cap
 BG_BUDGET_EVERY = 60.0
 
+#: How long a session busy only on its own leftover task may sit quiet while a message waits (Q2870)
+BG_PARKED_QUIET = 15 * 60.0
+
 #: What a background turn lost with its process is recorded as
 SESSION_LOST_ERROR = ("the worker's background session process ended before the turn "
                       "settled")
@@ -920,16 +923,42 @@ def _poll_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
     if entry is not None and entry.alive and not entry.idle:
         # Busy covers the worker's own background tasks too (fact 10): never cut one short
         cap = _bg_over_budget(store, wo, turn)
-        if cap is None:
-            return None
-        claude_cli.stop_bg(entry.id)
-        return _reap_bg(store, wo, turn, entry, project_name, budget_cap=cap)
+        if cap is not None:
+            claude_cli.stop_bg(entry.id)
+            return _reap_bg(store, wo, turn, entry, project_name, budget_cap=cap)
+        if _parked_on_message(store, wo, turn):
+            # ...unless parked on a queued message; `_reap_bg` stops it (issue #1400)
+            return _reap_bg(store, wo, turn, entry, project_name)
+        return None
     answered = _bg_answered(wo, turn)
     if entry is not None and entry.idle and not answered and age < BG_IDLE_GRACE:
         return None  # the resumed process has not taken its prompt yet
     if (entry is None or not entry.alive) and not answered and age < BG_DEAD_GRACE:
         return None
     return _reap_bg(store, wo, turn, entry, project_name)
+
+
+def _parked_on_message(store: ProjectStore, wo: dict[str, Any],
+                       turn: dict[str, Any]) -> bool:
+    """Quiet since its `Stop` with a message queued: busy only on a leftover task (#1400)"""
+    if not store.queued_messages(wo["id"]):
+        return False
+    stopped_at = _last_stop_at(store, wo["id"], turn)
+    if stopped_at is None or time.time() - stopped_at < BG_PARKED_QUIET:
+        return False
+    try:
+        calls = usage.session_calls(str(wo.get("session_id") or ""))
+    except OSError:
+        return False
+    # A task that finished wakes the session (fact 9): any call since the Stop means it is working again
+    return not any(call.ts > stopped_at for call in calls)
+
+
+def _last_stop_at(store: ProjectStore, wo_id: str, turn: dict[str, Any]) -> float | None:
+    """When the `Stop` hook last fired in this turn, or None"""
+    stops = [float(event["ts"]) for event in store.list_events(wo_id, limit=200, newest=True)
+             if event["kind"] == "hook:Stop" and event["ts"] >= turn["started_at"]]
+    return max(stops, default=None)
 
 
 def _bg_answered(wo: dict[str, Any], turn: dict[str, Any]) -> bool:
