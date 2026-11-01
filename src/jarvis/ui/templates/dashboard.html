@@ -134,6 +134,7 @@
     <button role="tab" data-panel="tab-new-wo" aria-selected="true" aria-controls="tab-new-wo">New work order</button>
     <button role="tab" data-panel="tab-new-fo" aria-selected="false" aria-controls="tab-new-fo">New feature order</button>
     <button role="tab" data-panel="tab-new-io" aria-selected="false" aria-controls="tab-new-io">New improvement order</button>
+    <button role="tab" data-panel="tab-new-do" aria-selected="false" aria-controls="tab-new-do">New decision order</button>
     <button role="tab" data-panel="tab-new-inv" aria-selected="false" aria-controls="tab-new-inv">New investigation</button>
     {% if not (brake and brake.paused) %}
     <button role="tab" data-panel="tab-brake" aria-selected="false" aria-controls="tab-brake">Fleet brake</button>
@@ -214,6 +215,29 @@
       <textarea name="refs" required
                 placeholder="evidence, one per line: wo-/fo-/io-/al- id, #issue, URL, or free text"></textarea>
       <button type="submit" class="primary">File it</button>
+    </div>
+  </form>
+</div>
+</div>
+
+{# `jarvis do create`: description required — see `ops.create_decision_order`. #}
+<div class="tabpanel" id="tab-new-do">
+<h2>New decision order</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <form method="post" action="/do/create">
+    <div class="form-line">
+      <select name="project" required style="max-width: 220px;">
+        {% for p in st.projects %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}
+      </select>
+      <input type="text" name="title" placeholder="the question you must decide" required>
+      <input type="text" name="budget" placeholder="budget $ (default: none)"
+             pattern="\s*\$?\s*[0-9,]*\.?[0-9]+\s*" style="max-width: 200px;"
+             title="A ceiling on the order and its researcher. e.g. 5 or $5.00.">
+    </div>
+    <div class="form-line">
+      <textarea name="description" required
+                placeholder="what to find out and what you will decide — the researcher sees only this text"></textarea>
+      <button type="submit" class="primary">Research it</button>
     </div>
   </form>
 </div>
