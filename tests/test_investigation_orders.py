@@ -786,9 +786,19 @@ def test_a_gap_asks_neo_and_its_view_follows_the_fix_order(started, store):
     assert chain["fix"]["wo_id"] == fix["id"] and chain["fix"]["production"] is None
 
 
-def test_a_gap_whose_fix_the_steward_parked_says_so_until_a_fix_starts(started, store):
-    """#1404: flagged, labelled, in the inbox and counted — and un-parked by the fix order"""
+@pytest.mark.parametrize("fix_project", ["proj_a", "proj_b"])
+def test_a_gap_whose_fix_the_steward_parked_says_so_until_a_fix_starts(started, store, tracker_b,
+                                                                       fix_project):
+    """#1404: flagged, labelled, in the inbox and counted; un-parked by the fix in any project"""
     from jarvis.central_store import CentralStore
+
+    def warnings() -> list[dict]:
+        central = CentralStore()
+        try:
+            return [i for i in central.unacked_inbox()
+                    if i["title"].startswith(f"{inv_id}: GAP fix not started")]
+        finally:
+            central.close()
 
     inv_id, _, _ = _submitted(started, store, "GAP")
     ops.record_investigation_dispatch(inv_id, "", "NOT started — the steward refused",
@@ -800,20 +810,16 @@ def test_a_gap_whose_fix_the_steward_parked_says_so_until_a_fix_starts(started, 
     assert ops.show_investigation_order(inv_id)["status_label"].endswith(
         "fix parked: steward `queue` (yield)")
     assert [r["id"] for r in ops.list_investigation_orders()] == [inv_id]
-    central = CentralStore()
-    try:
-        assert any(i["title"].startswith(f"{inv_id}: GAP fix not started")
-                   and i["level"] == "warning" for i in central.unacked_inbox())
-    finally:
-        central.close()
+    assert [i["level"] for i in warnings()] == ["warning"]
     assert ops.os_status()["investigations"]["fixes_parked"] == 1
 
-    fix = ops.create_work_order("proj_a", "the fix", "d", issue_url=started.issue_url)
+    fix = ops.create_work_order(fix_project, "the fix", "d", issue_url=started.issue_url)
     row = store.get_feature_order(inv_id)
     assert not row["needs_attention"]
     assert json.loads(row["plan"])["filed"]["wo_id"] == fix["id"]
     assert "fix parked" not in ops.show_investigation_order(inv_id)["status_label"]
     assert ops.os_status()["investigations"]["fixes_parked"] == 0
+    assert warnings() == []
 
 
 def _neo_answered(qid: int, seconds_ago: float) -> None:
