@@ -789,8 +789,7 @@ def seed_id(role: str, kind: str, test: str, pattern: str) -> str:
 
 # -- what the table is seeded with
 
-# The OS's own release script: the script file, or `shipit` as a whole word — never the
-# word inside a path like `tests/test_shipit.py` or `.claude/skills/shipit/` (#252)
+# Release script file, or `shipit` as whole word; never inside a path like tests/test_shipit.py (#252)
 SHIPIT_PATTERN = r"\bshipit\.sh\b|(?<![\w./-])shipit(?![\w./-])"
 
 # The recognisers
@@ -875,8 +874,7 @@ def seed_rows() -> list[dict[str, Any]]:
 
 # 2: the `config_write` kind, its recogniser and its canaries (the config console). 3: the... (#194)
 
-# 6: `jarvis onboard apply` writes configuration too, so it joins `config_write`
-# 7: the bare-substring `shipit` recogniser gives way to SHIPIT_PATTERN (#252)
+# 6: `jarvis onboard apply` joins `config_write`. 7: SHIPIT_PATTERN replaces bare `shipit` (#252)
 SEED_VERSION = "7"
 
 # Builtin recognisers a later seed replaced: (kind, pattern, why), retired on reseed
