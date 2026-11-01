@@ -119,7 +119,8 @@ DEFAULT_PROBES: tuple[HealthProbe, ...] = (
             "What innocently looks like this: groundwork the brief did not enumerate "
             "(reading neighbouring code, repairing a test the change broke), and a "
             "brief written at a high level whose implementation legitimately touches "
-            "more than it names.\n"
+            "more than it names. A child doing what its approved plan step says is not "
+            "drift: plan review settled that against the brief.\n"
             "Quote the part of the brief and the part of the evidence that disagree. If "
             "the brief is too vague to disagree with, that is not a finding."
         ),

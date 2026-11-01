@@ -946,6 +946,27 @@ def test_the_feature_packet_names_the_tree_the_rulings_and_the_verdicts(
     assert "# The work order" not in packet
 
 
+@pytest.mark.parametrize("status, shown", [("executing", True), ("plan_review", False)])
+def test_the_feature_packet_quotes_the_approved_plan_only_once_review_passed_it(
+        started, project, status, shown):
+    """al-52f142fc: the drift probe judged a planned child against the raw brief it never saw the plan for"""
+    started()
+    store = ProjectStore(project)
+    try:
+        fo_id = _feature(store, children=[], status=status)
+        plan = {"summary": "a console over the pipeline",
+                "children": [{"key": "observability", "title": "emit lifecycle events",
+                              "description": "touch only pipeline/graph.py"}]}
+        store.update_feature_order(fo_id, plan=db.to_json(plan))
+        packet = supervisor.build_evidence(store, _fo_subject(store, fo_id), None, CFG)
+    finally:
+        store.close()
+
+    assert ("[observability] emit lifecycle events: touch only pipeline/graph.py"
+            in packet) is shown
+    assert ("# The approved plan" in packet) is shown
+
+
 def test_a_twelve_child_tree_is_clipped_to_the_worst_children_and_says_how_many(
         started, project):
     """`worker_brief.CORE_BUDGET_CHARS`' pin, applied to the one section that scales with the feature"""

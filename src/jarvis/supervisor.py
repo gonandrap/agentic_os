@@ -381,6 +381,25 @@ def _feature_lines(fo: dict[str, Any], carrier: dict[str, Any] | None,
     ]
 
 
+#: A feature in these statuses has no approved plan yet
+UNAPPROVED_PLAN_STATUSES = ("pending", "planning", "plan_review")
+
+
+def _plan_lines(fo: dict[str, Any], budget: int) -> list[str]:
+    """What the children answer to once plan review passed it, an equal share per line (wo-ad18c743)"""
+    from . import db
+
+    plan = db.from_json(fo.get("plan"), None)
+    if not isinstance(plan, dict) or str(fo.get("status")) in UNAPPROVED_PLAN_STATUSES:
+        return []
+    body = [str(plan.get("summary") or "")]
+    body += [f"- [{c.get('key')}] {c.get('title')}: {c.get('description') or ''}"
+             for c in plan.get("children") or [] if isinstance(c, dict)]
+    each = budget // len(body)
+    return ["# The approved plan (settled against the brief at plan review)",
+            *[_clip(line, each) for line in body if line]]
+
+
 def _child_rank(child: dict[str, Any]) -> tuple[int, float]:
     """What survives the clip when the tree does not fit: what is wrong"""
     from . import db
@@ -576,7 +595,8 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
         tree = ["# The child tree",
                 *_child_lines(pstore.feature_children(fo_id, kinds=WORKER_CHILDREN), share)]
         history = _history_lines(pstore, "fo", fo_id, share)
-        sections += [rest[0], history, tree, *rest[1:]]
+        plan = _plan_lines(row, share)
+        sections += [rest[0], *([plan] if plan else []), history, tree, *rest[1:]]
     else:
         from . import health
 
