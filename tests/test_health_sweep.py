@@ -2035,6 +2035,24 @@ def test_a_live_turn_outside_running_is_still_judged(stuck_os):
         assert row["verdict"].stuck is True, status
 
 
+def test_a_stalled_turn_is_stuck_outright(stuck_os):
+    """Issue 1451: past TURN_STALL_SECONDS the turn no longer excludes, same fact as needs_attention"""
+    from jarvis import worker_session
+
+    store = stuck_os["store"]
+    now = db.now()
+    wo = ops.create_work_order("proj_a", "13 hours into one turn")
+    at = park_order(store, wo["id"], "running", hours=13)
+    running_turn(store, wo["id"], started=at)
+    assert worker_session.is_stalled(worker_session.busy(store, wo["id"]), now)
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == wo["id"]][0]
+
+    assert row["verdict"].stuck is True
+    assert row["verdict"].excluded == ""
+    assert "its turn has been running for 13.0h" in row["verdict"].reason
+
+
 # -- the idle feature manager: issue #1008
 
 
