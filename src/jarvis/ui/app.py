@@ -2586,6 +2586,20 @@ def create_app() -> FastAPI:
                                     status_code=303)
         return RedirectResponse(f"/io/{project}/{io['id']}", status_code=303)
 
+    @app.post("/do/create")
+    def create_do(project: str = Form(...), title: str = Form(...),
+                  description: str = Form(""), budget: str = Form("")):
+        from .. import budget as budget_mod
+
+        try:
+            do = ops.create_decision_order(
+                project, title, description, origin="ui",
+                budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
+        except (ValueError, ops.OpsError) as e:
+            return RedirectResponse(f"/?{urlencode({'error': str(e)}, quote_via=quote)}",
+                                    status_code=303)
+        return RedirectResponse(f"/do/{project}/{do['id']}", status_code=303)
+
     @app.post("/inv/create")
     def create_inv(subject: str = Form(...), why: str = Form(""),
                    budget: str = Form("")):
