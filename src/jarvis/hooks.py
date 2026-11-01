@@ -151,6 +151,34 @@ def gh_pr_create_body(command: str, cwd: str = "") -> str | None:
         return None
 
 
+def _same_path(a: str, b: str, cwd: str) -> bool:
+    return os.path.normpath(os.path.join(cwd, a)) == os.path.normpath(os.path.join(cwd, b))
+
+
+def body_file_written_first(command: str, cwd: str = "") -> bool:
+    """Whether this command writes its own `--body-file` before `gh pr create` reads it (issue 724)"""
+    path = (gh_pr_create_args(command) or {}).get("body_file")
+    if not path or path == "-":
+        return False
+    words = shlex.split(command)  # gh_pr_create_args parsed it, so it parses
+    after_tee = False
+    for i, word in enumerate(words):
+        if word in ("&&", "||", ";", "|"):
+            after_tee = False
+        elif (word == "gh" or word.endswith("/gh")) and words[i + 1:i + 3] == ["pr", "create"]:
+            return False
+        elif word in (">", ">>", ">|") and i + 1 < len(words):
+            if _same_path(words[i + 1], path, cwd):
+                return True
+        elif word.startswith(">") and _same_path(word.lstrip(">|"), path, cwd):
+            return True
+        elif word == "tee" or word.endswith("/tee"):
+            after_tee = True
+        elif after_tee and not word.startswith("-") and _same_path(word, path, cwd):
+            return True
+    return False
+
+
 def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     """Hold `gh pr create` to the work order's title prefix"""
     wo_id = env.get("JARVIS_WO_ID")
@@ -278,6 +306,13 @@ def pr_body_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, 
     if not env.get("JARVIS_WO_ID"):
         return None
     command = (payload.get("tool_input") or {}).get("command", "")
+    if body_file_written_first(command, payload.get("cwd") or ""):
+        # The file on disk is still the OLD body; fail closed rather than judge it
+        return _deny(
+            "This command writes its own `--body-file` and then opens the PR, so the "
+            "check would read the file as it was BEFORE this command, not the body you "
+            "wrote. Write the body in a separate call first (the Write tool, to a path "
+            "unique to this work order), then run `gh pr create --body-file <that path>`.")
     body = gh_pr_create_body(command, payload.get("cwd") or "")
     if body is None:
         return None
