@@ -1953,6 +1953,68 @@ def test_the_fleet_catalog_value_is_what_the_check_judges_by(
     store.close()
 
 
+def _seen_enabled(enabled: bool, ts: float) -> None:
+    from jarvis.central_store import CentralStore
+    from jarvis.daemon import Daemon
+
+    central = CentralStore()
+    try:
+        central.set_state(Daemon.STUCK_ENABLED_KEY,
+                          db.to_json({"enabled": enabled, "ts": ts}))
+    finally:
+        central.close()
+
+
+def test_a_re_enabled_sweep_is_not_dark_before_one_window(
+        jarvis_home, tmp_path, project, monkeypatch):
+    """#1452: the dark clock starts at the later of the last run and the re-enablement"""
+    import jarvis.catalog as catalog_mod
+
+    _own_the_os(monkeypatch, project)
+    window = catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES * 60
+    _sweep_run(tmp_path, project, ts=db.now() - 12 * 86400,
+               error="OperationalError: stale")
+    store = ProjectStore(project)
+
+    # The daemon has not yet seen the catalog flip back on
+    _seen_enabled(False, db.now() - 12 * 86400)
+    assert _stuck_dark(store) == []
+    # It has, just now: neither the stale run's age nor its error counts
+    _seen_enabled(True, db.now() - 60)
+    assert _stuck_dark(store) == []
+    # A full window after enablement with still no run IS dark
+    _seen_enabled(True, db.now() - window - 120)
+    (violation,) = _stuck_dark(store)
+    assert violation.context["cause"] == "dark"
+    assert violation.context["dark_minutes"] == window // 60 + 2
+    store.close()
+
+
+def test_the_daemon_records_each_enablement_flip(jarvis_home, tmp_path, project):
+    from jarvis.catalog import load_catalog
+    from jarvis.central_store import CentralStore
+    from jarvis.daemon import Daemon
+
+    path = _sweep_run(tmp_path, project)
+    daemon = Daemon(load_catalog(path))
+
+    def seen() -> dict:
+        central = CentralStore()
+        try:
+            return db.from_json(central.get_state(Daemon.STUCK_ENABLED_KEY), {})
+        finally:
+            central.close()
+
+    daemon.note_stuck_enablement()
+    first = seen()
+    assert first["enabled"] is True
+    daemon.note_stuck_enablement()
+    assert seen() == first  # no flip, no new timestamp
+    daemon.catalog = daemon.catalog.without_projects({"proj_a"})
+    daemon.note_stuck_enablement()
+    assert seen()["enabled"] is False
+
+
 def test_the_stuck_check_is_registered_where_it_can_push(tmp_path, project):
     """Review round 1: in `OS_INVARIANTS` only `jarvis doctor` ran it"""
     assert invariants.check_stuck_sweep_alive in invariants.INVARIANTS

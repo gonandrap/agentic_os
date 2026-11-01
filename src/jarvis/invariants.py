@@ -2891,8 +2891,15 @@ def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
     central = CentralStore()
     try:
         run = db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), None)
+        seen = db.from_json(central.get_state(Daemon.STUCK_ENABLED_KEY), None)
     finally:
         central.close()
+    # The dark clock starts at the later of the last run and the (re-)enablement (#1452)
+    if seen and not seen.get("enabled"):
+        return  # the daemon has not picked the enablement up yet: no cadence has passed
+    enabled_at = float((seen or {}).get("ts") or 0.0)
+    if run and float(run.get("ts") or 0.0) < enabled_at:
+        run = None  # a run from before the sweep was switched back on says nothing now
     # The FLEET number, off `catalog.os` the way `Daemon.stuck_tick` reads `max_per_day`: one fleet-wide...
     window = catalog.os.fleet_health.sweep_dark_minutes * 60
     if run and str(run.get("error") or ""):
@@ -2904,19 +2911,21 @@ def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
                                        "error": str(run["error"])[:500]},
         )
         return
-    if run is None:
+    if run is None and not enabled_at:
         # NEVER SWEPT is only dark while the OS is UP
         from .daemon import daemon_running
 
         if not daemon_running():
             return
-    dark = db.now() - float((run or {}).get("ts") or 0.0)
-    if run is not None and dark < window:
+    dark = db.now() - max(float((run or {}).get("ts") or 0.0), enabled_at)
+    if (run is not None or enabled_at) and dark < window:
         return
-    minutes = int(dark / 60) if run else 0
+    minutes = int(dark / 60) if run or enabled_at else 0
     yield Violation(
         invariant="INV-STUCK-SWEEP-DARK",
         detail=(f"the stuck sweep has not run for {minutes}m" if run else
+                f"the stuck sweep was enabled {minutes}m ago but has not run since"
+                if enabled_at else
                 "the stuck sweep is enabled but has never run — no sweep has been "
                 "scheduled") + ", so an order that stopped moving is nobody's finding",
         level="critical", context={"cause": "dark", "dark_minutes": minutes},
