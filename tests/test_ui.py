@@ -1650,7 +1650,7 @@ def test_a_project_whose_only_open_work_needs_review_is_not_an_empty_panel(clien
     for n in range(3):
         wo = ops.create_work_order("proj_a", f"needs a decision {n}")
         daemon.tick()
-        ops.assume(wo["id"], "assumed something")
+        ops.assume(wo["id"], "assumed the API is v2")
         ops.finish(wo["id"], "done-ish")
 
     for url in ("/", "/project/proj_a"):

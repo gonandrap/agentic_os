@@ -429,6 +429,27 @@ def test_an_over_cap_assumption_is_refused_and_told_to_split(dispatched, project
     _nothing_recorded(project, wo["id"])
 
 
+@pytest.mark.parametrize("probe", [
+    "test probe: short text", "probe probe probe", "probe one; probe two", "probe: one",
+    "probe mentioning jarvis wo ask inside the body", "ok", "dummy foo bar text"])
+def test_a_content_free_assumption_is_refused_at_record_time(dispatched, project, probe):
+    """Issue 1097: the reported probe bodies never reach the record, nor Neo"""
+    daemon, wo = dispatched
+
+    with pytest.raises(ops.OpsError, match="records no decision") as caught:
+        ops.assume(wo["id"], probe)
+
+    assert "jarvis search" in str(caught.value)
+    _nothing_recorded(project, wo["id"])
+
+
+@pytest.mark.parametrize("real", [
+    "CSV, not TSV", "polled every 30s", "kept the test fixture in conftest, not inline",
+    "the health probe stays on port 8787: the dashboard already binds it"])
+def test_a_terse_real_assumption_still_records(real):
+    assert not ops.content_free_assumption(real)
+
+
 def test_an_over_cap_question_is_refused_with_the_split_and_reference_hint(dispatched,
                                                                           project):
     """Test 2"""
@@ -463,7 +484,7 @@ def test_a_project_override_of_each_cap_is_honoured_and_zero_switches_it_off(
                                             "question_max_chars": 0}
     catalog_file.write_text(json.dumps(document))
 
-    ops.assume(wo["id"], "z" * 2500)
+    ops.assume(wo["id"], "used tabs, not spaces " * 120)
     ops.ask_question(wo["id"], "z" * 2500)
 
 
