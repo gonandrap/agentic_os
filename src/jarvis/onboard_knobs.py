@@ -175,7 +175,7 @@ _OPINION_LEAVES = frozenset({
     "feature_units", "fast_path", "review_findings", "max_concurrent", "max_in_flight",
     "budget_usd", "feature_budget_usd", "investigation_budget_usd", "investigation_model",
     "investigation_effort", "weekly_usd", "critical_weekly_usd", "order_budget_usd",
-    "yield_above_usd", "max_depth", "stakes_classifier", "on_failed", "on_timeout",
+    "yield_above_usd", "max_depth", "stakes_classifier", "high_stakes_hold", "on_failed", "on_timeout",
     "chair_model", "digest_model", "label", "bundled_skills", "claude_ai_connectors",
     "false_positive_disarm", "chrome",
 })

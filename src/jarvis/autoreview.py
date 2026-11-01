@@ -239,9 +239,14 @@ _CARVE_OUT_TIGHTENED_RE = re.compile("|".join(HIGH_STAKES_TIGHTENED_CARVE_OUTS),
                                      re.IGNORECASE)
 
 
+#: The REJECTED alternative `jarvis wo assume` asks for, up to its sentence end: the worker declined it (#1366)
+_REJECTED_CLAUSE_RE = re.compile(
+    r"\brejected(?:\s+alternatives?)?\s*:[^\n]*?(?:[.;](?=\s|$)|\n|$)", re.IGNORECASE)
+
+
 def high_stakes_marker(text: str, *, tightened: bool = False) -> str:
     """The high-stakes phrase this assumption contains, or `''`"""
-    text = text or ""
+    text = _REJECTED_CLAUSE_RE.sub(" ", text or "")
     net = _HIGH_STAKES_TIGHTENED_RE if tightened else _HIGH_STAKES_RE
     carve = _CARVE_OUT_TIGHTENED_RE if tightened else _CARVE_OUT_RE
     carved = [m.span() for m in carve.finditer(text)]
@@ -469,6 +474,11 @@ def decide_evidence(assumption: dict[str, Any], summary: str = "") -> Decision:
                     **fields)
 
 
+def _neo_settles_stakes(cfg: Any) -> bool:
+    """`validation.high_stakes_hold: neo` — Neo rules on a high-stakes row like any other (#1366)"""
+    return str(getattr(cfg, "high_stakes_hold", "") or "user") == "neo"
+
+
 def _stakes_hold(n: int, verdict: Stakes, fields: dict[str, Any]) -> Decision:
     """The high-stakes hold as the CLASSIFIER states it"""
     category = f" ({verdict.category})" if verdict.category else ""
@@ -514,7 +524,9 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
             and asked not in unreachable_question_ids:
         return _held(HELD_ASKED,
                      f"assumption #{n} is already with Neo (question {asked})", **fields)
-    if stakes is not None:
+    if _neo_settles_stakes(cfg):
+        pass
+    elif stakes is not None:
         # The caller computed the verdict (`Daemon._classify_stakes`) and this function stays PURE
         if stakes.high:
             return _stakes_hold(n, stakes, fields)
@@ -625,7 +637,9 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
             and asked not in unreachable_question_ids:
         return _held(HELD_ASKED,
                      f"assumption #{n} is already with Neo (question {asked})", **fields)
-    if stakes is not None:
+    if _neo_settles_stakes(cfg):
+        pass
+    elif stakes is not None:
         # The caller computed the verdict (`Daemon._classify_stakes`) and this function stays PURE
         if stakes.high:
             return _stakes_hold(n, stakes, fields)
