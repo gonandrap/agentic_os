@@ -540,6 +540,20 @@ def _daemon_liveness(central: CentralStore, pid: int | None) -> dict[str, Any] |
     }
 
 
+def _count_paused(summary: dict[str, Any], open_wos: list[dict[str, Any]],
+                  pauses: dict[str, dict[str, Any] | None]) -> None:
+    """A `running` order whose turn is paused is counted `paused`, not running (#247)"""
+    n = sum(1 for wo in open_wos
+            if wo["status"] == "running" and not wo.get("hidden") and pauses[wo["id"]])
+    if not n:
+        return
+    by_status = summary["by_status"]
+    by_status["running"] = by_status.get("running", 0) - n
+    if by_status["running"] <= 0:
+        del by_status["running"]
+    by_status["paused"] = n
+
+
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
     central = CentralStore()
     try:
@@ -570,6 +584,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             try:
                 summary = store.summary()
                 open_wos = store.list_work_orders(statuses=OPEN_STATUSES)
+                pauses = {wo["id"]: invariants.pause_state(store, wo) for wo in open_wos}
+                _count_paused(summary, open_wos, pauses)
                 # Attention isn't limited to open work orders: a FAILED worker (e.g. session disappeared) still needs...
                 flagged = {wo["id"]: wo for wo in open_wos if wo["needs_attention"]}
                 for wo in store.list_work_orders():
@@ -675,7 +691,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # Same rule for the other kind of hold — §2.7
                          "preconditions": open_preconditions(store, wo),
                          # Same rule, for the other reason a work order can be sitting still: the transport dropped its turn
-                         "pause": invariants.pause_note(store, wo),
+                         "pause": (pauses[wo["id"]] or {}).get("note", ""),
+                         "paused_until": (pauses[wo["id"]] or {}).get("until"),
                          # And the whole answer in one string
                          "status_label": invariants.status_label(store, wo, fleet_state),
                          "tags": wo_tags(wo, p["name"])}

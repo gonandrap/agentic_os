@@ -3685,6 +3685,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "status_label": invariants.status_label(store, wo,
                                                         ops.fleet_if_held([wo])),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
+                # The pause as fields: `status` stays the machine's state (#247)
+                **({"paused": paused}
+                   if (paused := invariants.pause_state(store, wo)) else {}),
                 # The other kind of hold, always present and empty when there are none (`validation_rounds`'... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
                 "preconditions": ops.open_preconditions(store, wo),
                 # What has already been dismissed on this order, decoded

@@ -1523,6 +1523,18 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
             f"(attempt {pause.attempts} of {pause.max_attempts})")
 
 
+def pause_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """`pause_note` as fields, so no reader has to parse the sentence (#247)"""
+    if wo["status"] not in RETRY_SWEEP_STATUSES:
+        return None
+    pause = worker_session.turn_pause(store, wo["id"])
+    if pause is None or pause.exhausted:
+        return None
+    # An auth pause resumes on the user's sign-in, not at a moment
+    until = None if pause.reason == worker_session.PAUSE_AUTH else pause.retry_at
+    return {"reason": pause.reason, "until": until, "note": pause_note(store, wo)}
+
+
 def neo_wait_note(wo: dict[str, Any]) -> str:
     """"with Neo …" for a work order parked on a question — or "" for anything else"""
     if wo["status"] != "waiting_input":
