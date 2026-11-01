@@ -338,3 +338,79 @@ def test_held_base_moved_without_a_fetched_tip_names_no_commit_at_all():
     assert BASE_2[:10] not in reason and BASE_2 not in reason
     assert "unknown commit" not in reason
     assert "`main` has moved" in reason
+
+
+# -- #1459: one merge request in flight per base tip
+
+PR_2 = "https://github.com/acme/proj/pull/8"
+JUDGED_2 = "a650fd2c98000000000000000000000000000ccc"
+
+
+def two_parked(project_path, fake_gh):
+    store, first = parked(project_path)
+    second = ops.create_work_order("proj_a", "add feature Y")
+    ops.finish(second["id"], "opened a PR", pr_url=PR_2)
+    row = store.open_validation_round(wo_id=second["id"], fingerprint="fp-2")
+    store.set_validation_head(row["id"], JUDGED_2)
+    store.close_validation_round(row["id"], "passed", "")
+    green_pr(fake_gh)
+    fake_gh.set_pr(PR_2, "OPEN", checks=GREEN, merge_state="CLEAN",
+                   head_oid=JUDGED_2, base_oid=BASE_1)
+    return store, first, store.get_work_order(second["id"])
+
+
+def leader(store, *wos):
+    """(the order that filed, the one queued behind it) — the poll's order is not this test's"""
+    filed = [w for w in wos if store.list_approvals(w["id"])]
+    assert len(filed) == 1, [w["id"] for w in filed]
+    return filed[0], next(w for w in wos if w is not filed[0])
+
+
+def test_a_second_pull_request_on_the_same_base_waits_for_the_first(
+        started, project, fake_gh, local):
+    """#1459: N armed PRs file ONE Neo question, not N"""
+    opt_in(started)
+    store, first, second = two_parked(project, fake_gh)
+
+    poll(started, store)
+
+    first, second = leader(store, first, second)
+    [request] = store.list_approvals(first["id"])
+    held = [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(second["id"], "automerge_held")]
+    assert held[-1]["code"] == automerge.HELD_MERGE_QUEUED
+    assert first["id"] in held[-1]["reason"]
+
+    gates.apply_decision(store, request["id"], "denied", "no", "neo", project="proj_a")
+    poll(started, store)
+
+    assert len(store.list_approvals(second["id"])) == 1
+
+
+def test_an_escalated_request_holds_no_lease(started, project, fake_gh, local):
+    """Neo Q3020: a request waiting on the user does not stall the queue"""
+    opt_in(started)
+    store, first, second = two_parked(project, fake_gh)
+    poll(started, store)
+    first, second = leader(store, first, second)
+    [request] = store.list_approvals(first["id"])
+    store.mark_approval_escalated(request["id"], "the user decides")
+
+    poll(started, store)
+
+    assert len(store.list_approvals(second["id"])) == 1
+
+
+def test_a_new_request_expires_the_grant_its_old_head_left_unspent(started, project):
+    """#1459: superseded approvals are expired, not left `approved`"""
+    store = ProjectStore(project)
+    wo = ops.create_work_order("proj_a", "add feature X")
+    old = store.add_approval(wo["id"], gates.AUTO_MERGE,
+                             automerge.merge_command(PR, JUDGED), max_uses=1)
+    store.decide_approval(old["id"], "approved", "ok", "neo")
+
+    assert store.supersede_grants(wo["id"], gates.AUTO_MERGE,
+                                  automerge.merge_command(PR, UPDATED), "moved") == 1
+
+    row = store.get_approval(old["id"])
+    assert (row["status"], row["closed_as"]) == ("expired", "superseded")
