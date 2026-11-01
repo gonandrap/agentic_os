@@ -811,6 +811,37 @@ class Daemon:
         if not sample.ok:
             log.warning("usage meter unreadable: %s", sample.reason)
         self.notice_meter_gap()
+        try:
+            self.notice_burn_rate()
+        except Exception:  # noqa: BLE001 — an early warning must not take the tick down
+            log.exception("usage burn-rate notice failed")
+
+    def notice_burn_rate(self, now: float | None = None) -> None:
+        """One `warning` inbox row while the 5h window will run dry well before it resets (issue #878)"""
+        b = usage_meter.burn(self.central, now=db.now() if now is None else now)
+        if b is None:
+            return  # unknown is not recovered: a standing warning stays up
+        marked = self.central.get_state(usage_meter.BURN_NOTICE_KEY) or ""
+        lead = self.catalog.os.cost.meter_burn_warn_lead_minutes * 60
+        if b.lead_seconds() < lead:
+            if marked:
+                self.central.revise_inbox("", usage_meter.BURN_NOTICE_TITLE, None, ack=True)
+                self.central.set_state(usage_meter.BURN_NOTICE_KEY, "")
+                self.central.conn.commit()
+            return
+        running = [f"{t['wo_id']} ({name})" for name, store in self._fleet_stores().items()
+                   for t in store.running_turns()]
+        body = usage_meter.burn_sentence(b, running)
+        window = str(int(b.resets_at))
+        if marked == window:
+            self.central.revise_inbox("", usage_meter.BURN_NOTICE_TITLE, None,
+                                      body=body, level="warning")
+        else:
+            # A new window is a new episode: the last one's row is history, not news
+            self.central.revise_inbox("", usage_meter.BURN_NOTICE_TITLE, None, ack=True)
+            self.central.add_inbox("", usage_meter.BURN_NOTICE_TITLE, body, level="warning")
+            self.central.set_state(usage_meter.BURN_NOTICE_KEY, window)
+        self.central.conn.commit()
 
     def notice_meter_gap(self) -> None:
         """One `warning` inbox row per failure STREAK, marked in `os_state` (§8)"""
@@ -1174,7 +1205,9 @@ class Daemon:
 
         pending = store.unsealed_terminal_orders()
         features = store.unsealed_terminal_features()
-        if not pending and not features:
+        reopened = [(o, False) for o in store.resettled_sealed_orders()] + [
+            (f, True) for f in store.resettled_sealed_orders(feature=True)]
+        if not pending and not features and not reopened:
             return
         # One index of Claude Code's transcript tree for the whole batch: it walks every project directory...
         index = usage.index_sessions()
@@ -1195,6 +1228,12 @@ class Daemon:
                 store.seal_bill(feature["id"], db.to_json(
                     {"error": "this bill could not be computed when the order settled"}),
                     feature=True)
+        for order, feature in reopened:
+            try:
+                bill_mod.reseal_settled(project.name, project.path, order,
+                                        feature=feature, index=index)
+            except Exception:  # noqa: BLE001
+                log.exception("re-sealing the bill for %s failed", order["id"])
 
     def seal_autopsies(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Freeze the ANATOMY of every settled order that has none yet (docs/superpowers/specs/2026-09-27-order-autopsy-durability.md)"""
@@ -4004,12 +4043,9 @@ class Daemon:
         future = self.health_pool.submit(self._health_sweep, due, state)
         future.add_done_callback(lambda f: setattr(self, "health_sweeping", False))
 
-    def _health_candidates(self, pstore: ProjectStore,
-                           cfg: Any) -> list[tuple[float, dict, str]]:
-        """Every open unit due for a look, LONGEST-UNREVIEWED FIRST"""
-        from . import health
-
-        now = db.now()
+    @staticmethod
+    def _health_subjects(pstore: ProjectStore) -> list[dict]:
+        """Every open unit the health sweep covers"""
         subjects = [{"kind": "work_order", "row": wo}
                     for wo in pstore.list_work_orders(statuses=OPEN_STATUSES)
                     if wo["origin"] not in UNGOVERNED_ORIGINS]
@@ -4017,6 +4053,17 @@ class Daemon:
                      for fo in pstore.list_feature_orders(statuses=FO_OPEN_STATUSES)
                      # A feature with no carrier has no session at all and nothing to record a finding on
                      if pstore.carrier_for_feature(fo["id"]) is not None]
+        return subjects
+
+    def _health_candidates(self, pstore: ProjectStore, cfg: Any,
+                           subjects: list[dict] | None = None
+                           ) -> list[tuple[float, dict, str]]:
+        """Every open unit due for a look, LONGEST-UNREVIEWED FIRST"""
+        from . import health
+
+        now = db.now()
+        if subjects is None:
+            subjects = self._health_subjects(pstore)
         out = []
         for subject in subjects:
             row = subject["row"]
@@ -4055,7 +4102,16 @@ class Daemon:
                         log.debug("[%s] health sweep held until %s: %s",
                                   project.name, hold[0], hold[1])
                         continue
-                    candidates = self._health_candidates(pstore, cfg)
+                    subjects = self._health_subjects(pstore)
+                    pause = state.pause if state is not None else None
+                    if pause is not None:
+                        # The user's own hold: no look, and a stall already raised is moot (issue 855)
+                        held = [s for s in subjects if health.paused(pstore, s, pause)]
+                        for subject in held:
+                            supervisor_mod.settle_paused(pstore, neo_store,
+                                                         project.name, subject)
+                        subjects = [s for s in subjects if s not in held]
+                    candidates = self._health_candidates(pstore, cfg, subjects)
                     # THE CAP BOUNDS SPEND, so it bounds the PAID triggers only and every due re-assertion is processed
                     free = [c for c in candidates if c[2] == health.REASSERT]
                     paid = [c for c in candidates
@@ -5838,6 +5894,13 @@ class Daemon:
                     and base_behind is not None):
                 self._supersede_stale_request(store, approval, pr)
                 return
+            if approval["status"] == "denied":
+                # #873: a denial that lost the race with another merge is caught up, not parked
+                caught = self._catch_up_with_base(project, store, wo, pr)
+                if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
+                    self._note_automerge_held(
+                        store, wo_id,
+                        automerge.held_base_moved(caught, pr, caught.base_tip))
             # Filed and not granted: pending with Neo, escalated to the user, denied, expired
             return
         if approval is None:
@@ -7105,6 +7168,21 @@ class Daemon:
                 log.info("[%s] carried round %s's verdict from %s to %s on %s",
                          project.name, carried["round"], judged[:10],
                          carried["carried_head_sha"][:10], wo["id"])
+        elif pr.head_oid and pr.head_oid != head_before:
+            # A red_ci return has no verdict to carry: resubmit for the worker (#1065)
+            try:
+                out = ops.resubmit_healed_red_ci(
+                    store, project.path, wo, project=project.name,
+                    cfg=project.validation, base=base_ref, base_sha=base_sha,
+                    head=pr.head_oid)
+            except Exception:  # noqa: BLE001 — the heal itself already landed
+                log.exception("[%s] could not resubmit %s after the base heal",
+                              project.name, wo["id"])
+                out = None
+            if out:
+                log.info("[%s] %s: its red_ci return was the base's — resubmitted it "
+                         "on %s as round %s", project.name, wo["id"],
+                         pr.head_oid[:10], out["round"])
         return True, pr
 
     def heal_pull_request(self, project: ProjectSpec, store: ProjectStore, wo: dict,

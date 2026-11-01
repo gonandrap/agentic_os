@@ -620,6 +620,11 @@ def automerge_denied(store: ProjectStore, wo: dict[str, Any]) -> bool:
         if (str(newest.get("code") or "") == HELD_SHA_MOVED
                 and str(newest.get("head_sha") or "") != sha):
             return False
+    # #873: the OS caught the denied commit up with its base, so a new submission is on its way
+    for e in store.events_of_kind(wo["id"], PR_BASE_UPDATED_EVENT):
+        if (float(e["ts"]) > float(decided[-1]["ts"])
+                and str(db.from_json(e["payload"], {}).get("head_before") or "") == sha):
+            return False
     return True
 
 
