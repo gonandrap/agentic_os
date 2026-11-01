@@ -176,6 +176,28 @@ def test_the_ceiling_counts_both_halves_of_the_bill(started, store):
     assert cap.remaining_usd == 6.0
 
 
+def test_a_spawned_call_with_no_cli_figure_counts_at_list_price(started, store):
+    """Issue #960: a worker-spawned `claude -p` without `total_cost_usd` still spends the cap"""
+    from jarvis import usage as usage_mod
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "eval", description="do it", budget_usd=10.0)
+    tokens = {"input": 1000, "cache_write": 20_000, "cache_read": 300_000, "output": 5000}
+    central = CentralStore()
+    try:
+        central.add_agent_call("worker_subprocess", label="pytest", model="sonnet",
+                               project="proj_a", wo_id=wo["id"], ok=True, usage=tokens)
+        central.add_agent_call("worker_subprocess", label="pytest", model="sonnet",
+                               project="proj_a", wo_id=wo["id"], ok=True,
+                               usage={**tokens, "total_cost_usd": 0.5})
+        spend = budget.spent(store, central, wo["id"])
+    finally:
+        central.close()
+    listed = sum(usage_mod.class_costs("sonnet", **tokens).values())
+    assert listed > 0
+    assert spend.jarvis_usd == pytest.approx(0.5 + listed)
+
+
 def test_a_compaction_is_counted_once_against_the_ceiling(started, store):
     """docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §2"""
     from jarvis.central_store import CentralStore
