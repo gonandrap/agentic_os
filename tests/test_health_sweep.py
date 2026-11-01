@@ -1022,6 +1022,47 @@ def test_the_tick_hands_the_health_sweep_the_reading_it_already_took(
     assert seen["state"] is shut
 
 
+def test_a_unit_held_by_jarvis_pause_is_not_swept_and_its_stall_finding_settles(
+        started, catalog_file, store, clock, fake_claude):
+    """Issue 855: the user's pause owns the stillness — no look, and a raised stall is skipped"""
+    from jarvis import fleet
+    from jarvis.neo_store import NeoStore
+
+    _enable(catalog_file)
+    held = _wo(store, "paused", status="pending")
+    allowed = _wo(store, "let through", status="pending", description="FORCE_HEALTH_CLEAR")
+    stall = store.add_finding(held, kind="no-progress", reason="never started",
+                              source="health", probe="no-progress")
+    other = store.add_finding(held, kind="going-in-circles", reason="loops",
+                              source="health", probe="going-in-circles")
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", held, "is it stuck?", kind="alarm")
+    finally:
+        neo.close()
+    store.update_alarm(stall["id"], status="escalated", neo_question_id=q["id"])
+    store.flag_attention(held, supervisor.ALARM_BLOCKER.format(alarm_id=stall["id"]))
+    daemon = started()
+    clock.advance(2 * FLOOR_MINUTES * 60)
+    paused = fleet.Fleet(3, 0, at=db.now(), pause=fleet.FleetPause(
+        since=db.now(), reason="", allow=frozenset({allowed})))
+
+    daemon.tick_count = 1
+    daemon._health_sweep(daemon._health_projects(), paused)
+
+    assert _reviews(store, subject_id=held) == [], "the paused order is never looked at"
+    assert _reviews(store, subject_id=allowed), "an allow-listed order is still swept"
+    assert store.get_alarm(stall["id"])["status"] == "skipped"
+    assert store.get_alarm(stall["id"])["verdict_reason"] == supervisor.PAUSE_HELD_REASON
+    assert store.get_alarm(other["id"])["status"] == "raised", "only stall probes are moot"
+    assert not store.get_work_order(held)["needs_attention"]
+    neo = NeoStore()
+    try:
+        assert neo.get(q["id"])["status"] != "pending"
+    finally:
+        neo.close()
+
+
 # -- the STUCK sweep: §§1-2 of docs/superpowers/specs/2026-09-30-an-order-that-stops
 
 HOUR = 3600.0
