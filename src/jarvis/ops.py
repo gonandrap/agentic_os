@@ -4180,6 +4180,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     # Spec §C of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md
     store.set_status(wo_id, status, trigger="landed")
     store.clear_attention(wo_id)
+    if status == "completed":
+        notify_completed(store, wo, "finished")
     if wo.get("backlog_id") and status == "completed":
         central = CentralStore()
         try:
@@ -5536,6 +5538,30 @@ def settle_in_session(store: ProjectStore, wo: dict[str, Any], event: str, *,
                                       "session_stopped": False})
 
 
+COMPLETED_TAIL_CHARS = 1200
+
+
+def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int | None:
+    """Tell the user an order THEY opened settled, with its result and final-message tail (issue 1385)"""
+    from .project_store import UNGOVERNED_ORIGINS
+
+    if launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS:
+        return None
+    fresh = store.get_work_order(wo["id"]) or wo
+    said = [str(fresh.get("result_summary") or "No summary on record.")]
+    if fresh.get("pr_url"):
+        said.append(f"Pull request: {fresh['pr_url']}")
+    replies = store.agent_replies(wo["id"])
+    last = str(replies[-1]["content"] or "").strip() if replies else ""
+    if last:
+        tail = last if len(last) <= COMPLETED_TAIL_CHARS else "…" + last[-COMPLETED_TAIL_CHARS:]
+        # Open offers and gaps in the final message die with the session unless they reach the user
+        said.append(f"Worker's final message (end):\n{tail}")
+    return store.add_notification(
+        title=f"{wo['id']} completed ({how}): {fresh.get('title') or 'untitled'}",
+        body="\n\n".join(said), level="info", wo_id=wo["id"], source="completion")
+
+
 def mark_backlog_done(wo: dict[str, Any]) -> None:
     """Close the backlog item a work order was promoted from, if it came from one"""
     if not wo.get("backlog_id"):
@@ -5576,6 +5602,7 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
                                  **({"merge_commit": merge_commit}
                                     if merge_commit else {})})
     mark_backlog_done(wo)
+    notify_completed(store, wo, "its pull request merged")
     return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
             "pr_url": wo.get("pr_url"), "merged_at": merged_at,
             "session_stopped": stopped["stopped"]}
@@ -14474,8 +14501,36 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
                 )
         finally:
             neo.close()
+    if row["wo_id"]:
+        _settle_alarm_attention(name, path, row["wo_id"], alarm_id)
     return {"alarm_id": alarm_id, "project": name, "wo_id": row["wo_id"],
             "review": review, "neo_question_closed": closed}
+
+
+def _settle_alarm_attention(name: str, path: Path, wo_id: str, alarm_id: str) -> None:
+    """A review is the user's answer, so the flag naming this alarm comes down (#1064)"""
+    from .supervisor import ALARM_BLOCKER
+
+    store = ProjectStore(path)
+    try:
+        try:
+            wo = store.get_work_order(wo_id)
+        except KeyError:
+            return
+        if wo.get("attention_reason") != ALARM_BLOCKER.format(alarm_id=alarm_id):
+            return  # the flag names something else: not this review's to touch
+        owed = [a for a in store.alarms_of(wo_id)
+                if a["id"] != alarm_id and a["status"] in ("escalated", "failed")
+                and a["review_status"] == "unreviewed"]
+    finally:
+        store.close()
+    settled = ack_os_flag(wo_id, name)
+    if not settled["blockers"] and owed:
+        store = ProjectStore(path)
+        try:
+            store.flag_attention(wo_id, ALARM_BLOCKER.format(alarm_id=owed[0]["id"]))
+        finally:
+            store.close()
 
 
 def approve_alarm_queue(project_name: str | None = None,
