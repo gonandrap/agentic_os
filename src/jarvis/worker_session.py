@@ -930,6 +930,16 @@ def _reap_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
     try:
         envelope = usage.window_envelope(sid, turn["started_at"], until,
                                          schema=claude_cli.USAGE_SCHEMA_VERSION)
+        if envelope is None and turn["kind"] == COMPACT_TURN:
+            # A `/compact` writes no assistant row: price its boundary instead (issue 1296)
+            done = usage.last_compaction(sid, since=turn["started_at"])
+            if done is not None:
+                # The model the session last answered on; an order's own model is often unset
+                model = next((m for m, _ in reversed(usage.said_in_session(sid))
+                              if m != usage.SYNTHETIC_MODEL), "") or wo_model(store, wo["id"])
+                envelope = usage.compaction_envelope(
+                    done, model,
+                    schema=claude_cli.USAGE_SCHEMA_VERSION, session_id=sid)
         said = usage.said_in_session(sid, since=turn["started_at"])
     except OSError:
         envelope, said = None, []
