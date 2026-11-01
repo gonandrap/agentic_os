@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% import "_release.html" as rel %}
+{% block title %}Release — Jarvis{% endblock %}
+{% block style %}
+.rel-list td { white-space: nowrap; }
+.rel-list td.prose { white-space: normal; }
+tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
+.cut-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-11-01-release-console.md #}
+{{ ui.page_head("Release", report.pending | length ~ " pending since " ~ (report.newest or "the first commit")
+                ~ " · " ~ report.releases | length ~ " releases · " ~ report.main_ref) }}
+
+{% if report.in_flight %}
+<section class="attention needs-you">
+  <div class="strip-head"><span class="n">{{ report.in_flight | length }}</span>release in flight — no new cut until it settles</div>
+  <ul>{% for w in report.in_flight %}<li>{{ ui.row_id(w.id, w.href) }} <span class="mono">{{ w.status }}</span>
+    <span class="sub">{{ w.title }}</span></li>{% endfor %}</ul>
+</section>
+{% endif %}
+
+{% call(r) ui.needs_you(attention, "releases with a PR that failed validation in production") %}
+  {{ ui.row_id(r.tag, "/release/" ~ r.tag) }}
+  <span class="mono tone-bad">{{ r.counts.failed }} failed</span>
+  <span class="sub">of {{ r.prs }} commits</span>
+{% endcall %}
+
+{{ ui.filter_bar("/release", filters, options, shown, total,
+                 {"q": "subject, wo id, sha or tag", "status": "every release status",
+                  "origin": "every pending origin"}) }}
+
+<h2>pending — on {{ report.main_ref }}, not in any release</h2>
+{% if report.pending %}
+<p class="kv">A release ships everything up to one commit on main, so picking a PR picks
+  every older one too (shaded). The OS files a release work order; its worker runs
+  <span class="mono">scripts/shipit.sh --stage</span> under the release gate.</p>
+<div class="cut-bar">
+  <form method="post" action="/release/cut">
+    <input type="hidden" name="base" value="{{ report.pending[0].sha }}">
+    <button {{ 'disabled' if report.in_flight }}>Add all — ship {{ report.pending | length }}</button>
+  </form>
+  <button form="cut" id="cut-picked" disabled>Ship selected</button>
+  <span class="sub" id="cut-sum">or pick the newest commit to ship below</span>
+</div>
+<form method="post" action="/release/cut" id="cut">
+  <div class="panel table-wrap">
+    <table class="rel-list" id="pending">
+      <tr><th>ship up to</th><th>commit</th><th>PR</th><th>work order</th><th>origin</th>
+        <th>traced from</th><th>subject</th><th>merged</th></tr>
+      {% for r in pending %}
+      <tr id="c-{{ r.short }}" data-rides="{{ r.rides }}">
+        <td><input type="radio" name="base" value="{{ r.sha }}" aria-label="ship up to {{ r.short }}"
+                   {{ 'disabled' if report.in_flight }}></td>
+        <td class="mono">{{ r.short }}</td>
+        <td class="mono">{{ rel.pr(r) }}</td>
+        <td class="mono">{{ rel.order(r) }}</td>
+        <td class="mono">{{ r.origin }}</td>
+        <td class="mono">{{ rel.trace(r) }}</td>
+        <td class="prose"><span class="clamp" title="{{ r.subject }}">{{ r.subject }}</span></td>
+        <td class="when mono" title="{{ fmt_ts(r.ts) }}">{{ fmt_age(r.ts) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="empty">nothing matches these filters</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+</form>
+<script>
+(function () {
+  var form = document.getElementById('cut'), picked = document.getElementById('cut-picked'),
+      sum = document.getElementById('cut-sum'), rows = form.querySelectorAll('tr[data-rides]');
+  form.addEventListener('change', function (e) {
+    if (e.target.name !== 'base') return;
+    var at = e.target.closest('tr'), after = false;
+    rows.forEach(function (tr) { if (tr === at) after = true; tr.classList.toggle('rides', after); });
+    picked.disabled = false;
+    sum.textContent = 'ships ' + at.dataset.rides + ' commit(s), up to ' + at.id.slice(2);
+  });
+})();
+</script>
+{% else %}
+<p class="empty">nothing pending — {{ report.main_ref }} has nothing after {{ report.newest or "the first commit" }}.</p>
+{% endif %}
+
+<h2>releases</h2>
+<div class="panel table-wrap">
+  <table class="rel-list">
+    <tr><th>release</th><th>status</th><th>commits</th><th>validated</th><th>pending</th>
+      <th>failed</th><th>unwatched</th><th>cut</th></tr>
+    {% for r in releases %}
+    <tr id="{{ r.tag }}">
+      <td class="mono">{{ ui.row_id(r.tag, "/release/" ~ r.tag) }}</td>
+      <td class="mono {{ rel.tone[r.status] }}">{{ r.status }}</td>
+      <td class="mono">{{ r.prs }}</td>
+      <td class="mono tone-ok">{{ r.counts.validated or "" }}</td>
+      <td class="mono tone-active">{{ r.counts.pending or "" }}</td>
+      <td class="mono tone-bad">{{ r.counts.failed or "" }}</td>
+      <td class="mono tone-muted">{{ r.counts.unwatched or "" }}</td>
+      <td class="when mono" title="{{ fmt_ts(r.ts) }}">{{ fmt_age(r.ts) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="empty">{{ 'nothing matches these filters' if filters else 'no jarvis-* tag yet' }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% call ui.explain("where this comes from") %}
+<p class="kv">Pending is every first-parent commit on {{ report.main_ref }} after
+  {{ report.newest or "the first commit" }}; a release is every commit between its tag and the
+  previous one, read from <span class="mono">{{ report.repo }}</span>. Colour is morpheus's
+  verdict on the PR in production; <i>unwatched</i> means morpheus has no item for it.</p>
+<p class="sub">from a terminal: <span class="mono">scripts/shipit.sh --dry-run</span> ·
+  <span class="mono">jarvis morpheus status</span></p>
+{% endcall %}
+{% endblock %}

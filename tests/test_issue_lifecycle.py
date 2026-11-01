@@ -1574,6 +1574,23 @@ def test_expediting_a_settled_order_is_refused(fleet):
         ops.expedite_work_order(wo_id, project_name="proj_a")
 
 
+def test_a_landed_fix_never_widens_a_user_cut_release(fleet):
+    """docs/superpowers/specs/2026-11-01-release-console.md §2: a pinned base ships only itself"""
+    from jarvis import db, release
+    store = fleet.store()
+    try:
+        pinned = store.create_work_order("Ship a release: 1 commit(s) up to abc", metadata={
+            release.BATCH_KEY: [], release.BASE_KEY: "a" * 40})
+    finally:
+        store.close()
+    fleet.land(fleet.file_bug(priority="low", expedite=True)["pickup"]["wo_id"])
+
+    rel = {r["id"]: db.from_json(r["metadata"], {}) for r in fleet.releases()}
+    assert rel[pinned["id"]][release.BATCH_KEY] == []
+    assert [m[release.BATCH_KEY] for i, m in rel.items() if i != pinned["id"]] == \
+        [[fleet.issue_url]]
+
+
 def test_an_expedited_order_records_that_it_was_expedited(fleet):
     """§1: the flag is on the ROW at creation"""
     from jarvis import db, ops

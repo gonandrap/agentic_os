@@ -443,20 +443,65 @@ def ask_body(c: Candidate, reason: str, decision_id: int, catalog: Catalog) -> s
     from .notify import ui_base_url
 
     item = str(c.payload.get("morpheus_item") or "")
+    act = act_on(c.origin_kind, item, c.parent_wo_id, c.project)
     if c.origin_kind == "morpheus" and item:
-        act = (f"`jarvis morpheus confirm {item} --fix \"<what to fix>\"` files the fix; "
-               f"`jarvis morpheus waive|requeue {item}` if it is not broken. "
-               f"{ui_base_url(catalog)}/morpheus#{item}")
-    elif c.origin_kind == "morpheus":
-        act = "`jarvis morpheus status` names the item; then `jarvis morpheus confirm <mv-id>`"
-    elif c.parent_wo_id:
-        act = f"`jarvis investigate {c.parent_wo_id} --why \"<what you saw>\"`"
-    else:
-        act = f"`jarvis wo create {c.project} \"<title>\"` to file it by hand"
+        act += f" {ui_base_url(catalog)}/morpheus#{item}"
     # An `ask` is never re-offered (`_queue_fields`), so the cap is no answer for THIS one
     return (f"{reason}. Act: {act}. Raising os.evolution.critical_weekly_usd lets later "
             f"ones through; it does not re-run this one.\n"
             f"{ui_base_url(catalog)}/steward#decision-{decision_id}")
+
+
+def act_on(origin_kind: str, morpheus_item: str, parent_wo_id: str, project: str) -> str:
+    """The one command that acts on held self-work, by where it came from"""
+    if origin_kind == "morpheus" and morpheus_item:
+        return (f"`jarvis morpheus confirm {morpheus_item} --fix \"<what to fix>\"` files the "
+                f"fix; `jarvis morpheus waive|requeue {morpheus_item}` if it is not broken.")
+    if origin_kind == "morpheus":
+        return "`jarvis morpheus status` names the item; then `jarvis morpheus confirm <mv-id>`"
+    if parent_wo_id:
+        return f"`jarvis investigate {parent_wo_id} --why \"<what you saw>\"`"
+    return f"`jarvis wo create {project} \"<title>\"` to file it by hand"
+
+
+def next_step(row: Mapping[str, Any], now: float | None = None) -> dict[str, Any]:
+    """What a steward decision asks of the user: `yours` and one line saying what to do, if anything"""
+    item = str((_candidate_of(row).get("payload") or {}).get("morpheus_item") or "")
+    act = act_on(row.get("origin_kind") or "", item, row.get("parent_wo_id") or "",
+                 row.get("project") or "")
+    outcome, state = row.get("outcome"), row.get("queue_state") or ""
+    if row.get("duplicate_of"):
+        return {"yours": False, "text": f"Nothing to do: the same defect as decision "
+                f"#{row['duplicate_of']}, which carries it."}
+    if row.get("wo_id"):
+        return {"yours": False, "text": f"Nothing to do: order {row['wo_id']} carries it."}
+    if outcome == "ask" and not row.get("applied"):
+        if (now or db.now()) - float(row.get("ts") or 0) < WINDOW_SECONDS:
+            return {"yours": True, "text": (
+                f"Needs you: the OS held this {row.get('severity')} fix because its weekly "
+                f"critical ceiling is spent, and it never retries it. Act: {act} Or leave it "
+                "if it no longer matters. Raising os.evolution.critical_weekly_usd lets later "
+                "ones through; it does not re-run this one.")}
+        return {"yours": False, "text": f"No longer waiting on you (asked over "
+                f"{WINDOW_SECONDS // 86400} days ago). Only if it still matters: {act}"}
+    if state == "waiting":
+        return {"yours": False, "text": (
+            f"Nothing to do: the daemon re-offers it every ~{DRAIN_EVERY_MINUTES} min once "
+            f"the ledger has room, and drops it after {QUEUE_TTL_SECONDS // 86400} days. "
+            f"Want it now: {act}")}
+    if state == "reoffered":
+        return {"yours": False, "text": "Nothing to do: re-offered from the queue."}
+    if state == "expired":
+        return {"yours": False, "text": "Nothing to do: expired from the queue; never re-offered."}
+    if outcome == "drop":
+        return {"yours": False, "text": "Nothing to do: recorded for counting only."}
+    if outcome == "queue":
+        return {"yours": False, "text": "Nothing to do: held, not dispatched; its source "
+                "asks again by itself, or it stays on the tracker for `jarvis issues start`."}
+    if row.get("mode") == "shadow":
+        return {"yours": False, "text": "Nothing to do: shadow record of what the steward "
+                "would have done."}
+    return {"yours": False, "text": "Nothing to do: dispatched."}
 
 
 #: How long an identical decision is not recorded again

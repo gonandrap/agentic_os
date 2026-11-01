@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% import "_release.html" as rel %}
+{% block title %}{{ d.tag }} — Jarvis{% endblock %}
+{% block style %}.rel-list td { white-space: nowrap; } .rel-list td.prose { white-space: normal; }{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-11-01-release-console.md §1 #}
+{% set counts = {} %}
+{% for r in d.rows %}{% if counts.update({r.validation: counts.get(r.validation, 0) + 1}) %}{% endif %}{% endfor %}
+{% set meta -%}
+  {{ d.rows | length }} commits since {{ d.previous or "the first commit" }}
+  {%- for s in ("failed", "pending", "validated", "unwatched") if counts.get(s) %} · {{ counts[s] }} {{ s }}{% endfor %}
+  · cut {{ fmt_ts(d.ts) }}
+{%- endset %}
+{{ ui.page_head(d.tag, meta) }}
+<p class="sub"><a href="/release">← every release</a>
+  {% if d.previous %}· previous: <a href="/release/{{ d.previous }}">{{ d.previous }}</a>{% endif %}</p>
+
+{% call(r) ui.needs_you(attention, "failed validation in production") %}
+  {{ rel.validation(r) }} <span class="mono">{{ rel.pr(r) }}</span> {{ rel.order(r) }}
+  <span class="sub">{{ (r.morpheus.resolution or "").split("\n")[0] if r.morpheus else r.subject }}</span>
+{% endcall %}
+
+{{ ui.filter_bar("/release/" ~ d.tag, filters, options, rows | length, total,
+                 {"q": "subject, wo id or sha"}) }}
+
+<div class="panel table-wrap">
+  <table class="rel-list">
+    <tr><th>validation</th><th>commit</th><th>PR</th><th>work order</th><th>origin</th>
+      <th>traced from</th><th>subject</th></tr>
+    {% for r in rows %}
+    <tr id="c-{{ r.short }}">
+      <td>{{ rel.validation(r) }}</td>
+      <td class="mono">{{ r.short }}</td>
+      <td class="mono">{{ rel.pr(r) }}</td>
+      <td class="mono">{{ rel.order(r) }}</td>
+      <td class="mono">{{ r.origin }}</td>
+      <td class="mono">{{ rel.trace(r) }}</td>
+      <td class="prose"><span class="clamp" title="{{ r.subject }}">{{ r.subject }}</span></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="empty">{{ 'nothing matches these filters' if filters else 'this release carries no commit of its own' }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

@@ -2241,6 +2241,57 @@ def create_app() -> FastAPI:
                                     status_code=303)
         return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
 
+    @app.get("/release", response_class=HTMLResponse)
+    def release_page(request: Request):
+        """Pending work, the cut, and every release by validation (docs/superpowers/specs/2026-11-01-release-console.md)"""
+        try:
+            report = ops.release_overview()
+        except ops.OpsError as e:
+            return render(request, "error.html", active="release", message=str(e),
+                          status_code=503)
+        pending, releases = report["pending"], report["releases"]
+        options = {"status": ["failed", "pending", "validated", "unwatched"],
+                   "origin": filter_options(pending, "origin"), "q": []}
+        filters = query_filters(request, options)
+        shown_pending = filter_rows(pending, {k: v for k, v in filters.items()
+                                              if k in ("origin", "q")},
+                                    text_keys=("subject", "wo_id", "sha"))
+        shown_releases = filter_rows(releases, {k: v for k, v in filters.items()
+                                                if k in ("status", "q")}, text_keys=("tag",))
+        return render(request, "release.html", active="release", report=report,
+                      pending=shown_pending, releases=shown_releases,
+                      attention=[r for r in shown_releases if r["status"] == "failed"],
+                      filters=filters, options=options,
+                      shown=len(shown_pending) + len(shown_releases),
+                      total=len(pending) + len(releases))
+
+    @app.post("/release/cut")
+    def release_cut(base: str = Form("")):
+        """File the release order for pending work up to `base` (spec 2026-11-01 §2)"""
+        try:
+            wo = ops.release_cut(base)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/release?error={quote(str(e))}", status_code=303)
+        return RedirectResponse(f"/wo/{quote(wo['project'])}/{wo['id']}", status_code=303)
+
+    @app.get("/release/{tag}", response_class=HTMLResponse)
+    def release_item_page(request: Request, tag: str):
+        """One release's contents traced to their orders, coloured by morpheus (spec 2026-11-01 §1)"""
+        try:
+            d = ops.release_detail(tag)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="release", message=str(e),
+                          status_code=404)
+        every = d["rows"]
+        options = {"validation": ["failed", "pending", "validated", "unwatched"],
+                   "origin": filter_options(every, "origin"), "q": []}
+        filters = query_filters(request, options)
+        rows = attention_first(filter_rows(every, filters, text_keys=("subject", "wo_id", "sha")),
+                               lambda r: r["validation"] == "failed")
+        return render(request, "release_item.html", active="release", d=d, rows=rows,
+                      attention=[r for r in rows if r["validation"] == "failed"],
+                      filters=filters, options=options, total=len(every))
+
     @app.get("/steward", response_class=HTMLResponse)
     def steward_page(request: Request):
         """Self-work the steward queued: what still waits, what was re-offered, what expired (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)"""
@@ -2266,8 +2317,11 @@ def create_app() -> FastAPI:
         if not decisions:
             return render(request, "error.html", active="steward", status_code=404,
                           message=f"no steward decision about {ref}")
+        from .. import steward
+
+        decisions = [{**d, "step": steward.next_step(d)} for d in decisions]
         return render(request, "steward_item.html", active="steward", ref=ref,
-                      decisions=decisions)
+                      decisions=decisions, yours=[d for d in decisions if d["step"]["yours"]])
 
     def _evolution(request: Request, project: str | None, days: int):
         """/evolution[/<project>], failures first (spec 2026-10-29 dashboard §5)"""
@@ -2594,6 +2648,20 @@ def create_app() -> FastAPI:
             return RedirectResponse(f"/?{urlencode({'error': str(e)}, quote_via=quote)}",
                                     status_code=303)
         return RedirectResponse(f"/io/{project}/{io['id']}", status_code=303)
+
+    @app.post("/do/create")
+    def create_do(project: str = Form(...), title: str = Form(...),
+                  description: str = Form(""), budget: str = Form("")):
+        from .. import budget as budget_mod
+
+        try:
+            do = ops.create_decision_order(
+                project, title, description, origin="ui",
+                budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
+        except (ValueError, ops.OpsError) as e:
+            return RedirectResponse(f"/?{urlencode({'error': str(e)}, quote_via=quote)}",
+                                    status_code=303)
+        return RedirectResponse(f"/do/{project}/{do['id']}", status_code=303)
 
     @app.post("/inv/create")
     def create_inv(subject: str = Form(...), why: str = Form(""),

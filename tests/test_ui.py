@@ -2396,8 +2396,28 @@ def test_a_feature_order_with_no_description_is_refused_by_the_browser_too(clien
 
 def test_the_dashboard_offers_every_create_form(client):
     page = client.get("/").text
-    for action in ("/wo/create", "/fo/create", "/io/create", "/inv/create"):
+    for action in ("/wo/create", "/fo/create", "/io/create", "/inv/create", "/do/create"):
         assert f'action="{action}"' in page
+
+
+def test_the_dashboard_takes_a_decision_order(client):
+    res = client.post("/do/create", data={
+        "project": "proj_a", "title": "which cache",
+        "description": "compare redis and memcached", "budget": "5"})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/do/proj_a/do-")
+    do = ops.show_decision_order(res.headers["location"].rsplit("/", 1)[-1], "proj_a")
+    assert (do["origin"], do["budget_usd"]) == ("ui", 5.0)
+
+
+def test_a_decision_order_with_no_description_is_refused_by_the_browser_too(client):
+    res = client.post("/do/create", data={"project": "proj_a", "title": "which cache",
+                                          "description": " "})
+
+    assert res.status_code == 303
+    assert res.headers["location"].startswith("/?error=")
+    assert ops.list_decision_orders("proj_a") == []
 
 
 def test_the_dashboard_takes_an_improvement_order(client):

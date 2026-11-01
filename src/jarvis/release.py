@@ -27,6 +27,8 @@ DAEMON_UNIT = "jarvis.service"
 
 #: The key under a release work order's `metadata` that says "this order exists to ship fixes
 BATCH_KEY = "release_for_issues"
+#: ...and the commit a user-cut release ships; a pinned base is never widened (docs/superpowers/specs/2026-11-01-release-console.md §2)
+BASE_KEY = "release_base"
 
 #: Said once per BROKEN COMMIT when a release that delivered no release is re-parked to wait for the...
 RED_DEFER_EVENT = "release_deferred_red_base"
