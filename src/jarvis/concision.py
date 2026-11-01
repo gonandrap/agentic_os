@@ -40,7 +40,7 @@ def word_count(text: str) -> int:
 #: The `jarvis` word itself, reached through a `cd … &&` chain
 _JARVIS = re.compile(r"(?:^|/)jarvis$")
 
-#: The same word in RAW, unparsed text, where the shell would RUN it: start of a line or after a separator (issue 912)
+#: The same word in RAW text, only where shell runs it (issue 912)
 _JARVIS_RAW = re.compile(r"(?:^|[;&|(\n]|\$\()\s*(?:\S*/)?jarvis\b")
 
 #: A heredoc opener: `<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`
