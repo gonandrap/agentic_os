@@ -154,6 +154,14 @@ SHIPS = [
     "command git push", "sudo -u root git push", "nohup git push", "time git commit -m x",
     "bash -c 'git push'", "sh -c 'cd /w && git commit -m x'", "zsh -lc \"gh pr create -t t\"",
     "env -i bash -c 'nohup git push'",
+    "env -S 'git push'", "env --split-string='git commit -m x'", "exec git push",
+    "xargs -n1 git push", "echo x | xargs git commit -m",
+]
+#: The hook cannot see what these run, so it refuses rather than passes (round 1 fail-open fault)
+OPAQUE = [
+    "eval 'git push'", "eval \"$CMD\"", "source scratch/ship.sh", ". scratch/ship.sh",
+    "bash scratch/ship.sh", "sh < ship.sh", "$GIT push", "echo $(git push)",
+    "env -i eval 'git push'", "bash -c 'eval git push'",
 ]
 READS = [
     "git log --oneline -5", "git diff main", "gh pr view 12", "python3 scripts/measure.py",
@@ -172,6 +180,15 @@ def test_a_researcher_may_not_commit_push_or_open_a_pull_request():
         assert hooks.researcher_bash_decision(_bash(command), _env("worker")) is None
 
 
+def test_a_researcher_command_the_hook_cannot_read_is_refused_not_passed():
+    for command in OPAQUE:
+        refusal = hooks.researcher_bash_decision(_bash(command), _env())
+        assert _decision(refusal) == "deny", command
+        assert "hides the command" in refusal["hookSpecificOutput"]["permissionDecisionReason"]
+        # Control: no other kind's behaviour changes
+        assert hooks.researcher_bash_decision(_bash(command), _env("worker")) is None
+
+
 def test_a_researcher_may_run_any_read_or_analysis_command():
     for command in READS + ["bash -c 'git log -1'", "env -u X git status"]:
         assert hooks.researcher_bash_decision(_bash(command), _env()) is None, command
@@ -181,7 +198,12 @@ CLOSES = ["jarvis do done do-1", "jarvis do cancel do-1",
           "env -u JARVIS_WO_ID jarvis do done do-1", "env -i jarvis do cancel do-1",
           "command jarvis do done do-1", "sudo jarvis do done do-1", "nohup jarvis do done do-1",
           "time jarvis do done do-1", "bash -c 'jarvis do done do-1'",
-          "ls && sh -c \"env -u JARVIS_WO_ID jarvis do cancel do-1\""]
+          "ls && sh -c \"env -u JARVIS_WO_ID jarvis do cancel do-1\"",
+          "env -S 'jarvis do done do-1'", "exec jarvis do done do-1",
+          "echo do-1 | xargs jarvis do done", "echo done do-1 | xargs jarvis do",
+          # Unreadable, refused on its text
+          "eval 'jarvis do done do-1'", "J=jarvis; $J do cancel do-1",
+          "bash -c 'eval \"jarvis do done do-1\"'"]
 
 
 def test_no_work_order_session_may_close_a_decision_order():
@@ -195,7 +217,7 @@ def test_no_work_order_session_may_close_a_decision_order():
     for command in CLOSES:
         assert hooks.decision_close_decision(_bash(command), {}) is None
     for command in ("jarvis do show do-1", "jarvis do report do-1 --from-file report.json",
-                    "jarvis wo done wo-1"):
+                    "jarvis wo done wo-1", "eval 'jarvis do show do-1'", "bash scripts/x.sh"):
         assert hooks.decision_close_decision(_bash(command), _env()) is None, command
 
 

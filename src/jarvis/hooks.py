@@ -1216,19 +1216,27 @@ _COMMAND_WRAPPERS: dict[str, frozenset[str]] = {
     "sudo": frozenset({"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-R"}),
     "nohup": frozenset(),
     "time": frozenset({"-f", "-o"}),
+    "exec": frozenset({"-a"}),
+    "xargs": frozenset({"-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-L", "-n",
+                        "--max-args", "-P", "--max-procs", "-s", "--max-chars"}),
 }
 _SHELLS = ("bash", "sh", "zsh")
+#: Programs whose command is text the hook never sees (a string, a file, stdin)
+_OPAQUE_PROGRAMS = ("eval", "source", ".")
+#: First word of the argv `_commands_run` returns for a segment it cannot read
+OPAQUE = "<opaque>"
 
 
 def _commands_run(segment: str, depth: int = 0) -> list[list[str]]:
     """The argv(s) one shell SEGMENT finally runs, past wrappers and into `bash -c`"""
-    # Not caught, by design: `eval`, and a script written to a file then run (unbounded)
+    # An unreadable segment returns `[OPAQUE, segment]`, never an empty pass (round 1 fail-open)
     from . import gate_rules
 
+    opaque = [[OPAQUE, segment]]
     try:
         words = shlex.split(segment)
     except ValueError:
-        words = segment.split()
+        return opaque
     while words:
         program = Path(words[0].lstrip("\\")).name
         if "=" in words[0] and not words[0].startswith("-"):
@@ -1239,19 +1247,35 @@ def _commands_run(segment: str, depth: int = 0) -> list[list[str]]:
                 flag, words = words[0], words[1:]
                 if flag == "--":
                     break
+                if program == "env" and flag.startswith(("-S", "--split-string")):
+                    # `env -S 'git push'`: the value is itself the command line
+                    value = flag.partition("=")[2] if flag.startswith("--") else flag[2:]
+                    if not value and words:
+                        value, words = words[0], words[1:]
+                    try:
+                        words = shlex.split(value) + words
+                    except ValueError:
+                        return opaque
+                    break
                 if flag in takes_value and words:
                     words = words[1:]
         else:
             break
     if not words:
         return []
-    program = Path(words[0].lstrip("\\")).name
-    if program in _SHELLS and depth < 4:
+    program = Path(words[0].lstrip("\\")).name or words[0]  # `.` has no name
+    if (program in _OPAQUE_PROGRAMS or "$" in words[0]
+            or any("$(" in w or "`" in w for w in words)):
+        return opaque
+    if program in _SHELLS:
         for i, word in enumerate(words[1:-1], start=1):
             if word.startswith("-") and not word.startswith("--") and "c" in word[1:]:
+                if depth >= 4:
+                    return opaque
                 script = words[i + 1]
                 return [argv for start, end, _ in gate_rules.segments(script)
                         for argv in _commands_run(script[start:end].strip(), depth + 1)]
+        return opaque  # `bash file.sh` or `bash` reading stdin: the script is never seen
     return [words]
 
 
@@ -1273,16 +1297,23 @@ def _researcher_ships(segment: str) -> str:
 
 def researcher_bash_decision(payload: dict[str, Any],
                              env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a RESEARCHER's commit, push and pull request; every other command is its job"""
+    """Refuse a RESEARCHER's commit, push and pull request, and any command it cannot read"""
     if env.get(WO_KIND_ENV) != "researcher" or payload.get("tool_name") != "Bash":
         return None
     from . import gate_rules
 
     command = ((payload.get("tool_input") or {}).get("command") or "").strip()
+    instead = _researcher_instead(env.get("JARVIS_WO_ID"))
     for start, end, _name in gate_rules.segments(command):
-        verb = _researcher_ships(command[start:end].strip())
+        segment = command[start:end].strip()
+        if any(words[0] == OPAQUE for words in _commands_run(segment)):
+            return _deny(
+                f"Refused: `{segment}` hides the command it runs (eval, source, a script file, "
+                f"stdin, `$(…)` or a `$VAR` program), so the hook cannot check it ships "
+                f"nothing. Run the command itself, or `bash -c '<command>'`. {instead}")
+        verb = _researcher_ships(segment)
         if verb:
-            return _deny(f"Refused: `{verb}`. {_researcher_instead(env.get('JARVIS_WO_ID'))}")
+            return _deny(f"Refused: `{verb}`. {instead}")
     return None
 
 
@@ -1297,14 +1328,27 @@ def decision_close_decision(payload: dict[str, Any],
 
     command = ((payload.get("tool_input") or {}).get("command") or "").strip()
     for start, end, _name in gate_rules.segments(command):
-        for words in _commands_run(command[start:end].strip()):
-            if (Path(words[0].lstrip("\\")).name == "jarvis" and len(words) >= 3
-                    and words[1] == "do" and words[2] in ("done", "cancel")):
+        segment = command[start:end].strip()
+        for words in _commands_run(segment):
+            if words[0] == OPAQUE:
+                # Match the raw text: refusing every eval would change regular workers
+                found = _DO_CLOSE_TEXT.search(segment)
+                verb = found.group(1) if found else ""
+            elif (Path(words[0].lstrip("\\")).name == "jarvis" and len(words) >= 2
+                    and words[1] == "do" and words[2:3] in (["done"], ["cancel"], [])):
+                verb = words[2] if len(words) > 2 else "done"  # bare `xargs jarvis do`: verb from stdin
+            else:
+                verb = ""
+            if verb:
                 return _deny(
-                    f"Refused: `jarvis do {words[2]}` from work order {wo_id}. Closing a "
+                    f"Refused: `jarvis do {verb}` from work order {wo_id}. Closing a "
                     f"decision order is the user's verb, never an agent's. Tell the user it "
-                    f"is ready; they run `jarvis do {words[2]} <do-id>` themselves.")
+                    f"is ready; they run `jarvis do {verb} <do-id>` themselves.")
     return None
+
+
+#: `do done` / `do cancel` in the raw text of a segment the hook cannot read
+_DO_CLOSE_TEXT = re.compile(r"\bdo\s+[\"']?(done|cancel)\b")
 
 
 def researcher_write_decision(payload: dict[str, Any],
@@ -1950,14 +1994,13 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         heredoc = heredoc_write_decision(payload, env)
         if heredoc is not None:
             return heredoc
-        # Before the gate, for the heredoc's reason: it never allows, and a refused ship files no gate request
-        shipping = researcher_bash_decision(payload, env)
-        if shipping is not None:
-            return shipping
-        # Same place, same reason; and before the `jarvis …` auto-allow below, which would wave it through
+        # Before the gate and the `jarvis …` auto-allow; closing first so it wins over the opaque reason
         closing = decision_close_decision(payload, env)
         if closing is not None:
             return closing
+        shipping = researcher_bash_decision(payload, env)
+        if shipping is not None:
+            return shipping
         gated = gate_decision(payload, env)
         if gated is not None:
             return gated
