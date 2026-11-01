@@ -1,0 +1,27 @@
+{# Shared by release.html and release_item.html — docs/superpowers/specs/2026-11-01-release-console.md §1 #}
+{% set tone = {"validated": "tone-ok", "pending": "tone-active", "failed": "tone-bad",
+               "unwatched": "tone-muted"} %}
+
+{% macro validation(r) -%}
+{%- if r.morpheus %}<a class="mono {{ tone[r.validation] }}" href="/morpheus/{{ r.morpheus.id }}"
+   title="morpheus {{ r.morpheus.state }}">{{ r.validation }}</a>
+{%- else %}<span class="mono tone-muted" title="morpheus has no item for this PR">{{ r.validation }}</span>{% endif -%}
+{%- endmacro %}
+
+{% macro pr(r) -%}
+{%- if r.pr is not none and r.morpheus and r.morpheus.pr_url %}<a href="{{ r.morpheus.pr_url }}">#{{ r.pr }}</a>
+{%- elif r.pr is not none %}#{{ r.pr }}{% else %}<span class="tone-muted">direct</span>{% endif -%}
+{%- endmacro %}
+
+{% macro order(r) -%}
+{%- if r.wo %}<a class="rowid" href="{{ r.wo.href }}" title="{{ r.wo.title }}">{{ r.wo.id }}</a> <span class="sub">{{ r.wo.status }}</span>
+{%- elif r.wo_id %}<a class="rowid" href="/go/{{ r.wo_id }}">{{ r.wo_id }}</a>
+{%- else %}—{% endif -%}
+{%- endmacro %}
+
+{% macro trace(r) -%}
+{%- for h in r.trace %}<span class="sub">{{ h.via }}</span>
+  <a class="mono" href="{{ h.href }}" title="{{ h.title }}">{{ h.id if not h.id.startswith('http') else '#' ~ h.id.rsplit('/', 1)[-1] }}</a>
+  {%- if h.kind %} <span class="sub">({{ h.kind }})</span>{% endif %}{{ " · " if not loop.last }}
+{%- else %}—{% endfor -%}
+{%- endmacro %}
