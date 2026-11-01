@@ -1457,6 +1457,12 @@ class Daemon:
             except Exception:  # noqa: BLE001 — one feature must not stop the rest
                 log.exception("[%s] could not refresh the spec under review for %s",
                               project.name, fo["id"])
+        for fo in store.list_feature_orders(statuses=("executing",)):
+            try:
+                ops.refresh_held_spec(fo["id"], project_name=project.name)
+            except Exception:  # noqa: BLE001 — one feature must not stop the rest
+                log.exception("[%s] could not re-read the held spec of %s",
+                              project.name, fo["id"])
 
     def settle_features(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close out feature orders whose children have all landed, or one of which has not (docs/superpowers/specs/2026-08-29-feature-order-resume.md)"""

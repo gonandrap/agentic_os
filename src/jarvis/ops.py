@@ -9348,6 +9348,62 @@ def refresh_plan_spec(fo_id: str,
             "superseded": qid}
 
 
+def refresh_held_spec(fo_id: str,
+                      project_name: str | None = None) -> dict[str, Any]:
+    """Re-read a released feature's spec while its spec PR is unmerged (docs/superpowers/specs/2026-11-01-a-held-spec-is-re-read-until-it-merges.md §2)"""
+    from . import landing, plans, sections, specs
+    from .project_store import SPEC_PR_OPEN_STATUSES, WORKER_CHILDREN
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    out: dict[str, Any] = {"project": name, "fo_id": fo_id, "refreshed": False}
+    if fo["status"] != "executing":
+        return {**out, "reason": f"{fo_id} is {fo['status']}"}
+    plan = db.from_json(fo.get("plan"), {}) or {}
+    planner = _planner_work_order(path, fo)
+    if not (plan.get("design_doc") and plan.get("design_doc_content")):
+        return {**out, "reason": "no spec snapshot"}
+    if not (planner and planner.get("pr_url")
+            and planner["status"] in SPEC_PR_OPEN_STATUSES):
+        return {**out, "reason": "the spec is not held"}
+
+    found = landing.committed_text(path, planner, plan["design_doc"])
+    if found is None:
+        return {**out, "reason": "nothing readable"}
+    text, source = found
+    old = str(plan["design_doc_content"])
+    if text == old:
+        return {**out, "reason": "unchanged"}
+
+    problems = list(plans.spec_problems(plan, text))
+    store = ProjectStore(path)
+    try:
+        if not problems:
+            # A started child keeps the section it was dispatched with
+            for kid in store.feature_children(fo_id, kinds=WORKER_CHILDREN):
+                which = str(kid.get("spec_section") or "").strip()
+                if (kid["status"] not in ("pending", "cancelled") and which
+                        and sections.extract_section(old, which)
+                        != sections.extract_section(text, which)):
+                    problems.append(f"{kid['id']} is {kid['status']} and its section "
+                                    f"{which!r} changed")
+        if problems:
+            reason = (f"the spec was revised on {source} but the children keep the "
+                      f"snapshot: " + "; ".join(problems))
+            if fo.get("attention_reason") != reason:
+                store.flag_feature_attention(fo_id, reason)
+                log.warning("[%s] %s: %s", name, fo_id, reason)
+            return {**out, "reason": "kept", "problems": problems}
+        plan["design_doc_content"], plan["design_doc_source"] = text, source
+        store.update_feature_order(fo_id, plan=db.to_json(plan))
+        store.add_event(planner["id"], "plan_spec_refreshed", {
+            "feature_order": fo_id, "source": source, "released": True})
+    finally:
+        store.close()
+    specs.install_agent(path, fo_id, str(plan.get("summary") or fo["title"]), text)
+    log.info("[%s] %s: released spec re-read from %s", name, fo_id, source)
+    return {**out, "refreshed": True, "source": source}
+
+
 def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
                 decided_by: str = "user",
                 project_name: str | None = None) -> dict[str, Any]:
