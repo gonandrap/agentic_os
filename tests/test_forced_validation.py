@@ -621,3 +621,27 @@ def test_the_panel_being_off_refuses_rather_than_opening_a_round_nothing_judges(
     with pytest.raises(ops.OpsError, match="validation panel is off"):
         ops.force_validation(wo["id"], reason="re-judge it")
     assert len(store.validation_rounds(wo_id=wo["id"])) == 1
+
+
+def test_a_submission_whose_pull_request_lags_the_worktree_spends_no_round(
+        fleet, project, fake_gh, monkeypatch):
+    """Issue #704: the panel would judge the previous push"""
+    import dataclasses
+
+    from jarvis import evidence
+
+    store, wo = parked(fleet, project)
+    artifact(fake_gh)
+    real = evidence.collect_work_order
+    monkeypatch.setattr(evidence, "collect_work_order", lambda *a, **k: dataclasses.replace(
+        real(*a, **k), pr_behind=("a" * 40, "b" * 40)))
+    before = len(store.validation_rounds(wo_id=wo["id"]))
+
+    row = ops.submit_for_validation(store, project, store.get_work_order(wo["id"]),
+                                    declared="ran the suite",
+                                    cfg=fleet.catalog.project("proj_a").validation)
+
+    assert row is None
+    assert len(store.validation_rounds(wo_id=wo["id"])) == before
+    refused = store.events_of_kind(wo["id"], "validation_refused")
+    assert refused and "pr_behind_worktree" in str(refused[-1]["payload"])
