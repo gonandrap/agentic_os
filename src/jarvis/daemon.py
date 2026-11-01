@@ -718,6 +718,8 @@ class Daemon:
         # Projects already warned that their pull requests cannot be polled (no `gh`
         self.pr_poll_warned: set[str] = set()
         self.issue_sync_warned: set[str] = set()
+        #: Trackers already reported as unwritable by `gh`'s account this run (#1346)
+        self.tracker_denied_warned: set[str] = set()
         # The systemd seam for staged releases (src/jarvis/release.py)
         self.release_runner: Any = None
         # The usage meter's `urlopen` seam
@@ -7338,9 +7340,15 @@ class Daemon:
             return
         from . import github, issues
 
+        probed = False
         for wo in tracked:
             if not issues.needs_sync(store, wo):
                 continue
+            # Probed only once there is a write to make; `apply` writes only to the OS's own tracker
+            if not probed:
+                probed = True
+                if not self._tracker_writable(project, store, issues.bug_repo()):
+                    return
             was = (wo.get("issue_state") or "")
             try:
                 applied = issues.record_applied(store, wo, project.bugs.label)
@@ -7396,11 +7404,15 @@ class Daemon:
                     row = {**row, "state": issue.state}
                 if (row.get("state") or "") != "OPEN":
                     continue
-                for link in store.unannounced_links(url):
+                links = store.unannounced_links(url)
+                relabel = int(row["refs"]) != int(row["refs_labelled"])
+                if not (links or relabel) or not self._tracker_writable(project, store, repo):
+                    continue
+                for link in links:
                     issues.comment(url, issues.reference_comment(
                         link["unit_id"], project.name, link["kind"]), repo)
                     store.mark_issue_announced(url, link["unit_id"])
-                if int(row["refs"]) != int(row["refs_labelled"]):
+                if relabel:
                     issues.set_reference_label(url, int(row["refs"]), repo)
                     store.record_issue_label(url, int(row["refs"]))
             except github.GitHubError as e:
@@ -7908,6 +7920,24 @@ conflicts, shipit refuses: report its reason and stop. Never fall back to releas
         if accounted:
             store.add_event(wo_id, self.RELEASE_BATCH_CLEARED_EVENT,
                             {"batch": batch})
+
+    def _tracker_writable(self, project: ProjectSpec, store: ProjectStore,
+                          repo: str) -> bool:
+        """False when `gh`'s account definitely cannot close or label on `repo` (#1346)"""
+        from . import issues
+
+        access = issues.tracker_access(repo)
+        if not access.denied:
+            return True
+        key = access.repo.lower()
+        if key not in self.tracker_denied_warned:
+            self.tracker_denied_warned.add(key)
+            log.warning("[%s] not writing to %s: gh account %s has %s permission",
+                        project.name, access.repo, access.login, access.permission)
+            store.add_notification(
+                title=f"Jarvis cannot write to the tracker {access.repo}",
+                body=access.explain(), level="critical", source="issue-sync")
+        return False
 
     def _warn_issue_sync_broken(self, project: ProjectSpec, store: ProjectStore,
                                 error: Exception) -> None:

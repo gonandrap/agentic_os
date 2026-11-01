@@ -3463,6 +3463,28 @@ def check_service_path() -> Iterator[Violation]:
     )
 
 
+def check_tracker_access() -> Iterator[Violation]:
+    """INV-TRACKER-ACCESS — `gh`'s account must be able to close and label on every tracker (#1346)"""
+    from . import issues, ops
+
+    repos = {issues.bug_repo()}
+    catalog = _live_catalog()
+    for p in getattr(catalog, "projects", ()) if catalog is not None else ():
+        if Path(p.path).is_dir():
+            repos.add(ops.follow_up_repo(Path(p.path), p.bugs.repo))
+    for repo in sorted(r for r in repos if r):
+        try:
+            access = issues.tracker_access(repo)
+        except issues.IssueLifecycleError:
+            continue  # not a repo name the OS would write to at all
+        if access.denied:
+            yield Violation(
+                invariant="INV-TRACKER-ACCESS", detail=access.explain(), level="critical",
+                context={"repo": access.repo, "login": access.login,
+                         "permission": access.permission,
+                         "needed": issues.TRACKER_NEEDED_PERMISSION})
+
+
 def check_production_clean() -> Iterator[Violation]:
     """INV-PROD-CLEAN — the production checkout must be byte-identical to its tag (#202)"""
     from . import release
@@ -3935,6 +3957,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_config_drift,
     check_offboarded_activity,
     check_service_path,
+    check_tracker_access,
     check_production_clean,
     check_prod_cli,
     check_cache_ttl_trigger,
