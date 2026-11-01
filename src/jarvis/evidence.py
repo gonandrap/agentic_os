@@ -60,6 +60,8 @@ class EvidencePacket:
     history: tuple[dict, ...] = ()
     #: `((path, digest), ...)`, sorted
     file_shas: tuple[tuple[str, str], ...] = ()
+    #: `(pr_head_sha, worktree_head)` when the PR lacks commits the worktree has; `()` otherwise
+    pr_behind: tuple[str, ...] = ()
     #: THE FOUR COLUMNS A FIX ORDER CARRIES (docs/superpowers/specs/2026-09-27-self-evolution.md)
     gap_class: str = ""
     detector_id: str = ""
@@ -292,6 +294,9 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
     pr_error = source = ""
     base = head = stat = diff = ""
     files: tuple[str, ...] = ()
+    behind: tuple[str, ...] = ()
+    # type: ignore — `ProjectRef` carries the one attribute that helper reads.
+    worktree = worker_session.worktree_path(ProjectRef(project_path), wo)  # type: ignore[arg-type]
 
     if pr_url:
         pr_data, pr_diff, pr_error = _pull_request(pr_url, project_path)
@@ -300,11 +305,10 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
             base, head = str(pr_data["base_ref"]), str(pr_data["head_ref"])
             stat, diff = str(pr_data["stat"]), pr_diff
             files = _dedupe(pr_data["files"])
+            behind = _pr_behind(worktree, str(pr_data.get("head_sha") or ""))
 
     if source != "pull_request":
         source = "worktree"
-        # type: ignore — `ProjectRef` carries the one attribute that helper reads.
-        worktree = worker_session.worktree_path(ProjectRef(project_path), wo)  # type: ignore[arg-type]
         if worktree is not None:
             base = base_ref(worktree)
             head = _git(worktree, "rev-parse", "HEAD").strip()
@@ -356,6 +360,7 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
             for a in assumptions),
         history=_history(history),
         file_shas=shas,
+        pr_behind=behind,
         gap_class=gap_class,
         detector_id=detector_id,
         remedy_rule_id=remedy_rule_id,
@@ -364,6 +369,18 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
                                                 trigger_wo_id, unproven),
         self_evolution_unproven=tuple(unproven),
     )
+
+
+def _pr_behind(worktree: Path | None, pr_head: str) -> tuple[str, ...]:
+    """`(pr_head, worktree_head)` when the worktree has commits the PR lacks, else `()` (#704)"""
+    if worktree is None or not pr_head:
+        return ()
+    wt_head = _git(worktree, "rev-parse", "HEAD").strip()
+    # A PR head unknown here fails the rev-list and reads as "not behind": today's behaviour
+    if wt_head and wt_head != pr_head and _git(
+            worktree, "rev-list", "--max-count=1", f"{pr_head}..HEAD").strip():
+        return (pr_head, wt_head)
+    return ()
 
 
 def _pull_request(url: str,
