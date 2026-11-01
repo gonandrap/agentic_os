@@ -106,7 +106,7 @@ def gate_environment(root: Path) -> dict[str, str]:
 
 def _bills_real_tokens() -> bool:
     """Is this run spending real money that a real work order will be charged for? (#103)"""
-    return bool(os.environ.get(LLM_EVALS_ENV) and os.environ.get("JARVIS_WO_ID"))
+    return agent_usage.bills_real_tokens()
 
 
 def _blocked_bin(root: Path, name: str, source: str) -> Path:
