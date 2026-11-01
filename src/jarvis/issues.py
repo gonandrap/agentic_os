@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -360,6 +362,69 @@ def gh_login() -> str:
         return ""
     _GH_LOGIN.append(login.strip())
     return _GH_LOGIN[0]
+
+
+#: `viewerPermission` levels that may close and label an issue; READ can only comment (#1346)
+TRACKER_WRITE_PERMISSIONS = ("ADMIN", "MAINTAIN", "WRITE", "TRIAGE")
+
+#: The lowest of them, as the inbox and doctor name it
+TRACKER_NEEDED_PERMISSION = "TRIAGE"
+
+#: How long one access answer is trusted
+TRACKER_ACCESS_TTL = 600
+
+
+@dataclass(frozen=True)
+class TrackerAccess:
+    """What `gh` can do on one tracker, as GitHub answered it (#1346)"""
+
+    repo: str
+    login: str
+    #: GitHub's `viewerPermission`, or "" when it could not be read
+    permission: str
+    error: str = ""
+
+    @property
+    def denied(self) -> bool:
+        """True only on a DEFINITE answer below triage; an unreadable probe is unknown"""
+        return bool(self.permission) and self.permission not in TRACKER_WRITE_PERMISSIONS
+
+    def explain(self) -> str:
+        """The account, the repo, what it lacks, and how to point `gh` elsewhere"""
+        config = os.environ.get("GH_CONFIG_DIR") or "the default gh config (~/.config/gh)"
+        return (f"`gh` is authenticated as {self.login or 'an unknown account'}, which has "
+                f"{self.permission} permission on {self.repo}; closing and labelling issues "
+                f"needs {TRACKER_NEEDED_PERMISSION} or higher. Jarvis has stopped writing to "
+                f"that tracker. This process reads {config}: set GH_CONFIG_DIR (or GH_TOKEN) "
+                f"in the daemon's service environment to the account that owns the tracker, "
+                f"or grant {self.login or 'that account'} triage access, then restart the "
+                f"daemon.")
+
+
+#: `tracker_access`'s process cache: repo to (answered at, answer)
+_TRACKER_ACCESS: dict[str, tuple[float, TrackerAccess]] = {}
+
+
+def reset_tracker_access() -> None:
+    """Forget every cached access answer"""
+    _TRACKER_ACCESS.clear()
+
+
+def tracker_access(repo: str) -> TrackerAccess:
+    """Who `gh` writes to `repo` as, and with what permission (#1346)"""
+    repo = checked_repo(repo)
+    key = repo.lower()
+    cached = _TRACKER_ACCESS.get(key)
+    if cached and time.time() - cached[0] < TRACKER_ACCESS_TTL:
+        return cached[1]
+    try:
+        stdout = _run(["repo", "view", repo, "--json", "viewerPermission"], url=repo)
+        permission = str(json.loads(stdout or "").get("viewerPermission") or "").upper()
+    except Exception as e:  # noqa: BLE001 — unknown, never a denial (kn-40db1828); not cached
+        return TrackerAccess(repo=repo, login=gh_login(), permission="", error=str(e))
+    answer = TrackerAccess(repo=repo, login=gh_login(), permission=permission)
+    _TRACKER_ACCESS[key] = (time.time(), answer)
+    return answer
 
 
 def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:
