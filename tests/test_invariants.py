@@ -626,6 +626,27 @@ def test_a_validating_work_order_is_silent_until_the_panel_gives_up(project):
         VALIDATION_STUCK_BLOCKER]
 
 
+def test_needs_review_label_names_which_decision_is_owed(project):
+    """#756: a panel give-up and pending assumptions must not read alike"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the thing")
+    store.set_status(wo["id"], "needs_review")
+    store.add_assumption(wo["id"], "something needing a decision")
+    assert invariants.status_label(store, store.get_work_order(wo["id"])) == (
+        "needs_review — 1 assumption pending your review")
+
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="abc")
+    store.close_validation_round(rnd["id"], "escalated", reason="no deal")
+    assert invariants.status_label(store, store.get_work_order(wo["id"])) == (
+        "needs_review — 1 assumption pending your review; "
+        f"{invariants.VALIDATION_GAVE_UP_LABEL}")
+
+    for a in store.pending_assumptions(wo["id"]):
+        store.review_assumption(a["id"], "rejected", decided_by="user")
+    assert invariants.status_label(store, store.get_work_order(wo["id"])) == (
+        f"needs_review — {invariants.VALIDATION_GAVE_UP_LABEL}")
+
+
 def test_a_validating_work_order_with_a_real_blocker_is_surfaced(project):
     """The other half of the pairing above"""
     store = ProjectStore(project)
