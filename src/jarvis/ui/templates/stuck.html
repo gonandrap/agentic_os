@@ -16,7 +16,7 @@
 
 {# issue 1450: a project the sweep skips says so; its silence is never "nothing stuck" #}
 {% for u in unjudged %}
-<section class="attention needs-you" id="unjudged-{{ u.project }}">
+<section class="attention unjudged" id="unjudged-{{ u.project }}">
   <div class="strip-head tone-warn"><span class="mono">{{ u.project }}</span>&nbsp;is not judged —
     <span class="mono">os.fleet_health.enabled</span> is off</div>
   <p class="sub">enable it: <span class="mono">{{ u.enable }}</span></p>
