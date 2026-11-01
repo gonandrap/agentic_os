@@ -91,6 +91,13 @@ def test_the_evidence_re_finish_rule_survived_the_cut_into_the_record_section():
     assert "finish again" in worker_brief.render_section("record")
 
 
+def test_record_section_bounds_targeted_tests_in_time():
+    """Issue 963: 'targeted' with no bound grew to ~590 tests over four overlapping commands."""
+    from jarvis import worker_brief
+    record = worker_brief.render_section("record")
+    assert "UNDER TWO MINUTES" in record and "-n auto" in record
+
+
 def test_index_names_every_section_and_says_fetching_is_one_command():
     p = _prompt(GATED)
     assert "# Full briefings" in p

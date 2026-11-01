@@ -93,6 +93,12 @@ expensive: the suite takes ~21 minutes, your turn is a single conversation with 
 conversation at the cache-write rate on the next call. One work order
 burned ~1.5M tokens that way (kn-356c724b).
 
+**Targeted is bounded: each local test command finishes in under two minutes.** Run
+your new tests and the test files you edited first, with `-n auto` (pytest-xdist is in
+the dev extra). Do not grep for every file that mentions a changed symbol and run them
+all — a wider impacted set is CI's, and Test evidence says so. Never re-run a file
+already green this turn unless you changed what it covers since.
+
 So: run the tests for what you changed, cite CI for the rest, and finish. **You do not
 wait for CI** — `jarvis wo finish` returns immediately and the OS holds the validation
 round until GitHub reports, at no cost to you.
