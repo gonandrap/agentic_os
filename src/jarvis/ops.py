@@ -3262,13 +3262,11 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
     from . import db
 
     newest: dict[str, Any] | None = None
-    stale = _stale_panel_hold(store, wo["id"], status=str(wo.get("status") or ""))
+    stale = _stale_ruling(store, wo["id"], status=str(wo.get("status") or ""))
     for kind in AUTOREVIEW_EVENTS:
         rows = store.events_of_kind(wo["id"], kind)
-        # A `panel_gave_up` hold about an overtaken round cannot be this kind's candidate
-        if kind == "autoreview_held":
-            rows = [r for r in rows
-                    if not stale(kind, db.from_json(r["payload"], {}))]
+        # A claim false of the current rows cannot be this kind's candidate (#814)
+        rows = [r for r in rows if not stale(kind, db.from_json(r["payload"], {}))]
         if not rows:
             continue
         # Payload first, so `kind` and `ts` are this function's answers and not whatever an event happened to...
@@ -3548,22 +3546,93 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     return bool(held_round) and held_round != int(latest_round.get("round") or 0)
 
 
-def _stale_panel_hold(store: ProjectStore, wo_id: str, *, status: str | None = None):
-    """`_panel_hold_is_stale` bound to this work order, reading its rows LAZILY and ONCE"""
+def _question_status():
+    """`question_id -> status`, or None when the question cannot be read"""
+    from .neo_store import NeoStore
+
+    cache: dict[int, str | None] = {}
+
+    def status(question_id: Any) -> str | None:
+        qid = int(question_id or 0)
+        if qid and qid not in cache:
+            cache[qid] = None
+            try:
+                neo = NeoStore()
+                try:
+                    q = neo.get(qid)
+                finally:
+                    neo.close()
+            except Exception:  # noqa: BLE001 — a surface never goes down over neo.db
+                q = None
+            if q:
+                cache[qid] = str(q["status"] or "")
+        return cache.get(qid)
+
+    return status
+
+
+def _stale_ruling(store: ProjectStore, wo_id: str, *, status: str | None = None):
+    """Is this `autoreview` event's claim false of the CURRENT rows? (docs/superpowers/specs/2026-11-01-every-autoreview-claim-is-re-derived-from-its-row.md)"""
     from . import autoreview
+    from .neo_store import NEO_HELD_Q_STATUSES
 
     cache: dict[str, Any] = {}
     rows: dict[int, dict[str, Any] | None] = {}
     codes = (autoreview.HELD_PANEL_GAVE_UP, autoreview.HELD_STATUS)
+    question = _question_status()
+
+    def once(key: str, read: Any) -> Any:
+        if key not in cache:
+            cache[key] = read()
+        return cache[key]
+
+    def left_neo(qid: Any) -> bool:
+        # No link is stale; an unreadable question is not evidence
+        if not int(qid or 0):
+            return True
+        q = question(qid)
+        return q is not None and q not in NEO_HELD_Q_STATUSES
+
+    # The hold codes re-derived from a row; `row` is never None here
+    held = {
+        autoreview.HELD_ASKED: lambda row: left_neo(row.get("neo_question_id")),
+        autoreview.HELD_CONFIRMING: lambda row: left_neo(row.get("confirm_question_id")),
+        autoreview.HELD_JUDGED: lambda row: not row.get("provisional_verdict"),
+        autoreview.HELD_REFUSAL_UNANSWERED: lambda row: once(
+            "answered", lambda: refusal_answered(store, wo_id)),
+        autoreview.HELD_OBJECTION_IN_FLIGHT: lambda row: not once(
+            "objecting", lambda: bool(store.outstanding_objections(wo_id))),
+    }
+
+    def claim_false(kind: str, payload: dict[str, Any], row: dict[str, Any]) -> bool:
+        if str(row.get("status") or "") != "pending":
+            return True
+        if kind == "autoreview_asked":
+            qid = int(payload.get("neo_question_id") or 0)
+            column = "confirm_question_id" if payload.get("confirm") else "neo_question_id"
+            # `failed` stays: the unreachable sentence is the true one for it
+            return (int(row.get(column) or 0) != qid
+                    or (left_neo(qid) and question(qid) != "failed"))
+        if kind == "autoreview_provisional":
+            return not row.get("provisional_verdict")
+        return bool(row.get("objection_withdrawn_ts")) or (
+            bool(row.get("objection_envelope_id"))
+            and invariants.objection_undeliverable(store, row))
 
     def stale(kind: str, payload: dict[str, Any]) -> bool:
-        if kind != "autoreview_held":
+        if kind not in ("autoreview_held", "autoreview_asked", "autoreview_provisional",
+                        "autoreview_objected"):
             return False
         code = str(payload.get("code") or "")
         aid = int(payload.get("assumption_id") or 0)
         if aid and aid not in rows:
             rows[aid] = store.get_assumption(aid)
         row = rows.get(aid)
+        if kind != "autoreview_held":
+            return row is not None and claim_false(kind, payload, row)
+        if code in held:
+            return _panel_hold_is_stale(None, payload, "", row) or (
+                row is not None and bool(held[code](row)))
         # The `codes` gate is the ROUND/STATUS clauses' alone: spec §3.3 of...
         if code not in codes:
             return _panel_hold_is_stale(None, payload, "", row)
@@ -3616,7 +3685,7 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
     newest: dict[int, dict[str, Any]] = {}
     # WHY AN OBJECTION WAS TAKEN BACK
     withdrawn_reason: dict[int, str] = {}
-    stale = _stale_panel_hold(store, wo_id)
+    stale = _stale_ruling(store, wo_id)
     for kind in AUTOREVIEW_EVENTS:
         for event in store.events_of_kind(wo_id, kind):
             payload = db.from_json(event["payload"], {})
@@ -3951,7 +4020,7 @@ def _autoreview_line(state: dict[str, Any]) -> str:
     # The early pass's five
     if kind == "autoreview_provisional":
         return (f"assumption #{n} provisionally {state.get('verdict') or 'judged'} by "
-                f"the OS while the worker runs — settles nothing")
+                f"the OS before the worker delivered — settles nothing")
     if kind == "autoreview_objected":
         return (f"the OS objected to assumption #{n} and told the worker — "
                 f"{state.get('reason') or 'no reason recorded'}")
