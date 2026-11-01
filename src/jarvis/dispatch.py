@@ -198,6 +198,9 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         "JARVIS_HOME": str(jarvis_home()),
         # Where TOKEN ACCOUNTING goes, pinned separately from JARVIS_HOME and read by `agent_usage` alone (#103)
         agent_usage.SPEND_HOME_ENV: str(jarvis_home()),
+        # So code from another checkout cannot write this fleet's books (#754)
+        agent_usage.LIVE_HOME_ENV: str(jarvis_home()),
+        agent_usage.LIVE_CODE_ENV: str(agent_usage.CODE_DIR),
         # Workers call `jarvis …` from Bash (contract)
         "PATH": _worker_path(),
         # Which privileged actions the PreToolUse gate mediates for this worker
