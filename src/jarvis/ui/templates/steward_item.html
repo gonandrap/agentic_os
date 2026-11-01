@@ -29,6 +29,7 @@
     <tr><th>rule</th><td><span class="mono">{{ d.rule }}</span>: {{ d.reason }}</td></tr>
     <tr><th>outcome</th><td class="mono">{{ d.outcome }} · {{ "applied" if d.applied else d.mode }}</td></tr>
     <tr><th>severity</th><td class="mono">{{ d.severity }}{% if d.claimed_severity and d.claimed_severity != d.severity %} (claimed {{ d.claimed_severity }}){% endif %}</td></tr>
+    <tr><th>type</th><td class="mono">{{ d.track }}</td></tr>
     <tr><th>origin</th><td class="mono">{{ d.origin_kind }} · generation {{ d.generation }}</td></tr>
     <tr><th>project</th><td class="mono">{% if d.project %}<a href="/project/{{ d.project }}">{{ d.project }}</a>{% else %}—{% endif %}</td></tr>
     <tr><th>order</th><td class="mono">{{ d.wo_id or "—" }}{% if d.parent_wo_id %} · from {{ d.parent_wo_id }}{% endif %}</td></tr>

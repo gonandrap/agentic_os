@@ -18,18 +18,23 @@
   the OS works through by itself; severity rates the defect, not your urgency. Open a decision
   for its <i>what now</i>.</p>
 
-{% call(i) ui.needs_you(attention, "held at the critical ceiling — waiting on you") %}
+{% set track_label = {"bug": "reported bug", "follow_up": "panel follow-up", "upkeep": "upkeep"} %}
+{% call(i) ui.needs_you(attention, "held at a spent ceiling — waiting on you") %}
   {{ ui.row_id("#" ~ i.id, href(i)) }}
-  <span class="mono">{{ i.severity }} · {{ i.origin_kind }}</span>
+  <span class="mono">{{ i.severity }} · {{ track_label.get(i.track, i.track) }} · {{ i.origin_kind }}</span>
   <span class="sub">{{ i.subject }}</span>
 {% endcall %}
 
 {% call ui.explain("what the steward queues") %}
 <p class="kv">Self-work the steward queued rather than dispatched. A waiting decision is
   re-offered against the current ledger by the daemon; it is never forced through.</p>
-<p class="kv">Waiting on you: critical self-work held at the ceiling this week. It is never
-  re-offered: act on it, or raising <span class="mono">os.evolution.critical_weekly_usd</span>
-  only lets later ones through.</p>
+<p class="kv">Reported bugs (investigation GAPs, bug reports, Morpheus, red main, accepted
+  findings) skip the yield line and recurrence rules and drain first; only their own ledger,
+  <span class="mono">os.evolution.bug_weekly_usd</span>, holds them. Panel follow-ups keep the
+  conservative rules and, re-offered, become tracker issues, never work orders.</p>
+<p class="kv">Waiting on you: a reported bug held at a spent bug ledger, or critical upkeep
+  held at the critical ceiling, this week. It is never re-offered: act on it, or raising the
+  ceiling only lets later ones through.</p>
 <p class="sub">{{ report.line }}</p>
 <p class="sub">from a terminal: <span class="mono">jarvis steward decisions</span> ·
   <span class="mono">jarvis steward why &lt;wo-id&gt;</span> ·
@@ -42,18 +47,20 @@
 {% macro table(items, empty, asks=false) -%}
   {% if items %}
   <div class="table-wrap"><table>
-    <tr><th>decision</th><th>state</th><th>severity</th><th>origin</th><th>project</th>
+    <tr><th>decision</th><th>state</th><th>severity</th><th>type</th><th>origin</th><th>project</th>
       <th>subject</th><th>{{ "act" if asks else "order" }}</th><th>age</th></tr>
     {% for i in items %}
     <tr id="decision-{{ i.id }}">
       <td>{{ ui.row_id("#" ~ i.id, href(i)) }}</td>
       <td class="mono {{ tone.get(i.queue_state, '') }}">{{ i.queue_state or "ask" }}</td>
       <td class="mono">{{ i.severity }}</td>
+      <td class="mono">{{ track_label.get(i.track, i.track) }}</td>
       <td class="mono">{{ i.origin_kind }}</td>
       <td class="mono">{% if i.project %}<a href="/project/{{ i.project }}">{{ i.project }}</a>{% else %}—{% endif %}</td>
       <td class="prose"><span class="clamp" title="{{ i.subject }} — {{ i.rule }}: {{ i.reason }}">{{ i.subject }}</span></td>
       <td class="mono act">
-        {%- if asks and i.origin_kind == "morpheus" %}<a href="/morpheus{{ '/' ~ i.morpheus_item if i.morpheus_item }}" title="confirm, waive or requeue">{{ i.morpheus_item or "morpheus" }}</a>
+        {%- if asks and i.issue_url %}<a href="{{ i.issue_url }}" title="jarvis issues start {{ i.issue_url }}">jarvis issues start</a>
+        {%- elif asks and i.origin_kind == "morpheus" %}<a href="/morpheus{{ '/' ~ i.morpheus_item if i.morpheus_item }}" title="confirm, waive or requeue">{{ i.morpheus_item or "morpheus" }}</a>
         {%- elif asks and i.parent_wo_id %}<span title="jarvis investigate {{ i.parent_wo_id }}">{{ i.parent_wo_id }}</span>
         {%- elif asks %}jarvis wo create {{ i.project }} "…"
         {%- else %}{{ i.wo_id or "—" }}{% endif %}</td>
@@ -74,7 +81,7 @@
   </div>
   <section class="tabpanel {{ 'on' if open_tab == 'asks' }}" id="steward-asks" role="tabpanel">
     <h2>Waiting on you</h2>
-    {{ table(tabs.asks, "nothing held at the critical ceiling", asks=true) }}
+    {{ table(tabs.asks, "nothing held at a spent ceiling", asks=true) }}
   </section>
   <section class="tabpanel {{ 'on' if open_tab == 'waiting' }}" id="steward-waiting" role="tabpanel">
     <h2>Waiting</h2>

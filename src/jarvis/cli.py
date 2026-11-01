@@ -1994,6 +1994,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                   f"({wo.get('status_label') or wo['status']}){att}")
     if st["backlog"]["open"]:
         print(f"\n🗂 backlog: {st['backlog']['open']} open items — `jarvis backlog list`")
+    from . import steward
+
+    held = steward.track_line(st.get("steward") or {})
+    if held:
+        print(f"\n🧭 steward: {held} — `jarvis steward decisions`")
     return 0
 
 
@@ -2942,18 +2947,24 @@ def cmd_steward(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps({"mode": cfg.mode, **asdict(book),
                                   "weekly_usd": cfg.weekly_usd,
+                                  "bug_weekly_usd": cfg.bug_weekly_usd,
                                   "critical_weekly_usd": cfg.critical_weekly_usd,
                                   "yield_above_usd": cfg.yield_above_usd}))
                 return 0
             print(f"mode {cfg.mode}; self_dispatch "
                   f"{'on' if catalog.os.autonomy.self_dispatch else 'off'}")
-            print(f"evolution  ${book.evolution_usd:8.2f} of ${cfg.weekly_usd:.2f}")
-            print(f"critical   ${book.critical_usd:8.2f} of ${cfg.critical_weekly_usd:.2f}")
-            print(f"fleet      ${book.fleet_usd:8.2f} (new self-work waits above "
-                  f"${cfg.yield_above_usd:.2f})")
+            print(f"reported bugs  ${book.bug_usd:8.2f} of ${cfg.bug_weekly_usd:.2f} "
+                  "(os.evolution.bug_weekly_usd)")
+            print(f"follow-ups     ${book.evolution_usd:8.2f} of ${cfg.weekly_usd:.2f} "
+                  "(panel follow-ups and upkeep: os.evolution.weekly_usd)")
+            print(f"  critical     ${book.critical_usd:8.2f} of "
+                  f"${cfg.critical_weekly_usd:.2f}")
+            print(f"fleet          ${book.fleet_usd:8.2f} (new follow-ups wait above "
+                  f"${cfg.yield_above_usd:.2f}; reported bugs never do)")
             return 0
         rows = (ops.steward_why(args.wo_id) if args.steward_cmd == "why"
                 else central.steward_decisions(limit=args.limit))
+        rows = [{**r, "track": steward.track_of(r["origin_kind"])} for r in rows]
         if args.json:
             print(json.dumps(rows))
             return 0
@@ -2968,7 +2979,8 @@ def cmd_steward(args: argparse.Namespace) -> int:
             applied = "applied" if r["applied"] else r["mode"]
             to = f" -> {r['wo_id']}" if r["wo_id"] else ""
             print(f"#{r['id']} {_age(r['ts'])} ago [{r['outcome']}/{applied}] "
-                  f"{r['origin_kind']} {r['severity']}"
+                  f"{steward.TRACK_LABELS[steward.track_of(r['origin_kind'])]} "
+                  f"({r['origin_kind']}) {r['severity']}"
                   + (f" (claimed {r['claimed_severity']})"
                      if r["claimed_severity"] and r["claimed_severity"] != r["severity"]
                      else "")
