@@ -70,8 +70,6 @@ HELD_CHECKS_CANCELLED = "checks_cancelled"
 HELD_BASE_RED = "base_red"
 #: The base moved and this head does not contain it
 HELD_BASE_MOVED = "base_moved"
-#: Another pull request holds this base's merge lease (#1459)
-HELD_MERGE_QUEUED = "merge_queued"
 
 #: WHY the merge command did not succeed on a pull request that merged anyway (§5.5)
 CLEANUP = "cleanup"
@@ -283,18 +281,30 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
                  catch_up=str(catch_up.outcome or ""), catch_up_cause=cause)
 
 
-def merge_queued(store: Any, wo: dict[str, Any], pr: Any) -> Decision | None:
-    """Held behind another order's merge in flight on this base tip, or None (#1459)"""
-    base_oid = str(getattr(pr, "base_oid", "") or "")
-    lease = store.merge_lease(GATE_KIND, base_oid, wo["id"]) if base_oid else None
-    if lease is None:
+def batch_grant(store: Any, wo: dict[str, Any], pr: Any,
+                judged: str) -> dict[str, Any] | None:
+    """A batch member's live grant, which outlives `main` moving (#1459)"""
+    # A textual conflict leaves the batch for the normal catch-up path
+    if not judged or str(getattr(pr, "head_oid", "") or "") != judged \
+            or not getattr(pr, "mergeable_now", False):
         return None
-    base = str(getattr(pr, "base_ref", "") or "the base")
-    return _held(HELD_MERGE_QUEUED,
-                 f"queued behind {lease['wo_id']}, whose merge into `{base}` at "
-                 f"{base_oid[:10]} is in flight (gate request {lease['id']}); this "
-                 f"branch is caught up and proposed once that one merges or is refused",
-                 head_sha=str(getattr(pr, "head_oid", "") or ""))
+    grant = store.usable_grant(wo["id"], GATE_KIND,
+                               merge_command(str(wo.get("pr_url") or ""), judged))
+    if grant is None or grant["status"] != "approved" or not grant["base_oid"]:
+        return None
+    return grant if store.batch_merged_since(grant["ts"], wo["id"]) else None
+
+
+def _batch_base(store: Any, wo_id: str, approval: dict[str, Any], cwd: Any,
+                base_ref: str, sha: str) -> bool:
+    """Did `main` move only forward from this grant's base, past a batch merge? (#1459)"""
+    from . import branchproof
+
+    base_oid = str(approval.get("base_oid") or "")
+    return (bool(base_oid)
+            and store.batch_merged_since(approval["ts"], wo_id)
+            and branchproof.is_ancestor(cwd, base_oid, sha)
+            and branchproof.is_ancestor(cwd, base_oid, f"origin/{base_ref}"))
 
 
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
@@ -707,7 +717,8 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
     # A fetch that failed leaves `origin/<base>` at whatever it was: stale, not fresh
     fetched = branchproof.fetch(cwd, base_ref)
     tip = branchproof.tip(cwd, f"origin/{base_ref}") if fetched else ""
-    if not tip or not branchproof.is_ancestor(cwd, tip, sha):
+    if not tip or not (branchproof.is_ancestor(cwd, tip, sha)
+                       or _batch_base(store, wo_id, grant, cwd, base_ref, sha)):
         raise StaleBase(
             f"{wo_id}: `{base_ref}` is at {tip[:10] or 'a commit git could not read'} "
             f"and {sha[:10]} does not contain it — the CI that was judged never ran "

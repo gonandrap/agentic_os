@@ -5706,9 +5706,12 @@ class Daemon:
         plan_assumptions = str((hold or {}).get("planner_id") or "")
         # docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2
         spec_unmerged = str((store.spec_hold(wo) or {}).get("pr_url") or "")
+        # #1459 (kn-41e5dd52): a batch member's live grant outlives `main` moving under it
+        batch = automerge.batch_grant(store, wo, pr, store.validated_head(round_row) or "")
         # Spec 2026-09-28 §3.2
         base_behind = (automerge.BaseBehind(base=pr.base_ref, base_oid=pr.base_oid)
-                       if ops.catch_up_needed(pr, repo=project.path) else None)
+                       if batch is None and ops.catch_up_needed(pr, repo=project.path)
+                       else None)
         # #1063
         drift = self._drift_hold(store, wo)
         no_ci = self._repo_has_no_ci(project, pr)
@@ -5735,11 +5738,6 @@ class Daemon:
                     drift=drift, no_ci=no_ci)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
-                # #1459: no catch-up while another merge on this base is in flight
-                queued = automerge.merge_queued(store, wo, pr)
-                if queued is not None:
-                    self._note_automerge_held(store, wo_id, queued)
-                    return
                 # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2
                 caught = self._catch_up_with_base(project, store, wo, pr)
                 if (caught.outcome == ops.CATCH_UP_DEFERRED
@@ -5827,11 +5825,6 @@ class Daemon:
             wo_id, automerge.GATE_KIND,
             automerge.merge_command(str(wo.get("pr_url") or ""), decision.judged_sha))
         if approval is None:
-            # #1459: one merge request in flight per base tip
-            queued = automerge.merge_queued(store, wo, pr)
-            if queued is not None:
-                self._note_automerge_held(store, wo_id, queued)
-                return
             # BEFORE A GRANT EXISTS AND NEVER AFTER ONE (spec 2026-09-27 §5.2)
             caught = self._catch_up_with_base(project, store, wo, pr)
             if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
@@ -5864,8 +5857,8 @@ class Daemon:
                 neo_store.close()
             return
         # AT THE CAP THE ATTEMPT CAN ONLY REFUSE (#1173)
-        if (ops.catch_up_attempts(store, wo_id)
-                >= ops.catch_up_policy(store).catch_up_max):
+        if batch is None and (ops.catch_up_attempts(store, wo_id)
+                              >= ops.catch_up_policy(store).catch_up_max):
             caught = self._catch_up_with_base(project, store, wo, pr)
             if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
                 self._note_automerge_held(
