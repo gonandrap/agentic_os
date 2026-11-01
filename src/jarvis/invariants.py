@@ -1541,6 +1541,18 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
             f"(attempt {pause.attempts} of {pause.max_attempts})")
 
 
+def pause_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """`pause_note` as fields, so no reader has to parse the sentence (#247)"""
+    if wo["status"] not in RETRY_SWEEP_STATUSES:
+        return None
+    pause = worker_session.turn_pause(store, wo["id"])
+    if pause is None or pause.exhausted:
+        return None
+    # An auth pause resumes on the user's sign-in, not at a moment
+    until = None if pause.reason == worker_session.PAUSE_AUTH else pause.retry_at
+    return {"reason": pause.reason, "until": until, "note": pause_note(store, wo)}
+
+
 def neo_wait_note(wo: dict[str, Any]) -> str:
     """"with Neo …" for a work order parked on a question — or "" for anything else"""
     if wo["status"] != "waiting_input":
@@ -2155,6 +2167,9 @@ def _stale_worker_question(store: ProjectStore,
     """(answer, why) if this worker question is moot, else None (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
     if not _is_work_order(store, q["wo_id"]):
         return None
+    gate = _decided_gate_asked_about(store, q)
+    if gate is not None:
+        return gate
     asked = float(q["ts"])
     reviews = [float(e["ts"]) for e in store.events_of_kind(q["wo_id"], "reviewed")
                if float(e["ts"]) > asked]
@@ -2168,6 +2183,35 @@ def _stale_worker_question(store: ProjectStore,
             "asked",
             f"the user reviewed work order {q['wo_id']} after it was asked, on a "
             f"delivery newer than the question")
+
+
+_GATE_REF = re.compile(r"\b(?:gate|approval)\s+#?(\d+)\b", re.IGNORECASE)
+_GATE_VERDICT_WORDS = re.compile(r"\b(?:approv\w*|den(?:y|ied|ial)|grant\w*)\b",
+                                 re.IGNORECASE)
+
+
+def _decided_gate_asked_about(store: ProjectStore,
+                              q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) when a worker asked for a verdict on its own gate that is already decided (#1388)"""
+    text = str(q["question"] or "")
+    if not _GATE_VERDICT_WORDS.search(text):
+        return None
+    for number in dict.fromkeys(int(n) for n in _GATE_REF.findall(text)):
+        approval = store.get_approval(number)
+        if (approval is None or approval["wo_id"] != q["wo_id"]
+                or approval["status"] in ("pending", "awaiting_case")):
+            continue
+        # `lapsed`/`spent` grants were approved before they expired
+        verdict = ("approved" if approval["closed_as"] in ("lapsed", "spent")
+                   else approval["closed_as"] or approval["status"])
+        by = f" by {approval['decided_by']}" if approval["decided_by"] else ""
+        # A text match can be wrong: put it on the record, not just in the answer
+        store.add_event(q["wo_id"], "question_superseded_by_gate", {
+            "question_id": q["id"], "approval_id": number, "verdict": verdict,
+            "question": text[:500]})
+        return (f"SUPERSEDED — gate {number} is already {verdict}{by}",
+                f"it asks for a verdict on gate {number}, already {verdict}{by}")
+    return None
 
 
 def _stale_triage_question(store: ProjectStore,

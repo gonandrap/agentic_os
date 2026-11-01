@@ -3691,6 +3691,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "status_label": invariants.status_label(store, wo,
                                                         ops.fleet_if_held([wo])),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
+                # The pause as fields: `status` stays the machine's state (#247)
+                **({"paused": paused}
+                   if (paused := invariants.pause_state(store, wo)) else {}),
                 # The other kind of hold, always present and empty when there are none (`validation_rounds`'... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
                 "preconditions": ops.open_preconditions(store, wo),
                 # What has already been dismissed on this order, decoded
@@ -4578,13 +4581,17 @@ GATE_ICON = {"awaiting_case": "✎", "pending": "⏸", "approved": "✅",
              "denied": "⛔", "dismissed": "⊘",
              "expired": "⌛",
              # Keyed on the DISPLAY state, not the status: a spent grant is `expired` in the database and an...
-             "spent": "☑"}
+             "spent": "☑", "used": "☑", "superseded": "⊘"}
 
 
 def _gate_display(row: dict) -> str:
     """The word this gate is rendered under"""
-    if row["status"] == "expired" and row["closed_as"] in ("spent", "abandoned"):
-        return row["closed_as"]
+    if row["status"] == "expired":
+        if row["closed_as"] in ("spent", "abandoned", "superseded"):
+            return row["closed_as"]
+        if row["closed_as"] == "lapsed" and row["uses"]:
+            # Approved and used, then timed out with uses left: not an expired approval (#1388)
+            return "used"
     return row["status"]
 
 
@@ -4684,6 +4691,11 @@ def cmd_gate(args: argparse.Namespace) -> int:
                     # The opposite of a lapse: this grant was used
                     state = (f"spent — approved by {r['decided_by'] or '?'}, then used "
                              f"{r['uses']}/{r['max_uses']}")
+                elif _gate_display(r) == "used":
+                    state = (f"approved by {r['decided_by'] or '?'} · used "
+                             f"{r['uses']}/{r['max_uses']} · lapsed")
+                elif r["closed_as"] == "superseded":
+                    state = "superseded — closed undecided by the OS"
                 else:
                     state = f"{r['status']} by {r['decided_by'] or '?'}"
                 print(f"{icon} {r['id']} [{r['project']}] {r['kind']} · {state} "

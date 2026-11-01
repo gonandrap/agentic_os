@@ -69,6 +69,8 @@ class EvidencePacket:
     self_evolution: str = ""
     #: THE §7.2 CHECKS THAT PASSED WITHOUT BEING EVALUATED
     self_evolution_unproven: tuple[str, ...] = ()
+    #: Why this head's red checks are the base's, for the seats (docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md §9)
+    base_red: str = ""
 
 
 #: §7.3's checklist, in the PACKET and never in the system prompt: `validation.build_shared_prefix`...
@@ -190,6 +192,20 @@ def ci_failing(packet: EvidencePacket) -> tuple[str, ...]:
                     "conclusion": str(c.get("conclusion") or "")}
                    for c in (packet.pr.get("checks") or ()))
     return github.failing_checks(checks)
+
+
+def ci_inherited(packet: EvidencePacket, workflow: str) -> bool:
+    """Every finished-red check belongs to `workflow`, the one already red on the base (docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md §9)"""
+    from . import github
+
+    if not workflow or packet.source != "pull_request" or not packet.pr:
+        return False
+    checks = tuple({"name": str(c.get("name") or ""),
+                    "conclusion": str(c.get("conclusion") or ""),
+                    "workflow": str(c.get("workflow") or "")}
+                   for c in (packet.pr.get("checks") or ()))
+    red = github.red_checks(checks)
+    return bool(red) and all(c["workflow"] == workflow for c in red)
 
 
 #: Keys the REGISTRY stamps on an effect rather than the collector producing them (docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §6.)
