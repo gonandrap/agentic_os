@@ -356,6 +356,21 @@ class NeoStore:
             (db.now() + retry_delay(attempts), reason, question_id))
         return "queued"
 
+    def requeue_unreadable(self, question_id: int, reason: str,
+                           max_attempts: int = MAX_ANSWER_ATTEMPTS) -> bool:
+        """Re-ask a claimed question whose reply could not be read; False once attempts are spent (#1401)"""
+        q = self.get(question_id)
+        if q is None:
+            return False
+        attempts = int(q["attempts"] or 0)
+        if attempts >= max_attempts:
+            return False
+        self.conn.execute(
+            "UPDATE questions SET status='queued', attempts=attempts+1, claimed_at=NULL, "
+            "retry_after=?, answer_reason=? WHERE id=?",
+            (db.now() + retry_delay(attempts), reason, question_id))
+        return True
+
     def revive_unreachable(self, kinds: tuple[str, ...] = REVIVABLE_KINDS,
                            max_revivals: int = MAX_REVIVALS) -> list[int]:
         """Re-queue the questions an outage gave up on — call it only once Neo has answered again"""
