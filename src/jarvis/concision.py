@@ -40,12 +40,30 @@ def word_count(text: str) -> int:
 #: The `jarvis` word itself, reached through a `cd … &&` chain
 _JARVIS = re.compile(r"(?:^|/)jarvis$")
 
-#: The same word in RAW, unparsed text
-_JARVIS_RAW = re.compile(r"\bjarvis\b")
+#: The same word in RAW, unparsed text, where the shell would RUN it: start of a line or after a separator (issue 912)
+_JARVIS_RAW = re.compile(r"(?:^|[;&|(\n]|\$\()\s*(?:\S*/)?jarvis\b")
+
+#: A heredoc opener: `<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _without_heredoc_bodies(command: str) -> str:
+    """`command` with every heredoc body dropped: its text is data, never shell words (issue 912)"""
+    out: list[str] = []
+    pending: list[str] = []
+    for line in command.splitlines(keepends=True):
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        out.append(line)
+        pending = [m.group(2) for m in _HEREDOC.finditer(line)]
+    return "".join(out)
 
 
 def unparseable_jarvis_command(command: str) -> bool:
     """Whether this is a `jarvis` command whose quoting no one can parse (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)"""
+    command = _without_heredoc_bodies(command)
     try:
         shlex.split(command)
     except ValueError:
