@@ -14483,8 +14483,36 @@ def review_alarm(alarm_id: str, approved: bool, feedback: str = "",
                 )
         finally:
             neo.close()
+    if row["wo_id"]:
+        _settle_alarm_attention(name, path, row["wo_id"], alarm_id)
     return {"alarm_id": alarm_id, "project": name, "wo_id": row["wo_id"],
             "review": review, "neo_question_closed": closed}
+
+
+def _settle_alarm_attention(name: str, path: Path, wo_id: str, alarm_id: str) -> None:
+    """A review is the user's answer, so the flag naming this alarm comes down (#1064)"""
+    from .supervisor import ALARM_BLOCKER
+
+    store = ProjectStore(path)
+    try:
+        try:
+            wo = store.get_work_order(wo_id)
+        except KeyError:
+            return
+        if wo.get("attention_reason") != ALARM_BLOCKER.format(alarm_id=alarm_id):
+            return  # the flag names something else: not this review's to touch
+        owed = [a for a in store.alarms_of(wo_id)
+                if a["id"] != alarm_id and a["status"] in ("escalated", "failed")
+                and a["review_status"] == "unreviewed"]
+    finally:
+        store.close()
+    settled = ack_os_flag(wo_id, name)
+    if not settled["blockers"] and owed:
+        store = ProjectStore(path)
+        try:
+            store.flag_attention(wo_id, ALARM_BLOCKER.format(alarm_id=owed[0]["id"]))
+        finally:
+            store.close()
 
 
 def approve_alarm_queue(project_name: str | None = None,
