@@ -9,6 +9,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -1191,72 +1192,191 @@ def investigator_bash_decision(payload: dict[str, Any],
 RESEARCHER_REPORT = WO_KIND_CONTRACTS["researcher"].artifact
 RESEARCHER_SCRATCH = Path(".jarvis") / "scratch"
 
-#: Shared tail of each researcher refusal: what it may do instead
-_RESEARCHER_INSTEAD = (
-    f"You are a RESEARCHER: you gather data for a decision the user takes, and you ship "
-    f"nothing. Write notes and analysis scripts under `{RESEARCHER_SCRATCH}/` or outside "
-    f"the worktree, write the report to `{RESEARCHER_REPORT}`, and deliver it with "
-    f"`jarvis do report <do-id> --from-file {RESEARCHER_REPORT}`, which is your finish. A "
-    f"change worth making goes in the report's `proposed_orders` for the user to file.")
+def researcher_temp_dir(wo_id: str | None) -> Path:
+    """The ONE directory outside its worktree a researcher may write; the prompt and the fence both name it"""
+    return Path(tempfile.gettempdir()) / (f"jarvis-researcher-{wo_id}" if wo_id
+                                          else "jarvis-researcher")
+
+
+def _researcher_instead(wo_id: str | None) -> str:
+    """Shared tail of each researcher refusal: what it may do instead"""
+    return (
+        f"You are a RESEARCHER: you gather data for a decision the user takes, and you ship "
+        f"nothing. Write notes and analysis scripts under `{RESEARCHER_SCRATCH}/` or "
+        f"`{researcher_temp_dir(wo_id)}/`, write the report to `{RESEARCHER_REPORT}`, and "
+        f"deliver it with `jarvis do report <do-id> --from-file {RESEARCHER_REPORT}`, which "
+        f"is your finish. A change worth making goes in the report's `proposed_orders` for "
+        f"the user to file.")
+
+
+#: Programs that run their arguments as the command; each maps to its flags that take a value
+_COMMAND_WRAPPERS: dict[str, frozenset[str]] = {
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    "command": frozenset(),
+    "sudo": frozenset({"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-R"}),
+    "nohup": frozenset(),
+    "time": frozenset({"-f", "-o"}),
+    "exec": frozenset({"-a"}),
+    "xargs": frozenset({"-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-L", "-n",
+                        "--max-args", "-P", "--max-procs", "-s", "--max-chars"}),
+}
+_SHELLS = ("bash", "sh", "zsh")
+#: Programs whose command is text the hook never sees (a string, a file, stdin)
+_OPAQUE_PROGRAMS = ("eval", "source", ".")
+#: First word of the argv `_commands_run` returns for a segment it cannot read
+OPAQUE = "<opaque>"
+
+
+def _commands_run(segment: str, depth: int = 0) -> list[list[str]]:
+    """The argv(s) one shell SEGMENT finally runs, past wrappers and into `bash -c`"""
+    # An unreadable segment returns `[OPAQUE, segment]`, never an empty pass (round 1 fail-open)
+    from . import gate_rules
+
+    opaque = [[OPAQUE, segment]]
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        return opaque
+    while words:
+        program = Path(words[0].lstrip("\\")).name
+        if "=" in words[0] and not words[0].startswith("-"):
+            words = words[1:]  # `VAR=x git push`
+        elif program in _COMMAND_WRAPPERS:
+            takes_value, words = _COMMAND_WRAPPERS[program], words[1:]
+            while words and words[0].startswith("-"):
+                flag, words = words[0], words[1:]
+                if flag == "--":
+                    break
+                if program == "env" and flag.startswith(("-S", "--split-string")):
+                    # `env -S 'git push'`: the value is itself the command line
+                    value = flag.partition("=")[2] if flag.startswith("--") else flag[2:]
+                    if not value and words:
+                        value, words = words[0], words[1:]
+                    try:
+                        words = shlex.split(value) + words
+                    except ValueError:
+                        return opaque
+                    break
+                if flag in takes_value and words:
+                    words = words[1:]
+        else:
+            break
+    if not words:
+        return []
+    program = Path(words[0].lstrip("\\")).name or words[0]  # `.` has no name
+    if (program in _OPAQUE_PROGRAMS or "$" in words[0]
+            or any("$(" in w or "`" in w for w in words)):
+        return opaque
+    if program in _SHELLS:
+        for i, word in enumerate(words[1:-1], start=1):
+            if word.startswith("-") and not word.startswith("--") and "c" in word[1:]:
+                if depth >= 4:
+                    return opaque
+                script = words[i + 1]
+                return [argv for start, end, _ in gate_rules.segments(script)
+                        for argv in _commands_run(script[start:end].strip(), depth + 1)]
+        return opaque  # `bash file.sh` or `bash` reading stdin: the script is never seen
+    return [words]
 
 
 def _researcher_ships(segment: str) -> str:
     """The shipping verb one shell SEGMENT runs (`git commit` …), or `""`"""
-    try:
-        words = shlex.split(segment)
-    except ValueError:
-        words = segment.split()
-    while words and "=" in words[0] and not words[0].startswith("-"):
-        words = words[1:]  # `VAR=x git push`
-    if not words:
-        return ""
-    program = Path(words[0].lstrip("\\")).name
-    rest = words[1:]
-    if program == "git":
-        while rest and rest[0].startswith("-"):
-            # `-C dir` / `-c k=v` carry an argument; `--git-dir=x` does not
-            rest = rest[2:] if rest[0] in ("-C", "-c") else rest[1:]
-        if rest and rest[0] in ("commit", "push"):
-            return f"git {rest[0]}"
-    if program == "gh" and len(rest) >= 2 and rest[0] == "pr" and rest[1] in ("create",
-                                                                              "merge"):
-        return f"gh pr {rest[1]}"
+    for words in _commands_run(segment):
+        program, rest = Path(words[0].lstrip("\\")).name, words[1:]
+        if program == "git":
+            while rest and rest[0].startswith("-"):
+                # `-C dir` / `-c k=v` carry an argument; `--git-dir=x` does not
+                rest = rest[2:] if rest[0] in ("-C", "-c") else rest[1:]
+            if rest and rest[0] in ("commit", "push"):
+                return f"git {rest[0]}"
+        if program == "gh" and len(rest) >= 2 and rest[0] == "pr" and rest[1] in ("create",
+                                                                                  "merge"):
+            return f"gh pr {rest[1]}"
     return ""
 
 
 def researcher_bash_decision(payload: dict[str, Any],
                              env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a RESEARCHER's commit, push and pull request; every other command is its job"""
+    """Refuse a RESEARCHER's commit, push and pull request, and any command it cannot read"""
     if env.get(WO_KIND_ENV) != "researcher" or payload.get("tool_name") != "Bash":
         return None
     from . import gate_rules
 
     command = ((payload.get("tool_input") or {}).get("command") or "").strip()
+    instead = _researcher_instead(env.get("JARVIS_WO_ID"))
     for start, end, _name in gate_rules.segments(command):
-        verb = _researcher_ships(command[start:end].strip())
+        segment = command[start:end].strip()
+        if any(words[0] == OPAQUE for words in _commands_run(segment)):
+            return _deny(
+                f"Refused: `{segment}` hides the command it runs (eval, source, a script file, "
+                f"stdin, `$(…)` or a `$VAR` program), so the hook cannot check it ships "
+                f"nothing. Run the command itself, or `bash -c '<command>'`. {instead}")
+        verb = _researcher_ships(segment)
         if verb:
-            return _deny(f"Refused: `{verb}`. {_RESEARCHER_INSTEAD}")
+            return _deny(f"Refused: `{verb}`. {instead}")
     return None
+
+
+def decision_close_decision(payload: dict[str, Any],
+                            env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse `jarvis do done|cancel` from ANY work-order session (docs/superpowers/specs/2026-10-31-decision-orders.md §2)"""
+    # The HOOK's env, which the model cannot strip; `ops._user_closes_decision` checks too
+    wo_id = env.get("JARVIS_WO_ID")
+    if not wo_id or payload.get("tool_name") != "Bash":
+        return None
+    from . import gate_rules
+
+    command = ((payload.get("tool_input") or {}).get("command") or "").strip()
+    for start, end, _name in gate_rules.segments(command):
+        segment = command[start:end].strip()
+        for words in _commands_run(segment):
+            if words[0] == OPAQUE:
+                # Match the raw text: refusing every eval would change regular workers
+                found = _DO_CLOSE_TEXT.search(segment)
+                verb = found.group(1) if found else ""
+            elif (Path(words[0].lstrip("\\")).name == "jarvis" and len(words) >= 2
+                    and words[1] == "do" and words[2:3] in (["done"], ["cancel"], [])):
+                verb = words[2] if len(words) > 2 else "done"  # bare `xargs jarvis do`: verb from stdin
+            else:
+                verb = ""
+            if verb:
+                return _deny(
+                    f"Refused: `jarvis do {verb}` from work order {wo_id}. Closing a "
+                    f"decision order is the user's verb, never an agent's. Tell the user it "
+                    f"is ready; they run `jarvis do {verb} <do-id>` themselves.")
+    return None
+
+
+#: `do done` / `do cancel` in the raw text of a segment the hook cannot read
+_DO_CLOSE_TEXT = re.compile(r"\bdo\s+[\"']?(done|cancel)\b")
 
 
 def researcher_write_decision(payload: dict[str, Any],
                               env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a RESEARCHER's edit to a worktree file other than its report and its scratch tree"""
+    """Refuse every RESEARCHER write but its report, its scratch tree and its temp dir: fail CLOSED"""
     if env.get(WO_KIND_ENV) != "researcher":
         return None
+    instead = _researcher_instead(env.get("JARVIS_WO_ID"))
     tool_input = payload.get("tool_input") or {}
     file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
     cwd = payload.get("cwd") or ""
     if not file_path or not cwd:
+        missing = "file path" if not file_path else "working directory"
+        return _deny(f"Refused: this write names no {missing}, so it cannot be placed "
+                     f"inside what a researcher may write. {instead}")
+    root = Path(cwd).resolve()
+    # Resolve the TARGET only: a symlink in scratch (or a symlinked scratch) then lands outside it
+    target = (root / file_path).resolve()
+    temp = Path(tempfile.gettempdir()).resolve() / researcher_temp_dir(
+        env.get("JARVIS_WO_ID")).name
+    if (target == root / RESEARCHER_REPORT or target.is_relative_to(root / RESEARCHER_SCRATCH)
+            or target.is_relative_to(temp)):
         return None
-    try:
-        rel = Path(file_path).resolve().relative_to(Path(cwd).resolve())
-    except ValueError:
-        return None  # outside the worktree: scratch space, which is allowed
-    if rel == Path(RESEARCHER_REPORT) or rel.is_relative_to(RESEARCHER_SCRATCH):
-        return None
-    return _deny(f"Refused: `{rel}` is a file of the project, and a researcher edits none. "
-                 f"{_RESEARCHER_INSTEAD}")
+    if target.is_relative_to(root):
+        return _deny(f"Refused: `{target.relative_to(root)}` is a file of the project, and a "
+                     f"researcher edits none. {instead}")
+    return _deny(f"Refused: `{target}` is outside your worktree, and a researcher writes "
+                 f"nowhere outside it but its temp dir. {instead}")
 
 
 #: The refusal IS the mitigation, so it names the call to make instead and the activation fallback
@@ -1874,7 +1994,10 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         heredoc = heredoc_write_decision(payload, env)
         if heredoc is not None:
             return heredoc
-        # Before the gate, for the heredoc's reason: it never allows, and a refused ship files no gate request
+        # Before the gate and the `jarvis …` auto-allow; closing first so it wins over the opaque reason
+        closing = decision_close_decision(payload, env)
+        if closing is not None:
+            return closing
         shipping = researcher_bash_decision(payload, env)
         if shipping is not None:
             return shipping

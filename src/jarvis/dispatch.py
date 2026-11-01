@@ -1105,7 +1105,7 @@ def _researcher_prompt(wo: dict[str, Any], project: ProjectSpec,
                        feature: dict[str, Any] | None = None) -> str:
     """The briefing for a decision order's researcher (docs/superpowers/specs/2026-10-31-decision-orders.md §3)"""
     from . import decision_report, worker_brief
-    from .hooks import RESEARCHER_REPORT, RESEARCHER_SCRATCH
+    from .hooks import RESEARCHER_REPORT, RESEARCHER_SCRATCH, researcher_temp_dir
 
     do_id = wo.get("parent_id") or "?"
     fo = (feature or {}).get("fo") or {}
@@ -1127,8 +1127,9 @@ def _researcher_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- Run any read command, query or analysis script you need: `jarvis … show|list"
         f"|cost|inspect`, `gh … view|list`, `git log|show|diff`, your own throwaway "
         f"scripts. Long reads and many commands are normal.",
-        f"- Write scratch files ONLY under `{RESEARCHER_SCRATCH}/` or outside the "
-        f"worktree. Never edit a tracked file of the project.",
+        f"- Write scratch files ONLY under `{RESEARCHER_SCRATCH}/` or "
+        f"`{researcher_temp_dir(wo['id'])}/`. Never edit a tracked file of the project; a "
+        f"hook refuses every other write, inside the worktree or outside it.",
         "- Never commit, never push, never open or merge a pull request. A hook refuses "
         "all of these.",
         "",
