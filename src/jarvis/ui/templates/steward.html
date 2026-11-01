@@ -13,6 +13,11 @@
 {{ ui.page_head("Steward", report.counts.waiting ~ " waiting · " ~ report.counts.reoffered
                 ~ " re-offered · " ~ report.counts.expired ~ " expired") }}
 
+<p class="kv">{% if attention %}Only <b>waiting on you</b> needs you: act on each one, or leave it.
+  {%- else %}<b>Nothing here needs you.</b>{% endif %} The other tabs are a read-only record
+  the OS works through by itself; severity rates the defect, not your urgency. Open a decision
+  for its <i>what now</i>.</p>
+
 {% call(i) ui.needs_you(attention, "held at the critical ceiling — waiting on you") %}
   {{ ui.row_id("#" ~ i.id, href(i)) }}
   <span class="mono">{{ i.severity }} · {{ i.origin_kind }}</span>

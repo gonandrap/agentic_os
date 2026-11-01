@@ -11,10 +11,20 @@
 <p class="sub"><a href="/steward">← every queued decision</a> · from a terminal:
   <span class="mono">jarvis steward why {{ ref }}</span></p>
 
+{% call(d) ui.needs_you(yours, "waiting on you") %}
+  <a class="rowid" href="#decision-{{ d.id }}">#{{ d.id }}</a> {{ d.step.text }}
+  {% if d.origin_kind == "morpheus" %}<a href="/morpheus">open morpheus</a>{% endif %}
+{% endcall %}
+{% if not yours %}
+<p class="kv"><b>Nothing here needs you.</b> This is the steward's record of why the OS did or
+  did not spend on fixing itself. Severity rates the defect, not your urgency.</p>
+{% endif %}
+
 {% for d in decisions %}
 <div class="panel table-wrap" id="decision-{{ d.id }}">
   <h2>#{{ d.id }} · {{ d.outcome }}{% if d.queue_state %} · queue {{ d.queue_state }}{% endif %}</h2>
   <table class="decision">
+    <tr><th>what now</th><td class="{{ 'tone-warn' if d.step.yours }}">{{ d.step.text }}</td></tr>
     <tr><th>subject</th><td>{{ d.subject }}</td></tr>
     <tr><th>rule</th><td><span class="mono">{{ d.rule }}</span>: {{ d.reason }}</td></tr>
     <tr><th>outcome</th><td class="mono">{{ d.outcome }} · {{ "applied" if d.applied else d.mode }}</td></tr>

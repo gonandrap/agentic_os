@@ -325,3 +325,33 @@ def test_a_decision_row_opens_its_detail_page_with_the_rule(jarvis_home, catalog
     assert f"#{about}" in client.get("/steward/wo-abc12345").text
     assert client.get("/steward/wo-nothing0").status_code == 404
     assert [r["id"] for r in ops.steward_why(f"#{bare}")] == [bare]
+
+
+def test_a_decision_page_says_whether_it_needs_you(jarvis_home, catalog_file):
+    """wo-c9337339: each decision says what, if anything, the user should do"""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    ops.start_os(str(catalog_file), foreground=True)
+    central = CentralStore()
+    try:
+        ask = _legacy(central, origin_kind="morpheus", outcome="ask", severity="critical",
+                      rule="critical-ceiling", parent_wo_id="wo-held0001", ts=db.now(),
+                      candidate_json=json.dumps({"payload": {"morpheus_item": "mv-1"}}))
+        drop = _legacy(central, outcome="drop", rule="duplicate", duplicate_of=ask,
+                       parent_wo_id="wo-held0001")
+        old = _legacy(central, outcome="ask", ts=db.now() - steward.WINDOW_SECONDS - 60)
+        rows = {r["id"]: r for r in central.steward_decisions(limit=50)}
+    finally:
+        central.close()
+    assert steward.next_step(rows[ask])["yours"]
+    assert "jarvis morpheus confirm mv-1" in steward.next_step(rows[ask])["text"]
+    assert not steward.next_step(rows[drop])["yours"]
+    assert f"#{ask}" in steward.next_step(rows[drop])["text"]
+    assert not steward.next_step(rows[old])["yours"]
+    client = TestClient(create_app())
+    page = client.get("/steward/wo-held0001").text
+    assert "Needs you:" in page and "what now" in page
+    assert "Nothing here needs you." in client.get(f"/steward/{drop}").text
