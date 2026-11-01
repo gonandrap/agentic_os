@@ -960,7 +960,7 @@ def test_refuses_to_run_from_productions_own_checkout(tmp_path):
     assert "not from production's own checkout" in r.stderr
 
 
-# --- issue 1180: a release half-published by a refused push is re-runnable ----------
+# --- issue 1180: a release half-published by a refused push is re-runnable
 
 def _half_cut(repo: Path, version: str) -> str:
     """What step 4 left behind when origin refused the tag: refs cut, only the branch pushed"""
