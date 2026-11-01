@@ -119,7 +119,8 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
            kind: str = "worker",
            exempt_kinds: Sequence[str] = (),
            by_design_idle: bool = False,
-           turn_in_flight: bool = False) -> Verdict:
+           turn_in_flight: bool = False,
+           stalled_turn_seconds: float = 0.0) -> Verdict:
     """The whole decision, over scalars: no store, no config object, no row (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)"""
     on_activity = status in activity_statuses
     clock = "activity" if on_activity else "status"
@@ -142,6 +143,13 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
                        reason=EXCLUSION_REASON.get(
                            cause, DEFAULT_EXCLUSION_REASON).format(cause=cause,
                                                                    kind=kind))
+    # Issue 1451: the fact that sets needs_attention, so both surfaces agree
+    if stalled_turn_seconds:
+        return Verdict(stuck=True, clock=clock, active_seconds=active,
+                       threshold_seconds=threshold, excluded="",
+                       reason=f"its turn has been running for "
+                              f"{_hours(stalled_turn_seconds)}, past the point the OS "
+                              f"trusts a turn in flight to be progressing")
     over = active >= threshold
     return Verdict(
         stuck=over, clock=clock, active_seconds=active, threshold_seconds=threshold,
