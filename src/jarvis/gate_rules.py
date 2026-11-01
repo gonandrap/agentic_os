@@ -139,6 +139,18 @@ _SHELL_INVOKER = re.compile(
     re.IGNORECASE,
 )
 
+# …and so do these, on another host or in a container (#213)
+_QUOTED_EXECUTOR = re.compile(
+    r"(?<![\w./-])(?:ssh|(?:docker|podman|kubectl)(?:\s+[^\s|;&]+)*?\s+exec)(?![\w.-])",
+)
+_QUOTED_EXECUTORS = frozenset({"ssh", "docker exec", "podman exec", "kubectl exec"})
+
+
+def _quoted_executors(text: str) -> frozenset[str]:
+    """Which of `_QUOTED_EXECUTORS` `text` runs, in executable position"""
+    found = (m.group(0).split()[0] for m in _QUOTED_EXECUTOR.finditer(_inert(text)))
+    return frozenset(w if w == "ssh" else f"{w} exec" for w in found)
+
 # A heredoc opener: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`
 _HEREDOC_OPEN = re.compile(
     r"(?<!<)<<-?\s*(?:'(?P<sq>[^']+)'|\"(?P<dq>[^\"]+)\"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
@@ -261,7 +273,9 @@ def scannable(command: str) -> str:
     blanked = _QUOTED.sub(
         lambda m: m.group(0) if any(s <= m.start() and m.end() <= e for s, e in programs)
         else " ", command)
-    return command if _SHELL_INVOKER.search(blanked) else blanked
+    if _SHELL_INVOKER.search(blanked) or _QUOTED_EXECUTOR.search(blanked):
+        return command
+    return blanked
 
 
 def program_spans(command: str) -> list[tuple[int, int]]:
@@ -608,7 +622,7 @@ class Shape:
         return (self.position in EXEMPTIBLE_POSITIONS
                 and bool(self.owner)
                 and not self.handoff
-                and not (self.names & _EXECUTORS))
+                and not self.blockers)
 
     def signature(self) -> str:
         return json.dumps({"position": self.position, "owner": self.owner},
@@ -617,7 +631,7 @@ class Shape:
     @property
     def blockers(self) -> tuple[str, ...]:
         """What in the literal's own segment could run it"""
-        return tuple(sorted(self.names & _EXECUTORS))
+        return tuple(sorted(self.names & (_EXECUTORS | _QUOTED_EXECUTORS)))
 
     def unlearnable_reason(self) -> str:
         """Why no dismissal of this shape could become a rule, or `""` if one could"""
@@ -664,8 +678,8 @@ def shape_of(command: str, pattern: str) -> Shape | None:
         """What shares a command with the match"""
         for s, e in lists:
             if s <= offset < e:
-                return command_names(command[s:e])
-        return all_names
+                return command_names(command[s:e]) | _quoted_executors(command[s:e])
+        return all_names | _quoted_executors(command)
 
     def handoff_at(offset: int) -> bool:
         """Whether the command holding the match writes what it was handed"""
@@ -830,6 +844,9 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("release", "cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh"),
     # The same, run without naming any member of `_EXECUTORS` at all
     ("release", "cat scripts/shipit.sh > /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh"),
+    # A remote or container shell runs its quoted payload (#213)
+    ("release", 'ssh prod "scripts/shipit.sh"'),
+    ("pr_merge", 'docker exec -it c "gh pr merge 31"'),
     ("service_restart", "sudo systemctl restart jarvis-daemon"),
     ("service_restart", "systemctl --user stop jarvisd"),
     ("push_protected", "git push origin main"),
