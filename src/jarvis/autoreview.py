@@ -239,9 +239,11 @@ _CARVE_OUT_TIGHTENED_RE = re.compile("|".join(HIGH_STAKES_TIGHTENED_CARVE_OUTS),
                                      re.IGNORECASE)
 
 
-#: The REJECTED alternative `jarvis wo assume` asks for, up to its sentence end: the worker declined it (#1366)
+#: Only a whole `Rejected:` sentence with no comma or connective; else nothing is stripped (#1366)
 _REJECTED_CLAUSE_RE = re.compile(
-    r"\brejected(?:\s+alternatives?)?\s*:[^\n]*?(?:[.;](?=\s|$)|\n|$)", re.IGNORECASE)
+    r"(?:^|(?<=[.;]\s)|(?<=\n))rejected(?:\s+alternatives?)?\s*:"
+    r"(?:(?!\b(?:so|then|instead|chose|chosen|but|and)\b)[^\n,;.])*[.;](?=\s|$)",
+    re.IGNORECASE)
 
 
 def high_stakes_marker(text: str, *, tightened: bool = False) -> str:

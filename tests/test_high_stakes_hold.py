@@ -25,8 +25,13 @@ def test_the_production_row_clears_the_default_net():
     # The act the worker CHOSE is still held, before or after its rejected clause
     ("Rejected: a soft delete. Chose an irreversible purge of the archive.", True),
     ("Purged the archive irreversibly. Rejected: keeping it.", True),
-    # A newline ends the clause too
+    # Fails CLOSED: no terminator, a comma, a connective, or mid-sentence strips nothing
     ("Rejected: keep it\nPurged the old archive.", True),
+    ("Rejected: a soft delete, so purged the archive irreversibly", True),
+    ("Rejected: a soft delete, so purged the archive irreversibly.", True),
+    ("The plan was rejected: we drop the prod table", True),
+    ("The plan was rejected: we drop the prod table.", True),
+    ("Rejected: keeping it and then purged the archive.", True),
 ])
 def test_the_rejected_clause_is_not_matched(tightened, text, held):
     assert bool(autoreview.high_stakes_marker(text, tightened=tightened)) is held
