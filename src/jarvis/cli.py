@@ -6011,6 +6011,8 @@ def _serve_dashboard(host: str, port: int, open_path: str | None = None) -> int:
         print("the web UI needs extras: pip install 'jarvis-os[ui]'", file=sys.stderr)
         return 1
     from .ui.app import create_app
+    from .uilog import register_stack_signal
+    register_stack_signal()
     server = uvicorn.Server(uvicorn.Config(create_app(), host=host, port=port,
                                            log_level="warning"))
     if open_path is not None:
