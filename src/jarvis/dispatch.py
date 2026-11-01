@@ -134,7 +134,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """Merge the project's injected settings with per-work-order env and persist them for --settings"""
     import json as _json
 
-    from . import agent_usage, concision, hooks, wiring, worker_session
+    from . import agent_usage, concision, disk, hooks, wiring, worker_session
     from .bootstrap import build_settings, deep_merge
     from .paths import jarvis_home
 
@@ -244,6 +244,10 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         hooks.TOOL_MANAGED_PATHS_ENV: _json.dumps(
             list(project.worktree.tool_managed_paths)),
     })
+    # pytest mkdirs only pytest-of-USER under the root, so the root must exist (#723)
+    temproot = disk.pytest_temproot(wo["id"])
+    temproot.mkdir(parents=True, exist_ok=True)
+    env["PYTEST_DEBUG_TEMPROOT"] = str(temproot)
     if opened_by_harness(project):
         env[hooks.HARNESS_WORKTREE_ENV] = "1"
     settings["env"] = env
