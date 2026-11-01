@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -908,7 +907,8 @@ def _parked(fleet, settle_turns, status: str, before_ttl: float) -> dict:
     store.set_status(wo["id"], status)
     turn = store.latest_turn(wo["id"])
     store.conn.execute("UPDATE wo_turns SET ended_at=? WHERE id=?",
-                       (time.time() - usage.WRITE_TTL_SECONDS + before_ttl, turn["id"]))
+                       (turn["ended_at"] - usage.WRITE_TTL_SECONDS + before_ttl,
+                        turn["id"]))
     return store.get_work_order(wo["id"])
 
 

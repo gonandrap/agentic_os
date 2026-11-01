@@ -373,10 +373,18 @@ def warm_compaction_due(store: ProjectStore, wo: dict[str, Any],
     if not ttl - WARM_COMPACT_LEAD_SECONDS <= age < ttl - WARM_COMPACT_LATEST_SECONDS:
         return None
     context = measured_context(store, wo["id"])
-    # UNKNOWN fails the floor here, unlike the cold path: this compaction is a bet, not a cost already owed
+    # UNKNOWN fails the floor here, unlike the cold path: this compaction is a bet
     if context is None or context < min_context:
         return None
     return Compaction(age=age, context=context, warm_for=ttl - age)
+
+
+def compact_while_warm(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
+                       min_context: int | None,
+                       now: float | None = None) -> dict[str, Any] | None:
+    """The warm compaction turn, or None when `warm_compaction_due` says not now"""
+    due = warm_compaction_due(store, wo, min_context, now=now)
+    return None if due is None else compact(store, project, wo, due)
 
 
 def compact_before_relaunch(store: ProjectStore, project: ProjectSpec,
