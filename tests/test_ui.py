@@ -3398,6 +3398,25 @@ def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
     assert wo["id"] in page and "jarvis rules list" in page
 
 
+def test_an_unjudged_project_is_a_banner_never_an_empty_table(client, project, capsys):
+    """Issue 1450: `fleet_health.enabled` off reads as 'not judged', never as 'nothing stuck'"""
+    from jarvis import cli
+
+    ops.create_work_order("proj_a", "open, but nobody judges it")
+    enable = "jarvis config set proj_a os.fleet_health.enabled true"
+    assert ops.stuck_report() == []
+    assert ops.stuck_unjudged() == [{"project": "proj_a", "enable": enable}]
+    assert ops.stuck_unjudged("proj_b") == []
+
+    page = " ".join(client.get("/stuck").text.split())
+    assert 'id="unjudged-proj_a"' in page and enable in page
+    assert "<table>" not in page and "no open order on any judged project" not in page
+
+    assert cli.main(["stuck"]) == 0
+    assert f"proj_a is not judged — os.fleet_health.enabled is off; enable it: {enable}" \
+        in capsys.readouterr().out
+
+
 @pytest.mark.usefixtures("self_dispatch_on")
 def test_the_terminal_names_the_blocker_too(client, project, capsys):
     """Parity fix: `jarvis stuck` prints the blocker `/stuck` already renders"""
