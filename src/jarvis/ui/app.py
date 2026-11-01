@@ -2177,7 +2177,8 @@ def create_app() -> FastAPI:
                    "status": filter_options(every, "status")}
         filters = query_filters(request, options)
         rows = attention_first(filter_rows(every, filters), lambda r: r["stuck"])
-        return render(request, "stuck.html", active="stuck", rows=rows,
+        unjudged = ops.stuck_unjudged(filters.get("project") or None)
+        return render(request, "stuck.html", active="stuck", rows=rows, unjudged=unjudged,
                       attention=[r for r in rows if r["stuck"]], filters=filters,
                       options=options, total=len(every))
 

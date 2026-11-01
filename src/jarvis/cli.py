@@ -3035,9 +3035,12 @@ def cmd_stuck(args: argparse.Namespace) -> int:
     if args.json:
         _print(rows, True)
         return 0
+    # Parity with the `/stuck` banners (issue 1450)
+    for u in ops.stuck_unjudged(args.project):
+        print(f"{u['project']} is not judged — os.fleet_health.enabled is off; "
+              f"enable it: {u['enable']}")
     if not rows:
-        print("no open order is being judged — `fleet_health.enabled` is off, or there "
-              "is nothing open")
+        print("no open order on any judged project")
         return 0
     over = [r for r in rows if r["stuck"]]
     print(f"{len(over)} past its threshold · {len(rows) - len(over)} on the record\n")
