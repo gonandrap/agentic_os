@@ -1724,6 +1724,17 @@ def test_the_request_names_the_base_the_squash_lands_on():
     assert "default branch" not in text
 
 
+def test_the_request_tells_the_reviewer_a_user_reserved_decision_is_a_deny():
+    """Issue 1385: Q2707 merged an order whose description said the user approves first"""
+    text = automerge._request_question(
+        "proj_a", {"id": "wo-1", "title": "t"},
+        automerge.Decision(armed=True, code="", reason="r", judged_sha=JUDGED,
+                           round_n=2), PR, checks=())
+
+    assert "DENY if the work order's description reserves" in text
+    assert text.index("DENY if") > text.index("# What it cannot undo")   # OS text, after the borrowed blocks
+
+
 def test_an_unprotected_base_names_itself_as_where_the_commit_lands():
     fact = automerge.protection_fact(None, "release/x")
 
