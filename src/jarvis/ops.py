@@ -8158,6 +8158,10 @@ def _fix_order_of(filed: Mapping[str, Any]) -> dict[str, Any] | None:
     return max(rows, key=lambda r: r.get("created_at") or "") if rows else None
 
 
+#: How long after Neo's answer a pending dispatch line counts as a LOST echo, not a late one (#1402)
+DISPATCH_ECHO_GRACE_SECONDS = 600
+
+
 def heal_investigation_dispatch(inv_id: str) -> str:
     """INV-INVESTIGATION-DISPATCH's repair: the dispatch line from durable facts, `""` if none owed (#1402)"""
     from .issues import INVESTIGATION_PENDING_MARK, START_COMMAND
@@ -8176,6 +8180,8 @@ def heal_investigation_dispatch(inv_id: str) -> str:
         neo.close()
     if not q or q.get("status") != "answered":
         return ""  # Neo has not ruled: the pre-triage sentence is still true
+    if db.now() - float(q.get("answered_at") or 0) < DISPATCH_ECHO_GRACE_SECONDS:
+        return ""  # settle_triage runs right after the answer: let its exact note land first
     wo = _fix_order_of(filed)
     if wo:
         note = f"{wo['id']} is on it"

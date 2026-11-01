@@ -786,28 +786,71 @@ def test_a_gap_asks_neo_and_its_view_follows_the_fix_order(started, store):
     assert chain["fix"]["wo_id"] == fix["id"] and chain["fix"]["production"] is None
 
 
-def test_a_lost_dispatch_echo_is_re_derived_once_neo_has_ruled(started, store):
-    """#1402: the pending sentence outliving Neo's answer is a lost echo the sweep heals"""
-    from jarvis import invariants
+def _neo_answered(qid: int, seconds_ago: float) -> None:
     from jarvis.neo_store import NeoStore
 
-    inv_id, _, out = _submitted(started, store, "GAP")
-    qid = out["filed"]["neo_question_id"]
-    assert list(invariants.check_investigation_dispatch_recorded(store)) == [], \
-        "Neo has not ruled: the pending sentence is still true"
     neo = NeoStore()
     try:
         neo.record_answer(qid, "approve", reason="r")
+        neo.conn.execute("UPDATE questions SET answered_at=? WHERE id=?",
+                         (db.now() - seconds_ago, qid))
     finally:
         neo.close()
-    fix = store.create_work_order("the fix", description="d")
-    store.update_work_order(fix["id"], issue_url=started.issue_url)
+
+
+@pytest.fixture()
+def tracker_b(started, tmp_path):
+    """A second registered project holding the fix order, as jarvis_os does for painforwisdom"""
+    from jarvis.central_store import CentralStore
+    from jarvis.testing import make_git_project
+
+    other = make_git_project(tmp_path, "proj_b")
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_b", str(other))
+    finally:
+        central.close()
+    s = ProjectStore(other)
+    yield s
+    s.close()
+
+
+def test_a_lost_dispatch_echo_finds_the_fix_in_another_project(started, store, tracker_b):
+    """#1402: investigation in proj_a, fix order in proj_b; the sweep heals the lost echo"""
+    from jarvis import invariants
+
+    inv_id, _, out = _submitted(started, store, "GAP")
+    fix = tracker_b.create_work_order("the fix", description="d")
+    tracker_b.update_work_order(fix["id"], issue_url=started.issue_url)
+    assert ops.investigation_fix_order(inv_id) == fix["id"]
+
+    assert list(invariants.check_investigation_dispatch_recorded(store)) == [], \
+        "Neo has not ruled: the pending sentence is still true"
+    _neo_answered(out["filed"]["neo_question_id"], seconds_ago=5)
+    assert list(invariants.check_investigation_dispatch_recorded(store)) == [], \
+        "inside the grace settle_triage's own exact note is still on its way"
+    _neo_answered(out["filed"]["neo_question_id"],
+                  seconds_ago=ops.DISPATCH_ECHO_GRACE_SECONDS + 1)
 
     [v] = invariants.check_investigation_dispatch_recorded(store)
     assert v.invariant == invariants.INV_INVESTIGATION_DISPATCH and v.subject_id == inv_id
     filed = ops.show_investigation_order(inv_id)["filed"]
     assert (filed["wo_id"], filed["dispatch"]) == (fix["id"], f"{fix['id']} is on it")
+    assert ops.show_investigation_order(inv_id)["chain"]["fix"]["wo_id"] == fix["id"]
     assert list(invariants.check_investigation_dispatch_recorded(store)) == []
+
+
+def test_a_lost_dispatch_echo_with_no_fix_order_says_not_started(started, store, tracker_b):
+    from jarvis import invariants
+
+    inv_id, _, out = _submitted(started, store, "GAP")
+    _neo_answered(out["filed"]["neo_question_id"],
+                  seconds_ago=ops.DISPATCH_ECHO_GRACE_SECONDS + 1)
+    [_] = invariants.check_investigation_dispatch_recorded(store)
+    filed = ops.show_investigation_order(inv_id)["filed"]
+    assert filed["dispatch"].startswith("NOT started")
+    assert f"jarvis issues start {started.issue_url}" in filed["dispatch"]
+    assert not filed["wo_id"]
 
 
 def test_a_gap_whose_duplicate_ops_finds_is_downgraded_honestly(started, store):
