@@ -256,25 +256,40 @@ def scannable(command: str) -> str:
     """The part of `command` that could actually *execute* something (#203)"""
     if _SUBSTITUTION.search(command):
         return command
-    programs = program_spans(command)
     # Replace rather than delete, so neighbouring tokens can't fuse into a false match
-    blanked = _QUOTED.sub(
-        lambda m: m.group(0) if any(s <= m.start() and m.end() <= e for s, e in programs)
-        else " ", command)
+    blanked = _blank(command, _code_quotes(command))
     return command if _SHELL_INVOKER.search(blanked) else blanked
 
 
-def program_spans(command: str) -> list[tuple[int, int]]:
-    """The heredoc bodies that are PROGRAMS rather than data: those owned by an executor"""
-    heres = heredoc_spans(command)
-    if not heres:
-        return []
-    segs = segments(command)
+def _code_quotes(command: str) -> list[tuple[int, int]]:
+    """Quoted spans in CODE, found in one pass with heredoc bodies: a body quote is body text (#208)"""
     spans: list[tuple[int, int]] = []
-    for start, end, opener, _ in heres:
-        owner = next((n for s, e, n in segs if s <= opener < e and n), "")
-        if owner and owner.split()[0] in _EXECUTORS:
-            spans.append((start, end))
+    pending: list[str] = []  # delimiters opened on the current line
+    pos = 0
+    while pos < len(command):
+        q = _QUOTED.search(command, pos)
+        o = _HEREDOC_OPEN.search(command, pos)
+        nl = command.find("\n", pos)
+        firsts = [m.start() for m in (q, o) if m] + ([nl] if nl != -1 else [])
+        if not firsts:
+            break
+        first = min(firsts)
+        if o and o.start() == first:
+            pending.append(o.group("sq") or o.group("dq") or o.group("bare"))
+            pos = o.end()
+        elif q and q.start() == first:
+            spans.append(q.span())
+            pos = q.end()
+        else:
+            pos = nl + 1
+            for delim in pending:  # each body in turn, through its terminator line
+                while pos < len(command):
+                    eol = command.find("\n", pos)
+                    line = command[pos:eol if eol != -1 else len(command)]
+                    pos = len(command) if eol == -1 else eol + 1
+                    if line.strip() == delim:
+                        break
+            pending = []
     return spans
 
 
@@ -820,6 +835,9 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("release", "uv publish"),
     ("release", "git push --follow-tags origin release/jarvis-1.2.3"),
     ("release", "cat <<'EOF' | bash\nscripts/shipit.sh\nEOF"),
+    # …however the path in that body is quoted (#208)
+    ("release", "cat <<'EOF' | bash\n\"scripts/shipit.sh\"\nEOF"),
+    ("release", "cat <<'EOF' | bash\n'scripts/shipit.sh'\nEOF"),
     ("release", 'eval "bash scripts/shipit.sh"'),
     # Added with the issue #203 fix, to pin what that fix must NOT turn into a miss
     ("release", "python3 - <<'PY'\nscripts/shipit.sh\nPY"),

@@ -566,6 +566,21 @@ def test_a_shell_invoker_in_executable_position_still_scans_the_command_whole():
         assert classify(command, gate_rules.RuleSet.from_seeds()) is not None, command
 
 
+@pytest.mark.parametrize("path", ["scripts/shipit.sh", '"scripts/shipit.sh"',
+                                  "'scripts/shipit.sh'"])
+def test_a_quote_inside_a_heredoc_body_is_body_text_not_a_blankable_span(path):
+    """Issue #208: quoting the path in a body piped into a shell hid it"""
+    command = f"cat <<'EOF' | bash\n{path}\nEOF"
+    assert "shipit" in gate_rules.scannable(command)
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
+
+
+def test_a_stray_quote_in_a_heredoc_body_cannot_swallow_the_code_after_it():
+    """A body quote must not pair with one past the terminator (#208)"""
+    command = "cat <<'EOF' > notes.md\nit's fine\nEOF\n./scripts/shipit.sh 'x'"
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
+
+
 @pytest.mark.parametrize("command", [
     'ssh prod "bash scripts/shipit.sh"',
     '"bash" -c "gh pr merge 31"',
