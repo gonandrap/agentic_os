@@ -552,6 +552,10 @@ def _request_question(project: str, wo: dict[str, Any], decision: Decision,
         "Approve it to let the OS merge, or deny it with a reason. Denying leaves the "
         "pull request open and with the user, which is today's behaviour and the safe "
         "answer whenever the case for merging is not made.",
+        # Issue 1385: wo-5e58ef32's description reserved the decision and Q2707 merged anyway
+        "DENY if the work order's description reserves the review, approval or merge "
+        "for the user (\"I review the plan first\", \"wait for my approval\", \"I decide\"): "
+        "the user asked to decide, so the OS merging it overrides them.",
     ]
     return "\n\n".join(parts)
 
