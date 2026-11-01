@@ -1257,8 +1257,8 @@ MESSAGE_AUTHOR_USER = "user"
 # A dependency is satisfied only when it reaches `completed`
 DEPENDENCY_SATISFIED_STATUS = "completed"
 
-#: A planner parked here behind its `pr_url` has a spec not yet on the default branch
-SPEC_PR_OPEN_STATUSES = ("validating", "waiting_pr_merge", "needs_review")
+#: Planner with `pr_url` in any open status has its spec unmerged, rework included (docs/superpowers/specs/2026-11-01-a-held-spec-is-re-read-until-it-merges.md §1)
+SPEC_PR_OPEN_STATUSES = OPEN_STATUSES
 
 # ...and these are the statuses from which it can never get there
 DEPENDENCY_DEAD_STATUSES = ("cancelled", "failed")
