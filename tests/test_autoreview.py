@@ -811,6 +811,8 @@ def _refusal_hold(store, wo, reason: str) -> autoreview.Decision:
 def test_the_undeclared_refusal_sentence_is_not_deduped_away_by_the_first(started):
     """ISSUE #975, measured on wo-2933fc24: both refusal sentences share the code..."""
     store, wo = park(started, auto_review=True, outcome="")
+    # The refusal both holds are about: without it the read side drops them (#814)
+    store.add_event(wo["id"], "reviewed", {"accepted": False})
 
     started._note_autoreview_held(
         store, wo["id"], _refusal_hold(store, wo, autoreview.REFUSAL_UNANSWERED_REASON))
@@ -865,7 +867,7 @@ def test_a_confirm_spent_hold_survives_the_panel_freshness_filter(started):
 
     latest = store.latest_validation_round(wo_id=wo["id"])
     assert not ops._panel_hold_is_stale(latest, payload)
-    assert not ops._stale_panel_hold(store, wo["id"])("autoreview_held", payload)
+    assert not ops._stale_ruling(store, wo["id"])("autoreview_held", payload)
 
     # ...and the hold is what the readers render, on both surfaces
     (line,) = rulings(store, wo["id"])
@@ -2659,3 +2661,111 @@ def test_an_unseen_reference_is_asked_for_not_ruled_on():
 def test_neo_answers_an_unseen_reference_by_asking_for_it():
     """The question-side twin of the rule above"""
     assert "NEVER DECIDE ON PARTIAL DATA" in neo.PERSONA
+
+
+# -- every autoreview claim is re-derived from its row (issue #814)
+
+
+def _neo_question(status: str = "queued") -> int:
+    neo_store = NeoStore()
+    try:
+        q = neo_store.ask("proj_a", "wo-x", "ASSUMPTION REVIEW — x", kind="assumption")
+        if status != "queued":
+            neo_store.mark(q["id"], status, reason="r")
+        return int(q["id"])
+    finally:
+        neo_store.close()
+
+
+def _state_line(store, wo_id: str) -> str:
+    state = ops.autoreview_state(store, store.get_work_order(wo_id))
+    return state["line"] if state else ""
+
+
+def test_an_ask_is_not_with_neo_once_neo_let_go_of_it_or_the_user_settled_it(started):
+    store, wo = park(started, auto_review=True)
+    (row,) = store.all_assumptions(wo["id"])
+    qid = _neo_question()
+    store.link_assumption_question(row["id"], qid)
+    store.add_event(wo["id"], "autoreview_asked",
+                    {"assumption_id": row["id"], "n": 1, "neo_question_id": qid})
+    assert f"is with Neo (question {qid})" in _state_line(store, wo["id"])
+    assert "awaiting ruling" in rulings(store, wo["id"])[0]
+
+    neo_store = NeoStore()
+    try:
+        neo_store.mark(qid, "escalated", reason="yours")
+    finally:
+        neo_store.close()
+    assert "is with Neo" not in _state_line(store, wo["id"])
+    assert rulings(store, wo["id"]) == [""]
+
+    # A dead question still renders the unreachable sentence, not nothing
+    dead = _neo_question("failed")
+    store.link_assumption_question(row["id"], dead)
+    store.add_event(wo["id"], "autoreview_asked",
+                    {"assumption_id": row["id"], "n": 1, "neo_question_id": dead})
+    assert "could not be reached" in _state_line(store, wo["id"])
+
+    store.conn.execute("UPDATE assumptions SET status='accepted', decided_by='user' "
+                       "WHERE id=?", (row["id"],))
+    assert "Neo" not in _state_line(store, wo["id"])
+
+
+def test_a_provisional_reading_is_dropped_once_the_row_no_longer_carries_it(started):
+    store, wo = park(started, auto_review=True)
+    (row,) = store.all_assumptions(wo["id"])
+    store.record_provisional(row["id"], verdict="accept")
+    store.add_event(wo["id"], "autoreview_provisional",
+                    {"assumption_id": row["id"], "n": 1, "verdict": "accept"})
+    # The order already delivered: the sentence must not claim a running worker
+    line = _state_line(store, wo["id"])
+    assert "before the worker delivered" in line and "runs" not in line
+
+    store.conn.execute("UPDATE assumptions SET provisional_verdict='' WHERE id=?",
+                       (row["id"],))
+    assert "provisionally" not in _state_line(store, wo["id"])
+
+
+def test_an_objection_withdrawn_is_not_told_to_the_worker(started):
+    store, wo = park(started, auto_review=True)
+    (row,) = store.all_assumptions(wo["id"])
+    store.record_objection(row["id"], envelope_id=1, transport="queue")
+    payload = {"assumption_id": row["id"], "n": 1, "reason": "wrong"}
+    stale = ops._stale_ruling(store, wo["id"])
+    assert not stale("autoreview_objected", payload)
+
+    store.withdraw_objection(row["id"])
+    assert ops._stale_ruling(store, wo["id"])("autoreview_objected", payload)
+
+
+def test_each_hold_code_is_re_derived_from_its_row(started):
+    store, wo = park(started, auto_review=True)
+    (row,) = store.all_assumptions(wo["id"])
+
+    def stale(code: str) -> bool:
+        return ops._stale_ruling(store, wo["id"])(
+            "autoreview_held", {"code": code, "assumption_id": row["id"], "n": 1,
+                                "reason": "r"})
+
+    # Nothing on the row backs any of them
+    assert stale(autoreview.HELD_ASKED)
+    assert stale(autoreview.HELD_CONFIRMING)
+    assert stale(autoreview.HELD_JUDGED)
+    assert stale(autoreview.HELD_OBJECTION_IN_FLIGHT)
+    assert stale(autoreview.HELD_REFUSAL_UNANSWERED) == ops.refusal_answered(
+        store, wo["id"])
+
+    live = _neo_question()
+    store.link_assumption_question(row["id"], live)
+    store.link_assumption_confirmation(row["id"], live)
+    store.record_provisional(row["id"], verdict="accept")
+    store.record_objection(row["id"], envelope_id=1, transport="queue")
+    for code in (autoreview.HELD_ASKED, autoreview.HELD_CONFIRMING,
+                 autoreview.HELD_JUDGED, autoreview.HELD_OBJECTION_IN_FLIGHT):
+        assert not stale(code), code
+
+    # A settled assumption makes every hold on it stale
+    store.conn.execute("UPDATE assumptions SET status='accepted' WHERE id=?", (row["id"],))
+    assert stale(autoreview.HELD_SETTLED)
+    assert stale(autoreview.HELD_JUDGED)
