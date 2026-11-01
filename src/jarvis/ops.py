@@ -540,6 +540,20 @@ def _daemon_liveness(central: CentralStore, pid: int | None) -> dict[str, Any] |
     }
 
 
+def _count_paused(summary: dict[str, Any], open_wos: list[dict[str, Any]],
+                  pauses: dict[str, dict[str, Any] | None]) -> None:
+    """A `running` order whose turn is paused is counted `paused`, not running (#247)"""
+    n = sum(1 for wo in open_wos
+            if wo["status"] == "running" and not wo.get("hidden") and pauses[wo["id"]])
+    if not n:
+        return
+    by_status = summary["by_status"]
+    by_status["running"] = by_status.get("running", 0) - n
+    if by_status["running"] <= 0:
+        del by_status["running"]
+    by_status["paused"] = n
+
+
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
     central = CentralStore()
     try:
@@ -570,6 +584,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             try:
                 summary = store.summary()
                 open_wos = store.list_work_orders(statuses=OPEN_STATUSES)
+                pauses = {wo["id"]: invariants.pause_state(store, wo) for wo in open_wos}
+                _count_paused(summary, open_wos, pauses)
                 # Attention isn't limited to open work orders: a FAILED worker (e.g. session disappeared) still needs...
                 flagged = {wo["id"]: wo for wo in open_wos if wo["needs_attention"]}
                 for wo in store.list_work_orders():
@@ -675,7 +691,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # Same rule for the other kind of hold — §2.7
                          "preconditions": open_preconditions(store, wo),
                          # Same rule, for the other reason a work order can be sitting still: the transport dropped its turn
-                         "pause": invariants.pause_note(store, wo),
+                         "pause": (pauses[wo["id"]] or {}).get("note", ""),
+                         "paused_until": (pauses[wo["id"]] or {}).get("until"),
                          # And the whole answer in one string
                          "status_label": invariants.status_label(store, wo, fleet_state),
                          "tags": wo_tags(wo, p["name"])}
@@ -4505,6 +4522,13 @@ has not registered its rule has not finished its job.
 Fix the above, then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
 again."""
 
+#: WHAT A SUBMISSION WHOSE PULL REQUEST LAGS THE WORKTREE IS TOLD (issue #704)
+PR_BEHIND_FEEDBACK = """REVIEW FEEDBACK (no round was spent)
+The pull request head {pr_head} lacks commits your worktree has (HEAD {worktree_head}).
+The panel reads the pull request, so it would have judged the previous push, not this
+submission. Push your branch, then run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
+
 #: The same refusal at the DAEMON site
 PRECHECK_SPENT_NOTE = (
     "\n\nThis round was opened before the check could run, so it HAS been spent.")
@@ -4645,6 +4669,10 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         unproven=tuple(unproven))
     # The NUMBER, not the budget position: a rebind spends one without spending the other (spec...
     nxt = store.numbered_validation_rounds(wo_id=wo["id"]) + 1
+    # Forced callers re-judge the PR head by design and read the round they asked for
+    if packet.pr_behind and not forced_reason.strip():
+        _pr_behind_refused(store, wo, packet.pr_behind, nxt)
+        return None
     # THE BUDGET GATES A COUNTED ROUND: past it no panel sits, the user decides (issue 239)
     if (not (forced_reason.strip() or uncounted)
             and store.counted_validation_rounds(wo_id=wo["id"]) >= int(cfg.max_rounds)):
@@ -4696,6 +4724,23 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
                      "fingerprint": round_row["fingerprint"],
                      "files": len(packet.files)})
     return round_row
+
+
+def _pr_behind_refused(store: ProjectStore, wo: Mapping[str, Any],
+                       behind: tuple[str, ...], would_be: int) -> None:
+    """Send a submission back unjudged: its pull request does not hold what the worktree does (issue #704)"""
+    wo_id = str(wo["id"])
+    pr_head, worktree_head = behind
+    store.add_event(wo_id, "validation_refused",
+                    {"would_be_round": would_be, "cause": "pr_behind_worktree",
+                     "pr_head": pr_head, "worktree_head": worktree_head})
+    bus.post(store, subject=bus.Subject(wo_id=wo_id),
+             from_role="reviewer", to_role="implementor",
+             payload=bus.ReviewFeedback(
+                 round=would_be, outcome="rejected",
+                 reason=PR_BEHIND_FEEDBACK.format(pr_head=pr_head[:10],
+                                                  worktree_head=worktree_head[:10],
+                                                  wo_id=wo_id)))
 
 
 def _bounce(store: ProjectStore, wo: dict[str, Any], previous: dict[str, Any],
@@ -6524,6 +6569,29 @@ def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
         store.close()
     return {"project": name, "wo_id": wo_id, "attention_reason": blockers[0] if blockers
             else None, "blockers": blockers}
+
+
+def expedite_work_order(wo_id: str, on: bool = True,
+                        project_name: str | None = None) -> dict[str, Any]:
+    """Flag an order so its merge ships ALONE as a cherry-picked release (docs/superpowers/specs/2026-10-31-an-expedited-merge-ships-alone.md)"""
+    from . import issues
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    if wo["status"] in ("completed", "failed", "cancelled"):
+        raise OpsError(f"{wo_id} is {wo['status']} — expediting acts on its merge, "
+                       "which is already behind it")
+    if release.is_release_order(wo):
+        raise OpsError(f"{wo_id} is itself a release order")
+    store = ProjectStore(path)
+    try:
+        meta = db.from_json(wo.get("metadata"), {}) or {}
+        if bool(meta.get(issues.EXPEDITED_KEY)) != on:
+            store.update_work_order(
+                wo_id, metadata=db.to_json({**meta, issues.EXPEDITED_KEY: on}))
+            store.add_event(wo_id, "expedited" if on else "unexpedited", {})
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "title": wo["title"], "expedited": on}
 
 
 def hide_work_order(wo_id: str, hidden: bool = True,

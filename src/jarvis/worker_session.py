@@ -229,12 +229,17 @@ class Compaction:
     age: float
     #: The conversation's size as measured (#885)
     context: int | None
+    #: Seconds of cache life left: set only on a pre-expiry compaction (issue #1179)
+    warm_for: float | None = None
 
     @property
     def why(self) -> str:
         size = (f"the conversation is {self.context:,} tokens"
                 if self.context is not None
                 else "the conversation's size could not be read")
+        if self.warm_for is not None:
+            return (f"the prompt cache expires in {int(self.warm_for)}s and {size} — "
+                    f"summarising it now reads it at the cache rate")
         return (f"the prompt cache expired {int(self.age // 60)}m ago and {size} — "
                 f"re-sending it would cost more than summarising it")
 
@@ -339,6 +344,47 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
         if held is not None and held.resumable:
             return None
     return Compaction(age=age, context=context)
+
+
+#: Parked statuses likely enough to take another turn that a warm compaction pays (issue #1179, Q2882)
+WARM_COMPACT_STATUSES = ("needs_review", "validating", "waiting_input")
+
+#: Fire this long before the TTL: process start and reap lag eat into the margin
+WARM_COMPACT_LEAD_SECONDS = 75
+
+#: Never closer to the TTL than this: a late start would buy a COLD compaction nobody may need
+WARM_COMPACT_LATEST_SECONDS = 30
+
+
+def warm_compaction_due(store: ProjectStore, wo: dict[str, Any],
+                        min_context: int | None,
+                        now: float | None = None) -> Compaction | None:
+    """Compact this parked conversation NOW, while its cache is still warm? (issue #1179)"""
+    if min_context is None or wo["status"] not in WARM_COMPACT_STATUSES:
+        return None
+    if not wo.get("session_id") or store.queued_messages(wo["id"]):
+        return None  # a queued message goes through `compact_before_relaunch` instead
+    turn = store.latest_turn(wo["id"])
+    if (turn is None or turn["kind"] == COMPACT_TURN or turn["state"] != "done"
+            or not turn.get("ended_at")):
+        return None
+    ttl = usage.ttl_seconds(str(turn.get("cache_ttl") or ""))
+    age = (time.time() if now is None else now) - turn["ended_at"]
+    if not ttl - WARM_COMPACT_LEAD_SECONDS <= age < ttl - WARM_COMPACT_LATEST_SECONDS:
+        return None
+    context = measured_context(store, wo["id"])
+    # UNKNOWN fails the floor here, unlike the cold path: this compaction is a bet
+    if context is None or context < min_context:
+        return None
+    return Compaction(age=age, context=context, warm_for=ttl - age)
+
+
+def compact_while_warm(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
+                       min_context: int | None,
+                       now: float | None = None) -> dict[str, Any] | None:
+    """The warm compaction turn, or None when `warm_compaction_due` says not now"""
+    due = warm_compaction_due(store, wo, min_context, now=now)
+    return None if due is None else compact(store, project, wo, due)
 
 
 def compact_before_relaunch(store: ProjectStore, project: ProjectSpec,

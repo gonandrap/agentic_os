@@ -148,13 +148,19 @@ GATE_META = {
     "abandoned": {"word": "abandoned, never reviewed", "icon": "⊗", "tone": "muted"},
     # Same treatment, opposite outcome: `expired` with `closed_as='spent'` was approved and then USED
     "spent": {"word": "spent", "icon": "✓", "tone": "ok"},
+    # `closed_as='lapsed'` with uses > 0: approved, used, then timed out (#1388)
+    "used": {"word": "approved, used, lapsed", "icon": "✓", "tone": "ok"},
+    "superseded": {"word": "superseded, never decided", "icon": "⊘", "tone": "muted"},
 }
 
 
 def gate_display(g: dict) -> str:
     """The key this gate renders under, which is not always its status: `expired` splits by `closed_as`"""
-    if g["status"] == "expired" and g["closed_as"] in ("spent", "abandoned"):
-        return g["closed_as"]
+    if g["status"] == "expired":
+        if g["closed_as"] in ("spent", "abandoned", "superseded"):
+            return g["closed_as"]
+        if g["closed_as"] == "lapsed" and g["uses"]:
+            return "used"
     return g["status"]
 
 
@@ -2549,6 +2555,15 @@ def create_app() -> FastAPI:
     def hide_wo(name: str, wo_id: str):
         ops.hide_work_order(wo_id, hidden=True, project_name=name)
         return RedirectResponse(f"/project/{name}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/expedite")
+    def expedite_wo(name: str, wo_id: str, off: str = Form("")):
+        page = f"/wo/{name}/{wo_id}"
+        try:
+            ops.expedite_work_order(wo_id, on=not off, project_name=name)
+        except ops.OpsError as e:
+            return RedirectResponse(f"{page}?error={quote(str(e))}", status_code=303)
+        return RedirectResponse(page, status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/unhide")
     def unhide_wo(name: str, wo_id: str):

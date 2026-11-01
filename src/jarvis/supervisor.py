@@ -598,12 +598,14 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
         plan = _plan_lines(row, share)
         sections += [rest[0], *([plan] if plan else []), history, tree, *rest[1:]]
     else:
-        from . import health
+        from . import health, invariants
 
         # ABSENT when there is no blocker
         blocked = health.blocker(pstore, subject, cfg)
         # ABSENT with no actor for the reason just above
         actor = health.actor(pstore, subject)
+        # A quota or API pause has an owner and a clock: quiet, not wedged (#247)
+        paused = invariants.pause_state(pstore, row)
         sections.append([
             "# The work order",
             f"{row.get('id')} [{row.get('status')}] on "
@@ -611,6 +613,8 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
             f"this session is {_what_it_is(row)}",
             *([f"scheduled_actor: {actor.pass_name} - {actor.why}"] if actor else []),
             *([f"blocked: {BLOCKED_SENTENCES.get(blocked, blocked)}"] if blocked else []),
+            *([f"paused ({paused['reason']}): {paused['note']} — the OS resumes "
+               "it by itself; this is not a stall"] if paused and paused["note"] else []),
             f"title: {row.get('title')}",
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
         ])
