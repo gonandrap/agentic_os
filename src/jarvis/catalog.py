@@ -42,7 +42,8 @@ SAFETY_KEYS = (
     # Files work nobody typed: same class of act as the scheduler
     "os.autonomy.*",
     # How much of that the steward may spend, and how deep it may go (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
-    "os.evolution.weekly_usd", "os.evolution.critical_weekly_usd",
+    "os.evolution.weekly_usd", "os.evolution.bug_weekly_usd",
+    "os.evolution.critical_weekly_usd",
     "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
     "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_refs_by_kind",
     "os.evolution.min_precision",
@@ -910,6 +911,7 @@ DEFAULT_EVOLUTION_MIN_SAMPLES = 3
 
 #: The steward's ledger (§3.3 of... (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
 DEFAULT_EVOLUTION_WEEKLY_USD = 150.0
+DEFAULT_EVOLUTION_BUG_WEEKLY_USD = 150.0
 DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD = 60.0
 DEFAULT_EVOLUTION_YIELD_ABOVE_USD = 900.0
 DEFAULT_EVOLUTION_ORDER_BUDGET_USD = 25.0
@@ -930,6 +932,8 @@ class EvolutionConfig:
     min_samples: int = DEFAULT_EVOLUTION_MIN_SAMPLES
     # The steward (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md...
     weekly_usd: float = DEFAULT_EVOLUTION_WEEKLY_USD
+    #: The reported-bug track's own ledger (steward.TRACKS)
+    bug_weekly_usd: float = DEFAULT_EVOLUTION_BUG_WEEKLY_USD
     critical_weekly_usd: float = DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD
     yield_above_usd: float = DEFAULT_EVOLUTION_YIELD_ABOVE_USD
     order_budget_usd: float = DEFAULT_EVOLUTION_ORDER_BUDGET_USD
@@ -1806,7 +1810,8 @@ def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
     if min_samples < 1:
         raise _err(f"{where}.min_samples must be 1 or more, got {min_samples}")
     money = {}
-    for key in ("weekly_usd", "critical_weekly_usd", "yield_above_usd", "order_budget_usd"):
+    for key in ("weekly_usd", "bug_weekly_usd", "critical_weekly_usd", "yield_above_usd",
+                "order_budget_usd"):
         value = float(raw.get(key, getattr(base, key)))
         if value < 0:
             raise _err(f"{where}.{key} must be 0 or more, got {value}")

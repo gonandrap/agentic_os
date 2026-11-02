@@ -817,6 +817,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "items": inbox[:10],
             },
             "backlog": {"open": len(backlog_open)},
+            # Reported bugs and panel follow-ups counted apart (wo-5b96c9da)
+            "steward": steward_track_counts(central),
             "investigations": {"fixes_parked": fixes_parked},
             "neo": neo_counts,
             "gates": {"awaiting_you": len(gate_items),
@@ -826,6 +828,17 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         }
     finally:
         central.close()
+
+
+def steward_track_counts(central: CentralStore) -> dict[str, dict[str, int]]:
+    """`steward.track_counts`, or {} when the decisions table cannot be read"""
+    from . import steward
+
+    try:
+        return steward.track_counts(central)
+    except Exception:  # noqa: BLE001 — the pulse check must not fail over one line
+        log.exception("status: steward counts unreadable")
+        return {}
 
 
 # -- work orders
@@ -2043,14 +2056,24 @@ def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
 
 def ack_decision_blocker(blockers: list[str]) -> str | None:
     """The blocker that makes acking unacceptable, or None — the one extraction of it"""
-    return next((b for b in blockers if "assumption" in b.lower()), None)
+    from .invariants import IDLE_NO_FINISH_BLOCKER
+
+    # An idle park's only exit is the user's action; an ack would hide it from every view (issue 1456)
+    return next((b for b in blockers
+                 if "assumption" in b.lower() or b == IDLE_NO_FINISH_BLOCKER), None)
 
 
 def ack_refusal(wo: dict[str, Any], blockers: list[str]) -> str | None:
     """Why `jarvis wo ack` would be refused on this order, or None if it would be taken"""
+    from .invariants import IDLE_NO_FINISH_BLOCKER
+
     blocker = ack_decision_blocker(blockers)
     if blocker is None:
         return None
+    if blocker == IDLE_NO_FINISH_BLOCKER:
+        return (f"{wo['id']} stopped mid-task and nothing will resume it — acknowledging "
+                f"would hide it. `jarvis wo send {wo['id']} \"…\"` sends it back to work; "
+                f"`jarvis wo done {wo['id']}` closes it.")
     return (f"{wo['id']} is waiting on a decision ({blocker}) — acknowledging would "
             f"bury it. Use `jarvis wo review {wo['id']}` to accept, or `--reject` to "
             f"send it back.")
@@ -7473,8 +7496,12 @@ def steward_queue_report(limit: int = 200) -> dict[str, Any]:
         central.close()
     keys = ("id", "ts", "project", "origin_kind", "severity", "subject", "rule", "reason",
             "wo_id", "parent_wo_id", "queue_state", "queue_note", "queue_ts")
-    items = [{k: r[k] for k in keys} for r in rows]
+    items = [{**{k: r[k] for k in keys}, "track": steward.track_of(r["origin_kind"])}
+             for r in rows]
     return {"asks": [{**{k: r[k] for k in keys}, "parent_wo_id": r["parent_wo_id"],
+                      "track": steward.track_of(r["origin_kind"]),
+                      "issue_url": (steward._candidate_of(r).get("payload") or {}).get(
+                          "issue_url", ""),
                       "morpheus_item": (steward._candidate_of(r).get("payload") or {}).get(
                           "morpheus_item", "")} for r in asks],
             "counts": {s: counts.get(s, 0) for s in ("waiting", "reoffered", "expired")},

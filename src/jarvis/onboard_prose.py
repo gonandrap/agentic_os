@@ -476,14 +476,18 @@ LINES: dict[str, str] = {
     "morpheus.on_timeout": "What a check that never decided hands off to: an investigation, "
                            "or Neo.",
     "autonomy.self_dispatch": "Whether the OS may create and dispatch orders nobody typed.",
+    "evolution.bug_weekly_usd": "What OS-reported bugs (investigation GAPs, bug reports, "
+                                "Morpheus failures, red main, io findings) may spend over a "
+                                "rolling week, at list price; its own ledger, apart from "
+                                "panel follow-ups.",
     "evolution.critical_weekly_usd": "The part of the weekly ledger expedited "
                                      "critical/blocker work may use.",
     "evolution.max_depth": "How many generations of OS work may dispatch from one "
                            "user-originated parent.",
     "evolution.order_budget_usd": "The dollar ceiling the steward sets on each order it "
                                   "dispatches.",
-    "evolution.weekly_usd": "What the OS may spend on itself over a rolling week, at list "
-                            "price.",
+    "evolution.weekly_usd": "What panel follow-ups and OS upkeep may spend over a rolling "
+                            "week, at list price; reported bugs have bug_weekly_usd.",
     "evolution.yield_above_usd": "Total fleet spend over the week above which nothing new "
                                  "from the steward dispatches.",
     "defaults.max_in_flight": "How many worker turns may run at once across the whole "
@@ -592,14 +596,17 @@ EXAMPLES: dict[str, str] = {
                               "dispatches it the same night, inside os.evolution.weekly_usd; "
                               "off, the same failure waits in `jarvis inbox` until you read "
                               "it.",
+    "evolution.bug_weekly_usd": "At $150, a reported bug starts at once, past the yield line "
+                                "and recurrence; once bugs spent $150 in seven days the next "
+                                "lands in `jarvis inbox` with its `jarvis issues start` command.",
     "evolution.critical_weekly_usd": "At $60, expedited critical work stops dispatching once "
                                      "it has used $60 of the week's ledger.",
     "evolution.max_depth": "At 1, an order the OS dispatched cannot itself cause another "
                            "OS-dispatched order.",
     "evolution.order_budget_usd": "At $25, each order the steward dispatches stops at $25 "
                                   "and waits for you to raise it.",
-    "evolution.weekly_usd": "At $150, once the OS has spent $150 on itself in seven days, a "
-                            "new candidate is queued instead of dispatched.",
+    "evolution.weekly_usd": "At $150, once follow-ups and upkeep spent $150 in seven days, a "
+                            "new one is queued instead of dispatched.",
     "evolution.yield_above_usd": "At $900, when the fleet's week passes $900 the steward "
                                  "dispatches nothing new until spend falls back.",
     "defaults.max_in_flight": "At 3, a fourth worker turn waits for one of three running "
