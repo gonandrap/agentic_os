@@ -4,10 +4,13 @@
 {% block title %}Monitoring orders — Jarvis{% endblock %}
 {% block style %}
   .mv-list td { white-space: nowrap; }
-  .mv-list td.mv-title { white-space: normal; }
+  .mv-list td.mv-title { white-space: normal; min-width: 12em; }
+  .mv-list td.mv-when { white-space: normal; }
   .mv-list form { margin: 0; }
-  .mv-new { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
-  .mv-new textarea { flex: 1 1 20em; min-height: 2.4em; }
+  .mv-list form button { padding: 2px 8px; }
+  .mv-new { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px; }
+  .mv-new input { width: auto; flex: 0 1 12em; }
+  .mv-new textarea { width: auto; flex: 1 1 20em; min-height: 2.4em; }
 {% endblock %}
 {% block content %}
 
@@ -55,7 +58,7 @@
       <td class="mono {{ mv.tone[i.state] }}">{{ i.state }}</td>
       <td class="mono">{{ mv.every(i) }}</td>
       <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
-      <td class="mono">
+      <td class="mono mv-when">
         {%- if i.state not in ("queued", "monitoring") %}settled
         {%- elif i.next_check_ts %}next {{ fmt_ts(i.next_check_ts) }}
         {%- else %}deadline {{ fmt_ts(i.deadline_ts) }}{% endif %}</td>
