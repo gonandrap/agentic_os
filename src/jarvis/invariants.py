@@ -620,6 +620,11 @@ def automerge_denied(store: ProjectStore, wo: dict[str, Any]) -> bool:
         if (str(newest.get("code") or "") == HELD_SHA_MOVED
                 and str(newest.get("head_sha") or "") != sha):
             return False
+    # #873: the OS caught the denied commit up with its base, so a new submission is on its way
+    for e in store.events_of_kind(wo["id"], PR_BASE_UPDATED_EVENT):
+        if (float(e["ts"]) > float(decided[-1]["ts"])
+                and str(db.from_json(e["payload"], {}).get("head_before") or "") == sha):
+            return False
     return True
 
 
@@ -1536,6 +1541,18 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
             f"(attempt {pause.attempts} of {pause.max_attempts})")
 
 
+def pause_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """`pause_note` as fields, so no reader has to parse the sentence (#247)"""
+    if wo["status"] not in RETRY_SWEEP_STATUSES:
+        return None
+    pause = worker_session.turn_pause(store, wo["id"])
+    if pause is None or pause.exhausted:
+        return None
+    # An auth pause resumes on the user's sign-in, not at a moment
+    until = None if pause.reason == worker_session.PAUSE_AUTH else pause.retry_at
+    return {"reason": pause.reason, "until": until, "note": pause_note(store, wo)}
+
+
 def neo_wait_note(wo: dict[str, Any]) -> str:
     """"with Neo …" for a work order parked on a question — or "" for anything else"""
     if wo["status"] != "waiting_input":
@@ -2150,6 +2167,9 @@ def _stale_worker_question(store: ProjectStore,
     """(answer, why) if this worker question is moot, else None (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
     if not _is_work_order(store, q["wo_id"]):
         return None
+    gate = _decided_gate_asked_about(store, q)
+    if gate is not None:
+        return gate
     asked = float(q["ts"])
     reviews = [float(e["ts"]) for e in store.events_of_kind(q["wo_id"], "reviewed")
                if float(e["ts"]) > asked]
@@ -2163,6 +2183,35 @@ def _stale_worker_question(store: ProjectStore,
             "asked",
             f"the user reviewed work order {q['wo_id']} after it was asked, on a "
             f"delivery newer than the question")
+
+
+_GATE_REF = re.compile(r"\b(?:gate|approval)\s+#?(\d+)\b", re.IGNORECASE)
+_GATE_VERDICT_WORDS = re.compile(r"\b(?:approv\w*|den(?:y|ied|ial)|grant\w*)\b",
+                                 re.IGNORECASE)
+
+
+def _decided_gate_asked_about(store: ProjectStore,
+                              q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) when a worker asked for a verdict on its own gate that is already decided (#1388)"""
+    text = str(q["question"] or "")
+    if not _GATE_VERDICT_WORDS.search(text):
+        return None
+    for number in dict.fromkeys(int(n) for n in _GATE_REF.findall(text)):
+        approval = store.get_approval(number)
+        if (approval is None or approval["wo_id"] != q["wo_id"]
+                or approval["status"] in ("pending", "awaiting_case")):
+            continue
+        # `lapsed`/`spent` grants were approved before they expired
+        verdict = ("approved" if approval["closed_as"] in ("lapsed", "spent")
+                   else approval["closed_as"] or approval["status"])
+        by = f" by {approval['decided_by']}" if approval["decided_by"] else ""
+        # A text match can be wrong: put it on the record, not just in the answer
+        store.add_event(q["wo_id"], "question_superseded_by_gate", {
+            "question_id": q["id"], "approval_id": number, "verdict": verdict,
+            "question": text[:500]})
+        return (f"SUPERSEDED — gate {number} is already {verdict}{by}",
+                f"it asks for a verdict on gate {number}, already {verdict}{by}")
+    return None
 
 
 def _stale_triage_question(store: ProjectStore,
@@ -2903,8 +2952,15 @@ def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
     central = CentralStore()
     try:
         run = db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), None)
+        seen = db.from_json(central.get_state(Daemon.STUCK_ENABLED_KEY), None)
     finally:
         central.close()
+    # The dark clock starts at the later of the last run and the (re-)enablement (#1452)
+    if seen and not seen.get("enabled"):
+        return  # the daemon has not picked the enablement up yet: no cadence has passed
+    enabled_at = float((seen or {}).get("ts") or 0.0)
+    if run and float(run.get("ts") or 0.0) < enabled_at:
+        run = None  # a run from before the sweep was switched back on says nothing now
     # The FLEET number, off `catalog.os` the way `Daemon.stuck_tick` reads `max_per_day`: one fleet-wide...
     window = catalog.os.fleet_health.sweep_dark_minutes * 60
     if run and str(run.get("error") or ""):
@@ -2916,19 +2972,21 @@ def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
                                        "error": str(run["error"])[:500]},
         )
         return
-    if run is None:
+    if run is None and not enabled_at:
         # NEVER SWEPT is only dark while the OS is UP
         from .daemon import daemon_running
 
         if not daemon_running():
             return
-    dark = db.now() - float((run or {}).get("ts") or 0.0)
-    if run is not None and dark < window:
+    dark = db.now() - max(float((run or {}).get("ts") or 0.0), enabled_at)
+    if (run is not None or enabled_at) and dark < window:
         return
-    minutes = int(dark / 60) if run else 0
+    minutes = int(dark / 60) if run or enabled_at else 0
     yield Violation(
         invariant="INV-STUCK-SWEEP-DARK",
         detail=(f"the stuck sweep has not run for {minutes}m" if run else
+                f"the stuck sweep was enabled {minutes}m ago but has not run since"
+                if enabled_at else
                 "the stuck sweep is enabled but has never run — no sweep has been "
                 "scheduled") + ", so an order that stopped moving is nobody's finding",
         level="critical", context={"cause": "dark", "dark_minutes": minutes},
@@ -3405,6 +3463,28 @@ def check_service_path() -> Iterator[Violation]:
     )
 
 
+def check_tracker_access() -> Iterator[Violation]:
+    """INV-TRACKER-ACCESS — `gh`'s account must be able to close and label on every tracker (#1346)"""
+    from . import issues, ops
+
+    repos = {issues.bug_repo()}
+    catalog = _live_catalog()
+    for p in getattr(catalog, "projects", ()) if catalog is not None else ():
+        if Path(p.path).is_dir():
+            repos.add(ops.follow_up_repo(Path(p.path), p.bugs.repo))
+    for repo in sorted(r for r in repos if r):
+        try:
+            access = issues.tracker_access(repo)
+        except issues.IssueLifecycleError:
+            continue  # not a repo name the OS would write to at all
+        if access.denied:
+            yield Violation(
+                invariant="INV-TRACKER-ACCESS", detail=access.explain(), level="critical",
+                context={"repo": access.repo, "login": access.login,
+                         "permission": access.permission,
+                         "needed": issues.TRACKER_NEEDED_PERMISSION})
+
+
 def check_production_clean() -> Iterator[Violation]:
     """INV-PROD-CLEAN — the production checkout must be byte-identical to its tag (#202)"""
     from . import release
@@ -3877,6 +3957,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_config_drift,
     check_offboarded_activity,
     check_service_path,
+    check_tracker_access,
     check_production_clean,
     check_prod_cli,
     check_cache_ttl_trigger,

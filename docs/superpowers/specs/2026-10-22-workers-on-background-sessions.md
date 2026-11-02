@@ -88,6 +88,13 @@ the OS sent, until the worker settles". Only two seams change:
 * **A turn spans the worker's own background work.** The OS holds queued messages while
   the roster says `busy`, so a message never interrupts a seat (fact 10). Stopping a busy
   session would kill its tasks; `deliver` only ever stops an `idle` one.
+* **A turn parked on a message** (issue #1400) — the one exception. A worker that ends its
+  turn (a `Stop` since the prompt) leaving a task that never ends, say a dev server, stays
+  `busy` for ever, and the answer it asked for sits queued behind it. So when a message is
+  queued, the last `Stop` is `BG_PARKED_QUIET` (15 min, Q2870) old and no API call came
+  after it, `poll` reaps the turn on that `Stop`'s reply and stops the session. The task
+  dies with it; the reap records it as orphaned and the next turn carries
+  `background.resume_note`. `deliver_messages` then sends the message as usual.
 * **Budget** — no `--max-budget-usd` (fact 13). The launch floor (`budget.launch_refusal`)
   is unchanged; mid-turn, `poll` compares `budget.in_flight` against the remaining cap and
   stops the session, settling the turn as `turn_budget_exhausted` exactly as the CLI's own

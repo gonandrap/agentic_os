@@ -433,3 +433,20 @@ What the surfaces render, with no change to any of them:
    `red_ci_returns` inherits the rest), `0` is accepted and disables the branch, `-1` is a
    `CatalogError` naming the key, and a round stamped with an older config version is
    judged under the bound it was opened with.
+
+## 9. A head red only where the base is red is judged, not returned (issue 1074)
+
+The return in §3.2 asks the worker to fix something. When the default branch is itself
+red, a branch that inherits the break cannot fix it, and every return costs a worker turn
+until the cap. So the round reads the stored red-base fact (`daemon.read_base_red`, the
+same fresh `base_health` reading `automerge.decide` holds merges on) and, when every
+finished-red check on the pull request is in that fact's workflow
+(`evidence.ci_inherited`, matched on workflow as `decide`'s rider is), it does not return.
+The round goes to the seats with `EvidencePacket.base_red` set, rendered under the CI
+section, telling them the red is the base's and is tracked separately.
+
+- A red check in any OTHER workflow is the branch's own and is still returned.
+- No red-base fact, a stale one, or one without a workflow: §3.2 unchanged.
+- The merge itself still waits: `decide` holds on `base_red` until main is green.
+- §5.1's exemption covers an inherited red as it covers a green head, so an unchanged
+  resubmission after an earlier `red_ci` return is not escalated as a repeat.

@@ -1257,8 +1257,8 @@ MESSAGE_AUTHOR_USER = "user"
 # A dependency is satisfied only when it reaches `completed`
 DEPENDENCY_SATISFIED_STATUS = "completed"
 
-#: A planner parked here behind its `pr_url` has a spec not yet on the default branch
-SPEC_PR_OPEN_STATUSES = ("validating", "waiting_pr_merge", "needs_review")
+#: Planner with `pr_url` in any open status has its spec unmerged, rework included (docs/superpowers/specs/2026-11-01-a-held-spec-is-re-read-until-it-merges.md §1)
+SPEC_PR_OPEN_STATUSES = OPEN_STATUSES
 
 # ...and these are the statuses from which it can never get there
 DEPENDENCY_DEAD_STATUSES = ("cancelled", "failed")
@@ -2163,6 +2163,21 @@ class ProjectStore:
         rows = self.conn.execute(
             f"SELECT * FROM work_orders WHERE status IN ({marks}) AND bill_json IS NULL"
             " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def resettled_sealed_orders(self, *, feature: bool = False,
+                                limit: int = 2) -> list[dict[str, Any]]:
+        """Settled orders whose bill was sealed BEFORE their last settlement — reopened since (#870)"""
+        table, kind = ("feature_orders", "fo") if feature else ("work_orders", "wo")
+        terminal = FO_TERMINAL_STATUSES if feature else TERMINAL_STATUSES
+        marks = ", ".join("?" for _ in terminal)
+        rows = self.conn.execute(
+            f"SELECT o.* FROM {table} o WHERE o.status IN ({marks})"
+            " AND o.bill_json IS NOT NULL AND o.bill_sealed_at < ("
+            "   SELECT MAX(s.ts) FROM wo_state_spans s WHERE s.order_id=o.id"
+            f"  AND s.order_kind=? AND s.to_status IN ({marks}))"
+            " ORDER BY o.updated_at LIMIT ?",
+            (*terminal, kind, *terminal, limit)).fetchall()
         return [dict(r) for r in rows]
 
     def settled_release_orders(self, since: float,
