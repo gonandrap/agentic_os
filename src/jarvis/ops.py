@@ -7162,7 +7162,7 @@ def resolve_ref(ref: str) -> str:
     from . import morpheus
 
     if morpheus.is_monitoring_order_id(rid):
-        return f"/morpheus/{rid}"
+        return f"/mo/{rid}"
     return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"/{rid}"
 
 
@@ -16446,6 +16446,38 @@ def morpheus_detail(item_id: str) -> dict[str, Any]:
         "handoff": {"kind": kind, "ref": "" if kind == "none" else rest,
                     "why": rest if kind == "none" else ""},
     }
+
+
+def mo_create(project: str, title: str, prompt: str = "", script: str = "",
+              every_minutes: int | None = None,
+              deadline_days: float | None = None) -> dict[str, Any]:
+    """The user's own monitoring order (docs/superpowers/specs/2026-11-01-monitoring-orders.md §5)"""
+    from . import morpheus
+
+    if not project:
+        raise OpsError("a monitoring order needs a project")
+    project = _morpheus_project(_morpheus_catalog(), project)
+    central = CentralStore()
+    try:
+        return morpheus.create(central, project=project, title=title, prompt=prompt,
+                               script=script, every_minutes=every_minutes,
+                               deadline_days=deadline_days, origin="user")
+    except ValueError as e:
+        raise OpsError(str(e)) from e
+    finally:
+        central.close()
+
+
+def mo_cancel(item_id: str) -> dict[str, Any]:
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.cancel(central, item_id)
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
 
 
 def morpheus_enqueue_release(tag: str, from_ref: str | None = None,
