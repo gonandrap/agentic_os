@@ -188,6 +188,21 @@ def precondition_hold_spans(rows: Iterable[Any], since: float,
     return sorted(spans)
 
 
+def dependency_hold_spans(dep_transitions: Iterable[Iterable[Any]], created_at: float,
+                          since: float, now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` a since-completed dependency held this order (issue 1488)"""
+    spans: list[tuple[float, float]] = []
+    for rows in dep_transitions:
+        done = next((float(r["ts"]) for r in rows
+                     if r["to_status"] == DEPENDENCY_SATISFIED_STATUS), None)
+        if done is None:
+            continue  # live edges are the exclusion's; a dead one stays judged
+        start, end = max(float(created_at or 0.0), since), min(done, now)
+        if end > start:
+            spans.append((start, end))
+    return sorted(spans)
+
+
 # What one seat proposed
 VALIDATION_VERDICTS = ("pass", "reject", "")
 # ...and whether that seat's opinion is usable at all

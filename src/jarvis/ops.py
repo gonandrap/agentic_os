@@ -8662,6 +8662,20 @@ def _script_wrong_rewrite(item_id: str, inv_id: str,
         central.close()
 
 
+def _rewrite_ask(item_id: str, script_fix: str) -> dict[str, Any]:
+    """The user's half of a SCRIPT_WRONG past its cap, `--why` pre-filled (#1481)"""
+    import shlex
+
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id) or {}
+    finally:
+        central.close()
+    # shlex, never double quotes: a script_fix quoting code carries backticks the shell would run
+    return {"item": item_id, "pr_number": item.get("pr_number"),
+            "command": f"jarvis morpheus rewrite {item_id} --why {shlex.quote(script_fix)}"}
+
+
 def investigation_chain(name: str, path: Path, fo: Mapping[str, Any]) -> dict[str, Any]:
     """validation -> investigation -> issue -> fix order -> production -> re-validation (#1344)"""
     from . import morpheus
@@ -8752,7 +8766,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
                                 UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                plan_hold_spans, precondition_hold_spans,
+                                dependency_hold_spans, plan_hold_spans, precondition_hold_spans,
                                 validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -8820,11 +8834,16 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             pre_held = bool(pstore.open_preconditions(wo["id"]))
             pre_spans = precondition_hold_spans(
                 pstore.preconditions_of(wo["id"]), since, now)
+        # A WAIT ON A DEPENDENCY THAT HAS SINCE COMPLETED IS NOT STUCK (issue 1488, kn-0a222b38)
+        dep_spans = (dependency_hold_spans(
+            [pstore.state_spans(d) for d in pstore.dependencies(wo)],
+            float(wo.get("created_at") or 0.0), since, now)
+            if wo["status"] == "pending" else [])
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
             + ci_spans + base_red_spans + plan_spans + automerge_spans
-            + budget_spans + pre_spans)
+            + budget_spans + pre_spans + dep_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9118,6 +9137,8 @@ def submit_verdict(inv_id: str, doc: Any,
     if verdict["classification"] == "SCRIPT_WRONG":
         settled, verdict["rewrite"] = _script_wrong_rewrite(morpheus_item_id, inv_id, verdict)
         escalate = not settled
+        if escalate:
+            verdict["rewrite_ask"] = _rewrite_ask(morpheus_item_id, verdict["script_fix"])
 
     classification = verdict["classification"]
     store = ProjectStore(path)
