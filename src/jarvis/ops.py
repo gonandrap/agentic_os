@@ -2472,6 +2472,19 @@ def fix_flag_notice(flag: str) -> str | None:
     return FIX_FLAG_NOTICES.get(flag)
 
 
+#: Words that carry no decision; `test` is absent on purpose — real assumptions name tests (issue 1097)
+_FILLER_WORDS = frozenset({"probe", "probing", "dummy", "placeholder", "filler",
+                           "foo", "bar", "baz", "lorem", "ipsum", "asdf", "xxx"})
+_PROBE_OPENER = re.compile(r"\s*(?:test(?:ing)?\s+)?prob(?:e|ing)\b", re.IGNORECASE)
+
+
+def content_free_assumption(content: str) -> bool:
+    """True for a body that records no decision — a hook probe, filler (issue 1097)"""
+    words = re.findall(r"[a-z0-9]+", content.lower())
+    if len(set(words)) < 5 or _PROBE_OPENER.match(content):        return True
+    return len(words) < 15 and 3 * sum(w in _FILLER_WORDS for w in words) >= len(words)
+
+
 def assume(wo_id: str, content: str) -> dict[str, Any]:
     """Record an assumption: DB row + ASSUMPTIONS.md append + conditional review flag (#711)"""
     from . import sections
@@ -2487,6 +2500,12 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
             f"alternative you rejected and why. Split it: a second decision is a "
             f"second `jarvis wo assume`, and cite this one in that one by its `#n` "
             f"(e.g. `per assumption #2`). Nothing was recorded.")
+    if content_free_assumption(content):
+        raise OpsError(
+            "that assumption records no decision — state the option you took, the "
+            "alternative you rejected and why. To probe a hook or verb, use the test "
+            "suite or a read-only command such as `jarvis search`, never `jarvis wo "
+            "assume` on your live order. Nothing was recorded.")
     _cited_blocks(name, path, wo, content)
     cited = _section_blocks(path, wo, content)
     store = ProjectStore(path)

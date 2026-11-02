@@ -151,7 +151,7 @@ def test_a_pending_assumption_is_not_buried_by_a_retry(daemon, project):
     """§5: `wo ack` and `wo done` refuse on one; a retry buries nothing, so it is told rather than blocked"""
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
-    ops.assume(wo["id"], "the exporter writes CSV")
+    ops.assume(wo["id"], "the exporter writes CSV (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "failed")
