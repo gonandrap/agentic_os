@@ -847,6 +847,28 @@ def test_a_queued_pr_wakes_one_turn_that_spawns_subagents(central, tmp_path):
     assert all(c["resume"] for c in turn.calls[1:])
 
 
+def test_a_resumed_turn_records_its_own_dollars_not_the_session_total(central, tmp_path):
+    """#1462: the envelope's cost is a session running total; each turn bills its delta"""
+    totals = iter([(47.23, 300_000), (56.59, 360_000)])
+
+    def turn(prompt, session_id, **kw):
+        cost, read = next(totals)
+        envelope = {"session_id": session_id, "total_cost_usd": cost,
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "modelUsage": {"claude-sonnet-5-5": {
+                        "inputTokens": 100, "outputTokens": 50, "cacheReadInputTokens": read,
+                        "cacheCreationInputTokens": 0, "costUSD": cost}}}
+        usage = claude_cli.derive_turn_usage(envelope, kw.get("previous"))
+        return claude_cli.HeadlessResult(text="ok", usage=usage, session_id=session_id)
+
+    queued(central, 2, body("Watch the inbox."))
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn) == "scripts"
+    assert morpheus.wake(central, catalog(), tmp_path,
+                         now=TEST_EPOCH + morpheus.REOFFER_SECONDS + 1, call=turn) == "scripts"
+    rows = central.conn.execute("SELECT cost_usd FROM agent_calls ORDER BY id").fetchall()
+    assert [round(r["cost_usd"], 2) for r in rows] == [47.23, 9.36]
+
+
 def test_past_the_compact_share_the_next_turn_is_a_compaction(central, tmp_path):
     turn = FakeTurn(share=0.31)
     queued(central, 2)
