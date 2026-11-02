@@ -233,6 +233,45 @@ def test_a_turn_parked_on_a_queued_message_is_reaped(bg_fleet, fake_claude, monk
     assert worker_session.delivery_hold(store, store.get_work_order(wo["id"])) is None
 
 
+def test_a_busy_session_whose_state_is_done_is_reaped(bg_fleet, fake_claude, monkeypatch):
+    """`busy` + `state: done`, quiet since its Stop: the turn is over, status is stale (#1476)"""
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    gate = fake_claude.hold_turns()
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    sid = store.get_work_order(wo["id"])["session_id"]
+    store.add_event(wo["id"], "hook:Stop", {"last_assistant_message": "Finished."})
+    monkeypatch.setattr(worker_session, "BG_IDLE_GRACE", 0.0)
+
+    # `working` is a task in flight (fact 10): held open
+    worker_session.poll(store)
+    assert worker_session.busy(store, wo["id"])
+
+    fake_claude.set_session_state(sid, "done")
+    worker_session.poll(store)
+    gate.unlink()
+
+    assert worker_session.busy(store, wo["id"]) is None
+    turn = store.latest_turn(wo["id"])
+    assert turn["state"] == "done" and turn["result"] == "Finished."
+
+
+def test_a_busy_done_session_with_no_stop_this_turn_stays_open(bg_fleet, fake_claude,
+                                                               monkeypatch):
+    """A `done` left over from the last turn is not this turn's end"""
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    gate = fake_claude.hold_turns()
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    monkeypatch.setattr(worker_session, "BG_IDLE_GRACE", 0.0)
+    fake_claude.set_session_state(store.get_work_order(wo["id"])["session_id"], "done")
+
+    worker_session.poll(store)
+
+    assert worker_session.busy(store, wo["id"])
+    gate.unlink()
+
+
 def test_a_parked_turn_that_called_the_api_after_its_stop_stays_open(bg_fleet, fake_claude,
                                                                      monkeypatch):
     """A finishing task wakes the session (fact 9): that is work, not a park"""
