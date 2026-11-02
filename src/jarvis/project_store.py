@@ -1164,6 +1164,8 @@ ADDED_COLUMNS = {
         "pending_at": "REAL",
         # THE BASE THIS REQUEST WAS FILED AGAINST — spec 2026-09-28 §3.5
         "base_oid": "TEXT NOT NULL DEFAULT ''",
+        # The queued APPROVED message: grant clock restarts when it is delivered (issue 40)
+        "verdict_msg_id": "INTEGER",
     },
     # An alarm can name a FEATURE ORDER as its subject and a health probe as its source (docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §1.)
     "health_reviews": {
@@ -3090,10 +3092,22 @@ class ProjectStore:
 
     def claim_message(self, msg_id: int) -> bool:
         """Mark one QUEUED message delivered; False when someone else already took it"""
+        now = db.now()
         cur = self.conn.execute(
             "UPDATE wo_messages SET status='delivered', delivered_at=? "
-            "WHERE id=? AND status='queued'", (db.now(), msg_id))
+            "WHERE id=? AND status='queued'", (now, msg_id))
+        if cur.rowcount == 1:
+            self._start_grant_clock(msg_id, now)
         return cur.rowcount == 1
+
+    def _start_grant_clock(self, msg_id: int, delivered_at: float) -> None:
+        """Grant TTL runs from verdict delivery; decision time stays the floor (issue 40)"""
+        from .gates import GRANT_TTL_SECONDS
+
+        self.conn.execute(
+            "UPDATE approvals SET expires_at=MAX(COALESCE(expires_at, 0), ?) "
+            "WHERE verdict_msg_id=? AND status='approved'",
+            (delivered_at + GRANT_TTL_SECONDS, msg_id))
 
     def record_agent_reply(self, wo_id: str, content: str, source: str = "worker") -> int:
         """Persist a worker's final assistant message into the work order record"""
@@ -3120,10 +3134,13 @@ class ProjectStore:
         return db.rows_to_dicts(rows)
 
     def mark_message(self, msg_id: int, status: str) -> None:
+        now = db.now()
         self.conn.execute(
             "UPDATE wo_messages SET status=?, delivered_at=? WHERE id=?",
-            (status, db.now() if status == "delivered" else None, msg_id),
+            (status, now if status == "delivered" else None, msg_id),
         )
+        if status == "delivered":
+            self._start_grant_clock(msg_id, now)
 
     def deliverable_messages(self, wo_id: str | None = None) -> list[dict[str, Any]]:
         """`queued_messages` minus the ones held by a delivery backoff"""
@@ -4128,6 +4145,11 @@ class ProjectStore:
         )
         return self.get_approval(approval_id)  # type: ignore[return-value]
 
+    def link_verdict_message(self, approval_id: int, msg_id: int) -> None:
+        """Tie a grant to the message that tells the worker about it (issue 40)"""
+        self.conn.execute("UPDATE approvals SET verdict_msg_id=? WHERE id=?",
+                          (msg_id, approval_id))
+
     def supersede_approval(self, approval_id: int, reason: str) -> dict[str, Any]:
         """Close a pending request that no longer has an answer worth giving"""
         approval = self.get_approval(approval_id)
@@ -4160,9 +4182,18 @@ class ProjectStore:
             return approval
         if approval["uses"] >= approval["max_uses"]:
             return None
-        if approval["expires_at"] is not None and db.now() > approval["expires_at"]:
+        if (approval["expires_at"] is not None and db.now() > approval["expires_at"]
+                and not self._verdict_undelivered(approval)):
             return None
         return approval
+
+    def _verdict_undelivered(self, approval: dict[str, Any]) -> bool:
+        """The worker has not been told of this grant yet, so its clock has not started"""
+        if not approval.get("verdict_msg_id"):
+            return False
+        row = self.conn.execute("SELECT status FROM wo_messages WHERE id=?",
+                                (approval["verdict_msg_id"],)).fetchone()
+        return row is not None and row["status"] == "queued"
 
     def consume_grant(self, approval_id: int) -> dict[str, Any]:
         """Spend one use of a grant"""
@@ -4237,7 +4268,10 @@ class ProjectStore:
         lapsed = self.conn.execute(
             """UPDATE approvals SET status='expired', closed_as='lapsed'
                WHERE status='approved'
-                 AND (uses >= max_uses OR (expires_at IS NOT NULL AND expires_at < ?))""",
+                 AND (uses >= max_uses OR (expires_at IS NOT NULL AND expires_at < ?
+                      AND NOT EXISTS (SELECT 1 FROM wo_messages m
+                                      WHERE m.id=approvals.verdict_msg_id
+                                        AND m.status='queued')))""",
             (db.now(),),
         )
         return spent.rowcount + lapsed.rowcount

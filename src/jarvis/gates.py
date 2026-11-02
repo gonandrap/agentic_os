@@ -908,8 +908,8 @@ def approved_message(approval: dict[str, Any], reason: str, by: str) -> str:
         f"[Gate {approval['id']} APPROVED by {by}] {reason}\n\n"
         f"Run this command again, exactly as written, and it will go through:\n"
         f"    {approval['command']}\n\n"
-        f"The approval covers this command only, for the next "
-        f"{GRANT_TTL_SECONDS // 60} minutes. Anything else still needs its own request."
+        f"The approval covers this command only, for {GRANT_TTL_SECONDS // 60} minutes "
+        f"from when this message reached you. Anything else still needs its own request."
     )
 
 
@@ -1049,7 +1049,9 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
         message = (dismissed_message(approval, reason, decided_by, learned)
                    if verdict == "dismissed"
                    else _VERDICT_MESSAGE[verdict](approval, reason, decided_by))
-        store.queue_message(approval["wo_id"], message, source="gate")
+        msg_id = store.queue_message(approval["wo_id"], message, source="gate")
+        if verdict == "approved":
+            store.link_verdict_message(approval_id, msg_id)
     if verdict == "dismissed":
         store.add_event(approval["wo_id"], "gate_dismissed", {
             "approval_id": approval_id,
