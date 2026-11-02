@@ -461,6 +461,14 @@ def test_a_fourth_stakes_classifier_value_is_refused_loudly():
         assert legal in message
 
 
+def test_high_stakes_hold_defaults_to_the_user_and_refuses_a_typo():
+    """#1366: `neo` opts in; anything but user|neo is refused"""
+    assert validation_of({}).high_stakes_hold == "user"
+    assert validation_of({"high_stakes_hold": "neo"}).high_stakes_hold == "neo"
+    with pytest.raises(CatalogError, match="never"):
+        validation_of({"high_stakes_hold": "never"})
+
+
 def test_a_project_inherits_the_fleet_stakes_classifier_and_may_override_it():
     """The ordinary field-level fallback: a project naming one key keeps the rest"""
     quiet, loud = projects_validation({"stakes_classifier": "shadow"},
