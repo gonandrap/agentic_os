@@ -1002,9 +1002,8 @@ def test_a_release_lifted_hold_starts_the_kill_count_again(central, tmp_path):
     kill_until_held(central, tmp_path)
     central.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.2")
     # Lifted on a pass with nothing to do: the reset is kept all the same
-    for item in central.conn.execute("SELECT id FROM morpheus_items").fetchall():
-        central.conn.execute("UPDATE morpheus_items SET state='validated' WHERE id=?",
-                             (item["id"],))
+    for item in central.morpheus_items():
+        central.update_morpheus_item(item["id"], state="validated")
     assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60,
                          call=FakeTurn()) == "idle"
     assert morpheus.session_state(central)["kills"] == 0
@@ -1467,3 +1466,156 @@ def test_a_failed_item_offers_all_three_decisions_and_links_its_neo_question(cen
     page = client.get(f"/morpheus/{item['id']}").text
     for verb in ("confirm", "waive", "requeue"):
         assert f'action="/morpheus/{item["id"]}/{verb}"' in page
+
+
+# -- monitoring orders: the record (docs/superpowers/specs/2026-11-01-monitoring-orders.md §2)
+
+# `morpheus_items` exactly as releases before monitoring orders shipped it
+OLD_MORPHEUS_ITEMS_DDL = """
+CREATE TABLE morpheus_items (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL,
+    pr_url TEXT NOT NULL DEFAULT '',
+    pr_title TEXT NOT NULL DEFAULT '',
+    wo_id TEXT NOT NULL DEFAULT '',
+    release_tag TEXT NOT NULL DEFAULT '',
+    hints TEXT NOT NULL DEFAULT '',
+    script TEXT NOT NULL DEFAULT '',
+    script_source TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    created_ts REAL NOT NULL,
+    updated_ts REAL NOT NULL,
+    deadline_ts REAL NOT NULL,
+    last_check_ts REAL,
+    next_check_ts REAL,
+    checks INTEGER NOT NULL DEFAULT 0,
+    last_exit INTEGER,
+    last_output TEXT NOT NULL DEFAULT '',
+    resolution TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    action_ts REAL,
+    auto_requeues INTEGER NOT NULL DEFAULT 0,
+    last_check_version TEXT NOT NULL DEFAULT '',
+    script_rewrites INTEGER NOT NULL DEFAULT 0,
+    rewrite_brief TEXT NOT NULL DEFAULT '',
+    UNIQUE (repo, pr_number)
+);
+CREATE INDEX idx_morpheus_items_state ON morpheus_items(state);
+CREATE TABLE IF NOT EXISTS os_state (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def _old_home() -> Path:
+    import sqlite3
+
+    from jarvis.paths import central_db_path
+
+    path = central_db_path()  # a fixture may have opened it with today's SCHEMA: undo that
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE IF EXISTS monitoring_orders")
+    conn.executescript(OLD_MORPHEUS_ITEMS_DDL)
+    rows = [("mv-aaaa1111", "jarvis_os", 7, "jarvis-0.1.1", "queued", "", 0),
+            ("mv-bbbb2222", "proj_a", 8, "", "failed", "neo:12", 1)]
+    for item_id, project, n, tag, state, action, exit_code in rows:
+        conn.execute("INSERT INTO morpheus_items (id, project, repo, pr_number, release_tag, "
+                     "state, action, last_exit, created_ts, updated_ts, deadline_ts) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     (item_id, project, "o/r", n, tag, state, action, exit_code,
+                      TEST_EPOCH, TEST_EPOCH, TEST_EPOCH + DAY))
+    session = {"turns": 3, "offers": {"mv-aaaa1111": {"n": 2, "ts": TEST_EPOCH + 5,
+                                                      "cause": "offer"}}}
+    conn.execute("INSERT OR REPLACE INTO os_state (key, value) VALUES (?, ?)",
+                 (morpheus.SESSION_KEY, json.dumps(session)))
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _tables(central) -> set[str]:
+    return {r["name"] for r in central.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def test_an_old_home_moves_into_monitoring_orders_once(cfg):
+    _old_home()
+    central = CentralStore()
+    try:
+        assert "morpheus_items" not in _tables(central)
+        rows = {i["id"]: i for i in central.morpheus_items()}
+        assert set(rows) == {"mv-aaaa1111", "mv-bbbb2222"}
+        a, b = rows["mv-aaaa1111"], rows["mv-bbbb2222"]
+        assert (a["state"], a["attempts"], a["last_attempt_ts"], a["origin"]) == \
+            ("queued", 2, TEST_EPOCH + 5, "release")
+        assert (b["state"], b["action"], b["attempts"], b["origin"]) == \
+            ("failed", "neo:12", 0, "merge")
+        before = central.morpheus_items()
+    finally:
+        central.close()
+    again = CentralStore()
+    try:
+        assert again.morpheus_items() == before and "morpheus_items" not in _tables(again)
+        # The PR uniqueness survived the rebuild: the same PR is never queued twice
+        assert queued(again, 7) is None
+    finally:
+        again.close()
+
+
+def test_a_fresh_home_never_creates_morpheus_items(central):
+    assert "monitoring_orders" in _tables(central) and "morpheus_items" not in _tables(central)
+
+
+def test_orders_with_no_pr_coexist_and_mint_mo_ids(central):
+    a = morpheus.create(central, project="jarvis_os", title="disk", prompt="watch the disk")
+    b = morpheus.create(central, project="jarvis_os", title="cpu", script="exit 75",
+                        every_minutes=5)
+    assert a["id"] != b["id"] and all(i["id"].startswith("mo-") for i in (a, b))
+    assert a["pr_number"] is None and b["pr_number"] is None
+    assert (a["state"], a["script"], a["origin"], a["prompt"]) == \
+        ("queued", "", "user", "watch the disk")
+    assert (b["state"], b["script_source"], b["every_minutes"]) == ("monitoring", "user", 5)
+    for bad in ({}, {"prompt": "x", "script": "exit 0"}):
+        with pytest.raises(ValueError):
+            morpheus.create(central, project="jarvis_os", title="t", **bad)
+    # A release-queued PR is a mo- order too
+    assert queued(central, 9)["id"].startswith("mo-")
+
+
+def test_check_honours_the_orders_own_interval(central, cfg, tmp_path):
+    assert cfg.check_every_minutes != 7
+    own = morpheus.create(central, project="jarvis_os", title="t", script="exit 75",
+                          every_minutes=7)
+    default = monitoring(central)
+    for item in (own, default):
+        morpheus.check(central, cfg, central.morpheus_item(item["id"]), tmp_path,
+                       now=TEST_EPOCH, run=_run(75), version=lambda where: "")
+    assert central.morpheus_item(own["id"])["next_check_ts"] == TEST_EPOCH + 7 * 60
+    assert central.morpheus_item(default["id"])["next_check_ts"] == \
+        TEST_EPOCH + cfg.check_every_minutes * 60
+
+
+def test_cancel_stops_an_open_order_and_sweep_leaves_it(central, cfg, tmp_path):
+    item = monitoring(central)
+    control = queued(central, 8)
+    for i in (item, control):
+        central.update_morpheus_item(i["id"], deadline_ts=TEST_EPOCH - 1)
+    done = morpheus.cancel(central, item["id"])
+    assert (done["state"], done["next_check_ts"]) == ("cancelled", None)
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH, run=_run(0))
+    # The control proves sweep would have moved an overdue open order
+    assert central.morpheus_item(control["id"])["state"] == "timedout"
+    assert central.morpheus_item(item["id"])["state"] == "cancelled"
+    with pytest.raises(ValueError):
+        morpheus.cancel(central, item["id"])
+    # A cancelled PR is never queued again: a release adds only PRs it has not seen
+    assert queued(central) is None
+    assert "cancelled" in morpheus.TERMINAL_STATES and "cancelled" not in morpheus.ACTION_STATES
+
+
+@pytest.mark.parametrize("value,expected", [("mv-1234abcd", True), ("mo-1234abcd", True),
+                                            ("fo-1234abcd", False), ("wo-1234abcd", False),
+                                            (None, False)])
+def test_one_predicate_names_a_monitoring_order(value, expected):
+    assert morpheus.is_monitoring_order_id(value) is expected

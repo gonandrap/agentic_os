@@ -557,12 +557,12 @@ CREATE TABLE IF NOT EXISTS steward_decisions (
     queue_note TEXT NOT NULL DEFAULT '',
     queue_ts REAL
 );
--- Morpheus's queue: one shipped PR being validated in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
-CREATE TABLE IF NOT EXISTS morpheus_items (
-    id TEXT PRIMARY KEY,                    -- mv-xxxxxxxx
+-- Morpheus's monitoring orders: a shipped PR, or anything else watched in production (docs/superpowers/specs/2026-11-01-monitoring-orders.md §2)
+CREATE TABLE IF NOT EXISTS monitoring_orders (
+    id TEXT PRIMARY KEY,                    -- mo-xxxxxxxx; older rows keep mv-
     project TEXT NOT NULL DEFAULT '',       -- the onboarded project the PR belongs to
     repo TEXT NOT NULL DEFAULT '',          -- owner/name
-    pr_number INTEGER NOT NULL,
+    pr_number INTEGER,                      -- NULL for an order that watches no PR
     pr_url TEXT NOT NULL DEFAULT '',
     pr_title TEXT NOT NULL DEFAULT '',
     wo_id TEXT NOT NULL DEFAULT '',         -- the work order the PR title names, if any
@@ -570,7 +570,7 @@ CREATE TABLE IF NOT EXISTS morpheus_items (
     hints TEXT NOT NULL DEFAULT '',         -- the PR's validation section, verbatim
     script TEXT NOT NULL DEFAULT '',
     script_source TEXT NOT NULL DEFAULT '', -- agent | user
-    state TEXT NOT NULL,                    -- queued | monitoring | validated | failed | timedout
+    state TEXT NOT NULL,                    -- queued | monitoring | validated | failed | timedout | cancelled
     created_ts REAL NOT NULL,
     updated_ts REAL NOT NULL,
     deadline_ts REAL NOT NULL,
@@ -586,9 +586,19 @@ CREATE TABLE IF NOT EXISTS morpheus_items (
     last_check_version TEXT NOT NULL DEFAULT '',  -- what production ran at the last check (#1301)
     script_rewrites INTEGER NOT NULL DEFAULT 0,  -- scripts Neo's verdict sent back to be rewritten (#1358)
     rewrite_brief TEXT NOT NULL DEFAULT '',  -- why the last script was wrong, for the rewrite
-    UNIQUE (repo, pr_number)
+    title TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL DEFAULT '',        -- release | merge | user | investigation | steward
+    prompt TEXT NOT NULL DEFAULT '',        -- what to monitor, for an order with no PR
+    every_minutes INTEGER,                  -- NULL = os.morpheus.check_every_minutes
+    attempts INTEGER NOT NULL DEFAULT 0,    -- failed sessions for the step now owed
+    kills INTEGER NOT NULL DEFAULT 0,
+    last_attempt_ts REAL,
+    last_session_id TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_morpheus_items_state ON morpheus_items(state);
+CREATE INDEX IF NOT EXISTS idx_monitoring_orders_state ON monitoring_orders(state);
+-- One order per PR, ever; an order with no PR is never a duplicate
+CREATE UNIQUE INDEX IF NOT EXISTS idx_monitoring_orders_pr
+    ON monitoring_orders(repo, pr_number) WHERE pr_number IS NOT NULL;
 -- One row per script run of an item, newest MORPHEUS_RUNS_KEPT kept (docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §3)
 CREATE TABLE IF NOT EXISTS morpheus_runs (
     id INTEGER PRIMARY KEY,
@@ -646,17 +656,6 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 
 # Columns added after the first release, exactly as in `neo_store` and `project_store`
 ADDED_COLUMNS = {
-    "morpheus_items": {
-        # A home that ran this table before items were per project
-        "project": "TEXT NOT NULL DEFAULT ''",
-        # …and before Neo's verdict could act on an item (issue #1254)
-        "auto_requeues": "INTEGER NOT NULL DEFAULT 0",
-        # …and before a check recorded the version it ran on (issue #1301)
-        "last_check_version": "TEXT NOT NULL DEFAULT ''",
-        # …and before a wrong script could be sent back to be rewritten (issue #1358)
-        "script_rewrites": "INTEGER NOT NULL DEFAULT 0",
-        "rewrite_brief": "TEXT NOT NULL DEFAULT ''",
-    },
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
         "paired_reason": "TEXT",
@@ -741,6 +740,35 @@ class CentralStore:
     def _migrate(self) -> None:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
         self.conn.executescript(POST_MIGRATION_SCHEMA)
+        self._rebuild_morpheus_items()
+
+    def _rebuild_morpheus_items(self) -> None:
+        """Move `morpheus_items` into `monitoring_orders`, once (docs/superpowers/specs/2026-11-01-monitoring-orders.md §2)"""
+        def old_table() -> bool:
+            return self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                     "AND name='morpheus_items'").fetchone() is not None
+        if not old_table():
+            return
+        with db.write_transaction(self.conn):
+            if not old_table():  # a concurrent opener moved it first
+                return
+            have = {r["name"] for r in self.conn.execute("PRAGMA table_info(morpheus_items)")}
+            want = {r["name"] for r in self.conn.execute("PRAGMA table_info(monitoring_orders)")}
+            cols = ", ".join(sorted(have & want))
+            self.conn.execute(f"INSERT OR IGNORE INTO monitoring_orders ({cols}) "
+                              f"SELECT {cols} FROM morpheus_items")
+            self.conn.execute("UPDATE monitoring_orders SET origin = CASE WHEN release_tag != '' "
+                              "THEN 'release' ELSE 'merge' END WHERE origin = ''")
+            try:  # morpheus.SESSION_KEY: the offer count the long-lived session kept
+                offers = json.loads(self.get_state("morpheus.session") or "{}").get("offers") or {}
+            except (ValueError, AttributeError):
+                offers = {}
+            for item_id, seen in offers.items() if isinstance(offers, dict) else ():
+                if isinstance(seen, dict):
+                    self.conn.execute(
+                        "UPDATE monitoring_orders SET attempts=?, last_attempt_ts=? WHERE id=?",
+                        (int(seen.get("n") or 0), seen.get("ts"), item_id))
+            self.conn.execute("DROP TABLE morpheus_items")
 
     def _ensure_fts(self) -> bool:
         """Create the search index and backfill it once (docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §4)"""
@@ -995,7 +1023,7 @@ class CentralStore:
     def live_rows_by_project(self) -> list[tuple[str, str, int]]:
         """(table, project, count) of rows the OS would still act on (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.3)"""
         live = {
-            "morpheus_items": "state IN ('queued', 'monitoring')",
+            "monitoring_orders": "state IN ('queued', 'monitoring')",
             # '' is fleet-wide and names no project
             "detectors": "status = 'armed' AND retired_at IS NULL AND project != ''",
             "rule_fires": "cleared_at IS NULL",
@@ -2335,27 +2363,29 @@ class CentralStore:
 
     # -- morpheus: production validation of shipped PRs
 
-    def add_morpheus_item(self, *, project: str, repo: str, pr_number: int, pr_url: str, pr_title: str,
-                          wo_id: str, release_tag: str, hints: str, script: str,
+    def add_morpheus_item(self, *, project: str, repo: str, pr_number: int | None, pr_url: str,
+                          pr_title: str, wo_id: str, release_tag: str, hints: str, script: str,
                           script_source: str, state: str, deadline_ts: float,
-                          resolution: str = "", now: float | None = None
-                          ) -> dict[str, Any] | None:
-        """Queue one PR; None when that PR is already queued (one item per PR, ever)"""
+                          resolution: str = "", title: str = "", origin: str = "",
+                          prompt: str = "", every_minutes: int | None = None,
+                          now: float | None = None) -> dict[str, Any] | None:
+        """Add one monitoring order; None when its PR already has one (one order per PR, ever)"""
         ts = db.now() if now is None else now
-        item_id = db.new_id("mv")
+        item_id = db.new_id("mo")
         cur = self.conn.execute(
-            """INSERT OR IGNORE INTO morpheus_items
+            """INSERT OR IGNORE INTO monitoring_orders
                (id, project, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints,
                 script, script_source, state, created_ts, updated_ts, deadline_ts,
-                next_check_ts, resolution)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                next_check_ts, resolution, title, origin, prompt, every_minutes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (item_id, project, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints,
              script, script_source, state, ts, ts, deadline_ts,
-             ts if state == "monitoring" else None, resolution))
+             ts if state == "monitoring" else None, resolution, title, origin, prompt,
+             every_minutes))
         return self.morpheus_item(item_id) if cur.rowcount else None
 
     def morpheus_item(self, item_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute("SELECT * FROM morpheus_items WHERE id=?",
+        row = self.conn.execute("SELECT * FROM monitoring_orders WHERE id=?",
                                 (item_id,)).fetchone()
         return dict(row) if row else None
 
@@ -2367,24 +2397,25 @@ class CentralStore:
             where = f"WHERE state IN ({','.join('?' * len(states))})"
             params = list(states)
         return db.rows_to_dicts(self.conn.execute(
-            f"SELECT * FROM morpheus_items {where} ORDER BY created_ts DESC, pr_number DESC "
+            f"SELECT * FROM monitoring_orders {where} ORDER BY created_ts DESC, pr_number DESC "
             f"LIMIT ?", (*params, limit)).fetchall())
 
     def morpheus_counts(self) -> dict[str, int]:
         return {r["state"]: r["n"] for r in self.conn.execute(
-            "SELECT state, COUNT(*) AS n FROM morpheus_items GROUP BY state").fetchall()}
+            "SELECT state, COUNT(*) AS n FROM monitoring_orders GROUP BY state").fetchall()}
 
     def update_morpheus_item(self, item_id: str, **fields: Any) -> None:
         """Write the named columns, stamping `updated_ts`"""
         allowed = {"script", "script_source", "state", "deadline_ts", "last_check_ts",
                    "next_check_ts", "checks", "last_exit", "last_output", "resolution",
                    "last_check_version", "rewrite_brief",
-                   "action", "action_ts", "hints"}
+                   "action", "action_ts", "hints",
+                   "attempts", "kills", "last_attempt_ts", "last_session_id"}
         bad = set(fields) - allowed
         assert not bad, bad
         fields["updated_ts"] = db.now()
         cols = ", ".join(f"{k}=?" for k in fields)
-        self.conn.execute(f"UPDATE morpheus_items SET {cols} WHERE id=?",
+        self.conn.execute(f"UPDATE monitoring_orders SET {cols} WHERE id=?",
                           (*fields.values(), item_id))
 
     def add_morpheus_run(self, item_id: str, *, exit: int | None, output: str,
@@ -2410,21 +2441,21 @@ class CentralStore:
     def claim_morpheus_action(self, item_id: str, action: str) -> bool:
         """Record the action ONCE: False when another pass already took it"""
         cur = self.conn.execute(
-            "UPDATE morpheus_items SET action=?, action_ts=?, updated_ts=? "
+            "UPDATE monitoring_orders SET action=?, action_ts=?, updated_ts=? "
             "WHERE id=? AND action=''", (action, db.now(), db.now(), item_id))
         return cur.rowcount == 1
 
     def claim_morpheus_auto_requeue(self, item_id: str, limit: int) -> bool:
         """Spend one automatic requeue: False once the item has spent `limit` of them"""
         cur = self.conn.execute(
-            "UPDATE morpheus_items SET auto_requeues=auto_requeues+1, updated_ts=? "
+            "UPDATE monitoring_orders SET auto_requeues=auto_requeues+1, updated_ts=? "
             "WHERE id=? AND auto_requeues<?", (db.now(), item_id, limit))
         return cur.rowcount == 1
 
     def claim_morpheus_script_rewrite(self, item_id: str, limit: int) -> bool:
         """Spend one automatic script rewrite: False once the item has spent `limit` of them"""
         cur = self.conn.execute(
-            "UPDATE morpheus_items SET script_rewrites=script_rewrites+1, updated_ts=? "
+            "UPDATE monitoring_orders SET script_rewrites=script_rewrites+1, updated_ts=? "
             "WHERE id=? AND script_rewrites<?", (db.now(), item_id, limit))
         return cur.rowcount == 1
 
