@@ -881,8 +881,7 @@ Tests are per-feature files under `tests/`, named for the thing they pin
 only the TARGETED tests for what you changed — never the full suite locally: it takes ~21
 minutes, the prompt cache TTL is 5 minutes, so every full run guarantees your whole
 conversation is re-sent at the cache-write rate, and CI already runs `pytest tests -q` on
-three Python versions plus `pytest evals -q`. Cite CI for the suite. `pytest addopts` is
-already `-q`, so adding your own makes it `-qq` and prints no summary line at all.
+three Python versions plus `pytest evals -q`. Cite CI for the suite.
 
 Any fixture that exercises a jarvis `PreToolUse` hook must create a `.jarvis/` directory
 at its repo root: `hooks.find_project_root` resolves the project by it.
