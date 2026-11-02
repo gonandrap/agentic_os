@@ -2198,7 +2198,7 @@ def create_app() -> FastAPI:
 
     @app.get("/mo", response_class=HTMLResponse)
     def morpheus_page(request: Request):
-        """Monitoring orders, failures first (spec 2026-10-29 dashboard §4.1, 2026-11-01-monitoring-orders.md §6)"""
+        """Monitoring orders, failures first (docs/superpowers/specs/2026-11-01-monitoring-orders.md §6)"""
         report = ops.morpheus_report()
         every = report["items"]
         options = {"state": list(report["counts"]), "project": filter_options(every, "project")}
