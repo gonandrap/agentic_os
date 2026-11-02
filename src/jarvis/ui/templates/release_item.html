@@ -13,9 +13,10 @@
   {%- for s in ("failed", "pending", "validated", "unwatched") if counts.get(s) %} · {{ counts[s] }} {{ s }}{% endfor %}
   · cut {{ fmt_ts(d.ts) }}
 {%- endset %}
+{% set qs = "?project=" ~ (project | urlencode) if project else "" %}
 {{ ui.page_head(d.tag, meta) }}
-<p class="sub"><a href="/release">← every release</a>
-  {% if d.previous %}· previous: <a href="/release/{{ d.previous }}">{{ d.previous }}</a>{% endif %}</p>
+<p class="sub"><a href="/release{{ qs }}">← every {{ d.project }} release</a>
+  {% if d.previous %}· previous: <a href="/release/{{ d.previous }}{{ qs }}">{{ d.previous }}</a>{% endif %}</p>
 
 {% call(r) ui.needs_you(attention, "failed validation in production") %}
   {{ rel.validation(r) }} <span class="mono">{{ rel.pr(r) }}</span> {{ rel.order(r) }}
@@ -23,7 +24,7 @@
 {% endcall %}
 
 {{ ui.filter_bar("/release/" ~ d.tag, filters, options, rows | length, total,
-                 {"q": "subject, wo id or sha"}) }}
+                 {"q": "subject, wo id or sha"}, {"project": project} if project else {}) }}
 
 <div class="panel table-wrap">
   <table class="rel-list">
