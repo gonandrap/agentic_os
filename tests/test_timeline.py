@@ -92,6 +92,17 @@ def test_a_cleanup_failure_reads_as_a_sentence_and_not_a_json_dump():
     assert "{" not in entry["label"] + entry["detail"]
 
 
+def test_a_park_on_a_user_only_command_reads_as_a_sentence_and_not_a_json_dump():
+    """#1506: the park is the order's whole ending, so the timeline must say it"""
+    entry = build_timeline({}, [ev("user_action_pending", 1.0, was="validating",
+                                   command="jarvis config set p worker.launcher x")],
+                           [])[0]
+    assert entry["level"] == "signal"
+    assert entry["label"] == "Waiting on a command only you may run"
+    assert entry["detail"] == "jarvis config set p worker.launcher x"
+    assert "{" not in entry["label"] + entry["detail"]
+
+
 def test_a_merge_that_timed_out_is_not_described_as_a_cleanup():
     """The two landed shapes are separate kinds precisely so this sentence differs: a timed-out merge... (#253)"""
     entry = build_timeline({}, [ev("automerge_command_unfinished", 1.0,

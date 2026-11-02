@@ -303,6 +303,9 @@ def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
         return False
     if not wo.get("pr_url"):
         return False
+    # An order left open by its own merge has nothing left to learn from GitHub (#1506)
+    if str(wo.get("pr_state") or "") == "MERGED":
+        return False
     if recorded is not None and wo["id"] not in recorded:
         return True
     from . import ops
@@ -2402,9 +2405,7 @@ class Daemon:
                          project.name, wo_id, n)
                 return
             # NOTHING CHANGED BECAUSE THE REST IS THE USER'S TO RUN: name it (#1352)
-            finished = store.events_of_kind(wo_id, "finished")
-            needs_user = (str(db.from_json(finished[-1]["payload"], {}).get("needs_user")
-                              or "") if finished else "")
+            needs_user = ops.declared_user_action(store, wo_id)
             if empty == "escalate" and needs_user:
                 self._escalate(store, wo, round_id, n,
                                f"this submission changes no files because the rest is "
