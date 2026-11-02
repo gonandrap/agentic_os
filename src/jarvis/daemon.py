@@ -5874,6 +5874,11 @@ class Daemon:
                     drift=drift, no_ci=no_ci)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
+                # #1459: no catch-up while another merge on this base is in flight
+                queued = automerge.merge_queued(store, wo, pr)
+                if queued is not None:
+                    self._note_automerge_held(store, wo_id, queued)
+                    return
                 # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2
                 caught = self._catch_up_with_base(project, store, wo, pr)
                 if (caught.outcome == ops.CATCH_UP_DEFERRED
@@ -5961,6 +5966,11 @@ class Daemon:
             wo_id, automerge.GATE_KIND,
             automerge.merge_command(str(wo.get("pr_url") or ""), decision.judged_sha))
         if approval is None:
+            # #1459: one merge request in flight per base tip
+            queued = automerge.merge_queued(store, wo, pr)
+            if queued is not None:
+                self._note_automerge_held(store, wo_id, queued)
+                return
             # BEFORE A GRANT EXISTS AND NEVER AFTER ONE (spec 2026-09-27 §5.2)
             caught = self._catch_up_with_base(project, store, wo, pr)
             if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
