@@ -787,14 +787,14 @@ def test_the_neo_tab_decides_a_validation_question_on_its_item(central):
     item, qid = _escalated(central)
     client = TestClient(create_app())
     page = client.get("/neo")
-    assert f'action="/morpheus/{item["id"]}/waive"' in page.text
-    assert f'action="/morpheus/{item["id"]}/requeue"' in page.text
+    assert f'action="/mo/{item["id"]}/waive"' in page.text
+    assert f'action="/mo/{item["id"]}/requeue"' in page.text
     assert "Send answer to worker" not in page.text
 
-    r = client.post(f"/morpheus/{item['id']}/waive", follow_redirects=False,
+    r = client.post(f"/mo/{item['id']}/waive", follow_redirects=False,
                     data={"reason": " ", "next": "/neo#tab-escalated"})
     assert "error=" in r.headers["location"] and _status(qid) == "escalated"
-    r = client.post(f"/morpheus/{item['id']}/waive", follow_redirects=False,
+    r = client.post(f"/mo/{item['id']}/waive", follow_redirects=False,
                     data={"reason": "works", "next": "/neo#tab-escalated"})
     assert r.headers["location"] == "/neo#tab-escalated"
     assert central.morpheus_item(item["id"])["state"] == "validated"
@@ -1244,7 +1244,7 @@ def test_the_dashboard_renders_without_a_session(central):
     from jarvis.ui.app import create_app
 
     queued(central, 2)
-    page = TestClient(create_app()).get("/morpheus")
+    page = TestClient(create_app()).get("/mo")
     assert page.status_code == 200
     assert "1 owed arming" in page.text and "compaction" not in page.text
 
@@ -1397,7 +1397,7 @@ def test_the_dashboard_shows_a_link_not_the_pr_s_text(central):
     from jarvis.ui.app import create_app
 
     item = _failed(central)
-    page = TestClient(create_app()).get("/morpheus")
+    page = TestClient(create_app()).get("/mo")
     assert page.status_code == 200
     assert '<a href="https://github.com/o/r/pull/7" title="[wo-1234abcd] thing">#7</a>' \
         in page.text
@@ -1452,8 +1452,8 @@ def test_the_dashboard_links_each_item_s_id_to_its_detail(central):
 
     item = _failed(central)
     morpheus.set_pause(central, "running", "validate the release", now=TEST_EPOCH)
-    page = TestClient(create_app()).get("/morpheus")
-    assert f'<a class="rowid" href="/morpheus/{item["id"]}">{item["id"]}</a>' in page.text
+    page = TestClient(create_app()).get("/mo")
+    assert f'<a class="rowid" href="/mo/{item["id"]}">{item["id"]}</a>' in page.text
     assert "jarvis morpheus unpause" in page.text and "validate the release" in page.text
 
 
@@ -1467,7 +1467,7 @@ def test_the_dashboard_shows_the_activity_and_its_backoff_not_only_the_pause_mod
     item = queued(central, 2)
     morpheus.arm(central, catalog(), tmp_path, now=db.now(),
                  call=FakeCall(error=refused(db.now() + 4000)))
-    page = TestClient(create_app()).get("/morpheus").text
+    page = TestClient(create_app()).get("/mo").text
     assert "unpaused (follows the fleet)" in page and "(usage limit)" in page
     # The refusal cost the order nothing
     assert central.morpheus_item(item["id"])["attempts"] == 0
@@ -1481,8 +1481,8 @@ def test_check_and_output_live_on_the_detail_not_in_the_list(central):
     item = _failed(central)
     central.update_morpheus_item(item["id"], last_output="boom <x>")
     client = TestClient(create_app())
-    assert "boom" not in client.get("/morpheus").text
-    page = client.get(f"/morpheus/{item['id']}").text
+    assert "boom" not in client.get("/mo").text
+    page = client.get(f"/mo/{item['id']}").text
     assert "boom &lt;x&gt;" in page and 'id="tab-output"' in page
     assert item["script"] in page and 'id="tab-script"' in page
 
@@ -1496,12 +1496,12 @@ def test_the_list_filters_by_state_and_puts_failures_first(central):
     later = queued(central, 8)
     central.update_morpheus_item(later["id"], hints="newer than the failure")
     client = TestClient(create_app())
-    page = client.get("/morpheus").text
+    page = client.get("/mo").text
     table = page.split('class="mv-list"')[1]
     assert table.index(failed["id"]) < table.index(later["id"])
-    narrowed = client.get("/morpheus?state=queued").text.split('class="mv-list"')[1]
+    narrowed = client.get("/mo?state=queued").text.split('class="mv-list"')[1]
     assert later["id"] in narrowed and failed["id"] not in narrowed
-    assert failed["id"] not in client.get("/morpheus?state=bogus").text.split('class="mv-list"')[1]
+    assert failed["id"] not in client.get("/mo?state=bogus").text.split('class="mv-list"')[1]
 
 
 def test_a_confirmed_failure_leaves_the_needs_you_strip(central):
@@ -1511,7 +1511,7 @@ def test_a_confirmed_failure_leaves_the_needs_you_strip(central):
 
     item = _failed(central)
     central.update_morpheus_item(item["id"], resolution="confirmed failed: fix filed")
-    assert "needs-you\">" not in TestClient(create_app()).get("/morpheus").text
+    assert "needs-you\">" not in TestClient(create_app()).get("/mo").text
 
 
 def test_the_detail_shows_runs_questions_and_handoff(central):
@@ -1522,12 +1522,12 @@ def test_the_detail_shows_runs_questions_and_handoff(central):
     item, qid = _escalated(central)
     central.add_morpheus_run(item["id"], exit=1, output="tail <y>", kind="check",
                              state_after="failed")
-    page = TestClient(create_app()).get(f"/morpheus/{item['id']}").text
+    page = TestClient(create_app()).get(f"/mo/{item['id']}").text
     assert "tail &lt;y&gt;" in page
     assert f'href="/neo/question/{qid}"' in page and "escalated" in page
     assert f'Neo <a href="/neo/question/{qid}">q{qid}</a>' in page
-    assert f'action="/morpheus/{item["id"]}/confirm"' in page
-    assert f'name="next" value="/morpheus/{item["id"]}"' in page
+    assert f'action="/mo/{item["id"]}/confirm"' in page
+    assert f'name="next" value="/mo/{item["id"]}"' in page
 
 
 def test_the_detail_says_history_starts_when_checks_predate_runs(central):
@@ -1537,7 +1537,7 @@ def test_the_detail_says_history_starts_when_checks_predate_runs(central):
 
     item = _failed(central)
     central.update_morpheus_item(item["id"], checks=3)
-    page = TestClient(create_app()).get(f"/morpheus/{item['id']}").text
+    page = TestClient(create_app()).get(f"/mo/{item['id']}").text
     assert "history starts with this release" in page
 
 
@@ -1546,7 +1546,7 @@ def test_an_unknown_item_detail_is_a_404(central):
 
     from jarvis.ui.app import create_app
 
-    r = TestClient(create_app()).get("/morpheus/mv-deadbeef")
+    r = TestClient(create_app()).get("/mo/mv-deadbeef")
     assert r.status_code == 404 and "mv-deadbeef" in r.text
 
 
@@ -1556,9 +1556,9 @@ def test_a_detail_action_lands_back_on_the_detail(central):
     from jarvis.ui.app import create_app
 
     item = _failed(central)
-    r = TestClient(create_app()).post(f"/morpheus/{item['id']}/requeue", follow_redirects=False,
-                                     data={"next": f"/morpheus/{item['id']}"})
-    assert r.headers["location"] == f"/morpheus/{item['id']}"
+    r = TestClient(create_app()).post(f"/mo/{item['id']}/requeue", follow_redirects=False,
+                                     data={"next": f"/mo/{item['id']}"})
+    assert r.headers["location"] == f"/mo/{item['id']}"
 
 
 def test_a_failed_item_offers_all_three_decisions_and_links_its_neo_question(central):
@@ -1570,10 +1570,10 @@ def test_a_failed_item_offers_all_three_decisions_and_links_its_neo_question(cen
     item = _failed(central)
     central.claim_morpheus_action(item["id"], "neo:2259")
     client = TestClient(create_app())
-    assert 'Neo <a href="/neo/question/2259">q2259</a>' in client.get("/morpheus").text
-    page = client.get(f"/morpheus/{item['id']}").text
+    assert 'Neo <a href="/neo/question/2259">q2259</a>' in client.get("/mo").text
+    page = client.get(f"/mo/{item['id']}").text
     for verb in ("confirm", "waive", "requeue"):
-        assert f'action="/morpheus/{item["id"]}/{verb}"' in page
+        assert f'action="/mo/{item["id"]}/{verb}"' in page
 
 
 # -- monitoring orders: the record (docs/superpowers/specs/2026-11-01-monitoring-orders.md §2)
@@ -1733,4 +1733,80 @@ def test_go_opens_both_id_shapes_on_the_morpheus_page():
     from jarvis import ops
 
     for rid in ("mv-1234abcd", "mo-1234abcd"):
-        assert ops.resolve_ref(rid) == f"/morpheus/{rid}"
+        assert ops.resolve_ref(rid) == f"/mo/{rid}"
+
+
+# -- monitoring orders: the dashboard (docs/superpowers/specs/2026-11-01-monitoring-orders.md §6)
+
+
+def _client():
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    return TestClient(create_app())
+
+
+def test_the_old_morpheus_paths_redirect_permanently(central):
+    item = _failed(central)
+    client = _client()
+    r = client.get("/morpheus?state=failed", follow_redirects=False)
+    assert (r.status_code, r.headers["location"]) == (301, "/mo?state=failed")
+    r = client.get(f"/morpheus/{item['id']}", follow_redirects=False)
+    assert (r.status_code, r.headers["location"]) == (301, f"/mo/{item['id']}")
+    # Both old paths still land on a rendered page
+    assert item["id"] in client.get("/morpheus").text
+    assert client.get(f"/morpheus/{item['id']}").status_code == 200
+
+
+def test_the_list_shows_origin_title_and_frequency_and_creates_a_monitor(central):
+    client = _client()
+    r = client.post("/mo/new", follow_redirects=False,
+                    data={"project": "proj_a", "title": "nightly backup ran",
+                          "prompt": "the backup log has today's line", "every_minutes": "30"})
+    assert r.status_code == 303
+    [item] = central.morpheus_items()
+    assert r.headers["location"] == f"/mo/{item['id']}"
+    assert item["id"].startswith("mo-") and item["every_minutes"] == 30
+    row = client.get("/mo").text.split(f'<tr id="{item["id"]}">')[1].split("</tr>")[0]
+    assert "nightly backup ran" in row and ">user<" in row and "30 min" in row
+    assert f'action="/mo/{item["id"]}/cancel"' in row
+    detail = client.get(r.headers["location"]).text
+    assert "the backup log has today&#39;s line" in detail
+
+
+def test_a_monitor_without_a_prompt_is_refused_and_creates_nothing(central):
+    r = _client().post("/mo/new", follow_redirects=False,
+                       data={"project": "proj_a", "title": "t", "prompt": " "})
+    assert r.status_code == 303 and "error=" in r.headers["location"]
+    assert central.morpheus_items() == []
+
+
+def test_cancel_stops_an_open_order_and_is_offered_only_on_open_ones(central):
+    open_item, settled = queued(central, 3), _failed(central)
+    client = _client()
+    page = client.get("/mo").text
+    assert f'action="/mo/{open_item["id"]}/cancel"' in page
+    assert f'action="/mo/{settled["id"]}/cancel"' not in page
+    r = client.post(f"/mo/{open_item['id']}/cancel", follow_redirects=False,
+                    data={"next": f"/mo/{open_item['id']}"})
+    assert r.headers["location"] == f"/mo/{open_item['id']}"
+    assert central.morpheus_item(open_item["id"])["state"] == "cancelled"
+    r = client.post(f"/mo/{settled['id']}/cancel", follow_redirects=False, data={})
+    assert "error=" in r.headers["location"]
+    assert central.morpheus_item(settled["id"])["state"] == "failed"
+
+
+def test_the_detail_shows_its_session_and_cost_only_when_the_bill_exists(central, monkeypatch):
+    from jarvis import bill
+
+    item = _failed(central)
+    central.update_morpheus_item(item["id"], last_session_id="sess-42")
+    client = _client()
+    page = client.get(f"/mo/{item['id']}").text
+    assert "sess-42" in page and f"jarvis cost {item['id']}" not in page
+    monkeypatch.setattr(bill, "for_monitoring_order",
+                        lambda mo_id: {"total": {"calls": 2, "cost": {"list_usd": 1.5}}},
+                        raising=False)
+    page = client.get(f"/mo/{item['id']}").text
+    assert "$1.50" in page and f"jarvis cost {item['id']}" in page

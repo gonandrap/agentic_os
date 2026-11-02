@@ -7162,7 +7162,7 @@ def resolve_ref(ref: str) -> str:
     from . import morpheus
 
     if morpheus.is_monitoring_order_id(rid):
-        return f"/morpheus/{rid}"
+        return f"/mo/{rid}"
     return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"/{rid}"
 
 
@@ -8656,6 +8656,20 @@ def _script_wrong_rewrite(item_id: str, inv_id: str,
         central.close()
 
 
+def _rewrite_ask(item_id: str, script_fix: str) -> dict[str, Any]:
+    """The user's half of a SCRIPT_WRONG past its cap, `--why` pre-filled (#1481)"""
+    import shlex
+
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id) or {}
+    finally:
+        central.close()
+    # shlex, never double quotes: a script_fix quoting code carries backticks the shell would run
+    return {"item": item_id, "pr_number": item.get("pr_number"),
+            "command": f"jarvis morpheus rewrite {item_id} --why {shlex.quote(script_fix)}"}
+
+
 def investigation_chain(name: str, path: Path, fo: Mapping[str, Any]) -> dict[str, Any]:
     """validation -> investigation -> issue -> fix order -> production -> re-validation (#1344)"""
     from . import morpheus
@@ -8746,7 +8760,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
                                 UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                plan_hold_spans, precondition_hold_spans,
+                                dependency_hold_spans, plan_hold_spans, precondition_hold_spans,
                                 validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -8814,11 +8828,16 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             pre_held = bool(pstore.open_preconditions(wo["id"]))
             pre_spans = precondition_hold_spans(
                 pstore.preconditions_of(wo["id"]), since, now)
+        # A WAIT ON A DEPENDENCY THAT HAS SINCE COMPLETED IS NOT STUCK (issue 1488, kn-0a222b38)
+        dep_spans = (dependency_hold_spans(
+            [pstore.state_spans(d) for d in pstore.dependencies(wo)],
+            float(wo.get("created_at") or 0.0), since, now)
+            if wo["status"] == "pending" else [])
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
             + ci_spans + base_red_spans + plan_spans + automerge_spans
-            + budget_spans + pre_spans)
+            + budget_spans + pre_spans + dep_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9112,6 +9131,8 @@ def submit_verdict(inv_id: str, doc: Any,
     if verdict["classification"] == "SCRIPT_WRONG":
         settled, verdict["rewrite"] = _script_wrong_rewrite(morpheus_item_id, inv_id, verdict)
         escalate = not settled
+        if escalate:
+            verdict["rewrite_ask"] = _rewrite_ask(morpheus_item_id, verdict["script_fix"])
 
     classification = verdict["classification"]
     store = ProjectStore(path)
@@ -16608,6 +16629,81 @@ def morpheus_rewrite(item_id: str, why: str) -> dict[str, Any]:
                                          f"rewritten: {why.strip()}",
                                 f"decided by the user on {item_id} itself")
     return item
+
+
+# -- `jarvis mo`: monitoring orders (docs/superpowers/specs/2026-11-01-monitoring-orders.md §5)
+
+_MO_SPAN = re.compile(r"^(\d+(?:\.\d+)?)([mhd]?)$")
+_MO_UNIT_SECONDS = {"m": 60.0, "h": 3600.0, "d": 86400.0}
+
+
+def _mo_span(text: str, unit: str) -> float:
+    """`15m`/`2h`/`3d` (a bare number is in `unit`), as a count of `unit`s"""
+    m = _MO_SPAN.match((text or "").strip())
+    if not m or float(m.group(1)) <= 0:
+        raise OpsError(f"{text!r} is not a duration like 15m, 2h or 3d")
+    return float(m.group(1)) * _MO_UNIT_SECONDS[m.group(2) or unit] / _MO_UNIT_SECONDS[unit]
+
+
+def require_mo_id(mo_id: str) -> str:
+    from . import morpheus
+
+    if not morpheus.is_monitoring_order_id(mo_id):
+        raise OpsError(f"{mo_id!r} is not a monitoring order id (mo-… or mv-…)")
+    return mo_id
+
+
+def mo_create(project: str, title: str, prompt: str = "", script: str = "",
+              every: str | None = None, deadline: str | None = None) -> dict[str, Any]:
+    """Insert the row only; the daemon arms a prompt order on its next pass (§5)"""
+    from . import morpheus
+
+    name = _morpheus_project(_morpheus_catalog(), project)
+    every_minutes = max(1, round(_mo_span(every, "m"))) if every else None
+    days = _mo_span(deadline, "d") if deadline else None
+    central = CentralStore()
+    try:
+        return morpheus.create(central, project=name, title=title, prompt=prompt,
+                               script=script, every_minutes=every_minutes,
+                               deadline_days=days, origin="user")
+    except ValueError as e:
+        raise OpsError(str(e)) from e
+    finally:
+        central.close()
+
+
+def mo_list(project: str | None = None, include_all: bool = False,
+            state: str | None = None) -> list[dict[str, Any]]:
+    """Open orders and the failed/timed-out ones owed a look; `include_all` adds the settled"""
+    from . import morpheus
+
+    if state and state not in morpheus.STATES:
+        raise OpsError(f"no state {state!r}; one of {', '.join(morpheus.STATES)}")
+    states = [state] if state else (None if include_all else
+                                    [*morpheus.OPEN_STATES, *morpheus.ACTION_STATES])
+    central = CentralStore()
+    try:
+        items = central.morpheus_items(states)
+    finally:
+        central.close()
+    return [i for i in items if not project or i.get("project") == project]
+
+
+def mo_show(mo_id: str) -> dict[str, Any]:
+    return morpheus_detail(require_mo_id(mo_id))
+
+
+def mo_cancel(mo_id: str) -> dict[str, Any]:
+    """Cancel an open order: terminal, never judged; a settled one is refused"""
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.cancel(central, require_mo_id(mo_id))
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
 
 
 # -- the release console (docs/superpowers/specs/2026-11-01-release-console.md)

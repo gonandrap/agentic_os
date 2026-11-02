@@ -29,7 +29,8 @@ def test_go_sends_a_feature_order_through_order_path(client):  # noqa: F811
     ("12", "/neo/question/12"),
     ("gate-7", "/gates/7"),
     ("kn-0123abcd", "/knowledge/kn-0123abcd"),
-    ("mv-0123abcd", "/morpheus/mv-0123abcd"),
+    ("mv-0123abcd", "/mo/mv-0123abcd"),
+    ("mo-0123abcd", "/mo/mo-0123abcd"),
     ("bl-0123abcd", "/backlog/bl-0123abcd"),
 ])
 def test_go_resolves_the_numbered_and_fleet_wide_ids(client, ref, where):  # noqa: F811

@@ -710,13 +710,34 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--project")
     sp.add_argument("--json", action="store_true")
 
-    # Morpheus: production validation of shipped PRs (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+    # `morpheus` is a permanent alias (docs/superpowers/specs/2026-11-01-monitoring-orders.md §5)
     mo = sub.add_parser(
-        "morpheus", help="Morpheus: every shipped PR watched in production until validated",
+        "mo", aliases=["morpheus"],
+        help="monitoring orders: shipped PRs and user watches checked in production",
     ).add_subparsers(dest="morpheus_cmd", required=True)
-    m = mo.add_parser("status", help="counts by state, the session, then every PR")
-    m.add_argument("--all", action="store_true", help="list settled PRs too")
-    m = mo.add_parser("show", help="one PR: its hints, script, last output and action")
+    m = mo.add_parser("create", help="watch something in production; the daemon arms a "
+                                     "--prompt order on its next pass")
+    m.add_argument("project")
+    m.add_argument("title")
+    what = m.add_mutually_exclusive_group(required=True)
+    what.add_argument("--prompt", help="what to monitor; a short session writes the script")
+    what.add_argument("--script", dest="script_file",
+                      help="the check script file (exit 0 validated, 1 failed, else keep "
+                           "watching), - for stdin")
+    m.add_argument("--every", help="check interval, e.g. 15m (default: "
+                                   "os.morpheus.check_every_minutes)")
+    m.add_argument("--deadline", help="give up after, e.g. 3d (default: "
+                                      "os.morpheus.timeout_days)")
+    m = mo.add_parser("list", help="open orders and those owed a look, newest first")
+    m.add_argument("project", nargs="?")
+    m.add_argument("--all", action="store_true", help="settled orders too")
+    m.add_argument("--state", help="only this state")
+    m = mo.add_parser("cancel", help="stop watching an open order; it is never judged")
+    m.add_argument("item_id")
+    m = mo.add_parser("status", help="counts by state, pause, activity, then every order")
+    m.add_argument("--all", action="store_true", help="list settled orders too")
+    m = mo.add_parser("show", help="one order: its hints or prompt, script, last output and "
+                                   "action")
     m.add_argument("item_id")
     m = mo.add_parser("enqueue-release",
                       help="queue every PR a release carries (shipit runs this)")
@@ -4235,9 +4256,10 @@ MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "fail
 
 def _morpheus_line(item: dict) -> str:
     action = f" → {item['action']}" if item.get("action") else ""
+    what = f"PR #{item['pr_number']} " if item.get("pr_number") else ""
     return (f"{MORPHEUS_ICON.get(item['state'], '•')} {item['id']} "
-            f"[{item.get('project') or '?'}] PR #{item['pr_number']} "
-            f"{item['state']}{action} — {item['pr_title'][:70]}")
+            f"[{item.get('project') or '?'}] {what}"
+            f"{item['state']}{action} — {(item.get('pr_title') or item.get('title') or '')[:70]}")
 
 
 def _fix_lines(fix: dict | None, dispatch: str) -> list[str]:
@@ -4280,6 +4302,36 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
     """`jarvis morpheus …` — a thin wrapper over `ops.morpheus_*`"""
     from . import ops
 
+    if getattr(args, "item_id", None) is not None:
+        ops.require_mo_id(args.item_id)
+    if args.morpheus_cmd == "create":
+        script = ""
+        if args.script_file:
+            script = (sys.stdin.read() if args.script_file == "-"
+                      else Path(args.script_file).read_text())
+        item = ops.mo_create(args.project, args.title, prompt=args.prompt or "",
+                             script=script, every=args.every, deadline=args.deadline)
+        if args.json:
+            _print(item, True)
+        else:
+            print(f"{item['id']} {item['state']}"
+                  + (" — armed by the daemon on its next pass" if item["state"] == "queued"
+                     else " — the daemon runs its script from production"))
+        return 0
+    if args.morpheus_cmd == "list":
+        items = ops.mo_list(args.project, args.all, args.state)
+        if args.json:
+            _print(items, True)
+            return 0
+        for item in items:
+            print(_morpheus_line(item))
+        if not items:
+            print("no monitoring orders" + ("" if args.all else " open — --all for settled"))
+        return 0
+    if args.morpheus_cmd == "cancel":
+        item = ops.mo_cancel(args.item_id)
+        _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
     if args.morpheus_cmd == "status":
         rep = ops.morpheus_report()
         if not args.all:
@@ -4304,8 +4356,12 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             _print(item, True)
             return 0
         print(_morpheus_line(item))
-        print(f"{item['pr_url']}  first release with this PR {item['release_tag'] or '—'}"
-              f"  work order {item['wo_id'] or '—'}")
+        if item.get("pr_number"):
+            print(f"{item['pr_url']}  first release with this PR {item['release_tag'] or '—'}"
+                  f"  work order {item['wo_id'] or '—'}")
+        else:
+            print(f"origin {item.get('origin') or '—'}"
+                  f" · every {item.get('every_minutes') or 'default'} min")
         if item["last_check_ts"]:
             print(f"last check {_stamp(item['last_check_ts'])}"
                   f" on {item.get('last_check_version') or 'an unknown version'}")
@@ -4315,7 +4371,10 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
                  if item.get("auto_requeues") else ""))
         if item["resolution"]:
             print(f"\n{item['resolution']}")
-        print(f"\nhints:\n{item['hints'] or '(none)'}")
+        if item.get("prompt"):
+            print(f"\nprompt:\n{item['prompt']}")
+        else:
+            print(f"\nhints:\n{item['hints'] or '(none)'}")
         print(f"\nscript ({item['script_source'] or 'none yet'}):\n{item['script'] or '—'}")
         if item["last_output"]:
             print(f"\nlast output:\n{item['last_output']}")
@@ -4533,14 +4592,16 @@ def cmd_investigate(args: argparse.Namespace) -> int:
         if args.json:
             _print(detail, True)
         else:
-            # THE CLASSIFICATION AND THE SUBJECT FIRST (§2.9), then the argument
+            # THE ASK FIRST (#1481), then the classification and the subject (§2.9), then the argument
             print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
                   f"[{detail['project']}] {detail['status_label']}")
-            print(f"\n{detail['classification'] or 'no verdict yet'} — "
-                  f"{detail['subject']}")
-            print(f"\n{detail['why']}\n")
             if detail["attention_reason"]:
-                print(f"⚠ {detail['attention_reason']}\n")
+                print(f"\n⚠ {detail['attention_reason']}")
+                ask = (detail["verdict"] or {}).get("rewrite_ask") or {}
+                if ask.get("command"):
+                    print(f"\n  {ask['command']}")
+            print(f"\n{detail['classification'] or 'no verdict yet'} — "
+                  f"{detail['subject']}\n")
             if detail["budget"]["budget_usd"]:
                 b = detail["budget"]
                 print(f"budget: ${b['spent_usd']:.2f} of ${b['budget_usd']:.2f}")
@@ -4558,6 +4619,7 @@ def cmd_investigate(args: argparse.Namespace) -> int:
                 print("\nchain:")
                 for line in _chain_lines(chain, detail["id"]):
                     print(f"  {line}")
+            print(f"\nwhy it was opened:\n{detail['why']}")
             if detail["assumptions"]:
                 print("\nthe investigator's calls (on record, for nobody's review):")
                 for a in detail["assumptions"]:
@@ -6143,7 +6205,7 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_investigate(args)
         if args.cmd == "do":
             return cmd_do(args)
-        if args.cmd == "morpheus":
+        if args.cmd in ("mo", "morpheus"):
             return cmd_morpheus(args)
         if args.cmd == "gate":
             return cmd_gate(args)
