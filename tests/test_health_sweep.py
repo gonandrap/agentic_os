@@ -1319,6 +1319,34 @@ def test_a_live_dependency_is_not_stuck(stuck_os):
     assert verdict.excluded == stuck.LIVE_DEPENDENCY
 
 
+def _dependency_cleared(stuck_os, cleared_hours_ago: float) -> str:
+    """A child 5h pending behind a dependency that completed `cleared_hours_ago`"""
+    store = stuck_os["store"]
+    dep = ops.create_work_order("proj_a", "the dependency")
+    child = ops.create_work_order("proj_a", "waiting as --depends-on designed",
+                                  depends_on=[dep["id"]])
+    park_order(store, child["id"], "pending", hours=5)
+    store.set_status(dep["id"], "completed")
+    store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE order_id=? AND to_status=?",
+                       (db.now() - cleared_hours_ago * HOUR, dep["id"], "completed"))
+    store.conn.commit()
+    return child["id"]
+
+
+def test_a_dependency_that_just_completed_is_not_stuck(stuck_os):
+    """Issue 1488: the wait behind the edge is discounted once it clears"""
+    child = _dependency_cleared(stuck_os, cleared_hours_ago=22 / 3600)
+    verdict = _judge(stuck_os, child)
+    assert verdict.stuck is False
+    assert verdict.excluded == ""
+
+
+def test_time_since_the_dependency_completed_is_still_judged(stuck_os):
+    """Issue 1488: only the held seconds are discounted"""
+    child = _dependency_cleared(stuck_os, cleared_hours_ago=2)
+    assert _judge(stuck_os, child).stuck is True
+
+
 @pytest.mark.parametrize("how", ["cancelled", "deleted"])
 def test_a_dead_dependency_is_still_judged(stuck_os, how):
     """§2.3: a dead edge cannot clear itself, so the order SHOULD be judged"""

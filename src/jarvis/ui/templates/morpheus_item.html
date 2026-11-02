@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% import "_layout.html" as ui %}
 {% import "_morpheus.html" as mv %}
-{% block title %}{{ item.id }} · Morpheus — Jarvis{% endblock %}
+{% block title %}{{ item.id }} · Monitoring orders — Jarvis{% endblock %}
 {% block style %}
   .mv-acts { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
   .mv-acts form { display: flex; gap: 6px; margin: 0; }
@@ -19,28 +19,35 @@
 
 {{ ui.page_head(item.id, (item.project or "—") ~ " · " ~ item.state) }}
 <p class="kv">
-  <a href="{{ item.pr_url }}">#{{ item.pr_number }}</a> {{ item.pr_title }}<br>
+  {{ mv.subject(item) }}<br>
   <span class="mono {{ mv.tone[item.state] }}">{{ item.state }}</span>
+  {% if item.origin %} · origin <span class="mono">{{ item.origin }}</span>{% endif %}
+  · every <span class="mono">{{ mv.every(item) }}</span>
   {% if item.release_tag %} · release <span class="mono">{{ item.release_tag }}</span>{% endif %}
   {% if item.wo_id %} · work order {{ ui.row_id(item.wo_id, "/go/" ~ item.wo_id) }}{% endif %}
   · created {{ fmt_ts(item.created_ts) }} · updated {{ fmt_ts(item.updated_ts) }}
+  {% if item.last_session_id %}<br>last session <span class="mono">{{ item.last_session_id }}</span>{% endif %}
+  {% if cost %}<br>cost <span class="mono">${{ '%.2f'|format(cost.cost.list_usd) }}</span> over
+    {{ cost.calls }} session(s) · <span class="mono">jarvis cost {{ item.id }}</span>{% endif %}
   {% if item.resolution %}<br><span class="sub">{{ item.resolution }}</span>{% endif %}
 </p>
+{% if item.prompt %}<p class="kv">watching: {{ item.prompt }}</p>{% endif %}
 
 <div class="mv-acts">
-  <form method="post" action="/morpheus/{{ item.id }}/requeue">
+  {% if open %}{{ mv.cancel(item.id, back) }}{% endif %}
+  <form method="post" action="/mo/{{ item.id }}/requeue">
     <input type="hidden" name="next" value="{{ back }}">
     <button title="run the check again with a fresh deadline">retry now</button>
   </form>
   {% if item.state != "validated" %}
-  <form method="post" action="/morpheus/{{ item.id }}/waive">
+  <form method="post" action="/mo/{{ item.id }}/waive">
     <input type="hidden" name="next" value="{{ back }}">
     <input type="text" name="reason" required placeholder="why it works">
     <button title="rule it validated">waive</button>
   </form>
   {% endif %}
   {% if confirmable %}
-  <form method="post" action="/morpheus/{{ item.id }}/confirm">
+  <form method="post" action="/mo/{{ item.id }}/confirm">
     <input type="hidden" name="next" value="{{ back }}">
     <input type="text" name="fix" required placeholder="broken: what to fix">
     <button title="files a work order that fixes it">confirm failed</button>
@@ -152,6 +159,6 @@
 </section>
 </div>
 
-<p class="sub"><a href="/morpheus">all watched PRs</a> · from a terminal:
+<p class="sub"><a href="/mo">all monitoring orders</a> · from a terminal:
   <span class="mono">jarvis morpheus show {{ item.id }}</span></p>
 {% endblock %}
