@@ -3865,36 +3865,57 @@ def _stamp(ts: float | None) -> str:
 MORPHEUS_GRACE_SECONDS = 3600
 
 
-def check_morpheus_moves() -> Iterator[Violation]:
-    """INV-MORPHEUS-OVERDUE — a PR still open past its deadline, or an action never taken"""
+def check_morpheus_moves(repair: bool = False) -> Iterator[Violation]:
+    """INV-MORPHEUS-OVERDUE — a PR still open past its deadline, an action never taken, or a dead judge's claim"""
     from . import morpheus
+    from .catalog import MorpheusConfig
     from .central_store import CentralStore
 
     catalog = _live_catalog()
     cfg = getattr(getattr(catalog, "os", None), "morpheus", None)
     if cfg is not None and not cfg.enabled:
         return
+    stale_claim = (cfg or MorpheusConfig()).turn_timeout_seconds * 3
     now = db.now()
     central = CentralStore()
     try:
         items = central.morpheus_items((*morpheus.OPEN_STATES, *morpheus.ACTION_STATES))
+        # A brake is deliberate, not a fault (Q3138)
+        held = morpheus.held(central, now)
+        found: list[Violation] = []
+        for item in items:
+            action = item["action"] or ""
+            repaired = False
+            if (item["state"] in morpheus.OPEN_STATES
+                    and now - float(item["deadline_ts"]) > MORPHEUS_GRACE_SECONDS):
+                why = f"is still {item['state']} {(now - float(item['deadline_ts'])) / 3600:.1f}h past its deadline"
+            elif (item["state"] in morpheus.ACTION_STATES
+                  and action.startswith(morpheus.JUDGE_CLAIM)
+                  and now - float(item["action_ts"] or 0) > stale_claim):
+                why = (f"has held its judging claim {(now - float(item['action_ts'] or 0)) / 3600:.1f}h:"
+                       " the judge died holding it")
+                if repair:
+                    central.update_morpheus_item(item["id"], action="", action_ts=None)
+                    repaired = True
+            elif (item["state"] in morpheus.ACTION_STATES and not action and not held
+                  and now - float(item["updated_ts"]) > MORPHEUS_GRACE_SECONDS):
+                why = f"{item['state']} {(now - float(item['updated_ts'])) / 3600:.1f}h ago and no action was taken"
+            else:
+                continue
+            found.append(_morpheus_overdue(item, why, repaired))
     finally:
         central.close()
-    for item in items:
-        if (item["state"] in morpheus.OPEN_STATES
-                and now - float(item["deadline_ts"]) > MORPHEUS_GRACE_SECONDS):
-            why = f"is still {item['state']} {(now - float(item['deadline_ts'])) / 3600:.1f}h past its deadline"
-        elif (item["state"] in morpheus.ACTION_STATES and not item["action"]
-              and now - float(item["updated_ts"]) > MORPHEUS_GRACE_SECONDS):
-            why = f"{item['state']} {(now - float(item['updated_ts'])) / 3600:.1f}h ago and no action was taken"
-        else:
-            continue
-        yield Violation(
-            invariant="INV-MORPHEUS-OVERDUE", subject_id=item["id"],
-            detail=(f"Morpheus item {item['id']} (PR #{item['pr_number']}) {why} — the "
-                    f"daemon's Morpheus pass is not running or is failing. `jarvis morpheus "
-                    f"show {item['id']}`; the daemon log names the error."),
-            context={"item": item["id"], "pr": item["pr_number"], "state": item["state"]})
+    yield from found
+
+
+def _morpheus_overdue(item: dict, why: str, repaired: bool) -> Violation:
+    return Violation(
+        invariant="INV-MORPHEUS-OVERDUE", subject_id=item["id"], repaired=repaired,
+        repair="cleared the claim; the next pass judges it again" if repaired else "",
+        detail=(f"Morpheus item {item['id']} (PR #{item['pr_number']}) {why} — the "
+                f"daemon's Morpheus pass is not running or is failing. `jarvis morpheus "
+                f"show {item['id']}`; the daemon log names the error."),
+        context={"item": item["id"], "pr": item["pr_number"], "state": item["state"]})
 
 
 #: libsqlite3 releases that deadlock in-process on WAL close vs open (io-6fdf5c66); fixed in 3.51.2
@@ -3971,7 +3992,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
 
 
 #: The OS-level checks that take `repair`
-OS_REPAIRABLE = (check_offboarded_activity,)
+OS_REPAIRABLE = (check_offboarded_activity, check_morpheus_moves)
 
 
 def check_os(repair: bool = False) -> list[Violation]:

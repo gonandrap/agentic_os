@@ -458,6 +458,16 @@ def test_run_script_reads_the_real_exit_code_and_output(tmp_path):
 # -- 5. failed and timed out hand off: Morpheus never diagnoses
 
 
+PROD = Path("/prod")
+
+
+def CONFIRM(prompt, system_prompt=None, **kw):
+    """A judge that confirms the failure"""
+    return claude_cli.HeadlessResult(
+        text=json.dumps({"verdict": "confirm", "reason": "the job errors in the log"}),
+        usage={"input_tokens": 1, "output_tokens": 1}, session_id="s-c", model="sonnet")
+
+
 def _failed(central) -> dict:
     item = monitoring(central)
     central.update_morpheus_item(item["id"], state="failed", resolution="script exited 1",
@@ -468,7 +478,7 @@ def _failed(central) -> dict:
 def test_failed_with_a_work_order_files_an_investigation_once(central):
     item = _failed(central)
     asked = []
-    action = morpheus.act(central, catalog(), item,
+    action = morpheus.act(central, catalog(), item, cwd=PROD, call=CONFIRM,
                           investigate=lambda c, i: ("fo-inv00001", ""),
                           ask_neo=lambda *a: asked.append(1) or 9)
     assert action == "investigation:fo-inv00001" and asked == []
@@ -488,7 +498,7 @@ def test_the_hand_off_states_only_facts(central):
 
 def test_an_investigation_that_cannot_be_filed_asks_neo_instead(central):
     notes = []
-    action = morpheus.act(central, catalog(), _failed(central),
+    action = morpheus.act(central, catalog(), _failed(central), cwd=PROD, call=CONFIRM,
                           investigate=lambda c, i: ("", "the steward said no"),
                           ask_neo=lambda c, i, note: notes.append(note) or 9)
     assert action == "neo:9" and notes == ["the steward said no"]
@@ -499,12 +509,13 @@ def test_timedout_asks_neo_by_default_and_the_route_is_configurable(central):
     central.update_morpheus_item(item["id"], state="timedout")
     filed = []
     assert morpheus.act(central, catalog(), central.morpheus_item(item["id"]),
+                        cwd=PROD, call=CONFIRM,
                         investigate=lambda c, i: filed.append(1) or ("x", ""),
                         ask_neo=lambda *a: 3) == "neo:3"
     assert filed == []
     central.update_morpheus_item(item["id"], action="")
     assert morpheus.act(central, catalog(on_timeout="investigate"),
-                        central.morpheus_item(item["id"]),
+                        central.morpheus_item(item["id"]), cwd=PROD, call=CONFIRM,
                         investigate=lambda c, i: ("fo-x", ""),
                         ask_neo=lambda *a: 3) == "investigation:fo-x"
 
@@ -552,7 +563,7 @@ def test_an_improvement_order_the_steward_refuses_asks_neo(central, monkeypatch)
 
 
 def test_an_improvement_order_is_recorded_as_one_not_as_an_investigation(central):
-    assert morpheus.act(central, catalog(), _failed(central),
+    assert morpheus.act(central, catalog(), _failed(central), cwd=PROD, call=CONFIRM,
                         investigate=lambda c, i: ("io-abcd1234", ""),
                         ask_neo=lambda *a: 9) == "improvement:io-abcd1234"
 
@@ -1004,7 +1015,7 @@ def test_the_first_pass_drops_the_long_lived_sessions_record(central, tmp_path):
 def test_an_unknown_purpose_is_refused_before_any_call(central, tmp_path):
     call = FakeCall()
     with pytest.raises(ValueError, match="no session purpose"):
-        morpheus.run_session(central, catalog(), queued(central, 2), purpose="judge",
+        morpheus.run_session(central, catalog(), queued(central, 2), purpose="nope",
                              cwd=tmp_path, call=call)
     assert call.calls == []
 
@@ -1017,6 +1028,166 @@ def test_the_long_lived_session_is_gone():
         assert not hasattr(morpheus, name), name
     src = REPO_ROOT / "src" / "jarvis"
     assert not [p for p in src.rglob("*.py") if "run_session_turn" in p.read_text()]
+
+
+# -- 7. judging a failure in a short session (docs/superpowers/specs/2026-11-01-monitoring-orders.md §4)
+
+
+def _judge(central, item, call, **kw) -> str:
+    asked = kw.pop("asked", [])
+    return morpheus.act(central, kw.pop("catalog", catalog()), item, cwd=PROD, call=call,
+                        now=kw.pop("now", TEST_EPOCH),
+                        investigate=kw.pop("investigate", lambda c, i: ("fo-inv00001", "")),
+                        ask_neo=lambda c, i, note: asked.append((i, note)) or 9)
+
+
+def test_a_rewrite_sets_the_judges_script_and_watches_again(central):
+    item = _failed(central)
+    central.add_morpheus_run(item["id"], exit=1, output="FAIL the job errored", now=TEST_EPOCH)
+    call = FakeCall(reply={"verdict": "rewrite", "reason": "keys on the wrong field",
+                           "script": "exit 0"})
+    assert _judge(central, central.morpheus_item(item["id"]), call) == "rewrite"
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["script"], after["script_source"], after["script_rewrites"],
+            after["action"], after["attempts"]) == ("monitoring", "exit 0", "agent", 1, "", 0)
+    assert after["deadline_ts"] == TEST_EPOCH + 3 * DAY and after["next_check_ts"] == TEST_EPOCH
+    # Built from the row: its script, its runs, its counters
+    prompt = call.calls[0]["prompt"]
+    assert "exit 75" in prompt and "FAIL the job errored" in prompt
+    assert "script exited 1" in prompt and "Script rewrites so far: 0 of 1" in prompt
+    assert call.calls[0]["persist"] is True and call.calls[0]["cwd"] == PROD
+    # No arming session follows: the row is not queued
+    assert morpheus.owed_arming(central, now=TEST_EPOCH + 10 * DAY) == []
+    [row] = central.conn.execute("SELECT label, wo_id FROM agent_calls").fetchall()
+    assert tuple(row) == ("judge", item["id"])
+
+
+def test_a_rewrite_at_the_cap_escalates_and_keeps_the_script(central):
+    item = _failed(central)
+    assert central.claim_morpheus_script_rewrite(item["id"], morpheus.MAX_SCRIPT_REWRITES)
+    asked = []
+    call = FakeCall(reply={"verdict": "rewrite", "reason": "wrong", "script": "exit 0"})
+    assert _judge(central, central.morpheus_item(item["id"]), call, asked=asked) == "neo:9"
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["script"], after["action"]) == ("failed", "exit 75", "neo:9")
+    assert "rewrite(s) are spent" in asked[0][1]
+
+
+def test_confirm_hands_off_with_the_judges_reading_marked_as_one(central):
+    item = _failed(central)
+    seen = []
+    action = _judge(central, item, CONFIRM,
+                    investigate=lambda c, i: seen.append(morpheus._why(i)) or ("fo-inv00001", ""))
+    assert action == "investigation:fo-inv00001"
+    assert central.morpheus_item(item["id"])["action"] == action
+    assert "reading — NOT a diagnosis:\nthe job errors in the log" in seen[0]
+
+
+def test_escalate_asks_neo_with_the_judges_reason(central):
+    item = _failed(central)
+    asked = []
+    call = FakeCall(reply={"verdict": "escalate", "reason": "production is half deployed"})
+    assert _judge(central, item, call, asked=asked) == "neo:9"
+    assert asked[0][0]["judge_reason"] == "production is half deployed" and asked[0][1] == ""
+    assert central.morpheus_item(item["id"])["action"] == "neo:9"
+
+
+def test_a_confirm_with_no_pull_request_escalates(central):
+    order = morpheus.create(central, project="proj_a", title="the nightly job", prompt="it runs")
+    central.update_morpheus_item(order["id"], state="failed", resolution="script exited 1",
+                                 script="exit 1", script_source="agent", last_exit=1)
+    filed, asked = [], []
+    assert _judge(central, central.morpheus_item(order["id"]), CONFIRM, asked=asked,
+                  investigate=lambda c, i: filed.append(1) or ("x", "")) == "neo:9"
+    assert filed == [] and "no pull request" in asked[0][1]
+    assert "Monitoring order" in morpheus._why(asked[0][0])
+
+
+@pytest.mark.parametrize("call", [FakeCall(reply="no JSON here"), FakeCall(error=sigkilled()),
+                                  FakeCall(error=claude_cli.ClaudeCliError("timed out"))],
+                         ids=["unparseable", "killed", "timeout"])
+def test_a_judge_that_fails_releases_its_claim_then_escalates_without_a_verdict(central, call):
+    item = _failed(central)
+    asked = []
+    for n in range(1, morpheus.MAX_OFFERS):
+        assert _judge(central, central.morpheus_item(item["id"]), call, asked=asked) == ""
+        after = central.morpheus_item(item["id"])
+        assert (after["action"], after["attempts"], after["state"]) == ("", n, "failed")
+    assert asked == []
+    assert _judge(central, central.morpheus_item(item["id"]), call, asked=asked) == "neo:9"
+    assert len(call.calls) == morpheus.MAX_OFFERS
+    [(seen, note)] = asked
+    assert "could not judge it" in note and "judge_reason" not in seen
+
+
+def test_a_pre_claimed_order_gets_no_session(central):
+    item = _failed(central)
+    central.claim_morpheus_action(item["id"], "judge:1")
+    call = FakeCall()
+    assert morpheus.owed_actions(central) == []
+    assert _judge(central, item, call) == "" and call.calls == []
+    assert central.morpheus_item(item["id"])["action"] == "judge:1"
+
+
+@pytest.mark.parametrize("state", ["cancelled", "validated"])
+def test_a_settled_order_is_never_judged(central, state):
+    item = _failed(central)
+    central.update_morpheus_item(item["id"], state=state, action="")
+    call = FakeCall()
+    assert morpheus.owed_actions(central) == []
+    assert _judge(central, central.morpheus_item(item["id"]), call) == "" and call.calls == []
+
+
+def test_the_brake_and_the_usage_window_hold_judging_and_spend_nothing(central):
+    item = _failed(central)
+    morpheus.set_pause(central, "paused", "quiet", now=TEST_EPOCH)
+    call = FakeCall()
+    assert _judge(central, item, call) == "" and call.calls == []
+    morpheus.set_pause(central, "running", "go", now=TEST_EPOCH)
+    call = FakeCall(error=refused(TEST_EPOCH + 4000))
+    assert _judge(central, item, call) == "usage_held"
+    after = central.morpheus_item(item["id"])
+    assert (after["action"], after["attempts"]) == ("", 0)
+    assert _judge(central, after, call) == "" and len(call.calls) == 1
+
+
+def test_a_hand_off_that_crashes_gives_its_claim_back(central):
+    item = _failed(central)
+
+    def boom(c, i):
+        raise RuntimeError("steward down")
+
+    with pytest.raises(RuntimeError):
+        _judge(central, item, CONFIRM, investigate=boom)
+    assert central.morpheus_item(item["id"])["action"] == ""
+
+
+def test_a_stale_judging_claim_trips_the_invariant_and_is_cleared(central, monkeypatch):
+    from jarvis import invariants
+
+    item = _failed(central)
+    central.claim_morpheus_action(item["id"], "judge:1")
+    claimed = central.morpheus_item(item["id"])["action_ts"]
+    stale = MorpheusConfig().turn_timeout_seconds * 3
+    monkeypatch.setattr("jarvis.db.now", lambda: claimed + stale - 1)
+    assert list(invariants.check_morpheus_moves(repair=True)) == []
+    monkeypatch.setattr("jarvis.db.now", lambda: claimed + stale + 1)
+    [v] = list(invariants.check_morpheus_moves(repair=True))
+    assert v.invariant == "INV-MORPHEUS-OVERDUE" and v.repaired and "judging claim" in v.detail
+    assert central.morpheus_item(item["id"])["action"] == ""
+    assert invariants.check_morpheus_moves in invariants.OS_REPAIRABLE
+
+
+def test_a_held_brake_is_not_an_overdue_action(central, monkeypatch):
+    from jarvis import invariants
+
+    item = _failed(central)
+    morpheus.set_pause(central, "paused", "quiet", now=TEST_EPOCH)
+    monkeypatch.setattr("jarvis.db.now",
+                        lambda: float(central.morpheus_item(item["id"])["updated_ts"]) + 2 * 3600)
+    assert list(invariants.check_morpheus_moves()) == []
+    morpheus.set_pause(central, "running", "go", now=TEST_EPOCH)
+    assert [v.invariant for v in invariants.check_morpheus_moves()] == ["INV-MORPHEUS-OVERDUE"]
 
 
 @pytest.mark.parametrize("persist", [True, False])
@@ -1178,11 +1349,19 @@ def test_the_daemon_pass_runs_each_check_in_its_project_and_hands_off(
     bad = monitoring(central, n=2, script="exit 1", title="no wo")
     central.update_morpheus_item(bad["id"], last_exit=1)  # its first exit 1 is behind it
     monkeypatch.setattr(morpheus, "_ask_neo", lambda c, i, note="": 42)
+    judged = []
+
+    def judge(central, catalog, item, *, purpose, cwd, call=None):
+        judged.append((item["id"], purpose, cwd))
+        return {"verdict": "escalate", "reason": "cannot tell"}
+
+    monkeypatch.setattr(morpheus, "run_session", judge)
     daemon._morpheus_pass()
     assert central.morpheus_item(good["id"])["state"] == "validated"
     assert (project / "ran-here").read_text().strip() == str(project)
     after = central.morpheus_item(bad["id"])
     assert after["state"] == "failed" and after["action"] == "neo:42"
+    assert judged == [(bad["id"], "judge", project)]
 
 
 def test_cli_status_and_script(central, tmp_path, capsys):

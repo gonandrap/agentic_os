@@ -3349,23 +3349,27 @@ class Daemon:
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
             skip = archived_projects(central)
-            moved = morpheus.sweep(central, cfg,
-                                   lambda item: dirs.get(item.get("project") or "", fallback),
-                                   skip=skip)
+            def cwd_for(item: dict) -> Path:
+                return dirs.get(item.get("project") or "", fallback)
+
+            moved = morpheus.sweep(central, cfg, cwd_for, skip=skip)
             if any(moved.values()):
                 log.info("morpheus sweep: %s", {k: v for k, v in moved.items() if v})
+            # One short judging session per failed order, where it runs (§4)
             for item in morpheus.owed_actions(central):
                 if (item["project"] or "") in skip:
                     continue
+                if morpheus.held(central):
+                    break
                 try:
-                    log.info("morpheus %s (PR #%s) %s -> %s", item["id"], item["pr_number"],
-                             item["state"], morpheus.act(central, self.catalog, item))
+                    action = morpheus.act(central, self.catalog, item, cwd=cwd_for(item))
+                    if action:
+                        log.info("morpheus %s (PR #%s) %s -> %s", item["id"],
+                                 item["pr_number"], item["state"], action)
                 except Exception:  # noqa: BLE001 — one item must not starve the others
                     log.exception("morpheus: action for %s failed", item["id"])
             # One short session per owed order, in that order's production directory (§3)
-            armed = morpheus.arm(central, self.catalog,
-                                 lambda item: dirs.get(item.get("project") or "", fallback),
-                                 skip=skip)
+            armed = morpheus.arm(central, self.catalog, cwd_for, skip=skip)
             ran = {k: v for k, v in armed.items() if v and k not in ("paused", "usage_held")}
             if ran:
                 log.info("morpheus arm: %s", ran)
