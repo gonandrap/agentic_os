@@ -267,6 +267,13 @@ def verdict_landed(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 def settle_headline(inv_id: str, verdict: dict[str, Any]) -> str:
     """The attention line a WAITING_ON_USER verdict, or a SCRIPT_WRONG past its cap, raises"""
+    ask = verdict.get("rewrite_ask") or {}
+    if ask:
+        # Verdict and ask first, no jargon (#1481); SCRIPT_WRONG means the PR behaves as hinted
+        pr = f"PR #{ask['pr_number']}" if ask.get("pr_number") else "the PR"
+        return (f"{pr} works; its validation script is wrong. Approve a rewrite: "
+                f"`jarvis morpheus rewrite {ask['item']} --why …` — pre-filled in "
+                f"`jarvis investigate show {inv_id}`")
     owes = verdict.get("user_owes") or (
         f"its validation script is wrong and {verdict.get('rewrite', '')}")
     return (f"{inv_id}: {verdict.get('subject', '')} is waiting on you — "

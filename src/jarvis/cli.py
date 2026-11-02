@@ -4552,14 +4552,16 @@ def cmd_investigate(args: argparse.Namespace) -> int:
         if args.json:
             _print(detail, True)
         else:
-            # THE CLASSIFICATION AND THE SUBJECT FIRST (§2.9), then the argument
+            # THE ASK FIRST (#1481), then the classification and the subject (§2.9), then the argument
             print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
                   f"[{detail['project']}] {detail['status_label']}")
-            print(f"\n{detail['classification'] or 'no verdict yet'} — "
-                  f"{detail['subject']}")
-            print(f"\n{detail['why']}\n")
             if detail["attention_reason"]:
-                print(f"⚠ {detail['attention_reason']}\n")
+                print(f"\n⚠ {detail['attention_reason']}")
+                ask = (detail["verdict"] or {}).get("rewrite_ask") or {}
+                if ask.get("command"):
+                    print(f"\n  {ask['command']}")
+            print(f"\n{detail['classification'] or 'no verdict yet'} — "
+                  f"{detail['subject']}\n")
             if detail["budget"]["budget_usd"]:
                 b = detail["budget"]
                 print(f"budget: ${b['spent_usd']:.2f} of ${b['budget_usd']:.2f}")
@@ -4577,6 +4579,7 @@ def cmd_investigate(args: argparse.Namespace) -> int:
                 print("\nchain:")
                 for line in _chain_lines(chain, detail["id"]):
                     print(f"  {line}")
+            print(f"\nwhy it was opened:\n{detail['why']}")
             if detail["assumptions"]:
                 print("\nthe investigator's calls (on record, for nobody's review):")
                 for a in detail["assumptions"]:
