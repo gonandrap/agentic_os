@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -102,15 +101,16 @@ def test_a_restart_serves_at_once_and_renders_both_windows_from_the_snapshot(
                          and len(first.app.state.cost_cache.entries) == 2)
 
     # The restart's round one hangs: nothing below may wait for it
-    release = threading.Event()
+    release, done = threading.Event(), []
     real = ui_app._cost_payloads
     monkeypatch.setattr(ui_app, "_cost_payloads",
-                        lambda picked, project: (release.wait(30), real(picked, project))[1])
+                        lambda picked, project: (release.wait(30), done.append(1),
+                                                 real(picked, project))[2])
     try:
-        began = time.monotonic()
         with TestClient(create_app(), follow_redirects=False) as fresh:
             assert fresh.get("/").status_code == 200
-            assert time.monotonic() - began < 5
+            # Startup that waited for round one would have seen a compute finish
+            assert not done
             for url in ("/cost", "/cost?window=5h"):
                 page = fresh.get(url)
                 assert page.status_code == 200, url
@@ -127,14 +127,13 @@ def test_a_cold_boot_with_no_snapshot_still_serves_and_shows_computing(
 
     from jarvis.ui import app as ui_app
 
-    release = threading.Event()
+    release, done = threading.Event(), []
     monkeypatch.setattr(ui_app, "_cost_payloads",
-                        lambda picked, project: (release.wait(30), {})[1])
+                        lambda picked, project: (release.wait(30), done.append(1), {})[2])
     try:
-        began = time.monotonic()
         with TestClient(create_app(), follow_redirects=False) as fresh:
             assert fresh.get("/").status_code == 200
-            assert time.monotonic() - began < 5
+            assert not done
             assert "What the work cost — computing" in fresh.get("/cost").text
             release.set()
     finally:
