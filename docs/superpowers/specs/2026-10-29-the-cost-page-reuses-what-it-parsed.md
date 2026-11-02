@@ -178,6 +178,10 @@ distinct *bounded* ranges that happened to fall in one bucket onto a single entr
 (`since=` with no `until`), and only that case is bucketed. A window with both bounds
 given keeps its exact `until`.
 
+Issue 1464 dropped the bucket: an open-ended `until` keys as `"now"`, and the entry's
+`computed_at` against `REFRESH_SECONDS` decides fresh or stale. A bucket edge between two
+visits keyed them apart, so the second visit got `computing` again despite a fresh entry.
+
 ## Tests
 
 `tests/test_transcript_cache.py`

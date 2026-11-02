@@ -576,10 +576,10 @@ class CostCache:
 
     @staticmethod
     def key(picked: dict, project: str) -> tuple:
-        """The scope and the bounds, an open-ended `until` bucketed because it IS now (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)"""
+        """The scope and the bounds, an open-ended `until` keyed as NOW: `computed_at` ages it, not a clock bucket (issue 1464)"""
         until = picked["until"]
         if picked.get("open_ended"):
-            until = ("now", int(until // REFRESH_SECONDS))
+            until = "now"
         return (project, picked["since"], until)
 
     def _compute_on_demand(self, key: tuple, picked: dict, project: str) -> None:

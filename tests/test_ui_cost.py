@@ -1151,9 +1151,6 @@ def test_an_open_ended_window_is_computed_once_however_often_it_is_visited(
                       0.05, 48_000)
     cache = client.app.state.cost_cache
     calls = count_live(monkeypatch)
-    # One frozen NOW: visits straddling a REFRESH_SECONDS bucket edge key twice (kn-a3d67b6c)
-    frozen = db.now()
-    monkeypatch.setattr(db, "now", lambda: frozen)
 
     page = _computing_then_page(client, cache, "/cost?since=2026-01-01T00:00")
 
@@ -1163,6 +1160,27 @@ def test_an_open_ended_window_is_computed_once_however_often_it_is_visited(
     assert client.get("/cost?since=2026-01-01T00:00").status_code == 200
     assert len(calls) == 1
     assert not cache.computing
+
+
+def test_an_open_ended_window_is_not_recomputed_across_a_refresh_edge(client, project,
+                                                                     monkeypatch):
+    """Issue 1464: the second visit landing past a REFRESH_SECONDS edge still finds the entry"""
+    from jarvis.ui import app as ui_app
+
+    cache = seed_cache(client, project)
+    calls = count_live(monkeypatch)
+    edge = (db.now() // ui_app.REFRESH_SECONDS + 1) * ui_app.REFRESH_SECONDS
+    clock = [edge - 0.5]
+    monkeypatch.setattr(db, "now", lambda: clock[0])
+    first = client.get("/cost?since=2026-01-01T00:00")
+    assert "What the work cost — computing" in first.text
+    assert _wait_for(lambda: not cache.computing)
+
+    clock[0] = edge + 0.5
+    page = client.get("/cost?since=2026-01-01T00:00")
+
+    assert "What the work cost — computing" not in page.text
+    assert len(calls) == 1
 
 
 def _wait_for(predicate, timeout: float = 15.0) -> bool:
