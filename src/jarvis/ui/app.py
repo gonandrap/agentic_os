@@ -2308,6 +2308,7 @@ def create_app() -> FastAPI:
                  + [{**i, "tab": "waiting"} for i in report["waiting"]]
                  + [{**i, "tab": "settled"} for i in report["settled"]])
         options = {"project": filter_options(every, "project"),
+                   "track": filter_options(every, "track"),
                    "tab": ["asks", "waiting", "settled"]}
         filters = query_filters(request, options)
         shown = filter_rows(every, filters)
@@ -2326,7 +2327,9 @@ def create_app() -> FastAPI:
                           message=f"no steward decision about {ref}")
         from .. import steward
 
-        decisions = [{**d, "step": steward.next_step(d)} for d in decisions]
+        decisions = [{**d, "step": steward.next_step(d),
+                      "track": steward.TRACK_LABELS[steward.track_of(d["origin_kind"])]}
+                     for d in decisions]
         return render(request, "steward_item.html", active="steward", ref=ref,
                       decisions=decisions, yours=[d for d in decisions if d["step"]["yours"]])
 

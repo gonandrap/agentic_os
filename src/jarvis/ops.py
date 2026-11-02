@@ -817,6 +817,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "items": inbox[:10],
             },
             "backlog": {"open": len(backlog_open)},
+            # Reported bugs and panel follow-ups counted apart (wo-5b96c9da)
+            "steward": steward_track_counts(central),
             "investigations": {"fixes_parked": fixes_parked},
             "neo": neo_counts,
             "gates": {"awaiting_you": len(gate_items),
@@ -826,6 +828,17 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         }
     finally:
         central.close()
+
+
+def steward_track_counts(central: CentralStore) -> dict[str, dict[str, int]]:
+    """`steward.track_counts`, or {} when the decisions table cannot be read"""
+    from . import steward
+
+    try:
+        return steward.track_counts(central)
+    except Exception:  # noqa: BLE001 — the pulse check must not fail over one line
+        log.exception("status: steward counts unreadable")
+        return {}
 
 
 # -- work orders
@@ -7483,8 +7496,12 @@ def steward_queue_report(limit: int = 200) -> dict[str, Any]:
         central.close()
     keys = ("id", "ts", "project", "origin_kind", "severity", "subject", "rule", "reason",
             "wo_id", "parent_wo_id", "queue_state", "queue_note", "queue_ts")
-    items = [{k: r[k] for k in keys} for r in rows]
+    items = [{**{k: r[k] for k in keys}, "track": steward.track_of(r["origin_kind"])}
+             for r in rows]
     return {"asks": [{**{k: r[k] for k in keys}, "parent_wo_id": r["parent_wo_id"],
+                      "track": steward.track_of(r["origin_kind"]),
+                      "issue_url": (steward._candidate_of(r).get("payload") or {}).get(
+                          "issue_url", ""),
                       "morpheus_item": (steward._candidate_of(r).get("payload") or {}).get(
                           "morpheus_item", "")} for r in asks],
             "counts": {s: counts.get(s, 0) for s in ("waiting", "reoffered", "expired")},
