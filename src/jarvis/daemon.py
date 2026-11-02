@@ -159,7 +159,7 @@ PR_POLL_EVERY_TICKS = 24
 #: One Morpheus pass every N ticks (~1 minute at the default 5s poll)
 MORPHEUS_EVERY_TICKS = 12
 
-#: Read the account's usage meter every N ticks — 150s at the default 5s interval (kn-e75f210c)
+#: Read the account's usage meter every N ticks — 150s at the default 5s interval (kn-ff0b7bc2)
 USAGE_SAMPLE_EVERY_TICKS = 30
 
 #: Re-offer the steward's queued self-work every N ticks — ten minutes at the default 5s (#1181)

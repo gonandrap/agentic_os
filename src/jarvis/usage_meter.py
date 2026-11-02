@@ -22,7 +22,7 @@ FIRST_CLASS = ("five_hour", "seven_day")   #: the two windows with their own col
 #: Same shape as `notify.sink_telegram`, so the OS has one HTTP idiom (§1)
 TIMEOUT = 10
 
-#: The sampler's own period, a UNIT and not a setting: the endpoint allows ~30 reads/hour (kn-e75f210c)
+#: The sampler's own period, a UNIT and not a setting: the endpoint allows ~30 reads/hour (kn-ff0b7bc2)
 SAMPLE_SECONDS = 150.0
 
 #: Two missed readings end a calibration span (§5)
