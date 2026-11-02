@@ -306,6 +306,8 @@ DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE = 0.5
 STAKES_CLASSIFIER_MODES = ("regex", "shadow", "classifier", "regex-tightened")
 # The measured winner (spec 2026-09-25 §7: precision 0.486 / recall 0.944 vs regex 0.140 / 0.667)
 DEFAULT_STAKES_CLASSIFIER = "regex-tightened"
+#: Who settles an assumption that net calls high-stakes: the user, or Neo like any other (#1366)
+HIGH_STAKES_HOLD_MODES = ("user", "neo")
 
 
 @dataclass
@@ -340,6 +342,8 @@ class ValidationConfig:
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
     # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
     stakes_classifier: str = DEFAULT_STAKES_CLASSIFIER
+    # WHO SETTLES A HIGH-STAKES ASSUMPTION — see `HIGH_STAKES_HOLD_MODES`
+    high_stakes_hold: str = "user"
     # WHEN FAILING EARLY OBJECTIONS REACH THE INBOX: withdrawn over sent (io-ce566253)
     objection_withdrawal_alarm_rate: float = DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE
 
@@ -1443,6 +1447,10 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         # The `roster` precedent: refused loudly rather than shrugged to the default
         raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
                    f"one of {list(STAKES_CLASSIFIER_MODES)}")
+    high_stakes_hold = str(raw.get("high_stakes_hold", base.high_stakes_hold) or "user")
+    if high_stakes_hold not in HIGH_STAKES_HOLD_MODES:
+        raise _err(f"{where}.high_stakes_hold is {high_stakes_hold!r}, which is not "
+                   f"one of {list(HIGH_STAKES_HOLD_MODES)}")
     feature_merge_wait_minutes = int(
         raw.get("feature_merge_wait_minutes", base.feature_merge_wait_minutes))
     if feature_merge_wait_minutes < 0:
@@ -1480,6 +1488,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         auto_review=bool(raw.get("auto_review", base.auto_review)),
         # Same fallback again — see `ValidationConfig.stakes_classifier`
         stakes_classifier=stakes_classifier,
+        high_stakes_hold=high_stakes_hold,
         objection_withdrawal_alarm_rate=withdrawal_rate,
     )
 
