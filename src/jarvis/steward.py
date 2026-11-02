@@ -748,7 +748,7 @@ def _store_for(central: CentralStore, project: str) -> ProjectStore | None:
 # ---------------------------------------------------------------- the queue (#1181)
 
 #: Origin kinds whose `queue` the OS dispatches later on its own; the rest re-ask by themselves
-DRAINABLE = ("panel", "worker_io", "remedy", "neo_rider", "io_finding")
+DRAINABLE = ("panel", "worker_io", "remedy", "neo_rider", "io_finding", "bug_agent")
 #: Origin kinds whose candidate is about the PARENT unit's code: moot once that is cancelled
 PARENT_BOUND = ("panel",)
 #: A queued decision older than this is not re-offered: the code it named has moved on

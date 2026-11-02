@@ -1776,5 +1776,107 @@ def test_neo_disagreeing_starts_nothing_and_says_so(fleet, gap):
     assert recorded[-1][3] == "", "Neo's ruling is not a steward hold"
 
 
+# -- a work order's filing goes to the steward at every priority (wo-b59a21b1)
+
+FILER = "wo-feedbeef"
+
+
+@pytest.fixture()
+def worker(fleet, monkeypatch):
+    """The fleet with the steward enforcing; filings come from a work-order session"""
+    from jarvis import ops
+
+    def enforce(**evolution):
+        data = json.loads(fleet.catalog_path.read_text())
+        data["os"]["evolution"] = {"mode": "enforce", **evolution}
+        fleet.catalog_path.write_text(json.dumps(data))
+        ops.start_os(str(fleet.catalog_path), foreground=True)
+
+    monkeypatch.setenv("JARVIS_WO_ID", FILER)
+    fleet.enforce = enforce
+    return fleet
+
+
+def _bug_decisions():
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:
+        return [r for r in central.steward_decisions() if r["origin_kind"] == "bug_agent"]
+    finally:
+        central.close()
+
+
+def test_a_worker_filed_medium_is_dispatched_by_the_steward_when_there_is_room(worker):
+    worker.enforce(weekly_usd=100.0)
+    pickup = worker.file_bug(priority="medium")["pickup"]
+    wo_id = worker.wo_id()
+    assert wo_id and pickup["wo_id"] == wo_id
+    [row] = _bug_decisions()
+    assert (row["outcome"], row["parent_wo_id"], row["wo_id"]) == ("dispatch", FILER, wo_id)
+    note = bugreport.pickup_note(pickup)
+    assert "steward" in note and "pick up" not in note and "issues start" not in note
+    assert any(wo_id in c for c in worker.gh.issue()["comments"]), "the tracker says so too"
+
+
+def test_a_spent_bug_ledger_asks_the_user_and_says_so(worker):
+    worker.enforce(bug_weekly_usd=0.0)
+    pickup = worker.file_bug(priority="medium")["pickup"]
+    assert not worker.wo_id()
+    assert _bug_decisions()[0]["outcome"] == "ask"
+    assert "bug-budget" in pickup["reason"] and "pick up" not in pickup["reason"]
+
+
+def test_a_queued_worker_filing_drains_once_the_steward_allows_it(worker):
+    from jarvis import ops, steward
+    from jarvis.central_store import CentralStore
+
+    worker.enforce(max_depth=0)
+    pickup = worker.file_bug(priority="medium")["pickup"]
+    assert not worker.wo_id()
+    [row] = _bug_decisions()
+    assert (row["outcome"], row["queue_state"]) == ("queue", "waiting")
+    assert "queued" in pickup["reason"] and "pick up" not in pickup["reason"]
+
+    worker.enforce(max_depth=1)
+    central = CentralStore()
+    try:
+        assert steward.drain(ops.resolve_catalog(), central)["dispatched"] == 1
+    finally:
+        central.close()
+    assert worker.wo_id(), "queued meant waiting for room, not lost"
+
+
+def test_a_worker_filed_low_is_dropped_and_says_why(worker):
+    worker.enforce(weekly_usd=100.0)
+    pickup = worker.file_bug(priority="low")["pickup"]
+    assert not worker.wo_id()
+    assert _bug_decisions()[0]["outcome"] == "drop"
+    assert "low-severity" in pickup["reason"]
+
+
+def test_a_worker_filed_critical_still_asks_neo_first(worker):
+    worker.enforce(weekly_usd=100.0)
+    pickup = worker.file_bug(priority="critical")["pickup"]
+    assert pickup["neo_question_id"] and not pickup["wo_id"]
+    assert not _bug_decisions(), "the steward decides after Neo settles the level"
+
+
+def test_neo_downgrading_a_worker_filing_still_reaches_the_steward(worker):
+    worker.enforce(weekly_usd=100.0)
+    worker.file_bug(priority="blocker")
+    worker.triage(approve=False, answer="high", reason="has a workaround")
+    [row] = _bug_decisions()
+    assert (row["severity"], row["parent_wo_id"]) == ("major", FILER)
+    assert worker.wo_id(), "a downgrade is a level, not `start it yourself`"
+
+
+def test_a_human_filed_medium_is_left_for_the_user(worker, monkeypatch):
+    monkeypatch.delenv("JARVIS_WO_ID")
+    worker.enforce(weekly_usd=100.0)
+    pickup = worker.file_bug(priority="medium")["pickup"]
+    assert not worker.wo_id() and not _bug_decisions()
+    assert "jarvis issues start" in pickup["reason"]
+
+
 # Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
 pytestmark = pytest.mark.usefixtures("self_dispatch_on")
