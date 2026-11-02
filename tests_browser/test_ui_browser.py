@@ -1220,11 +1220,11 @@ def test_morpheus_reads_at_desktop_and_phone_width(page, server, readable):
     failed, _ = _morpheus_rows()
     for size in _WIDTHS:
         page.set_viewport_size(size)
-        page.goto(f"{server}/morpheus")
+        page.goto(f"{server}/mo")
         assert failed in page.locator(".needs-you").inner_text()
         readable(page)
         _shot(page, f"morpheus-{size['width']}")
-        page.goto(f"{server}/morpheus/{failed}")
+        page.goto(f"{server}/mo/{failed}")
         assert "boom" in page.locator("#tab-runs").inner_html()
         readable(page)
         _shot(page, f"morpheus-item-{size['width']}")
@@ -1232,7 +1232,7 @@ def test_morpheus_reads_at_desktop_and_phone_width(page, server, readable):
 
 def test_a_morpheus_filter_in_the_url_narrows_the_rows(page, server):
     failed, watching = _morpheus_rows()
-    page.goto(f"{server}/morpheus?state=monitoring")
+    page.goto(f"{server}/mo?state=monitoring")
     table = page.locator("table.mv-list").inner_text()
     assert watching in table and failed not in table
     assert "1 of 2 shown" in page.locator("main").inner_text()
@@ -1263,7 +1263,7 @@ def test_the_operation_jump_opens_its_tab_on_the_worker_prompt_page(page, server
 
 def test_a_failed_morpheus_row_sits_above_the_others(page, server):
     failed, watching = _morpheus_rows()
-    page.goto(f"{server}/morpheus")
+    page.goto(f"{server}/mo")
     rows = page.locator("table.mv-list a.rowid")
     first = rows.filter(has_text=failed).bounding_box()
     assert first["y"] < rows.filter(has_text=watching).bounding_box()["y"]
@@ -1271,12 +1271,12 @@ def test_a_failed_morpheus_row_sits_above_the_others(page, server):
 
 def test_clicking_a_morpheus_row_id_opens_its_detail(page, server):
     failed, _ = _morpheus_rows()
-    page.goto(f"{server}/morpheus")
+    page.goto(f"{server}/mo")
     page.click(f"table.mv-list a.rowid:has-text('{failed}')")
-    page.wait_for_url(f"**/morpheus/{failed}")
+    page.wait_for_url(f"**/mo/{failed}")
     assert "confirm failed" in page.locator("main").inner_text()
     page.goto(f"{server}/go/{failed}")
-    page.wait_for_url(f"**/morpheus/{failed}")
+    page.wait_for_url(f"**/mo/{failed}")
 
 
 # §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
