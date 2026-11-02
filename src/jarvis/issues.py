@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -362,6 +364,69 @@ def gh_login() -> str:
     return _GH_LOGIN[0]
 
 
+#: `viewerPermission` levels that may close and label an issue; READ can only comment (#1346)
+TRACKER_WRITE_PERMISSIONS = ("ADMIN", "MAINTAIN", "WRITE", "TRIAGE")
+
+#: The lowest of them, as the inbox and doctor name it
+TRACKER_NEEDED_PERMISSION = "TRIAGE"
+
+#: How long one access answer is trusted
+TRACKER_ACCESS_TTL = 600
+
+
+@dataclass(frozen=True)
+class TrackerAccess:
+    """What `gh` can do on one tracker, as GitHub answered it (#1346)"""
+
+    repo: str
+    login: str
+    #: GitHub's `viewerPermission`, or "" when it could not be read
+    permission: str
+    error: str = ""
+
+    @property
+    def denied(self) -> bool:
+        """True only on a DEFINITE answer below triage; an unreadable probe is unknown"""
+        return bool(self.permission) and self.permission not in TRACKER_WRITE_PERMISSIONS
+
+    def explain(self) -> str:
+        """The account, the repo, what it lacks, and how to point `gh` elsewhere"""
+        config = os.environ.get("GH_CONFIG_DIR") or "the default gh config (~/.config/gh)"
+        return (f"`gh` is authenticated as {self.login or 'an unknown account'}, which has "
+                f"{self.permission} permission on {self.repo}; closing and labelling issues "
+                f"needs {TRACKER_NEEDED_PERMISSION} or higher. Jarvis has stopped writing to "
+                f"that tracker. This process reads {config}: set GH_CONFIG_DIR (or GH_TOKEN) "
+                f"in the daemon's service environment to the account that owns the tracker, "
+                f"or grant {self.login or 'that account'} triage access, then restart the "
+                f"daemon.")
+
+
+#: `tracker_access`'s process cache: repo to (answered at, answer)
+_TRACKER_ACCESS: dict[str, tuple[float, TrackerAccess]] = {}
+
+
+def reset_tracker_access() -> None:
+    """Forget every cached access answer"""
+    _TRACKER_ACCESS.clear()
+
+
+def tracker_access(repo: str) -> TrackerAccess:
+    """Who `gh` writes to `repo` as, and with what permission (#1346)"""
+    repo = checked_repo(repo)
+    key = repo.lower()
+    cached = _TRACKER_ACCESS.get(key)
+    if cached and time.time() - cached[0] < TRACKER_ACCESS_TTL:
+        return cached[1]
+    try:
+        stdout = _run(["repo", "view", repo, "--json", "viewerPermission"], url=repo)
+        permission = str(json.loads(stdout or "").get("viewerPermission") or "").upper()
+    except Exception as e:  # noqa: BLE001 — unknown, never a denial (kn-40db1828); not cached
+        return TrackerAccess(repo=repo, login=gh_login(), permission="", error=str(e))
+    answer = TrackerAccess(repo=repo, login=gh_login(), permission=permission)
+    _TRACKER_ACCESS[key] = (time.time(), answer)
+    return answer
+
+
 def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:
     """Every follow-up the panel has already filed on `repo` for one unit"""
     repo = checked_repo(repo)
@@ -576,6 +641,8 @@ START_COMMAND = "jarvis issues start {url}"
 #: Keys a triage question's context carries when an investigation GAP filed the bug (#1344)
 INVESTIGATION_KEY = "investigation"
 MORPHEUS_ITEM_KEY = "morpheus_item"
+#: The pre-triage dispatch line's tail; still on the record after Neo answered = a lost echo (#1402)
+INVESTIGATION_PENDING_MARK = "Neo is re-assessing it; the fix starts at once"
 
 def self_dispatch(catalog: Any) -> bool:
     """`os.autonomy.self_dispatch`: may a confirmed claim dispatch work nobody typed?"""
@@ -656,7 +723,7 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
                                             extra=investigation)
         if investigation and not expedite:
             out["reason"] = (f"`{priority}` filed by {investigation.get(INVESTIGATION_KEY)} "
-                             f"— Neo is re-assessing it; the fix starts at once if Neo "
+                             f"— {INVESTIGATION_PENDING_MARK} if Neo "
                              f"agrees and the steward allows it")
         elif expedite:
             out["reason"] += (f"; Neo is re-assessing the `{priority}` claim in "
@@ -820,9 +887,10 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
 
         out["dispatch"] = investigation_dispatch_note(out)
         try:
+            # By id alone: the investigation lives in the investigated project, not the tracker's (#1402)
             record_investigation_dispatch(inv_id, out.get("existing_wo_id") or "",
-                                          out["dispatch"], q.get("project") or None)
-        except Exception:  # noqa: BLE001 — the settlement stands; only its echo is lost
+                                          out["dispatch"], parked=out.get("parked") or "")
+        except Exception:  # noqa: BLE001 — the settlement stands; INV-INVESTIGATION-DISPATCH re-derives the echo
             log.exception("could not record the dispatch on %s", inv_id)
     return out
 
@@ -893,6 +961,11 @@ def _settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any],
         out["steward"] = f"{decision.outcome}, {decision.rule}: {decision.reason}"
         if decision.outcome == "dispatch" and not decision.allowed:
             out["steward"] += "; os.autonomy.self_dispatch is off"
+        if not decision.allowed:
+            # What the investigation's own status and the user's inbox say (#1404)
+            out["parked"] = (f"steward `{decision.outcome}` ({decision.rule})"
+                             if decision.outcome != "dispatch"
+                             else "os.autonomy.self_dispatch is off")
     if decision is not None and decision.allowed:
         out["wo_id"] = promote_confirmed(
             spec, payload, metadata=steward.stamped(links, decision),

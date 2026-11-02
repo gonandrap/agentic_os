@@ -53,7 +53,7 @@ def at(monkeypatch, ts: float):
 
 def test_assumptions_blocker_agrees_with_the_user_blockers(started, project):
     wo = an_order(started)
-    ops.assume(wo["id"], "exporting CSV by default")
+    ops.assume(wo["id"], "exporting CSV by default (fixture decision)")
 
     d = ops.diagnose(wo["id"])
 
@@ -73,7 +73,7 @@ def test_disagreement_reported_when_the_blocker_does_not_need_the_user(started,
                                                                       monkeypatch):
     """`true_blockers` wants the user; `waiting_on` says a turn is in flight"""
     wo = an_order(started)
-    ops.assume(wo["id"], "exporting CSV by default")
+    ops.assume(wo["id"], "exporting CSV by default (fixture decision)")
     monkeypatch.setattr(ops, "waiting_on", lambda store, w, now=None: {
         "what": "turn_running", "stalled": False,
         "detail": "a turn is in flight — the worker is working"})
@@ -260,7 +260,7 @@ def test_an_uncapped_list_says_nothing_about_a_cap(started):
 
 def test_ack_is_withheld_while_assumptions_are_pending(started):
     wo = an_order(started)
-    ops.assume(wo["id"], "exporting CSV by default")
+    ops.assume(wo["id"], "exporting CSV by default (fixture decision)")
 
     d = ops.diagnose(wo["id"])
 
@@ -433,7 +433,7 @@ def test_cli_says_when_no_daemon_pass_will_act(started, project, capsys):
 
 def test_cli_json_round_trips_the_ops_dict(started, capsys):
     wo = an_order(started)
-    ops.assume(wo["id"], "exporting CSV by default")
+    ops.assume(wo["id"], "exporting CSV by default (fixture decision)")
 
     assert cli.main(["wo", "why", wo["id"], "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
@@ -447,7 +447,7 @@ def test_cli_json_round_trips_the_ops_dict(started, capsys):
 
 def test_cli_human_rendering_names_the_blocker(started, capsys):
     wo = an_order(started)
-    ops.assume(wo["id"], "exporting CSV by default")
+    ops.assume(wo["id"], "exporting CSV by default (fixture decision)")
 
     for _ in range(ops.OS_CALLS_SHOWN + 2):
         agent_usage.record("neo_answer", wo_id=wo["id"], project="proj_a",
@@ -486,7 +486,7 @@ def test_ack_is_offered_and_the_real_command_accepts_it(started, project):
 def test_a_withheld_ack_is_explained(started, project):
     """§6.5: a command not offered says why, like a withheld `validation force`"""
     wo = an_order(started)
-    ops.assume(wo["id"], "exporting CSV by default")
+    ops.assume(wo["id"], "exporting CSV by default (fixture decision)")
 
     d = ops.diagnose(wo["id"])
 

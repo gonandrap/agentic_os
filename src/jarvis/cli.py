@@ -1009,6 +1009,13 @@ def build_parser() -> argparse.ArgumentParser:
     uh.add_argument("wo_id")
     uh.add_argument("--project")
 
+    ex = wo.add_parser("expedite", help="once its pull request merges, ship it ALONE: "
+                                        "a release of the latest tag plus this one "
+                                        "cherry-picked commit, not main's head")
+    ex.add_argument("wo_id")
+    ex.add_argument("--off", action="store_true", help="clear the flag")
+    ex.add_argument("--project")
+
     dl = wo.add_parser("delete", help="permanently delete a work order and its whole "
                                       "history — this cannot be undone")
     dl.add_argument("wo_id")
@@ -1994,6 +2001,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                   f"({wo.get('status_label') or wo['status']}){att}")
     if st["backlog"]["open"]:
         print(f"\n🗂 backlog: {st['backlog']['open']} open items — `jarvis backlog list`")
+    parked = st.get("investigations", {}).get("fixes_parked")
+    if parked:
+        print(f"\n🅿 {parked} investigation fix(es) parked by the steward — `jarvis investigate list`")
     return 0
 
 
@@ -3028,9 +3038,12 @@ def cmd_stuck(args: argparse.Namespace) -> int:
     if args.json:
         _print(rows, True)
         return 0
+    # Parity with the `/stuck` banners (issue 1450)
+    for u in ops.stuck_unjudged(args.project):
+        print(f"{u['project']} is not judged — os.fleet_health.enabled is off; "
+              f"enable it: {u['enable']}")
     if not rows:
-        print("no open order is being judged — `fleet_health.enabled` is off, or there "
-              "is nothing open")
+        print("no open order on any judged project")
         return 0
     over = [r for r in rows if r["stuck"]]
     print(f"{len(over)} past its threshold · {len(rows) - len(over)} on the record\n")
@@ -3685,6 +3698,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "status_label": invariants.status_label(store, wo,
                                                         ops.fleet_if_held([wo])),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
+                # The pause as fields: `status` stays the machine's state (#247)
+                **({"paused": paused}
+                   if (paused := invariants.pause_state(store, wo)) else {}),
                 # The other kind of hold, always present and empty when there are none (`validation_rounds`'... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
                 "preconditions": ops.open_preconditions(store, wo),
                 # What has already been dismissed on this order, decoded
@@ -3780,6 +3796,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "ack":
         _print(ops.ack_attention(args.wo_id, all_projects=args.all,
                                  project_name=args.project), args.json)
+    elif args.wo_cmd == "expedite":
+        _print(ops.expedite_work_order(args.wo_id, on=not args.off,
+                                       project_name=args.project), args.json)
     elif args.wo_cmd in ("hide", "unhide"):
         _print(ops.hide_work_order(args.wo_id, hidden=args.wo_cmd == "hide",
                                    project_name=args.project), args.json)
@@ -4572,13 +4591,17 @@ GATE_ICON = {"awaiting_case": "✎", "pending": "⏸", "approved": "✅",
              "denied": "⛔", "dismissed": "⊘",
              "expired": "⌛",
              # Keyed on the DISPLAY state, not the status: a spent grant is `expired` in the database and an...
-             "spent": "☑"}
+             "spent": "☑", "used": "☑", "superseded": "⊘"}
 
 
 def _gate_display(row: dict) -> str:
     """The word this gate is rendered under"""
-    if row["status"] == "expired" and row["closed_as"] in ("spent", "abandoned"):
-        return row["closed_as"]
+    if row["status"] == "expired":
+        if row["closed_as"] in ("spent", "abandoned", "superseded"):
+            return row["closed_as"]
+        if row["closed_as"] == "lapsed" and row["uses"]:
+            # Approved and used, then timed out with uses left: not an expired approval (#1388)
+            return "used"
     return row["status"]
 
 
@@ -4678,6 +4701,11 @@ def cmd_gate(args: argparse.Namespace) -> int:
                     # The opposite of a lapse: this grant was used
                     state = (f"spent — approved by {r['decided_by'] or '?'}, then used "
                              f"{r['uses']}/{r['max_uses']}")
+                elif _gate_display(r) == "used":
+                    state = (f"approved by {r['decided_by'] or '?'} · used "
+                             f"{r['uses']}/{r['max_uses']} · lapsed")
+                elif r["closed_as"] == "superseded":
+                    state = "superseded — closed undecided by the OS"
                 else:
                     state = f"{r['status']} by {r['decided_by'] or '?'}"
                 print(f"{icon} {r['id']} [{r['project']}] {r['kind']} · {state} "
@@ -6011,6 +6039,8 @@ def _serve_dashboard(host: str, port: int, open_path: str | None = None) -> int:
         print("the web UI needs extras: pip install 'jarvis-os[ui]'", file=sys.stderr)
         return 1
     from .ui.app import create_app
+    from .uilog import register_stack_signal
+    register_stack_signal()
     server = uvicorn.Server(uvicorn.Config(create_app(), host=host, port=port,
                                            log_level="warning"))
     if open_path is not None:

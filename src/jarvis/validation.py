@@ -326,6 +326,9 @@ def _pull_request_sections(packet: EvidencePacket) -> list[str]:
                    "Check the DECLARED testing evidence above against this. A "
                    "submitter claiming a green suite over a failing check is the "
                    "cheapest defect on this page to find.\n" + rows)
+        if packet.base_red:
+            out.append("### The red checks above are the base's, not this change's\n"
+                       + packet.base_red)
     else:
         # Said out loud rather than omitted: a seat that sees no check section can only guess whether CI...
         out.append("## What CI reported on this pull request\n"

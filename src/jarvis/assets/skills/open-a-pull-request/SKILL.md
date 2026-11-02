@@ -38,7 +38,9 @@ requires, so do not rename or drop any of them.
 ## 2. Fill every section
 
 Write the body to a file and pass `--body-file`; a body this shape does not survive
-being typed as a shell argument.
+being typed as a shell argument. Write it with the Write tool in its own call, to a path
+named after your work order (`pr-body-<wo-id>.md`, never a shared `pr.md`): a command
+that writes the file and runs `gh pr create` together is denied.
 
 **Summary** — what changed and why, a few sentences. Longer rationale is a spec:
 write it under `docs/superpowers/specs/YYYY-MM-DD-<name>.md` and link it.
@@ -92,6 +94,12 @@ expensive: the suite takes ~21 minutes, your turn is a single conversation with 
 5-minute prompt cache, and one blocking call that long re-sends the whole
 conversation at the cache-write rate on the next call. One work order
 burned ~1.5M tokens that way (kn-356c724b).
+
+**Targeted is bounded: each local test command finishes in under two minutes.** Run
+your new tests and the test files you edited first, with `-n auto` (pytest-xdist is in
+the dev extra). Do not grep for every file that mentions a changed symbol and run them
+all — a wider impacted set is CI's, and Test evidence says so. Never re-run a file
+already green this turn unless you changed what it covers since.
 
 So: run the tests for what you changed, cite CI for the rest, and finish. **You do not
 wait for CI** — `jarvis wo finish` returns immediately and the OS holds the validation

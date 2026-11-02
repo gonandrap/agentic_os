@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,11 @@ REGENERABLE_NAMES = frozenset({
 REGENERABLE_SUFFIXES = (".pyc", ".pyo", ".egg-info")
 
 
+def pytest_temproot(wo_id: str) -> Path:
+    """The order's own PYTEST_DEBUG_TEMPROOT, so a sibling's pytest never garbage-collects its tmp_path (#723)"""
+    return Path(tempfile.gettempdir()) / "jarvis-pytest" / wo_id
+
+
 def make_dirs_writable(worktree: Path) -> int:
     """Owner-write on read-only dirs, whose files a removal cannot unlink (EACCES, wo-b6e2ddda)"""
     fixed = 0
@@ -54,7 +60,7 @@ def make_dirs_writable(worktree: Path) -> int:
 
 
 def prune_build_caches(worktree: Path, artifacts: Iterable[str] = ()) -> list[str]:
-    """Delete UNTRACKED regenerable caches and consumed `artifacts`, which read as work (#1257)"""
+    """Clear caches and consumed `artifacts` that read as work (#1257, #1292)"""
     consumed = set(artifacts)
     # `=all` so an untracked DIRECTORY cannot hide what it holds behind its own name
     status = branchproof.run(worktree, "--no-optional-locks", "status", "--porcelain",
@@ -63,6 +69,11 @@ def prune_build_caches(worktree: Path, artifacts: Iterable[str] = ()) -> list[st
         return []
     pruned: list[str] = []
     for entry in status.split("\0"):
+        # A consumed artifact a past PR committed reads as MODIFIED, not untracked (#1292)
+        if entry[:2] in (" M", "M ", "MM") and entry[3:] in consumed:
+            if branchproof.run(worktree, "checkout", "HEAD", "--", entry[3:]) is not None:
+                pruned.append(entry[3:])
+            continue
         if not entry.startswith("??"):
             continue
         rel = entry[3:] if entry[3:] in consumed else _regenerable_root(entry[3:])
@@ -148,6 +159,7 @@ def _reclaim_one(project_path: Path,
                                       str(path))
     if out is None:
         return None, f"git would not remove it: {' '.join(stderr.split())[:200]}"
+    shutil.rmtree(pytest_temproot(str(row["id"])), ignore_errors=True)
     return {"worktree": name, "removed": True, "branch": authored.branch,
             "commits": authored.commits}, ""
 

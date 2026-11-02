@@ -549,7 +549,7 @@ def test_an_uncovered_blocker_hands_back_the_diagnosis_as_the_users_command(star
     """§6's pre-validated way through"""
     _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
     wo = ops.create_work_order("proj_a", "waiting on a decision")
-    ops.assume(wo["id"], "exporting CSV by default")
+    ops.assume(wo["id"], "exporting CSV by default (fixture decision)")
 
     out = ops.fix(wo["id"])
 

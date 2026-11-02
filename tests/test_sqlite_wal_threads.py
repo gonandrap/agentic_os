@@ -23,6 +23,30 @@ def test_two_threads_connect_select_close_on_a_wal_file_do_not_deadlock(tmp_path
         raise AssertionError(f"WAL connect/close deadlocked on SQLite {sqlite3.sqlite_version}") from None
 
 
+def test_threads_racing_connect_on_a_fresh_file_all_get_wal(tmp_path):
+    """Concurrent first WAL switch fails instantly without the retry (issue 805)"""
+    import threading
+
+    from jarvis import db
+
+    errors = []
+
+    def open_it(path):
+        try:
+            assert db.connect(path).execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    for i in range(150):
+        path = tmp_path / f"{i}.db"
+        ts = [threading.Thread(target=open_it, args=(path,)) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    assert errors == []
+
+
 def test_jarvis_refuses_a_deadlocking_sqlite():
     import sqlite3
 
