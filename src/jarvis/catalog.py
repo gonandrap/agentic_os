@@ -1079,7 +1079,7 @@ class MorpheusConfig:
     timeout_days: float = 3.0
     check_every_minutes: int = 15
     script_timeout_seconds: int = 60
-    #: Compact Morpheus's session once its context passes this share of the window
+    #: Ignored, no session to compact; parsed so old catalogs load (monitoring-orders §3)
     compact_at: float = 0.30
     on_failed: str = "investigate"
     on_timeout: str = "neo"
