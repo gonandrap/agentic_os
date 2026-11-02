@@ -122,5 +122,5 @@ def test_a_release_page_colours_a_failed_pr(os_repo):
     from jarvis.ui.app import create_app
 
     page = TestClient(create_app()).get("/release/jarvis-0.1.1").text
-    assert f'class="mono tone-bad" href="/morpheus/{os_repo["mv"]}"' in page
+    assert f'class="mono tone-bad" href="/mo/{os_repo["mv"]}"' in page
     assert "needs-you" in page

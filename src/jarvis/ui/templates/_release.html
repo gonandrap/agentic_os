@@ -3,7 +3,7 @@
                "unwatched": "tone-muted"} %}
 
 {% macro validation(r) -%}
-{%- if r.morpheus %}<a class="mono {{ tone[r.validation] }}" href="/morpheus/{{ r.morpheus.id }}"
+{%- if r.morpheus %}<a class="mono {{ tone[r.validation] }}" href="/mo/{{ r.morpheus.id }}"
    title="morpheus {{ r.morpheus.state }}">{{ r.validation }}</a>
 {%- else %}<span class="mono tone-muted" title="morpheus has no item for this PR">{{ r.validation }}</span>{% endif -%}
 {%- endmacro %}
