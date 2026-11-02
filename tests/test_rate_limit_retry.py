@@ -677,3 +677,78 @@ def test_an_exhausted_work_order_still_takes_a_message(started, fake_claude, pro
     assert settle_turns(store)
     assert store.latest_turn(wo["id"])["prompt"] == "limit restored, retry"
     store.close()
+
+
+# -- the worker reports the limit itself (issue 1456)
+
+#: wo-5b96c9da turn 2, verbatim
+WORKER_SAID = "Your usage limit was reached, so this work order stopped partway."
+
+
+def _meter(*, pct: float, resets_at: float, extra: dict | None = None) -> None:
+    from jarvis import usage_meter
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        usage_meter.record(central, usage_meter.Sample(
+            ts=time.time(), five_hour_pct=pct, five_hour_resets_at=resets_at,
+            seven_day_pct=40.0, seven_day_resets_at=resets_at + 86_400,
+            extra=extra or {}))
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+def _worker_stops(store, reply=WORKER_SAID):
+    turn = store.create_turn("wo-test", kind="message", prompt="do the thing")
+    return worker_session._settle_result(
+        store, turn, claude_cli.TurnResult(ok=True, result=reply))
+
+
+def test_a_reported_limit_the_meter_confirms_is_the_same_pause(jarvis_home, store):
+    """The reset comes off the meter, never the prose"""
+    reset = time.time() + 2 * 3600
+    _meter(pct=100.0, resets_at=reset)
+
+    turn = _worker_stops(store)
+
+    assert turn["state"] == "failed"
+    pause = worker_session.turn_pause(store, "wo-test")
+    assert pause.reason == worker_session.PAUSE_USAGE_LIMIT
+    assert pause.retry_at == pytest.approx(int(reset))
+    (event,) = store.events_of_kind("wo-test", "turn_paused")
+    assert db.from_json(event["payload"], {})["source"] == "worker_report"
+
+
+def test_a_spent_per_model_window_counts_and_the_latest_reset_wins(jarvis_home, store):
+    reset = time.time() + 3600
+    later = reset + 5 * 3600
+    _meter(pct=100.0, resets_at=reset,
+           extra={"seven_day_opus": {"utilization": 100.0, "resets_at": later}})
+
+    _worker_stops(store)
+
+    assert worker_session.turn_pause(store, "wo-test").retry_at == pytest.approx(int(later))
+
+
+@pytest.mark.parametrize("pct, reply", [
+    (100.0, "Done with step one; stopping here for your input."),  # no claim
+    (97.0, WORKER_SAID),                                             # the meter disagrees
+])
+def test_a_claim_or_a_meter_alone_arms_nothing(jarvis_home, store, pct, reply):
+    _meter(pct=pct, resets_at=time.time() + 3600)
+
+    assert _worker_stops(store, reply)["state"] == "done"
+    assert worker_session.turn_pause(store, "wo-test") is None
+
+
+def test_no_meter_reading_arms_nothing(jarvis_home, store):
+    assert _worker_stops(store)["state"] == "done"
+
+
+def test_a_finished_worker_is_not_paused(jarvis_home, store):
+    _meter(pct=100.0, resets_at=time.time() + 3600)
+    store.update_work_order("wo-test", result_summary="shipped it; the limit hit after")
+
+    assert _worker_stops(store)["state"] == "done"
