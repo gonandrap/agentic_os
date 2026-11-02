@@ -70,6 +70,8 @@ HELD_CHECKS_CANCELLED = "checks_cancelled"
 HELD_BASE_RED = "base_red"
 #: The base moved and this head does not contain it
 HELD_BASE_MOVED = "base_moved"
+#: Another pull request holds this base's merge lease (#1459)
+HELD_MERGE_QUEUED = "merge_queued"
 
 #: WHY the merge command did not succeed on a pull request that merged anyway (§5.5)
 CLEANUP = "cleanup"
@@ -279,6 +281,20 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
     return _held(HELD_BASE_MOVED, reason,
                  head_sha=str(getattr(pr, "head_oid", "") or ""),
                  catch_up=str(catch_up.outcome or ""), catch_up_cause=cause)
+
+
+def merge_queued(store: Any, wo: dict[str, Any], pr: Any) -> Decision | None:
+    """Held behind another order's merge in flight on this base tip, or None (#1459)"""
+    base_oid = str(getattr(pr, "base_oid", "") or "")
+    lease = store.merge_lease(GATE_KIND, base_oid, wo["id"]) if base_oid else None
+    if lease is None:
+        return None
+    base = str(getattr(pr, "base_ref", "") or "the base")
+    return _held(HELD_MERGE_QUEUED,
+                 f"queued behind {lease['wo_id']}, whose merge into `{base}` at "
+                 f"{base_oid[:10]} is in flight (gate request {lease['id']}); this "
+                 f"branch is caught up and proposed once that one merges or is refused",
+                 head_sha=str(getattr(pr, "head_oid", "") or ""))
 
 
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
@@ -571,6 +587,8 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
     # Spec 2026-09-28 §3.5: the base this request was filed against, ON the request
     base = str(getattr(pr, "base_ref", "") or "the base")
     base_oid = str(getattr(pr, "base_oid", "") or "")
+    store.supersede_grants(wo["id"], GATE_KIND, command,
+                           f"superseded by the request for {decision.judged_sha[:10]}")
     approval = store.add_approval(
         wo["id"], GATE_KIND, command,
         # No recogniser fired: this was filed by the OS
