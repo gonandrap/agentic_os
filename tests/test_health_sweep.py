@@ -1319,6 +1319,34 @@ def test_a_live_dependency_is_not_stuck(stuck_os):
     assert verdict.excluded == stuck.LIVE_DEPENDENCY
 
 
+def _dependency_cleared(stuck_os, cleared_hours_ago: float) -> str:
+    """A child 5h pending behind a dependency that completed `cleared_hours_ago`"""
+    store = stuck_os["store"]
+    dep = ops.create_work_order("proj_a", "the dependency")
+    child = ops.create_work_order("proj_a", "waiting as --depends-on designed",
+                                  depends_on=[dep["id"]])
+    park_order(store, child["id"], "pending", hours=5)
+    store.set_status(dep["id"], "completed")
+    store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE order_id=? AND to_status=?",
+                       (db.now() - cleared_hours_ago * HOUR, dep["id"], "completed"))
+    store.conn.commit()
+    return child["id"]
+
+
+def test_a_dependency_that_just_completed_is_not_stuck(stuck_os):
+    """Issue 1488: the wait behind the edge is discounted once it clears"""
+    child = _dependency_cleared(stuck_os, cleared_hours_ago=22 / 3600)
+    verdict = _judge(stuck_os, child)
+    assert verdict.stuck is False
+    assert verdict.excluded == ""
+
+
+def test_time_since_the_dependency_completed_is_still_judged(stuck_os):
+    """Issue 1488: only the held seconds are discounted"""
+    child = _dependency_cleared(stuck_os, cleared_hours_ago=2)
+    assert _judge(stuck_os, child).stuck is True
+
+
 @pytest.mark.parametrize("how", ["cancelled", "deleted"])
 def test_a_dead_dependency_is_still_judged(stuck_os, how):
     """§2.3: a dead edge cannot clear itself, so the order SHOULD be judged"""
@@ -1338,7 +1366,7 @@ def test_a_dead_dependency_is_still_judged(stuck_os, how):
 
 
 def test_a_dependency_just_completed_is_not_stuck_before_dispatch(stuck_os):
-    """§2.4 (issue 1490): the held seconds are discounted, so the exclusion lapsing is no verdict"""
+    """Issues 1488 and 1490: the held seconds are discounted, so the exclusion lapsing is no verdict"""
     store = stuck_os["store"]
     dep = ops.create_work_order("proj_a", "the dependency")
     child = ops.create_work_order("proj_a", "waiting as --depends-on designed",
@@ -1353,7 +1381,7 @@ def test_a_dependency_just_completed_is_not_stuck_before_dispatch(stuck_os):
 
 
 def test_a_dead_edge_beside_a_live_one_gets_no_discount(stuck_os):
-    """§2.3 holds over §2.4: the live edge's hold is moot while a dead one stands"""
+    """§2.3: a live edge's hold is moot while a dead one stands (issue 1490)"""
     store = stuck_os["store"]
     dead = ops.create_work_order("proj_a", "the edge that can never clear")
     live = ops.create_work_order("proj_a", "the live edge")
@@ -1365,27 +1393,6 @@ def test_a_dead_edge_beside_a_live_one_gets_no_discount(stuck_os):
 
     verdict = _judge(stuck_os, child["id"])
     assert verdict.stuck is True and verdict.excluded == ""
-
-
-def test_dependency_hold_spans_walk_each_timeline_and_clip():
-    """§2.4: pure over `state_spans` rows; satisfied and dead spans hold nothing"""
-    from jarvis.project_store import dependency_hold_spans
-
-    def tl(*steps):
-        return [{"ts": ts, "to_status": s} for ts, s in steps]
-
-    assert dependency_hold_spans([tl((50.0, "pending"), (150.0, "completed"))],
-                                 100.0, 200.0) == [(100.0, 150.0)]
-    assert dependency_hold_spans([tl((50.0, "running"))], 100.0, 200.0) == [(100.0, 200.0)]
-    assert dependency_hold_spans([tl((120.0, "running"), (140.0, "cancelled"))],
-                                 100.0, 200.0) == [(120.0, 140.0)]
-    assert dependency_hold_spans([tl((50.0, "running"), (80.0, "completed"))],
-                                 100.0, 200.0) == []
-    # One timeline per edge, all returned — the union is `union_seconds`' job
-    assert dependency_hold_spans([tl((110.0, "running"), (160.0, "completed")),
-                                  tl((130.0, "pending"))], 100.0, 200.0) == [
-        (110.0, 160.0), (130.0, 200.0)]
-    assert dependency_hold_spans([], 100.0, 200.0) == []
 
 
 def test_pending_with_no_dependencies_is_still_stuck(stuck_os):

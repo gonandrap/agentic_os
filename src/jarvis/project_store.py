@@ -188,19 +188,18 @@ def precondition_hold_spans(rows: Iterable[Any], since: float,
     return sorted(spans)
 
 
-def dependency_hold_spans(timelines: Iterable[Sequence[Any]], since: float,
-                          now: float) -> list[tuple[float, float]]:
-    """Live-edge hold spans (§2.4 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md)"""
-    settled = (DEPENDENCY_SATISFIED_STATUS, *DEPENDENCY_DEAD_STATUSES)
+def dependency_hold_spans(dep_transitions: Iterable[Iterable[Any]], created_at: float,
+                          since: float, now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` a since-completed dependency held this order (issue 1488)"""
     spans: list[tuple[float, float]] = []
-    for rows in timelines:
-        for i, row in enumerate(rows):
-            if str(row["to_status"]) in settled:
-                continue  # satisfied, or dead and so still judged (§2.3)
-            start = max(float(row["ts"]), since)
-            end = min(float(rows[i + 1]["ts"]) if i + 1 < len(rows) else now, now)
-            if end > start:
-                spans.append((start, end))
+    for rows in dep_transitions:
+        done = next((float(r["ts"]) for r in rows
+                     if r["to_status"] == DEPENDENCY_SATISFIED_STATUS), None)
+        if done is None:
+            continue  # live edges are the exclusion's; a dead one stays judged
+        start, end = max(float(created_at or 0.0), since), min(done, now)
+        if end > start:
+            spans.append((start, end))
     return sorted(spans)
 
 
