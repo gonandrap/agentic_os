@@ -23,8 +23,11 @@
 
 {# `options` maps each query key to its values; a `q` key gives a text box instead of a select.
    `labels` names a select's empty choice (default "every <key>") or the text box's placeholder. #}
-{% macro filter_bar(action, filters, options, shown, total, labels={}) %}
+{# `hidden` params ride along on every submit, chip and clear link without being filters. #}
+{% macro filter_bar(action, filters, options, shown, total, labels={}, hidden={}) %}
+{% set action = action ~ ('?' ~ (hidden | urlencode) if hidden else '') %}
 <form class="filter-bar" method="get" action="{{ action }}">
+  {% for key, v in hidden.items() %}<input type="hidden" name="{{ key }}" value="{{ v }}">{% endfor %}
   {% for key, values in options.items() %}
   {% if key == "q" %}
   <input type="text" name="q" value="{{ filters.get('q', '') }}" aria-label="search"
@@ -42,7 +45,7 @@
   {% for key, v in filters.items() if v %}
   {% set rest = {} %}
   {% for k2, v2 in filters.items() if k2 != key and v2 %}{% if rest.update({k2: v2}) %}{% endif %}{% endfor %}
-  <a class="chip" href="{{ action }}{{ '?' ~ (rest | urlencode) if rest }}" title="remove this filter">{{ key }}: {{ v }} ×</a>
+  <a class="chip" href="{{ action }}{{ ('&' if hidden else '?') ~ (rest | urlencode) if rest }}" title="remove this filter">{{ key }}: {{ v }} ×</a>
   {% endfor %}
   <span class="shown">{{ shown }} of {{ total }} shown</span>
   {% if filters %}<a href="{{ action }}">clear</a>{% endif %}
