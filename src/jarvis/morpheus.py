@@ -967,7 +967,8 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
         result = call(prompt, session_id, resume=resume, cwd=cwd, model=cfg.model,
                       append_system_prompt=MORPHEUS_PERSONA,
                       permission_mode=catalog.os.default_permission_mode,
-                      add_dirs=add_dirs, timeout=cfg.turn_timeout_seconds)
+                      add_dirs=add_dirs, timeout=cfg.turn_timeout_seconds,
+                      previous=state.get("last_usage") if resume else None)
     except claude_cli.UsageLimitError as e:
         # BEFORE ClaudeCliError, its base: the window refused the call, so it costs no offer (#1171)
         from .worker_session import RATE_LIMIT_FALLBACK_DELAY
@@ -1018,6 +1019,10 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
     state.pop("turn_started_ts", None)
     agent_usage.record(agent_usage.MORPHEUS, usage=result, label=kind,
                        session_id=session_id, store=central)
+    # The cumulative reading the next resumed turn subtracts (#1462)
+    if isinstance(result.usage, dict) and isinstance(result.usage.get("reported"), dict):
+        state["last_usage"] = {"usage_v": result.usage.get("usage_v"),
+                               "reported": result.usage["reported"]}
     state["turns"] = int(state.get("turns") or 0) + 1
     state["last_error"] = ""
     state["kills"] = 0

@@ -910,14 +910,15 @@ def test_both_surfaces_render_a_spent_grant_under_the_same_key(gated):
     from jarvis import cli
     from jarvis.ui import app as ui_app
 
-    for closed_as, expected in (("spent", "spent"), ("abandoned", "abandoned"),
-                                ("lapsed", "expired"), ("superseded", "expired")):
-        row = {"status": "expired", "closed_as": closed_as}
+    for closed_as, uses, expected in (("spent", 3, "spent"), ("abandoned", 0, "abandoned"),
+                                      ("lapsed", 0, "expired"), ("lapsed", 1, "used"),
+                                      ("superseded", 0, "superseded")):
+        row = {"status": "expired", "closed_as": closed_as, "uses": uses}
         assert cli._gate_display(row) == expected
         assert ui_app.gate_display(row) == expected
         assert expected in ui_app.GATE_META
 
-    live = {"status": "approved", "closed_as": ""}
+    live = {"status": "approved", "closed_as": "", "uses": 0}
     assert cli._gate_display(live) == ui_app.gate_display(live) == "approved"
 
 

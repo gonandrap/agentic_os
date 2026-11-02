@@ -24,6 +24,8 @@ def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
            f"item you rely on (`6.2 item 5`), never by pasting it and never by naming a "
            f"whole document. A citation points, it does not argue: still state the fact "
            f"the decision rests on, since Neo may not be shown what you cite."
+           f" Never probe a hook or verb with `wo assume` or `wo ask` on your live "
+           f"order: use the test suite or a read-only `jarvis search`."
            if cite_spec else "")
         + tail)
 
@@ -536,6 +538,13 @@ def record_section(wo_id: str = WO_PLACEHOLDER,
         "is one conversation with a five-minute prompt cache, so a single twenty-minute "
         "blocking call re-sends the whole conversation at the cache-WRITE rate on the "
         "next call. One work order paid that seven times over (kn-356c724b).",
+        "",
+        "TARGETED IS BOUNDED: EACH LOCAL TEST COMMAND FINISHES IN UNDER TWO MINUTES. Run "
+        "your new tests and the test files you edited first, with `-n auto` "
+        "(pytest-xdist is in the dev extra). Do not grep for every file that mentions a "
+        "changed symbol and run them all: a wider impacted set is CI's, and your "
+        "evidence says so. Never re-run a file already green this turn unless you "
+        "changed what it covers since (issue 963).",
         "",
         "DO NOT WAIT FOR CI EITHER — that is the same blocked turn with a different "
         "command in it. Finish as soon as your targeted tests pass and the pull request "

@@ -12,6 +12,7 @@ from jarvis.cli import main
 from jarvis.invariants import (
     IDLE_NO_FINISH_BLOCKER,
     PARKED_BLOCKER,
+    PR_CLOSED_BLOCKER,
     STALE_FINISH_BLOCKER,
     true_blockers,
 )
@@ -41,6 +42,36 @@ def _idle_needs_review(project, title: str = "the one that went quiet") -> dict:
         store.set_status(wo["id"], "needs_review")
         store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
         return store.get_work_order(wo["id"])
+    finally:
+        store.close()
+
+
+def _closed_pr_needs_review(project, title: str = "the one that was refused") -> dict:
+    """A `needs_review` blocker the user MAY ack: the idle one is refused (issue 1456)"""
+    wo = ops.create_work_order("proj_a", title)
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "needs_review", pr_state="CLOSED")
+        store.flag_attention(wo["id"], PR_CLOSED_BLOCKER)
+        return store.get_work_order(wo["id"])
+    finally:
+        store.close()
+
+
+def test_ack_is_refused_on_an_idle_park_and_names_the_way_out(registered):
+    """An acked idle park vanished from every derived view (issue 1456)"""
+    wo = _idle_needs_review(registered)
+
+    with pytest.raises(ops.OpsError, match=f"jarvis wo send {wo['id']}"):
+        ops.ack_attention(wo["id"])
+    assert ops.ack_attention(all_projects=True)["skipped"] == [
+        {"wo_id": wo["id"], "reason": IDLE_NO_FINISH_BLOCKER}]
+
+    store = ProjectStore(registered)
+    try:
+        row = store.get_work_order(wo["id"])
+        assert row["needs_attention"] == 1
+        assert true_blockers(store, row) == [IDLE_NO_FINISH_BLOCKER]
     finally:
         store.close()
 
@@ -144,7 +175,7 @@ def test_ack_os_flag_writes_no_timeline_row_when_the_reason_is_unchanged(registe
 def test_the_users_own_ack_still_records_who_made_it(registered):
     """`jarvis wo ack` is unchanged — and now says on the record that it was them"""
     project = registered
-    wo = _idle_needs_review(project)
+    wo = _closed_pr_needs_review(project)
 
     ops.ack_attention(wo["id"])
 
@@ -152,7 +183,7 @@ def test_the_users_own_ack_still_records_who_made_it(registered):
     try:
         row = store.get_work_order(wo["id"])
         assert row["needs_attention"] == 0
-        assert json.loads(row["acknowledged_blockers"]) == [IDLE_NO_FINISH_BLOCKER]
+        assert json.loads(row["acknowledged_blockers"]) == [PR_CLOSED_BLOCKER]
         (event,) = store.events_of_kind(wo["id"], "acknowledged")
         assert json.loads(event["payload"])["by"] == "you"
     finally:
@@ -165,7 +196,7 @@ def test_the_users_own_ack_still_records_who_made_it(registered):
 def test_the_cli_show_carries_what_was_already_seen(registered, capsys):
     """`jarvis wo show` on an acked `needs_review` used to print `attention_reason: None` and nothing else..."""
     project = registered
-    wo = _idle_needs_review(project)
+    wo = _closed_pr_needs_review(project)
     ops.ack_attention(wo["id"])
 
     main(["wo", "show", wo["id"], "--json"])
@@ -173,30 +204,29 @@ def test_the_cli_show_carries_what_was_already_seen(registered, capsys):
     detail = json.loads(capsys.readouterr().out)
     assert detail["status"] == "needs_review"
     assert detail["attention_reason"] is None
-    assert detail["seen_blockers"] == [IDLE_NO_FINISH_BLOCKER]
+    assert detail["seen_blockers"] == [PR_CLOSED_BLOCKER]
 
 
 def test_the_cli_list_says_why_an_unflagged_order_is_open(registered, capsys):
     project = registered
-    wo = _idle_needs_review(project)
+    wo = _closed_pr_needs_review(project)
     ops.ack_attention(wo["id"])
 
     main(["wo", "list"])
 
     out = capsys.readouterr().out
     assert "already seen" in out
-    assert IDLE_NO_FINISH_BLOCKER in out
+    assert PR_CLOSED_BLOCKER in out
 
 
 def test_the_dashboard_page_says_why_after_the_got_it_button(client, project):
-    wo = _idle_needs_review(project)
+    wo = _closed_pr_needs_review(project)
     client.post(f"/wo/proj_a/{wo['id']}/ack")
 
     page = client.get(f"/wo/proj_a/{wo['id']}")
 
     assert "already seen" in page.text
-    # The dashboard escapes the backticks' contents, not the words around them
-    assert "stopped mid-task without" in page.text
+    assert "closed without merging" in page.text
 
 
 # -- (d) the acknowledgement reads as prose
@@ -205,7 +235,7 @@ def test_the_dashboard_page_says_why_after_the_got_it_button(client, project):
 def test_the_acknowledged_event_is_prose_and_names_who_acked(registered):
     """It reached the user as `{"blockers": ["…\\u2014 nothing it started…"]}`"""
     project = registered
-    wo = _idle_needs_review(project)
+    wo = _closed_pr_needs_review(project)
     ops.ack_attention(wo["id"])
 
     store = ProjectStore(project)
@@ -217,7 +247,7 @@ def test_the_acknowledged_event_is_prose_and_names_who_acked(registered):
 
     (entry,) = [r for r in rows if r["label"].startswith("Acknowledged")]
     assert entry["label"] == "Acknowledged by you"
-    assert entry["detail"] == IDLE_NO_FINISH_BLOCKER
+    assert entry["detail"] == PR_CLOSED_BLOCKER
     assert "{" not in entry["detail"]
 
 

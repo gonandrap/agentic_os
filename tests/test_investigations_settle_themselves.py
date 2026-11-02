@@ -183,7 +183,7 @@ def test_an_investigator_assumption_raises_nothing_and_shows_beside_the_verdict(
 def test_every_other_kind_still_puts_its_assumptions_to_the_user(started, store):
     wo = store.create_work_order("ship it")
     store.set_status(wo["id"], "needs_review")
-    ops.assume(wo["id"], "CSV, not TSV")
+    ops.assume(wo["id"], "CSV, not TSV (fixture decision)")
     assert any("assumption" in b for b in
                invariants.true_blockers(store, store.get_work_order(wo["id"])))
 

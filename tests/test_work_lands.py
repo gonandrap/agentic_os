@@ -249,7 +249,7 @@ def test_accepting_assumptions_will_not_complete_an_order_holding_unlanded_commi
 def test_accepting_assumptions_completes_an_order_that_produced_no_code(started, project):
     """The pairing: the review still does what it always did when nothing is stranded"""
     wo = _order(project, "decide something")
-    ops.assume(wo["id"], "used the existing helper")
+    ops.assume(wo["id"], "used the existing helper (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "needs_review")
@@ -262,7 +262,7 @@ def test_accepting_assumptions_completes_an_order_that_produced_no_code(started,
 def test_a_merged_pull_request_is_not_re_flagged_by_its_own_commits(started, project):
     """THE FALSE POSITIVE THAT WOULD ARRIVE BY THE BACK DOOR"""
     wo = _order(project, code="merged_feature")
-    ops.assume(wo["id"], "named it merged_feature")
+    ops.assume(wo["id"], "named it merged_feature (fixture decision)")
     store = ProjectStore(project)
     try:
         store.update_work_order(wo["id"], pr_url=PR, pr_state="MERGED")
@@ -276,7 +276,7 @@ def test_a_merged_pull_request_is_not_re_flagged_by_its_own_commits(started, pro
 def test_the_parked_flag_survives_a_reconcile_tick(started, project):
     """kn-eafe383a's rule, one level over: a flag `true_blockers` cannot re-derive is relabelled by..."""
     wo = _order(project, code="watchdogs")
-    ops.assume(wo["id"], "polled every 30s")
+    ops.assume(wo["id"], "polled every 30s (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "needs_review")
@@ -442,6 +442,45 @@ def test_complete_merged_writes_the_sha_that_merged_onto_the_event(started, proj
     assert json.loads(event["payload"])["head_oid"] == sha
 
 
+def _completions(project: Path, wo_id: str) -> list[dict]:
+    store = ProjectStore(project)
+    try:
+        return [n for n in store.unrouted_notifications()
+                if n["wo_id"] == wo_id and n["source"] == "completion"]
+    finally:
+        store.close()
+
+
+def test_a_user_order_that_merges_tells_the_user_with_its_final_message(started, project):
+    """Issue 1385: wo-d83e989e's final message offered two follow-ups and nobody heard"""
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    store = ProjectStore(project)
+    try:
+        store.record_agent_reply(wo["id"], "Done. Two gaps remain; want me to file them?")
+        ops.complete_merged(store, store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+    [note] = _completions(project, wo["id"])
+    assert "pull request merged" in note["title"]
+    assert "opened a PR" in note["body"] and PR in note["body"]
+    assert "want me to file them?" in note["body"]
+
+
+def test_an_order_the_os_opened_completes_without_an_inbox_item(started, project):
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    store = ProjectStore(project)
+    try:
+        store.update_work_order(wo["id"], origin="os")
+        ops.complete_merged(store, store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+    assert _completions(project, wo["id"]) == []
+
+
 def test_the_sweep_records_the_merge_it_saw_and_never_settles_the_order(
         started, project, fake_gh):
     """The merge, on the record, without `pr_state` gaining a writer — 2026-09-25 spec §5"""
@@ -525,7 +564,7 @@ def test_the_merge_the_sweep_saw_answers_a_park_over_the_same_work(started, proj
                                                                   fake_gh):
     """§6's INTENDED consequence, and the one reader the second `pr_merged` writer changes (#742)"""
     wo = _order(project, code="watchdogs")
-    ops.assume(wo["id"], "polled every 30s")
+    ops.assume(wo["id"], "polled every 30s (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "needs_review")

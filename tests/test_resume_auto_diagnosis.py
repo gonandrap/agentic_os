@@ -176,7 +176,7 @@ def test_it_says_the_panel_is_still_reading_a_work_order_parked_for_the_user(sta
 
     assert "in parallel" not in judged["diagnosis"]
     assert invariants.status_label(store, store.get_work_order(wo["id"])) == \
-        "needs_review"
+        "needs_review — 1 assumption pending your review"
 
 
 def test_it_declines_for_a_worker_that_is_simply_working(started, project):

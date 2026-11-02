@@ -1639,6 +1639,10 @@ class CentralStore:
                 (row["id"], now, row["role"], row["kind"], row["test"], row["pattern"],
                  row.get("summary", ""), row.get("source", "builtin")),
             )
+        for rule_id, why in gate_rules.retired_seed_ids():
+            self.conn.execute(
+                "UPDATE gate_rules SET retired_at=?, retired_reason=? WHERE id=?"
+                " AND retired_at IS NULL", (now, why, rule_id))
         self.set_state("gate_rules_seed", gate_rules.SEED_VERSION)
 
     def add_gate_rule(self, role: str, test: str, pattern: str, *, kind: str = "",

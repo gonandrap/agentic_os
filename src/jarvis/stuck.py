@@ -46,8 +46,9 @@ EXCLUSION_REASON: Mapping[str, str] = {
                          "feature has not finished with it — nothing is judged while "
                          "that is true"),
     TURN_IN_FLIGHT_CAUSE: ("a worker turn is in flight and writes nothing to the "
-                           "timeline while its tools run — it clears by itself when the "
-                           "turn ends, so nothing is judged while it does"),
+                           "timeline while its tools run — its transcript is still "
+                           "moving, so nothing is judged until it falls silent past the "
+                           "threshold"),
     BASE_RED_CAUSE: ("the OS is holding this merge itself: the default branch's own build "
                      "is broken and nothing merges onto a red base — it clears when the "
                      "base goes green, with no decision from you, so nothing is judged "
@@ -119,13 +120,16 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
            kind: str = "worker",
            exempt_kinds: Sequence[str] = (),
            by_design_idle: bool = False,
-           turn_in_flight: bool = False) -> Verdict:
+           turn_in_flight: bool = False,
+           stalled_turn_seconds: float = 0.0) -> Verdict:
     """The whole decision, over scalars: no store, no config object, no row (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)"""
     on_activity = status in activity_statuses
     clock = "activity" if on_activity else "status"
     judged = seconds_since_activity if on_activity else seconds_in_status
     threshold = float(thresholds.get(status, fallback_seconds))
     active = max(0.0, judged - discounted_seconds)
+    # Issue 1449: an in-flight turn silent past the threshold is wedged, not working
+    silent_turn = turn_in_flight and on_activity and active >= threshold
     cause = ""
     if kind in exempt_kinds:
         cause = HOLD_EXEMPT_KIND
@@ -133,7 +137,7 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
         cause = excluded_cause
     elif by_design_idle:
         cause = IDLE_MANAGER_CAUSE
-    elif turn_in_flight:
+    elif turn_in_flight and not silent_turn:
         cause = TURN_IN_FLIGHT_CAUSE
     if cause:
         # One site composes the sentence
@@ -142,7 +146,21 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
                        reason=EXCLUSION_REASON.get(
                            cause, DEFAULT_EXCLUSION_REASON).format(cause=cause,
                                                                    kind=kind))
+    # Issue 1451: the fact that sets needs_attention, so both surfaces agree
+    if stalled_turn_seconds:
+        return Verdict(stuck=True, clock=clock, active_seconds=active,
+                       threshold_seconds=threshold, excluded="",
+                       reason=f"its turn has been running for "
+                              f"{_hours(stalled_turn_seconds)}, past the point the OS "
+                              f"trusts a turn in flight to be progressing")
     over = active >= threshold
+    if silent_turn:
+        return Verdict(
+            stuck=True, clock=clock, active_seconds=active, threshold_seconds=threshold,
+            excluded="",
+            reason=f"a worker turn is in flight but silent: {_hours(active)} with no "
+                   f"API call, tool event or record write, past the {_hours(threshold)} "
+                   f"threshold for {status}")
     return Verdict(
         stuck=over, clock=clock, active_seconds=active, threshold_seconds=threshold,
         excluded="",

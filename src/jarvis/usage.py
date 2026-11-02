@@ -661,6 +661,33 @@ def last_compaction(session_id: str, *, since: float = 0.0,
     return max(found, key=lambda c: c["ts"]) if found else None
 
 
+def compaction_envelope(compaction: dict[str, Any], model: str, *, schema: int,
+                        session_id: str = "") -> dict[str, Any]:
+    """An ESTIMATED envelope for a `/compact` that wrote no assistant row"""
+    # kn-f5fb467e: billed as plain input over the old conversation; the summary is the output
+    pre, post = int(compaction.get("pre") or 0), int(compaction.get("post") or 0)
+    cost = round(priced(model, input=pre, output=post).list_cost_usd, 6)
+    return {
+        "usage_v": schema,
+        "total_cost_usd": cost,
+        "input": pre, "cache_write": 0, "cache_read": 0, "output": post,
+        "reported": {"session_id": session_id, "source": "transcript",
+                     "estimated_from": "compact_boundary"},
+        "estimated": True,
+        "continues": False,
+        "cache_1h": 0, "cache_5m": 0,
+        "api_calls": 1,
+        "iterations_sampled": 0,
+        "num_turns": None,
+        "context_peak": pre,
+        "context_window": None,
+        "duration_api_ms": None,
+        "cost_by_model": {model: cost},
+        "by_model": [{"model": model, "cost_usd": cost, "context_window": None,
+                      "input": pre, "cache_write": 0, "cache_read": 0, "output": post}],
+    }
+
+
 def _call_of(message: dict[str, Any]) -> Call:
     return Call(ts=message.get("ts") or 0.0, model=message.get("model") or "",
                 input=message.get("input_tokens", 0),

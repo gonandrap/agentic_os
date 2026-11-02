@@ -33,6 +33,7 @@ def parked(started, project, fake_gh):
     ops.finish(wo["id"], "opened a PR", pr_url=PR)
     store = ProjectStore(project)
     assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+    store.update_work_order(wo["id"], session_id="sess-1")     # a nudge needs a session
     return wo
 
 
@@ -138,16 +139,86 @@ def test_a_green_pull_request_is_untouched(started, project, fake_gh, parked):
         assert kinds(store, parked["id"], kind) == []
 
 
-def test_a_failure_with_cancelled_siblings_is_never_re_run(started, project, fake_gh,
-                                                           parked):
-    """Fail-fast cancels the siblings of a real failure: that is the worker's to fix"""
+def test_a_failure_with_cancelled_siblings_is_not_a_cancelled_re_run(started, project,
+                                                                    fake_gh, parked):
+    """Fail-fast cancels the siblings of a real failure: only the flake re-run takes it (#1465)"""
     pr(fake_gh, [check("unit (3.11)", "FAILURE"), check("unit (3.13)", "CANCELLED")])
     fake_gh.set_runs(HEAD, [run(555, HEAD, conclusion="failure")])
     store = ProjectStore(project)
 
     poll(started, store)
 
+    assert fake_gh.reruns == ["run rerun 555 --failed"]
+    assert kinds(store, parked["id"], ci_rerun.RERUN_EVENT) == []
+    [flake] = kinds(store, parked["id"], ci_rerun.FLAKE_RERUN_EVENT)
+    assert flake["run_ids"] == [555]
+
+
+FAILED = [check("unit (3.13)", "FAILURE"), check("lint", "SUCCESS")]
+
+
+def nudges(store, wo_id: str) -> list[dict]:
+    return [m for m in store.queued_messages(wo_id) if m["source"] == "pr-checks"]
+
+
+def test_a_failed_check_is_re_run_once_before_the_worker_is_asked(started, project,
+                                                                  fake_gh, parked):
+    """Issue 1465: a flake must not reach the worker, and a reproduced failure must"""
+    pr(fake_gh, FAILED)
+    fake_gh.set_runs(HEAD, [run(555, HEAD, conclusion="failure")])
+    store = ProjectStore(project)
+
+    poll(started, store)
+    assert fake_gh.reruns == ["run rerun 555 --failed"]
+    assert nudges(store, parked["id"]) == []
+
+    poll(started, store)     # the re-run came back FAILURE: it reproduces
+    assert len(fake_gh.reruns) == 1
+    assert len(nudges(store, parked["id"])) == 1
+    assert kinds(store, parked["id"], ci_rerun.FLAKE_CONFIRMED_EVENT) == []
+
+
+def test_a_failed_check_green_on_its_re_run_is_counted_as_a_flake(started, project,
+                                                                  fake_gh, parked):
+    pr(fake_gh, FAILED)
+    fake_gh.set_runs(HEAD, [run(555, HEAD, conclusion="failure")])
+    store = ProjectStore(project)
+    poll(started, store)
+
+    pr(fake_gh, [check("unit (3.13)", "SUCCESS"), check("lint", "SUCCESS")])
+    poll(started, store)
+    poll(started, store)
+
+    assert nudges(store, parked["id"]) == []
+    [flake] = kinds(store, parked["id"], ci_rerun.FLAKE_CONFIRMED_EVENT)
+    assert flake["head_sha"] == HEAD and "unit (3.13): FAILURE" in flake["checks"]
+
+
+def test_a_red_rollup_older_than_the_re_run_does_not_nudge(started, project, fake_gh,
+                                                           parked):
+    stale = [{**check("unit (3.13)", "FAILURE"), "startedAt": "2020-01-01T00:00:00Z"}]
+    pr(fake_gh, stale)
+    fake_gh.set_runs(HEAD, [run(555, HEAD, conclusion="failure")])
+    store = ProjectStore(project)
+
+    poll(started, store)
+    poll(started, store)
+
+    assert len(fake_gh.reruns) == 1
+    assert nudges(store, parked["id"]) == []
+
+
+def test_no_failed_run_to_re_run_asks_the_worker_at_once(started, project, fake_gh,
+                                                         parked):
+    pr(fake_gh, FAILED)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
     assert fake_gh.reruns == []
+    [flake] = kinds(store, parked["id"], ci_rerun.FLAKE_RERUN_EVENT)
+    assert flake["run_ids"] == []
+    assert len(nudges(store, parked["id"])) == 1
 
 
 def test_a_cancelled_check_github_does_not_block_on_is_left_alone(started, project,

@@ -208,6 +208,55 @@ def test_a_busy_session_holds_the_turn_open(bg_fleet, fake_claude, settle_turns)
     assert worker_session.busy(store, wo["id"]) is None
 
 
+def test_a_turn_parked_on_a_queued_message_is_reaped(bg_fleet, fake_claude, monkeypatch):
+    """Ended with a task left running, quiet past the threshold, a message waiting (issue #1400)"""
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    gate = fake_claude.hold_turns()  # stands in for the task that keeps the session busy
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    store.add_event(wo["id"], "hook:Stop", {"last_assistant_message": "Waiting on Neo."})
+    monkeypatch.setattr(worker_session, "BG_PARKED_QUIET", 0.0)
+
+    # Nothing waits on it yet: still busy, never cut short
+    worker_session.poll(store)
+    assert worker_session.busy(store, wo["id"])
+
+    store.queue_message(wo["id"], "[Neo] go with (a)", source="neo")
+    worker_session.poll(store)
+    sid = store.get_work_order(wo["id"])["session_id"]
+    # Stopped by poll itself, while the task still holds it: a live session would fork on resume (fact 5)
+    assert not claude_cli.bg_roster()[sid].alive
+    gate.unlink()
+
+    turn = store.latest_turn(wo["id"])
+    assert turn["state"] == "done" and turn["result"] == "Waiting on Neo."
+    assert worker_session.delivery_hold(store, store.get_work_order(wo["id"])) is None
+
+
+def test_a_parked_turn_that_called_the_api_after_its_stop_stays_open(bg_fleet, fake_claude,
+                                                                     monkeypatch):
+    """A finishing task wakes the session (fact 9): that is work, not a park"""
+    from jarvis import usage
+
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    gate = fake_claude.hold_turns()
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    store.add_event(wo["id"], "hook:Stop", {"last_assistant_message": "Waiting on Neo."})
+    store.queue_message(wo["id"], "[Neo] go with (a)", source="neo")
+    monkeypatch.setattr(worker_session, "BG_PARKED_QUIET", 0.0)
+    woke = usage.Call(ts=time.time() + 1, model="claude-fake-1", input=1, cache_write=0,
+                      cache_read=0, output=1, cache_1h=0, cache_5m=0, sealed=True)
+    monkeypatch.setattr(usage, "session_calls", lambda *a, **k: [woke])
+
+    worker_session.poll(store)
+
+    sid = store.get_work_order(wo["id"])["session_id"]
+    assert worker_session.busy(store, wo["id"])
+    assert not claude_cli.bg_roster()[sid].idle and claude_cli.bg_roster()[sid].alive
+    gate.unlink()
+
+
 def test_a_session_that_dies_mid_turn_is_a_transport_pause(bg_fleet, fake_claude,
                                                            settle_turns):
     store, project = bg_fleet["store"], bg_fleet["project"]
@@ -440,6 +489,25 @@ def test_a_consumed_verdict_does_not_keep_an_investigator_session(
 
     assert (store.get_work_order(wo["id"])["bg_id"] is None) is removed
     assert (tree / "verdict.json").exists() is not removed
+
+
+def test_a_consumed_artifact_tracked_on_main_does_not_keep_a_planner_session(
+        bg_fleet, fake_claude, settle_turns):
+    """Planner PRs committed plan.json, so each planner left it modified, not untracked (#1292)"""
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    (project.path / "plan.json").write_text('{"old": true}\n')
+    subprocess.run(["git", "add", "plan.json"], cwd=project.path, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm",
+                    "stale plan"], cwd=project.path, check=True)
+    wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {"plan.json": '{"new": true}\n'})
+    store.conn.execute("UPDATE work_orders SET kind='planner' WHERE id=?", (wo["id"],))
+    store.conn.commit()
+    store.set_status(wo["id"], "completed")
+
+    worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] is None
+    assert (tree / "plan.json").read_text() == '{"old": true}\n'
 
 
 def test_read_only_directories_are_made_removable(tmp_path):

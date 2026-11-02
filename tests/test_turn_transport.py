@@ -454,6 +454,18 @@ def test_worker_settings_carry_the_work_orders_kind(project, jarvis_home) -> Non
                                     "kind": None})["JARVIS_WO_KIND"] == "worker"
 
 
+def test_each_worker_gets_its_own_existing_pytest_temproot(project, jarvis_home,
+                                                            tmp_path, monkeypatch) -> None:
+    """A sibling's pytest cannot garbage-collect this worker's tmp_path (#723)"""
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    one = _worker_env(project, wo={"id": "wo-tt04", "title": "t"})["PYTEST_DEBUG_TEMPROOT"]
+    two = _worker_env(project, wo={"id": "wo-tt05", "title": "t"})["PYTEST_DEBUG_TEMPROOT"]
+    assert one != two
+    assert Path(one).is_dir() and Path(two).is_dir()
+
+
 def test_the_hook_reads_the_keys_dispatch_writes(project, jarvis_home) -> None:
     """The two halves cannot drift: what `_write_worker_settings` writes is exactly what `hooks` looks up"""
     from jarvis import hooks

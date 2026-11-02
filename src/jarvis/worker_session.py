@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -229,12 +230,17 @@ class Compaction:
     age: float
     #: The conversation's size as measured (#885)
     context: int | None
+    #: Seconds of cache life left: set only on a pre-expiry compaction (issue #1179)
+    warm_for: float | None = None
 
     @property
     def why(self) -> str:
         size = (f"the conversation is {self.context:,} tokens"
                 if self.context is not None
                 else "the conversation's size could not be read")
+        if self.warm_for is not None:
+            return (f"the prompt cache expires in {int(self.warm_for)}s and {size} — "
+                    f"summarising it now reads it at the cache rate")
         return (f"the prompt cache expired {int(self.age // 60)}m ago and {size} — "
                 f"re-sending it would cost more than summarising it")
 
@@ -339,6 +345,47 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
         if held is not None and held.resumable:
             return None
     return Compaction(age=age, context=context)
+
+
+#: Parked statuses likely enough to take another turn that a warm compaction pays (issue #1179, Q2882)
+WARM_COMPACT_STATUSES = ("needs_review", "validating", "waiting_input")
+
+#: Fire this long before the TTL: process start and reap lag eat into the margin
+WARM_COMPACT_LEAD_SECONDS = 75
+
+#: Never closer to the TTL than this: a late start would buy a COLD compaction nobody may need
+WARM_COMPACT_LATEST_SECONDS = 30
+
+
+def warm_compaction_due(store: ProjectStore, wo: dict[str, Any],
+                        min_context: int | None,
+                        now: float | None = None) -> Compaction | None:
+    """Compact this parked conversation NOW, while its cache is still warm? (issue #1179)"""
+    if min_context is None or wo["status"] not in WARM_COMPACT_STATUSES:
+        return None
+    if not wo.get("session_id") or store.queued_messages(wo["id"]):
+        return None  # a queued message goes through `compact_before_relaunch` instead
+    turn = store.latest_turn(wo["id"])
+    if (turn is None or turn["kind"] == COMPACT_TURN or turn["state"] != "done"
+            or not turn.get("ended_at")):
+        return None
+    ttl = usage.ttl_seconds(str(turn.get("cache_ttl") or ""))
+    age = (time.time() if now is None else now) - turn["ended_at"]
+    if not ttl - WARM_COMPACT_LEAD_SECONDS <= age < ttl - WARM_COMPACT_LATEST_SECONDS:
+        return None
+    context = measured_context(store, wo["id"])
+    # UNKNOWN fails the floor here, unlike the cold path: this compaction is a bet
+    if context is None or context < min_context:
+        return None
+    return Compaction(age=age, context=context, warm_for=ttl - age)
+
+
+def compact_while_warm(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
+                       min_context: int | None,
+                       now: float | None = None) -> dict[str, Any] | None:
+    """The warm compaction turn, or None when `warm_compaction_due` says not now"""
+    due = warm_compaction_due(store, wo, min_context, now=now)
+    return None if due is None else compact(store, project, wo, due)
 
 
 def compact_before_relaunch(store: ProjectStore, project: ProjectSpec,
@@ -833,6 +880,17 @@ def _settle_result(store: ProjectStore, turn: dict[str, Any],
 
     reply = result.result or _last_assistant_message(store, wo_id, turn)
     msg_id = store.record_agent_reply(wo_id, reply) if reply else None
+    # The worker SAYING it hit the limit is a claim; the meter arms the pause (issue 1456)
+    spent = (None if store.get_work_order(wo_id).get("result_summary")
+             else reported_usage_limit(reply))
+    if spent is not None:
+        error = REPORTED_LIMIT_ERROR.format(epoch=int(spent[1]), window=spent[0])
+        store.add_event(wo_id, "turn_paused", {
+            "seq": turn["seq"], "error": error, "reason": PAUSE_USAGE_LIMIT,
+            "reset_at": spent[1], "source": "worker_report"})
+        return store.finish_turn(turn["id"], "failed", error=error, result=reply,
+                                 cost_usd=result.cost_usd, num_turns=result.num_turns,
+                                 usage_json=usage_json, cost_source=source)
     # WHAT THE TURN LEFT RUNNING, asked here because this is the one place a turn is settled exactly once... (docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md)
     orphaned = background.orphaned_in_turn(store, wo_id, turn)
     if orphaned:
@@ -858,6 +916,9 @@ BG_DEAD_GRACE = 10.0
 #: How often a running background turn's spend is read against its cap
 BG_BUDGET_EVERY = 60.0
 
+#: How long a session busy only on its own leftover task may sit quiet while a message waits (Q2870)
+BG_PARKED_QUIET = 15 * 60.0
+
 #: What a background turn lost with its process is recorded as
 SESSION_LOST_ERROR = ("the worker's background session process ended before the turn "
                       "settled")
@@ -874,16 +935,42 @@ def _poll_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
     if entry is not None and entry.alive and not entry.idle:
         # Busy covers the worker's own background tasks too (fact 10): never cut one short
         cap = _bg_over_budget(store, wo, turn)
-        if cap is None:
-            return None
-        claude_cli.stop_bg(entry.id)
-        return _reap_bg(store, wo, turn, entry, project_name, budget_cap=cap)
+        if cap is not None:
+            claude_cli.stop_bg(entry.id)
+            return _reap_bg(store, wo, turn, entry, project_name, budget_cap=cap)
+        if _parked_on_message(store, wo, turn):
+            # ...unless parked on a queued message; `_reap_bg` stops it (issue #1400)
+            return _reap_bg(store, wo, turn, entry, project_name)
+        return None
     answered = _bg_answered(wo, turn)
     if entry is not None and entry.idle and not answered and age < BG_IDLE_GRACE:
         return None  # the resumed process has not taken its prompt yet
     if (entry is None or not entry.alive) and not answered and age < BG_DEAD_GRACE:
         return None
     return _reap_bg(store, wo, turn, entry, project_name)
+
+
+def _parked_on_message(store: ProjectStore, wo: dict[str, Any],
+                       turn: dict[str, Any]) -> bool:
+    """Quiet since its `Stop` with a message queued: busy only on a leftover task (#1400)"""
+    if not store.queued_messages(wo["id"]):
+        return False
+    stopped_at = _last_stop_at(store, wo["id"], turn)
+    if stopped_at is None or time.time() - stopped_at < BG_PARKED_QUIET:
+        return False
+    try:
+        calls = usage.session_calls(str(wo.get("session_id") or ""))
+    except OSError:
+        return False
+    # A task that finished wakes the session (fact 9): any call since the Stop means it is working again
+    return not any(call.ts > stopped_at for call in calls)
+
+
+def _last_stop_at(store: ProjectStore, wo_id: str, turn: dict[str, Any]) -> float | None:
+    """When the `Stop` hook last fired in this turn, or None"""
+    stops = [float(event["ts"]) for event in store.list_events(wo_id, limit=200, newest=True)
+             if event["kind"] == "hook:Stop" and event["ts"] >= turn["started_at"]]
+    return max(stops, default=None)
 
 
 def _bg_answered(wo: dict[str, Any], turn: dict[str, Any]) -> bool:
@@ -930,6 +1017,16 @@ def _reap_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
     try:
         envelope = usage.window_envelope(sid, turn["started_at"], until,
                                          schema=claude_cli.USAGE_SCHEMA_VERSION)
+        if envelope is None and turn["kind"] == COMPACT_TURN:
+            # A `/compact` writes no assistant row: price its boundary instead (issue 1296)
+            done = usage.last_compaction(sid, since=turn["started_at"])
+            if done is not None:
+                # The model the session last answered on; an order's own model is often unset
+                model = next((m for m, _ in reversed(usage.said_in_session(sid))
+                              if m != usage.SYNTHETIC_MODEL), "") or wo_model(store, wo["id"])
+                envelope = usage.compaction_envelope(
+                    done, model,
+                    schema=claude_cli.USAGE_SCHEMA_VERSION, session_id=sid)
         said = usage.said_in_session(sid, since=turn["started_at"])
     except OSError:
         envelope, said = None, []
@@ -1028,9 +1125,44 @@ def _stderr_tail(turn: dict[str, Any]) -> str:
         return ""
 
 
-def is_stalled(turn: dict[str, Any] | None) -> bool:
+def is_stalled(turn: dict[str, Any] | None, now: float | None = None) -> bool:
     return bool(turn and turn["state"] == "running"
-                and time.time() - turn["started_at"] > TURN_STALL_SECONDS)
+                and (time.time() if now is None else now) - turn["started_at"]
+                > TURN_STALL_SECONDS)
+
+
+#: A worker's own words that it stopped on the limit
+_LIMIT_CLAIM_RE = re.compile(
+    r"\blimits?\b.{0,40}?\b(?:reached|hit|exhausted)\b"
+    r"|\b(?:reached|hit)\b.{0,40}?\blimits?\b", re.IGNORECASE | re.DOTALL)
+
+#: The legacy epoch shape `claude_cli.usage_limit` parses, so every pause reader sees one refusal
+REPORTED_LIMIT_ERROR = ("Claude AI usage limit reached|{epoch} (reported by the worker; "
+                        "the account meter shows its {window} window spent)")
+
+
+def reported_usage_limit(reply: str | None,
+                         now: float | None = None) -> tuple[str, float] | None:
+    """(window, reset_at) when the reply claims the limit AND the meter shows a spent window"""
+    from . import usage_meter
+
+    if not reply or not _LIMIT_CLAIM_RE.search(reply):
+        return None
+    now = time.time() if now is None else now
+    try:
+        sample = usage_meter.latest_sample(now=now,
+                                           within=usage_meter.MAX_SPAN_GAP_SECONDS)
+    except Exception:  # noqa: BLE001 — no meter, no pause: the prose alone never schedules spend
+        return None
+    if sample is None:
+        return None
+    windows = [(k, sample.pct(k), sample.resets_at(k)) for k in usage_meter.FIRST_CLASS]
+    windows += [(k, w.get("utilization"), w.get("resets_at"))
+                for k, w in sample.extra.items() if isinstance(w, dict)]
+    spent = [(k, float(r)) for k, pct, r in windows
+             if pct is not None and pct >= 100 and r is not None and r > now]
+    # Every spent window has to reopen, so the latest reset is the one to wait for
+    return max(spent, key=lambda w: w[1]) if spent else None
 
 
 # -- parked, and coming back by itself

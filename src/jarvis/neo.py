@@ -240,7 +240,9 @@ def _unparseable_verdict(raw: str) -> dict[str, Any]:
             "verdict_stated": False, "dispatch": None,
             # The one FAILED-class member written in this module
             "cause": "unparseable-reply",
-            "reason": f"{UNPARSEABLE_PREFIX}{(raw or '')[:120]}"}
+            "reason": f"{UNPARSEABLE_PREFIX}{(raw or '')[:120]}",
+            # The whole reply, for the question row and the log: `reason` is a headline (#1401)
+            "raw": raw or ""}
 
 
 def _fold_split_reply(raw: str) -> dict[str, Any]:
@@ -290,11 +292,6 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
            wo_id=q.get("wo_id") or "", label=q.get("kind") or "question",
            model=result.model or model, question_id=q.get("id"))
     verdict = parse_verdict(result.text)
-    if verdict["reason"].startswith(UNPARSEABLE_PREFIX):
-        # THE FULL REPLY, ONCE, HERE
-        log.warning("neo question %s: reply could not be parsed (%d chars) — full raw "
-                    "reply follows:\n%s", q.get("id"), len(result.text or ""),
-                    result.text or "")
     # THE MODEL THAT ACTUALLY ANSWERED, as the transport reported it
     return {**verdict, "model": result.model or model}
 
@@ -392,6 +389,15 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             revived = store.revive_unreachable()
             if revived:
                 log.info("neo answered again: re-queued unreachable question(s) %s", revived)
+        unreadable = verdict.get("cause") == "unparseable-reply"
+        if unreadable:
+            # A reply nobody can read is a failed call, not a ruling: re-ask it, as a transport fault is (#1401)
+            raw = str(verdict.get("raw") or "")
+            log.warning("neo question %s: reply could not be parsed (%d chars) — full raw "
+                        "reply follows:\n%s", q["id"], len(raw), raw)
+            if store.requeue_unreadable(q["id"], f"{UNPARSEABLE_PREFIX}{raw}"):
+                results.append({"question": q, "verdict": None, "outcome": "queued"})
+                continue
         if verdict.get("refine") and not refinable:
             # The loop cap: a bounce past it is the user's to settle
             verdict = {**verdict, "refine": False, "escalate": True,
@@ -402,7 +408,9 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             log.info("neo returned question %s to its asker: %s", q["id"], verdict["reason"])
         elif verdict["escalate"]:
             # Spec §2 of docs/superpowers/specs/2026-10-01-neo-observability.md
-            store.mark(q["id"], "escalated", reason=verdict["reason"],
+            store.mark(q["id"], "escalated",
+                       reason=(f"{UNPARSEABLE_PREFIX}{verdict.get('raw') or ''}"
+                               if unreadable else verdict["reason"]),
                        cause=verdict.get("cause") or "")
             log.info("neo escalated question %s: %s", q["id"], verdict["reason"])
         else:

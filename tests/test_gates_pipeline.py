@@ -1104,6 +1104,32 @@ def test_the_cli_prints_a_spent_grant_as_spent(capsys, fleet):
     assert "expired by" not in line
 
 
+def test_the_cli_prints_a_used_grant_that_lapsed_as_approved_and_used(capsys, fleet):
+    """Issue 1388: one use, then the TTL ran out with uses left"""
+    from jarvis import cli, db
+    from jarvis.project_store import ProjectStore
+
+    fleet.request("gh pr merge 31 --squash")
+    approval = fleet.approval()
+    ops.decide_gate(approval["id"], verdict="approved", reason="the panel passed it")
+    assert _decision(fleet.attempt("gh pr merge 31 --squash")) == "allow"
+    store = ProjectStore(fleet.project)
+    try:
+        store.conn.execute("UPDATE approvals SET expires_at=? WHERE id=?",
+                           (db.now() - 60, approval["id"]))
+        store.expire_approvals()
+        store.conn.commit()
+    finally:
+        store.close()
+    capsys.readouterr()
+
+    assert cli.main(["gate", "list"]) == 0
+
+    out = capsys.readouterr().out
+    assert f"approved by user · used 1/{gates.GRANT_MAX_USES} · lapsed" in out
+    assert "expired by" not in out
+
+
 def test_a_contest_may_only_amend_an_open_uncontested_row(fleet):
     """One claim, one review"""
     fleet.attempt(PROSE)

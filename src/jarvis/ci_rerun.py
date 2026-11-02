@@ -38,6 +38,10 @@ RERUN_EVENT = "ci_rerun_requested"
 STUCK_EVENT = "ci_rerun_unrecoverable"
 RECOVERED_EVENT = "ci_rerun_recovered"
 
+#: A FAILED check's one re-run per head, and its green result: a flake (#1465)
+FLAKE_RERUN_EVENT = "ci_flake_rerun_requested"
+FLAKE_CONFIRMED_EVENT = "ci_flake_confirmed"
+
 #: Why the OS stopped, as stable tokens
 CAUSE_CANCELLED_AGAIN = "cancelled_again"
 CAUSE_NO_RUN = "no_run"
@@ -127,6 +131,28 @@ def runs_to_rerun(aborted: tuple[dict[str, str], ...],
     return tuple(picked.values())
 
 
+def failed_runs_to_rerun(red: tuple[dict[str, str], ...],
+                         runs: tuple[Run, ...]) -> tuple[Run, ...]:
+    """The newest red run of each workflow a failing check belongs to (#1465)"""
+    picked: dict[str, Run] = {}
+    for check in red:
+        workflow = str(check.get("workflow") or "")
+        found = next((r for r in runs if workflow and r.workflow == workflow
+                      and r.completed and r.red and r.run_id > 0), None)
+        if found is not None:
+            picked[workflow] = found
+    return tuple(picked.values())
+
+
+def head_events(store: Any, wo_id: str, kind: str, head: str) -> list[dict[str, Any]]:
+    """The payloads of `kind` events on this head"""
+    from . import db
+
+    return [p for p in (db.from_json(e["payload"], {}) or {}
+                        for e in store.events_of_kind(wo_id, kind))
+            if str(p.get("head_sha") or "") == head]
+
+
 @dataclass(frozen=True)
 class Episode:
     """What the timeline says the OS already did about one head"""
@@ -137,15 +163,9 @@ class Episode:
 
 def episode(store: Any, wo_id: str, head: str) -> Episode:
     """This head's re-runs and give-up, read off the timeline"""
-    from . import db
-
-    def of(kind: str) -> list[dict[str, Any]]:
-        return [p for p in (db.from_json(e["payload"], {}) or {}
-                            for e in store.events_of_kind(wo_id, kind))
-                if str(p.get("head_sha") or "") == head]
-
-    stuck = of(STUCK_EVENT)
-    return Episode(reruns=tuple(of(RERUN_EVENT)), stuck=stuck[-1] if stuck else None)
+    stuck = head_events(store, wo_id, STUCK_EVENT, head)
+    return Episode(reruns=tuple(head_events(store, wo_id, RERUN_EVENT, head)),
+                   stuck=stuck[-1] if stuck else None)
 
 
 def stuck_blocker(pr_url: str, head: str, cause: str, checks: str,

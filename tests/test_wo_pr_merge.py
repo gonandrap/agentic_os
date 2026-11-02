@@ -72,7 +72,7 @@ def test_waiting_pr_merge_is_open_but_never_asks_for_the_user(started, project):
 def test_pending_assumptions_outrank_the_pr(started, project):
     """A merge before the decision would accept the assumptions by the back door"""
     wo = ops.create_work_order("proj_a", "add feature X")
-    ops.assume(wo["id"], "used tabs, not spaces")
+    ops.assume(wo["id"], "used tabs, not spaces (fixture decision)")
 
     out = ops.finish(wo["id"], "opened a PR", pr_url=PR)
 
@@ -144,7 +144,7 @@ def test_cli_list_puts_running_then_pr_merges_first(started, project, capsys):
 def reviewable_pr(started, project):
     """Finished behind a PR, held in `needs_review` by one pending assumption"""
     wo = ops.create_work_order("proj_a", "add feature X")
-    ops.assume(wo["id"], "used tabs, not spaces")
+    ops.assume(wo["id"], "used tabs, not spaces (fixture decision)")
     assert ops.finish(wo["id"], "opened a PR", pr_url=PR)["status"] == "needs_review"
     return wo
 
@@ -1292,7 +1292,7 @@ def test_it_refuses_an_order_that_is_not_waiting_on_a_pull_request(started, proj
     wo = ops.create_work_order("proj_a", "add feature X")
     store = ProjectStore(project)
     try:
-        ops.assume(wo["id"], "polled every 30s")
+        ops.assume(wo["id"], "polled every 30s (fixture decision)")
         store.set_status(wo["id"], "needs_review")
     finally:
         store.close()
@@ -1321,7 +1321,7 @@ def test_it_refuses_a_work_order_that_does_not_exist(started, project):
 def test_a_pending_assumption_keeps_the_status_and_the_accept_lands_it(started, project,
                                                                        pushed):
     """§8's status rule"""
-    ops.assume(pushed["id"], "polled every 30s")
+    ops.assume(pushed["id"], "polled every 30s (fixture decision)")
 
     out = ops.record_pull_request(pushed["id"], PR)
 

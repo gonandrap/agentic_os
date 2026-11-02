@@ -106,7 +106,7 @@ def gate_environment(root: Path) -> dict[str, str]:
 
 def _bills_real_tokens() -> bool:
     """Is this run spending real money that a real work order will be charged for? (#103)"""
-    return bool(os.environ.get(LLM_EVALS_ENV) and os.environ.get("JARVIS_WO_ID"))
+    return agent_usage.bills_real_tokens()
 
 
 def _blocked_bin(root: Path, name: str, source: str) -> Path:
@@ -1419,7 +1419,9 @@ elif argv[:2] == ["repo", "view"]:
     # than the withheld one by accident. The public default is the production truth and
     # every test that cares names it.
     whole = {"isPrivate": os.environ.get("FAKE_GH_PRIVATE", "1") == "1",
-             "nameWithOwner": argv[2] if len(argv) > 2 else ""}
+             "nameWithOwner": argv[2] if len(argv) > 2 else "",
+             # What the authenticated account may do there (#1346)
+             "viewerPermission": os.environ.get("FAKE_GH_PERMISSION", "ADMIN")}
     fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
     print(json.dumps({k: v for k, v in whole.items() if not fields or k in fields}))
 elif argv[:2] == ["label", "create"]:
@@ -2018,6 +2020,7 @@ def fake_gh(tmp_path, monkeypatch):
     # `issues.gh_login` caches for the PROCESS
     from . import issues as _issues
     _issues.reset_gh_login()
+    _issues.reset_tracker_access()
 
     class Handle:
         dir = gdir
@@ -2117,6 +2120,12 @@ def fake_gh(tmp_path, monkeypatch):
         def set_private(self, private: bool) -> None:
             """What `gh repo view --json isPrivate` answers for every repository"""
             monkeypatch.setenv("FAKE_GH_PRIVATE", "1" if private else "0")
+
+        def set_permission(self, permission: str) -> None:
+            """What `gh repo view --json viewerPermission` answers for every repository"""
+            from . import issues as _issues
+            monkeypatch.setenv("FAKE_GH_PERMISSION", permission)
+            _issues.reset_tracker_access()
 
         def fail_privacy_read(self, message: str = "gh: HTTP 502") -> None:
             """Fail `gh repo view` and NOTHING else — `fail_merge`'s rationale exactly"""

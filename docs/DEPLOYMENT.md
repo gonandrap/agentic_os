@@ -292,6 +292,7 @@ with no `gh`.
 | `scripts/shipit.sh` step 5a | re-renders both units from the tag being deployed (`install_prod_service.sh --no-restart`; the restarts stay with shipit, which owns their order) | every release, staged or not |
 | `bugreport.heal_path` | appends the missing `GH_SEARCH_DIRS` to the daemon's own `os.environ["PATH"]` at start-up, which every worker then inherits — appends, never prepends, so nothing shadows the prod venv | every daemon start |
 | `INV-SERVICE-PATH` | reports an installed unit whose PATH cannot reach `gh`, reading the file rather than the healed process | `jarvis doctor` |
+| `INV-TRACKER-ACCESS` | reports a tracker where `gh`'s account is below TRIAGE (cannot close or label); the daemon also stops writing there and raises one inbox item. Fix: GH_CONFIG_DIR or GH_TOKEN in the service environment (#1346) | `jarvis doctor`, issue sweeps |
 
 The `jarvis` wrapper on PATH is kept applied the same way, for the same reason — it
 names `$PROD_DIR`, so it goes stale exactly as a unit does:

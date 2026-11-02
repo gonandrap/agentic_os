@@ -37,6 +37,10 @@
 #                                     # A release approval is scoped to the exact command
 #                                     # string, so the commit being shipped has to be in
 #                                     # it (2026-10-01 spec §1-§3). Required in --stage.
+#   scripts/shipit.sh --cherry-pick <sha>[,<sha>...]
+#                                     # SHIP ALONE: cut the release from the LATEST TAG and
+#                                     # cherry-pick only these squash commits of origin/main
+#                                     # onto it (2026-10-31 spec §4). Excludes --base.
 #   scripts/shipit.sh --stage <ver> --wo <wo-id> --base <sha>
 #                                     # SELF-SHIP mode: everything above EXCEPT the
 #                                     # service restarts and the Telegram notify.
@@ -64,15 +68,18 @@ DRY_RUN=0
 STAGE=0
 WO_ID=""
 BASE_SHA=""
+PICKS=""
 BUMP_OR_VERSION=""
 DEPLOY_TAG=""
 usage() {
   cat <<'USAGE'
 usage: scripts/shipit.sh [--dry-run] [X.Y.Z|major|minor|patch] [--base <sha>]
        scripts/shipit.sh [--dry-run] --stage <X.Y.Z> --wo <wo-id> --base <sha>
+       scripts/shipit.sh [--dry-run] [--stage --wo <wo-id>] --cherry-pick <sha>[,<sha>...]
        scripts/shipit.sh [--dry-run] --deploy <jarvis-X.Y.Z|X.Y.Z>
 
   (no --deploy)  CUT a new release from merged main, then deploy it to production
+  --cherry-pick  release the latest tag plus ONLY these squash commits of main
   --deploy TAG   deploy an EXISTING release tag to production; cuts nothing
                  (checkout, uv sync, re-render units + `jarvis` wrapper, restart)
 
@@ -87,6 +94,8 @@ while [ $# -gt 0 ]; do
     --stage)   STAGE=1 ;;
     --wo)      shift; WO_ID="${1:-}" ;;
     --base)    shift; BASE_SHA="${1:-}" ;;
+    --cherry-pick) shift; PICKS="${1:-}"
+               [ -n "$PICKS" ] || usage_die "--cherry-pick needs one or more full shas, comma-separated" ;;
     --deploy)  shift; DEPLOY_TAG="${1:-}"
                [ -n "$DEPLOY_TAG" ] || usage_die "--deploy needs a release tag (jarvis-X.Y.Z)" ;;
     -h|--help) usage; exit 0 ;;
@@ -100,8 +109,8 @@ case "$BUMP_OR_VERSION" in
   v[0-9]*) usage_die "version '$BUMP_OR_VERSION': drop the v — did you mean ${BUMP_OR_VERSION#v}?" ;;
 esac
 if [ -n "$DEPLOY_TAG" ]; then
-  [ "$STAGE" = 0 ] && [ -z "$BASE_SHA" ] && [ -z "$BUMP_OR_VERSION" ] \
-    || usage_die "--deploy takes no version, --stage or --base: it cuts nothing, it deploys an existing tag"
+  [ "$STAGE" = 0 ] && [ -z "$BASE_SHA" ] && [ -z "$PICKS" ] && [ -z "$BUMP_OR_VERSION" ] \
+    || usage_die "--deploy takes no version, --stage, --base or --cherry-pick: it cuts nothing, it deploys an existing tag"
   case "$DEPLOY_TAG" in
     jarvis-[0-9]*.[0-9]*.[0-9]*) ;;
     [0-9]*.[0-9]*.[0-9]*) DEPLOY_TAG="jarvis-$DEPLOY_TAG" ;;
@@ -115,7 +124,21 @@ if [ "$STAGE" = 1 ] && [ -z "$WO_ID" ]; then
   exit 1
 fi
 # Pure argument checks, before any git call (2026-10-01 spec §1).
-if [ "$STAGE" = 1 ] && [ -z "$BASE_SHA" ]; then
+if [ -n "$PICKS" ] && [ -n "$BASE_SHA" ]; then
+  usage_die "--cherry-pick and --base exclude each other: a cherry-pick release is cut from the latest tag"
+fi
+PICK_LIST=()
+if [ -n "$PICKS" ]; then
+  IFS=, read -r -a PICK_LIST <<<"$PICKS"
+  for p in "${PICK_LIST[@]}"; do
+    if [ "${#p}" != 40 ] || [ -n "${p//[0-9a-f]/}" ]; then
+      printf '\033[1;31m✗ %s\033[0m\n' \
+        "--cherry-pick takes full 40-character shas, not '$p'" >&2
+      exit 1
+    fi
+  done
+fi
+if [ "$STAGE" = 1 ] && [ -z "$BASE_SHA" ] && [ -z "$PICKS" ]; then
   printf '\033[1;31m✗ %s\033[0m\n' \
     "--stage requires --base <sha>: a release approval is scoped to the command string, so the commit being shipped has to be in it" >&2
   exit 1
@@ -165,7 +188,7 @@ if [ "$(cd "$PROD_DIR" 2>/dev/null && pwd -P)" = "$(pwd -P)" ]; then
   # step 5 checks out another tag in PROD_DIR, rewriting this script while bash reads it
   die "run shipit from a dev clone, not from production's own checkout ($PROD_DIR)"
 fi
-if [ -z "$DEPLOY_TAG" ] && [ -z "$BASE_SHA" ] && [ "$BRANCH" != "main" ]; then
+if [ -z "$DEPLOY_TAG" ] && [ -z "$BASE_SHA" ] && [ -z "$PICKS" ] && [ "$BRANCH" != "main" ]; then
   say "warning: shipping from '$BRANCH', not 'main' (releases cut from merged main)"
 fi
 
@@ -251,15 +274,28 @@ elif [ -n "$BASE_SHA" ]; then
   git merge-base --is-ancestor "$BASE_SHA" origin/main \
     || die "--base $BASE_SHA is not an ancestor of origin/main — releases are cut from already-merged main
      (origin/main is at $(git rev-parse --short origin/main))"
+elif [ -n "$PICKS" ]; then
+  # Neo, wo-afb1c9e3: ONE squash commit per pick, or refuse — never guess a sha range
+  for p in "${PICK_LIST[@]}"; do
+    git cat-file -e "$p^{commit}" 2>/dev/null \
+      || die "--cherry-pick $p is not a commit in this checkout — fetch origin and pass a sha from origin/main"
+    git merge-base --is-ancestor "$p" origin/main \
+      || die "--cherry-pick $p is not on origin/main — only landed fixes ship"
+    [ "$(git rev-list --parents -n 1 "$p" | wc -w)" -eq 2 ] \
+      || die "--cherry-pick $p is a merge commit, not one squash commit — refusing to guess its range"
+    git log -1 --format=%s "$p" | grep -Eq '\(#[0-9]+\)$' \
+      || die "--cherry-pick $p does not look like a squash merge (its subject ends in no '(#N)') — refusing to guess its range"
+  done
 elif [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
   die "HEAD is not origin/main — land the code on main via a merged PR and pull first
      (local $(git rev-parse --short HEAD) vs origin/main $(git rev-parse --short origin/main))"
 fi
 
 cur_version()   { grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/'; }
-latest_tagged() {  # highest X.Y.Z among jarvis-* tags, empty if none
+latest_tagged() {  # latest_tagged [<exclude>] — highest X.Y.Z among jarvis-* tags, empty if none
   git tag -l 'jarvis-*' | sed -E 's/^jarvis-//' \
-    | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1
+    | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+    | { grep -vxF "${1:-}" || true; } | sort -V | tail -1
 }
 
 bump() {  # bump <X.Y.Z> <major|minor|patch>
@@ -320,18 +356,66 @@ case "$BUMP_OR_VERSION" in
   *) die "invalid version/bump: '$BUMP_OR_VERSION' (want X.Y.Z or major|minor|patch)" ;;
 esac
 
+# A resumed cut already holds its own tag; the previous release is the one below it (issue 1180)
+if [ -z "$DEPLOY_TAG" ] && [ "$BASE" = "$VERSION" ]; then
+  BASE="$(latest_tagged "$VERSION")"; BASE="${BASE:-$(cur_version)}"
+fi
+
 TAG="jarvis-$VERSION"
 REL_BRANCH="release/jarvis-$VERSION"
 SHIP_SHA="$(git rev-parse "${BASE_SHA:-HEAD}")"
-PREV_TAG="jarvis-$BASE"
+# The previous RELEASE is the newest tag on ORIGIN below this one, never the local ref
+# store: an abandoned cut leaves a tag only here, and prod cannot resolve it (issue 1183).
+ORIGIN_TAGS="$(git ls-remote --tags --refs origin 'refs/tags/jarvis-*')" \
+  || die "cannot list origin's release tags — the previous release is read from the remote"
+PREV="$({ printf '%s\n' "$ORIGIN_TAGS" | sed -E 's#^.*refs/tags/jarvis-##' \
+            | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; }; echo "$VERSION"; } \
+          | sort -uV | sed -n "/^$VERSION\$/q;p" | tail -1)"
+PREV_TAG="${PREV:+jarvis-$PREV}"
+# Where release notes and Morpheus stop reading: the shipped commit, or the new tag when
+# only the tag holds the picks
+RANGE_END="$SHIP_SHA"
+if [ -n "$PICKS" ]; then
+  git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null \
+    || die "--cherry-pick needs a previous release tag to pick onto; $PREV_TAG does not exist"
+  SHIP_SHA="$(git rev-parse "refs/tags/$PREV_TAG^{commit}")"
+  RANGE_END="$TAG"
+fi
 
 # >>> steps 2-4a CUT a new release; --deploy jumps straight to step 5 (issue 1348)
 if [ -n "$DEPLOY_TAG" ]; then
   say "Deploying existing release $TAG to production — nothing is cut, tagged or pushed"
   say "  deploy: $PROD_DIR"
 else
-git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG already exists"
-git rev-parse -q --verify "refs/heads/$REL_BRANCH" >/dev/null && die "branch $REL_BRANCH already exists"
+# >>> release-resume (sliced verbatim by tests/test_shipit.py — keep both markers)
+# A cut that died after step 3 (issue 1180: origin refused the tag) left refs behind.
+# Re-running at the same version and base reuses them instead of refusing; anything
+# else holding those names is not this release and still stops the script.
+resume_commit() {  # resume_commit <tag> <branch> <base-sha> <version> — bump commit to reuse, empty if none
+  local tag="$1" branch="$2" base="$3" version="$4" ref c found="" pyproject lock
+  for ref in "refs/tags/$tag" "refs/heads/$branch" "refs/remotes/origin/$branch"; do
+    c="$(git rev-parse -q --verify "$ref^{commit}" 2>/dev/null)" || continue
+    [ -z "$found" ] || [ "$c" = "$found" ] \
+      || die "$ref is at ${c:0:9} but another ref of $tag is at ${found:0:9} — not one release cut; remove the stale refs by hand"
+    found="$c"
+  done
+  [ -n "$found" ] || return 0
+  [ "$(git rev-parse -q --verify "$found^" 2>/dev/null)" = "$base" ] \
+    || die "$tag / $branch already exist on ${found:0:9}, which was not cut from ${base:0:9} — release a new version"
+  # Only step 3's own bump may be reused: anything else under these names ships unreviewed code
+  local not_bump="$tag / $branch already exist on ${found:0:9}, which is not exactly step 3's bump to $version — release a new version"
+  ! git diff --name-only "$base" "$found" | grep -qvxE 'pyproject\.toml|uv\.lock' || die "$not_bump"
+  pyproject="$(git show "$base:pyproject.toml" 2>/dev/null \
+    | awk -v v="$version" '!done && /^version *= *"[^"]+"/ { sub(/"[^"]+"/, "\"" v "\""); done = 1 } { print }')" \
+    || die "$not_bump"
+  [ "$pyproject" = "$(git show "$found:pyproject.toml" 2>/dev/null)" ] || die "$not_bump"
+  lock="$(git show "$base:uv.lock" 2>/dev/null \
+    | sed -E "/^name = \"jarvis-os\"\$/{n;s/^version = \"[^\"]+\"\$/version = \"$version\"/;}")" || lock=""
+  [ "$lock" = "$(git show "$found:uv.lock" 2>/dev/null || true)" ] || die "$not_bump"
+  echo "$found"
+}
+# <<< release-resume
+RESUME_SHA="$(resume_commit "$TAG" "$REL_BRANCH" "$SHIP_SHA" "$VERSION")" || exit 1
 
 # The single ref the rest of the script hangs off. Not "main's sha" since §3: the branch,
 # the bump commit, the tag and production's checkout all descend from this one commit, so
@@ -340,6 +424,13 @@ say "Releasing Jarvis OS $VERSION  (base tag: ${BASE}, base: ${SHIP_SHA:0:9})"
 say "  branch: $REL_BRANCH   tag: $TAG"
 say "  deploy: $PROD_DIR"
 
+if [ -n "$RESUME_SHA" ]; then
+say "resuming $TAG: reusing bump commit ${RESUME_SHA:0:9}, cut from ${SHIP_SHA:0:9} by an earlier run"
+git rev-parse -q --verify "refs/heads/$REL_BRANCH" >/dev/null \
+  || run "git branch '$REL_BRANCH' '$RESUME_SHA'"
+git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+  || run "git tag -a '$TAG' -m 'Jarvis OS $VERSION' '$RESUME_SHA'"
+else
 # --- 2. cut the release branch from the shipped commit ---------------------------
 say "cutting release branch $REL_BRANCH from ${SHIP_SHA:0:9}"
 run "git branch '$REL_BRANCH' '$SHIP_SHA'"
@@ -352,6 +443,17 @@ cleanup() { [ "$DRY_RUN" != 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ] \
               && git worktree remove --force "$WT" 2>/dev/null || true; }
 trap cleanup EXIT
 run "git worktree add --quiet '$WT' '$REL_BRANCH'"
+for p in ${PICK_LIST[@]+"${PICK_LIST[@]}"}; do
+  say "cherry-picking ${p:0:9} onto $PREV_TAG"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf "  [dry-run] git -C '%s' cherry-pick -x %s\n" "$WT" "$p"
+  elif ! git -C "$WT" cherry-pick -x "$p"; then
+    git -C "$WT" cherry-pick --abort 2>/dev/null || true
+    git worktree remove --force "$WT" 2>/dev/null || true
+    git branch -D "$REL_BRANCH" >/dev/null 2>&1 || true
+    die "cherry-picking $p onto $PREV_TAG conflicts — it needs something main has not released yet. Nothing was tagged or pushed"
+  fi
+done
 # awk, not `sed -i -E '0,/re/…'`: both the in-place flag and the `0,` address are GNU-only
 run "awk -v v='$VERSION' '!done && /^version *= *\"[^\"]+\"/ { sub(/\"[^\"]+\"/, \"\\\"\" v \"\\\"\"); done = 1 } { print }' '$WT/pyproject.toml' > '$WT/pyproject.toml.bumped' && mv '$WT/pyproject.toml.bumped' '$WT/pyproject.toml'"
 # uv.lock records the root package's own version, so a tag carrying the bumped
@@ -368,13 +470,26 @@ run "git -C '$WT' commit -m 'Release jarvis-$VERSION'"
 say "tagging $TAG on $REL_BRANCH"
 run "git -C '$WT' tag -a '$TAG' -m 'Jarvis OS $VERSION'"
 run "git worktree remove --force '$WT'"
+fi
 
 # --- 4. push to origin (git is the source of truth) ------------------------------
 # Do this BEFORE deploying: production pulls from the remote, so an unpushed ref
 # would mean shipping something no one else can reproduce.
+# >>> push-retry (sliced verbatim by tests/test_shipit.py — keep both markers)
+# Origin's refusal can be transient (issue 1180); pushing an unchanged ref again is a no-op.
+push_ref() {  # push_ref <refspec>
+  local attempt=1
+  until run "git push origin '$1'"; do
+    [ "$attempt" -lt 3 ] || die "origin refused $1 $attempt times — re-run the same shipit command: it resumes this release from the refs already cut"
+    say "origin refused $1 (attempt $attempt/3) — retrying in $((attempt * 5))s"
+    sleep $((attempt * 5))
+    attempt=$((attempt + 1))
+  done
+}
+# <<< push-retry
 say "pushing $REL_BRANCH and $TAG to origin"
-run "git push origin 'refs/heads/$REL_BRANCH:refs/heads/$REL_BRANCH'"
-run "git push origin 'refs/tags/$TAG'"
+push_ref "refs/heads/$REL_BRANCH:refs/heads/$REL_BRANCH"
+push_ref "refs/tags/$TAG"
 
 # --- 4a. publish the GitHub release — this version's changelog page --------------
 #
@@ -399,10 +514,10 @@ run "git push origin 'refs/tags/$TAG'"
 GH_TITLE="Jarvis OS $VERSION"
 
 release_notes() {  # the body of the release page, on stdout
-  local range="$SHIP_SHA" have_prev=0 base
+  local range="$RANGE_END" have_prev=0 base
   if git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
     have_prev=1
-    range="$PREV_TAG..$SHIP_SHA"
+    range="$PREV_TAG..$RANGE_END"
   fi
   printf "## What's changed\n\n"
   git log --first-parent --format='- %s (%h)' "$range" \
@@ -567,7 +682,7 @@ else
     MORPHEUS_FROM="--from '$PREV_TAG'"
   fi
   say "queueing $TAG's pull requests for production validation (Morpheus)"
-  run "JARVIS_HOME='$PROD_ROOT/state' '$PROD_DIR/.venv/bin/jarvis' morpheus enqueue-release '$TAG' $MORPHEUS_FROM --to '$SHIP_SHA' --repo '$PROD_DIR' \
+  run "JARVIS_HOME='$PROD_ROOT/state' '$PROD_DIR/.venv/bin/jarvis' morpheus enqueue-release '$TAG' $MORPHEUS_FROM --to '$RANGE_END' --repo '$PROD_DIR' \
     || say 'NOTE: Morpheus queueing failed — the daemon queues the running release at boot'"
 fi
 

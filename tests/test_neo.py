@@ -173,15 +173,15 @@ def test_escalation_reaches_the_user(asked, project):
     assert st["neo"]["escalated"] == 1
 
 
-def test_garbage_output_escalates_not_delivers(asked, project):
-    """Unparseable model output must never reach a worker as an answer"""
+def test_garbage_output_is_re_asked_not_delivered(asked, project):
+    """Unparseable model output must never reach a worker as an answer, and is re-asked (#1401)"""
     daemon, wo, _ = asked
     ops.ask_question(wo["id"], "FORCE_GARBAGE: what about the schema?")
     drain(daemon)
     neo = NeoStore()
     try:
         q2 = neo.get(2)
-        assert q2["status"] == "escalated"
+        assert (q2["status"], q2["attempts"], q2["answer"]) == ("queued", 1, None)
         assert "unparseable" in q2["answer_reason"]
     finally:
         neo.close()
@@ -868,24 +868,20 @@ def test_two_objects_that_both_rule_still_escalate():
     assert v["reason"].startswith(neo_mod.UNPARSEABLE_PREFIX)
 
 
-def test_answer_question_logs_the_full_raw_reply_when_it_cannot_be_parsed(
-        jarvis_home, monkeypatch, caplog):
-    """Every SURFACE clips the raw reply to 120 characters"""
-    from jarvis import claude_cli
-
+def test_the_drain_logs_the_full_raw_reply_when_it_cannot_be_parsed(jarvis_home, caplog):
+    """Every SURFACE clips the raw reply to 120 characters; the drain covers the panel path too (#1401)"""
     raw = '{"escalate": false, "answer": "' + "x" * 500 + '", "reason": "cut off here'
-    monkeypatch.setattr(claude_cli, "run_headless_result",
-                        lambda *a, **kw: claude_cli.HeadlessResult(text=raw, model="m"))
     store = NeoStore()
-    q = {"id": 145, "project": "proj_a", "wo_id": "wo-1", "question": "which?",
-         "kind": "question"}
-    with caplog.at_level("WARNING", logger="neo"):
-        verdict = neo_mod.answer_question(store, q, "m", record=lambda *a, **kw: None)
-
-    assert verdict["escalate"] is True
+    try:
+        q = store.ask("proj_a", "wo-1", "which?")
+        with caplog.at_level("WARNING", logger="neo"):
+            neo_mod.drain_queue(store, "m",
+                                answer=lambda *a, **k: neo_mod.parse_verdict(raw))
+    finally:
+        store.close()
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert raw in logged, "the WHOLE reply must be in the log, not the 120-char clip"
-    assert "145" in logged, "and it must say which question it came from"
+    assert str(q["id"]) in logged, "and it must say which question it came from"
 
 
 def test_answer_question_does_not_log_a_reply_it_could_parse(

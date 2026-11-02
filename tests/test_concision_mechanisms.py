@@ -412,6 +412,21 @@ def test_an_unparseable_non_jarvis_command_is_not_this_checks_business():
     assert concision.unparseable_jarvis_command('jarvis wo list') is False
 
 
+@pytest.mark.parametrize("command", [
+    "cat > /tmp/pr.md <<'EOF'\nFixes the jarvis guard.\nIt's fine.\nEOF",
+    'cat > /tmp/pr.md <<EOF\njarvis wo list\nwon\'t parse\nEOF\necho ok',
+    "echo \"mentions jarvis and it's unbalanced",
+])
+def test_jarvis_mentioned_but_not_run_is_not_refused(command):
+    """Issue 912: a heredoc body or quoted text that names jarvis runs no jarvis command"""
+    assert concision.unparseable_jarvis_command(command) is False
+
+
+def test_a_jarvis_command_after_a_heredoc_still_counts():
+    command = "cat > /tmp/x <<'EOF'\nit's\nEOF\ncd /tmp && jarvis wo send wo-x 'unclosed"
+    assert concision.unparseable_jarvis_command(command) is True
+
+
 @pytest.mark.parametrize("spelling", ["--summ", "--s", "--summar"])
 def test_an_abbreviated_summary_option_is_capped_like_the_full_spelling(spelling):
     """`jarvis` uses argparse with the default `allow_abbrev=True`"""
