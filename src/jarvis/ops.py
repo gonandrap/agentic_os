@@ -4266,6 +4266,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
                 return park_pr_pending(store, wo, stranding)
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
+    if status == "completed" and (owed := declared_user_action(store, wo_id)):
+        return park_user_action(store, wo, owed)
     # Spec §C of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md
     store.set_status(wo_id, status, trigger="landed")
     store.clear_attention(wo_id)
@@ -4365,6 +4367,35 @@ def park_pr_pending(store: ProjectStore, wo: dict[str, Any],
     store.add_event(wo["id"], PR_PENDING_EVENT, park)
     store.set_status(wo["id"], "needs_review")
     store.flag_attention(wo["id"], pr_pending_blocker(wo["id"], park))
+    return "needs_review"
+
+
+def declared_user_action(store: ProjectStore, wo_id: str) -> str:
+    """The command only the user may run that the latest finish declared, else "" (#1352)"""
+    finished = store.events_of_kind(wo_id, "finished")
+    if not finished:
+        return ""
+    return str(db.from_json(finished[-1]["payload"], {}).get("needs_user") or "")
+
+
+def park_user_action(store: ProjectStore, wo: dict[str, Any], command: str) -> str:
+    """Hold an order whose result waits on a command only the user may run (GitHub issue #1506)"""
+    from .invariants import user_action_owed_blocker
+    from .project_store import UNGOVERNED_ORIGINS, USER_ACTION_EVENT
+
+    wo_id = wo["id"]
+    blocker = user_action_owed_blocker(command)
+    if store.user_action_open(wo_id) is None:
+        store.add_event(wo_id, USER_ACTION_EVENT,
+                        {"command": command, "was": wo["status"]})
+    store.set_status(wo_id, "needs_review", trigger="user_action")
+    store.flag_attention(wo_id, blocker)
+    fresh = store.get_work_order(wo_id) or wo
+    if not (launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS):
+        store.add_notification(
+            title=f"{wo_id} waits on you: {fresh.get('title') or 'untitled'}",
+            body=f"{fresh.get('result_summary') or 'No summary on record.'}\n\n{blocker}",
+            level="warning", wo_id=wo_id, source="completion", paired=True)
     return "needs_review"
 
 
@@ -5740,6 +5771,9 @@ def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int |
     said = [str(fresh.get("result_summary") or "No summary on record.")]
     if fresh.get("pr_url"):
         said.append(f"Pull request: {fresh['pr_url']}")
+    owed = declared_user_action(store, wo["id"])
+    if owed:
+        said.append(f"Still yours to run: `{owed}`")
     replies = store.agent_replies(wo["id"])
     last = str(replies[-1]["content"] or "").strip() if replies else ""
     if last:
@@ -5748,7 +5782,8 @@ def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int |
         said.append(f"Worker's final message (end):\n{tail}")
     return store.add_notification(
         title=f"{wo['id']} completed ({how}): {fresh.get('title') or 'untitled'}",
-        body="\n\n".join(said), level="info", wo_id=wo["id"], source="completion")
+        body="\n\n".join(said), level="warning" if owed else "info",
+        wo_id=wo["id"], source="completion")
 
 
 def mark_backlog_done(wo: dict[str, Any]) -> None:

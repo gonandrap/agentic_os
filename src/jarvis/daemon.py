@@ -2402,9 +2402,7 @@ class Daemon:
                          project.name, wo_id, n)
                 return
             # NOTHING CHANGED BECAUSE THE REST IS THE USER'S TO RUN: name it (#1352)
-            finished = store.events_of_kind(wo_id, "finished")
-            needs_user = (str(db.from_json(finished[-1]["payload"], {}).get("needs_user")
-                              or "") if finished else "")
+            needs_user = ops.declared_user_action(store, wo_id)
             if empty == "escalate" and needs_user:
                 self._escalate(store, wo, round_id, n,
                                f"this submission changes no files because the rest is "
