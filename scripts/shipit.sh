@@ -358,7 +358,14 @@ esac
 TAG="jarvis-$VERSION"
 REL_BRANCH="release/jarvis-$VERSION"
 SHIP_SHA="$(git rev-parse "${BASE_SHA:-HEAD}")"
-PREV_TAG="jarvis-$BASE"
+# The previous RELEASE is the newest tag on ORIGIN below this one, never the local ref
+# store: an abandoned cut leaves a tag only here, and prod cannot resolve it (issue 1183).
+ORIGIN_TAGS="$(git ls-remote --tags --refs origin 'refs/tags/jarvis-*')" \
+  || die "cannot list origin's release tags — the previous release is read from the remote"
+PREV="$({ printf '%s\n' "$ORIGIN_TAGS" | sed -E 's#^.*refs/tags/jarvis-##' \
+            | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; }; echo "$VERSION"; } \
+          | sort -uV | sed -n "/^$VERSION\$/q;p" | tail -1)"
+PREV_TAG="${PREV:+jarvis-$PREV}"
 # Where release notes and Morpheus stop reading: the shipped commit, or the new tag when
 # only the tag holds the picks
 RANGE_END="$SHIP_SHA"
