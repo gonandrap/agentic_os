@@ -1326,7 +1326,7 @@ def test_the_resync_module_builds_only_the_two_commands_it_declares():
 
 def test_an_unchanged_red_run_is_not_nudged_twice(started, project, fake_gh, parked,
                                                   monkeypatch):
-    """wo-b78babef: three attempts on run 41331509517 at one head; the worker's flake answer must reach the user"""
+    """wo-b78babef: three attempts on run 41331509517 at one head"""
     monkeypatch.setattr(Daemon, "rerun_failed_checks", lambda *a, **k: False)
     store = ProjectStore(project)
     flake = [{**check("unit-shard (5)", "FAILURE"), "startedAt": "2026-11-01T09:00:00Z"}]
