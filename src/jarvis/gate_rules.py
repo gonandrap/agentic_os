@@ -139,6 +139,18 @@ _SHELL_INVOKER = re.compile(
     re.IGNORECASE,
 )
 
+# …and so do these, on another host or in a container (#213)
+_QUOTED_EXECUTOR = re.compile(
+    r"(?<![\w./-])(?:ssh|(?:docker|podman|kubectl)(?:\s+[^\s|;&]+)*?\s+exec)(?![\w.-])",
+)
+_QUOTED_EXECUTORS = frozenset({"ssh", "docker exec", "podman exec", "kubectl exec"})
+
+
+def _quoted_executors(text: str) -> frozenset[str]:
+    """Which of `_QUOTED_EXECUTORS` `text` runs, in executable position"""
+    found = (m.group(0).split()[0] for m in _QUOTED_EXECUTOR.finditer(_inert(text)))
+    return frozenset(w if w == "ssh" else f"{w} exec" for w in found)
+
 # A heredoc opener: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`
 _HEREDOC_OPEN = re.compile(
     r"(?<!<)<<-?\s*(?:'(?P<sq>[^']+)'|\"(?P<dq>[^\"]+)\"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
@@ -258,7 +270,9 @@ def scannable(command: str) -> str:
         return command
     # Replace rather than delete, so neighbouring tokens can't fuse into a false match
     blanked = _blank(command, _code_quotes(command))
-    return command if _SHELL_INVOKER.search(blanked) else blanked
+    if _SHELL_INVOKER.search(blanked) or _QUOTED_EXECUTOR.search(blanked):
+        return command
+    return blanked
 
 
 def _code_quotes(command: str) -> list[tuple[int, int]]:
@@ -623,7 +637,7 @@ class Shape:
         return (self.position in EXEMPTIBLE_POSITIONS
                 and bool(self.owner)
                 and not self.handoff
-                and not (self.names & _EXECUTORS))
+                and not self.blockers)
 
     def signature(self) -> str:
         return json.dumps({"position": self.position, "owner": self.owner},
@@ -632,7 +646,7 @@ class Shape:
     @property
     def blockers(self) -> tuple[str, ...]:
         """What in the literal's own segment could run it"""
-        return tuple(sorted(self.names & _EXECUTORS))
+        return tuple(sorted(self.names & (_EXECUTORS | _QUOTED_EXECUTORS)))
 
     def unlearnable_reason(self) -> str:
         """Why no dismissal of this shape could become a rule, or `""` if one could"""
@@ -679,8 +693,8 @@ def shape_of(command: str, pattern: str) -> Shape | None:
         """What shares a command with the match"""
         for s, e in lists:
             if s <= offset < e:
-                return command_names(command[s:e])
-        return all_names
+                return command_names(command[s:e]) | _quoted_executors(command[s:e])
+        return all_names | _quoted_executors(command)
 
     def handoff_at(offset: int) -> bool:
         """Whether the command holding the match writes what it was handed"""
@@ -804,11 +818,14 @@ def seed_id(role: str, kind: str, test: str, pattern: str) -> str:
 
 # -- what the table is seeded with
 
+# Release script file, or `shipit` as whole word; never inside a path like tests/test_shipit.py (#252)
+SHIPIT_PATTERN = r"\bshipit\.sh\b|(?<![\w./-])shipit(?![\w./-])"
+
 # The recognisers
 SEED_MATCHES: tuple[tuple[str, str], ...] = (
     ("pr_merge", r"\bgh\s+pr\s+merge\b"),
     ("pr_merge", r"\bgh\s+api\b[^\n]*\bpulls/\d+/merge\b"),
-    ("release", r"shipit"),                      # the OS's own release script
+    ("release", SHIPIT_PATTERN),
     ("release", r"\bgh\s+release\s+create\b"),
     ("release", r"\bnpm\s+publish\b"),
     ("release", r"\b(twine|uv)\s+publish\b"),
@@ -848,6 +865,9 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("release", "cat scripts/shipit.sh > /tmp/s.sh && bash /tmp/s.sh"),
     # The same, run without naming any member of `_EXECUTORS` at all
     ("release", "cat scripts/shipit.sh > /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh"),
+    # A remote or container shell runs its quoted payload (#213)
+    ("release", 'ssh prod "scripts/shipit.sh"'),
+    ("pr_merge", 'docker exec -it c "gh pr merge 31"'),
     ("service_restart", "sudo systemctl restart jarvis-daemon"),
     ("service_restart", "systemctl --user stop jarvisd"),
     ("push_protected", "git push origin main"),
@@ -889,8 +909,20 @@ def seed_rows() -> list[dict[str, Any]]:
 
 # 2: the `config_write` kind, its recogniser and its canaries (the config console). 3: the... (#194)
 
-# 6: `jarvis onboard apply` writes configuration too, so it joins `config_write`
-SEED_VERSION = "6"
+# 6: `jarvis onboard apply` joins `config_write`. 7: SHIPIT_PATTERN replaces bare `shipit` (#252)
+SEED_VERSION = "7"
+
+# Builtin recognisers a later seed replaced: (kind, pattern, why), retired on reseed
+RETIRED_SEED_MATCHES: tuple[tuple[str, str, str], ...] = (
+    ("release", r"shipit",
+     "builtin superseded (#252): the bare substring gated any path naming the script"),
+)
+
+
+def retired_seed_ids() -> list[tuple[str, str]]:
+    """(rule id, reason) for every builtin recogniser a newer seed superseded"""
+    return [(seed_id(MATCH, kind, REGEX, pattern), why)
+            for kind, pattern, why in RETIRED_SEED_MATCHES]
 
 
 # -- the live rule base

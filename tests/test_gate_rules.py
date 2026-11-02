@@ -492,7 +492,7 @@ def test_no_seeded_pattern_can_reach_across_a_newline():
 def test_check_canaries_catches_a_retracted_recogniser(central):
     """The other way a gate goes quiet: not a bad exemption, a missing recogniser"""
     shipit = [r for r in central.gate_rules(role="match")
-              if r["pattern"] == "shipit"][0]
+              if r["pattern"] == gate_rules.SHIPIT_PATTERN][0]
     central.retract_gate_rule(shipit["id"], "testing")
 
     failures = gate_rules.RuleSet.load(central).check_canaries()
@@ -505,7 +505,7 @@ def test_the_invariant_reports_a_disarmed_gate(central):
 
     assert list(check_gate_canaries()) == []
     shipit = [r for r in central.gate_rules(role="match")
-              if r["pattern"] == "shipit"][0]
+              if r["pattern"] == gate_rules.SHIPIT_PATTERN][0]
     central.retract_gate_rule(shipit["id"], "testing")
 
     violations = list(check_gate_canaries())
@@ -525,7 +525,7 @@ def test_retracting_an_exemption_re_arms_the_gate(central):
 
 def test_seeding_is_idempotent_and_does_not_resurrect_a_retracted_rule(jarvis_home):
     first = CentralStore()
-    shipit = [r for r in first.gate_rules(role="match") if r["pattern"] == "shipit"][0]
+    shipit = [r for r in first.gate_rules(role="match") if r["pattern"] == gate_rules.SHIPIT_PATTERN][0]
     first.retract_gate_rule(shipit["id"], "deliberate")
     seeded = len(first.gate_rules(include_retired=True))
     first.close()
@@ -535,6 +535,49 @@ def test_seeding_is_idempotent_and_does_not_resurrect_a_retracted_rule(jarvis_ho
     try:
         assert len(second.gate_rules(include_retired=True)) == seeded
         assert second.get_gate_rule(shipit["id"])["retired_at"] is not None
+    finally:
+        second.close()
+
+
+# Issue #252: the release recogniser fires on running the script, not on its name in a path
+@pytest.mark.parametrize("command", [
+    "uv run pytest tests/test_shipit.py -q",
+    "timeout 560 uv run pytest tests/test_gate_rules.py tests/test_shipit.py -q",
+    "ls .claude/skills/shipit/",
+    "rg -n release .claude/skills/shipit/SKILL.md",
+    "python -m pytest tests/test_shipit.py::test_stage -x",
+])
+def test_the_release_recogniser_ignores_the_word_in_a_path(central, command):
+    assert classify(command, gate_rules.RuleSet.load(central)) is None
+
+
+@pytest.mark.parametrize("command", [
+    "./scripts/shipit.sh",
+    "bash scripts/shipit.sh --dry-run",
+    "sh /home/u/agentic_os/scripts/shipit.sh --deploy jarvis-1.2.3",
+    "shipit --deploy jarvis-1.2.3",
+    "cd repo && shipit",
+])
+def test_the_release_recogniser_still_gates_running_the_script(central, command):
+    match = classify(command, gate_rules.RuleSet.load(central))
+    assert match is not None and match.kind == "release"
+
+
+def test_reseeding_retires_the_bare_substring_recogniser(jarvis_home):
+    old_id = gate_rules.seed_id(gate_rules.MATCH, "release", gate_rules.REGEX, "shipit")
+    first = CentralStore()
+    first.conn.execute(
+        "INSERT OR IGNORE INTO gate_rules (id, ts, role, kind, test, pattern, source)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (old_id, db.now(), gate_rules.MATCH, "release", gate_rules.REGEX, "shipit", "builtin"))
+    first.set_state("gate_rules_seed", "6")
+    first.close()
+
+    second = CentralStore()
+    try:
+        assert second.get_gate_rule(old_id)["retired_at"] is not None
+        live = [r["pattern"] for r in second.gate_rules(role="match", kind="release")]
+        assert "shipit" not in live and gate_rules.SHIPIT_PATTERN in live
     finally:
         second.close()
 
@@ -581,13 +624,9 @@ def test_a_stray_quote_in_a_heredoc_body_cannot_swallow_the_code_after_it():
     assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
 
 
-@pytest.mark.parametrize("command", [
-    'ssh prod "bash scripts/shipit.sh"',
-    '"bash" -c "gh pr merge 31"',
-])
-def test_a_wrapper_whose_payload_names_no_invoker_was_never_gated(command):
-    """These two look like the positional test lost them"""
-    assert classify(command, gate_rules.RuleSet.from_seeds()) is None
+def test_a_quoted_interpreter_name_was_never_gated():
+    """Looks like the positional test lost it: a quote sits where `_SHELL_INVOKER` needs whitespace"""
+    assert classify('"bash" -c "gh pr merge 31"', gate_rules.RuleSet.from_seeds()) is None
 
 
 @pytest.mark.parametrize("command", [
@@ -602,23 +641,43 @@ def test_a_substitution_gates_however_it_is_quoted(command):
 
 
 @pytest.mark.parametrize("command", [
+    'ssh prod "bash scripts/shipit.sh"',
     'ssh prod "sh -c \'scripts/shipit.sh\'"',
     'ssh prod "eval scripts/shipit.sh"',
     'docker exec c "bash -c \'scripts/shipit.sh\'"',
+    'ssh prod "scripts/shipit.sh"',
+    'ssh -p 22 prod "gh pr merge 31"',
+    'docker exec -it c "scripts/shipit.sh"',
+    'sudo podman exec c \'scripts/shipit.sh\'',
+    'kubectl -n prod exec pod -- sh -c "scripts/shipit.sh"',
+    'docker compose exec web "scripts/shipit.sh"',
 ])
-def test_a_wrapper_that_executes_its_quoted_payload_is_a_known_miss(command):
-    """Issue #213, asserted as the miss it is rather than left unexamined"""
-    assert classify(command, gate_rules.RuleSet.from_seeds()) is None
+def test_a_wrapper_that_executes_its_quoted_payload_gates(command):
+    """Issue #213: ssh and container exec hand their quoted payload to a shell"""
+    assert gate_rules.scannable(command) == command
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
 
 
 @pytest.mark.parametrize("command", [
     'ssh prod "scripts/shipit.sh"',
-    'ssh prod "gh pr merge 31"',
-    'docker exec c "scripts/shipit.sh"',
+    'echo "scripts/shipit.sh" | ssh prod',
+    'docker exec c sh <<EOF\nscripts/shipit.sh\nEOF',
 ])
-def test_the_wrapper_miss_is_older_than_the_positional_test(command):
-    """The control for the case above (#213)"""
-    assert classify(command, gate_rules.RuleSet.from_seeds()) is None
+def test_no_learned_rule_can_clear_a_literal_a_quoted_executor_runs(command):
+    """A quoted or piped payload of ssh / container exec is code, so no exemption may learn it (#213)"""
+    shape = gate_rules.shape_of(command, "shipit")
+    assert not shape.exemptible and shape.blockers
+
+
+@pytest.mark.parametrize("command", [
+    'git commit -m "ssh prod scripts/shipit.sh"',
+    'cat ~/.ssh/config "scripts/shipit.sh"',
+    'ssh-keygen -C "scripts/shipit.sh"',
+    'docker logs c "scripts/shipit.sh"',
+])
+def test_a_wrapper_named_only_as_data_does_not_disarm_blanking(command):
+    """The pairing: the wrapper has to be in executable position, as with `_SHELL_INVOKER` (#203)"""
+    assert "shipit" not in gate_rules.scannable(command)
 
 
 @pytest.mark.parametrize("command", [
