@@ -27,7 +27,8 @@ from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE, invariant_title
 from .neo_store import QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
 # The `os_state` keys the dashboard's self-heal keeps
-from .uilog import UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS
+from .uilog import (UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS,
+                    register_stack_signal)
 from .project_store import (
     COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
@@ -8053,6 +8054,7 @@ def run_daemon(catalog_path: str | Path, poll_interval: float = 5.0,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         handlers=handlers,
     )
+    register_stack_signal()
     # Before anything is spawned: every worker inherits this process's PATH verbatim... (#41)
     added = bugreport.heal_path()
     if added:
