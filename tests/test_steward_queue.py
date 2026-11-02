@@ -286,7 +286,7 @@ def test_the_steward_page_lists_an_ask_with_where_to_act(jarvis_home, catalog_fi
     html = TestClient(create_app()).get("/steward").text
     asks = html.split('id="steward-asks"', 1)[1].split('id="steward-waiting"', 1)[0]
     # Its morpheus item opens its own detail page (fo-744c42a5 §5), not a scroll on /morpheus
-    assert f'id="decision-{ask}"' in asks and 'href="/morpheus/mv-1"' in asks
+    assert f'id="decision-{ask}"' in asks and 'href="/mo/mv-1"' in asks
 
 
 def test_the_steward_page_renders_with_nothing_queued(jarvis_home, catalog_file):
