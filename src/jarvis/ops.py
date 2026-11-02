@@ -2056,14 +2056,24 @@ def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
 
 def ack_decision_blocker(blockers: list[str]) -> str | None:
     """The blocker that makes acking unacceptable, or None — the one extraction of it"""
-    return next((b for b in blockers if "assumption" in b.lower()), None)
+    from .invariants import IDLE_NO_FINISH_BLOCKER
+
+    # An idle park's only exit is the user's action; an ack would hide it from every view (issue 1456)
+    return next((b for b in blockers
+                 if "assumption" in b.lower() or b == IDLE_NO_FINISH_BLOCKER), None)
 
 
 def ack_refusal(wo: dict[str, Any], blockers: list[str]) -> str | None:
     """Why `jarvis wo ack` would be refused on this order, or None if it would be taken"""
+    from .invariants import IDLE_NO_FINISH_BLOCKER
+
     blocker = ack_decision_blocker(blockers)
     if blocker is None:
         return None
+    if blocker == IDLE_NO_FINISH_BLOCKER:
+        return (f"{wo['id']} stopped mid-task and nothing will resume it — acknowledging "
+                f"would hide it. `jarvis wo send {wo['id']} \"…\"` sends it back to work; "
+                f"`jarvis wo done {wo['id']}` closes it.")
     return (f"{wo['id']} is waiting on a decision ({blocker}) — acknowledging would "
             f"bury it. Use `jarvis wo review {wo['id']}` to accept, or `--reject` to "
             f"send it back.")

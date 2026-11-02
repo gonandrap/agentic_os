@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -879,6 +880,17 @@ def _settle_result(store: ProjectStore, turn: dict[str, Any],
 
     reply = result.result or _last_assistant_message(store, wo_id, turn)
     msg_id = store.record_agent_reply(wo_id, reply) if reply else None
+    # The worker SAYING it hit the limit is a claim; the meter arms the pause (issue 1456)
+    spent = (None if store.get_work_order(wo_id).get("result_summary")
+             else reported_usage_limit(reply))
+    if spent is not None:
+        error = REPORTED_LIMIT_ERROR.format(epoch=int(spent[1]), window=spent[0])
+        store.add_event(wo_id, "turn_paused", {
+            "seq": turn["seq"], "error": error, "reason": PAUSE_USAGE_LIMIT,
+            "reset_at": spent[1], "source": "worker_report"})
+        return store.finish_turn(turn["id"], "failed", error=error, result=reply,
+                                 cost_usd=result.cost_usd, num_turns=result.num_turns,
+                                 usage_json=usage_json, cost_source=source)
     # WHAT THE TURN LEFT RUNNING, asked here because this is the one place a turn is settled exactly once... (docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md)
     orphaned = background.orphaned_in_turn(store, wo_id, turn)
     if orphaned:
@@ -1117,6 +1129,40 @@ def is_stalled(turn: dict[str, Any] | None, now: float | None = None) -> bool:
     return bool(turn and turn["state"] == "running"
                 and (time.time() if now is None else now) - turn["started_at"]
                 > TURN_STALL_SECONDS)
+
+
+#: A worker's own words that it stopped on the limit
+_LIMIT_CLAIM_RE = re.compile(
+    r"\blimits?\b.{0,40}?\b(?:reached|hit|exhausted)\b"
+    r"|\b(?:reached|hit)\b.{0,40}?\blimits?\b", re.IGNORECASE | re.DOTALL)
+
+#: The legacy epoch shape `claude_cli.usage_limit` parses, so every pause reader sees one refusal
+REPORTED_LIMIT_ERROR = ("Claude AI usage limit reached|{epoch} (reported by the worker; "
+                        "the account meter shows its {window} window spent)")
+
+
+def reported_usage_limit(reply: str | None,
+                         now: float | None = None) -> tuple[str, float] | None:
+    """(window, reset_at) when the reply claims the limit AND the meter shows a spent window"""
+    from . import usage_meter
+
+    if not reply or not _LIMIT_CLAIM_RE.search(reply):
+        return None
+    now = time.time() if now is None else now
+    try:
+        sample = usage_meter.latest_sample(now=now,
+                                           within=usage_meter.MAX_SPAN_GAP_SECONDS)
+    except Exception:  # noqa: BLE001 — no meter, no pause: the prose alone never schedules spend
+        return None
+    if sample is None:
+        return None
+    windows = [(k, sample.pct(k), sample.resets_at(k)) for k in usage_meter.FIRST_CLASS]
+    windows += [(k, w.get("utilization"), w.get("resets_at"))
+                for k, w in sample.extra.items() if isinstance(w, dict)]
+    spent = [(k, float(r)) for k, pct, r in windows
+             if pct is not None and pct >= 100 and r is not None and r > now]
+    # Every spent window has to reopen, so the latest reset is the one to wait for
+    return max(spent, key=lambda w: w[1]) if spent else None
 
 
 # -- parked, and coming back by itself
