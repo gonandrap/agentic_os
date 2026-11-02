@@ -2980,6 +2980,14 @@ class ProjectStore:
         """Has the OS already stopped trying on this episode and said so?"""
         return bool(self._this_episode(wo_id, repair, f"pr_{repair}_unresolved"))
 
+    def pr_repair_held(self, wo_id: str, repair: str) -> bool:
+        """Is the newest ask of this episode answered and its run unchanged since? (#1438)"""
+        held = self._this_episode(wo_id, repair, f"pr_{repair}_held")
+        if not held:
+            return False
+        nudges = self.pr_repair_nudges(wo_id, repair)
+        return not nudges or held[-1]["ts"] > nudges[-1]["ts"]
+
     def pr_closure_told(self, wo_id: str) -> bool:
         """Has the user already been told about THIS closure of the pull request? (#224)"""
         closed = self.events_of_kind(wo_id, "pr_closed")
