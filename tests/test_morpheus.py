@@ -1619,3 +1619,10 @@ def test_cancel_stops_an_open_order_and_sweep_leaves_it(central, cfg, tmp_path):
                                             (None, False)])
 def test_one_predicate_names_a_monitoring_order(value, expected):
     assert morpheus.is_monitoring_order_id(value) is expected
+
+
+def test_go_opens_both_id_shapes_on_the_morpheus_page():
+    from jarvis import ops
+
+    for rid in ("mv-1234abcd", "mo-1234abcd"):
+        assert ops.resolve_ref(rid) == f"/morpheus/{rid}"
