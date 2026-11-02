@@ -3866,7 +3866,7 @@ MORPHEUS_GRACE_SECONDS = 3600
 
 
 def check_morpheus_moves(repair: bool = False) -> Iterator[Violation]:
-    """INV-MORPHEUS-OVERDUE — a PR still open past its deadline, an action never taken, or a dead judge's claim"""
+    """INV-MORPHEUS-OVERDUE — an order overdue, unhanded-off or held by a dead judge's claim"""
     from . import morpheus
     from .catalog import MorpheusConfig
     from .central_store import CentralStore
