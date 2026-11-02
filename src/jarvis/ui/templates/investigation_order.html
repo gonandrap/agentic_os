@@ -29,7 +29,13 @@
 {% if error %}<div class="panel"><div class="row tone-bad">✗ {{ error }}</div></div>{% endif %}
 
 {% if inv.needs_attention %}
-<div class="panel"><div class="row tone-warn">◭ {{ inv.attention_reason }}</div></div>
+<div class="panel">
+  <div class="row tone-warn">◭ {{ inv.attention_reason }}</div>
+  {% if v.rewrite_ask and v.rewrite_ask.command %}
+  {# The ask, pre-filled with the investigator's script fix (#1481) #}
+  <div class="row"><div class="grow mono" style="white-space: pre-wrap; user-select: all;">{{ v.rewrite_ask.command }}</div></div>
+  {% endif %}
+</div>
 {% endif %}
 
 {% call ui.explain("Why it was opened") %}

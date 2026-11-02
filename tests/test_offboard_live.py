@@ -173,7 +173,7 @@ def test_morpheus_sweep_leaves_an_archived_projects_item_alone(central, tmp_path
     item = _queue(central, "proj_b")
     morpheus.sweep(central, MorpheusConfig(), lambda i: tmp_path, skip={"proj_b"})
     assert central.morpheus_item(item["id"])["state"] == "queued"
-    assert morpheus.wanting_scripts(central, skip={"proj_b"}) == []
+    assert morpheus.owed_arming(central, skip={"proj_b"}) == []
 
     morpheus.sweep(central, MorpheusConfig(), lambda i: tmp_path)
     assert central.morpheus_item(item["id"])["state"] == "timedout"
