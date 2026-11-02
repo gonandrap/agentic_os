@@ -5698,7 +5698,8 @@ class Daemon:
                     # IS THIS THE BRANCH'S FAILURE AT ALL?
                     handled, pr = self.heal_inherited_failure(project, store, wo, pr,
                                                               base_ci)
-                    if not handled:
+                    if not handled and not self.rerun_failed_checks(project, store, wo,
+                                                                    pr):
                         self.heal_pull_request(
                             project, store, wo, ops.PR_CHECKS,
                             f"has failing checks ({', '.join(pr.failing)})",
@@ -5716,6 +5717,7 @@ class Daemon:
                                  project.name, wo["pr_url"], wo["id"])
                     # Not `elif`: a pull request can stop conflicting and go green in the same poll
                     if pr.checks_green:
+                        self.note_flake(store, wo, pr)
                         # Re-read ONLY if the clear above ran
                         row = store.get_work_order(wo["id"]) if healed else wo
                         if ops.clear_pr_repair(store, row, ops.PR_CHECKS):
@@ -7138,6 +7140,73 @@ class Daemon:
         store.update_work_order(wo["id"], pr_checks_stuck_head=head)
         log.info("%s: cancelled CI on %s needs the user (%s)", wo["id"], head[:10],
                  cause)
+
+    def rerun_failed_checks(self, project: ProjectSpec, store: ProjectStore,
+                            wo: dict, pr: Any) -> bool:
+        """Re-run a FAILED check ONCE per head before the worker is asked to fix it; True holds the nudge (#1465)"""
+        from . import ci, ci_rerun, github
+
+        wo_id, head = wo["id"], str(pr.head_oid or "")
+        if not ci.SHA_RE.match(head):
+            return False
+        done = ci_rerun.head_events(store, wo_id, ci_rerun.FLAKE_RERUN_EVENT, head)
+        if done:
+            at = float(done[-1].get("at") or 0)
+            # A red check older than the re-run is the rollup not having caught up yet
+            stale = all((t := ci.parse_ts(c.get("started_at"))) is not None and t < at
+                        for c in pr.red)
+            return bool(done[-1].get("run_ids")) and stale
+        if any(c["status"].upper() in github.UNFINISHED_STATUSES - {"EXPECTED"}
+               for c in pr.checks):
+            return True     # `--failed` only takes a finished run
+        red = pr.red
+        checks = ", ".join(f"{c['name'] or '(unnamed check)'}: {c['conclusion']}"
+                           for c in red)
+        try:
+            runs = ci_rerun.head_runs(head, cwd=project.path)
+        except github.GitHubError as e:
+            log.info("[%s] could not list the runs of %s for %s: %s", project.name,
+                     head[:10], wo_id, e)
+            return False
+        rerun: list[Any] = []
+        error = ""
+        for run in ci_rerun.failed_runs_to_rerun(red, runs):
+            try:
+                ci_rerun.rerun(run.run_id, cwd=project.path)
+            except github.GitHubError as e:
+                error = str(e)[:300]
+                break
+            rerun.append(run)
+        store.add_event(wo_id, ci_rerun.FLAKE_RERUN_EVENT, {
+            "head_sha": head, "pr_url": wo.get("pr_url"), "checks": checks,
+            "at": db.now(), "run_ids": [r.run_id for r in rerun],
+            "workflows": [r.workflow for r in rerun], **({"error": error} if error else {})})
+        if rerun:
+            self.__dict__.setdefault("_flake_reruns", set()).add((wo_id, head))
+            log.info("[%s] re-ran failed CI on %s for %s before asking the worker "
+                     "(runs %s)", project.name, head[:10], wo_id,
+                     ", ".join(str(r.run_id) for r in rerun))
+        return bool(rerun)
+
+    def note_flake(self, store: ProjectStore, wo: dict, pr: Any) -> None:
+        """A head the OS re-ran red is green now: the failure was a flake, counted once (#1465)"""
+        from . import ci_rerun
+
+        head = str(pr.head_oid or "")
+        # In-process only, so a green poll costs no read; a restart mid-re-run loses one count
+        pending = self.__dict__.setdefault("_flake_reruns", set())
+        if (wo["id"], head) not in pending:
+            return
+        pending.discard((wo["id"], head))
+        reruns = ci_rerun.head_events(store, wo["id"], ci_rerun.FLAKE_RERUN_EVENT, head)
+        if not reruns or not reruns[-1].get("run_ids"):
+            return
+        store.add_event(wo["id"], ci_rerun.FLAKE_CONFIRMED_EVENT, {
+            "head_sha": head, "pr_url": wo.get("pr_url"),
+            "checks": reruns[-1].get("checks") or "",
+            "run_ids": reruns[-1].get("run_ids")})
+        log.info("%s: failed CI on %s passed on its re-run — a flake (%s)", wo["id"],
+                 head[:10], reruns[-1].get("checks"))
 
     def _note_reopened(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> bool:
