@@ -710,8 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--project")
     sp.add_argument("--json", action="store_true")
 
-    # Monitoring orders (docs/superpowers/specs/2026-11-01-monitoring-orders.md §5);
-    # `morpheus` is a permanent alias: production's shipit calls `jarvis morpheus enqueue-release`
+    # `morpheus` is a permanent alias (docs/superpowers/specs/2026-11-01-monitoring-orders.md §5)
     mo = sub.add_parser(
         "mo", aliases=["morpheus"],
         help="monitoring orders: shipped PRs and user watches checked in production",
