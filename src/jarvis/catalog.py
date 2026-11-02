@@ -916,8 +916,7 @@ DEFAULT_EVOLUTION_ORDER_BUDGET_USD = 25.0
 DEFAULT_EVOLUTION_MAX_DEPTH = 1
 DEFAULT_EVOLUTION_MAJOR_MIN_REFS = 1
 DEFAULT_EVOLUTION_MEDIUM_MIN_REFS = 3
-#: Per origin kind, in place of the severity's `*_min_refs`: Neo raises a cleanup once, in one verdict;
-#: a filed bug report is its own sighting (Q3080)
+#: Per origin kind, in place of `*_min_refs`: a Neo verdict or a filed bug is one sighting (Q3080)
 DEFAULT_EVOLUTION_MIN_REFS_BY_KIND = {"neo_rider": 1, "bug_agent": 1}
 DEFAULT_EVOLUTION_MIN_PRECISION = 0.2
 #: `shadow` decides and records but changes no dispatch; `enforce` applies the decision
