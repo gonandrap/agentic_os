@@ -21,9 +21,9 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger("jarvisd.morpheus")
 
-STATES = ("queued", "monitoring", "validated", "failed", "timedout")
+STATES = ("queued", "monitoring", "validated", "failed", "timedout", "cancelled")
 OPEN_STATES = ("queued", "monitoring")
-TERMINAL_STATES = ("validated", "failed", "timedout")
+TERMINAL_STATES = ("validated", "failed", "timedout", "cancelled")
 #: The terminal states that must cause something
 ACTION_STATES = ("failed", "timedout")
 
@@ -242,7 +242,47 @@ def enqueue(central: CentralStore, cfg: MorpheusConfig, pr: PullRequestBody, *,
         hints=section.text[:8000], script="", script_source="",
         state="validated" if waived else "queued",
         deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY,
-        resolution=f"waived by the PR: {section.waived}" if waived else "", now=now)
+        resolution=f"waived by the PR: {section.waived}" if waived else "",
+        origin="release" if release_tag else "merge", now=now)
+
+
+def is_monitoring_order_id(x: object) -> bool:
+    """`mv-` (older rows) or `mo-` (docs/superpowers/specs/2026-11-01-monitoring-orders.md §1.3)"""
+    return isinstance(x, str) and x.startswith(("mv-", "mo-"))
+
+
+def create(central: CentralStore, *, project: str, title: str, prompt: str = "",
+           script: str = "", every_minutes: int | None = None,
+           deadline_days: float | None = None, origin: str = "user") -> dict:
+    """An order watching no PR: exactly one of `prompt` (armed later) or `script`"""
+    from .catalog import MorpheusConfig
+
+    prompt, script = (prompt or "").strip(), (script or "").strip()
+    if bool(prompt) == bool(script):
+        raise ValueError("give exactly one of a prompt (what to watch) or a script")
+    if not (title or "").strip():
+        raise ValueError("a monitoring order needs a title")
+    if every_minutes is not None and int(every_minutes) < 1:
+        raise ValueError("every_minutes must be at least 1")
+    days = MorpheusConfig().timeout_days if deadline_days is None else deadline_days
+    now = db.now()
+    item = central.add_morpheus_item(
+        project=project, repo="", pr_number=None, pr_url="", pr_title="", wo_id="",
+        release_tag="", hints="", script="", script_source="", state="queued",
+        deadline_ts=now + float(days) * SECONDS_PER_DAY, title=title.strip(), origin=origin,
+        prompt=prompt, every_minutes=every_minutes, now=now)
+    assert item is not None  # no PR, so no uniqueness to collide with
+    return set_script(central, item["id"], script, "user") if script else item
+
+
+def cancel(central: CentralStore, mo_id: str) -> dict:
+    """Cancel an open order, never judged; a settled one is refused"""
+    item = _item_or_raise(central, mo_id)
+    if item["state"] not in OPEN_STATES:
+        raise ValueError(f"{mo_id} is already {item['state']}")
+    central.update_morpheus_item(mo_id, state="cancelled", next_check_ts=None,
+                                 resolution="cancelled")
+    return central.morpheus_item(mo_id) or {}
 
 
 def enqueue_release(central: CentralStore, cfg: MorpheusConfig, repo: Path, tag: str, *,
@@ -325,7 +365,8 @@ def set_script(central: CentralStore, item_id: str, script: str, source: str) ->
         raise ValueError("an empty script validates nothing")
     fields: dict[str, Any] = {"script": script, "script_source": source}
     if item["state"] == "queued":
-        fields.update(state="monitoring", next_check_ts=db.now())
+        # Armed: attempts restart (docs/superpowers/specs/2026-11-01-monitoring-orders.md §1.3)
+        fields.update(state="monitoring", next_check_ts=db.now(), attempts=0)
     central.update_morpheus_item(item_id, **fields)
     return central.morpheus_item(item_id) or {}
 
@@ -517,7 +558,8 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
     fields: dict[str, Any] = {"last_check_ts": now, "checks": int(item["checks"]) + 1,
                               "last_check_version": (version or checked_version)(where),
                               "last_exit": result.exit, "last_output": result.output,
-                              "next_check_ts": now + cfg.check_every_minutes * 60}
+                              "next_check_ts": now + int(item.get("every_minutes")
+                                                         or cfg.check_every_minutes) * 60}
     if result.exit == EXIT_VALIDATED:
         fields.update(state="validated", next_check_ts=None, resolution="script exited 0")
     # One exit 1 may be the environment, not the PR, so `failed` needs a second in a row (#1255)

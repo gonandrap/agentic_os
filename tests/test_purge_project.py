@@ -12,7 +12,7 @@ from jarvis.gate_rules import PR_MERGE, RuleSet
 from jarvis.neo_store import NeoStore
 
 SCOPE_TABLES = ["agent_calls", "backlog", "inbox", "knowledge", "knowledge_reads",
-                "morpheus_items", "rule_fires", "rule_recurrences", "steward_decisions"]
+                "monitoring_orders", "rule_fires", "rule_recurrences", "steward_decisions"]
 COND = {"field": "status", "op": "eq", "value": "needs_review"}
 
 

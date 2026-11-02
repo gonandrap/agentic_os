@@ -97,8 +97,8 @@
   transaction), `Subject`/`ReviewFeedback`/`DeferralRequest`, `DELIVERY_ATTEMPT_CEILING`.
   Turned by `Daemon.deliver_envelopes`; watched by INV-ENVELOPE-STUCK. See `mem:message-bus`.
 - `morpheus.py` — MORPHEUS, production validation of shipped PRs (spec
-  `2026-10-21-morpheus-validates-releases-in-production.md`). Queue = `morpheus_items`
-  in `os.db`, one row per PR with a `project` (`CentralStore.add/update_morpheus_item`,
+  `2026-10-21-morpheus-validates-releases-in-production.md`). Queue = `monitoring_orders`
+  in `os.db` (was `morpheus_items`; `mv-`/`mo-` ids, `morpheus.is_monitoring_order_id`), at most one row per PR, PR-less rows allowed, each with a `project` (`CentralStore.add/update_morpheus_item`,
   `claim_morpheus_action`), states `queued|monitoring|validated|failed|timedout`.
   Queued by: `enqueue_release()` for the OS (shipit step 5a3 + `ensure_release_queued`
   daemon backstop) and `queue_merges()` for every other project (`pr_merged` events,

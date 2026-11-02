@@ -7058,7 +7058,7 @@ def find_feature_order(fo_id: str, project_name: str | None = None, *,
 
 
 #: Every id the OS mints that has a page, and the shapes a reader types for the rest
-_REF_ID = re.compile(r"^(wo|fo|io|inv|kn|al|mv|bl)-[0-9a-f]{8}$")
+_REF_ID = re.compile(r"^(wo|fo|io|inv|kn|al|mv|mo|bl)-[0-9a-f]{8}$")
 _REF_NUMBERED = re.compile(r"^(q|gate-|issue-|#)?(\d+)$")
 
 
@@ -7091,7 +7091,9 @@ def resolve_ref(ref: str) -> str:
             return f"/alarms/{name}/{rid}"
     except OpsError:
         return search
-    if prefix == "mv":
+    from . import morpheus
+
+    if morpheus.is_monitoring_order_id(rid):
         return f"/morpheus/{rid}"
     return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"/{rid}"
 
@@ -16579,7 +16581,8 @@ def _release_rows(rows: list[dict[str, Any]], project: str, repo: Path) -> list[
     central = CentralStore()
     try:
         items = {int(i["pr_number"]): i for i in central.morpheus_items()
-                 if not slug or not i.get("repo") or i.get("repo") == slug}
+                 if i["pr_number"] is not None  # a monitoring order may watch no PR
+                 and (not slug or not i.get("repo") or i.get("repo") == slug)}
     finally:
         central.close()
     paths = registered_project_paths()
