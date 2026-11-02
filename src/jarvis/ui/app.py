@@ -2282,13 +2282,17 @@ def create_app() -> FastAPI:
     @app.get("/release", response_class=HTMLResponse)
     def release_page(request: Request):
         """Pending work, the cut, and every release by validation (docs/superpowers/specs/2026-11-01-release-console.md)"""
+        project = (request.query_params.get("project") or "").strip()
         try:
-            report = ops.release_overview()
+            report = ops.release_overview(project)
         except ops.OpsError as e:
             return render(request, "error.html", active="release", message=str(e),
                           status_code=503)
         pending, releases = report["pending"], report["releases"]
-        options = {"status": ["failed", "pending", "validated", "unwatched"],
+        # Spec 2026-11-01 §3: no `project` is the OS's own releases
+        options = {"project": [p for p in ops.release_projects()
+                               if p != (report["project"] if not project else "")],
+                   "status": ["failed", "pending", "validated", "unwatched"],
                    "origin": filter_options(pending, "origin"), "q": []}
         filters = query_filters(request, options)
         shown_pending = filter_rows(pending, {k: v for k, v in filters.items()
@@ -2304,19 +2308,20 @@ def create_app() -> FastAPI:
                       total=len(pending) + len(releases))
 
     @app.post("/release/cut")
-    def release_cut(base: str = Form("")):
+    def release_cut(base: str = Form(""), project: str = Form("")):
         """File the release order for pending work up to `base` (spec 2026-11-01 §2)"""
         try:
-            wo = ops.release_cut(base)
+            wo = ops.release_cut(base, project.strip())
         except ops.OpsError as e:
-            return RedirectResponse(f"/release?error={quote(str(e))}", status_code=303)
+            back = f"/release?project={quote(project.strip())}&" if project.strip() else "/release?"
+            return RedirectResponse(f"{back}error={quote(str(e))}", status_code=303)
         return RedirectResponse(f"/wo/{quote(wo['project'])}/{wo['id']}", status_code=303)
 
     @app.get("/release/{tag}", response_class=HTMLResponse)
     def release_item_page(request: Request, tag: str):
         """One release's contents traced to their orders, coloured by morpheus (spec 2026-11-01 §1)"""
         try:
-            d = ops.release_detail(tag)
+            d = ops.release_detail(tag, (request.query_params.get("project") or "").strip())
         except ops.OpsError as e:
             return render(request, "error.html", active="release", message=str(e),
                           status_code=404)
@@ -2327,6 +2332,7 @@ def create_app() -> FastAPI:
         rows = attention_first(filter_rows(every, filters, text_keys=("subject", "wo_id", "sha")),
                                lambda r: r["validation"] == "failed")
         return render(request, "release_item.html", active="release", d=d, rows=rows,
+                      project=(request.query_params.get("project") or "").strip(),
                       attention=[r for r in rows if r["validation"] == "failed"],
                       filters=filters, options=options, total=len(every))
 
