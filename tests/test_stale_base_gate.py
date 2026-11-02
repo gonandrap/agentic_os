@@ -340,87 +340,87 @@ def test_held_base_moved_without_a_fetched_tip_names_no_commit_at_all():
     assert "`main` has moved" in reason
 
 
-# -- #1459 / kn-41e5dd52: a batch merges back to back while `main` moves
+# -- #1459: one merge request in flight per base tip
 
 PR_2 = "https://github.com/acme/proj/pull/8"
-PR_3 = "https://github.com/acme/proj/pull/9"
 JUDGED_2 = "a650fd2c98000000000000000000000000000ccc"
-JUDGED_3 = "b760fd2c98000000000000000000000000000ddd"
 
 
-def three_parked(project_path, fake_gh):
-    """Three armed orders on one tip: (store, [(wo, pr_url, judged), ...])"""
+def two_parked(project_path, fake_gh):
     store, first = parked(project_path)
+    second = ops.create_work_order("proj_a", "add feature Y")
+    ops.finish(second["id"], "opened a PR", pr_url=PR_2)
+    row = store.open_validation_round(wo_id=second["id"], fingerprint="fp-2")
+    store.set_validation_head(row["id"], JUDGED_2)
+    store.close_validation_round(row["id"], "passed", "")
     green_pr(fake_gh)
-    members = [(first, PR, JUDGED)]
-    for pr_url, judged in ((PR_2, JUDGED_2), (PR_3, JUDGED_3)):
-        wo = ops.create_work_order("proj_a", f"add {pr_url}")
-        ops.finish(wo["id"], "opened a PR", pr_url=pr_url)
-        row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp-" + wo["id"])
-        store.set_validation_head(row["id"], judged)
-        store.close_validation_round(row["id"], "passed", "")
-        fake_gh.set_pr(pr_url, "OPEN", checks=GREEN, merge_state="CLEAN",
-                       head_oid=judged, base_oid=BASE_1)
-        members.append((store.get_work_order(wo["id"]), pr_url, judged))
-    return store, members
+    fake_gh.set_pr(PR_2, "OPEN", checks=GREEN, merge_state="CLEAN",
+                   head_oid=JUDGED_2, base_oid=BASE_1)
+    return store, first, store.get_work_order(second["id"])
 
 
-def test_a_batch_merges_back_to_back_on_its_own_heads_as_main_moves(
+def leader(store, *wos):
+    """(the order that filed, the one queued behind it) — the poll's order is not this test's"""
+    filed = [w for w in wos if store.list_approvals(w["id"])]
+    assert len(filed) == 1, [w["id"] for w in filed]
+    return filed[0], next(w for w in wos if w is not filed[0])
+
+
+def test_a_second_pull_request_on_the_same_base_waits_for_the_first(
         started, project, fake_gh, local):
-    """#1459 / kn-41e5dd52: one approval per PR, no catch-up, a conflict alone drops out"""
+    """#1459: N armed PRs file ONE Neo question, not N"""
     opt_in(started)
-    store, members = three_parked(project, fake_gh)
+    store, first, second = two_parked(project, fake_gh)
 
     poll(started, store)
 
-    grants = {wo["id"]: store.list_approvals(wo["id"]) for wo, _, _ in members}
-    assert all(len(g) == 1 for g in grants.values()), grants
-    (first, _, _), (second, pr_2, judged_2), (third, pr_3, _) = members
-    gates.apply_decision(store, grants[first["id"]][0]["id"], "approved", "ok", "neo",
-                         project="proj_a")
-    poll(started, store)
-    assert store.get_work_order(first["id"])["status"] == "completed"
+    first, second = leader(store, first, second)
+    [request] = store.list_approvals(first["id"])
+    held = [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(second["id"], "automerge_held")]
+    assert held[-1]["code"] == automerge.HELD_MERGE_QUEUED
+    assert first["id"] in held[-1]["reason"]
 
-    # The first member landed: `main` moved past every other member's head
-    fake_gh.set_pr(PR, "MERGED", merged_at="2026-11-01T10:00:00Z")
-    fake_gh.set_pr(pr_2, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=judged_2,
-                   base_oid=BASE_2)
-    fake_gh.set_pr(pr_3, "OPEN", checks=GREEN, merge_state="DIRTY",
-                   mergeable="CONFLICTING", head_oid=JUDGED_3, base_oid=BASE_2)
-    fake_gh.base_sha(BASE_2)
-    local.update({"tip": BASE_2, "contains": {BASE_1}})
-    for wo in (second, third):
-        gates.apply_decision(store, grants[wo["id"]][0]["id"], "approved", "ok", "neo",
-                             project="proj_a")
+    gates.apply_decision(store, request["id"], "denied", "no", "neo", project="proj_a")
     poll(started, store)
 
-    assert store.get_work_order(second["id"])["status"] == "completed"
-    assert [c["argv"][c["argv"].index("--match-head-commit") + 1]
-            for c in merges(fake_gh)] == [JUDGED, judged_2]
-    assert store.events_of_kind(second["id"], "pr_base_updated") == []
-    assert pr_2 not in fake_gh.updates
-    # The conflicting member alone takes the catch-up path
-    assert store.get_work_order(third["id"])["status"] == "waiting_pr_merge"
-    held = [db.from_json(e["payload"], {})["code"]
-            for e in store.events_of_kind(third["id"], "automerge_held")]
-    assert automerge.HELD_BASE_MOVED in held or pr_3 in fake_gh.updates, held
     assert len(store.list_approvals(second["id"])) == 1
 
 
-def test_main_moving_with_no_batch_merge_still_refuses_a_stale_base(
+def test_a_branch_behind_the_base_is_not_caught_up_while_another_merge_is_in_flight(
         started, project, fake_gh, local):
-    """The batch carve-out needs an OS merge since the grant was filed, not just a live grant"""
+    """#1459: the base-moved hold queues before the catch-up, so no catch-up CI is wasted"""
     opt_in(started)
-    store, wo = parked(project)
-    green_pr(fake_gh)
-    poll(started, store)
-    [approval] = store.list_approvals(wo["id"])
-    gates.apply_decision(store, approval["id"], "approved", "ok", "neo", project="proj_a")
-
+    store, first, second = two_parked(project, fake_gh)
+    store.add_approval(first["id"], gates.AUTO_MERGE, automerge.merge_command(PR, JUDGED),
+                       max_uses=1, base_oid=BASE_2)
+    # The leader's checks still run, so it files nothing new this tick
+    green_pr(fake_gh, base_oid=BASE_2, checks=[check("unit", "", "IN_PROGRESS")])
+    fake_gh.set_pr(PR_2, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED_2,
+                   base_oid=BASE_2)
     local.update({"tip": BASE_2, "contains": {BASE_1}})
+
     poll(started, store)
 
-    assert merges(fake_gh) == []
+    held = [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(second["id"], "automerge_held")]
+    assert held[-1]["code"] == automerge.HELD_MERGE_QUEUED
+    assert PR_2 not in fake_gh.updates
+    assert store.list_approvals(second["id"]) == []
+
+
+def test_an_escalated_request_holds_no_lease(started, project, fake_gh, local):
+    """Neo Q3020: a request waiting on the user does not stall the queue"""
+    opt_in(started)
+    store, first, second = two_parked(project, fake_gh)
+    poll(started, store)
+    first, second = leader(store, first, second)
+    [request] = store.list_approvals(first["id"])
+    store.mark_approval_escalated(request["id"], "the user decides")
+
+    poll(started, store)
+
+    assert len(store.list_approvals(second["id"])) == 1
 
 
 def test_a_new_request_expires_the_grant_its_old_head_left_unspent(started, project):
