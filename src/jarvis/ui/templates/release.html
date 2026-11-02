@@ -38,7 +38,7 @@ tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
 <p class="kv">A release ships everything up to one commit on main, so picking a PR picks
   every older one too (shaded). The OS files a release work order in {{ report.project }};
   {% if report.is_os %}its worker runs <span class="mono">scripts/shipit.sh --stage</span>
-  {%- else %}its worker tags the commit and releases it the way the project documents{% endif %}
+  {%- else %}its worker tags the commit and releases it the way the project documents,{% endif %}
   under the release gate.</p>
 <div class="cut-bar">
   <form method="post" action="/release/cut">
