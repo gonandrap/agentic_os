@@ -184,6 +184,24 @@ def test_a_release_already_shipped_and_deployed_completes_the_order(
     assert not store.get_work_order(rel)["needs_attention"]
 
 
+def test_a_release_whose_own_turn_is_running_is_left_to_its_shipit(
+        project, store, daemon, deploy):
+    """Issue #1485: shipit moved the checkout but has not written the marker yet"""
+    landed = land(project, "fix-one.txt")
+    tag(project, TAG)
+    deploy(project, TAG)
+    rel = release_order(store, project, shas={ISSUE: landed})
+    turn = store.create_turn(rel, "dispatch", "ship it")
+
+    step(daemon, store)
+    assert store.get_work_order(rel)["status"] == "running"
+    assert not events(store, rel, "release_completed")
+
+    store.finish_turn(int(turn["id"]), "done")
+    step(daemon, store)
+    assert store.get_work_order(rel)["status"] == "completed"
+
+
 # -- 4: a tag nobody deployed
 
 
