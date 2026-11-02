@@ -1045,6 +1045,52 @@ def test_a_refreshed_spec_reaches_the_children_and_the_feature_agent(planning, s
     assert "frozen records" in definition.read_text()
 
 
+def _reworking_planner(store, fo: dict) -> str:
+    """The planner reworking a panel rejection of its spec PR"""
+    planner = fo["plan_wo_id"]
+    store.update_work_order(planner, pr_url="https://github.com/x/y/pull/9")
+    store.conn.execute("UPDATE work_orders SET status='running' WHERE id=?", (planner,))
+    return planner
+
+
+def test_a_reworked_spec_reaches_the_pending_children(executing, store, project):
+    """docs/superpowers/specs/2026-11-01-a-held-spec-is-re-read-until-it-merges.md"""
+    _daemon, fo, schema, _api = executing
+    _reworking_planner(store, fo)
+    assert store.spec_hold(store.get_work_order(schema["id"]))   # §1: rework holds
+
+    commit_spec(project, REVISED)
+    assert ops.refresh_held_spec(fo["id"])["refreshed"]           # §2
+
+    assert specs.spec_of(store, store.get_work_order(schema["id"]))["content"] == REVISED
+    assert store.events_of_kind(fo["plan_wo_id"], "plan_spec_refreshed")
+
+
+def test_a_started_childs_changed_section_keeps_the_snapshot(executing, store, project):
+    _daemon, fo, schema, _api = executing
+    _reworking_planner(store, fo)
+    store.conn.execute("UPDATE work_orders SET status='running' WHERE id=?",
+                       (schema["id"],))
+    head = f"## {fixture_spec_section('schema')}."
+    commit_spec(project, "\n".join(
+        line + ("\n\nA new requirement." if line.startswith(head) else "")
+        for line in FIXTURE_DESIGN_DOC_BODY.splitlines()))
+
+    out = ops.refresh_held_spec(fo["id"])
+
+    after = store.get_feature_order(fo["id"])
+    assert out["reason"] == "kept"
+    assert json.loads(after["plan"])["design_doc_content"] == FIXTURE_DESIGN_DOC_BODY
+    assert schema["id"] in after["attention_reason"]
+
+
+def test_a_merged_spec_is_not_re_read(executing, store, project):
+    _daemon, fo, _schema, _api = executing
+    commit_spec(project, REVISED)
+
+    assert ops.refresh_held_spec(fo["id"])["reason"] == "the spec is not held"
+
+
 # -- a child's section is derivable, not written once
 
 

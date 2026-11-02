@@ -76,6 +76,7 @@ jarvis wo ack <id> / --all                 # "seen it" — refuses on pending as
 jarvis wo done <id>                        # user closes it; PR-parked orders close themselves on merge
 jarvis wo pr <id> <url>                    # record a PR the user opened by hand for a pushed branch
 jarvis wo hide <id> / unhide <id>          # declutter, record kept
+jarvis wo expedite <id> [--off]            # its merge ships ALONE: latest tag + cherry-pick
 jarvis wo delete <id> --yes                # irreversible
 jarvis wo resume-auto <id>                 # what is it ACTUALLY waiting on?
 jarvis wo retry <id> [--message "…"]       # relaunch a FAILED order in its own session; never automatic

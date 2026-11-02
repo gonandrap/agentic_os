@@ -9,5 +9,6 @@ tags: [testing]
 
 - `uv sync --extra dev` once per worktree, then `uv run pytest tests/<file> -q -x`.
 - Never the whole suite locally (>15 min; it outlives the prompt cache) — cite CI instead.
+- Each local command under two minutes, with `-n auto`: new tests and edited test files first; a wider impacted set is CI's. Never re-run a file already green this turn.
 - LLM evals: `JARVIS_EVALS_LLM=1 uv run pytest evals/llm/<file> -q`.
 - What covers what: Serena `read_memory testing`.

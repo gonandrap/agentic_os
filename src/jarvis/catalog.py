@@ -42,7 +42,8 @@ SAFETY_KEYS = (
     # Files work nobody typed: same class of act as the scheduler
     "os.autonomy.*",
     # How much of that the steward may spend, and how deep it may go (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
-    "os.evolution.weekly_usd", "os.evolution.critical_weekly_usd",
+    "os.evolution.weekly_usd", "os.evolution.bug_weekly_usd",
+    "os.evolution.critical_weekly_usd",
     "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
     "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_refs_by_kind",
     "os.evolution.min_precision",
@@ -305,6 +306,8 @@ DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE = 0.5
 STAKES_CLASSIFIER_MODES = ("regex", "shadow", "classifier", "regex-tightened")
 # The measured winner (spec 2026-09-25 §7: precision 0.486 / recall 0.944 vs regex 0.140 / 0.667)
 DEFAULT_STAKES_CLASSIFIER = "regex-tightened"
+#: Who settles an assumption that net calls high-stakes: the user, or Neo like any other (#1366)
+HIGH_STAKES_HOLD_MODES = ("user", "neo")
 
 
 @dataclass
@@ -339,6 +342,8 @@ class ValidationConfig:
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
     # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
     stakes_classifier: str = DEFAULT_STAKES_CLASSIFIER
+    # WHO SETTLES A HIGH-STAKES ASSUMPTION — see `HIGH_STAKES_HOLD_MODES`
+    high_stakes_hold: str = "user"
     # WHEN FAILING EARLY OBJECTIONS REACH THE INBOX: withdrawn over sent (io-ce566253)
     objection_withdrawal_alarm_rate: float = DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE
 
@@ -656,6 +661,8 @@ DEFAULT_COST_METER_OUTSIDE_ROWS = 10
 DEFAULT_COST_METER_OUTSIDE_ALERT_SHARE = 0.25
 DEFAULT_COST_METER_RESIDUAL_ALERT_SHARE = 0.25
 DEFAULT_COST_METER_ALERT_MIN_USD = 5.0
+#: Warn when the 5h window's projected exhaustion lands this long before its reset (issue #878)
+DEFAULT_COST_METER_BURN_WARN_LEAD_MINUTES = 60
 
 
 @dataclass
@@ -681,6 +688,7 @@ class CostConfig:
     meter_outside_alert_share: float = DEFAULT_COST_METER_OUTSIDE_ALERT_SHARE
     meter_residual_alert_share: float = DEFAULT_COST_METER_RESIDUAL_ALERT_SHARE
     meter_alert_min_usd: float = DEFAULT_COST_METER_ALERT_MIN_USD
+    meter_burn_warn_lead_minutes: int = DEFAULT_COST_METER_BURN_WARN_LEAD_MINUTES
 
 
 #: The legal observability levels and the shipped default, as LITERALS (docs/superpowers/specs/2026-09-24-order-observability.md §10.)
@@ -907,6 +915,7 @@ DEFAULT_EVOLUTION_MIN_SAMPLES = 3
 
 #: The steward's ledger (§3.3 of... (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
 DEFAULT_EVOLUTION_WEEKLY_USD = 150.0
+DEFAULT_EVOLUTION_BUG_WEEKLY_USD = 150.0
 DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD = 60.0
 DEFAULT_EVOLUTION_YIELD_ABOVE_USD = 900.0
 DEFAULT_EVOLUTION_ORDER_BUDGET_USD = 25.0
@@ -927,6 +936,8 @@ class EvolutionConfig:
     min_samples: int = DEFAULT_EVOLUTION_MIN_SAMPLES
     # The steward (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md...
     weekly_usd: float = DEFAULT_EVOLUTION_WEEKLY_USD
+    #: The reported-bug track's own ledger (steward.TRACKS)
+    bug_weekly_usd: float = DEFAULT_EVOLUTION_BUG_WEEKLY_USD
     critical_weekly_usd: float = DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD
     yield_above_usd: float = DEFAULT_EVOLUTION_YIELD_ABOVE_USD
     order_budget_usd: float = DEFAULT_EVOLUTION_ORDER_BUDGET_USD
@@ -1436,6 +1447,10 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         # The `roster` precedent: refused loudly rather than shrugged to the default
         raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
                    f"one of {list(STAKES_CLASSIFIER_MODES)}")
+    high_stakes_hold = str(raw.get("high_stakes_hold", base.high_stakes_hold) or "user")
+    if high_stakes_hold not in HIGH_STAKES_HOLD_MODES:
+        raise _err(f"{where}.high_stakes_hold is {high_stakes_hold!r}, which is not "
+                   f"one of {list(HIGH_STAKES_HOLD_MODES)}")
     feature_merge_wait_minutes = int(
         raw.get("feature_merge_wait_minutes", base.feature_merge_wait_minutes))
     if feature_merge_wait_minutes < 0:
@@ -1473,6 +1488,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         auto_review=bool(raw.get("auto_review", base.auto_review)),
         # Same fallback again — see `ValidationConfig.stakes_classifier`
         stakes_classifier=stakes_classifier,
+        high_stakes_hold=high_stakes_hold,
         objection_withdrawal_alarm_rate=withdrawal_rate,
     )
 
@@ -1707,6 +1723,8 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
                                                  base.meter_residual_alert_share)),
         meter_alert_min_usd=float(raw.get("meter_alert_min_usd",
                                           base.meter_alert_min_usd)),
+        meter_burn_warn_lead_minutes=int(raw.get("meter_burn_warn_lead_minutes",
+                                                 base.meter_burn_warn_lead_minutes)),
     )
     if not 0 <= cfg.week_reset_weekday <= 6:
         raise _err(f"{where}.week_reset_weekday must be 0..6 (0 = Monday) — "
@@ -1750,6 +1768,9 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
     if cfg.meter_alert_min_usd < 0:
         raise _err(f"{where}.meter_alert_min_usd must be >= 0 — "
                    f"{cfg.meter_alert_min_usd} is not an amount of money")
+    if cfg.meter_burn_warn_lead_minutes < 1:
+        raise _err(f"{where}.meter_burn_warn_lead_minutes must be >= 1 — zero would warn "
+                   f"about a window that runs dry a minute before it resets anyway")
     try:
         zoneinfo.ZoneInfo(cfg.week_reset_zone)
     except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
@@ -1798,7 +1819,8 @@ def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
     if min_samples < 1:
         raise _err(f"{where}.min_samples must be 1 or more, got {min_samples}")
     money = {}
-    for key in ("weekly_usd", "critical_weekly_usd", "yield_above_usd", "order_budget_usd"):
+    for key in ("weekly_usd", "bug_weekly_usd", "critical_weekly_usd", "yield_above_usd",
+                "order_budget_usd"):
         value = float(raw.get(key, getattr(base, key)))
         if value < 0:
             raise _err(f"{where}.{key} must be 0 or more, got {value}")

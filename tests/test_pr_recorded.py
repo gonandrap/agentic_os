@@ -184,7 +184,7 @@ def test_route_finish_with_abandon_is_the_way_through(started, project):
 def test_route_assumption_review_parks(started, project):
     """ROUTE 2 — `ops.review_work_order`, the user accepting the assumptions"""
     wo = _order(project, code="watchdogs")
-    ops.assume(wo["id"], "polled every 30s")
+    ops.assume(wo["id"], "polled every 30s (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "needs_review")
@@ -198,7 +198,7 @@ def test_route_assumption_review_parks(started, project):
 def test_route_neo_accepting_an_assumption_parks_too(started, project):
     """ROUTE 3 — `ops.accept_assumption`"""
     wo = _order(project, code="watchdogs")
-    ops.assume(wo["id"], "polled every 30s")
+    ops.assume(wo["id"], "polled every 30s (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "needs_review")
@@ -465,7 +465,7 @@ def test_the_pr_pending_park_is_written_once_however_many_ticks_run(started, pro
 def test_accepting_the_assumptions_parks_on_the_specific_blocker(started, project):
     """§2's free half and §7.1"""
     wo = _pushed_order(project, code="watchdogs")
-    ops.assume(wo["id"], "polled every 30s")
+    ops.assume(wo["id"], "polled every 30s (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "needs_review")

@@ -111,7 +111,7 @@ def test_a_compute_and_print_heredoc_is_left_alone(worker):
 
 
 def test_git_commit_with_a_heredoc_is_untouched(worker):
-    """Data, not a program — the distinction `gate_rules.program_spans` already owns"""
+    """Data, not a program"""
     command = "git commit -F - <<'EOF'\nfix the thing\nEOF"
 
     assert _decision(worker.attempt(command)) != "deny"

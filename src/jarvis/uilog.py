@@ -134,6 +134,18 @@ def dump_stacks(note: str = "") -> Path | None:
         return None
 
 
+def register_stack_signal() -> bool:
+    """`kill -USR1 <pid>` dumps every thread's stack to stderr (the journal), no ptrace needed (#848)"""
+    import faulthandler
+    import signal
+    import sys
+
+    if not hasattr(signal, "SIGUSR1"):
+        return False
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
+    return True
+
+
 def record_wedge(*, limiter: dict[str, int], uptime_seconds: float,
                  version: str = "", reason: str = "threadpool wedged",
                  ) -> dict[str, object]:

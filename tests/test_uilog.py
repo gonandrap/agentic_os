@@ -14,6 +14,17 @@ def _boom(msg: str = "kaboom") -> Exception:
         return e
 
 
+def test_sigusr1_dumps_every_thread_to_stderr():
+    import subprocess
+    import sys
+
+    code = ("import os, signal; from jarvis import uilog; uilog.register_stack_signal(); "
+            "os.kill(os.getpid(), signal.SIGUSR1); print('alive')")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    assert out.stdout.strip() == "alive"
+    assert "most recent call first" in out.stderr
+
+
 def test_error_round_trips_through_the_log(jarvis_home):
     uilog.record_error("GET", "/wo/proj_a/wo-1", _boom("no such thing"))
 

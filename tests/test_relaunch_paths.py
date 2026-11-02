@@ -21,6 +21,7 @@ EXEMPT: dict[str, str] = {
     "worker_session.compact": "the transport itself; the decision is above it",
     "worker_session._compact_or_withdraw": "the withdrawal wrapper around the action",
     "worker_session.compact_before_relaunch": "the decision itself",
+    "worker_session.compact_while_warm": "the pre-expiry decision; nothing is relaunched (issue #1179)",
 }
 
 

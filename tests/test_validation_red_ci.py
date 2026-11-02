@@ -396,3 +396,68 @@ def test_red_ci_is_an_uncounted_cause_and_never_a_holding_one(fleet):
         assert row["hold_cause"] is None
     finally:
         store.close()
+
+
+# -- 5. a check already red on the base is the base's, not the branch's (#1074, spec §9)
+
+#: In the same workflow the stored red-base fact names
+BASE_RED = [{"name": "unit (3.13)", "status": "COMPLETED", "conclusion": "FAILURE",
+             "workflowName": "ci"}]
+
+
+def _red_base(workflow="ci", fix_wo_id=""):
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.set_base_health("proj_a", {
+            "red": True, "base": "main", "workflow": workflow,
+            "run_url": "https://x/runs/1", "head_sha": "b7c36f6abc", "wo_id": "",
+            "fix_wo_id": fix_wo_id, "checked_at": db.now()})
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+def test_red_only_in_the_bases_red_workflow_is_inherited():
+    red = {"name": "unit (3.13)", "status": "COMPLETED", "conclusion": "FAILURE",
+           "workflow": "ci"}
+    packet = _packet([red, {"name": "evals", "status": "COMPLETED",
+                            "conclusion": "SUCCESS", "workflow": "evals"}])
+    assert evidence_mod.ci_inherited(packet, "ci") is True
+    assert evidence_mod.ci_inherited(packet, "") is False
+    assert evidence_mod.ci_inherited(packet, "other") is False
+    own = _packet([red, {"name": "lint", "status": "COMPLETED", "conclusion": "FAILURE",
+                         "workflow": "lint"}])
+    assert evidence_mod.ci_inherited(own, "ci") is False, "a red of its own is returned"
+    assert evidence_mod.ci_inherited(_packet(GREEN), "ci") is False
+
+
+def test_a_head_red_only_where_the_base_is_red_is_judged_not_returned(fleet, fake_gh):
+    """THE CLAIM OF #1074: the worker delivers once; the panel is told whose red it is"""
+    _red_base(fix_wo_id="wo-fix1")
+    panel = Validator(passed())
+    fleet.daemon.validator = panel
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "x = 1")
+    pr = finish(fleet, wo["id"])["pr_url"]
+    fake_gh.set_pr_artifact(pr, checks=BASE_RED, files=FILES, diff="+x = 1")
+
+    fleet.drain()
+
+    assert [c["round"] for c in panel.calls] == [1]
+    note = panel.calls[0]["packet"].base_red
+    assert "`main` itself is red" in note and "wo-fix1" in note
+    rnd = _round(fleet, wo["id"])
+    assert rnd["outcome"] == "passed" and rnd["uncounted_cause"] != ops.RED_CI_CAUSE
+
+
+def test_a_red_of_its_own_beside_a_red_base_is_still_returned(fleet, fake_gh):
+    _red_base(workflow="other")
+    never = Validator(passed())
+    fleet.daemon.validator = never
+    wo, _ = _red_return(fleet, fake_gh, checks=BASE_RED)
+
+    assert never.calls == []
+    assert _round(fleet, wo["id"])["uncounted_cause"] == ops.RED_CI_CAUSE

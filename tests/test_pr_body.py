@@ -280,7 +280,33 @@ def test_an_inline_body_is_read_in_every_flag_spelling(command):
 
 
 @pytest.mark.parametrize("command", [
-    "gh pr create --fill",                     # no body of ours to judge
+    "cat > b.md <<'EOF'\n{body}\nEOF\ngh pr create --title '[wo-1234abcd] x' --body-file b.md",
+    "cat >./b.md <<EOF\n{body}\nEOF\n/snap/bin/gh pr create -t '[wo-1234abcd] x' -F b.md",
+    "printf x | tee -a b.md && gh pr create --title '[wo-1234abcd] x' --body-file ./b.md",
+])
+def test_a_body_file_the_same_command_writes_is_denied_not_judged_stale(tmp_path, command):
+    """Issue 724: the file on disk is another body; the denial must not quote it"""
+    (tmp_path / "b.md").write_text("stale sibling body #607\n")
+
+    # The rule itself, not preflight: the heredoc file-write guard would refuse first
+    payload = {"tool_input": {"command": command.format(body=_body())}, "cwd": str(tmp_path)}
+    out = hooks.pr_body_decision(payload, WO)
+
+    assert out is not None
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "separate call" in reason
+    assert "#607" not in reason
+
+
+def test_writing_some_other_file_first_still_judges_the_body_file(tmp_path):
+    (tmp_path / "b.md").write_text(_body())
+
+    assert _decide("echo hi > notes.txt && gh pr create --title '[wo-1234abcd] x' "
+                   "--body-file b.md", cwd=str(tmp_path)) is None
+
+
+@pytest.mark.parametrize("command", [
+    "gh pr create --fill",                    # no body of ours to judge
     "gh pr create --title '[wo-1234abcd] x'",  # an editor prompt
     "gh pr create --body-file -",              # stdin: a hook cannot see it
     "gh pr create --body-file /no/such/file",  # unreadable is not judgeable

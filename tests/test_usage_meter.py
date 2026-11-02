@@ -573,6 +573,79 @@ def _meter_inbox(central: CentralStore) -> list[dict]:
         if "usage meter" in r["title"]]
 
 
+# -- burn-rate early warning (issue #878)
+
+
+def _burn_series(central: CentralStore, *, start_pct: float, per_min: float,
+                 resets_at: float, minutes: int = 11, start: float = T0) -> float:
+    for i in range(minutes):
+        usage_meter.record(central, usage_meter.Sample(
+            ts=start + i * MINUTE, five_hour_pct=start_pct + per_min * i,
+            five_hour_resets_at=resets_at, seven_day_pct=1.0))
+    central.conn.commit()
+    return start + (minutes - 1) * MINUTE
+
+
+def _burn_inbox(central: CentralStore, *, unacked: bool = True) -> list[dict]:
+    return [r for r in db.rows_to_dicts(central.conn.execute("SELECT * FROM inbox").fetchall())
+            if r["title"] == usage_meter.BURN_NOTICE_TITLE
+            and (not unacked or r["status"] != "acked")]
+
+
+@pytest.fixture()
+def burn_daemon(jarvis_home, catalog_file):
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    daemon = Daemon(load_catalog(catalog_file))
+    store = daemon.store_for(daemon.catalog.projects[0])
+    store.create_work_order("burner", wo_id="wo-burner1", status="running")
+    store.create_turn("wo-burner1", "dispatch", "")
+    store.conn.commit()
+    return daemon
+
+
+def test_a_burn_dry_hours_before_reset_raises_one_warning_naming_the_running_orders(
+        burn_daemon):
+    central = burn_daemon.central
+    # 10% rising 2.8%/min: dry ~32 minutes out, the window resets ~4.5h out
+    last = _burn_series(central, start_pct=10.0, per_min=2.8, resets_at=T0 + 4.5 * 3600)
+    burn_daemon.notice_burn_rate(now=last)
+    burn_daemon.notice_burn_rate(now=last)
+    (row,) = _burn_inbox(central, unacked=False)
+    assert row["level"] == "warning"
+    assert "wo-burner1 (proj_a)" in row["body"] and "jarvis pause" in row["body"]
+    assert "park ~3h" in row["body"]
+
+
+def test_a_burn_that_runs_dry_after_the_reset_raises_nothing(burn_daemon):
+    central = burn_daemon.central
+    # 10% rising 0.2%/min: dry 7.5h out, after the 4.5h reset
+    last = _burn_series(central, start_pct=10.0, per_min=0.2, resets_at=T0 + 4.5 * 3600)
+    burn_daemon.notice_burn_rate(now=last)
+    assert not _burn_inbox(central, unacked=False)
+
+
+def test_a_recovered_projection_clears_the_warning(burn_daemon):
+    central = burn_daemon.central
+    resets = T0 + 4.5 * 3600
+    last = _burn_series(central, start_pct=10.0, per_min=2.8, resets_at=resets)
+    burn_daemon.notice_burn_rate(now=last)
+    assert len(_burn_inbox(central)) == 1
+    last = _burn_series(central, start_pct=38.0, per_min=0.0, resets_at=resets,
+                        start=last + MINUTE)
+    burn_daemon.notice_burn_rate(now=last)
+    assert not _burn_inbox(central)
+    assert not central.get_state(usage_meter.BURN_NOTICE_KEY)
+
+
+def test_a_stale_or_short_series_is_no_projection(central):
+    last = _burn_series(central, start_pct=10.0, per_min=2.8, resets_at=T0 + 4.5 * 3600,
+                        minutes=3)
+    assert usage_meter.burn(central, now=last) is None
+    assert usage_meter.burn(central, now=last + 10 * MINUTE) is None
+
+
 def _stale(found):
     matching = [v for v in found if v.invariant == "INV-USAGE-METER-STALE"]
     assert len(matching) <= 1

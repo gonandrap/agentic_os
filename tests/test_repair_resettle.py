@@ -45,7 +45,7 @@ def repaired(started, project, fake_gh, fake_claude, settle_turns):
     started.tick()
     store = ProjectStore(project)
     assert settle_turns(store)
-    ops.assume(wo["id"], "used tabs, not spaces")
+    ops.assume(wo["id"], "used tabs, not spaces (fixture decision)")
     assert ops.finish(wo["id"], "opened a PR", pr_url=PR)["status"] == "needs_review"
 
     conflicting(fake_gh)
@@ -191,7 +191,7 @@ def test_a_decided_assumption_line_is_rewritten(started, project):
 def test_a_vaguer_but_true_assumption_line_is_left_alone(started, project):
     """The XOR: `ops.assume`'s generic reason against a real pending decision is true"""
     wo = ops.create_work_order("proj_a", "add feature X")
-    ops.assume(wo["id"], "used tabs, not spaces")
+    ops.assume(wo["id"], "used tabs, not spaces (fixture decision)")
     store = ProjectStore(project)
 
     assert [v.invariant for v in check_project(store)] == []

@@ -359,6 +359,80 @@ def test_a_verdict_for_an_alarm_the_user_already_decided_is_dropped(escalated):
         neo.close()
 
 
+def _attention(wo_id: str) -> tuple[int, str | None]:
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        wo = store.get_work_order(wo_id)
+        return wo["needs_attention"], wo["attention_reason"]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_reviewing_an_escalated_alarm_puts_its_flag_down(escalated, approved):
+    """Issue 1064: the review IS the user's answer, no `wo ack` after it"""
+    daemon, wo_id = escalated(extra="FORCE_ALARM_NEO_ESCALATE")
+    daemon._neo_drain()
+    alarm_id = _alarm(wo_id)["id"]
+    assert _attention(wo_id) == (1, supervisor.ALARM_BLOCKER.format(alarm_id=alarm_id))
+
+    ops.review_alarm(alarm_id, approved=approved, feedback="it is stuck, not slow")
+
+    assert _attention(wo_id) == (0, None)
+
+
+def test_reviewing_an_alarm_leaves_a_real_blocker_standing(escalated):
+    """Re-derived, not cleared: a failed order still needs the user"""
+    daemon, wo_id = escalated(extra="FORCE_ALARM_NEO_ESCALATE")
+    daemon._neo_drain()
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        store.update_work_order(wo_id, status="failed")
+    finally:
+        store.close()
+
+    ops.review_alarm(_alarm(wo_id)["id"], approved=True)
+
+    flagged, reason = _attention(wo_id)
+    assert flagged == 1
+    assert reason and "alarm" not in reason
+
+
+def test_reviewing_one_of_two_alarms_hands_the_flag_to_the_other(escalated):
+    """Issue 1064's own order carried two escalated alarms"""
+    daemon, wo_id = escalated(extra="FORCE_ALARM_NEO_ESCALATE")
+    daemon._neo_drain()
+    first = _alarm(wo_id)["id"]
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        second = store.add_alarm(wo_id, "long-turn", 99, "another long turn",
+                                 status="escalated")["id"]
+    finally:
+        store.close()
+    assert _attention(wo_id) == (1, supervisor.ALARM_BLOCKER.format(alarm_id=first))
+
+    ops.review_alarm(first, approved=True)
+    assert _attention(wo_id) == (1, supervisor.ALARM_BLOCKER.format(alarm_id=second))
+
+    ops.review_alarm(second, approved=True)
+    assert _attention(wo_id) == (0, None)
+
+
+def test_reviewing_an_alarm_leaves_a_flag_naming_something_else(escalated):
+    """Only the flag naming THIS alarm is the review's to settle"""
+    daemon, wo_id = escalated(extra="FORCE_ALARM_NEO_ESCALATE")
+    daemon._neo_drain()
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        store.flag_attention(wo_id, "cost alarm al-other needs you")
+    finally:
+        store.close()
+
+    ops.review_alarm(_alarm(wo_id)["id"], approved=True)
+
+    assert _attention(wo_id) == (1, "cost alarm al-other needs you")
+
+
 def test_the_review_surfaces_light_up_off_the_pointer_this_section_writes(escalated):
     """§5 already reads `neo_advice` through `wo_alarms.neo_question_id`"""
     daemon, wo_id = escalated()

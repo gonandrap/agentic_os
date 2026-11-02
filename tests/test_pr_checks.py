@@ -604,7 +604,7 @@ def test_a_refusal_is_not_hidden_behind_a_pending_assumption(started, project,
                                                              fake_gh):
     """Widening the poll made a co-occurrence reachable that `true_blockers` had a guard against precisely..."""
     wo = ops.create_work_order("proj_a", "add feature X")
-    ops.assume(wo["id"], "used tabs, not spaces")
+    ops.assume(wo["id"], "used tabs, not spaces (fixture decision)")
     assert ops.finish(wo["id"], "opened a PR", pr_url=PR)["status"] == "needs_review"
     fake_gh.set_pr(PR, "CLOSED")
     store = ProjectStore(project)
@@ -1319,3 +1319,34 @@ def test_the_resync_module_builds_only_the_two_commands_it_declares():
              if isinstance(e, ast.Constant) and isinstance(e.value, str)
              and e.value.startswith("--")}
     assert flags == set()
+
+
+# -- the same red run is asked about once (issue #1438)
+
+
+def test_an_unchanged_red_run_is_not_nudged_twice(started, project, fake_gh, parked,
+                                                  monkeypatch):
+    """wo-b78babef: three attempts on run 41331509517 at one head"""
+    monkeypatch.setattr(Daemon, "rerun_failed_checks", lambda *a, **k: False)
+    store = ProjectStore(project)
+    flake = [{**check("unit-shard (5)", "FAILURE"), "startedAt": "2026-11-01T09:00:00Z"}]
+    red(fake_gh, flake)
+    fake_gh.set_pr(PR, "OPEN", base_ref="main", checks=flake, head_oid=COUNTED_HEAD)
+
+    poll(started, store)
+    assert delivered(store, parked["id"])
+    poll(started, store)                  # the worker answered "flake", pushed nothing
+    poll(started, store)
+
+    assert store.pr_repair_attempts(parked["id"], "checks") == 1
+    assert not store.queued_messages(parked["id"])
+    assert len(store.events_of_kind(parked["id"], "pr_checks_held")) == 1
+    row = store.get_work_order(parked["id"])
+    assert row["attention_reason"] == PR_CHECKS_BLOCKER
+    assert [v.invariant for v in check_project(store)] == []
+
+    # A re-run is a new run: ask again
+    rerun = [{**flake[0], "startedAt": "2026-11-01T10:00:00Z"}]
+    fake_gh.set_pr(PR, "OPEN", base_ref="main", checks=rerun, head_oid=COUNTED_HEAD)
+    poll(started, store)
+    assert store.pr_repair_attempts(parked["id"], "checks") == 2

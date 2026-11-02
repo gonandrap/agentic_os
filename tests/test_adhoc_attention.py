@@ -8,8 +8,8 @@ import pytest
 
 from jarvis import db, ops
 from jarvis.hooks import handle_hook
-from jarvis.invariants import (IDLE_NO_FINISH_BLOCKER, WORKER_FAILED_BLOCKER,
-                               check_project, true_blockers)
+from jarvis.invariants import (IDLE_NO_FINISH_BLOCKER, PR_CLOSED_BLOCKER,
+                               WORKER_FAILED_BLOCKER, check_project, true_blockers)
 from jarvis.project_store import ProjectStore
 
 from test_pipeline import _add_session, _inject, started  # noqa: F401
@@ -334,8 +334,8 @@ def test_ack_all_clears_the_whole_attention_list(started, project):
     ids = []
     for i in range(3):
         wo = store.create_work_order(f"task {i}")
-        store.set_status(wo["id"], "needs_review")
-        store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
+        store.set_status(wo["id"], "needs_review", pr_state="CLOSED")
+        store.flag_attention(wo["id"], PR_CLOSED_BLOCKER)
         ids.append(wo["id"])
     keep = store.create_work_order("needs a decision")
     store.add_assumption(keep["id"], "picked postgres")
@@ -354,8 +354,8 @@ def test_ack_all_clears_the_whole_attention_list(started, project):
 def test_ack_is_recorded_on_the_timeline(started, project):
     store = ProjectStore(project)
     wo = store.create_work_order("task")
-    store.set_status(wo["id"], "needs_review")
-    store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
+    store.set_status(wo["id"], "needs_review", pr_state="CLOSED")
+    store.flag_attention(wo["id"], PR_CLOSED_BLOCKER)
 
     ops.ack_attention(wo["id"])
 
@@ -366,8 +366,8 @@ def test_ack_is_recorded_on_the_timeline(started, project):
 def test_status_stops_listing_acknowledged_work(started, project):
     store = ProjectStore(project)
     wo = store.create_work_order("task")
-    store.set_status(wo["id"], "needs_review")
-    store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
+    store.set_status(wo["id"], "needs_review", pr_state="CLOSED")
+    store.flag_attention(wo["id"], PR_CLOSED_BLOCKER)
     assert any(a["wo_id"] == wo["id"] for a in ops.os_status()["attention"])
 
     ops.ack_attention(wo["id"])

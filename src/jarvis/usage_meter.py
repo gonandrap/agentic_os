@@ -274,6 +274,70 @@ def gap_streak(central: Any) -> Streak:
     return found
 
 
+#: The burn rate is the 5h rise over this trailing span of readings (issue #878)
+BURN_LOOKBACK_SECONDS = 10 * 60.0
+#: Fewer minutes than this between the span's ends is a blip, not a rate
+BURN_MIN_SPAN_SECONDS = 5 * 60.0
+BURN_NOTICE_KEY = "usage_meter_burn_notice"
+BURN_NOTICE_TITLE = "the 5h usage window will run dry before it resets"
+
+
+@dataclass
+class Burn:
+    pct: float
+    pct_per_min: float
+    at: float
+    resets_at: float
+
+    @property
+    def exhausts_at(self) -> float | None:
+        """When the window hits 100% at this rate, or None if it is not rising"""
+        if self.pct_per_min <= 0:
+            return None
+        return self.at + (100.0 - self.pct) / self.pct_per_min * 60.0
+
+    def lead_seconds(self) -> float:
+        """How long the window sits spent before it resets; 0 when it never runs dry"""
+        dry = self.exhausts_at
+        return max(0.0, self.resets_at - dry) if dry is not None else 0.0
+
+
+def burn(central: Any, *, now: float) -> Burn | None:
+    """The 5h window's recent burn, from the newest fresh reading back; None without enough of it"""
+    try:
+        rows = central.conn.execute(
+            "SELECT ts, five_hour_pct, five_hour_resets_at FROM usage_samples "
+            "WHERE ok=1 AND five_hour_pct IS NOT NULL AND five_hour_resets_at IS NOT NULL "
+            "AND ts >= ? AND ts <= ? ORDER BY ts",
+            (now - BURN_LOOKBACK_SECONDS, now)).fetchall()
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    last = rows[-1]
+    resets = float(last["five_hour_resets_at"])
+    # Only the readings of the window the newest one is in: a reset is a fall, not a burn
+    same = [r for r in rows
+            if abs(float(r["five_hour_resets_at"]) - resets) <= RESET_TOLERANCE_SECONDS]
+    first = same[0]
+    span = float(last["ts"]) - float(first["ts"])
+    if span < BURN_MIN_SPAN_SECONDS or now - float(last["ts"]) > 2 * SAMPLE_SECONDS:
+        return None
+    rise = float(last["five_hour_pct"]) - float(first["five_hour_pct"])
+    return Burn(pct=float(last["five_hour_pct"]), pct_per_min=rise / span * 60.0,
+                at=float(last["ts"]), resets_at=resets)
+
+
+def burn_sentence(b: Burn, running: Sequence[str]) -> str:
+    """The warning's body: the projection, who is burning, and the brake (issue #878)"""
+    clock = lambda ts: time.strftime("%H:%M", time.localtime(ts))  # noqa: E731
+    who = ", ".join(running) if running else "none right now"
+    return (f"5h window at {b.pct:.0f}%, rising ~{b.pct_per_min:.1f}%/min: dry at "
+            f"~{clock(b.exhausts_at or b.at)}, resets at {clock(b.resets_at)} — turns park "
+            f"~{_duration(b.lead_seconds())}. Running: {who}. Brake: "
+            f"jarvis pause --reason \"5h window burning ~{b.pct_per_min:.1f}%/min\"")
+
+
 # -- 4. the segment sum
 
 

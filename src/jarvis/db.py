@@ -30,10 +30,25 @@ def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10, isolation_level=None)  # autocommit
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    _set_wal(conn)
     conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _set_wal(conn: sqlite3.Connection, deadline_s: float = 10.0) -> None:
+    # Racing first WAL switches on a fresh file fail instantly; busy handler is skipped (issue 805)
+    give_up = time.monotonic() + deadline_s
+    delay = 0.005
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e) or time.monotonic() >= give_up:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.2)
 
 
 @contextmanager

@@ -61,6 +61,11 @@ def os_repo(tmp_path, monkeypatch):
 
 
 def test_pending_is_newest_first_traced_and_coloured(os_repo):
+    central = CentralStore()
+    try:  # an order with no PR is no release row, and no crash (monitoring-orders spec §2)
+        morpheus.create(central, project="jarvis_os", title="disk", prompt="watch the disk")
+    finally:
+        central.close()
     report = ops.release_overview()
     newest, older = report["pending"]
     assert (newest["pr"], newest["rides"], older["pr"], older["rides"]) == (3, 2, 2, 1)

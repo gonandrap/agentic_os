@@ -197,32 +197,21 @@ def test_with_self_dispatch_on_the_steward_files_the_orders_as_os_work(
     assert not store.get_feature_order(improvement_order["id"])["needs_attention"]
 
 
-def test_enforced_with_no_room_the_diagnosis_stands_and_its_orders_drain_later(
+def test_enforced_a_spent_follow_up_ledger_never_holds_a_finding(
         boot, store, improvement_order, central, self_dispatch_on):
-    daemon = boot(evolution={"mode": "enforce", "weekly_usd": 0.0})
+    """wo-5b96c9da: an io finding is a reported bug, on its own ledger"""
+    daemon = boot(evolution={"mode": "enforce", "weekly_usd": 0.0, "order_budget_usd": 10.0})
     submitted(store, improvement_order, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
 
     daemon._neo_drain()
 
     f = finding(store, improvement_order["id"])
-    assert f["status"] == "accepted" and f["orders_held"]
-    assert f["knowledge_id"]
-    assert filed_orders(store) == []
-    [row] = central.steward_decisions()
-    assert (row["origin_kind"], row["outcome"], row["queue_state"]) == (
-        "io_finding", "queue", "waiting")
-    # Decided: the held orders are the steward's to file, not the user's to chase
-    assert store.get_feature_order(improvement_order["id"])["status"] == "completed"
-
-    boot(evolution={"mode": "enforce", "weekly_usd": 30.0, "order_budget_usd": 10.0})
-    assert steward.drain(ops.resolve_catalog(), central)["dispatched"] == 1
-
+    assert f["status"] == "accepted" and "orders_held" not in f
     [wo] = filed_orders(store)
     assert steward.stamp_of(wo)["origin_kind"] == "io_finding"
-    assert wo["budget_usd"] == 10.0
-    f = finding(store, improvement_order["id"])
-    assert "orders_held" not in f and f["created_orders"][0]["id"] == wo["id"]
-    # A second pass finds nothing left to file
+    assert steward.stamp_of(wo)["track"] == "bug"
+    [row] = central.steward_decisions()
+    assert (row["outcome"], row["rule"]) == ("dispatch", "reported-bug")
     assert steward.drain(ops.resolve_catalog(), central)["dispatched"] == 0
 
 

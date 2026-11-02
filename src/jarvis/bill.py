@@ -703,9 +703,8 @@ def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
     try:
         fresh = (for_feature_order(project, path, order) if feature
                  else for_work_order(project, path, order))
-        stale, now = sealed["total"]["tokens"], fresh["total"]["tokens"]
-        shrank = any(now.get(cls, 0) < stale.get(cls, 0)
-                     for cls in (*usage_mod.TOKEN_CLASSES, "total"))
+        stale = sealed["total"]["tokens"]
+        shrank = _shrank(sealed, fresh)
         corrects = _corrects_a_reading(sealed, fresh)
         if shrank and not corrects:
             return None
@@ -723,6 +722,36 @@ def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
     except Exception:  # noqa: BLE001 — an upgrade that fails must not cost the reader
         return None                                        # the bill they already have
     return fresh
+
+
+def _shrank(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
+    stale, now = sealed["total"]["tokens"], fresh["total"]["tokens"]
+    return any(now.get(cls, 0) < stale.get(cls, 0)
+               for cls in (*usage_mod.TOKEN_CLASSES, "total"))
+
+
+def reseal_settled(project: str, path: Path, order: dict[str, Any], *,
+                   feature: bool = False,
+                   index: dict[str, list[Path]] | None = None) -> bool:
+    """Re-derive a seal taken before the order's LAST settlement (#870); True when the bill changed"""
+    from .project_store import ProjectStore
+
+    sealed = unseal(order)
+    try:
+        fresh = (for_feature_order(project, path, order, index=index) if feature
+                 else for_work_order(project, path, order, index=index))
+    except Exception:  # noqa: BLE001 — the old seal stands; the re-stamp below stops the retry
+        fresh = None
+    # Evidence gone (a smaller bill no corrected reading explains): keep the old seal, never a floor
+    keep = fresh is None or (sealed is not None and _shrank(sealed, fresh)
+                             and not _corrects_a_reading(sealed, fresh))
+    store = ProjectStore(path)
+    try:
+        store.seal_bill(order["id"], order["bill_json"] if keep else db.to_json(fresh),
+                        feature=feature)
+    finally:
+        store.close()
+    return not keep
 
 
 def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
