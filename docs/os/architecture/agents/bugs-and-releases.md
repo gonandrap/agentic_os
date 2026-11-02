@@ -9,7 +9,8 @@ tags: [architecture, agents, bugs, releases, diagrams]
 Any agent can file an OS bug with the `report-jarvis-bug` skill (`jarvis bug report`).
 **The priority routes it.** Neo re-assesses a claim of `critical` or `blocker`.
 `--expedite` is a scheduling decision that only the user can make: inside a work order
-(`JARVIS_WO_ID` set) it is ignored.
+(`JARVIS_WO_ID` set) it is ignored. A work order's filing is never left for the user: the
+steward decides it at every priority, and a queued one starts when `steward.drain` finds room.
 
 ```mermaid
 sequenceDiagram
@@ -27,14 +28,16 @@ sequenceDiagram
     opt --expedite (user only)
         I->>D: work order now (expedited, no rating on it yet)
     end
-    alt low / medium / high
+    alt low / medium / high, filed by a work order
+        I->>D: steward.gate(bug_agent) → dispatch now / ask (bug ledger spent) / queue (drain re-offers) / drop
+    else low / medium / high, filed by the user
         Note over GH: waits on the tracker
         U->>D: jarvis issues start {url|#n}
     else critical / blocker
         I->>N: kind=triage
-        alt confirmed (and self_dispatch on)
-            N-->>D: settle_triage → work order created
-        else downgraded / unconfirmed
+        alt confirmed, or a work order's filing downgraded
+            N-->>D: settle_triage → steward.gate at the settled level
+        else the user's filing downgraded / unconfirmed
             N-->>U: inbox: jarvis issues start {url}
         end
     end

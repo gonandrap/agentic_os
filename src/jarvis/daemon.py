@@ -7410,12 +7410,15 @@ class Daemon:
                       f"issue stands at `{out['claimed']}` as a claim; start work on it "
                       f"with `{start}` if you agree with the rating.\n{full}"))
         elif out["outcome"] == "downgraded":
+            # A work order's filing went on to the steward at the settled level (wo-b59a21b1)
+            fate = (f"The steward dispatched it as {out['wo_id']}." if out.get("wo_id")
+                    else f"The steward decided: {out['steward']}." if out.get("steward")
+                    else f"Not dispatched. Start work on it with `{start}`.")
             central.add_inbox(
                 project=q.get("project") or self._os_project() or "os", level="info",
                 title=f"Neo downgraded a `{out['claimed']}` bug to "
                       f"`{out['settled']}`",
-                body=(f"{out['issue_url']}\n{head}\n"
-                      f"Not dispatched. Start work on it with `{start}`.\n{full}"))
+                body=f"{out['issue_url']}\n{head}\n{fate}\n{full}")
 
     def sync_issues(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep the tracker saying what the OS is actually doing (#240)"""

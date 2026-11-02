@@ -271,12 +271,13 @@ def _rubric() -> str:
 
 def _route(url: str, title: str, body: str, priority: str,
            expedite: bool = False,
-           investigation: dict[str, str] | None = None) -> dict[str, Any]:
+           investigation: dict[str, str] | None = None,
+           filed_by: str = "") -> dict[str, Any]:
     """Put the freshly filed issue on the OS's rails"""
     from .issues import route_filing
     try:
         return route_filing(url, title, body, priority, expedite=expedite,
-                            investigation=investigation)
+                            investigation=investigation, filed_by=filed_by)
     except Exception as e:  # noqa: BLE001 — see the docstring: the issue is already filed
         return {"wo_id": "", "backlog_id": "", "project": "", "priority": priority,
                 "reason": f"the OS could not route it ({e}) — it is filed and untracked"}
@@ -287,7 +288,9 @@ def pickup_note(pickup: dict[str, Any]) -> str:
     level = pickup.get("priority") or "?"
     if pickup.get("wo_id"):
         # `expedited` and `confirmed` are different facts about the same work order: one says the user asked...
-        verb = "expedited" if pickup.get("expedited") else "confirmed"
+        verb = ("expedited" if pickup.get("expedited")
+                else "dispatched by the steward" if pickup.get("steward_dispatched")
+                else "confirmed")
         head = (f"`{level}` {verb} — work order {pickup['wo_id']} in "
                 f"{pickup.get('project') or '?'}")
     elif pickup.get("project"):
@@ -326,8 +329,8 @@ def _notify(project: str, title: str, url: str, version: str, wo_id: str,
         central.close()
 
 
-AGENT_EXPEDITE_NOTE = ("--expedite ignored: filed from a work-order session, so the issue "
-                       "is filed only — the user decides whether to start it")
+AGENT_EXPEDITE_NOTE = ("--expedite ignored: filed from a work-order session, so the "
+                       "steward decides whether to start it")
 
 
 def report_bug(*, title: str, description: str, expected: str, actual: str,
@@ -377,7 +380,8 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
     url = create_issue(title, body, repo)
     # Between creating the issue and telling anyone about it (#240)
     pickup = _route(url, title, body, priority, expedite=expedite,
-                    investigation=investigation)
+                    investigation=investigation,
+                    filed_by=os.environ.get("JARVIS_WO_ID", ""))
     _notify(project, title, url, version, wo_id, pickup)
     out = {"url": url, "title": title, "repo": repo, "version": version,
            "project": project, "wo_id": wo_id, "pickup": pickup}

@@ -659,9 +659,70 @@ def self_dispatch_configured() -> bool:
         return False
 
 
+#: Key a triage question's context carries when a WORK ORDER filed the bug (wo-b59a21b1)
+FILED_BY_KEY = "filed_by"
+#: `WORK_ORDER_BRIEF`'s `why` for a bug the steward dispatched
+STEWARD_WHY = """\
+This bug is `{priority}`, reported by work order {filed_by} and started by the steward \
+within the OS's own budget."""
+
+
+def steward_note(decision: Any, wo_id: str, public: bool = False) -> str:
+    """What the steward decided about a filed bug; `public` leaves its spend figures off the tracker"""
+    why = decision.rule if public else f"{decision.rule}: {decision.reason}"
+    if wo_id:
+        return f"the steward dispatched it as {wo_id}"
+    if decision.outcome == "dispatch":
+        return ("the steward would dispatch it, but `os.autonomy.self_dispatch` is off, "
+                "so it waits for the user")
+    if decision.outcome == "queue":
+        return f"the steward queued it ({why}); it starts by itself when the budget has room"
+    if decision.outcome == "ask":
+        return f"the steward asks the user ({why}); its inbox item says how to start it"
+    return f"the steward decided `{decision.outcome}` ({why})"
+
+
+def gate_bug(catalog: Any, spec: Any, payload: dict[str, Any], *, filed_by: str,
+             evidence: str, links: dict[str, Any] | None = None,
+             origin_kind: str = "bug_agent") -> tuple[Any, str]:
+    """The steward's call on a filed bug at `payload['priority']`, and the order it started or ''"""
+    from . import steward
+    from .project_store import ProjectStore
+
+    held = {k: str(payload.get(k) or "") for k in ("issue_url", "title", "body", "priority")}
+    held[FILED_BY_KEY] = filed_by
+    store = ProjectStore(spec.path)
+    try:
+        decision = steward.gate(
+            steward.Candidate(origin_kind, held["priority"], spec.name,
+                              held["title"] or held["issue_url"], evidence=(evidence,),
+                              parent_wo_id=filed_by,
+                              # A filed report is its own sighting (Q3080)
+                              refs=1, payload=held),
+            catalog=catalog, store=store, self_dispatch=self_dispatch(catalog))
+    finally:
+        store.close()
+    wo_id = ""
+    if decision.allowed:
+        wo_id = promote_confirmed(
+            spec, payload, metadata=steward.stamped(links, decision),
+            budget_usd=decision.budget_usd, why=steward_why(held))
+        steward.linked(decision, wo_id)
+    return decision, wo_id
+
+
+def steward_why(held: dict[str, Any]) -> str:
+    """`STEWARD_WHY` for a work order's filing below `critical`; '' keeps `TRIAGED_WHY`"""
+    priority, filed_by = str(held.get("priority") or ""), str(held.get(FILED_BY_KEY) or "")
+    if not filed_by or dispatches(priority):
+        return ""
+    return STEWARD_WHY.format(priority=priority, filed_by=filed_by)
+
+
 def route_filing(issue_url: str, title: str, body: str, priority: str,
                  repo: str | None = None, expedite: bool = False,
-                 investigation: dict[str, str] | None = None) -> dict[str, Any]:
+                 investigation: dict[str, str] | None = None,
+                 filed_by: str = "") -> dict[str, Any]:
     """Everything that happens to a freshly filed bug, before anyone is told about it"""
     from .catalog import CatalogError
     from .central_store import CentralStore
@@ -710,6 +771,28 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
                              f"created ({e}) — start it yourself with "
                              f"`{START_COMMAND.format(url=issue_url)}`")
 
+    # A work order's filing goes to the steward at every level, never to the user (wo-b59a21b1)
+    if filed_by and not dispatches(priority) and not investigation and not expedite:
+        try:
+            decision, out["wo_id"] = gate_bug(
+                catalog, spec, {"issue_url": issue_url, "title": title, "body": body,
+                                "priority": priority},
+                filed_by=filed_by, evidence=f"filed by {filed_by}: {issue_url}")
+        except Exception as e:  # noqa: BLE001 — the issue exists whatever happens here
+            log.exception("steward gate failed for %s", issue_url)
+            out["reason"] = (f"`{priority}` filed by {filed_by}, but the steward could "
+                             f"NOT be asked ({e}); start it with "
+                             f"`{START_COMMAND.format(url=issue_url)}`")
+            return out
+        out["steward_dispatched"] = bool(out["wo_id"])
+        out["reason"] = f"`{priority}` filed by {filed_by} — {steward_note(decision, out['wo_id'])}"
+        try:
+            comment(issue_url, f"Reported by a work order: "
+                               f"{steward_note(decision, out['wo_id'], public=True)}.")
+        except GitHubError as e:
+            out["comment_error"] = str(e)
+        return out
+
     # An investigation's GAP is triaged at ANY level: Neo agreeing plus the steward starts it (#1344)
     if not dispatches(priority) and not investigation:
         if not expedite:
@@ -719,9 +802,13 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
 
     # `expedite` appends to the sentence above; a plain filing has none and writes its own
     try:
+        extra = {**(investigation or {}), **({FILED_BY_KEY: filed_by} if filed_by else {})}
         out["neo_question_id"] = ask_triage(spec.name, issue_url, title, body, priority,
-                                            extra=investigation)
-        if investigation and not expedite:
+                                            extra=extra or None)
+        if filed_by and not investigation and not expedite:
+            out["reason"] = (f"`{priority}` filed by {filed_by} — Neo is re-assessing the "
+                             f"rating; the steward then decides at the level Neo settles on")
+        elif investigation and not expedite:
             out["reason"] = (f"`{priority}` filed by {investigation.get(INVESTIGATION_KEY)} "
                              f"— {INVESTIGATION_PENDING_MARK} if Neo "
                              f"agrees and the steward allows it")
@@ -938,28 +1025,18 @@ def _settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any],
         out["reason"] = f"project {q.get('project')!r} is no longer in the catalog"
         return out
 
-    from . import steward
-    from .project_store import ProjectStore
-
     decision = None
     # The fix order points back at the investigation and the validation it came from (#1344)
     links = {k: payload[k] for k in (INVESTIGATION_KEY, MORPHEUS_ITEM_KEY) if payload.get(k)}
-    if out["outcome"] == "confirmed":
+    filed_by = "" if links else str(payload.get(FILED_BY_KEY) or "")
+    # A work order's filing reaches the steward at the level Neo SETTLED on, downgrades too (Q3080)
+    if out["outcome"] == "confirmed" or (filed_by and out["outcome"] == "downgraded"):
         # The steward's call (spec 2026-10-21 §3.2): Neo's confirmation IS the evidence a...
-
-        store = ProjectStore(spec.path)
-        try:
-            decision = steward.gate(
-                steward.Candidate("investigation" if links else "bug_agent",
-                                  out["settled"], spec.name,
-                                  payload.get("title") or url,
-                                  evidence=(f"neo question {q.get('id')} confirmed",),
-                                  parent_wo_id=str(q.get("wo_id") or ""),
-                                  # A `bug-budget` ask names `jarvis issues start` on it
-                                  payload={"issue_url": url}),
-                catalog=catalog, store=store, self_dispatch=self_dispatch(catalog))
-        finally:
-            store.close()
+        decision, out["wo_id"] = gate_bug(
+            catalog, spec, {**payload, "priority": out["settled"]},
+            filed_by=filed_by or str(q.get("wo_id") or ""), links=links,
+            evidence=f"neo question {q.get('id')} {out['outcome']}",
+            origin_kind="investigation" if links else "bug_agent")
         out["steward"] = f"{decision.outcome}, {decision.rule}: {decision.reason}"
         if decision.outcome == "dispatch" and not decision.allowed:
             out["steward"] += "; os.autonomy.self_dispatch is off"
@@ -968,11 +1045,7 @@ def _settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any],
             out["parked"] = (f"steward `{decision.outcome}` ({decision.rule})"
                              if decision.outcome != "dispatch"
                              else "os.autonomy.self_dispatch is off")
-    if decision is not None and decision.allowed:
-        out["wo_id"] = promote_confirmed(
-            spec, payload, metadata=steward.stamped(links, decision),
-            budget_usd=decision.budget_usd)
-        steward.linked(decision, out["wo_id"])
+    if out["wo_id"]:
         if out["backlog_id"]:
             # Only a question asked BEFORE the backlog item stopped being created can have one
             central = CentralStore()
@@ -995,6 +1068,8 @@ def _settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any],
             claimed, out["settled"],
             f"A work order is on it: `{out['existing_wo_id']}`."
             if out["existing_wo_id"] else
+            f"No work order yet: {steward_note(decision, '', public=True)}."
+            if filed_by and decision is not None else
             f"No work order was created. Start one with "
             f"`{START_COMMAND.format(url=url)}`."))
     except GitHubError as e:
