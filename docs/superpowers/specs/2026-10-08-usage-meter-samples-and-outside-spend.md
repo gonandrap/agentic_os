@@ -396,6 +396,16 @@ minutes), and records `usage_meter_notice_streak` in `os_state` (via
 reads the same streak start says nothing; an `ok` sample clears the key, so the NEXT
 outage notifies again.
 
+**The burn-rate early warning (issue #878).** After each sample, `Daemon.notice_burn_rate`
+projects when the 5h window hits 100% from the rise over the last 10 minutes of `ok`
+readings in the same window (`usage_meter.burn`; under 5 minutes of span or a reading older
+than 2 minutes is no projection, and no projection leaves the state alone). When that lands
+at least `cost.meter_burn_warn_lead_minutes` (default 60) before `resets_at`, one `warning`
+inbox row names the running orders, the park duration and the `jarvis pause` brake; it is
+rewritten in place while it stands and acked once the projection recovers.
+`usage_meter_burn_notice` in `os_state` holds the window's `resets_at`, so a new window is a
+new episode. Admission control that prevents the burn is #846.
+
 **Why `os_state` and not a `pr_poll_warned`-style in-memory set** (daemon.py:588-592): that
 set is reset by a daemon restart, which for the PR poll is also what fixes the condition.
 Here it is not — a rotated token survives restarts, and a daemon in a restart loop would

@@ -598,12 +598,14 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
         plan = _plan_lines(row, share)
         sections += [rest[0], *([plan] if plan else []), history, tree, *rest[1:]]
     else:
-        from . import health
+        from . import health, invariants
 
         # ABSENT when there is no blocker
         blocked = health.blocker(pstore, subject, cfg)
         # ABSENT with no actor for the reason just above
         actor = health.actor(pstore, subject)
+        # A quota or API pause has an owner and a clock: quiet, not wedged (#247)
+        paused = invariants.pause_state(pstore, row)
         sections.append([
             "# The work order",
             f"{row.get('id')} [{row.get('status')}] on "
@@ -611,6 +613,8 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
             f"this session is {_what_it_is(row)}",
             *([f"scheduled_actor: {actor.pass_name} - {actor.why}"] if actor else []),
             *([f"blocked: {BLOCKED_SENTENCES.get(blocked, blocked)}"] if blocked else []),
+            *([f"paused ({paused['reason']}): {paused['note']} — the OS resumes "
+               "it by itself; this is not a stall"] if paused and paused["note"] else []),
             f"title: {row.get('title')}",
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
         ])
@@ -909,6 +913,47 @@ def reassert_health(pstore: Any, project: str, subject: dict[str, Any]) -> dict[
         findings=prior["findings"], detail=prior["detail"])
     log.debug("[%s] re-asserted the last judgement of %s for free", project, subject_id)
     return {"outcome": prior["outcome"], "trigger": health.REASSERT}
+
+
+#: The settled alarm's reason, and the superseded Neo question's answer (issue 855)
+PAUSE_HELD_REASON = "held by jarvis pause"
+
+
+def settle_paused(pstore: Any, neo_store: Any, project: str,
+                  subject: dict[str, Any]) -> list[str]:
+    """Skip the open stall findings on a unit the user's pause holds, ids returned (issue 855)"""
+    from .invariants import true_blockers
+    from .project_store import ALARM_OPEN_STATUSES
+
+    kind, row = subject["kind"], subject["row"]
+    alarms = (pstore.alarms_for_feature(row["id"]) if kind == "feature_order"
+              else [a for a in pstore.alarms_of(row["id"])
+                    if a.get("subject_kind") == "work_order"])
+    settled = []
+    for alarm in alarms:
+        if (alarm.get("source") != "health" or alarm["status"] not in ALARM_OPEN_STATUSES
+                or alarm.get("probe") not in health.PAUSE_MOOT_PROBES):
+            continue
+        pstore.update_alarm(alarm["id"], status="skipped", decided_at=db.now(),
+                            verdict_reason=PAUSE_HELD_REASON)
+        if alarm.get("neo_question_id"):
+            neo_store.supersede(int(alarm["neo_question_id"]), PAUSE_HELD_REASON,
+                                reason=f"{alarm['id']} settled: {PAUSE_HELD_REASON}")
+        settled.append(alarm["id"])
+    carriers = {a["wo_id"] for a in alarms if a["id"] in settled}
+    for wo_id in carriers:
+        # `ops.ack_os_flag`'s rule, on the store already open
+        wo = pstore.get_work_order(wo_id)
+        blockers = true_blockers(pstore, wo)
+        if blockers:
+            if not wo["needs_attention"] or wo.get("attention_reason") != blockers[0]:
+                pstore.flag_attention(wo_id, blockers[0])
+        elif wo["needs_attention"]:
+            pstore.lower_attention(wo_id)
+    if settled:
+        log.info("[%s] %s held by jarvis pause: skipped %s", project, row["id"],
+                 ", ".join(settled))
+    return settled
 
 
 def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
