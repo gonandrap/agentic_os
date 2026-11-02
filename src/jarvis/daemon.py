@@ -303,6 +303,9 @@ def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
         return False
     if not wo.get("pr_url"):
         return False
+    # An order left open by its own merge has nothing left to learn from GitHub (#1506)
+    if str(wo.get("pr_state") or "") == "MERGED":
+        return False
     if recorded is not None and wo["id"] not in recorded:
         return True
     from . import ops

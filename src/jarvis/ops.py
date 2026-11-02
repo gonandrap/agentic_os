@@ -5826,8 +5826,12 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
                                  **({"merge_commit": merge_commit}
                                     if merge_commit else {})})
     mark_backlog_done(wo)
-    notify_completed(store, wo, "its pull request merged")
-    return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
+    status = "completed"
+    if owed := declared_user_action(store, wo["id"]):
+        status = park_user_action(store, wo, owed)
+    else:
+        notify_completed(store, wo, "its pull request merged")
+    return {"wo_id": wo["id"], "status": status, "was": wo["status"],
             "pr_url": wo.get("pr_url"), "merged_at": merged_at,
             "session_stopped": stopped["stopped"]}
 

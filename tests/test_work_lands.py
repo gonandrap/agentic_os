@@ -510,20 +510,42 @@ def test_acking_the_owed_command_lowers_the_flag_and_leaves_the_order_open(
         store.close()
 
 
-def test_a_merge_that_leaves_the_user_a_command_warns_instead_of_informing(
+def test_a_merge_that_leaves_the_user_a_command_parks_instead_of_completing(
         started, project):
-    """The merge route still settles the order, but the owed command is not an `info` row"""
+    """No route completes an order the user still owes a command: the merge parks too"""
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR, needs_user=USER_COMMAND)
+    store = ProjectStore(project)
+    try:
+        result = ops.complete_merged(store, store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+    assert result["status"] == "needs_review"
+    row = _row(project, wo["id"])
+    assert row["status"] == "needs_review"
+    assert row["needs_attention"] == 1
+    assert USER_COMMAND in row["attention_reason"]
+    [note] = _completions(project, wo["id"])
+    assert note["level"] == "warning"
+    assert USER_COMMAND in note["body"]
+
+
+def test_a_parked_order_whose_pull_request_merged_is_never_polled_again(
+        started, project):
+    """Else every tick re-raises the flag the user just acked"""
+    from jarvis import daemon
+
     wo = _order(project, "launcher contract", code="launcher")
     ops.finish(wo["id"], "opened a PR", pr_url=PR, needs_user=USER_COMMAND)
     store = ProjectStore(project)
     try:
         ops.complete_merged(store, store.get_work_order(wo["id"]))
+        row = store.get_work_order(wo["id"])
+        assert row["status"] == "needs_review" and row["pr_state"] == "MERGED"
+        assert daemon.polls_pull_request(store, row) is False
     finally:
         store.close()
-
-    [note] = _completions(project, wo["id"])
-    assert note["level"] == "warning"
-    assert USER_COMMAND in note["body"]
 
 
 def test_an_order_the_os_opened_completes_without_an_inbox_item(started, project):
