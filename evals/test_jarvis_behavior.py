@@ -99,7 +99,7 @@ def test_assumptions_flag_review(fleet):
     d = fleet["daemon"]
     wo = ops.create_work_order("proj_a", "task")
     d.tick()
-    ops.assume(wo["id"], "picked postgres over sqlite")
+    ops.assume(wo["id"], "picked postgres over sqlite (fixture decision)")
     ops.finish(wo["id"], "done, one assumption")
     st = ops.os_status()
     item = [a for a in st["attention"] if a["wo_id"] == wo["id"]]
@@ -111,7 +111,7 @@ def test_review_clears(fleet):
     d = fleet["daemon"]
     wo = ops.create_work_order("proj_a", "task")
     d.tick()
-    ops.assume(wo["id"], "assumed X")
+    ops.assume(wo["id"], "assumed the API is v2")
     ops.finish(wo["id"], "done")
     ops.review_work_order(wo["id"], accept=True)
     st = ops.os_status()
@@ -321,7 +321,7 @@ def test_reject_keeps_attention(fleet):
     d = fleet["daemon"]
     wo = ops.create_work_order("proj_a", "task")
     d.tick()
-    ops.assume(wo["id"], "assumed the wrong thing")
+    ops.assume(wo["id"], "assumed the wrong thing (fixture decision)")
     ops.finish(wo["id"], "done")
     ops.review_work_order(wo["id"], accept=False)
     st = ops.os_status()

@@ -1254,7 +1254,7 @@ def test_a_decision_the_os_took_is_not_credited_to_the_user(started):
 def test_an_escalation_names_every_other_assumption_left_with_you(started):
     """wo-57c7f94b: #1 escalated, #2 held, #3 escalated last — the banner named only #3"""
     wo = ops.create_work_order("proj_a", "three owed")
-    for text in ("one", "two", "three"):
+    for text in ("used CSV for export one", "used CSV for export two", "used CSV for export three"):
         ops.assume(wo["id"], text)
     store = ProjectStore(started.catalog.project("proj_a").path)
     a1, a2, a3 = store.pending_assumptions(wo["id"])
