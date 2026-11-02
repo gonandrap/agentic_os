@@ -954,7 +954,9 @@ def _settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any],
                                   out["settled"], spec.name,
                                   payload.get("title") or url,
                                   evidence=(f"neo question {q.get('id')} confirmed",),
-                                  parent_wo_id=str(q.get("wo_id") or "")),
+                                  parent_wo_id=str(q.get("wo_id") or ""),
+                                  # A `bug-budget` ask names `jarvis issues start` on it
+                                  payload={"issue_url": url}),
                 catalog=catalog, store=store, self_dispatch=self_dispatch(catalog))
         finally:
             store.close()

@@ -663,6 +663,15 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 str(p.get("blocker") or ""))
     if kind == "ci_rerun_recovered":
         return "Cancelled CI no longer holds the pull request", ""
+    # Failed CI, re-run once per head before the worker is asked (#1465)
+    if kind == "ci_flake_rerun_requested":
+        runs = ", ".join(str(i) for i in p.get("run_ids") or [])
+        return ("CI failed — the OS re-ran it once before asking the worker"
+                if runs else "CI failed — the OS found no run to re-run",
+                f"{p.get('checks') or ''}; run {runs}" if runs else
+                str(p.get("error") or p.get("checks") or ""))
+    if kind == "ci_flake_confirmed":
+        return "Failed CI passed on its re-run — a flaky check", str(p.get("checks") or "")
     if kind == "pr_conflict_unresolved":
         return ("Merge conflict the worker could not resolve — over to you",
                 f"{p.get('attempts')} attempts")

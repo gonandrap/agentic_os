@@ -2980,6 +2980,14 @@ class ProjectStore:
         """Has the OS already stopped trying on this episode and said so?"""
         return bool(self._this_episode(wo_id, repair, f"pr_{repair}_unresolved"))
 
+    def pr_repair_held(self, wo_id: str, repair: str) -> bool:
+        """Is the newest ask of this episode answered and its run unchanged since? (#1438)"""
+        held = self._this_episode(wo_id, repair, f"pr_{repair}_held")
+        if not held:
+            return False
+        nudges = self.pr_repair_nudges(wo_id, repair)
+        return not nudges or held[-1]["ts"] > nudges[-1]["ts"]
+
     def pr_closure_told(self, wo_id: str) -> bool:
         """Has the user already been told about THIS closure of the pull request? (#224)"""
         closed = self.events_of_kind(wo_id, "pr_closed")
@@ -4165,6 +4173,42 @@ class ProjectStore:
             "reason": reason,
         })
         return self.get_approval(approval_id)  # type: ignore[return-value]
+
+    def merge_lease(self, kind: str, base_oid: str, wo_id: str) -> dict[str, Any] | None:
+        """Another waiting order's request in flight against this base tip, oldest first (#1459)"""
+        # An escalated request waits on the user, not on a merge: it holds no lease (Neo Q3020)
+        row = self.conn.execute(
+            """SELECT a.* FROM approvals a JOIN work_orders w ON w.id = a.wo_id
+               WHERE a.kind=? AND a.base_oid=? AND a.wo_id<>?
+                 AND w.status='waiting_pr_merge'
+                 AND ((a.status IN ('pending', 'awaiting_case') AND COALESCE(a.escalated, 0)=0)
+                      OR (a.status='approved' AND a.uses < a.max_uses
+                          AND (a.expires_at IS NULL OR a.expires_at >= ?)))
+               ORDER BY a.ts, a.id LIMIT 1""",
+            (kind, base_oid, wo_id, db.now()),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def supersede_grants(self, wo_id: str, kind: str, command: str,
+                         reason: str) -> int:
+        """Expire this order's unspent grants for any OTHER command of this kind (#1459)"""
+        rows = self.conn.execute(
+            """SELECT id, command FROM approvals
+               WHERE wo_id=? AND kind=? AND command<>? AND status='approved'
+                 AND uses < max_uses""",
+            (wo_id, kind, command),
+        ).fetchall()
+        for row in rows:
+            self.conn.execute(
+                """UPDATE approvals SET status='expired', closed_as='superseded',
+                                        expires_at=NULL WHERE id=?""",
+                (row["id"],),
+            )
+            self.add_event(wo_id, "gate_superseded", {
+                "approval_id": row["id"], "kind": kind, "command": row["command"],
+                "reason": reason,
+            })
+        return len(rows)
 
     def usable_grant(self, wo_id: str, kind: str, command: str) -> dict[str, Any] | None:
         """The decided request that lets this exact command through right now, or None"""

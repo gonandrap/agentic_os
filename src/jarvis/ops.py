@@ -817,6 +817,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "items": inbox[:10],
             },
             "backlog": {"open": len(backlog_open)},
+            # Reported bugs and panel follow-ups counted apart (wo-5b96c9da)
+            "steward": steward_track_counts(central),
             "investigations": {"fixes_parked": fixes_parked},
             "neo": neo_counts,
             "gates": {"awaiting_you": len(gate_items),
@@ -826,6 +828,17 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         }
     finally:
         central.close()
+
+
+def steward_track_counts(central: CentralStore) -> dict[str, dict[str, int]]:
+    """`steward.track_counts`, or {} when the decisions table cannot be read"""
+    from . import steward
+
+    try:
+        return steward.track_counts(central)
+    except Exception:  # noqa: BLE001 — the pulse check must not fail over one line
+        log.exception("status: steward counts unreadable")
+        return {}
 
 
 # -- work orders
@@ -2043,14 +2056,24 @@ def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
 
 def ack_decision_blocker(blockers: list[str]) -> str | None:
     """The blocker that makes acking unacceptable, or None — the one extraction of it"""
-    return next((b for b in blockers if "assumption" in b.lower()), None)
+    from .invariants import IDLE_NO_FINISH_BLOCKER
+
+    # An idle park's only exit is the user's action; an ack would hide it from every view (issue 1456)
+    return next((b for b in blockers
+                 if "assumption" in b.lower() or b == IDLE_NO_FINISH_BLOCKER), None)
 
 
 def ack_refusal(wo: dict[str, Any], blockers: list[str]) -> str | None:
     """Why `jarvis wo ack` would be refused on this order, or None if it would be taken"""
+    from .invariants import IDLE_NO_FINISH_BLOCKER
+
     blocker = ack_decision_blocker(blockers)
     if blocker is None:
         return None
+    if blocker == IDLE_NO_FINISH_BLOCKER:
+        return (f"{wo['id']} stopped mid-task and nothing will resume it — acknowledging "
+                f"would hide it. `jarvis wo send {wo['id']} \"…\"` sends it back to work; "
+                f"`jarvis wo done {wo['id']}` closes it.")
     return (f"{wo['id']} is waiting on a decision ({blocker}) — acknowledging would "
             f"bury it. Use `jarvis wo review {wo['id']}` to accept, or `--reject` to "
             f"send it back.")
@@ -2472,6 +2495,19 @@ def fix_flag_notice(flag: str) -> str | None:
     return FIX_FLAG_NOTICES.get(flag)
 
 
+#: Words that carry no decision; `test` is absent on purpose — real assumptions name tests (issue 1097)
+_FILLER_WORDS = frozenset({"probe", "probing", "dummy", "placeholder", "filler",
+                           "foo", "bar", "baz", "lorem", "ipsum", "asdf", "xxx"})
+_PROBE_OPENER = re.compile(r"\s*(?:test(?:ing)?\s+)?prob(?:e|ing)\b", re.IGNORECASE)
+
+
+def content_free_assumption(content: str) -> bool:
+    """True for a body that records no decision — a hook probe, filler (issue 1097)"""
+    words = re.findall(r"[a-z0-9]+", content.lower())
+    if len(set(words)) < 5 or _PROBE_OPENER.match(content):        return True
+    return len(words) < 15 and 3 * sum(w in _FILLER_WORDS for w in words) >= len(words)
+
+
 def assume(wo_id: str, content: str) -> dict[str, Any]:
     """Record an assumption: DB row + ASSUMPTIONS.md append + conditional review flag (#711)"""
     from . import sections
@@ -2487,6 +2523,12 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
             f"alternative you rejected and why. Split it: a second decision is a "
             f"second `jarvis wo assume`, and cite this one in that one by its `#n` "
             f"(e.g. `per assumption #2`). Nothing was recorded.")
+    if content_free_assumption(content):
+        raise OpsError(
+            "that assumption records no decision — state the option you took, the "
+            "alternative you rejected and why. To probe a hook or verb, use the test "
+            "suite or a read-only command such as `jarvis search`, never `jarvis wo "
+            "assume` on your live order. Nothing was recorded.")
     _cited_blocks(name, path, wo, content)
     cited = _section_blocks(path, wo, content)
     store = ProjectStore(path)
@@ -5851,6 +5893,21 @@ PR_UNDECLARED = PrRepair(invariants.PR_UNDECLARED_REPAIR, PR_UNDECLARED_NUDGE,
 PR_REPAIRS = (PR_CONFLICT, PR_CHECKS, PR_UNDECLARED)
 
 
+def red_run_fields(head: str | None, red: tuple[dict[str, str], ...]) -> dict[str, Any]:
+    """A red build's identity: its head and when each red check started; {} when unknowable (#1438)"""
+    if not head or not red or not all(c.get("started_at") for c in red):
+        return {}
+    return {"head_sha": head,
+            "red_runs": sorted(f"{c['name']}@{c['started_at']}" for c in red)}
+
+
+def same_red_run(nudge: dict[str, Any], fields: dict[str, Any]) -> bool:
+    """Is every red check now one that `nudge` already asked about, on the same head?"""
+    last = db.from_json(nudge["payload"], {}) or {}
+    return (bool(fields.get("red_runs")) and last.get("head_sha") == fields["head_sha"]
+            and set(fields["red_runs"]) <= set(last.get("red_runs") or ()))
+
+
 def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
                     **fields: Any) -> dict[str, Any]:
     """GitHub says this pull request is broken: ask the worker to fix it, or give up"""
@@ -5862,6 +5919,16 @@ def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
             store.flag_attention(wo["id"], repair.blocker)
         return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
                 "gave_up": True}
+    # THE WORKER ALREADY ANSWERED THIS VERY RUN without a push: its answer is the user's (#1438)
+    if attempts and same_red_run(store.pr_repair_nudges(wo["id"], repair.name)[-1], fields):
+        if not store.pr_repair_held(wo["id"], repair.name):
+            store.add_event(wo["id"], repair.event("held"),
+                            {"pr_url": wo.get("pr_url"), "attempts": attempts,
+                             "head_sha": fields["head_sha"],
+                             "red_runs": fields["red_runs"]})
+            store.flag_attention(wo["id"], repair.blocker)
+        return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
+                "gave_up": False, "held": True}
     attempt = attempts + 1
     msg_id = store.queue_message(
         wo["id"],
@@ -7429,8 +7496,12 @@ def steward_queue_report(limit: int = 200) -> dict[str, Any]:
         central.close()
     keys = ("id", "ts", "project", "origin_kind", "severity", "subject", "rule", "reason",
             "wo_id", "parent_wo_id", "queue_state", "queue_note", "queue_ts")
-    items = [{k: r[k] for k in keys} for r in rows]
+    items = [{**{k: r[k] for k in keys}, "track": steward.track_of(r["origin_kind"])}
+             for r in rows]
     return {"asks": [{**{k: r[k] for k in keys}, "parent_wo_id": r["parent_wo_id"],
+                      "track": steward.track_of(r["origin_kind"]),
+                      "issue_url": (steward._candidate_of(r).get("payload") or {}).get(
+                          "issue_url", ""),
                       "morpheus_item": (steward._candidate_of(r).get("payload") or {}).get(
                           "morpheus_item", "")} for r in asks],
             "counts": {s: counts.get(s, 0) for s in ("waiting", "reoffered", "expired")},

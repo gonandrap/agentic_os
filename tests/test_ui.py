@@ -14,7 +14,7 @@ from jarvis import gates, ops  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
-from jarvis.invariants import IDLE_NO_FINISH_BLOCKER, check_project  # noqa: E402
+from jarvis.invariants import PR_CLOSED_BLOCKER, check_project  # noqa: E402
 from jarvis.project_store import VALIDATION_CI_CAUSE, ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 
@@ -606,7 +606,7 @@ def test_assumptions_are_numbered_to_match_the_timeline(client, daemon, project)
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
     ops.assume(wo["id"], "assumed the API is v2")
-    ops.assume(wo["id"], "assumed UTF-8 throughout")
+    ops.assume(wo["id"], "assumed UTF-8 throughout (fixture decision)")
     ops.finish(wo["id"], "done-ish")
 
     page = client.get(f"/wo/proj_a/{wo['id']}").text
@@ -767,7 +767,7 @@ def test_wo_show_carries_every_assumption_with_its_number(jarvis_home, fake_clau
     ops.start_os(str(catalog_file), foreground=True)
     wo = ops.create_work_order("proj_a", "risky change")
     ops.assume(wo["id"], "assumed the API is v2")
-    ops.assume(wo["id"], "assumed UTF-8 throughout")
+    ops.assume(wo["id"], "assumed UTF-8 throughout (fixture decision)")
     ops.review_work_order(wo["id"], accept=True)
 
     capsys.readouterr()
@@ -1561,7 +1561,7 @@ def test_mark_done_from_the_work_order_page(client, project):
 def test_mark_done_is_not_offered_while_assumptions_are_pending(client, project):
     """It would accept the assumptions silently"""
     wo = ops.create_work_order("proj_a", "has an open question")
-    ops.assume(wo["id"], "used the sqlite backend")
+    ops.assume(wo["id"], "used the sqlite backend (fixture decision)")
 
     detail = client.get(f"/wo/proj_a/{wo['id']}")
     assert "Mark done" not in detail.text
@@ -1665,7 +1665,7 @@ def test_a_project_whose_only_open_work_needs_review_is_not_an_empty_panel(clien
     for n in range(3):
         wo = ops.create_work_order("proj_a", f"needs a decision {n}")
         daemon.tick()
-        ops.assume(wo["id"], "assumed something")
+        ops.assume(wo["id"], "assumed the API is v2")
         ops.finish(wo["id"], "done-ish")
 
     for url in ("/", "/project/proj_a"):
@@ -1743,8 +1743,9 @@ def test_got_it_button_puts_the_flag_down(client, project):
     """The dashboard complaint in one test: acking has to survive the daemon"""
     wo = ops.create_work_order("proj_a", "noisy task")
     store = ProjectStore(project)
-    store.set_status(wo["id"], "needs_review")
-    store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
+    # An ackable blocker: an idle park refuses the ack (issue 1456)
+    store.set_status(wo["id"], "needs_review", pr_state="CLOSED")
+    store.flag_attention(wo["id"], PR_CLOSED_BLOCKER)
     assert "NEEDS YOU" in client.get("/").text
 
     detail = client.get(f"/wo/proj_a/{wo['id']}")
