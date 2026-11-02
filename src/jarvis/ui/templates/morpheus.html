@@ -1,11 +1,17 @@
 {% extends "base.html" %}
 {% import "_layout.html" as ui %}
 {% import "_morpheus.html" as mv %}
-{% block title %}Morpheus — Jarvis{% endblock %}
-{% block style %}.mv-list td { white-space: nowrap; }{% endblock %}
+{% block title %}Monitoring orders — Jarvis{% endblock %}
+{% block style %}
+  .mv-list td { white-space: nowrap; }
+  .mv-list td.mv-title { white-space: normal; }
+  .mv-list form { margin: 0; }
+  .mv-new { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+  .mv-new textarea { flex: 1 1 20em; min-height: 2.4em; }
+{% endblock %}
 {% block content %}
 
-{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §4.1 #}
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §4.1, 2026-11-01-monitoring-orders.md §6 #}
 {% set act = report.activity %}
 {% set meta -%}
   {% for s, n in report.counts.items() if n %}{{ n }} {{ s }} · {% endfor -%}
@@ -13,53 +19,69 @@
   · {{ act.state }}
   {%- if act.usage_hold_until %} · held until {{ fmt_ts(act.usage_hold_until) }}{% endif %}
 {%- endset %}
-{{ ui.page_head("Morpheus", meta) }}
+{{ ui.page_head("Monitoring orders", meta) }}
 
 {% call(i) ui.needs_you(attention, "failed checks — need you") %}
-  {{ ui.row_id(i.id, "/morpheus/" ~ i.id) }}
-  <a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a>
+  {{ ui.row_id(i.id, "/mo/" ~ i.id) }}
+  {{ mv.subject(i) }}
   <span class="mono {{ mv.tone[i.state] }}">{{ i.state }}</span>
   <span class="sub">{{ (i.resolution or "").split("\n")[0] }}</span>
 {% endcall %}
 
-{{ ui.filter_bar("/morpheus", filters, options, rows | length, total) }}
+<details class="panel">
+  <summary>New monitor</summary>
+  <form method="post" action="/mo/new" class="mv-new">
+    <input type="text" name="project" required placeholder="project" list="mv-projects">
+    <datalist id="mv-projects">{% for p in options.project %}<option value="{{ p }}">{% endfor %}</datalist>
+    <input type="text" name="title" required placeholder="title">
+    <textarea name="prompt" required placeholder="what to watch — a session writes the check"></textarea>
+    <input type="number" name="every_minutes" min="1" placeholder="every N min">
+    <button title="armed by the daemon on its next pass">create</button>
+  </form>
+</details>
+
+{{ ui.filter_bar("/mo", filters, options, rows | length, total) }}
 
 <div class="panel table-wrap">
   <table class="mv-list">
-    <tr><th>id</th><th>project</th><th>PR</th><th>state</th><th>runs</th>
-      <th>next check / deadline</th><th>handed to</th></tr>
+    <tr><th>id</th><th>project</th><th>origin</th><th>title</th><th>state</th><th>every</th>
+      <th>runs</th><th>next check / deadline</th><th>handed to</th><th></th></tr>
     {% for i in rows %}
     <tr id="{{ i.id }}">
-      <td class="mono">{{ ui.row_id(i.id, "/morpheus/" ~ i.id) }}</td>
+      <td class="mono">{{ ui.row_id(i.id, "/mo/" ~ i.id) }}</td>
       <td class="mono">{{ i.project or "—" }}</td>
-      <td class="mono"><a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a></td>
+      <td class="mono">{{ i.origin or "—" }}</td>
+      <td class="mv-title">{{ mv.subject(i) }}</td>
       <td class="mono {{ mv.tone[i.state] }}">{{ i.state }}</td>
+      <td class="mono">{{ mv.every(i) }}</td>
       <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
       <td class="mono">
-        {%- if i.state in ("failed", "timedout", "validated") %}settled
+        {%- if i.state not in ("queued", "monitoring") %}settled
         {%- elif i.next_check_ts %}next {{ fmt_ts(i.next_check_ts) }}
         {%- else %}deadline {{ fmt_ts(i.deadline_ts) }}{% endif %}</td>
       <td class="mono">{{ mv.handoff(i.action) }}</td>
+      <td>{% if i.state in ("queued", "monitoring") %}{{ mv.cancel(i.id, "/mo") }}{% endif %}</td>
     </tr>
     {% else %}
-    <tr><td colspan="7" class="empty">{{ 'nothing matches these filters' if filters else 'nothing queued — a release or a merge fills this' }}</td></tr>
+    <tr><td colspan="10" class="empty">{{ 'nothing matches these filters' if filters else 'nothing watched — a release, a merge or "New monitor" fills this' }}</td></tr>
     {% endfor %}
   </table>
 </div>
 
-{% call ui.explain("session") %}
+{% call ui.explain("how it works") %}
 <p class="kv">
-  Every PR that reached production, in every project, watched until its check exits 0.
-  Morpheus only runs the check and reads the exit code; a PR that fails or times out is
-  handed to an investigation or to Neo, once.
+  Every PR that reached production, in every project, and every monitor a user asked for,
+  watched until its check exits 0. A short fresh session writes each check; the daemon
+  runs it and reads the exit code. A failure or timeout is handed to an investigation or
+  to Neo, once.
 </p>
 <div class="panel">
   <table>
     <tr><th>state</th><td class="mono">
       {% if report.enabled == false %}<span class="tone-warn">disabled (os.morpheus.enabled)</span>
-      {% elif report.pause.override == "paused" %}<span class="tone-warn">paused by <span class="mono">jarvis morpheus pause</span> — checks still run, no session turns</span>{% if report.pause.reason %} · {{ report.pause.reason }}{% endif %}
+      {% elif report.pause.override == "paused" %}<span class="tone-warn">paused by <span class="mono">jarvis morpheus pause</span> — checks still run, no sessions</span>{% if report.pause.reason %} · {{ report.pause.reason }}{% endif %}
       {% elif report.pause.override == "running" %}<span class="tone-ok">running by <span class="mono">jarvis morpheus unpause</span>{% if report.pause.fleet_paused %}, through the fleet pause{% endif %}</span>{% if report.pause.reason %} · {{ report.pause.reason }}{% endif %}
-      {% elif report.paused %}<span class="tone-warn">paused with the fleet — checks still run, no session turns</span>
+      {% elif report.paused %}<span class="tone-warn">paused with the fleet — checks still run, no sessions</span>
       {% else %}<span class="tone-ok">unpaused (follows the fleet)</span>{% endif %}</td></tr>
     {# the state row above is the pause MODE; this one is what Morpheus is doing (issue #1162) #}
     <tr><th>activity</th><td class="mono">{{ act.state }}

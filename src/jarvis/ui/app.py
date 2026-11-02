@@ -2188,9 +2188,17 @@ def create_app() -> FastAPI:
                       attention=[r for r in rows if r["stuck"]], filters=filters,
                       options=options, total=len(every))
 
-    @app.get("/morpheus", response_class=HTMLResponse)
+    @app.get("/morpheus")
+    @app.get("/morpheus/{item_id}")
+    def morpheus_moved(request: Request, item_id: str = ""):
+        """Old links in inbox rows and Telegram (docs/superpowers/specs/2026-11-01-monitoring-orders.md §6)"""
+        query = f"?{request.url.query}" if request.url.query else ""
+        return RedirectResponse(f"/mo/{quote(item_id)}{query}" if item_id else f"/mo{query}",
+                                status_code=301)
+
+    @app.get("/mo", response_class=HTMLResponse)
     def morpheus_page(request: Request):
-        """Shipped PRs watched in production, failures first (spec 2026-10-29 dashboard §4.1)"""
+        """Monitoring orders, failures first (spec 2026-10-29 dashboard §4.1, 2026-11-01-monitoring-orders.md §6)"""
         report = ops.morpheus_report()
         every = report["items"]
         options = {"state": list(report["counts"]), "project": filter_options(every, "project")}
@@ -2207,46 +2215,69 @@ def create_app() -> FastAPI:
                       rows=rows, attention=[i for i in rows if needs_you(i)],
                       filters=filters, options=options, total=len(every))
 
-    @app.get("/morpheus/{item_id}", response_class=HTMLResponse)
+    @app.get("/mo/{item_id}", response_class=HTMLResponse)
     def morpheus_item_page(request: Request, item_id: str):
-        """One watched PR: its runs, retries, Neo questions and handoff (spec 2026-10-29 dashboard §4.2)"""
+        """One monitoring order: runs, retries, Neo questions, handoff, cost (spec 2026-10-29 dashboard §4.2)"""
         try:
             detail = ops.morpheus_detail(item_id)
         except ops.OpsError as e:
             return render(request, "error.html", active="morpheus", message=str(e),
                           status_code=404)
+        # 2026-11-01-monitoring-orders.md §7 adds it; until then there is no cost line
+        for_mo = getattr(bill, "for_monitoring_order", None)
+        cost = for_mo(item_id)["total"] if for_mo else None
         return render(request, "morpheus_item.html", active="morpheus", d=detail,
-                      item=detail["item"], back=f"/morpheus/{item_id}")
+                      item=detail["item"], cost=cost, back=f"/mo/{item_id}")
 
-    @app.post("/morpheus/{item_id}/waive")
+    @app.post("/mo/new")
+    def mo_create(project: str = Form(""), title: str = Form(""), prompt: str = Form(""),
+                  every_minutes: str = Form("")):
+        """A monitoring order watching no PR, armed by the daemon's next pass"""
+        try:
+            every = int(every_minutes) if every_minutes.strip() else None
+            item = ops.mo_create(project.strip(), title, prompt=prompt, every_minutes=every)
+        except (ops.OpsError, ValueError) as e:
+            return RedirectResponse(_same_site_back("/mo", "/mo", str(e)), status_code=303)
+        return RedirectResponse(f"/mo/{item['id']}", status_code=303)
+
+    @app.post("/mo/{item_id}/cancel")
+    def mo_cancel(item_id: str, next: str = Form("")):
+        """Stop watching an open order; it is never judged"""
+        try:
+            ops.mo_cancel(item_id)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/mo", str(e)), status_code=303)
+        return RedirectResponse(_same_site_back(next, "/mo"), status_code=303)
+
+    @app.post("/mo/{item_id}/waive")
     def morpheus_waive(item_id: str, reason: str = Form(""), next: str = Form("")):
         """The user rules a shipped PR working in production"""
         try:
             ops.morpheus_waive(item_id, reason)
         except ops.OpsError as e:
-            return RedirectResponse(_same_site_back(next, "/morpheus", str(e)),
+            return RedirectResponse(_same_site_back(next, "/mo", str(e)),
                                     status_code=303)
-        return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
+        return RedirectResponse(_same_site_back(next, "/mo"), status_code=303)
 
-    @app.post("/morpheus/{item_id}/requeue")
+    @app.post("/mo/{item_id}/requeue")
     def morpheus_requeue(item_id: str, next: str = Form("")):
         """Run a shipped PR's production check again, with a fresh deadline"""
         try:
             ops.morpheus_requeue(item_id)
         except ops.OpsError as e:
-            return RedirectResponse(_same_site_back(next, "/morpheus", str(e)),
+            return RedirectResponse(_same_site_back(next, "/mo", str(e)),
                                     status_code=303)
-        return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
+        return RedirectResponse(_same_site_back(next, "/mo"), status_code=303)
 
-    @app.post("/morpheus/{item_id}/confirm")
+    @app.post("/mo/{item_id}/confirm")
     def morpheus_confirm(item_id: str, fix: str = Form(""), next: str = Form("")):
         """The user rules a failed check real and files its fix order"""
         try:
             ops.morpheus_confirm(item_id, fix)
         except ops.OpsError as e:
-            return RedirectResponse(_same_site_back(next, "/morpheus", str(e)),
+            return RedirectResponse(_same_site_back(next, "/mo", str(e)),
                                     status_code=303)
-        return RedirectResponse(_same_site_back(next, "/morpheus"), status_code=303)
+        return RedirectResponse(_same_site_back(next, "/mo"), status_code=303)
 
     @app.get("/release", response_class=HTMLResponse)
     def release_page(request: Request):

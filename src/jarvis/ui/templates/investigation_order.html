@@ -112,7 +112,7 @@
 <div class="panel">
   {% if c.validation %}
   <div class="row"><div class="grow">validation
-    <a href="/morpheus/{{ c.validation.id }}">{{ c.validation.id }}</a>
+    <a href="/mo/{{ c.validation.id }}">{{ c.validation.id }}</a>
     (PR #{{ c.validation.pr_number }})</div></div>
   {% endif %}
   <div class="row"><div class="grow">this investigation
@@ -129,7 +129,7 @@
   <div class="row"><div class="grow">
     {% if c.fix.production %}in production: PR #{{ c.fix.production.pr_number }}
       {% if c.fix.production.release_tag %}in {{ c.fix.production.release_tag }}{% endif %}
-      · its own validation <a href="/morpheus/{{ c.fix.production.item }}">{{ c.fix.production.item }}</a>
+      · its own validation <a href="/mo/{{ c.fix.production.item }}">{{ c.fix.production.item }}</a>
       {{ c.fix.production.state }}
     {% else %}not in production yet{% endif %}
   </div></div>
