@@ -656,6 +656,8 @@ DEFAULT_COST_METER_OUTSIDE_ROWS = 10
 DEFAULT_COST_METER_OUTSIDE_ALERT_SHARE = 0.25
 DEFAULT_COST_METER_RESIDUAL_ALERT_SHARE = 0.25
 DEFAULT_COST_METER_ALERT_MIN_USD = 5.0
+#: Warn when the 5h window's projected exhaustion lands this long before its reset (issue #878)
+DEFAULT_COST_METER_BURN_WARN_LEAD_MINUTES = 60
 
 
 @dataclass
@@ -681,6 +683,7 @@ class CostConfig:
     meter_outside_alert_share: float = DEFAULT_COST_METER_OUTSIDE_ALERT_SHARE
     meter_residual_alert_share: float = DEFAULT_COST_METER_RESIDUAL_ALERT_SHARE
     meter_alert_min_usd: float = DEFAULT_COST_METER_ALERT_MIN_USD
+    meter_burn_warn_lead_minutes: int = DEFAULT_COST_METER_BURN_WARN_LEAD_MINUTES
 
 
 #: The legal observability levels and the shipped default, as LITERALS (docs/superpowers/specs/2026-09-24-order-observability.md §10.)
@@ -1707,6 +1710,8 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
                                                  base.meter_residual_alert_share)),
         meter_alert_min_usd=float(raw.get("meter_alert_min_usd",
                                           base.meter_alert_min_usd)),
+        meter_burn_warn_lead_minutes=int(raw.get("meter_burn_warn_lead_minutes",
+                                                 base.meter_burn_warn_lead_minutes)),
     )
     if not 0 <= cfg.week_reset_weekday <= 6:
         raise _err(f"{where}.week_reset_weekday must be 0..6 (0 = Monday) — "
@@ -1750,6 +1755,9 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
     if cfg.meter_alert_min_usd < 0:
         raise _err(f"{where}.meter_alert_min_usd must be >= 0 — "
                    f"{cfg.meter_alert_min_usd} is not an amount of money")
+    if cfg.meter_burn_warn_lead_minutes < 1:
+        raise _err(f"{where}.meter_burn_warn_lead_minutes must be >= 1 — zero would warn "
+                   f"about a window that runs dry a minute before it resets anyway")
     try:
         zoneinfo.ZoneInfo(cfg.week_reset_zone)
     except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
