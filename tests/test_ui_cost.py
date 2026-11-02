@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -83,21 +84,61 @@ def give_session(project, wo_id: str, session_id: str) -> None:
         store.close()
 
 
-def test_a_fresh_app_renders_both_current_windows_without_the_computing_state(
-        client, project, transcript):
-    """Round one is `lifespan`'s, so the FIRST request after a restart has it (kn-79da1c34)"""
+def test_a_restart_serves_at_once_and_renders_both_windows_from_the_snapshot(
+        client, project, transcript, monkeypatch):
+    """Round one never blocks startup; the last round's snapshot keeps /cost warm (issue 1495, kn-79da1c34)"""
+    import threading
+
+    from jarvis.ui import app as ui_app
+
     wo = ops.create_work_order("proj_a", "an ask")
     transcript("sess-fresh", write_tok=1_000, out=100)
     give_session(project, wo["id"], "sess-fresh")
     add_recorded_turn(project, wo["id"], 0.0, 1_000)
 
     # `with` is what runs the lifespan, which is what the released service does
-    with TestClient(create_app(), follow_redirects=False) as fresh:
-        for url in ("/cost", "/cost?window=5h"):
-            page = fresh.get(url)
-            assert page.status_code == 200, url
-            assert "What the work cost — computing" not in page.text, url
-            assert "not a bill" in page.text, url
+    with TestClient(create_app(), follow_redirects=False) as first:
+        assert _wait_for(lambda: ui_app.cost_snapshot_path().exists()
+                         and len(first.app.state.cost_cache.entries) == 2)
+
+    # The restart's round one hangs: nothing below may wait for it
+    release = threading.Event()
+    real = ui_app._cost_payloads
+    monkeypatch.setattr(ui_app, "_cost_payloads",
+                        lambda picked, project: (release.wait(30), real(picked, project))[1])
+    try:
+        began = time.monotonic()
+        with TestClient(create_app(), follow_redirects=False) as fresh:
+            assert fresh.get("/").status_code == 200
+            assert time.monotonic() - began < 5
+            for url in ("/cost", "/cost?window=5h"):
+                page = fresh.get(url)
+                assert page.status_code == 200, url
+                assert "What the work cost — computing" not in page.text, url
+                assert "not a bill" in page.text, url
+            release.set()
+    finally:
+        release.set()
+
+
+def test_a_cold_boot_with_no_snapshot_still_serves_and_shows_computing(
+        client, project, monkeypatch):
+    import threading
+
+    from jarvis.ui import app as ui_app
+
+    release = threading.Event()
+    monkeypatch.setattr(ui_app, "_cost_payloads",
+                        lambda picked, project: (release.wait(30), {})[1])
+    try:
+        began = time.monotonic()
+        with TestClient(create_app(), follow_redirects=False) as fresh:
+            assert fresh.get("/").status_code == 200
+            assert time.monotonic() - began < 5
+            assert "What the work cost — computing" in fresh.get("/cost").text
+            release.set()
+    finally:
+        release.set()
 
 
 def test_shutdown_waits_out_a_detached_cost_compute(monkeypatch):
