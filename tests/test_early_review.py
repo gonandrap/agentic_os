@@ -316,7 +316,7 @@ def test_an_early_high_stakes_hold_does_not_read_as_a_user_ask(started, catalog_
                        catalog_path=str(catalog_file))
     store, wo = running(started, assumptions=(
         "used the live production credentials in the smoke test",))
-    store.create_turn(wo["id"], "dispatch", "go")
+    turn = store.create_turn(wo["id"], "dispatch", "go")
 
     ask(started, store)
 
@@ -328,6 +328,28 @@ def test_an_early_high_stakes_hold_does_not_read_as_a_user_ask(started, catalog_
     wait = ops.waiting_on(store, store.get_work_order(wo["id"]))
     assert wait["what"] == "turn_running"
     assert wait["detail"].endswith("; 1 assumption(s) go to review on delivery")
+
+    # Delivery: the turn ends, the order reaches needs_review, the settle pass runs
+    store.finish_turn(turn["id"], "done", result="done")
+    store.set_status(wo["id"], "needs_review")
+    ask(started, store)
+
+    first, second = events(store, wo["id"], "autoreview_held")
+    assert first["early"] is True and "early" not in second
+    label, _ = timeline._describe("autoreview_held", second)
+    assert label == "The OS would not decide assumption #1"
+    wait = ops.waiting_on(store, store.get_work_order(wo["id"]))
+    assert wait["what"] == "assumptions" and "await your review" in wait["detail"]
+
+
+def test_a_live_turn_does_not_defer_assumptions_the_user_reviews(started):
+    """No auto-review on disk: neo_reviews_later is false, so they stay the user's"""
+    store, wo = running(started, auto_review=False)
+    store.create_turn(wo["id"], "dispatch", "go")
+
+    wait = ops.waiting_on(store, store.get_work_order(wo["id"]))
+
+    assert wait["what"] == "assumptions" and "await your review" in wait["detail"]
 
 
 def test_the_early_pass_never_touches_a_confirmation_link(started):
