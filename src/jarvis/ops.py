@@ -5870,6 +5870,21 @@ PR_UNDECLARED = PrRepair(invariants.PR_UNDECLARED_REPAIR, PR_UNDECLARED_NUDGE,
 PR_REPAIRS = (PR_CONFLICT, PR_CHECKS, PR_UNDECLARED)
 
 
+def red_run_fields(head: str | None, red: tuple[dict[str, str], ...]) -> dict[str, Any]:
+    """A red build's identity: its head and when each red check started; {} when unknowable (#1438)"""
+    if not head or not red or not all(c.get("started_at") for c in red):
+        return {}
+    return {"head_sha": head,
+            "red_runs": sorted(f"{c['name']}@{c['started_at']}" for c in red)}
+
+
+def same_red_run(nudge: dict[str, Any], fields: dict[str, Any]) -> bool:
+    """Is every red check now one that `nudge` already asked about, on the same head?"""
+    last = db.from_json(nudge["payload"], {}) or {}
+    return (bool(fields.get("red_runs")) and last.get("head_sha") == fields["head_sha"]
+            and set(fields["red_runs"]) <= set(last.get("red_runs") or ()))
+
+
 def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
                     **fields: Any) -> dict[str, Any]:
     """GitHub says this pull request is broken: ask the worker to fix it, or give up"""
@@ -5881,6 +5896,16 @@ def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
             store.flag_attention(wo["id"], repair.blocker)
         return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
                 "gave_up": True}
+    # THE WORKER ALREADY ANSWERED THIS VERY RUN without a push: its answer is the user's (#1438)
+    if attempts and same_red_run(store.pr_repair_nudges(wo["id"], repair.name)[-1], fields):
+        if not store.pr_repair_held(wo["id"], repair.name):
+            store.add_event(wo["id"], repair.event("held"),
+                            {"pr_url": wo.get("pr_url"), "attempts": attempts,
+                             "head_sha": fields["head_sha"],
+                             "red_runs": fields["red_runs"]})
+            store.flag_attention(wo["id"], repair.blocker)
+        return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
+                "gave_up": False, "held": True}
     attempt = attempts + 1
     msg_id = store.queue_message(
         wo["id"],

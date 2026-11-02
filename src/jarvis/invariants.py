@@ -793,7 +793,9 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # A PULL REQUEST THE OS TRIED TO REPAIR AND COULD NOT — conflicts, a red build, or both
     if wo["status"] in PR_REPAIR_STATUSES:
         for repair, blocker in PR_REPAIR_BLOCKERS:
-            if store.pr_repair_attempts(wo["id"], repair) >= PR_REPAIR_MAX_ATTEMPTS:
+            n = store.pr_repair_attempts(wo["id"], repair)
+            # ...or held it: the worker answered and the red run never changed (#1438)
+            if n >= PR_REPAIR_MAX_ATTEMPTS or (n and store.pr_repair_held(wo["id"], repair)):
                 blockers.append(blocker)
     # CANCELLED CI THE OS'S ONE RE-RUN DID NOT CLEAR — the column keeps the green path free of reads (#1123)
     ci_stuck = ci_checks_stuck(store, wo)

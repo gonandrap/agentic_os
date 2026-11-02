@@ -5706,7 +5706,8 @@ class Daemon:
                             failing=", ".join(pr.failing),
                             # BEHIND rides along with a nudge that was going out anyway and never causes one: spec §5
                             behind=(ops.PR_BEHIND_NOTE.format(
-                                base=pr.base_ref or "its base") if pr.behind else ""))
+                                base=pr.base_ref or "its base") if pr.behind else ""),
+                            **ops.red_run_fields(pr.head_oid, pr.red))
                     self.auto_merge(project, store, wo, pr, record_only=True,
                                     base_red=base_red)
                 else:
@@ -7374,6 +7375,9 @@ class Daemon:
         if out["gave_up"]:
             log.info("[%s] %s still %s after %s attempts — %s needs the user",
                      project.name, wo["pr_url"], what, out["attempts"], wo["id"])
+        elif out.get("held"):
+            log.debug("[%s] %s %s on the run already asked about — %s waits on the user",
+                      project.name, wo["pr_url"], what, wo["id"])
         else:
             log.info("[%s] %s %s — asking %s to fix it (attempt %s)",
                      project.name, wo["pr_url"], what, wo["id"], out["attempts"])
