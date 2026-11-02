@@ -100,6 +100,8 @@
         {{ ui.row_id(wo.id, '/wo/' ~ wo.project ~ '/' ~ wo.id) }}
         {{ wo.title }}
         <span class="sub">· {{ wo.project }}</span>
+        {# Running and owing the user a decision are both true at once (#245) #}
+        {% if wo.needs_attention and wo.attention_reason %}<div class="sub tone-warn">◭ {{ wo.attention_reason }}</div>{% endif %}
         {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
           <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
         {% endif %}

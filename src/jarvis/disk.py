@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,11 @@ REGENERABLE_NAMES = frozenset({
 
 #: …and the files those tools drop beside the sources
 REGENERABLE_SUFFIXES = (".pyc", ".pyo", ".egg-info")
+
+
+def pytest_temproot(wo_id: str) -> Path:
+    """The order's own PYTEST_DEBUG_TEMPROOT, so a sibling's pytest never garbage-collects its tmp_path (#723)"""
+    return Path(tempfile.gettempdir()) / "jarvis-pytest" / wo_id
 
 
 def make_dirs_writable(worktree: Path) -> int:
@@ -153,6 +159,7 @@ def _reclaim_one(project_path: Path,
                                       str(path))
     if out is None:
         return None, f"git would not remove it: {' '.join(stderr.split())[:200]}"
+    shutil.rmtree(pytest_temproot(str(row["id"])), ignore_errors=True)
     return {"worktree": name, "removed": True, "branch": authored.branch,
             "commits": authored.commits}, ""
 

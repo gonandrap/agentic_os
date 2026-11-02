@@ -183,3 +183,29 @@ saves are capped at the reads actually observed. What it leaves in: the compacti
 whole cost, at list prices, every time.
 
 Dollars are Anthropic list prices — a common unit, not an invoice (`usage.py`).
+
+## 6. Before the cache expires (issue #1179)
+
+A parked order compacted at the cold boundary pays 1.0x for the read; compacted while
+warm it pays 0.1x (probe 2026-10-22: $0.0084 warm vs ~$0.053 cold). `Daemon.compact_parked`
+calls `worker_session.warm_compaction_due` every tick and fires `worker_session.compact`
+when the last turn ended normally, nothing is queued or running, the context is KNOWN
+and over `os.compact_min_context`, and its age is in `[ttl − 75s, ttl − 30s)` — the TTL
+of the arm that turn bought, so 225s on 5m and 58m45s on 1h. Past `ttl − 30s` it does
+nothing: the cold path in §3 stays the fallback.
+
+**Which statuses (Q2882).** Warm costs ~0.1C + summary output whether or not another
+turn comes; the cold path costs C + output only if one does. Break-even P(another turn)
+is ~36% at the 100k floor, ~21% at 300k. Measured on jarvis_os (done turns ≥100k, no
+next turn before ended + 225s):
+
+| status at that moment | n | P(another turn) |
+|---|---|---|
+| needs_review | 371 | 58% |
+| waiting_pr_merge | 132 | 31% |
+| completed | 111 | 4% |
+| validating | 108 | 51% |
+| waiting_input | 6 | 100% |
+
+Armed: `needs_review`, `validating`, `waiting_input` (`WARM_COMPACT_STATUSES`).
+`waiting_pr_merge` is left out until a measurement says otherwise.

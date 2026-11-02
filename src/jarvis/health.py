@@ -143,6 +143,28 @@ def _children_blocker(pstore: Any, row: dict[str, Any], cfg: Any) -> str | None:
     return None
 
 
+#: The probes whose premise a user's pause answers: the stillness has an owner (issue 855)
+PAUSE_MOOT_PROBES = ("no-progress", "waiting-on-nobody")
+
+
+def paused(pstore: Any, subject: dict[str, Any], pause: Any) -> bool:
+    """Is this unit standing still only because `jarvis pause` holds it? (issue 855)"""
+    from .project_store import TERMINAL_STATUSES
+
+    if pause is None:
+        return False
+    row = subject["row"]
+    if subject["kind"] == "feature_order":
+        if pause.allows(row["id"]):
+            return False
+        open_children = [c for c in pstore.feature_children(row["id"], kinds=WORKER_CHILDREN)
+                         if c.get("status") not in TERMINAL_STATUSES]
+        return not any(c.get("status") == "running" or pause.allows(c["id"])
+                       for c in open_children)
+    # A turn already running is not stopped by the brake, so it is still watched
+    return row.get("status") != "running" and not pause.allows(row["id"])
+
+
 def due(review: dict[str, Any] | None, current: str, cfg: Any, now: float,
         created: float, last_attempt: float | None = None,
         blocker: str | None = None) -> str | None:
