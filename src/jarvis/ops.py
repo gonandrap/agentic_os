@@ -7458,7 +7458,22 @@ def steward_dispatchers() -> dict[str, Any]:
 
     return {"panel": reoffer_panel_follow_up, "worker_io": reoffer_improvement_order,
             "remedy": remedies.reoffer_file_work_order, "neo_rider": reoffer_neo_cleanup,
-            "io_finding": reoffer_io_finding}
+            "io_finding": reoffer_io_finding, "bug_agent": reoffer_bug_filing}
+
+
+def reoffer_bug_filing(row: Mapping[str, Any], candidate: Any, decision: Any) -> str:
+    """Start a filed bug's queued fix the steward now has room for (`steward.drain`, wo-b59a21b1)"""
+    from . import issues, steward
+
+    held = dict(candidate.payload or {})
+    spec = _spec_or_none(candidate.project)
+    if spec is None:
+        raise OpsError(f"project {candidate.project!r} is not in the catalog")
+    if not held.get("issue_url"):
+        raise OpsError("the queued decision kept no issue url")
+    return issues.promote_confirmed(
+        spec, held, metadata=steward.stamped({}, decision), budget_usd=decision.budget_usd,
+        why=issues.steward_why(held))
 
 
 def list_improvement_orders(project_name: str | None = None,

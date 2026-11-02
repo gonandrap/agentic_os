@@ -96,15 +96,24 @@ def test_scraps_of_room_queue_instead_of_dispatching_a_doomed_order():
 
 
 def test_a_medium_needs_recurrence_a_major_needs_less():
-    assert outcome(cand(severity="medium", refs=2)) == ("queue", "recurrence")
-    assert outcome(cand(severity="medium", refs=3)) == ("dispatch", "medium")
-    assert outcome(cand(severity="major", refs=1)) == ("dispatch", "major")
-    assert outcome(cand(severity="major", refs=0)) == ("queue", "recurrence")
+    # A panel finding: a filed bug report is its own sighting (Q3080)
+    assert outcome(cand(origin_kind="panel", severity="medium", refs=2)) == (
+        "queue", "recurrence")
+    assert outcome(cand(origin_kind="panel", severity="medium", refs=3)) == (
+        "dispatch", "medium")
+    assert outcome(cand(origin_kind="panel", severity="major", refs=1)) == (
+        "dispatch", "major")
+    assert outcome(cand(origin_kind="panel", severity="major", refs=0)) == (
+        "queue", "recurrence")
+
+
+def test_a_filed_bug_report_is_one_sighting_enough():
+    assert outcome(cand(severity="medium", refs=1)) == ("dispatch", "medium")
 
 
 def test_a_neo_cleanup_is_one_sighting_enough_a_panel_medium_is_not():
     """Neo raises a cleanup once, in one verdict: its own threshold, not `medium_min_refs`"""
-    assert CFG.min_refs_by_kind == {"neo_rider": 1}
+    assert CFG.min_refs_by_kind == {"neo_rider": 1, "bug_agent": 1}
     assert outcome(cand(origin_kind="neo_rider", severity="medium")) == ("dispatch",
                                                                          "medium")
     assert outcome(cand(origin_kind="neo_rider", severity="medium", refs=0)) == (
@@ -156,9 +165,9 @@ def test_a_per_kind_threshold_merges_over_the_default_and_can_raise_it_back():
     def parse(raw, projects=()):
         return parse_catalog({"os": {"evolution": raw}, "projects": list(projects)})
     assert parse({"min_refs_by_kind": {"panel": 2}}).os.evolution.min_refs_by_kind == {
-        "neo_rider": 1, "panel": 2}
+        "neo_rider": 1, "bug_agent": 1, "panel": 2}
     assert parse({"min_refs_by_kind": {"neo_rider": 3}}).os.evolution.min_refs_by_kind == {
-        "neo_rider": 3}
+        "neo_rider": 3, "bug_agent": 1}
 
 
 @pytest.mark.parametrize("bad", [{"mode": "loud"}, {"weekly_usd": -1},

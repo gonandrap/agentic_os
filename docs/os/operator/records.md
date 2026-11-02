@@ -23,7 +23,7 @@ TRACKER ISSUES THE FLEET KEEPS RUNNING INTO, most-referenced first. A validation
 
 ## `jarvis issues start <issue-url|`
 
-number>    # open a work order ON a tracker issue. THE ROUTE A BUG THAT WAS NOT DISPATCHED TAKES: `jarvis bug report` files the issue and nothing else — no backlog item, because GitHub issues replaced the backlog and the user stopped reading it. So a `low`/`medium` /`high` filing, and a `critical` Neo downgraded or could not settle, all wait on the TRACKER, and this is what picks one up. Hands back the existing work order if one is already live on that issue. `--project` when the issue is not on the OS's own tracker.
+number>    # open a work order ON a tracker issue. THE ROUTE A BUG THAT WAS NOT DISPATCHED TAKES: `jarvis bug report` files the issue and nothing else — no backlog item, because GitHub issues replaced the backlog and the user stopped reading it. So the USER's `low`/`medium` /`high` filing, and a `critical` Neo downgraded or could not settle, all wait on the TRACKER (a work order's filing goes to the steward instead), and this is what picks one up. Hands back the existing work order if one is already live on that issue. `--project` when the issue is not on the OS's own tracker.
 
 ## `jarvis inbox / jarvis inbox ack [id]`
 
@@ -51,7 +51,7 @@ same for the knowledge base: retire a superseded entry so it stops reaching work
 
 ## `jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority>`
 
-a bug in the OS itself -> GitHub issue on the (PUBLIC) tracker + Telegram ping. Every agent has the report-jarvis-bug skill. FILING IS ALL IT DOES BY DEFAULT: whatever the --priority, the issue waits on the tracker for `jarvis issues start`. Neo re-assesses a critical/blocker CLAIM and settles the `priority:` label; it dispatches nothing and no release is cut on landing — releases go out via the user's shipit. The OS creates orders nobody typed only with `os.autonomy.self_dispatch: true` (ships off). --expedite is the USER's: from an interactive session it files AND dispatches a work order at once; from a work-order session (an agent) it is ignored with a note. A picked-up issue is labelled `in progress` and closes ITSELF once the code lands, so never close one by hand.
+a bug in the OS itself -> GitHub issue on the (PUBLIC) tracker + Telegram ping. Every agent has the report-jarvis-bug skill. FROM A WORK ORDER (`JARVIS_WO_ID` set) the filing goes to the steward at every priority — dispatched now, queued until the budget has room (`steward.drain` re-offers it), or dropped (`low` is minor) — and the inbox line and a tracker comment say which; never "for the user to pick up". FROM THE USER, filing is all it does: the issue waits on the tracker for `jarvis issues start`. Neo re-assesses a critical/blocker CLAIM and settles the `priority:` label before the steward decides; releases go out via the user's shipit. The OS creates orders nobody typed only with `os.autonomy.self_dispatch: true` (ships off). --expedite is the USER's: from an interactive session it files AND dispatches a work order at once; from a work-order session (an agent) it is ignored with a note. A picked-up issue is labelled `in progress` and closes ITSELF once the code lands, so never close one by hand.
 
 ## `jarvis config wiring [project]`
 
