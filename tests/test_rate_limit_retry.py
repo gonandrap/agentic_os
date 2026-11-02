@@ -684,6 +684,15 @@ def test_an_exhausted_work_order_still_takes_a_message(started, fake_claude, pro
 #: wo-5b96c9da turn 2, verbatim
 WORKER_SAID = "Your usage limit was reached, so this work order stopped partway."
 
+NOW = testing.TEST_EPOCH
+
+
+@pytest.fixture()
+def meter_home(jarvis_home, monkeypatch):
+    """The meter is read against the clock, so the clock is pinned"""
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    return jarvis_home
+
 
 def _meter(*, pct: float, resets_at: float, extra: dict | None = None) -> None:
     from jarvis import usage_meter
@@ -692,7 +701,7 @@ def _meter(*, pct: float, resets_at: float, extra: dict | None = None) -> None:
     central = CentralStore()
     try:
         usage_meter.record(central, usage_meter.Sample(
-            ts=time.time(), five_hour_pct=pct, five_hour_resets_at=resets_at,
+            ts=NOW, five_hour_pct=pct, five_hour_resets_at=resets_at,
             seven_day_pct=40.0, seven_day_resets_at=resets_at + 86_400,
             extra=extra or {}))
         central.conn.commit()
@@ -706,9 +715,9 @@ def _worker_stops(store, reply=WORKER_SAID):
         store, turn, claude_cli.TurnResult(ok=True, result=reply))
 
 
-def test_a_reported_limit_the_meter_confirms_is_the_same_pause(jarvis_home, store):
+def test_a_reported_limit_the_meter_confirms_is_the_same_pause(meter_home, store):
     """The reset comes off the meter, never the prose"""
-    reset = time.time() + 2 * 3600
+    reset = NOW + 2 * 3600
     _meter(pct=100.0, resets_at=reset)
 
     turn = _worker_stops(store)
@@ -721,8 +730,8 @@ def test_a_reported_limit_the_meter_confirms_is_the_same_pause(jarvis_home, stor
     assert db.from_json(event["payload"], {})["source"] == "worker_report"
 
 
-def test_a_spent_per_model_window_counts_and_the_latest_reset_wins(jarvis_home, store):
-    reset = time.time() + 3600
+def test_a_spent_per_model_window_counts_and_the_latest_reset_wins(meter_home, store):
+    reset = NOW + 3600
     later = reset + 5 * 3600
     _meter(pct=100.0, resets_at=reset,
            extra={"seven_day_opus": {"utilization": 100.0, "resets_at": later}})
@@ -736,19 +745,19 @@ def test_a_spent_per_model_window_counts_and_the_latest_reset_wins(jarvis_home, 
     (100.0, "Done with step one; stopping here for your input."),  # no claim
     (97.0, WORKER_SAID),                                             # the meter disagrees
 ])
-def test_a_claim_or_a_meter_alone_arms_nothing(jarvis_home, store, pct, reply):
-    _meter(pct=pct, resets_at=time.time() + 3600)
+def test_a_claim_or_a_meter_alone_arms_nothing(meter_home, store, pct, reply):
+    _meter(pct=pct, resets_at=NOW + 3600)
 
     assert _worker_stops(store, reply)["state"] == "done"
     assert worker_session.turn_pause(store, "wo-test") is None
 
 
-def test_no_meter_reading_arms_nothing(jarvis_home, store):
+def test_no_meter_reading_arms_nothing(meter_home, store):
     assert _worker_stops(store)["state"] == "done"
 
 
-def test_a_finished_worker_is_not_paused(jarvis_home, store):
-    _meter(pct=100.0, resets_at=time.time() + 3600)
+def test_a_finished_worker_is_not_paused(meter_home, store):
+    _meter(pct=100.0, resets_at=NOW + 3600)
     store.update_work_order("wo-test", result_summary="shipped it; the limit hit after")
 
     assert _worker_stops(store)["state"] == "done"

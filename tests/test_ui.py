@@ -14,7 +14,7 @@ from jarvis import gates, ops  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
-from jarvis.invariants import IDLE_NO_FINISH_BLOCKER, check_project  # noqa: E402
+from jarvis.invariants import PR_CLOSED_BLOCKER, check_project  # noqa: E402
 from jarvis.project_store import VALIDATION_CI_CAUSE, ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 
@@ -1743,8 +1743,9 @@ def test_got_it_button_puts_the_flag_down(client, project):
     """The dashboard complaint in one test: acking has to survive the daemon"""
     wo = ops.create_work_order("proj_a", "noisy task")
     store = ProjectStore(project)
-    store.set_status(wo["id"], "needs_review")
-    store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
+    # An ackable blocker: an idle park refuses the ack (issue 1456)
+    store.set_status(wo["id"], "needs_review", pr_state="CLOSED")
+    store.flag_attention(wo["id"], PR_CLOSED_BLOCKER)
     assert "NEEDS YOU" in client.get("/").text
 
     detail = client.get(f"/wo/proj_a/{wo['id']}")
