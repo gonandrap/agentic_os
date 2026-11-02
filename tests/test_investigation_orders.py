@@ -131,6 +131,28 @@ def test_an_investigator_may_read_everything_it_needs():
             hooks.investigator_bash_decision(_bash(command), _env())) == "allow", command
 
 
+def test_a_jarvis_read_piped_or_with_stderr_redirected_is_still_a_read():
+    """Issue 1480: the pipe and `2>&1` are not what makes a command a write"""
+    for command in (
+        "jarvis wo show wo-11111111 2>&1 | head -80",
+        "jarvis wo show wo-11111111 | head -80",
+        "jarvis inspect wo-11111111 2>/dev/null | grep -n cache",
+        "git log --oneline 2>&1 | head -5",
+    ):
+        assert _decision(
+            hooks.investigator_bash_decision(_bash(command), _env())) == "allow", command
+    for command in (
+        "jarvis wo show wo-11111111 > out.txt",
+        "jarvis wo show wo-11111111 2>err.txt | head",
+        "jarvis wo show wo-11111111 | tee out.txt",
+        "jarvis wo show wo-11111111 | jarvis wo finish wo-inv001 --summary x",
+        "jarvis issues start 790 2>&1 | head",
+        "jarvis wo show wo-11111111 >&out.txt",
+    ):
+        assert _decision(
+            hooks.investigator_bash_decision(_bash(command), _env())) == "deny", command
+
+
 def test_a_permitted_read_is_an_explicit_allow_and_never_a_prompt():
     """`preflight_decision`'s docstring: these auto-approvals exist because a background session otherwise..."""
     for command in ("git log --oneline", "gh pr view 5"):
