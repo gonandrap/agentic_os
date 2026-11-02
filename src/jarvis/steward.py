@@ -30,6 +30,18 @@ BUG_PRIORITY_SEVERITY = {"low": "minor", "medium": "medium", "high": "major",
 ORIGIN_KINDS = ("bug_agent", "investigation", "neo_rider", "red_main", "release",
                 "remedy", "panel", "morpheus", "worker_io", "io_finding")
 
+#: Each origin kind's track: diagnosed defect, panel side finding, or upkeep (Neo Q2941)
+TRACKS = {"bug": ("investigation", "bug_agent", "morpheus", "red_main", "io_finding"),
+          "follow_up": ("panel",),
+          "upkeep": ("neo_rider", "remedy", "worker_io", "release")}
+TRACK_LABELS = {"bug": "reported bug", "follow_up": "panel follow-up", "upkeep": "upkeep"}
+
+
+def track_of(origin_kind: str) -> str:
+    """The track an origin kind belongs to; an unknown kind is upkeep, today's rules"""
+    return next((t for t, kinds in TRACKS.items() if origin_kind in kinds), "upkeep")
+
+
 OUTCOMES = ("dispatch", "queue", "drop", "ask")
 
 #: The work-order metadata key every steward-dispatched order carries: its provenance
@@ -94,9 +106,10 @@ class Candidate:
 
 @dataclass
 class Ledger:
-    """Rolling 7-day spend, list-price USD (§3.2 decision 3)"""
+    """Rolling 7-day spend, list-price USD (§3.2 decision 3); `evolution_usd` excludes bugs"""
 
     evolution_usd: float = 0.0
+    bug_usd: float = 0.0
     critical_usd: float = 0.0
     fleet_usd: float = 0.0
 
@@ -161,6 +174,15 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
         return ("queue", "self-reference",
                 f"its subject is work the `{c.origin_kind}` detector itself created",
                 severity)
+    if track_of(c.origin_kind) == "bug":
+        # A diagnosed defect: no yield, recurrence, precision or critical gate, only its ledger
+        bug_room = cfg.bug_weekly_usd - ledger.bug_usd
+        if bug_room < MIN_ORDER_USD:
+            return ("ask", "bug-budget",
+                    f"a reported bug, but the bug ledger is spent (${ledger.bug_usd:.2f} of "
+                    f"${cfg.bug_weekly_usd:.2f}; an order needs ${MIN_ORDER_USD:.2f})",
+                    severity)
+        return "dispatch", "reported-bug", f"a reported `{severity}` bug: act now", severity
     if severity in URGENT:
         spent = ledger.critical_usd
         if spent >= cfg.critical_weekly_usd or room < MIN_ORDER_USD:
@@ -188,6 +210,15 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
                 severity)
     return ("dispatch", severity, f"`{severity}`, recurring, and the ledger has room",
             severity)
+
+
+def order_budget(cfg: EvolutionConfig, book: Ledger, origin_kind: str) -> float:
+    """One dispatched order's ceiling: `order_budget_usd`, capped by its track's room"""
+    if track_of(origin_kind) == "bug":
+        room = cfg.bug_weekly_usd - book.bug_usd
+    else:
+        room = cfg.weekly_usd - book.evolution_usd
+    return round(max(0.0, min(cfg.order_budget_usd, room)), 2)
 
 
 # ---------------------------------------------------------------- the ledger
@@ -246,19 +277,21 @@ def ledger(catalog: Catalog, central: CentralStore | None = None, *,
                 (since,)).fetchone()
             out.fleet_usd += float(row["c"] or 0.0)
             orders = stamped_orders(store, since)
-            for fo, usd in _features_spend(store, central, since,
-                                           {wo["id"] for wo in orders}):
-                out.evolution_usd += usd
-                if stamp_of(fo).get("severity") in URGENT:
-                    out.critical_usd += usd
+            units = list(_features_spend(store, central, since, {wo["id"] for wo in orders}))
             for wo in orders:
                 cost = budget.spent(store, central, wo["id"]).total_usd
                 reserved = 0.0
                 if wo.get("status") in OPEN_STATUSES and wo.get("budget_usd"):
                     reserved = max(0.0, float(wo["budget_usd"]) - cost)
-                out.evolution_usd += cost + reserved
-                if stamp_of(wo).get("severity") in URGENT:
-                    out.critical_usd += cost + reserved
+                units.append((wo, cost + reserved))
+            for unit, usd in units:
+                stamp = stamp_of(unit)
+                if track_of(str(stamp.get("origin_kind") or "")) == "bug":
+                    out.bug_usd += usd
+                    continue
+                out.evolution_usd += usd
+                if stamp.get("severity") in URGENT:
+                    out.critical_usd += usd
         finally:
             store.close()
     if central is not None:
@@ -353,13 +386,12 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
             allowed = self_dispatch
         budget_usd = None
         if outcome == "dispatch" and mode == "enforce" and c.origin_kind != "release":
-            budget_usd = round(max(0.0, min(cfg.order_budget_usd,
-                                            cfg.weekly_usd - book.evolution_usd)), 2)
+            budget_usd = order_budget(cfg, book, c.origin_kind)
         decision = Decision(outcome=outcome, rule=rule, reason=reason, severity=severity,
                             claimed_severity=claimed, generation=generation, mode=mode,
                             allowed=allowed, budget_usd=budget_usd)
-        decision.stamp = {"origin_kind": c.origin_kind, "generation": generation,
-                          "severity": severity, "mode": mode}
+        decision.stamp = {"origin_kind": c.origin_kind, "track": track_of(c.origin_kind),
+                          "generation": generation, "severity": severity, "mode": mode}
         key = dedupe_key(c)
         prior = _duplicate_of(central, key, c)
         duplicate = int(prior["id"]) if prior else 0
@@ -443,17 +475,27 @@ def ask_body(c: Candidate, reason: str, decision_id: int, catalog: Catalog) -> s
     from .notify import ui_base_url
 
     item = str(c.payload.get("morpheus_item") or "")
-    act = act_on(c.origin_kind, item, c.parent_wo_id, c.project)
+    act = act_on(c.origin_kind, item, c.parent_wo_id, c.project,
+                 str(c.payload.get("issue_url") or ""))
     if c.origin_kind == "morpheus" and item:
         act += f" {ui_base_url(catalog)}/morpheus#{item}"
     # An `ask` is never re-offered (`_queue_fields`), so the cap is no answer for THIS one
-    return (f"{reason}. Act: {act}. Raising os.evolution.critical_weekly_usd lets later "
+    return (f"{reason}. Act: {act}. Raising {ceiling_key(c.origin_kind)} lets later "
             f"ones through; it does not re-run this one.\n"
             f"{ui_base_url(catalog)}/steward#decision-{decision_id}")
 
 
-def act_on(origin_kind: str, morpheus_item: str, parent_wo_id: str, project: str) -> str:
+def ceiling_key(origin_kind: str) -> str:
+    """The config key whose spent ceiling made an `ask` of this kind"""
+    return ("os.evolution.bug_weekly_usd" if track_of(origin_kind) == "bug"
+            else "os.evolution.critical_weekly_usd")
+
+
+def act_on(origin_kind: str, morpheus_item: str, parent_wo_id: str, project: str,
+           issue_url: str = "") -> str:
     """The one command that acts on held self-work, by where it came from"""
+    if issue_url:
+        return f"`jarvis issues start {issue_url}`"
     if origin_kind == "morpheus" and morpheus_item:
         return (f"`jarvis morpheus confirm {morpheus_item} --fix \"<what to fix>\"` files the "
                 f"fix; `jarvis morpheus waive|requeue {morpheus_item}` if it is not broken.")
@@ -466,9 +508,11 @@ def act_on(origin_kind: str, morpheus_item: str, parent_wo_id: str, project: str
 
 def next_step(row: Mapping[str, Any], now: float | None = None) -> dict[str, Any]:
     """What a steward decision asks of the user: `yours` and one line saying what to do, if anything"""
-    item = str((_candidate_of(row).get("payload") or {}).get("morpheus_item") or "")
-    act = act_on(row.get("origin_kind") or "", item, row.get("parent_wo_id") or "",
-                 row.get("project") or "")
+    payload = _candidate_of(row).get("payload") or {}
+    kind = str(row.get("origin_kind") or "")
+    act = act_on(kind, str(payload.get("morpheus_item") or ""),
+                 row.get("parent_wo_id") or "", row.get("project") or "",
+                 str(payload.get("issue_url") or ""))
     outcome, state = row.get("outcome"), row.get("queue_state") or ""
     if row.get("duplicate_of"):
         return {"yours": False, "text": f"Nothing to do: the same defect as decision "
@@ -479,18 +523,22 @@ def next_step(row: Mapping[str, Any], now: float | None = None) -> dict[str, Any
         if (now or db.now()) - float(row.get("ts") or 0) < WINDOW_SECONDS:
             return {"yours": True, "text": (
                 f"Needs you: the OS held this {row.get('severity')} fix because its weekly "
-                f"critical ceiling is spent, and it never retries it. Act: {act} Or leave it "
-                "if it no longer matters. Raising os.evolution.critical_weekly_usd lets later "
-                "ones through; it does not re-run this one.")}
+                f"{'bug ledger' if track_of(kind) == 'bug' else 'critical ceiling'} is spent, "
+                f"and it never retries it. Act: {act} Or leave it if it no longer matters. "
+                f"Raising {ceiling_key(kind)} lets later ones through; it does not re-run "
+                "this one.")}
         return {"yours": False, "text": f"No longer waiting on you (asked over "
                 f"{WINDOW_SECONDS // 86400} days ago). Only if it still matters: {act}"}
+    # A panel follow-up re-offered becomes a tracker issue, never a work order (Neo Q2941)
+    filed = (" Re-offered, it becomes a tracker issue, never a work order: `jarvis "
+             "issues start <its url>` starts it." if track_of(kind) == "follow_up" else "")
     if state == "waiting":
         return {"yours": False, "text": (
             f"Nothing to do: the daemon re-offers it every ~{DRAIN_EVERY_MINUTES} min once "
-            f"the ledger has room, and drops it after {QUEUE_TTL_SECONDS // 86400} days. "
-            f"Want it now: {act}")}
+            f"the ledger has room, and drops it after {QUEUE_TTL_SECONDS // 86400} days."
+            f"{filed} Want it now: {act}")}
     if state == "reoffered":
-        return {"yours": False, "text": "Nothing to do: re-offered from the queue."}
+        return {"yours": False, "text": f"Nothing to do: re-offered from the queue.{filed}"}
     if state == "expired":
         return {"yours": False, "text": "Nothing to do: expired from the queue; never re-offered."}
     if outcome == "drop":
@@ -815,7 +863,11 @@ def drain(catalog: Catalog, central: CentralStore, *, now: float | None = None,
         dispatchers = ops.steward_dispatchers()
     book: Ledger | None = None
     slow: set[str] = set()
-    for row in sorted(rows, key=lambda r: (-severity_rank(r["severity"]), r["ts"], r["id"])):
+    # Reported bugs first, and uncapped: panel noise never delays them (Neo Q2941)
+    capped = 0
+    for row in sorted(rows, key=lambda r: (track_of(str(r["origin_kind"])) != "bug",
+                                           -severity_rank(r["severity"]), r["ts"], r["id"])):
+        bug = track_of(str(row["origin_kind"])) == "bug"
         store = _store_for(central, str(row["project"]))
         try:
             why = _stale(central, row, store, now)
@@ -827,7 +879,7 @@ def drain(catalog: Catalog, central: CentralStore, *, now: float | None = None,
             dispatch = dispatchers.get(str(row["origin_kind"]))
             if not self_dispatch and row["origin_kind"] not in SELF_DISPATCH_EXEMPT:
                 dispatch = None  # the master switch: the OS files nothing nobody typed
-            if out["dispatched"] >= limit or dispatch is None:
+            if (not bug and capped >= limit) or dispatch is None:
                 out["waiting"] += 1
                 continue
             if book is None:
@@ -842,6 +894,7 @@ def drain(catalog: Catalog, central: CentralStore, *, now: float | None = None,
             landed = _reoffer(central, cfg, book, slow, row, store, dispatch, now)
             out[landed] += 1
             if landed == "dispatched":
+                capped += not bug
                 book = None  # it spent or reserved some of the week: read the ledger again
         finally:
             if store is not None:
@@ -863,15 +916,14 @@ def _reoffer(central: CentralStore, cfg: EvolutionConfig, book: Ledger, slow: se
             "queue_note": f"re-offered, still `{outcome}` ({rule}): {reason}",
             "queue_ts": now})
         return "waiting"
-    budget_usd = round(max(0.0, min(cfg.order_budget_usd,
-                                    cfg.weekly_usd - book.evolution_usd)), 2)
+    budget_usd = order_budget(cfg, book, c.origin_kind)
     decision = Decision(
         outcome="dispatch", rule=rule, severity=severity, generation=generation,
         reason=f"{reason}; re-offered from the queue (was `{row['rule']}`)",
         claimed_severity=str(row["claimed_severity"] or severity), mode=cfg.mode,
         allowed=True, budget_usd=budget_usd, decision_id=int(row["id"]))
-    decision.stamp = {"origin_kind": c.origin_kind, "generation": generation,
-                      "severity": severity, "mode": cfg.mode,
+    decision.stamp = {"origin_kind": c.origin_kind, "track": track_of(c.origin_kind),
+                      "generation": generation, "severity": severity, "mode": cfg.mode,
                       "decision_id": decision.decision_id}
     try:
         made = dispatch(row, c, decision)
@@ -908,6 +960,7 @@ def digest(catalog: Catalog, central: CentralStore, *, now: float | None = None
         counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
     counts = precision(catalog, now=now)
     return {"mode": cfg.mode, "ledger": book, "weekly_usd": cfg.weekly_usd,
+            "bug_weekly_usd": cfg.bug_weekly_usd,
             "critical_weekly_usd": cfg.critical_weekly_usd,
             "yield_above_usd": cfg.yield_above_usd, "by_kind": by_kind,
             "held": [r for r in rows if r["outcome"] in ("queue", "ask")][:10],
@@ -917,13 +970,15 @@ def digest(catalog: Catalog, central: CentralStore, *, now: float | None = None
 
 def render_digest(d: Mapping[str, Any]) -> str:
     book: Ledger = d["ledger"]
-    lines = [f"steward ({d['mode']}): evolution ${book.evolution_usd:.2f} of "
-             f"${d['weekly_usd']:.2f} this week, critical ${book.critical_usd:.2f} of "
-             f"${d['critical_weekly_usd']:.2f}; fleet ${book.fleet_usd:.2f} "
-             f"(new self-work yields above ${d['yield_above_usd']:.2f})"]
-    for kind, counts in sorted(d["by_kind"].items()):
-        lines.append(f"  {kind:<14} " + "  ".join(f"{o} {counts.get(o, 0)}"
-                                                    for o in OUTCOMES))
+    lines = [f"steward ({d['mode']}): reported bugs ${book.bug_usd:.2f} of "
+             f"${d.get('bug_weekly_usd', 0):.2f} this week; follow-ups and upkeep "
+             f"${book.evolution_usd:.2f} of ${d['weekly_usd']:.2f}, critical "
+             f"${book.critical_usd:.2f} of ${d['critical_weekly_usd']:.2f}; fleet "
+             f"${book.fleet_usd:.2f} (new follow-ups yield above ${d['yield_above_usd']:.2f})"]
+    for kind, counts in sorted(d["by_kind"].items(),
+                               key=lambda kv: (list(TRACKS).index(track_of(kv[0])), kv[0])):
+        lines.append(f"  {TRACK_LABELS[track_of(kind)]:<15} {kind:<14} "
+                     + "  ".join(f"{o} {counts.get(o, 0)}" for o in OUTCOMES))
     if d["precision"]:
         lines.append("precision (user touched / dispatched, 28 days):")
         for kind, (hit, total) in sorted(d["precision"].items()):
@@ -933,9 +988,34 @@ def render_digest(d: Mapping[str, Any]) -> str:
         lines.append(queue_line(d["queue"]))
     if d["held"]:
         lines.append("held back:")
-        lines += [f"  [{r['outcome']}] {r['origin_kind']} {r['severity']}: "
+        lines += [f"  [{r['outcome']}] {TRACK_LABELS[track_of(r['origin_kind'])]} "
+                  f"({r['origin_kind']}) {r['severity']}: "
                   f"{r['subject'][:70]} — {r['rule']}" for r in d["held"]]
     return "\n".join(lines)
+
+
+def track_counts(central: CentralStore, *, now: float | None = None
+                 ) -> dict[str, dict[str, int]]:
+    """{track: {"asks": n, "queued": n}}: what waits on the user, what waits for room"""
+    now = now if now is not None else db.now()
+    out = {t: {"asks": 0, "queued": 0} for t in TRACKS}
+    for row in central.steward_asks(now - WINDOW_SECONDS, limit=5000):
+        out[track_of(row["origin_kind"])]["asks"] += 1
+    for row in central.steward_queue():
+        out[track_of(row["origin_kind"])]["queued"] += 1
+    return out
+
+
+def track_line(counts: Mapping[str, Mapping[str, int]]) -> str:
+    """`track_counts` in one line for `jarvis status`, or '' when nothing is held"""
+    parts = []
+    for track, n in counts.items():
+        bits = ([f"{n['asks']} waiting on you"] if n.get("asks") else []) + (
+            [f"{n['queued']} queued"] if n.get("queued") else [])
+        if bits:
+            plural = "" if track == "upkeep" else "s"
+            parts.append(f"{TRACK_LABELS[track]}{plural} {', '.join(bits)}")
+    return "; ".join(parts)
 
 
 def queue_line(counts: Mapping[str, int]) -> str:

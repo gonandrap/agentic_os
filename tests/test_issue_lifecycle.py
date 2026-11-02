@@ -1818,18 +1818,26 @@ def test_a_worker_filed_medium_is_dispatched_by_the_steward_when_there_is_room(w
     assert any(wo_id in c for c in worker.gh.issue()["comments"]), "the tracker says so too"
 
 
-def test_a_worker_filed_medium_queues_without_room_and_drains_once_there_is(worker):
+def test_a_spent_bug_ledger_asks_the_user_and_says_so(worker):
+    worker.enforce(bug_weekly_usd=0.0)
+    pickup = worker.file_bug(priority="medium")["pickup"]
+    assert not worker.wo_id()
+    assert _bug_decisions()[0]["outcome"] == "ask"
+    assert "bug-budget" in pickup["reason"] and "pick up" not in pickup["reason"]
+
+
+def test_a_queued_worker_filing_drains_once_the_steward_allows_it(worker):
     from jarvis import ops, steward
     from jarvis.central_store import CentralStore
 
-    worker.enforce(weekly_usd=0.0)
+    worker.enforce(max_depth=0)
     pickup = worker.file_bug(priority="medium")["pickup"]
     assert not worker.wo_id()
     [row] = _bug_decisions()
     assert (row["outcome"], row["queue_state"]) == ("queue", "waiting")
     assert "queued" in pickup["reason"] and "pick up" not in pickup["reason"]
 
-    worker.enforce(weekly_usd=100.0)
+    worker.enforce(max_depth=1)
     central = CentralStore()
     try:
         assert steward.drain(ops.resolve_catalog(), central)["dispatched"] == 1

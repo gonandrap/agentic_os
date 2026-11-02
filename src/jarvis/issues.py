@@ -677,6 +677,8 @@ def steward_note(decision: Any, wo_id: str, public: bool = False) -> str:
                 "so it waits for the user")
     if decision.outcome == "queue":
         return f"the steward queued it ({why}); it starts by itself when the budget has room"
+    if decision.outcome == "ask":
+        return f"the steward asks the user ({why}); its inbox item says how to start it"
     return f"the steward decided `{decision.outcome}` ({why})"
 
 

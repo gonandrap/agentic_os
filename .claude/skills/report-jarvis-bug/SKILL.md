@@ -77,8 +77,8 @@ disagreement, which is a signal the user wants.
 
 **Reporting is all you do; the OS does the rest.** From a work-order session the OS
 files the issue and hands it to the steward at every priority (after Neo settles a
-`critical`/`blocker` claim): the steward starts a fix now, queues it until the budget
-has room, or drops it (a `low` is dropped as minor). Never open an issue yourself
+`critical`/`blocker` claim): the steward starts a fix now on the bug ledger, asks
+the user once that ledger is spent, or drops it (a `low` is dropped as minor). Never open an issue yourself
 (`gh issue create`) and never start one with `jarvis issues start`: an issue the OS did
 not file reaches nobody. NEVER pass `--expedite` — expediting is the user's call, and
 from a work-order session the OS ignores it and says so.

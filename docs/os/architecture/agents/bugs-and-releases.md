@@ -29,7 +29,7 @@ sequenceDiagram
         I->>D: work order now (expedited, no rating on it yet)
     end
     alt low / medium / high, filed by a work order
-        I->>D: steward.gate(bug_agent) → dispatch now / queue (drain re-offers) / drop
+        I->>D: steward.gate(bug_agent) → dispatch now / ask (bug ledger spent) / queue (drain re-offers) / drop
     else low / medium / high, filed by the user
         Note over GH: waits on the tracker
         U->>D: jarvis issues start {url|#n}

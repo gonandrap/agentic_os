@@ -115,8 +115,8 @@ Rules that cost the user if forgotten:
 - A `waiting_pr_merge` order closes itself once its PR merges, and the OS resolves merge
   conflicts with the worker by itself. Never tell a parked order to fix conflicts.
 - Bugs in the OS go through `jarvis bug report` (the `report-jarvis-bug` skill). A
-  work order's filing goes to the steward at every priority, which starts, queues or
-  drops it; the user's own filing waits for `jarvis issues start`. Neo re-assesses a
+  work order's filing goes to the steward at every priority, which starts it on the
+  bug ledger, asks you once that is spent, or drops it; the user's own filing waits for `jarvis issues start`. Neo re-assesses a
   critical/blocker claim, and any claim an investigation's GAP filed, before the
   steward decides. `--expedite` is the user's: from an interactive session it files and
   dispatches at once (ignored from a work-order session). The OS creates orders nobody

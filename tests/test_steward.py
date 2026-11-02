@@ -13,7 +13,7 @@ from jarvis.project_store import ProjectStore
 
 
 def cand(**kw) -> steward.Candidate:
-    base = dict(origin_kind="bug_agent", severity="major", project="proj_a",
+    base = dict(origin_kind="remedy", severity="major", project="proj_a",
                 subject="a defect", evidence=("alarm al-1",), refs=1)
     return steward.Candidate(**{**base, **kw})
 
@@ -96,24 +96,15 @@ def test_scraps_of_room_queue_instead_of_dispatching_a_doomed_order():
 
 
 def test_a_medium_needs_recurrence_a_major_needs_less():
-    # A panel finding: a filed bug report is its own sighting (Q3080)
-    assert outcome(cand(origin_kind="panel", severity="medium", refs=2)) == (
-        "queue", "recurrence")
-    assert outcome(cand(origin_kind="panel", severity="medium", refs=3)) == (
-        "dispatch", "medium")
-    assert outcome(cand(origin_kind="panel", severity="major", refs=1)) == (
-        "dispatch", "major")
-    assert outcome(cand(origin_kind="panel", severity="major", refs=0)) == (
-        "queue", "recurrence")
-
-
-def test_a_filed_bug_report_is_one_sighting_enough():
-    assert outcome(cand(severity="medium", refs=1)) == ("dispatch", "medium")
+    assert outcome(cand(severity="medium", refs=2)) == ("queue", "recurrence")
+    assert outcome(cand(severity="medium", refs=3)) == ("dispatch", "medium")
+    assert outcome(cand(severity="major", refs=1)) == ("dispatch", "major")
+    assert outcome(cand(severity="major", refs=0)) == ("queue", "recurrence")
 
 
 def test_a_neo_cleanup_is_one_sighting_enough_a_panel_medium_is_not():
     """Neo raises a cleanup once, in one verdict: its own threshold, not `medium_min_refs`"""
-    assert CFG.min_refs_by_kind == {"neo_rider": 1, "bug_agent": 1}
+    assert CFG.min_refs_by_kind == {"neo_rider": 1}
     assert outcome(cand(origin_kind="neo_rider", severity="medium")) == ("dispatch",
                                                                          "medium")
     assert outcome(cand(origin_kind="neo_rider", severity="medium", refs=0)) == (
@@ -135,7 +126,7 @@ def test_a_per_kind_threshold_keeps_every_rule_before_recurrence():
 
 
 def test_a_per_kind_threshold_overrides_major_and_medium_alike():
-    cfg = EvolutionConfig(min_refs_by_kind={"bug_agent": 4})
+    cfg = EvolutionConfig(min_refs_by_kind={"remedy": 4})
     assert outcome(cand(severity="major", refs=3), cfg=cfg) == ("queue", "recurrence")
     assert outcome(cand(severity="medium", refs=4), cfg=cfg) == ("dispatch", "medium")
     assert outcome(cand(origin_kind="panel", severity="major", refs=1), cfg=cfg) == (
@@ -145,6 +136,27 @@ def test_a_per_kind_threshold_overrides_major_and_medium_alike():
 def test_a_throttled_detector_queues_but_urgent_still_goes():
     assert outcome(cand(), throttled=True) == ("queue", "low-precision")
     assert outcome(cand(severity="critical"), throttled=True) == ("dispatch", "urgent")
+
+
+@pytest.mark.parametrize("kind", steward.TRACKS["bug"])
+def test_a_reported_bug_skips_yield_recurrence_precision_and_the_follow_up_ledger(kind):
+    """wo-5b96c9da: #1401's fix sat queued under `yield` while its investigation read completed"""
+    held = steward.Ledger(evolution_usd=10_000, critical_usd=10_000,
+                          fleet_usd=CFG.yield_above_usd + 1)
+    bug = cand(origin_kind=kind, severity="medium", refs=0)
+    assert outcome(bug, held, throttled=True) == ("dispatch", "reported-bug")
+    assert outcome(cand(origin_kind=kind, severity="minor")) == ("drop", "low-severity")
+    assert outcome(bug, generation=2) == ("queue", "max-depth")
+
+
+def test_a_spent_bug_ledger_asks_with_the_start_command():
+    spent = steward.Ledger(bug_usd=CFG.bug_weekly_usd)
+    assert outcome(cand(origin_kind="investigation"), spent) == ("ask", "bug-budget")
+    # A follow-up never draws the bug ledger down, nor a bug the follow-up one
+    assert outcome(cand(), spent) == ("dispatch", "major")
+    url = "https://github.com/o/r/issues/1401"
+    assert steward.act_on("investigation", "", "wo-1", "p", url) == (
+        f"`jarvis issues start {url}`")
 
 
 def test_a_release_ships_whatever_the_ledger_says():
@@ -165,9 +177,9 @@ def test_a_per_kind_threshold_merges_over_the_default_and_can_raise_it_back():
     def parse(raw, projects=()):
         return parse_catalog({"os": {"evolution": raw}, "projects": list(projects)})
     assert parse({"min_refs_by_kind": {"panel": 2}}).os.evolution.min_refs_by_kind == {
-        "neo_rider": 1, "bug_agent": 1, "panel": 2}
+        "neo_rider": 1, "panel": 2}
     assert parse({"min_refs_by_kind": {"neo_rider": 3}}).os.evolution.min_refs_by_kind == {
-        "neo_rider": 3, "bug_agent": 1}
+        "neo_rider": 3}
 
 
 @pytest.mark.parametrize("bad", [{"mode": "loud"}, {"weekly_usd": -1},
@@ -219,7 +231,7 @@ def test_enforce_applies_the_decision_and_sets_a_budget(fleet):
     assert steward.gate(cand(severity="minor"), catalog=cat, store=store).allowed is False
     d = steward.gate(cand(), catalog=cat, store=store)
     assert (d.allowed, d.budget_usd) == (True, 25.0)
-    assert d.stamp["generation"] == 1 and d.stamp["origin_kind"] == "bug_agent"
+    assert d.stamp["generation"] == 1 and d.stamp["origin_kind"] == "remedy"
 
 
 def test_enforce_never_dispatches_with_self_dispatch_off(fleet):
@@ -231,10 +243,10 @@ def test_enforce_never_dispatches_with_self_dispatch_off(fleet):
 
 def test_an_ask_reaches_the_inbox_with_a_link_and_the_command_that_acts(fleet):
     make, store = fleet
-    cat = make(mode="enforce", critical_weekly_usd=0)
+    cat = make(mode="enforce", bug_weekly_usd=0)
     d = steward.gate(cand(origin_kind="morpheus", severity="critical", parent_wo_id="wo-p1",
                           payload={"morpheus_item": "mv-1"}), catalog=cat, store=store)
-    assert d.outcome == "ask"
+    assert (d.outcome, d.rule) == ("ask", "bug-budget")
     central = CentralStore()
     try:
         [item] = central.new_inbox()
@@ -260,6 +272,14 @@ def test_the_ledger_counts_stamped_spend_and_what_is_still_reserved(fleet):
     # 10 spent + 15 still reserved on the open order; the user's 40 is fleet spend only
     assert book.evolution_usd == pytest.approx(25.0)
     assert book.fleet_usd == pytest.approx(50.0)
+    bug = steward.gate(cand(origin_kind="investigation"), catalog=cat, store=store)
+    fix = store.create_work_order("bug fix", metadata=steward.stamped({}, bug),
+                                  budget_usd=bug.budget_usd)
+    _spend(store, fix["id"], 7.0)
+    book = steward.ledger(cat)
+    # The bug's spend lands on its own ledger, not on the follow-up one
+    assert book.bug_usd == pytest.approx(bug.budget_usd)
+    assert book.evolution_usd == pytest.approx(25.0)
 
 
 def test_the_ledger_counts_a_stamped_improvement_order_and_its_analyst(fleet):
@@ -341,7 +361,7 @@ EVERY_RUN = "a healed error comes back on every run: the access tail loses each 
 
 def test_the_bucket_is_the_origin_unit_and_the_file(fleet):
     assert steward.dedupe_key(cand(parent_wo_id="wo-1", file="SRC/Jarvis/UiLog.py")) == (
-        "proj_a|bug_agent|wo-1|src/jarvis/uilog.py")
+        "proj_a|remedy|wo-1|src/jarvis/uilog.py")
     # Nothing to collapse by: a candidate that names no code, or none that caused it
     assert steward.dedupe_key(cand(parent_wo_id="wo-1")) == ""
     assert steward.dedupe_key(cand(file="src/jarvis/uilog.py")) == ""
@@ -622,6 +642,26 @@ def test_the_drain_offers_the_severest_then_the_oldest_up_to_its_limit(queue):
     assert central.steward_decision(medium.decision_id)["queue_state"] == "waiting"
 
 
+def test_the_drain_offers_queued_bugs_first_and_outside_its_limit(queue):
+    make, store, central, calls, dispatchers = queue
+    held = make(mode="enforce", weekly_usd=0)
+    _queued(store, held, "a follow-up major")
+    bugs = []
+    for n in range(2):
+        parent = store.create_work_order(f"bug parent {n}")
+        # Queued bugs exist only from before the track split (or past max-depth)
+        bugs.append(central.record_steward_decision({
+            "project": "proj_a", "origin_kind": "io_finding", "subject": f"a bug {n}",
+            "severity": "major", "outcome": "queue", "rule": "yield", "mode": "enforce",
+            "parent_wo_id": parent["id"], "queue_state": "waiting",
+            "candidate_json": json.dumps({"subject": f"a bug {n}", "payload": {}})}))
+    dispatchers["io_finding"] = dispatchers["panel"]
+    roomy = make(mode="enforce", weekly_usd=100, order_budget_usd=10)
+    out = steward.drain(roomy, central, dispatchers=dispatchers, limit=1)
+    assert out["dispatched"] == 3
+    assert [c[1] for c in calls] == ["a bug 0", "a bug 1", "a follow-up major"]
+
+
 def test_a_failed_re_offer_stays_queued_for_the_next_pass(queue):
     make, store, central, _calls, _d = queue
     d = _queued(store, make(mode="enforce", weekly_usd=0), "a major")
@@ -702,7 +742,7 @@ def test_the_digest_goes_out_once_a_week_and_says_what_was_held(fleet):
                   if i["title"].startswith("steward")]
     finally:
         central.close()
-    assert "bug_agent" in item["body"] and "drop 1" in item["body"]
+    assert "remedy" in item["body"] and "drop 1" in item["body"]
 
 
 def test_a_week_with_no_decisions_sends_nothing(fleet):

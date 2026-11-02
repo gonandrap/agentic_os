@@ -24,6 +24,8 @@ def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
            f"item you rely on (`6.2 item 5`), never by pasting it and never by naming a "
            f"whole document. A citation points, it does not argue: still state the fact "
            f"the decision rests on, since Neo may not be shown what you cite."
+           f" Never probe a hook or verb with `wo assume` or `wo ask` on your live "
+           f"order: use the test suite or a read-only `jarvis search`."
            if cite_spec else "")
         + tail)
 
