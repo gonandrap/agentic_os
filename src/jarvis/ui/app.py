@@ -576,7 +576,7 @@ class CostCache:
 
     @staticmethod
     def key(picked: dict, project: str) -> tuple:
-        """The scope and the bounds, an open-ended `until` keyed as NOW: `computed_at` ages it, not a clock bucket (issue 1464)"""
+        """The scope and the bounds; an open-ended `until` is NOW, aged by `computed_at` (issue 1464)"""
         until = picked["until"]
         if picked.get("open_ended"):
             until = "now"
