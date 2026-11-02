@@ -464,8 +464,7 @@ def rewrite(central: CentralStore, cfg: MorpheusConfig, item_id: str, why: str, 
     if not why:
         raise ValueError("say what is wrong with the script")
     now = db.now()
-    # last_exit goes too: the old script's exit 1 must not count toward the new one's two-in-a-row
-    # A user's script stays so the arm session revalidates it, not replaces it (monitoring-orders §3)
+    # A user's script stays for the arm session to revalidate (monitoring-orders §3); last_exit resets
     user = item["script_source"] == "user"
     central.update_morpheus_item(
         item_id, state="queued", script=item["script"] if user else "",
@@ -936,12 +935,7 @@ def usage_hold_until(central: CentralStore, now: float | None = None) -> float |
 def run_session(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
                 purpose: str, cwd: Path, call: Callable[..., Any] | None = None
                 ) -> dict[str, Any] | None:
-    """ONE fresh `claude -p` for one order, never resumed (spec 2026-11-01-monitoring-orders §1.3).
-
-    Returns the validated reply, or None for a failed call or an unparseable reply.
-    RE-RAISES `claude_cli.UsageLimitError` (after setting the usage hold) and
-    `claude_cli.KilledError`: neither is an answer, so the caller bounds them on the row.
-    """
+    """One fresh `claude -p` per order (§1.3): reply or None; re-raises kill and usage-limit errors"""
     from . import agent_usage, claude_cli, structured
 
     if purpose not in SESSION_PROMPTS:
