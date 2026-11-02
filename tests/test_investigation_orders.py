@@ -740,7 +740,15 @@ def test_script_wrong_past_its_cap_asks_the_user(started, store):
     assert (item["state"], item["script"]) == ("failed", "exit 1")
     row = store.get_feature_order(inv_id)
     assert row["needs_attention"]
-    assert f"jarvis morpheus rewrite {item_id}" in json.loads(row["plan"])["rewrite"]
+    plan = json.loads(row["plan"])
+    assert f"jarvis morpheus rewrite {item_id}" in plan["rewrite"]
+    # #1481: verdict and ask lead, no jargon; the command comes pre-filled and shell-safe
+    assert row["attention_reason"].startswith(
+        "PR #1360 works; its validation script is wrong. Approve a rewrite:")
+    import shlex
+    argv = shlex.split(plan["rewrite_ask"]["command"])
+    assert argv[:5] == ["jarvis", "morpheus", "rewrite", item_id, "--why"]
+    assert argv[5] == plan["script_fix"]
 
 
 def test_script_wrong_is_refused_off_a_morpheus_item(started, store):
