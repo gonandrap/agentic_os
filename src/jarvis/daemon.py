@@ -3309,7 +3309,7 @@ class Daemon:
         future.add_done_callback(lambda f: setattr(self, "morpheus_busy", False))
 
     def _morpheus_pass(self) -> None:
-        """Queue what reached production, run due scripts, hand off verdicts, then wake the session"""
+        """Queue what reached production, run due scripts, hand off verdicts, then arm what is owed"""
         from . import morpheus
         from .paths import production_code_dir
 
@@ -3362,10 +3362,13 @@ class Daemon:
                              item["state"], morpheus.act(central, self.catalog, item))
                 except Exception:  # noqa: BLE001 — one item must not starve the others
                     log.exception("morpheus: action for %s failed", item["id"])
-            # The session lives in the OS project's checkout; each batch adds the projects it touches
-            home = next((p.path for p in self.catalog.projects if p.name == os_name), fallback)
-            morpheus.wake(central, self.catalog, home, dirs=dirs,
-                          paused=morpheus.pause_state(central)["paused"], skip=skip)
+            # One short session per owed order, in that order's production directory (§3)
+            armed = morpheus.arm(central, self.catalog,
+                                 lambda item: dirs.get(item.get("project") or "", fallback),
+                                 skip=skip)
+            ran = {k: v for k, v in armed.items() if v and k not in ("paused", "usage_held")}
+            if ran:
+                log.info("morpheus arm: %s", ran)
         except Exception:  # noqa: BLE001 — the loop must survive anything
             log.exception("morpheus pass failed")
         finally:

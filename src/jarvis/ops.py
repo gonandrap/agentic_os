@@ -8656,6 +8656,20 @@ def _script_wrong_rewrite(item_id: str, inv_id: str,
         central.close()
 
 
+def _rewrite_ask(item_id: str, script_fix: str) -> dict[str, Any]:
+    """The user's half of a SCRIPT_WRONG past its cap, `--why` pre-filled (#1481)"""
+    import shlex
+
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id) or {}
+    finally:
+        central.close()
+    # shlex, never double quotes: a script_fix quoting code carries backticks the shell would run
+    return {"item": item_id, "pr_number": item.get("pr_number"),
+            "command": f"jarvis morpheus rewrite {item_id} --why {shlex.quote(script_fix)}"}
+
+
 def investigation_chain(name: str, path: Path, fo: Mapping[str, Any]) -> dict[str, Any]:
     """validation -> investigation -> issue -> fix order -> production -> re-validation (#1344)"""
     from . import morpheus
@@ -9112,6 +9126,8 @@ def submit_verdict(inv_id: str, doc: Any,
     if verdict["classification"] == "SCRIPT_WRONG":
         settled, verdict["rewrite"] = _script_wrong_rewrite(morpheus_item_id, inv_id, verdict)
         escalate = not settled
+        if escalate:
+            verdict["rewrite_ask"] = _rewrite_ask(morpheus_item_id, verdict["script_fix"])
 
     classification = verdict["classification"]
     store = ProjectStore(path)

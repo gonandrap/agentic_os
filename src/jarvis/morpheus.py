@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import subprocess
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Union
@@ -34,8 +33,6 @@ SECTION = "How to validate in production"
 EXIT_VALIDATED = 0
 EXIT_FAILED = 1
 
-#: The os_state key holding Morpheus's session
-SESSION_KEY = "morpheus.session"
 #: The os_state key naming the last release whose PRs were queued
 RELEASE_KEY = "morpheus.last_release"
 #: Per project: the last `pr_merged` event already queued
@@ -44,14 +41,12 @@ MERGE_CURSOR_KEY = "morpheus.merge_cursor.{project}"
 PAUSE_KEY = "morpheus.pause"
 PAUSE_MODES = ("paused", "running")
 
-#: How long an item offered to Morpheus waits before it is offered again
+#: How long an order whose session failed waits before the next one
 REOFFER_SECONDS = 6 * 3600
-#: How many times an item is offered before Morpheus gives up on it (the deadline then acts)
+#: Failed sessions one owed step gets before Morpheus gives up on it (the deadline then acts)
 MAX_OFFERS = 3
-#: Consecutive killed turns tolerated before the session holds back (one release restart kills once)
+#: Consecutive killed sessions that cost one attempt (one release restart kills once)
 MAX_KILLS = 3
-#: How long that hold lasts when no new release lifts it first
-KILL_HOLD_SECONDS = 6 * 3600
 #: How much of a script's output is kept
 OUTPUT_TAIL = 2000
 #: What a `validation` verdict may ask the OS to do — a waive stays the user's (issue #1254)
@@ -457,8 +452,7 @@ def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str, *,
         item_id, state="monitoring" if item["script"] else "queued",
         deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY,
         next_check_ts=now if item["script"] else None, resolution=resolution, action="",
-        action_ts=None)
-    _forget_offer(central, item_id)
+        action_ts=None, attempts=0, kills=0, last_attempt_ts=None)
     return central.morpheus_item(item_id) or {}
 
 
@@ -470,15 +464,17 @@ def rewrite(central: CentralStore, cfg: MorpheusConfig, item_id: str, why: str, 
     if not why:
         raise ValueError("say what is wrong with the script")
     now = db.now()
-    # last_exit goes too: the old script's exit 1 must not count toward the new one's two-in-a-row
+    # A user's script stays for the arm session to revalidate (monitoring-orders §3); last_exit resets
+    user = item["script_source"] == "user"
     central.update_morpheus_item(
-        item_id, state="queued", script="", script_source="", last_exit=None,
+        item_id, state="queued", script=item["script"] if user else "",
+        script_source="user" if user else "", last_exit=None, attempts=0, kills=0,
+        last_attempt_ts=None,
         rewrite_brief=(f"{why[:1500]}\n\nThe rejected script:\n"
                        f"{item['script'][:3000] or '(none)'}"),
         deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY, next_check_ts=None,
         resolution=resolution or f"script sent back to be rewritten: {why[:600]}",
         action="", action_ts=None)
-    _forget_offer(central, item_id)
     return central.morpheus_item(item_id) or {}
 
 
@@ -855,235 +851,182 @@ def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, 
              + f"jarvis morpheus show {item_id}")
 
 
-# -- the only LLM: Morpheus's session turns hints into scripts
+# -- the only LLM: one short session per order (docs/superpowers/specs/2026-11-01-monitoring-orders.md §3)
 
-MORPHEUS_PERSONA = """You are MORPHEUS, the production validator of the Jarvis agentic OS.
+MORPHEUS_PERSONA = """You are MORPHEUS, the production monitor of the Jarvis agentic OS.
 
-The OS ships pull requests to production, for every project it runs. Each PR says, under
-`## How to validate in production`, HINTS about what production activity shows it working.
-Your only job is to turn those hints into a SCRIPT the OS then runs mechanically on a
-schedule. You never run the validation, never judge a result and never diagnose a failure:
-the OS reads the exit code, and finding out why something failed is someone else's job.
+The OS ships changes to production, for every project it runs. Each time you run, you are
+given ONE monitoring order: one thing production should show working. You run in a fresh
+session from that project's production directory, with read-only tools.
 
-For each item you are given, spawn ONE subagent (Task tool), in parallel. Each subagent:
-  1. reads the item's hints (and the PR or the project's code if it must:
-     `gh pr view <url>`, the project path given with the item);
-  2. writes a bash script to /tmp/morpheus-<item id>.sh that:
-     - runs from the project's production directory, the one given with the item;
-     - is READ-ONLY: it inspects production (CLIs with --json, logs, `systemctl --user
-       status`, `gh` reads, HTTP GETs) and never changes anything;
-     - exits 0 when production shows the change working;
-     - exits 1 ONLY when production shows THIS PR's own failure signature — the exact
-       symptom the PR fixed, happening again. Anything the PR does not own is NOT a
-       failure: a command that errored, an endpoint that was unreachable, a missing
-       file, a reading stale for its own reason. Those exit 75, and so does every
-       check that could not read what it needed to judge;
-     - exits 75 for everything else, including production not having exercised the
-       change yet;
-     - finishes in well under a minute;
-     - prints ONE line per hint it checks, starting `PASS`, `FAIL` or `UNKNOWN` (the
-       last for a check that exits 75), naming the hint in plain words a human reads
-       without the script — never a bare internal field name like `wedged=false`;
-     - never prints the release that first carried the PR on its own: the OS already
-       records that, and the check's own version, beside the output;
-  3. registers it: `jarvis morpheus script <item id> --file /tmp/morpheus-<item id>.sh`.
-If the hints cannot be made mechanical, the subagent registers a script that exits 75 and
-prints why — the item then times out and a human decides.
+You never run `jarvis`, never change production and never write outside /tmp. You never
+judge a result yourself: the OS runs what you return on a schedule and reads its exit code.
 
-Reply with one line per item: its id and what the script checks. Nothing else."""
+Read what you need (the PR with `gh pr view <url>`, the project's code, its logs), then reply
+with ONE JSON object and nothing else, in the shape the order asks for."""
+
+#: The exit-code contract every arming prompt opens with: identical text, so it caches
+ARM_CONTRACT = """Write the bash script that monitors this order. The script:
+- runs from the production directory you are in;
+- is READ-ONLY: it inspects production (CLIs with --json, logs, `systemctl --user status`,
+  `gh` reads, HTTP GETs) and never changes anything;
+- exits 0 when production shows the change working;
+- exits 1 ONLY when production shows THIS change's own failure signature: the exact symptom
+  it fixed, happening again. Anything the change does not own is NOT a failure: a command
+  that errored, an endpoint that was unreachable, a missing file. Those exit 75;
+- exits 75 when it cannot read the environment, including production not having exercised
+  the change yet;
+- finishes in well under a minute;
+- prints ONE line per thing it checks, starting PASS, FAIL or UNKNOWN, naming it in plain
+  words a human reads without the script, never a bare internal field name;
+- never prints the release that first carried the change: the OS records that already.
+
+Reply {"script": "<the bash script>", "notes": "<one line: what it checks>"}.
+If what to watch cannot be made mechanical, reply {"refuse": "<why>"} instead."""
+
+#: The os_state key holding the account's usage-window hold: one for every order
+USAGE_HOLD_KEY = "morpheus.usage_hold"
+#: Tools an order's session may use: reads only, and Bash for `gh` and the CLIs it inspects
+SESSION_TOOLS = "Bash,Read,Glob,Grep"
 
 
-def session_state(central: CentralStore) -> dict[str, Any]:
-    raw = central.get_state(SESSION_KEY)
+def _arm_prompt(item: dict[str, Any]) -> str:
+    title = item.get("title") or item.get("pr_title") or "(untitled)"
+    what = (item.get("hints") or item.get("prompt")
+            or "(the PR gave no hints at all: read the PR)")
+    parts = [ARM_CONTRACT,
+             f"## Order {item['id']} — {item.get('project') or '?'}: {title}"
+             + (f"\n{item['pr_url']}" if item.get("pr_url") else ""),
+             f"What to watch:\n{what[:4000]}"]
+    if item.get("rewrite_brief"):
+        parts.append("A REWRITE: its previous script was ruled wrong, not the change. Write one "
+                     f"that avoids this:\n{item['rewrite_brief']}")
+    if item.get("script_source") == "user" and item.get("script"):
+        parts.append("The user wrote this script. Return it unchanged if it keeps the contract; "
+                     f"change it only where it does not:\n{item['script'][:4000]}")
+    return "\n\n".join(parts)
+
+
+def _arm_reply(data: dict[str, Any]) -> dict[str, str]:
+    refuse = data.get("refuse")
+    if isinstance(refuse, str) and refuse.strip():
+        return {"refuse": refuse.strip()}
+    script = data.get("script")
+    if not isinstance(script, str) or not script.strip():
+        raise ValueError("neither a script nor a refusal")
+    return {"script": script, "notes": str(data.get("notes") or "")}
+
+
+#: purpose: (prompt built from the row, reply validator); §4 adds "judge"
+SESSION_PROMPTS: dict[str, tuple[Callable[[dict], str], Callable[[dict], Any]]] = {
+    "arm": (_arm_prompt, _arm_reply)}
+
+
+def usage_hold_until(central: CentralStore, now: float | None = None) -> float | None:
+    """When the usage window reopens, or None when no hold stands"""
+    now = db.now() if now is None else now
     try:
-        data = json.loads(raw) if raw else {}
+        until = float(central.get_state(USAGE_HOLD_KEY) or 0)
     except ValueError:
-        data = {}
-    return data if isinstance(data, dict) else {}
+        until = 0.0
+    return until if now < until else None
 
 
-def _save_session(central: CentralStore, state: dict[str, Any]) -> None:
-    central.set_state(SESSION_KEY, json.dumps(state))
+def run_session(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
+                purpose: str, cwd: Path, call: Callable[..., Any] | None = None
+                ) -> dict[str, Any] | None:
+    """One fresh `claude -p` per order (§1.3): reply or None; re-raises kill and usage-limit errors"""
+    from . import agent_usage, claude_cli, structured
 
-
-def _forget_offer(central: CentralStore, item_id: str) -> None:
-    state = session_state(central)
-    if item_id in (state.get("offers") or {}):
-        state["offers"].pop(item_id)
-        _save_session(central, state)
-
-
-def wanting_scripts(central: CentralStore, *, now: float | None = None,
-                    skip: Collection[str] = ()) -> list[dict]:
-    """Queued items Morpheus should be asked about now"""
-    now = db.now() if now is None else now
-    offers = session_state(central).get("offers") or {}
-    out = []
-    for item in central.morpheus_items(("queued",)):
-        if (item["project"] or "") in skip:
-            continue
-        seen = offers.get(item["id"]) or {}
-        if int(seen.get("n") or 0) >= MAX_OFFERS:
-            continue
-        if now - float(seen.get("ts") or 0) < REOFFER_SECONDS:
-            continue
-        out.append(item)
-    return out
-
-
-def build_prompt(items: list[dict[str, Any]], dirs: dict[str, Path]) -> str:
-    blocks = [f"### {i['id']} — {i.get('project') or '?'} PR #{i['pr_number']}: "
-              f"{i['pr_title']}\n{i['pr_url']}\nproduction directory: "
-              f"{dirs.get(i.get('project') or '', '(unknown)')}\n\n"
-              f"{(i['hints'] or '(the PR gave no hints at all: read the PR)')[:4000]}"
-              + (f"\n\nA REWRITE: its previous script was ruled wrong, not the PR. Write one "
-                 f"that avoids this:\n{i['rewrite_brief']}" if i.get("rewrite_brief") else "")
-              for i in items]
-    return (f"{len(items)} shipped PR(s) need a validation script.\n\n"
-            + "\n\n".join(blocks))
-
-
-def context_share(usage: dict[str, Any] | None) -> float | None:
-    """How full the session's window was at the end of a turn"""
-    if not usage:
-        return None
-    peak, window = usage.get("context_peak") or 0, usage.get("context_window") or 0
-    return (peak / window) if peak and window else None
-
-
-def kill_hold(central: CentralStore, state: dict[str, Any], now: float) -> float:
-    """The live hold after MAX_KILLS kills in a row — 0 once it expires or a new release lands"""
-    until = float(state.get("kill_hold_until") or 0)
-    if not until or now >= until:
-        return 0.0
-    # A release restart is the usual cause of the kills AND the usual fix, so it lifts the hold (#1161)
-    if (central.get_state(RELEASE_KEY) or "") != (state.get("kill_hold_release") or ""):
-        return 0.0
-    return until
-
-
-def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = False,
-         dirs: dict[str, Path] | None = None, now: float | None = None,
-         call: Callable[..., Any] | None = None, skip: Collection[str] = ()) -> str:
-    """One pass of Morpheus's session: compact if due, else write scripts if any are wanted"""
-    from . import agent_usage, claude_cli
-
+    if purpose not in SESSION_PROMPTS:
+        raise ValueError(f"no session purpose {purpose!r}: {sorted(SESSION_PROMPTS)}")
+    build, validate = SESSION_PROMPTS[purpose]
     cfg = catalog.os.morpheus
-    now = db.now() if now is None else now
-    if paused:
-        return "paused"
-    call = call or claude_cli.run_session_turn
-    dirs = dirs or {}
-    state = session_state(central)
-    hold = float(state.get("usage_hold_until") or 0)
-    if now < hold:
-        # The account's window is spent: any turn would be refused, so none is attempted (#1171)
-        return "usage_held"
-    if hold:
-        state.pop("usage_hold_until", None)
-    if kill_hold(central, state, now):
-        # Every turn is dying before it answers: retrying each wake only burns resume context
-        return "kill_held"
-    if state.get("kill_hold_until"):
-        if (central.get_state(RELEASE_KEY) or "") != (state.get("kill_hold_release") or ""):
-            # A release lifted it: the count starts over, or one restart re-arms the hold (#52)
-            state["kills"] = 0
-        state.pop("kill_hold_until", None)
-        state.pop("kill_hold_release", None)
-        _save_session(central, state)
-    items = wanting_scripts(central, now=now, skip=skip)
-    if not state.get("compact_due") and not items:
-        return "idle"
-    session_id = state.get("session_id") or str(uuid.uuid4())
-    resume = bool(state.get("turns"))
-    if state.get("compact_due") and resume:
-        prompt, kind, batch = claude_cli.COMPACT_PROMPT, "compact", []
-    else:
-        prompt, kind, batch = build_prompt(items, dirs), "scripts", items
-    add_dirs = sorted({dirs[i["project"]] for i in batch if i.get("project") in dirs})
-    state.update(session_id=session_id, last_turn_ts=now, last_turn_kind=kind,
-                 turn_started_ts=now)
-    # Persisted before the call: this is what another process reads as "a turn is in flight"
-    _save_session(central, state)
+    call = call or claude_cli.run_headless_result
     try:
-        result = call(prompt, session_id, resume=resume, cwd=cwd, model=cfg.model,
-                      append_system_prompt=MORPHEUS_PERSONA,
-                      permission_mode=catalog.os.default_permission_mode,
-                      add_dirs=add_dirs, timeout=cfg.turn_timeout_seconds,
-                      previous=state.get("last_usage") if resume else None)
+        result = call(build(item), MORPHEUS_PERSONA, model=cfg.model, cwd=cwd,
+                      timeout=cfg.turn_timeout_seconds, tools=SESSION_TOOLS,
+                      records_itself=agent_usage.MORPHEUS,
+                      permission_mode=catalog.os.default_permission_mode, persist=True)
     except claude_cli.UsageLimitError as e:
-        # BEFORE ClaudeCliError, its base: the window refused the call, so it costs no offer (#1171)
+        # BEFORE ClaudeCliError, its base: the window is the account's, so it holds every order
         from .worker_session import RATE_LIMIT_FALLBACK_DELAY
 
-        state.pop("turn_started_ts", None)
-        state["last_error"] = str(e)[:500]
-        state["usage_limits"] = int(state.get("usage_limits") or 0) + 1
-        state["usage_hold_until"] = e.limit.reset_at or now + RATE_LIMIT_FALLBACK_DELAY
-        if not resume:
-            state.pop("session_id", None)
-        _save_session(central, state)
-        log.warning("morpheus turn refused by the usage window, held until %s: %s",
-                    state["usage_hold_until"], e)
-        return "usage_limit"
-    except claude_cli.KilledError as e:
-        # BEFORE ClaudeCliError, its base: a kill is not an answer, so it costs no offer (#1161)
-        state.pop("turn_started_ts", None)
-        state["last_error"] = str(e)[:500]
-        state["kills"] = kills = int(state.get("kills") or 0) + 1
-        if not resume:
-            state.pop("session_id", None)
-        if kills >= MAX_KILLS:
-            state["kill_hold_until"] = now + KILL_HOLD_SECONDS
-            state["kill_hold_release"] = central.get_state(RELEASE_KEY) or ""
-            state["last_error"] = f"held after {kills} killed turns in a row: {str(e)[:400]}"
-            central.add_inbox(
-                project=_os_project(catalog), level="warning",
-                title=f"Morpheus held after {kills} killed turns in a row",
-                body="No session turn answered, so no PR gets a validation script. It retries "
-                     f"when the next release deploys, or in {KILL_HOLD_SECONDS // 3600}h.\n"
-                     "jarvis morpheus status")
-            log.warning("morpheus held after %s killed turns in a row: %s", kills, e)
-        else:
-            log.warning("morpheus turn killed before it answered: %s", e)
-        _save_session(central, state)
-        return "killed"
+        central.set_state(USAGE_HOLD_KEY,
+                          str(e.limit.reset_at or db.now() + RATE_LIMIT_FALLBACK_DELAY))
+        log.warning("morpheus %s %s refused by the usage window: %s", purpose, item["id"], e)
+        raise
+    except claude_cli.KilledError:
+        raise
     except claude_cli.ClaudeCliError as e:
-        state.pop("turn_started_ts", None)
-        state["last_error"] = str(e)[:500]
-        state["errors"] = int(state.get("errors") or 0) + 1
-        if not resume:
-            # The CLI may have half-created the session: the next first turn mints a fresh id
-            state.pop("session_id", None)
-        _mark_offered(state, batch, now, error=True)
-        _save_session(central, state)
-        log.warning("morpheus turn failed: %s", e)
-        return "error"
-    state.pop("turn_started_ts", None)
-    agent_usage.record(agent_usage.MORPHEUS, usage=result, label=kind,
-                       session_id=session_id, store=central)
-    # The cumulative reading the next resumed turn subtracts (#1462)
-    if isinstance(result.usage, dict) and isinstance(result.usage.get("reported"), dict):
-        state["last_usage"] = {"usage_v": result.usage.get("usage_v"),
-                               "reported": result.usage["reported"]}
-    state["turns"] = int(state.get("turns") or 0) + 1
-    state["last_error"] = ""
-    state["kills"] = 0
-    state.pop("kill_hold_until", None)
-    state.pop("kill_hold_release", None)
-    share = context_share(result.usage)
-    if kind == "compact":
-        state["compactions"] = int(state.get("compactions") or 0) + 1
-        state["compact_due"] = False
-    else:
-        _mark_offered(state, batch, now)
-        state["last_reply"] = (result.text or "")[:2000]
-        state["compact_due"] = share is not None and share >= cfg.compact_at
-    if share is not None:
-        state["context_share"] = round(share, 4)
-        state["context_peak"] = (result.usage or {}).get("context_peak")
-        state["context_window"] = (result.usage or {}).get("context_window")
-    _save_session(central, state)
-    return kind
+        log.warning("morpheus %s %s failed: %s", purpose, item["id"], e)
+        return None
+    reply = structured.coerce(result.text or "", validate, on_invalid=lambda _raw: None)
+    agent_usage.record(agent_usage.MORPHEUS, usage=result, wo_id=item["id"],
+                       project=item.get("project") or "", label=purpose,
+                       session_id=result.session_id, ok=reply is not None, store=central)
+    if result.session_id:
+        central.update_morpheus_item(item["id"], last_session_id=result.session_id)
+    return reply
+
+
+def owed_arming(central: CentralStore, *, now: float | None = None,
+                skip: Collection[str] = ()) -> list[dict[str, Any]]:
+    """Queued orders owed an arming session now, oldest first (§1.3)"""
+    now = db.now() if now is None else now
+    return [i for i in reversed(central.morpheus_items(("queued",)))
+            if (i["project"] or "") not in skip
+            and int(i["attempts"] or 0) < MAX_OFFERS
+            and now - float(i["last_attempt_ts"] or 0) >= REOFFER_SECONDS]
+
+
+def arm(central: CentralStore, catalog: Catalog, cwd_for: CwdFor, *,
+        now: float | None = None, call: Callable[..., Any] | None = None,
+        skip: Collection[str] = ()) -> dict[str, int]:
+    """One session per owed order, one at a time, so the shared system prompt stays cached"""
+    from . import claude_cli
+
+    now = db.now() if now is None else now
+    if central.get_state("morpheus.session"):
+        # The long-lived session's record: its offers moved into the rows at migration (§2)
+        central.set_state("morpheus.session", "")
+    if pause_state(central)["paused"]:
+        return {"paused": 1}
+    if usage_hold_until(central, now):
+        return {"usage_held": 1}
+    out = {"armed": 0, "refused": 0, "failed": 0, "killed": 0}
+    for item in owed_arming(central, now=now, skip=skip):
+        try:
+            reply = run_session(central, catalog, item, purpose="arm",
+                                cwd=_cwd(cwd_for, item), call=call)
+        except claude_cli.UsageLimitError:
+            out["usage_held"] = 1
+            break
+        except claude_cli.KilledError as e:
+            out["killed"] += 1
+            kills = int(item["kills"] or 0) + 1
+            # A kill is no answer, so it costs no attempt; MAX_KILLS in a row cost one (kn-1e43fe1a)
+            if kills >= MAX_KILLS:
+                central.update_morpheus_item(item["id"], kills=0, last_attempt_ts=now,
+                                             attempts=int(item["attempts"] or 0) + 1)
+            else:
+                central.update_morpheus_item(item["id"], kills=kills)
+            log.warning("morpheus arm %s killed before it answered: %s", item["id"], e)
+            continue
+        if reply is None or "refuse" in reply:
+            out["failed" if reply is None else "refused"] += 1
+            fields: dict[str, Any] = {"attempts": int(item["attempts"] or 0) + 1,
+                                      "last_attempt_ts": now}
+            if reply is not None:
+                fields.update(kills=0, resolution=f"arming refused: {reply['refuse'][:600]}")
+            central.update_morpheus_item(item["id"], **fields)
+            continue
+        user = (item["script_source"] == "user"
+                and reply["script"].strip() == (item["script"] or "").strip())
+        set_script(central, item["id"], reply["script"], "user" if user else "agent")
+        central.update_morpheus_item(item["id"], kills=0, last_attempt_ts=now)
+        out["armed"] += 1
+    return out
 
 
 def set_pause(central: CentralStore, mode: str | None, reason: str = "",
@@ -1100,7 +1043,7 @@ def set_pause(central: CentralStore, mode: str | None, reason: str = "",
 
 
 def pause_state(central: CentralStore) -> dict[str, Any]:
-    """Morpheus's override, the fleet's pause, and whether session turns are held"""
+    """Morpheus's override, the fleet's pause, and whether sessions are held"""
     from . import fleet
 
     try:
@@ -1115,68 +1058,25 @@ def pause_state(central: CentralStore) -> dict[str, Any]:
             "since": pin.get("since"), "fleet_paused": fleet_paused}
 
 
-def _mark_offered(state: dict[str, Any], items: list[dict], now: float,
-                  error: bool = False) -> None:
-    offers = state.setdefault("offers", {})
-    for item in items:
-        seen = offers.get(item["id"]) or {}
-        offers[item["id"]] = {"n": int(seen.get("n") or 0) + 1, "ts": now,
-                              "cause": "error" if error else "offer"}
-
-
-def _offer_cause(seen: dict[str, Any]) -> str | None:
-    """None for an entry written before the cause was recorded — unknown, not "an offer" (#1171)"""
-    if seen.get("cause"):
-        return str(seen["cause"])
-    if "error" in seen:
-        return "error" if seen["error"] else "offer"
-    return None
-
-
-def activity(central: CentralStore, *, timeout: float | None = None,
-             now: float | None = None) -> dict[str, Any]:
-    """What the session is DOING — never its pause mode: in flight, idle, or holding items back"""
-    from .catalog import MorpheusConfig
-
+def activity(central: CentralStore, *, now: float | None = None) -> dict[str, Any]:
+    """What Morpheus is doing, from the rows and the hold — there is no session (§1.3)"""
     now = db.now() if now is None else now
-    state = session_state(central)
-    offers = state.get("offers") or {}
-    limit = float(timeout or MorpheusConfig().turn_timeout_seconds)
-    started = float(state.get("turn_started_ts") or 0)
-    # A marker older than the turn's own timeout is a crashed daemon, not work in flight
-    in_flight = bool(started) and now - started <= limit
-    held = []
-    for item in central.morpheus_items(("queued",)):
-        seen = offers.get(item["id"]) or {}
-        n, ts = int(seen.get("n") or 0), float(seen.get("ts") or 0)
-        if n >= MAX_OFFERS:
-            held.append({"id": item["id"], "offers": n, "next_offer_ts": None,
-                         "exhausted": True, "cause": _offer_cause(seen)})
-        elif now - ts < REOFFER_SECONDS:
-            held.append({"id": item["id"], "offers": n, "next_offer_ts": ts + REOFFER_SECONDS,
-                         "exhausted": False, "cause": _offer_cause(seen)})
-    usage_hold = float(state.get("usage_hold_until") or 0)
-    return {"usage_hold_until": usage_hold if now < usage_hold else None,
-            "kill_hold_until": kill_hold(central, state, now) or None,
-            "kills": int(state.get("kills") or 0), "max_kills": MAX_KILLS,
-            "turn_in_flight": in_flight, "turn_kind": state.get("last_turn_kind") or "",
-            "turn_started_ts": started if in_flight else None,
-            "abandoned_turn_ts": started if started and not in_flight else None,
-            "due": len(wanting_scripts(central, now=now)),
-            "held": held, "max_offers": MAX_OFFERS}
+    hold = usage_hold_until(central, now)
+    owed_arm, owed_judge = len(owed_arming(central, now=now)), len(owed_actions(central))
+    state = ("paused" if pause_state(central)["paused"] else "usage_held" if hold
+             else "arming" if owed_arm else "judging" if owed_judge else "idle")
+    return {"state": state, "owed_arm": owed_arm, "owed_judge": owed_judge,
+            "usage_hold_until": hold, "max_offers": MAX_OFFERS}
 
 
 # -- what the surfaces read
 
 def report(central: CentralStore, catalog: Catalog | None = None) -> dict[str, Any]:
-    """Counts first, then the session, then every item"""
-    state = session_state(central)
-    state.pop("offers", None)
+    """Counts first, then what Morpheus is doing, then every item"""
     pause = pause_state(central)
-    timeout = catalog.os.morpheus.turn_timeout_seconds if catalog else None
     return {"enabled": bool(catalog.os.morpheus.enabled) if catalog else None,
             "counts": {s: central.morpheus_counts().get(s, 0) for s in STATES},
-            "session": state, "paused": pause["paused"], "pause": pause,
-            "activity": activity(central, timeout=timeout),
+            "paused": pause["paused"], "pause": pause,
+            "activity": activity(central),
             "last_release": central.get_state(RELEASE_KEY) or "",
             "items": central.morpheus_items()}
