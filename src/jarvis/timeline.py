@@ -397,6 +397,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return (f"Assumption #{p.get('n')} left with you{why}",
                 p.get("reason") or "no reason recorded")
     if kind == "autoreview_held":
+        if p.get("early"):
+            # Held by the early pass while the worker works: nothing is owed yet (#1482)
+            return (f"Assumption #{p.get('n')} goes to review on delivery — the OS "
+                    f"will not decide it",
+                    p.get("reason") or "no reason recorded")
         return (f"The OS would not decide assumption #{p.get('n')}",
                 p.get("reason") or "no reason recorded")
     # ...and the early pass's five (docs/superpowers/specs/2026-09-23-an-assumption-...

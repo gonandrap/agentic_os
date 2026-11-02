@@ -6269,14 +6269,14 @@ class Daemon:
                                                  confirm(), confirm)
                 if not decision.armed:
                     self._note_autoreview_held(store, wo["id"], decision,
-                                               suppress=suppress)
+                                               suppress=suppress, early=early)
                     continue
                 # THE SECOND GATE, over the TEXTS rather than the row (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md)
                 evidence_ok = autoreview.decide_evidence(
                     a, summary=str(wo.get("result_summary") or ""))
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
-                                               suppress=suppress)
+                                               suppress=suppress, early=early)
                     continue
                 try:
                     autoreview.propose_confirmation(store, neo_store, project.name, wo,
@@ -6302,7 +6302,7 @@ class Daemon:
             decision = self._stakes_reviewed(project, store, wo, cfg, a, judge(), judge)
             if not decision.armed:
                 self._note_autoreview_held(store, wo["id"], decision,
-                                           suppress=suppress)
+                                           suppress=suppress, early=early)
                 if (not early and decision.code == autoreview.HELD_HIGH_STAKES
                         and (not linked or linked in dead_questions)):
                     # Neo ADVISES on a high-stakes hold; the user still decides (wo-6d90354c)
@@ -6392,24 +6392,29 @@ class Daemon:
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
                               decision: Any, *, settling: bool = False,
-                              suppress: tuple[str, ...] | None = None) -> None:
+                              suppress: tuple[str, ...] | None = None,
+                              early: bool = False) -> None:
         """Record ONCE, per (assumption, reason), that the OS declined to decide"""
         if not settling and decision.code in (suppress or ()):
             return
         # THE ROUND IS PART OF THE KEY, and the hold that needs it is `panel_gave_up`: two consecutive... (#975)
+        # `early` too: the delivery pass's hold is news after the early pass's (#1482)
         key = (int(decision.assumption_id or 0), str(decision.code or ""),
-               int(decision.round or 0), str(decision.reason or ""))
+               int(decision.round or 0), str(decision.reason or ""), early)
         if not _hold_is_news(store, wo_id, "autoreview_held", key,
                              lambda p: (int(p.get("assumption_id") or 0),
                                         str(p.get("code") or ""),
                                         int(p.get("round") or 0),
-                                        str(p.get("reason") or ""))):
+                                        str(p.get("reason") or ""),
+                                        bool(p.get("early")))):
             return
         store.add_event(wo_id, "autoreview_held", {
             "code": decision.code, "reason": decision.reason,
             "assumption_id": decision.assumption_id, "n": decision.n,
             # What the freshness check at the read side compares against the current round
-            "round": decision.round})
+            "round": decision.round,
+            # Held while the worker still works: the user meets it on delivery (#1482)
+            **({"early": True} if early else {})})
 
     def _deliver_assumption_verdict(self, central: CentralStore, neo_store: Any,
                                     pstore: ProjectStore | None, q: dict,

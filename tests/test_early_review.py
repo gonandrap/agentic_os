@@ -307,6 +307,29 @@ def test_a_high_stakes_assumption_mid_run_is_never_asked_about_at_all(started):
     assert held["code"] == autoreview.HELD_HIGH_STAKES
 
 
+def test_an_early_high_stakes_hold_does_not_read_as_a_user_ask(started, catalog_file):
+    """Issue 1482: a working order's hold is the user's on delivery, not now"""
+    from jarvis import timeline
+
+    for key in ("validation.enabled", "validation.auto_review"):
+        ops.set_config(key, True, project="proj_a", reason="fixture",
+                       catalog_path=str(catalog_file))
+    store, wo = running(started, assumptions=(
+        "used the live production credentials in the smoke test",))
+    store.create_turn(wo["id"], "dispatch", "go")
+
+    ask(started, store)
+
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["early"] is True
+    label, _ = timeline._describe("autoreview_held", held)
+    assert label == ("Assumption #1 goes to review on delivery — the OS will not "
+                     "decide it")
+    wait = ops.waiting_on(store, store.get_work_order(wo["id"]))
+    assert wait["what"] == "turn_running"
+    assert wait["detail"].endswith("; 1 assumption(s) go to review on delivery")
+
+
 def test_the_early_pass_never_touches_a_confirmation_link(started):
     """§10.5 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-..."""
     store, wo = running(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
