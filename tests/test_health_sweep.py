@@ -1337,6 +1337,57 @@ def test_a_dead_dependency_is_still_judged(stuck_os, how):
     assert verdict.stuck is True and verdict.excluded == ""
 
 
+def test_a_dependency_just_completed_is_not_stuck_before_dispatch(stuck_os):
+    """§2.4 (issue 1490): the held seconds are discounted, so the exclusion lapsing is no verdict"""
+    store = stuck_os["store"]
+    dep = ops.create_work_order("proj_a", "the dependency")
+    child = ops.create_work_order("proj_a", "waiting as --depends-on designed",
+                                  depends_on=[dep["id"]])
+    park_order(store, dep["id"], "running", hours=5.1)
+    park_order(store, child["id"], "pending", hours=5)
+    store.set_status(dep["id"], "completed")  # 24s gap: the daemon has not claimed the child
+
+    verdict = _judge(stuck_os, child["id"])
+    assert verdict.excluded == ""
+    assert verdict.stuck is False, verdict.reason
+
+
+def test_a_dead_edge_beside_a_live_one_gets_no_discount(stuck_os):
+    """§2.3 holds over §2.4: the live edge's hold is moot while a dead one stands"""
+    store = stuck_os["store"]
+    dead = ops.create_work_order("proj_a", "the edge that can never clear")
+    live = ops.create_work_order("proj_a", "the live edge")
+    child = ops.create_work_order("proj_a", "blocked on a dead edge",
+                                  depends_on=[dead["id"], live["id"]])
+    park_order(store, live["id"], "running", hours=6)
+    park_order(store, dead["id"], "cancelled", hours=6)
+    park_order(store, child["id"], "pending", hours=5)
+
+    verdict = _judge(stuck_os, child["id"])
+    assert verdict.stuck is True and verdict.excluded == ""
+
+
+def test_dependency_hold_spans_walk_each_timeline_and_clip():
+    """§2.4: pure over `state_spans` rows; satisfied and dead spans hold nothing"""
+    from jarvis.project_store import dependency_hold_spans
+
+    def tl(*steps):
+        return [{"ts": ts, "to_status": s} for ts, s in steps]
+
+    assert dependency_hold_spans([tl((50.0, "pending"), (150.0, "completed"))],
+                                 100.0, 200.0) == [(100.0, 150.0)]
+    assert dependency_hold_spans([tl((50.0, "running"))], 100.0, 200.0) == [(100.0, 200.0)]
+    assert dependency_hold_spans([tl((120.0, "running"), (140.0, "cancelled"))],
+                                 100.0, 200.0) == [(120.0, 140.0)]
+    assert dependency_hold_spans([tl((50.0, "running"), (80.0, "completed"))],
+                                 100.0, 200.0) == []
+    # One timeline per edge, all returned — the union is `union_seconds`' job
+    assert dependency_hold_spans([tl((110.0, "running"), (160.0, "completed")),
+                                  tl((130.0, "pending"))], 100.0, 200.0) == [
+        (110.0, 160.0), (130.0, 200.0)]
+    assert dependency_hold_spans([], 100.0, 200.0) == []
+
+
 def test_pending_with_no_dependencies_is_still_stuck(stuck_os):
     """§2.2: the exclusion is the EDGES, not the status"""
     store = stuck_os["store"]

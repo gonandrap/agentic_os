@@ -89,6 +89,17 @@ if dependency_is_dead(dep)]` — behaviour identical, callers
 the same predicate. Two copies of "dead" could drift apart and leave an order both
 excluded from the sweep and flagged dead, which is the one incoherent outcome.
 
+### 2.4 The discount — `project_store.dependency_hold_spans` (issue 1490)
+
+`pending` is judged on time in status, so §2.2's exclusion alone lapses the instant the
+last edge completes with the whole wait still on the clock (kn-0a222b38), and the first
+sweep before dispatch buys an investigation. The pure `dependency_hold_spans` walks each
+current dependency's `state_spans` timeline (kn-8cac5855: no new column) and returns every
+interval inside `[since, now]` it sat outside `completed` and the dead statuses.
+`stuck_scan` unions them into `discounted` via `holds.union_seconds`, never a sum. No
+discount while any current edge is dead: that order can never dispatch, so §2.3 keeps it
+judged. Dead and satisfied spans hold nothing.
+
 ## 3. Out of scope
 
 - `true_blockers`' deliberate silence on live ordinary blocking. Unchanged — an excluded

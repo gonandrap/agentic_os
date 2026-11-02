@@ -8760,7 +8760,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
                                 UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                plan_hold_spans, precondition_hold_spans,
+                                dependency_hold_spans, plan_hold_spans,
+                                precondition_hold_spans,
                                 validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -8828,14 +8829,19 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             pre_held = bool(pstore.open_preconditions(wo["id"]))
             pre_spans = precondition_hold_spans(
                 pstore.preconditions_of(wo["id"]), since, now)
+        # §2.2 and §2.4 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
+        edges, dep_spans = [], []
+        if wo["status"] == "pending":
+            edges = pstore.unfinished_dependencies(wo["id"])
+            # One dead edge and the order can never dispatch: no live edge holds it (§2.3)
+            if not any(invariants.dependency_is_dead(dep) for dep in edges):
+                dep_spans = dependency_hold_spans(
+                    [pstore.state_spans(d) for d in pstore.dependencies(wo)], since, now)
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
             + ci_spans + base_red_spans + plan_spans + automerge_spans
-            + budget_spans + pre_spans)
-        # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
-        edges = (pstore.unfinished_dependencies(wo["id"])
-                 if wo["status"] == "pending" else [])
+            + budget_spans + pre_spans + dep_spans)
         live_edges = bool(edges) and not any(
             invariants.dependency_is_dead(dep) for dep in edges)
         # IS THIS MANAGER WAITING CORRECTLY? (#1008)

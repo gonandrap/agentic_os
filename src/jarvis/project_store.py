@@ -188,6 +188,22 @@ def precondition_hold_spans(rows: Iterable[Any], since: float,
     return sorted(spans)
 
 
+def dependency_hold_spans(timelines: Iterable[Sequence[Any]], since: float,
+                          now: float) -> list[tuple[float, float]]:
+    """Live-edge hold spans (§2.4 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md)"""
+    settled = (DEPENDENCY_SATISFIED_STATUS, *DEPENDENCY_DEAD_STATUSES)
+    spans: list[tuple[float, float]] = []
+    for rows in timelines:
+        for i, row in enumerate(rows):
+            if str(row["to_status"]) in settled:
+                continue  # satisfied, or dead and so still judged (§2.3)
+            start = max(float(row["ts"]), since)
+            end = min(float(rows[i + 1]["ts"]) if i + 1 < len(rows) else now, now)
+            if end > start:
+                spans.append((start, end))
+    return sorted(spans)
+
+
 # What one seat proposed
 VALIDATION_VERDICTS = ("pass", "reject", "")
 # ...and whether that seat's opinion is usable at all
