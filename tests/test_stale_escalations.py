@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from jarvis import gates, ops
@@ -423,6 +425,52 @@ def test_a_review_with_no_delivery_between_leaves_the_question_open(worker_quest
     """The other boundary of the same predicate: a verdict with NO `finished` between it and the question..."""
     wo, q = worker_question
     event_at(store, wo["id"], "reviewed", q["ts"] + 20, {"accepted": True})
+
+    violations = [v for v in check_project(store, repair=True)
+                  if v.invariant == "INV-NEO-ESCALATION-STALE"]
+
+    assert violations == []
+    assert question(neo, q["id"])["status"] == "escalated"
+
+
+def _gate_question(store, neo, status: str, text: str = "") -> tuple[dict, dict]:
+    wo = store.create_work_order(title="the release", description="")
+    gate = store.add_approval(wo["id"], "release", "./scripts/shipit.sh")
+    if status != "pending":
+        store.decide_approval(gate["id"], verdict=status, reason="ok", decided_by="neo")
+    store.conn.commit()
+    q = neo.ask("proj_a", wo["id"],
+                text or f"[Gate {gate['id']}] Approve release gate {gate['id']}?")
+    neo.mark(q["id"], "escalated", reason="the user must rule")
+    return gate, question(neo, q["id"])
+
+
+def test_a_question_asking_for_a_verdict_on_a_decided_gate_settles(store, neo):
+    """Issue 1388: the worker asked the user to approve a gate Neo had already approved"""
+    gate, q = _gate_question(store, neo, "approved")
+
+    violations = [v for v in check_project(store, repair=True)
+                  if v.invariant == "INV-NEO-ESCALATION-STALE"]
+
+    assert [v.context["question_id"] for v in violations] == [q["id"]]
+    closed = question(neo, q["id"])
+    assert (closed["status"], closed["answered_by"]) == ("answered", "os")
+    assert f"gate {gate['id']} is already approved by neo" in closed["answer"]
+    # Neo's ruling: a text match can be wrong, so it is on the record
+    [event] = store.events_of_kind(q["wo_id"], "question_superseded_by_gate")
+    assert json.loads(event["payload"])["approval_id"] == gate["id"]
+
+
+@pytest.mark.parametrize("status,text", [
+    ("pending", ""),
+    # Names the gate but asks for no verdict
+    ("approved", "Gate {n} went through; should the changelog list the fix?"),
+])
+def test_a_gate_question_that_is_still_open_or_asks_no_verdict_stays(store, neo,
+                                                                     status, text):
+    wo = store.create_work_order(title="probe", description="")
+    n = store.add_approval(wo["id"], "release", "x")["id"] + 1
+    _, q = _gate_question(store, neo, status, text.format(n=n))
 
     violations = [v for v in check_project(store, repair=True)
                   if v.invariant == "INV-NEO-ESCALATION-STALE"]
