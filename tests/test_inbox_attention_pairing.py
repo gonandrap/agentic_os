@@ -162,3 +162,18 @@ def test_the_dashboard_says_the_same(started, store):
     assert cli.INBOX_LIST_NOTE in html.unescape(c.get("/inbox").text)
     assert c.post("/inbox/ack", data={"inbox_id": str(item["id"])}).status_code == 303
     assert not store.get_work_order(item["wo_id"])["needs_attention"]
+
+
+def test_assumptions_pending_review_reach_the_inbox_once(started, store):
+    """Issue #244: the flag alone reaches nobody; one paired notice per raise"""
+    wo = store.create_work_order(title="t", description="d", origin="jarvis")
+    store.set_status(wo["id"], "running")
+    store.add_assumption(wo["id"], "assumed the schema is stable")
+
+    assert ops.land_when_cleared(store, store.get_work_order(wo["id"])) == "needs_review"
+    ops.flag_assumptions_pending(store, wo["id"])
+
+    items = route(started, store)
+    assert [i["wo_id"] for i in items] == [wo["id"]]
+    assert "1 assumption" in items[0]["title"]
+    assert store.get_work_order(wo["id"])["attention_reason"] == ops.ASSUMPTIONS_PENDING_REASON

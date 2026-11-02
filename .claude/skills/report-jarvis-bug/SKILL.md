@@ -75,10 +75,13 @@ UNTRUE — not how irritating it was.
 rubric. Claim one honestly when it fits; a downgrade costs nothing but the
 disagreement, which is a signal the user wants.
 
-**Filing is all you do.** Whatever the priority, the OS dispatches no work order and
-cuts no release off your report: the issue waits on the tracker until the user runs
-`jarvis issues start <issue-url>`. NEVER pass `--expedite` — expediting is the user's
-call, and from a work-order session the OS ignores it and says so.
+**Reporting is all you do; the OS does the rest.** From a work-order session the OS
+files the issue and hands it to the steward at every priority (after Neo settles a
+`critical`/`blocker` claim): the steward starts a fix now on the bug ledger, asks
+the user once that ledger is spent, or drops it (a `low` is dropped as minor). Never open an issue yourself
+(`gh issue create`) and never start one with `jarvis issues start`: an issue the OS did
+not file reaches nobody. NEVER pass `--expedite` — expediting is the user's call, and
+from a work-order session the OS ignores it and says so.
 
 The running Jarvis OS version, your project and your work order id are attached
 automatically — do not put them in the text.

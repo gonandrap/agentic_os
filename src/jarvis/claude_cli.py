@@ -391,6 +391,9 @@ def stop_session(bg_id: str) -> bool:
 #: `agents --json` `status` of a session with nothing left to do; anything else is `busy`
 BG_IDLE = "idle"
 
+#: `agents --json` `state` of a session whose turn is over; a task in flight reads `working` (fact 10)
+BG_DONE = "done"
+
 #: How long `stop_bg` waits for the process to leave the roster before giving up
 BG_STOP_WAIT_SECONDS = 15.0
 

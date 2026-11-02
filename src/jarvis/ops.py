@@ -2495,6 +2495,26 @@ def fix_flag_notice(flag: str) -> str | None:
     return FIX_FLAG_NOTICES.get(flag)
 
 
+ASSUMPTIONS_PENDING_REASON = "assumptions pending review"
+
+
+def flag_assumptions_pending(store: ProjectStore, wo_id: str) -> None:
+    """Flag AND notify: the flag reaches only who already looks (issue #244)"""
+    row = store.get_work_order(wo_id) or {}
+    already = (row.get("needs_attention")
+               and row.get("attention_reason") == ASSUMPTIONS_PENDING_REASON)
+    store.flag_attention(wo_id, ASSUMPTIONS_PENDING_REASON)
+    if already:
+        return
+    n = sum(1 for a in store.all_assumptions(wo_id) if a["status"] == "pending")
+    store.add_notification(
+        title=f"{wo_id} is waiting on your review of {n} assumption{'s' if n != 1 else ''}",
+        body=f"{row.get('title') or ''}\n"
+             f"Read them: jarvis wo show {wo_id}\n"
+             f"Decide: jarvis wo review {wo_id} [--reject] --feedback \"…\"",
+        level="warning", wo_id=wo_id, source="assumptions", paired=True)
+
+
 #: Words that carry no decision; `test` is absent on purpose — real assumptions name tests (issue 1097)
 _FILLER_WORDS = frozenset({"probe", "probing", "dummy", "placeholder", "filler",
                            "foo", "bar", "baz", "lorem", "ipsum", "asdf", "xxx"})
@@ -2540,7 +2560,7 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
                                 if cited else {}))
         # An investigator's call is its diagnosis's audit trail, reviewed by nobody
         if kind_contract(wo).assumptions_reviewed and not neo_reviews_later(store, wo):
-            store.flag_attention(wo_id, "assumptions pending review")
+            flag_assumptions_pending(store, wo_id)
     finally:
         store.close()
     md = path / "ASSUMPTIONS.md"
@@ -4491,7 +4511,7 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
     wo_id = wo["id"]
     if invariants.reviewable_assumptions(store, wo):
         store.set_status(wo_id, "needs_review")
-        store.flag_attention(wo_id, "assumptions pending review")
+        flag_assumptions_pending(store, wo_id)
         return "needs_review"
     if not refusal_answered(store, wo_id):
         # The flag and the guidance are `review_work_order`'s
@@ -7531,7 +7551,22 @@ def steward_dispatchers() -> dict[str, Any]:
 
     return {"panel": reoffer_panel_follow_up, "worker_io": reoffer_improvement_order,
             "remedy": remedies.reoffer_file_work_order, "neo_rider": reoffer_neo_cleanup,
-            "io_finding": reoffer_io_finding}
+            "io_finding": reoffer_io_finding, "bug_agent": reoffer_bug_filing}
+
+
+def reoffer_bug_filing(row: Mapping[str, Any], candidate: Any, decision: Any) -> str:
+    """Start a filed bug's queued fix the steward now has room for (`steward.drain`, wo-b59a21b1)"""
+    from . import issues, steward
+
+    held = dict(candidate.payload or {})
+    spec = _spec_or_none(candidate.project)
+    if spec is None:
+        raise OpsError(f"project {candidate.project!r} is not in the catalog")
+    if not held.get("issue_url"):
+        raise OpsError("the queued decision kept no issue url")
+    return issues.promote_confirmed(
+        spec, held, metadata=steward.stamped({}, decision), budget_usd=decision.budget_usd,
+        why=issues.steward_why(held))
 
 
 def list_improvement_orders(project_name: str | None = None,

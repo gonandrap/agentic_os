@@ -938,8 +938,8 @@ def _poll_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
         if cap is not None:
             claude_cli.stop_bg(entry.id)
             return _reap_bg(store, wo, turn, entry, project_name, budget_cap=cap)
-        if _parked_on_message(store, wo, turn):
-            # ...unless parked on a queued message; `_reap_bg` stops it (issue #1400)
+        if _parked_on_message(store, wo, turn) or _busy_but_done(store, wo, turn, entry):
+            # ...unless parked on a queued message (#1400) or done with no task (#1476); `_reap_bg` stops it
             return _reap_bg(store, wo, turn, entry, project_name)
         return None
     answered = _bg_answered(wo, turn)
@@ -955,8 +955,20 @@ def _parked_on_message(store: ProjectStore, wo: dict[str, Any],
     """Quiet since its `Stop` with a message queued: busy only on a leftover task (#1400)"""
     if not store.queued_messages(wo["id"]):
         return False
+    return _quiet_since_stop(store, wo, turn, BG_PARKED_QUIET)
+
+
+def _busy_but_done(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
+                   entry: claude_cli.BgEntry) -> bool:
+    """`busy` with `state: done` and quiet since its `Stop`: settled, a stale status (#1476)"""
+    return entry.state == claude_cli.BG_DONE and _quiet_since_stop(store, wo, turn, BG_IDLE_GRACE)
+
+
+def _quiet_since_stop(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
+                      quiet: float) -> bool:
+    """This turn's `Stop` fired over `quiet` seconds ago and no API call came after it"""
     stopped_at = _last_stop_at(store, wo["id"], turn)
-    if stopped_at is None or time.time() - stopped_at < BG_PARKED_QUIET:
+    if stopped_at is None or time.time() - stopped_at < quiet:
         return False
     try:
         calls = usage.session_calls(str(wo.get("session_id") or ""))
