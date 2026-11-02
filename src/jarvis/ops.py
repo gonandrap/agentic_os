@@ -3384,7 +3384,7 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = {**newest, "resolved_status": status,
                       "resolved_decider": assumption_decider(row or {})}
     line = _autoreview_line(newest)
-    # The newest event names ONE assumption, whatever its kind: name every other one still owed by the user (#1470)
+    # The newest event names ONE assumption: name every other one still owed by the user (#1470)
     held = newest.get("held") if isinstance(newest.get("held"), list) else []
     named = {int(h.get("n") or 0) for h in held} | {int(newest.get("n") or 0)}
     others = [n for n in _owed_pending(store, wo["id"], stale) if n not in named]
