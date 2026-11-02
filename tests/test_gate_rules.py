@@ -609,13 +609,24 @@ def test_a_shell_invoker_in_executable_position_still_scans_the_command_whole():
         assert classify(command, gate_rules.RuleSet.from_seeds()) is not None, command
 
 
-@pytest.mark.parametrize("command", [
-    'ssh prod "bash scripts/shipit.sh"',
-    '"bash" -c "gh pr merge 31"',
-])
-def test_a_wrapper_whose_payload_names_no_invoker_was_never_gated(command):
-    """These two look like the positional test lost them"""
-    assert classify(command, gate_rules.RuleSet.from_seeds()) is None
+@pytest.mark.parametrize("path", ["scripts/shipit.sh", '"scripts/shipit.sh"',
+                                  "'scripts/shipit.sh'"])
+def test_a_quote_inside_a_heredoc_body_is_body_text_not_a_blankable_span(path):
+    """Issue #208: quoting the path in a body piped into a shell hid it"""
+    command = f"cat <<'EOF' | bash\n{path}\nEOF"
+    assert "shipit" in gate_rules.scannable(command)
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
+
+
+def test_a_stray_quote_in_a_heredoc_body_cannot_swallow_the_code_after_it():
+    """A body quote must not pair with one past the terminator (#208)"""
+    command = "cat <<'EOF' > notes.md\nit's fine\nEOF\n./scripts/shipit.sh 'x'"
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
+
+
+def test_a_quoted_interpreter_name_was_never_gated():
+    """Looks like the positional test lost it: a quote sits where `_SHELL_INVOKER` needs whitespace"""
+    assert classify('"bash" -c "gh pr merge 31"', gate_rules.RuleSet.from_seeds()) is None
 
 
 @pytest.mark.parametrize("command", [
@@ -630,23 +641,43 @@ def test_a_substitution_gates_however_it_is_quoted(command):
 
 
 @pytest.mark.parametrize("command", [
+    'ssh prod "bash scripts/shipit.sh"',
     'ssh prod "sh -c \'scripts/shipit.sh\'"',
     'ssh prod "eval scripts/shipit.sh"',
     'docker exec c "bash -c \'scripts/shipit.sh\'"',
+    'ssh prod "scripts/shipit.sh"',
+    'ssh -p 22 prod "gh pr merge 31"',
+    'docker exec -it c "scripts/shipit.sh"',
+    'sudo podman exec c \'scripts/shipit.sh\'',
+    'kubectl -n prod exec pod -- sh -c "scripts/shipit.sh"',
+    'docker compose exec web "scripts/shipit.sh"',
 ])
-def test_a_wrapper_that_executes_its_quoted_payload_is_a_known_miss(command):
-    """Issue #213, asserted as the miss it is rather than left unexamined"""
-    assert classify(command, gate_rules.RuleSet.from_seeds()) is None
+def test_a_wrapper_that_executes_its_quoted_payload_gates(command):
+    """Issue #213: ssh and container exec hand their quoted payload to a shell"""
+    assert gate_rules.scannable(command) == command
+    assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
 
 
 @pytest.mark.parametrize("command", [
     'ssh prod "scripts/shipit.sh"',
-    'ssh prod "gh pr merge 31"',
-    'docker exec c "scripts/shipit.sh"',
+    'echo "scripts/shipit.sh" | ssh prod',
+    'docker exec c sh <<EOF\nscripts/shipit.sh\nEOF',
 ])
-def test_the_wrapper_miss_is_older_than_the_positional_test(command):
-    """The control for the case above (#213)"""
-    assert classify(command, gate_rules.RuleSet.from_seeds()) is None
+def test_no_learned_rule_can_clear_a_literal_a_quoted_executor_runs(command):
+    """A quoted or piped payload of ssh / container exec is code, so no exemption may learn it (#213)"""
+    shape = gate_rules.shape_of(command, "shipit")
+    assert not shape.exemptible and shape.blockers
+
+
+@pytest.mark.parametrize("command", [
+    'git commit -m "ssh prod scripts/shipit.sh"',
+    'cat ~/.ssh/config "scripts/shipit.sh"',
+    'ssh-keygen -C "scripts/shipit.sh"',
+    'docker logs c "scripts/shipit.sh"',
+])
+def test_a_wrapper_named_only_as_data_does_not_disarm_blanking(command):
+    """The pairing: the wrapper has to be in executable position, as with `_SHELL_INVOKER` (#203)"""
+    assert "shipit" not in gate_rules.scannable(command)
 
 
 @pytest.mark.parametrize("command", [
