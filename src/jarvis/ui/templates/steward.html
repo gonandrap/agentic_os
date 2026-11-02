@@ -60,7 +60,7 @@
       <td class="prose"><span class="clamp" title="{{ i.subject }} — {{ i.rule }}: {{ i.reason }}">{{ i.subject }}</span></td>
       <td class="mono act">
         {%- if asks and i.issue_url %}<a href="{{ i.issue_url }}" title="jarvis issues start {{ i.issue_url }}">jarvis issues start</a>
-        {%- elif asks and i.origin_kind == "morpheus" %}<a href="/morpheus{{ '/' ~ i.morpheus_item if i.morpheus_item }}" title="confirm, waive or requeue">{{ i.morpheus_item or "morpheus" }}</a>
+        {%- elif asks and i.origin_kind == "morpheus" %}<a href="/mo{{ '/' ~ i.morpheus_item if i.morpheus_item }}" title="confirm, waive or requeue">{{ i.morpheus_item or "morpheus" }}</a>
         {%- elif asks and i.parent_wo_id %}<span title="jarvis investigate {{ i.parent_wo_id }}">{{ i.parent_wo_id }}</span>
         {%- elif asks %}jarvis wo create {{ i.project }} "…"
         {%- else %}{{ i.wo_id or "—" }}{% endif %}</td>

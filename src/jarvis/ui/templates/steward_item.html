@@ -13,7 +13,7 @@
 
 {% call(d) ui.needs_you(yours, "waiting on you") %}
   <a class="rowid" href="#decision-{{ d.id }}">#{{ d.id }}</a> {{ d.step.text | replace('`', '') }}
-  {% if d.origin_kind == "morpheus" %}<a href="/morpheus">open morpheus</a>{% endif %}
+  {% if d.origin_kind == "morpheus" %}<a href="/mo">open morpheus</a>{% endif %}
 {% endcall %}
 {% if not yours %}
 <p class="kv"><b>Nothing here needs you.</b> This is the steward's record of why the OS did or

@@ -7162,7 +7162,7 @@ def resolve_ref(ref: str) -> str:
     from . import morpheus
 
     if morpheus.is_monitoring_order_id(rid):
-        return f"/morpheus/{rid}"
+        return f"/mo/{rid}"
     return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"/{rid}"
 
 
