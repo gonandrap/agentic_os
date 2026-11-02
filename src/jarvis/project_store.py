@@ -4248,7 +4248,7 @@ class ProjectStore:
 
     def _verdict_undelivered(self, approval: dict[str, Any]) -> bool:
         """The worker has not been told of this grant yet, so its clock has not started"""
-        if not approval.get("verdict_msg_id"):
+        if not approval.get("verdict_msg_id") or approval.get("uses"):
             return False
         row = self.conn.execute("SELECT status FROM wo_messages WHERE id=?",
                                 (approval["verdict_msg_id"],)).fetchone()
@@ -4328,9 +4328,9 @@ class ProjectStore:
             """UPDATE approvals SET status='expired', closed_as='lapsed'
                WHERE status='approved'
                  AND (uses >= max_uses OR (expires_at IS NOT NULL AND expires_at < ?
-                      AND NOT EXISTS (SELECT 1 FROM wo_messages m
+                      AND (uses > 0 OR NOT EXISTS (SELECT 1 FROM wo_messages m
                                       WHERE m.id=approvals.verdict_msg_id
-                                        AND m.status='queued')))""",
+                                        AND m.status='queued'))))""",
             (db.now(),),
         )
         return spent.rowcount + lapsed.rowcount
