@@ -1257,8 +1257,8 @@ MESSAGE_AUTHOR_USER = "user"
 # A dependency is satisfied only when it reaches `completed`
 DEPENDENCY_SATISFIED_STATUS = "completed"
 
-#: A planner parked here behind its `pr_url` has a spec not yet on the default branch
-SPEC_PR_OPEN_STATUSES = ("validating", "waiting_pr_merge", "needs_review")
+#: Planner with `pr_url` in any open status has its spec unmerged, rework included (docs/superpowers/specs/2026-11-01-a-held-spec-is-re-read-until-it-merges.md §1)
+SPEC_PR_OPEN_STATUSES = OPEN_STATUSES
 
 # ...and these are the statuses from which it can never get there
 DEPENDENCY_DEAD_STATUSES = ("cancelled", "failed")
@@ -2163,6 +2163,21 @@ class ProjectStore:
         rows = self.conn.execute(
             f"SELECT * FROM work_orders WHERE status IN ({marks}) AND bill_json IS NULL"
             " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def resettled_sealed_orders(self, *, feature: bool = False,
+                                limit: int = 2) -> list[dict[str, Any]]:
+        """Settled orders whose bill was sealed BEFORE their last settlement — reopened since (#870)"""
+        table, kind = ("feature_orders", "fo") if feature else ("work_orders", "wo")
+        terminal = FO_TERMINAL_STATUSES if feature else TERMINAL_STATUSES
+        marks = ", ".join("?" for _ in terminal)
+        rows = self.conn.execute(
+            f"SELECT o.* FROM {table} o WHERE o.status IN ({marks})"
+            " AND o.bill_json IS NOT NULL AND o.bill_sealed_at < ("
+            "   SELECT MAX(s.ts) FROM wo_state_spans s WHERE s.order_id=o.id"
+            f"  AND s.order_kind=? AND s.to_status IN ({marks}))"
+            " ORDER BY o.updated_at LIMIT ?",
+            (*terminal, kind, *terminal, limit)).fetchall()
         return [dict(r) for r in rows]
 
     def settled_release_orders(self, since: float,
@@ -4150,6 +4165,42 @@ class ProjectStore:
             "reason": reason,
         })
         return self.get_approval(approval_id)  # type: ignore[return-value]
+
+    def merge_lease(self, kind: str, base_oid: str, wo_id: str) -> dict[str, Any] | None:
+        """Another waiting order's request in flight against this base tip, oldest first (#1459)"""
+        # An escalated request waits on the user, not on a merge: it holds no lease (Neo Q3020)
+        row = self.conn.execute(
+            """SELECT a.* FROM approvals a JOIN work_orders w ON w.id = a.wo_id
+               WHERE a.kind=? AND a.base_oid=? AND a.wo_id<>?
+                 AND w.status='waiting_pr_merge'
+                 AND ((a.status IN ('pending', 'awaiting_case') AND COALESCE(a.escalated, 0)=0)
+                      OR (a.status='approved' AND a.uses < a.max_uses
+                          AND (a.expires_at IS NULL OR a.expires_at >= ?)))
+               ORDER BY a.ts, a.id LIMIT 1""",
+            (kind, base_oid, wo_id, db.now()),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def supersede_grants(self, wo_id: str, kind: str, command: str,
+                         reason: str) -> int:
+        """Expire this order's unspent grants for any OTHER command of this kind (#1459)"""
+        rows = self.conn.execute(
+            """SELECT id, command FROM approvals
+               WHERE wo_id=? AND kind=? AND command<>? AND status='approved'
+                 AND uses < max_uses""",
+            (wo_id, kind, command),
+        ).fetchall()
+        for row in rows:
+            self.conn.execute(
+                """UPDATE approvals SET status='expired', closed_as='superseded',
+                                        expires_at=NULL WHERE id=?""",
+                (row["id"],),
+            )
+            self.add_event(wo_id, "gate_superseded", {
+                "approval_id": row["id"], "kind": kind, "command": row["command"],
+                "reason": reason,
+            })
+        return len(rows)
 
     def usable_grant(self, wo_id: str, kind: str, command: str) -> dict[str, Any] | None:
         """The decided request that lets this exact command through right now, or None"""

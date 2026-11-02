@@ -27,7 +27,8 @@ from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE, invariant_title
 from .neo_store import QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
 # The `os_state` keys the dashboard's self-heal keeps
-from .uilog import UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS
+from .uilog import (UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS,
+                    register_stack_signal)
 from .project_store import (
     COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
@@ -61,6 +62,40 @@ OBJECTION_ALARM_WINDOW_DAYS = 7
 OBJECTION_ALARM_MIN_SENT = 3
 
 #: Why an objection was taken back
+
+
+def read_base_red(central: Any, project_name: str) -> Any:
+    """The stored red-base fact as `automerge.BaseRed`, or None — on whichever thread's `central`"""
+    from . import automerge
+    from .central_store import BASE_HEALTH_FRESH_SECONDS
+
+    try:
+        fact = central.base_health(project_name)
+    except Exception:  # noqa: BLE001 — an unreadable fact is not a red base
+        return None
+    if not fact.get("red"):
+        return None
+    checked_at = fact.get("checked_at")
+    if not isinstance(checked_at, (int, float)):
+        return None
+    if db.now() - float(checked_at) > BASE_HEALTH_FRESH_SECONDS:
+        return None
+    return automerge.BaseRed(
+        base=str(fact.get("base") or ""), workflow=str(fact.get("workflow") or ""),
+        run_url=str(fact.get("run_url") or ""),
+        head_sha=str(fact.get("head_sha") or ""),
+        wo_id=str(fact.get("wo_id") or ""),
+        # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5
+        fix_wo_id=str(fact.get("fix_wo_id") or ""),
+        issue_url=str(fact.get("issue_url") or ""),
+        issue_os_filed=bool(fact.get("issue_os_filed")))
+
+
+#: What the seats read when a head's red checks are the base's (spec 2026-10-13 §9)
+BASE_RED_PANEL_NOTE = (
+    "`{base}` itself is red in workflow `{workflow}` (run {run_url}, at {sha}), and every "
+    "red check on this pull request is in that workflow. The OS tracks the broken base "
+    "separately{fixing}. Do not reject over these checks; judge the change.")
 
 
 def fetch_healthz(url: str, timeout: float) -> dict[str, Any] | None:
@@ -435,6 +470,15 @@ REVIEW_FEEDBACK = """REVIEW FEEDBACK (round {n} of {max})
 Address this and then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
 again. Re-submitting without changed code or new evidence will end the review."""
 
+#: THE SAME REJECTION ON A ROUND PAST THE BUDGET: the findings still reach the worker (issue 239)
+POST_BUDGET_FEEDBACK = """REVIEW FEEDBACK (round {n}, no review round left)
+{reason}
+
+The panel rejected this and the review budget is spent, so the work order is with the
+user to decide. Fix what is above on your branch, then run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."`: no panel judges it again,
+the user decides what lands."""
+
 #: THE SAME REJECTION ON A ROUND NOBODY WAS CHARGED FOR (docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.4)
 REBIND_FEEDBACK = """REVIEW FEEDBACK (re-judgement {used} of {max}, no round spent)
 {reason}
@@ -675,6 +719,8 @@ class Daemon:
         # Projects already warned that their pull requests cannot be polled (no `gh`
         self.pr_poll_warned: set[str] = set()
         self.issue_sync_warned: set[str] = set()
+        #: Trackers already reported as unwritable by `gh`'s account this run (#1346)
+        self.tracker_denied_warned: set[str] = set()
         # The systemd seam for staged releases (src/jarvis/release.py)
         self.release_runner: Any = None
         # The usage meter's `urlopen` seam
@@ -800,6 +846,37 @@ class Daemon:
         if not sample.ok:
             log.warning("usage meter unreadable: %s", sample.reason)
         self.notice_meter_gap()
+        try:
+            self.notice_burn_rate()
+        except Exception:  # noqa: BLE001 — an early warning must not take the tick down
+            log.exception("usage burn-rate notice failed")
+
+    def notice_burn_rate(self, now: float | None = None) -> None:
+        """One `warning` inbox row while the 5h window will run dry well before it resets (issue #878)"""
+        b = usage_meter.burn(self.central, now=db.now() if now is None else now)
+        if b is None:
+            return  # unknown is not recovered: a standing warning stays up
+        marked = self.central.get_state(usage_meter.BURN_NOTICE_KEY) or ""
+        lead = self.catalog.os.cost.meter_burn_warn_lead_minutes * 60
+        if b.lead_seconds() < lead:
+            if marked:
+                self.central.revise_inbox("", usage_meter.BURN_NOTICE_TITLE, None, ack=True)
+                self.central.set_state(usage_meter.BURN_NOTICE_KEY, "")
+                self.central.conn.commit()
+            return
+        running = [f"{t['wo_id']} ({name})" for name, store in self._fleet_stores().items()
+                   for t in store.running_turns()]
+        body = usage_meter.burn_sentence(b, running)
+        window = str(int(b.resets_at))
+        if marked == window:
+            self.central.revise_inbox("", usage_meter.BURN_NOTICE_TITLE, None,
+                                      body=body, level="warning")
+        else:
+            # A new window is a new episode: the last one's row is history, not news
+            self.central.revise_inbox("", usage_meter.BURN_NOTICE_TITLE, None, ack=True)
+            self.central.add_inbox("", usage_meter.BURN_NOTICE_TITLE, body, level="warning")
+            self.central.set_state(usage_meter.BURN_NOTICE_KEY, window)
+        self.central.conn.commit()
 
     def notice_meter_gap(self) -> None:
         """One `warning` inbox row per failure STREAK, marked in `os_state` (§8)"""
@@ -980,6 +1057,8 @@ class Daemon:
         # First, so everything below runs under one configuration — and the same one
         self.reload_catalog()
         self.evict_offboarded()
+        # Before the project loop's invariants judge INV-STUCK-SWEEP-DARK against it (#1452)
+        self.note_stuck_enablement()
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
         poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
@@ -1030,6 +1109,8 @@ class Daemon:
                 # Before delivery, not after: an envelope BECOMES a queued message
                 self.deliver_envelopes(project, store)
                 self.deliver_messages(project, store, state)
+                # After delivery: an order with a message queued is the delivery path's to compact
+                self.compact_parked(project, store, state)
                 # After delivery, not before: an envelope this round machine posted on an earlier tick is already on...
                 self.validation_tick(project, store, state)
                 # Beside its twin and for the same reason: an envelope a feature round posted on an earlier tick has...
@@ -1163,7 +1244,9 @@ class Daemon:
 
         pending = store.unsealed_terminal_orders()
         features = store.unsealed_terminal_features()
-        if not pending and not features:
+        reopened = [(o, False) for o in store.resettled_sealed_orders()] + [
+            (f, True) for f in store.resettled_sealed_orders(feature=True)]
+        if not pending and not features and not reopened:
             return
         # One index of Claude Code's transcript tree for the whole batch: it walks every project directory...
         index = usage.index_sessions()
@@ -1184,6 +1267,12 @@ class Daemon:
                 store.seal_bill(feature["id"], db.to_json(
                     {"error": "this bill could not be computed when the order settled"}),
                     feature=True)
+        for order, feature in reopened:
+            try:
+                bill_mod.reseal_settled(project.name, project.path, order,
+                                        feature=feature, index=index)
+            except Exception:  # noqa: BLE001
+                log.exception("re-sealing the bill for %s failed", order["id"])
 
     def seal_autopsies(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Freeze the ANATOMY of every settled order that has none yet (docs/superpowers/specs/2026-09-27-order-autopsy-durability.md)"""
@@ -1406,6 +1495,12 @@ class Daemon:
                 ops.refresh_plan_spec(fo["id"], project_name=project.name)
             except Exception:  # noqa: BLE001 — one feature must not stop the rest
                 log.exception("[%s] could not refresh the spec under review for %s",
+                              project.name, fo["id"])
+        for fo in store.list_feature_orders(statuses=("executing",)):
+            try:
+                ops.refresh_held_spec(fo["id"], project_name=project.name)
+            except Exception:  # noqa: BLE001 — one feature must not stop the rest
+                log.exception("[%s] could not re-read the held spec of %s",
                               project.name, fo["id"])
 
     def settle_features(self, project: ProjectSpec, store: ProjectStore) -> None:
@@ -2076,6 +2171,37 @@ class Daemon:
             if self._deliver(project, store, wo, msgs) and state is not None:
                 state.launched()
 
+    def compact_parked(self, project: ProjectSpec, store: ProjectStore,
+                       state: fleet.Fleet | None = None) -> None:
+        """Compact parked conversations BEFORE their cache expires, at the read rate (issue #1179)"""
+        floor = self.catalog.os.compact_min_context
+        if floor is None:
+            return
+        budget = project.max_concurrent - store.count_active()
+        for wo in store.list_work_orders(statuses=worker_session.WARM_COMPACT_STATUSES):
+            if wo["origin"] in UNGOVERNED_ORIGINS:
+                continue
+            if state is not None and state.blocked(wo["id"]):
+                continue
+            takes_a_slot = resume_spends_slot(wo)
+            if takes_a_slot and budget <= 0:
+                continue
+            try:
+                turn = worker_session.compact_while_warm(store, project, wo, floor)
+                if turn is None:
+                    continue
+            except budget_mod.BudgetExhausted:
+                continue  # an order with no money left is not worth a bet
+            except Exception:  # noqa: BLE001 — the cold path is the fallback
+                log.exception("[%s] could not compact %s before its cache expired",
+                              project.name, wo["id"])
+                continue
+            budget -= takes_a_slot
+            log.info("[%s] compacting parked %s while warm (turn %s)",
+                     project.name, wo["id"], turn["seq"])
+            if state is not None:
+                state.launched()
+
     def deliver_envelopes(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Route every queued envelope, oldest first (src/jarvis/bus.py)"""
         for envelope in store.queued_envelopes():
@@ -2198,6 +2324,7 @@ class Daemon:
             try:
                 refusal = ops.fix_order_precheck(store, project.path, wo,
                                                  central=central, unproven=unproven)
+                base_red = read_base_red(central, project.name)
             finally:
                 central.close()
             packet = evidence_mod.collect_work_order(
@@ -2224,9 +2351,22 @@ class Daemon:
 
             # A HEAD GITHUB HAS ALREADY CALLED RED IS SENT BACK, not judged (docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md)
             failing = evidence_mod.ci_failing(packet)
+            # RED ONLY WHERE THE BASE IS RED is the base's failure: judged, not returned (spec 2026-10-13 §9)
+            inherited = bool(failing and base_red is not None
+                             and evidence_mod.ci_inherited(packet, base_red.workflow))
+            if inherited:
+                packet = dataclasses.replace(packet, base_red=BASE_RED_PANEL_NOTE.format(
+                    base=base_red.base or "the base", workflow=base_red.workflow,
+                    run_url=base_red.run_url or "unknown",
+                    sha=base_red.head_sha[:10] or "an unknown commit",
+                    fixing=(f"; {base_red.fix_wo_id} is fixing it" if base_red.fix_wo_id
+                            else "")))
+                log.info("[%s] %s: round %d red only where `%s` is red — judged",
+                         project.name, wo_id, n, base_red.base)
             returns = store.uncounted_validation_rounds(
                 wo_id=wo_id, cause=ops.RED_CI_CAUSE)
-            if not pending and failing and returns < int(cfg.red_ci_returns):
+            if (not pending and failing and not inherited
+                    and returns < int(cfg.red_ci_returns)):
                 self._validation_red_ci(store, wo, round_id, n, max_rounds, failing)
                 log.info("[%s] %s: round %d returned unjudged — CI is red (%s)",
                          project.name, wo_id, n, ", ".join(failing))
@@ -2298,7 +2438,7 @@ class Daemon:
             # A REPEAT of the IMMEDIATELY PRECEDING round only
             previous = self._preceding_round(store, n, wo_id=wo_id)
             # A SUBMISSION SENT BACK FOR RED CI MAY COME BACK UNCHANGED (#1023)
-            after_red_ci = (previous is not None and not failing
+            after_red_ci = (previous is not None and (not failing or inherited)
                             and str(previous["uncounted_cause"] or "")
                             == ops.RED_CI_CAUSE)
             if self._repeat_submission(round_row, previous,
@@ -2395,9 +2535,16 @@ class Daemon:
                          else ops.ESCALATION_USER_REWORK_CEILING
                          if uncounted and cause == ops.USER_REWORK_CAUSE
                          else ops.ESCALATION_ROUNDS_SPENT)
-                self._escalate(store, wo, round_id, n, reason or (
-                    f"the review was not satisfied after {max_rounds} rounds."),
-                    cause=spent)
+                reason = reason or (
+                    f"the review was not satisfied after {max_rounds} rounds.")
+                self._escalate(store, wo, round_id, n, reason, cause=spent)
+                # A round that ran must reach whoever can act on it (issue 239)
+                bus.post(store, subject=bus.Subject(wo_id=wo_id),
+                         from_role="reviewer", to_role="implementor",
+                         payload=bus.ReviewFeedback(
+                             round=n, outcome="rejected",
+                             reason=POST_BUDGET_FEEDBACK.format(
+                                 n=n, reason=reason, wo_id=wo_id)))
             else:
                 # `escalated`, or anything the validator returned that is not a verdict this machine knows
                 self._escalate(store, wo, round_id, n, reason or (
@@ -3986,12 +4133,9 @@ class Daemon:
         future = self.health_pool.submit(self._health_sweep, due, state)
         future.add_done_callback(lambda f: setattr(self, "health_sweeping", False))
 
-    def _health_candidates(self, pstore: ProjectStore,
-                           cfg: Any) -> list[tuple[float, dict, str]]:
-        """Every open unit due for a look, LONGEST-UNREVIEWED FIRST"""
-        from . import health
-
-        now = db.now()
+    @staticmethod
+    def _health_subjects(pstore: ProjectStore) -> list[dict]:
+        """Every open unit the health sweep covers"""
         subjects = [{"kind": "work_order", "row": wo}
                     for wo in pstore.list_work_orders(statuses=OPEN_STATUSES)
                     if wo["origin"] not in UNGOVERNED_ORIGINS]
@@ -3999,6 +4143,17 @@ class Daemon:
                      for fo in pstore.list_feature_orders(statuses=FO_OPEN_STATUSES)
                      # A feature with no carrier has no session at all and nothing to record a finding on
                      if pstore.carrier_for_feature(fo["id"]) is not None]
+        return subjects
+
+    def _health_candidates(self, pstore: ProjectStore, cfg: Any,
+                           subjects: list[dict] | None = None
+                           ) -> list[tuple[float, dict, str]]:
+        """Every open unit due for a look, LONGEST-UNREVIEWED FIRST"""
+        from . import health
+
+        now = db.now()
+        if subjects is None:
+            subjects = self._health_subjects(pstore)
         out = []
         for subject in subjects:
             row = subject["row"]
@@ -4037,7 +4192,16 @@ class Daemon:
                         log.debug("[%s] health sweep held until %s: %s",
                                   project.name, hold[0], hold[1])
                         continue
-                    candidates = self._health_candidates(pstore, cfg)
+                    subjects = self._health_subjects(pstore)
+                    pause = state.pause if state is not None else None
+                    if pause is not None:
+                        # The user's own hold: no look, and a stall already raised is moot (issue 855)
+                        held = [s for s in subjects if health.paused(pstore, s, pause)]
+                        for subject in held:
+                            supervisor_mod.settle_paused(pstore, neo_store,
+                                                         project.name, subject)
+                        subjects = [s for s in subjects if s not in held]
+                    candidates = self._health_candidates(pstore, cfg, subjects)
                     # THE CAP BOUNDS SPEND, so it bounds the PAID triggers only and every due re-assertion is processed
                     free = [c for c in candidates if c[2] == health.REASSERT]
                     paid = [c for c in candidates
@@ -4075,6 +4239,16 @@ class Daemon:
 
     #: The run row, newest only
     STUCK_RUN_KEY = "stuck_sweep_run"
+    #: `{"enabled": bool, "ts": <when the daemon last saw it flip>}` — the dark clock's other start (#1452)
+    STUCK_ENABLED_KEY = "stuck_sweep_enabled"
+
+    def note_stuck_enablement(self) -> None:
+        """Record the moment the daemon sees the stuck sweep switch on or off"""
+        enabled = any(p.fleet_health.enabled for p in self.catalog.projects)
+        seen = db.from_json(self.central.get_state(self.STUCK_ENABLED_KEY), None)
+        if not seen or bool(seen.get("enabled")) != enabled:
+            self.central.set_state(self.STUCK_ENABLED_KEY,
+                                   db.to_json({"enabled": enabled, "ts": db.now()}))
 
     def stuck_cadence(self) -> int:
         """Ticks between two entries into `stuck_tick`"""
@@ -5387,29 +5561,7 @@ class Daemon:
 
     def _base_red(self, project: ProjectSpec) -> Any:
         """The stored red-base fact as `automerge.BaseRed`, or None"""
-        from . import automerge
-        from .central_store import BASE_HEALTH_FRESH_SECONDS
-
-        try:
-            fact = self.central.base_health(project.name)
-        except Exception:  # noqa: BLE001 — an unreadable fact is not a red base
-            return None
-        if not fact.get("red"):
-            return None
-        checked_at = fact.get("checked_at")
-        if not isinstance(checked_at, (int, float)):
-            return None
-        if db.now() - float(checked_at) > BASE_HEALTH_FRESH_SECONDS:
-            return None
-        return automerge.BaseRed(
-            base=str(fact.get("base") or ""), workflow=str(fact.get("workflow") or ""),
-            run_url=str(fact.get("run_url") or ""),
-            head_sha=str(fact.get("head_sha") or ""),
-            wo_id=str(fact.get("wo_id") or ""),
-            # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5
-            fix_wo_id=str(fact.get("fix_wo_id") or ""),
-            issue_url=str(fact.get("issue_url") or ""),
-            issue_os_filed=bool(fact.get("issue_os_filed")))
+        return read_base_red(self.central, project.name)
 
     def poll_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what happened to the pull requests this project is parked behind (docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md)"""
@@ -5510,6 +5662,7 @@ class Daemon:
                     ops.complete_merged(store, wo, merged_at=pr.merged_at,
                                         head_oid=pr.head_oid,
                                         merge_commit=pr.merge_commit_oid)
+                    self.ship_expedited(project, store, wo)
                 elif pr.closed_unmerged:
                     # ONCE PER CLOSURE
                     if pr_resync_unreopened(store, wo):
@@ -5545,7 +5698,8 @@ class Daemon:
                     # IS THIS THE BRANCH'S FAILURE AT ALL?
                     handled, pr = self.heal_inherited_failure(project, store, wo, pr,
                                                               base_ci)
-                    if not handled:
+                    if not handled and not self.rerun_failed_checks(project, store, wo,
+                                                                    pr):
                         self.heal_pull_request(
                             project, store, wo, ops.PR_CHECKS,
                             f"has failing checks ({', '.join(pr.failing)})",
@@ -5563,6 +5717,7 @@ class Daemon:
                                  project.name, wo["pr_url"], wo["id"])
                     # Not `elif`: a pull request can stop conflicting and go green in the same poll
                     if pr.checks_green:
+                        self.note_flake(store, wo, pr)
                         # Re-read ONLY if the clear above ran
                         row = store.get_work_order(wo["id"]) if healed else wo
                         if ops.clear_pr_repair(store, row, ops.PR_CHECKS):
@@ -5719,6 +5874,11 @@ class Daemon:
                     drift=drift, no_ci=no_ci)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
+                # #1459: no catch-up while another merge on this base is in flight
+                queued = automerge.merge_queued(store, wo, pr)
+                if queued is not None:
+                    self._note_automerge_held(store, wo_id, queued)
+                    return
                 # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2
                 caught = self._catch_up_with_base(project, store, wo, pr)
                 if (caught.outcome == ops.CATCH_UP_DEFERRED
@@ -5806,6 +5966,11 @@ class Daemon:
             wo_id, automerge.GATE_KIND,
             automerge.merge_command(str(wo.get("pr_url") or ""), decision.judged_sha))
         if approval is None:
+            # #1459: one merge request in flight per base tip
+            queued = automerge.merge_queued(store, wo, pr)
+            if queued is not None:
+                self._note_automerge_held(store, wo_id, queued)
+                return
             # BEFORE A GRANT EXISTS AND NEVER AFTER ONE (spec 2026-09-27 §5.2)
             caught = self._catch_up_with_base(project, store, wo, pr)
             if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
@@ -5820,6 +5985,13 @@ class Daemon:
                     and base_behind is not None):
                 self._supersede_stale_request(store, approval, pr)
                 return
+            if approval["status"] == "denied":
+                # #873: a denial that lost the race with another merge is caught up, not parked
+                caught = self._catch_up_with_base(project, store, wo, pr)
+                if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
+                    self._note_automerge_held(
+                        store, wo_id,
+                        automerge.held_base_moved(caught, pr, caught.base_tip))
             # Filed and not granted: pending with Neo, escalated to the user, denied, expired
             return
         if approval is None:
@@ -5894,6 +6066,7 @@ class Daemon:
                                        "round_id": decision.round_id,
                                        "round": decision.round_n,
                                        "head_sha": decision.judged_sha})
+        self.ship_expedited(project, store, wo)
 
     def auto_review(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Put this project's pending assumptions to Neo, one question each (docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md)"""
@@ -6968,6 +7141,73 @@ class Daemon:
         log.info("%s: cancelled CI on %s needs the user (%s)", wo["id"], head[:10],
                  cause)
 
+    def rerun_failed_checks(self, project: ProjectSpec, store: ProjectStore,
+                            wo: dict, pr: Any) -> bool:
+        """Re-run a FAILED check ONCE per head before the worker is asked to fix it; True holds the nudge (#1465)"""
+        from . import ci, ci_rerun, github
+
+        wo_id, head = wo["id"], str(pr.head_oid or "")
+        if not ci.SHA_RE.match(head):
+            return False
+        done = ci_rerun.head_events(store, wo_id, ci_rerun.FLAKE_RERUN_EVENT, head)
+        if done:
+            at = float(done[-1].get("at") or 0)
+            # A red check older than the re-run is the rollup not having caught up yet
+            stale = all((t := ci.parse_ts(c.get("started_at"))) is not None and t < at
+                        for c in pr.red)
+            return bool(done[-1].get("run_ids")) and stale
+        if any(c["status"].upper() in github.UNFINISHED_STATUSES - {"EXPECTED"}
+               for c in pr.checks):
+            return True     # `--failed` only takes a finished run
+        red = pr.red
+        checks = ", ".join(f"{c['name'] or '(unnamed check)'}: {c['conclusion']}"
+                           for c in red)
+        try:
+            runs = ci_rerun.head_runs(head, cwd=project.path)
+        except github.GitHubError as e:
+            log.info("[%s] could not list the runs of %s for %s: %s", project.name,
+                     head[:10], wo_id, e)
+            return False
+        rerun: list[Any] = []
+        error = ""
+        for run in ci_rerun.failed_runs_to_rerun(red, runs):
+            try:
+                ci_rerun.rerun(run.run_id, cwd=project.path)
+            except github.GitHubError as e:
+                error = str(e)[:300]
+                break
+            rerun.append(run)
+        store.add_event(wo_id, ci_rerun.FLAKE_RERUN_EVENT, {
+            "head_sha": head, "pr_url": wo.get("pr_url"), "checks": checks,
+            "at": db.now(), "run_ids": [r.run_id for r in rerun],
+            "workflows": [r.workflow for r in rerun], **({"error": error} if error else {})})
+        if rerun:
+            self.__dict__.setdefault("_flake_reruns", set()).add((wo_id, head))
+            log.info("[%s] re-ran failed CI on %s for %s before asking the worker "
+                     "(runs %s)", project.name, head[:10], wo_id,
+                     ", ".join(str(r.run_id) for r in rerun))
+        return bool(rerun)
+
+    def note_flake(self, store: ProjectStore, wo: dict, pr: Any) -> None:
+        """A head the OS re-ran red is green now: the failure was a flake, counted once (#1465)"""
+        from . import ci_rerun
+
+        head = str(pr.head_oid or "")
+        # In-process only, so a green poll costs no read; a restart mid-re-run loses one count
+        pending = self.__dict__.setdefault("_flake_reruns", set())
+        if (wo["id"], head) not in pending:
+            return
+        pending.discard((wo["id"], head))
+        reruns = ci_rerun.head_events(store, wo["id"], ci_rerun.FLAKE_RERUN_EVENT, head)
+        if not reruns or not reruns[-1].get("run_ids"):
+            return
+        store.add_event(wo["id"], ci_rerun.FLAKE_CONFIRMED_EVENT, {
+            "head_sha": head, "pr_url": wo.get("pr_url"),
+            "checks": reruns[-1].get("checks") or "",
+            "run_ids": reruns[-1].get("run_ids")})
+        log.info("%s: failed CI on %s passed on its re-run — a flake (%s)", wo["id"],
+                 head[:10], reruns[-1].get("checks"))
+
     def _note_reopened(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> bool:
         """This open pull request was recorded as closed: say so, once"""
@@ -7087,6 +7327,21 @@ class Daemon:
                 log.info("[%s] carried round %s's verdict from %s to %s on %s",
                          project.name, carried["round"], judged[:10],
                          carried["carried_head_sha"][:10], wo["id"])
+        elif pr.head_oid and pr.head_oid != head_before:
+            # A red_ci return has no verdict to carry: resubmit for the worker (#1065)
+            try:
+                out = ops.resubmit_healed_red_ci(
+                    store, project.path, wo, project=project.name,
+                    cfg=project.validation, base=base_ref, base_sha=base_sha,
+                    head=pr.head_oid)
+            except Exception:  # noqa: BLE001 — the heal itself already landed
+                log.exception("[%s] could not resubmit %s after the base heal",
+                              project.name, wo["id"])
+                out = None
+            if out:
+                log.info("[%s] %s: its red_ci return was the base's — resubmitted it "
+                         "on %s as round %s", project.name, wo["id"],
+                         pr.head_oid[:10], out["round"])
         return True, pr
 
     def heal_pull_request(self, project: ProjectSpec, store: ProjectStore, wo: dict,
@@ -7165,9 +7420,15 @@ class Daemon:
             return
         from . import github, issues
 
+        probed = False
         for wo in tracked:
             if not issues.needs_sync(store, wo):
                 continue
+            # Probed only once there is a write to make; `apply` writes only to the OS's own tracker
+            if not probed:
+                probed = True
+                if not self._tracker_writable(project, store, issues.bug_repo()):
+                    return
             was = (wo.get("issue_state") or "")
             try:
                 applied = issues.record_applied(store, wo, project.bugs.label)
@@ -7189,8 +7450,9 @@ class Daemon:
             # TWO ROUTES TO A RELEASE, and expediting is the user's own: an expedited order carries an honest... (#961)
             if (applied == issues.CLOSED and was != issues.CLOSED
                     and ops_mod.routes_on_pull_request(store, wo)
-                    and (issues.dispatches(wo.get("issue_priority") or "")
-                         or issues.was_expedited(wo))):
+                    and issues.dispatches(wo.get("issue_priority") or "")
+                    # An expedited order shipped ALONE on its merge (ship_expedited)
+                    and not issues.was_expedited(wo)):
                 self.ensure_release(project, store, wo)
 
     #: How long a cached issue state is good for
@@ -7222,11 +7484,15 @@ class Daemon:
                     row = {**row, "state": issue.state}
                 if (row.get("state") or "") != "OPEN":
                     continue
-                for link in store.unannounced_links(url):
+                links = store.unannounced_links(url)
+                relabel = int(row["refs"]) != int(row["refs_labelled"])
+                if not (links or relabel) or not self._tracker_writable(project, store, repo):
+                    continue
+                for link in links:
                     issues.comment(url, issues.reference_comment(
                         link["unit_id"], project.name, link["kind"]), repo)
                     store.mark_issue_announced(url, link["unit_id"])
-                if int(row["refs"]) != int(row["refs_labelled"]):
+                if relabel:
                     issues.set_reference_label(url, int(row["refs"]), repo)
                     store.record_issue_label(url, int(row["refs"]))
             except github.GitHubError as e:
@@ -7263,6 +7529,47 @@ newest commit on `origin/main` that carries every fix listed above and whose CI 
 green, written out in full (40 characters). If that base is red, or you cannot read \
 CI's verdict on it, say so and stop — a release is not the place to fix a red build."""
 
+    #: Marks a release order that ships its fixes ALONE, cherry-picked onto the latest tag
+    CHERRY_PICK_KEY = "cherry_pick"
+
+    #: What a cherry-pick release order is told to do (docs/superpowers/specs/2026-10-31-an-expedited-merge-ships-alone.md)
+    HOTFIX_BRIEF = """\
+Ship a release carrying ONLY these fixes. They have LANDED on `main` and the user \
+expedited them, so production gets the latest release tag plus their commits \
+cherry-picked onto it — NOT main's head:
+
+{fixes}
+
+Run the ordinary release path in its cherry-pick mode and nothing else:
+
+    scripts/shipit.sh --stage --wo {wo_id} --cherry-pick <sha>[,<sha>...]
+
+That is a PRIVILEGED ACTION and it will be gated — that is correct and expected. Make \
+your case first (`jarvis gate request`), and read `jarvis brief gates` before you do. Do \
+NOT invent a second release path, do not restart any service by hand, and do not drop \
+`--stage`: an inline restart kills your own session mid-turn. Changing the shas after \
+approval invalidates the grant: the approved string names the commits.
+
+Resolve each `<sha>` BEFORE you ask: the commit each pull request's squash merge put on \
+`main` (`gh pr view <url> --json mergeCommit`), written out in full (40 characters), \
+oldest first. If a pull request did not land as ONE squash commit, or a cherry-pick \
+conflicts, shipit refuses: report its reason and stop. Never fall back to releasing \
+`main`."""
+
+    def ship_expedited(self, project: ProjectSpec, store: ProjectStore,
+                       wo: dict) -> str:
+        """An expedited order's pull request merged: ship it alone (spec 2026-10-31 §2)"""
+        from . import issues
+
+        if not issues.was_expedited(wo):
+            return ""
+        try:
+            return self.ensure_release(project, store, store.get_work_order(wo["id"]))
+        except Exception:  # noqa: BLE001 — a release filing must never stall the merge sweep
+            log.exception("[%s] filing the release for expedited %s failed",
+                          project.name, wo["id"])
+            return ""
+
     def ensure_release(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> str:
         """Make sure a release carrying this landed fix is on its way (#945)"""
@@ -7273,9 +7580,13 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
             return ""  # releases only via the user's shipit unless os.autonomy is on
         if self._already_live(project, store, wo):
             return ""
-        url = wo.get("issue_url") or ""
+        # An expedited order may track no issue: its pull request names it (spec 2026-10-31 §3)
+        url = wo.get("issue_url") or wo.get("pr_url") or ""
+        if not url:
+            return ""
+        alone = issues.was_expedited(wo)
         # Expedited first: an order can be both
-        reason = ("expedited by the filer" if issues.was_expedited(wo)
+        reason = ("expedited" if alone
                   else f"confirmed `{wo.get('issue_priority')}` by Neo")
         line = (f"- {url} — fixed by `{wo['id']}`"
                 + (f" ({wo['pr_url']})" if wo.get("pr_url") else "")
@@ -7285,7 +7596,8 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
                                                 include_hidden=True):
             meta = db.from_json(candidate.get("metadata"), {}) or {}
             batch = meta.get(self.RELEASE_BATCH_KEY)
-            if isinstance(batch, list):
+            # A cherry-pick release never batches with a release of main's head
+            if isinstance(batch, list) and bool(meta.get(self.CHERRY_PICK_KEY)) == alone:
                 candidates.append((candidate, meta, batch))
         # §1.3, pass one over the one read: an url already batched anywhere is never added twice and never...
         for candidate, _meta, batch in candidates:
@@ -7314,14 +7626,16 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
                               parent_wo_id=str(wo["id"])),
             catalog=self.catalog, store=store,
             self_dispatch=self.self_dispatch)
+        meta = {self.RELEASE_BATCH_KEY: [url], **({self.CHERRY_PICK_KEY: True} if alone else {})}
         fresh = store.create_work_order(
-            title=f"Ship the fix for {wo.get('title') or url}",
+            title=(f"Ship {wo.get('title') or url} alone" if alone
+                   else f"Ship the fix for {wo.get('title') or url}"),
             description="", origin="os",
-            metadata=steward.stamped({self.RELEASE_BATCH_KEY: [url]}, decision))
+            metadata=steward.stamped(meta, decision))
         steward.linked(decision, fresh["id"])
+        brief = self.HOTFIX_BRIEF if alone else self.RELEASE_BRIEF
         store.update_work_order(
-            fresh["id"],
-            description=self.RELEASE_BRIEF.format(wo_id=fresh["id"], fixes=line))
+            fresh["id"], description=brief.format(wo_id=fresh["id"], fixes=line))
         store.add_event(fresh["id"], "release_batched",
                         {"issue_url": url, "wo_id": wo["id"]})
         log.info("[%s] %s landed — filed release %s", project.name, url, fresh["id"])
@@ -7687,6 +8001,24 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
             store.add_event(wo_id, self.RELEASE_BATCH_CLEARED_EVENT,
                             {"batch": batch})
 
+    def _tracker_writable(self, project: ProjectSpec, store: ProjectStore,
+                          repo: str) -> bool:
+        """False when `gh`'s account definitely cannot close or label on `repo` (#1346)"""
+        from . import issues
+
+        access = issues.tracker_access(repo)
+        if not access.denied:
+            return True
+        key = access.repo.lower()
+        if key not in self.tracker_denied_warned:
+            self.tracker_denied_warned.add(key)
+            log.warning("[%s] not writing to %s: gh account %s has %s permission",
+                        project.name, access.repo, access.login, access.permission)
+            store.add_notification(
+                title=f"Jarvis cannot write to the tracker {access.repo}",
+                body=access.explain(), level="critical", source="issue-sync")
+        return False
+
     def _warn_issue_sync_broken(self, project: ProjectSpec, store: ProjectStore,
                                 error: Exception) -> None:
         """Tell the user once per daemon run that the tracker is not being kept up"""
@@ -7801,6 +8133,7 @@ def run_daemon(catalog_path: str | Path, poll_interval: float = 5.0,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         handlers=handlers,
     )
+    register_stack_signal()
     # Before anything is spawned: every worker inherits this process's PATH verbatim... (#41)
     added = bugreport.heal_path()
     if added:

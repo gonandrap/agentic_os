@@ -795,6 +795,25 @@ def test_a_rejection_with_the_counted_budget_spent_says_rounds_spent(
     store.close()
 
 
+def test_a_counted_submission_past_the_budget_is_refused_before_the_panel(
+        tmp_path, git_project, jarvis_home, fake_claude, fake_gh):
+    """Issue 239: once max_rounds are spent no panel sits; the user decides"""
+    from tests.test_rejudge_moved_head import _cfg, artifact, boot, parked, PUSHED
+
+    fleet = boot(tmp_path, git_project, max_rounds=2)
+    store, wo = parked(git_project, rounds=2)          # budget already spent
+    artifact(fake_gh, head_oid=PUSHED)
+    row = ops.submit_for_validation(store, git_project, store.get_work_order(wo["id"]),
+                                    declared="pushed again", cfg=_cfg(fleet))
+
+    assert row is not None and row["outcome"] == "escalated"
+    assert _payload(store, wo["id"])["cause"] == ops.ESCALATION_BUDGET_SPENT
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "needs_review"
+    assert ops.review_state(store, fresh)["family"] == "not_reviewed"
+    store.close()
+
+
 def test_a_rejected_rebind_with_the_rebind_budget_spent_says_rebinds_spent(
         tmp_path, git_project, jarvis_home, fake_claude, fake_gh):
     """The third arm, and the one the round NUMBER cannot name: a rebind sits past `max_rounds` and is..."""

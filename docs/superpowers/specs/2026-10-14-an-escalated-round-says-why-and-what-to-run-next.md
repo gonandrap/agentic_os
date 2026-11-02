@@ -105,6 +105,7 @@ ineligible.
 | `ESCALATION_BOUNCE_EXHAUSTED` | `"bounce_exhausted"` | `ops.submit_for_validation` |
 | `ESCALATION_NOTHING_TO_JUDGE` | `"nothing_to_judge"` | `Daemon._validate_work_order`'s empty-submission guard |
 | `ESCALATION_REPEAT_SUBMISSION` | `"repeat_submission"` | `Daemon._validate_work_order`'s identical-fingerprint guard |
+| `ESCALATION_BUDGET_SPENT` | `"budget_spent"` | `ops.submit_for_validation`, a counted submission once `max_rounds` are spent (issue 239) |
 
 Family `unjudged` — the panel COULD NOT JUDGE. Nobody has an opinion on the work.
 

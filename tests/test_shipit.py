@@ -80,6 +80,11 @@ def _tag_like_shipit(repo: Path, version: str) -> None:
     _git(repo, "checkout", "-q", "main")
 
 
+def _released(repo: Path, version: str) -> None:
+    _tag_like_shipit(repo, version)
+    _git(repo, "push", "-q", "origin", f"refs/tags/jarvis-{version}")
+
+
 def _dry_run(repo: Path, prod: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Drive the real script in --dry-run, with a STUB `uv` first on PATH"""
     stub_bin = _stub(repo.parent / "stub-bin", "uv").parent
@@ -442,7 +447,7 @@ def test_publishes_a_github_release_for_the_tag(tmp_path):
 
 def test_the_release_notes_list_what_landed_since_the_previous_release(tmp_path):
     repo = _make_repo(tmp_path)
-    _tag_like_shipit(repo, "0.1.2")
+    _released(repo, "0.1.2")
     _commit(repo, "Teach the gate about spent grants (#516)")
     _commit(repo, "Cap the finish summary (#574)")
     _git(repo, "push", "-q", "origin", "main")
@@ -456,7 +461,7 @@ def test_the_release_notes_exclude_what_the_previous_release_already_shipped(tmp
     """The range is anchored on the previous TAG, which does not sit on main"""
     repo = _make_repo(tmp_path)
     _commit(repo, "Shipped back in 0.1.2")
-    _tag_like_shipit(repo, "0.1.2")
+    _released(repo, "0.1.2")
     _commit(repo, "Landed after 0.1.2")
     _git(repo, "push", "-q", "origin", "main")
     r = _dry_run(repo, tmp_path / "prod", "patch")
@@ -465,6 +470,20 @@ def test_the_release_notes_exclude_what_the_previous_release_already_shipped(tmp
     assert "Shipped back in 0.1.2" not in r.stdout
     # the previous release's own bump commit is not a change this release makes
     assert "- Release jarvis-0.1.2" not in r.stdout
+
+
+def test_an_abandoned_local_tag_is_not_the_previous_release(tmp_path):
+    """Issue 1183: the previous release is origin's newest tag, not a local leftover"""
+    repo = _make_repo(tmp_path)
+    _released(repo, "0.1.2")
+    _commit(repo, "The fix this release carries (#1174)")
+    _tag_like_shipit(repo, "0.1.3")  # the cut that died before its tag reached origin
+    _git(repo, "push", "-q", "origin", "main")
+    r = _dry_run(repo, tmp_path / "prod", "0.1.4")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "The fix this release carries (#1174)" in r.stdout
+    assert "--from 'jarvis-0.1.2'" in r.stdout
+    assert "jarvis-0.1.3" not in r.stdout
 
 
 def test_the_first_release_still_gets_notes(tmp_path):
@@ -713,7 +732,7 @@ def test_a_pinned_release_ignores_the_local_head(tmp_path):
 def test_the_notes_stop_at_the_base(tmp_path):
     """§3: what merged after the base rides the next release's notes, not this one's"""
     repo = _make_repo(tmp_path)
-    _tag_like_shipit(repo, "0.1.2")
+    _released(repo, "0.1.2")
     _commit(repo, "Up to the base (#1)")
     base = _sha(repo, "HEAD")
     _commit(repo, "Merged after the base (#2)")
@@ -905,6 +924,9 @@ def test_an_unknown_service_manager_refuses_to_ship(tmp_path):
     (["--deploy", "latest"], "is not a release tag"),
     (["--deploy"], "--deploy needs a release tag"),
     (["--deploy", "jarvis-0.2.0", "patch"], "--deploy takes no version"),
+    (["--cherry-pick"], "--cherry-pick needs one or more full shas"),
+    (["--cherry-pick", "a" * 40, "--base", "b" * 40], "exclude each other"),
+    (["--deploy", "jarvis-0.2.0", "--cherry-pick", "a" * 40], "--deploy takes no version"),
 ])
 def test_bad_arguments_exit_2_with_usage_and_cut_nothing(tmp_path, args, says):
     repo = _make_repo(tmp_path)
@@ -913,11 +935,6 @@ def test_bad_arguments_exit_2_with_usage_and_cut_nothing(tmp_path, args, says):
     assert says in r.stderr
     assert "usage: scripts/shipit.sh" in r.stderr
     assert "git branch" not in r.stdout
-
-
-def _released(repo: Path, version: str) -> None:
-    _tag_like_shipit(repo, version)
-    _git(repo, "push", "-q", "origin", f"refs/tags/jarvis-{version}")
 
 
 @pytest.mark.parametrize("tag", ["jarvis-0.2.0", "0.2.0"])
@@ -947,6 +964,68 @@ def test_deploy_refuses_a_tag_that_is_not_on_origin(tmp_path):
     assert r.returncode == 1
     assert "not on origin" in r.stderr
     assert "checkout -f" not in r.stdout
+
+
+# --- --cherry-pick: an expedited merge ships alone (2026-10-31 spec §4)
+
+
+def _landed_after_a_release(tmp_path: Path) -> tuple[Path, str]:
+    repo = _make_repo(tmp_path)
+    _released(repo, "0.2.0")
+    _commit(repo, "Stacked on main (#1)")
+    _commit(repo, "The expedited fix (#2)")
+    _git(repo, "push", "-q", "origin", "main")
+    return repo, _sha(repo, "HEAD")
+
+
+def test_a_cherry_pick_release_is_the_latest_tag_plus_only_the_pick(tmp_path):
+    repo, fix = _landed_after_a_release(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "--cherry-pick", fix)
+    assert r.returncode == 0, r.stdout + r.stderr
+    tag = _sha(repo, "refs/tags/jarvis-0.2.0^{commit}")
+    assert f"git branch 'release/jarvis-0.2.1' '{tag}'" in r.stdout
+    assert f"cherry-pick -x {fix}" in r.stdout
+    assert "HEAD is not origin/main" not in (r.stdout + r.stderr)
+
+
+def test_a_cherry_pick_must_be_a_full_sha(tmp_path):
+    repo, fix = _landed_after_a_release(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "--cherry-pick", fix[:9])
+    assert r.returncode != 0
+    assert "40-character" in r.stderr
+
+
+def test_a_cherry_pick_must_be_on_origin_main(tmp_path):
+    repo, _ = _landed_after_a_release(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "Never merged (#3)")
+    r = _dry_run(repo, tmp_path / "prod", "--cherry-pick", _sha(repo, "HEAD"))
+    assert r.returncode != 0
+    assert "not on origin/main" in r.stderr
+    assert "git branch" not in r.stdout
+
+
+def test_a_merge_commit_is_refused_rather_than_guessed(tmp_path):
+    """Neo's condition on Q2841: not one squash commit, no release"""
+    repo, _ = _landed_after_a_release(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "on a branch")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "Merge pull request #4", "feature")
+    _git(repo, "push", "-q", "origin", "main")
+    r = _dry_run(repo, tmp_path / "prod", "--cherry-pick", _sha(repo, "HEAD"))
+    assert r.returncode != 0
+    assert "merge commit" in r.stderr
+    assert "git branch" not in r.stdout
+
+
+def test_a_commit_without_a_pr_number_is_refused(tmp_path):
+    repo, _ = _landed_after_a_release(tmp_path)
+    _commit(repo, "pushed straight to main")
+    _git(repo, "push", "-q", "origin", "main")
+    r = _dry_run(repo, tmp_path / "prod", "--cherry-pick", _sha(repo, "HEAD"))
+    assert r.returncode != 0
+    assert "does not look like a squash merge" in r.stderr
 
 
 def test_refuses_to_run_from_productions_own_checkout(tmp_path):

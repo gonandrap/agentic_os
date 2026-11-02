@@ -823,8 +823,28 @@ def test_max_rounds_rejections_escalate(fleet):
         assert fresh["status"] == "needs_review"
         assert fresh["attention_reason"] == VALIDATION_STUCK_BLOCKER
         assert true_blockers(store, fresh) == [VALIDATION_STUCK_BLOCKER]
-        # The last round sends nothing back: there is no round left to fix in
-        assert len(store.envelopes(subject_wo_id=wo["id"])) == 1
+        # The last round's findings still reach the worker (issue 239)
+        sent = store.envelopes(subject_wo_id=wo["id"])
+        assert len(sent) == 2
+        assert "no review round left" in sent[-1]["payload"]
+    finally:
+        store.close()
+
+    # The worker re-submits past the budget: refused before the panel, back to the user
+    fleet.tick()
+    fleet.change(wo["id"], "print('one')\nprint('two')\nprint('three')\n")
+    finish(fleet, wo["id"], summary="fixed the last asks")
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        assert len(fleet.daemon.validator.calls) == 2, "a panel sat past the budget"
+        last = store.latest_validation_round(wo_id=wo["id"])
+        assert last["outcome"] == "escalated"
+        assert ops.escalation_cause(store, wo_id=wo["id"], round_id=last["id"]) == (
+            ops.ESCALATION_BUDGET_SPENT)
+        assert store.get_work_order(wo["id"])["status"] == "needs_review"
+        assert len(store.envelopes(subject_wo_id=wo["id"])) == 2, "nothing new to send"
     finally:
         store.close()
 
@@ -1136,13 +1156,15 @@ def test_an_escalation_while_the_user_is_deciding_leaves_the_assumption_in_front
     finally:
         store.close()
 
+    # The findings woke the worker (issue 239); its re-delivery is refused past the budget
+    finish(fleet, wo["id"], summary="addressed the findings")
     assert ops.review_work_order(wo["id"], accept=True)["status"] == "waiting_pr_merge"
 
     store = fleet.store()
     try:
         fresh = store.get_work_order(wo["id"])
         assert fresh["needs_attention"] == 0
-        assert len(store.validation_rounds(wo_id=wo["id"])) == 1, "a second round opened"
+        assert len(fleet.daemon.validator.calls) == 1, "a second panel sat"
     finally:
         store.close()
 
@@ -1228,8 +1250,16 @@ def test_a_work_order_already_judged_is_not_validated_a_second_time(fleet):
         assert store.get_work_order(judged["id"])["status"] == "needs_review"
         assert store.get_work_order(judged["id"])["attention_reason"] == (
             VALIDATION_STUCK_BLOCKER)
+        assert len(store.validation_rounds(wo_id=judged["id"])) == 1, (
+            "the control never got a round")
+    finally:
+        store.close()
+    # The findings wake the worker (issue 239); its re-delivery is refused past the budget
+    fleet.tick()
+    finish(fleet, judged["id"], pr="https://github.com/x/y/pull/10")
+    store = fleet.store()
+    try:
         before = len(store.validation_rounds(wo_id=judged["id"]))
-        assert before == 1, "the control never got a round"
     finally:
         store.close()
 

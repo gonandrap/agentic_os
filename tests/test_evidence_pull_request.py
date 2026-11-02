@@ -260,3 +260,24 @@ def test_the_side_effect_digest_does_not_depend_on_key_order():
     a = {"kind": "knowledge_added", "id": "kn-1", "detail": "x"}
     b = {"detail": "x", "id": "kn-1", "kind": "knowledge_added"}
     assert evidence.side_effects_digest([a]) == evidence.side_effects_digest([b])
+
+
+# ------------------------------------------------- a PR that lags the worktree (#704)
+
+
+def test_a_pull_request_behind_the_worktree_says_so(project, fake_gh):
+    worktree = project / ".claude" / "worktrees" / "wt"
+    pushed = _git(worktree, "rev-parse", "HEAD~1").strip()
+    local = _git(worktree, "rev-parse", "HEAD").strip()
+    _registered(fake_gh, head_oid=pushed)
+    assert collect(project, pr_url=PR).pr_behind == (pushed, local)
+
+
+@pytest.mark.parametrize("head", ["HEAD", "unknown"])
+def test_a_pull_request_holding_the_worktree_head_is_not_behind(project, fake_gh, head):
+    """The pushed head itself, or one this clone never saw: today's behaviour"""
+    worktree = project / ".claude" / "worktrees" / "wt"
+    oid = (_git(worktree, "rev-parse", "HEAD").strip() if head == "HEAD"
+           else "c0ffee11c0ffee22c0ffee33c0ffee44c0ffee55")
+    _registered(fake_gh, head_oid=oid)
+    assert collect(project, pr_url=PR).pr_behind == ()
