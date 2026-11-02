@@ -54,6 +54,17 @@ def seed() -> Path:
         if tag:
             _git(repo, "tag", tag)
     store.close()
+    app = repo.parent / "shop"  # another project, spec §3
+    app.mkdir()
+    _git(app, "init", "-q", "-b", "main")
+    _git(app, "config", "user.email", "t@t")
+    _git(app, "config", "user.name", "t")
+    for n, subject in enumerate(["checkout flow (#11)", "cart totals (#12)", "fix tax (#13)"]):
+        _git(app, "commit", "-q", "--allow-empty", "-m", subject)
+        if n == 0:
+            _git(app, "tag", "shop-0.1.0")
+    central.upsert_project("shop", str(app), "a shop")
+    central.conn.commit()
     central.close()
     return repo
 
@@ -64,7 +75,8 @@ def serve(repo: Path) -> None:
     from jarvis import ops
     from jarvis.ui.app import create_app
 
-    ops._release_repo = lambda: ("jarvis_os", repo)
+    real = ops._release_repo
+    ops._release_repo = lambda project="": real(project) if project else ("jarvis_os", repo)
     uvicorn.run(create_app(), host="127.0.0.1", port=PORT, log_level="warning")
 
 
@@ -80,6 +92,8 @@ def shoot() -> None:
         page.screenshot(path=SHOTS / "release-console.png", full_page=True)
         page.goto(f"http://127.0.0.1:{PORT}/release/jarvis-0.1.1")
         page.screenshot(path=SHOTS / "release-detail.png", full_page=True)
+        page.goto(f"http://127.0.0.1:{PORT}/release?project=shop")
+        page.screenshot(path=SHOTS / "release-other-project.png", full_page=True)
         browser.close()
 
 
