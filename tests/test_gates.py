@@ -443,6 +443,8 @@ def test_grant_expires_and_is_refiled(gated, monkeypatch):
     approval = gated.store.list_approvals(gated.wo["id"])[0]
     gates.apply_decision(gated.store, approval["id"], verdict="approved", reason="ok",
                          decided_by="user")
+    for m in gated.store.queued_messages(gated.wo["id"]):
+        gated.store.mark_message(m["id"], "delivered")
     assert _decision(gated.attempt("./scripts/shipit.sh")) == "allow"
 
     # Wind the clock past the window: the grant stops working on its own
@@ -453,6 +455,35 @@ def test_grant_expires_and_is_refiled(gated, monkeypatch):
     assert _decision(result) == "deny"
     # An expired window is not a refusal — a fresh request is filed
     assert len(gated.store.list_approvals(gated.wo["id"])) == 2
+
+
+def test_grant_clock_starts_when_the_verdict_is_delivered(gated, monkeypatch):
+    """Issue 40: an approval delivered after the decision-time hour still works"""
+    from jarvis import db
+
+    gated.attempt("gh pr merge 31")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    gates.apply_decision(gated.store, approval["id"], verdict="approved", reason="ok",
+                         decided_by="neo")
+    decided = gated.store.get_approval(approval["id"])
+    (msg,) = [m for m in gated.store.queued_messages(gated.wo["id"])
+              if m["source"] == "gate"]
+    assert decided["verdict_msg_id"] == msg["id"]
+
+    # Two hours with the verdict still queued: nothing lapses
+    late = decided["decided_at"] + 2 * gates.GRANT_TTL_SECONDS
+    monkeypatch.setattr(db, "now", lambda: late)
+    assert gated.store.expire_approvals() == 0
+    assert gated.store.get_approval(approval["id"])["status"] == "approved"
+
+    gated.store.claim_message(msg["id"])
+    assert gated.store.get_approval(approval["id"])["expires_at"] == \
+        late + gates.GRANT_TTL_SECONDS
+    assert _decision(gated.attempt("gh pr merge 31")) == "allow"
+
+    # The hour from delivery is still a bound
+    monkeypatch.setattr(db, "now", lambda: late + gates.GRANT_TTL_SECONDS + 1)
+    assert _decision(gated.attempt("gh pr merge 31")) == "deny"
 
 
 def test_grant_is_use_limited(gated):
@@ -838,6 +869,8 @@ def test_a_grant_nobody_used_still_lapses(gated):
     approval = gated.store.list_approvals(gated.wo["id"])[0]
     gates.apply_decision(gated.store, approval["id"], verdict="approved", reason="ok",
                          decided_by="neo")
+    for m in gated.store.queued_messages(gated.wo["id"]):
+        gated.store.mark_message(m["id"], "delivered")
     gated.store.conn.execute("UPDATE approvals SET expires_at = ? WHERE id=?",
                              (db.now() - 60, approval["id"]))
 
