@@ -51,3 +51,13 @@ A cut is refused while any release order is still open, naming it — concurrent
 orders are how empty versions shipped before (kn-4f5aaa2b).
 
 Out of scope: arbitrary non-prefix subsets (a cherry-pick mode in shipit).
+
+### 3. Any project (wo-ea726f56, Neo Q3185)
+
+`?project=<name>` picks any registered project with a git checkout (`ops.release_projects`);
+none means the OS project, unchanged. Another project's releases are its `<project>-*` tags,
+else every tag; with no tag, everything on main is pending. Its cut files a work order in
+THAT project carrying only `BASE_KEY` — not `BATCH_KEY`, whose OS release machinery would
+park it as "shipped nothing" — briefed to tag the base `<project>-X.Y.Z` and release per
+the project's own documented process, under the release gate. One open order carrying
+either key blocks the next cut.

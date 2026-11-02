@@ -11,7 +11,8 @@ tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
 {% block content %}
 
 {# docs/superpowers/specs/2026-11-01-release-console.md #}
-{{ ui.page_head("Release", report.pending | length ~ " pending since " ~ (report.newest or "the first commit")
+{% set qs = "?project=" ~ (filters.project | urlencode) if filters.project else "" %}
+{{ ui.page_head("Release — " ~ report.project, report.pending | length ~ " pending since " ~ (report.newest or "the first commit")
                 ~ " · " ~ report.releases | length ~ " releases · " ~ report.main_ref) }}
 
 {% if report.in_flight %}
@@ -23,29 +24,33 @@ tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
 {% endif %}
 
 {% call(r) ui.needs_you(attention, "releases with a PR that failed validation in production") %}
-  {{ ui.row_id(r.tag, "/release/" ~ r.tag) }}
+  {{ ui.row_id(r.tag, "/release/" ~ r.tag ~ qs) }}
   <span class="mono tone-bad">{{ r.counts.failed }} failed</span>
   <span class="sub">of {{ r.prs }} commits</span>
 {% endcall %}
 
 {{ ui.filter_bar("/release", filters, options, shown, total,
-                 {"q": "subject, wo id, sha or tag", "status": "every release status",
+                 {"project": "the OS project", "q": "subject, wo id, sha or tag", "status": "every release status",
                   "origin": "every pending origin"}) }}
 
 <h2>pending — on {{ report.main_ref }}, not in any release</h2>
 {% if report.pending %}
 <p class="kv">A release ships everything up to one commit on main, so picking a PR picks
-  every older one too (shaded). The OS files a release work order; its worker runs
-  <span class="mono">scripts/shipit.sh --stage</span> under the release gate.</p>
+  every older one too (shaded). The OS files a release work order in {{ report.project }};
+  {% if report.is_os %}its worker runs <span class="mono">scripts/shipit.sh --stage</span>
+  {%- else %}its worker tags the commit and releases it the way the project documents,{% endif %}
+  under the release gate.</p>
 <div class="cut-bar">
   <form method="post" action="/release/cut">
     <input type="hidden" name="base" value="{{ report.pending[0].sha }}">
+    <input type="hidden" name="project" value="{{ filters.project or '' }}">
     <button {{ 'disabled' if report.in_flight }}>Add all — ship {{ report.pending | length }}</button>
   </form>
   <button form="cut" id="cut-picked" disabled>Ship selected</button>
   <span class="sub" id="cut-sum">or pick the newest commit to ship below</span>
 </div>
 <form method="post" action="/release/cut" id="cut">
+  <input type="hidden" name="project" value="{{ filters.project or '' }}">
   <div class="panel table-wrap">
     <table class="rel-list" id="pending">
       <tr><th>ship up to</th><th>commit</th><th>PR</th><th>work order</th><th>origin</th>
@@ -92,7 +97,7 @@ tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
       <th>failed</th><th>unwatched</th><th>cut</th></tr>
     {% for r in releases %}
     <tr id="{{ r.tag }}">
-      <td class="mono">{{ ui.row_id(r.tag, "/release/" ~ r.tag) }}</td>
+      <td class="mono">{{ ui.row_id(r.tag, "/release/" ~ r.tag ~ qs) }}</td>
       <td class="mono {{ rel.tone[r.status] }}">{{ r.status }}</td>
       <td class="mono">{{ r.prs }}</td>
       <td class="mono tone-ok">{{ r.counts.validated or "" }}</td>
@@ -102,7 +107,7 @@ tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
       <td class="when mono" title="{{ fmt_ts(r.ts) }}">{{ fmt_age(r.ts) }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="8" class="empty">{{ 'nothing matches these filters' if filters else 'no jarvis-* tag yet' }}</td></tr>
+    <tr><td colspan="8" class="empty">{{ 'nothing matches these filters' if filters else 'no ' ~ report.tag_glob ~ ' tag yet' }}</td></tr>
     {% endfor %}
   </table>
 </div>
@@ -112,7 +117,7 @@ tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
   {{ report.newest or "the first commit" }}; a release is every commit between its tag and the
   previous one, read from <span class="mono">{{ report.repo }}</span>. Colour is morpheus's
   verdict on the PR in production; <i>unwatched</i> means morpheus has no item for it.</p>
-<p class="sub">from a terminal: <span class="mono">scripts/shipit.sh --dry-run</span> ·
-  <span class="mono">jarvis morpheus status</span></p>
+{% if report.is_os %}<p class="sub">from a terminal: <span class="mono">scripts/shipit.sh --dry-run</span> ·
+  <span class="mono">jarvis morpheus status</span></p>{% endif %}
 {% endcall %}
 {% endblock %}
