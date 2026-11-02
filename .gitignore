@@ -233,3 +233,6 @@ promo/out/
 
 # Jarvis OS local state
 .jarvis/
+
+# planner submission artifact, consumed by `jarvis fo plan --from-file` (#1292)
+/plan.json
