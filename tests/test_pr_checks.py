@@ -604,7 +604,7 @@ def test_a_refusal_is_not_hidden_behind_a_pending_assumption(started, project,
                                                              fake_gh):
     """Widening the poll made a co-occurrence reachable that `true_blockers` had a guard against precisely..."""
     wo = ops.create_work_order("proj_a", "add feature X")
-    ops.assume(wo["id"], "used tabs, not spaces")
+    ops.assume(wo["id"], "used tabs, not spaces (fixture decision)")
     assert ops.finish(wo["id"], "opened a PR", pr_url=PR)["status"] == "needs_review"
     fake_gh.set_pr(PR, "CLOSED")
     store = ProjectStore(project)

@@ -403,7 +403,7 @@ def test_an_assumption_with_no_reference_at_all_is_recorded_as_before(dispatched
                                                                       project):
     daemon, wo = dispatched
 
-    ops.assume(wo["id"], "used tabs, not spaces")
+    ops.assume(wo["id"], "used tabs, not spaces (fixture decision)")
 
     store = ProjectStore(project)
     try:
@@ -431,7 +431,8 @@ def test_an_over_cap_assumption_is_refused_and_told_to_split(dispatched, project
 
 @pytest.mark.parametrize("probe", [
     "test probe: short text", "probe probe probe", "probe one; probe two", "probe: one",
-    "probe mentioning jarvis wo ask inside the body", "ok", "dummy foo bar text"])
+    "probe mentioning jarvis wo ask inside the body", "ok", "dummy foo bar text",
+    "used CSV export"])
 def test_a_content_free_assumption_is_refused_at_record_time(dispatched, project, probe):
     """Issue 1097: the reported probe bodies never reach the record, nor Neo"""
     daemon, wo = dispatched
@@ -444,7 +445,7 @@ def test_a_content_free_assumption_is_refused_at_record_time(dispatched, project
 
 
 @pytest.mark.parametrize("real", [
-    "CSV, not TSV", "polled every 30s", "kept the test fixture in conftest, not inline",
+    "chose CSV export, not TSV", "polled the API every 30s", "kept the test fixture in conftest, not inline",
     "the health probe stays on port 8787: the dashboard already binds it"])
 def test_a_terse_real_assumption_still_records(real):
     assert not ops.content_free_assumption(real)
@@ -484,7 +485,7 @@ def test_a_project_override_of_each_cap_is_honoured_and_zero_switches_it_off(
                                             "question_max_chars": 0}
     catalog_file.write_text(json.dumps(document))
 
-    ops.assume(wo["id"], "used tabs, not spaces " * 120)
+    ops.assume(wo["id"], "used tabs, not spaces (fixture decision) " * 120)
     ops.ask_question(wo["id"], "z" * 2500)
 
 
@@ -565,8 +566,8 @@ def test_a_question_asked_on_this_order_but_unanswered_is_accepted(dispatched, p
 def test_a_cited_sibling_assumption_is_accepted_on_both_verbs(dispatched, project):
     """Test 5's write half: the sibling is order-scoped, so `#2` resolves off this order"""
     daemon, wo = dispatched
-    ops.assume(wo["id"], "wrote the header")
-    ops.assume(wo["id"], "and quoted every field")
+    ops.assume(wo["id"], "wrote the header (fixture decision)")
+    ops.assume(wo["id"], "and quoted every CSV field")
 
     for verb in _both_verbs(wo["id"]):
         verb("Per assumptions 1 and 2, the exporter stays as it is.")

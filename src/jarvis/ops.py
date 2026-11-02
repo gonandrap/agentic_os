@@ -2454,8 +2454,7 @@ _PROBE_OPENER = re.compile(r"\s*(?:test(?:ing)?\s+)?prob(?:e|ing)\b", re.IGNOREC
 def content_free_assumption(content: str) -> bool:
     """True for a body that records no decision — a hook probe, filler (issue 1097)"""
     words = re.findall(r"[a-z0-9]+", content.lower())
-    if len(set(words)) < 3 or _PROBE_OPENER.match(content):
-        return True
+    if len(set(words)) < 5 or _PROBE_OPENER.match(content):        return True
     return len(words) < 15 and 3 * sum(w in _FILLER_WORDS for w in words) >= len(words)
 
 

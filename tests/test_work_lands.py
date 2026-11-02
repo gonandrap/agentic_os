@@ -249,7 +249,7 @@ def test_accepting_assumptions_will_not_complete_an_order_holding_unlanded_commi
 def test_accepting_assumptions_completes_an_order_that_produced_no_code(started, project):
     """The pairing: the review still does what it always did when nothing is stranded"""
     wo = _order(project, "decide something")
-    ops.assume(wo["id"], "used the existing helper")
+    ops.assume(wo["id"], "used the existing helper (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "needs_review")
@@ -262,7 +262,7 @@ def test_accepting_assumptions_completes_an_order_that_produced_no_code(started,
 def test_a_merged_pull_request_is_not_re_flagged_by_its_own_commits(started, project):
     """THE FALSE POSITIVE THAT WOULD ARRIVE BY THE BACK DOOR"""
     wo = _order(project, code="merged_feature")
-    ops.assume(wo["id"], "named it merged_feature")
+    ops.assume(wo["id"], "named it merged_feature (fixture decision)")
     store = ProjectStore(project)
     try:
         store.update_work_order(wo["id"], pr_url=PR, pr_state="MERGED")
@@ -276,7 +276,7 @@ def test_a_merged_pull_request_is_not_re_flagged_by_its_own_commits(started, pro
 def test_the_parked_flag_survives_a_reconcile_tick(started, project):
     """kn-eafe383a's rule, one level over: a flag `true_blockers` cannot re-derive is relabelled by..."""
     wo = _order(project, code="watchdogs")
-    ops.assume(wo["id"], "polled every 30s")
+    ops.assume(wo["id"], "polled every 30s (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "needs_review")
@@ -525,7 +525,7 @@ def test_the_merge_the_sweep_saw_answers_a_park_over_the_same_work(started, proj
                                                                   fake_gh):
     """§6's INTENDED consequence, and the one reader the second `pr_merged` writer changes (#742)"""
     wo = _order(project, code="watchdogs")
-    ops.assume(wo["id"], "polled every 30s")
+    ops.assume(wo["id"], "polled every 30s (fixture decision)")
     store = ProjectStore(project)
     try:
         store.set_status(wo["id"], "needs_review")
