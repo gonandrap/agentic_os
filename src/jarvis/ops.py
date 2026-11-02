@@ -16448,38 +16448,6 @@ def morpheus_detail(item_id: str) -> dict[str, Any]:
     }
 
 
-def mo_create(project: str, title: str, prompt: str = "", script: str = "",
-              every_minutes: int | None = None,
-              deadline_days: float | None = None) -> dict[str, Any]:
-    """The user's own monitoring order (docs/superpowers/specs/2026-11-01-monitoring-orders.md §5)"""
-    from . import morpheus
-
-    if not project:
-        raise OpsError("a monitoring order needs a project")
-    project = _morpheus_project(_morpheus_catalog(), project)
-    central = CentralStore()
-    try:
-        return morpheus.create(central, project=project, title=title, prompt=prompt,
-                               script=script, every_minutes=every_minutes,
-                               deadline_days=deadline_days, origin="user")
-    except ValueError as e:
-        raise OpsError(str(e)) from e
-    finally:
-        central.close()
-
-
-def mo_cancel(item_id: str) -> dict[str, Any]:
-    from . import morpheus
-
-    central = CentralStore()
-    try:
-        return morpheus.cancel(central, item_id)
-    except (KeyError, ValueError) as e:
-        raise OpsError(str(e).strip("'\"")) from e
-    finally:
-        central.close()
-
-
 def morpheus_enqueue_release(tag: str, from_ref: str | None = None,
                              to_ref: str | None = None,
                              repo: str | None = None,
@@ -16690,6 +16658,8 @@ def mo_create(project: str, title: str, prompt: str = "", script: str = "",
     """Insert the row only; the daemon arms a prompt order on its next pass (§5)"""
     from . import morpheus
 
+    if not project:
+        raise OpsError("a monitoring order needs a project")
     name = _morpheus_project(_morpheus_catalog(), project)
     every_minutes = max(1, round(_mo_span(every, "m"))) if every else None
     days = _mo_span(deadline, "d") if deadline else None
