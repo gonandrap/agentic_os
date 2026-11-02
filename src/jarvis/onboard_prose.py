@@ -447,6 +447,8 @@ LINES: dict[str, str] = {
                              "thrown away.",
     "validation.stakes_classifier": "Which net decides that an assumption is high-stakes and "
                                     "must reach you, before any model call.",
+    "validation.high_stakes_hold": "Who settles an assumption that net calls high-stakes: "
+                                   "you, or Neo like any other.",
     "neo.digest_model": "Which model shortens an over-long question for the dashboard.",
     "neo.enabled": "Whether Neo answers questions in your name or every one waits for you.",
     "neo.model": "Which model Neo answers on.",
@@ -549,6 +551,9 @@ EXAMPLES: dict[str, str] = {
     "validation.stakes_classifier": "With regex-tightened, an assumption that touches money "
                                     "or deletion is held for you by pattern before any "
                                     "model call is spent on it.",
+    "validation.high_stakes_hold": "With neo, an assumption held only for a word like "
+                                   "'prod' is accepted when Neo approves it; Neo's "
+                                   "escalation still reaches you.",
     "neo.digest_model": "With haiku, a 40-line worker question shows on the dashboard as a "
                         "short digest, for the price of one small call.",
     "neo.enabled": "On, a worker asking which of two designs you prefer gets an answer from "
