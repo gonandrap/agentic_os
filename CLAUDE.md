@@ -65,7 +65,8 @@ jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settl
 jarvis investigate list / show <inv-id> / cancel <inv-id>
 jarvis do create <project> "title" -d "<the decision; what data settles it>"  # "do" = decision order: data for YOUR call; never self-closes
 jarvis do show|send|follow-up|done|cancel <id>
-jarvis morpheus status / show|waive|requeue <mv-id> / pause|unpause|follow-fleet   # PRs validated in prod; own brake
+jarvis mo create <project> "title" --prompt "…"|--script f [--every 15m] [--deadline 3d]
+jarvis mo list|show|cancel|waive|requeue|rewrite|confirm / pause|unpause|follow-fleet   # `jarvis morpheus` = alias
 jarvis backlog promote <id> --as feature   # intake -> feature order
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
@@ -100,7 +101,7 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority> [--ex
 jarvis config wiring [project]             # which of the user's MCP servers/skills/plugins reach workers
 jarvis config set <project> <key> <value> --reason "…"
 jarvis doctor [project] [--repair]         # the OS's own post-conditions
-jarvis cost [project|wo-id|fo-id]          # tokens: worker half + Jarvis's own half
+jarvis cost [project|wo-id|fo-id|mo-id]    # tokens: worker half + Jarvis's own half
 jarvis inspect <wo-id|fo-id>               # where the TIME went, and why each cache write happened
 jarvis alarms [project]                    # turns the OS flagged while they burned
 jarvis steward ledger|decisions|why <wo-id>|digest   # what the OS may spend on ITSELF, and each decision's rule

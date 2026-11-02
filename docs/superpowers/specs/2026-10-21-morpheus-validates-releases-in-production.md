@@ -1,5 +1,9 @@
 # Morpheus: every shipped PR validated in production
 
+> **2026-11-01:** Morpheus's long-lived session is gone; every item is now a monitoring
+> order armed and judged by short sessions. See
+> docs/superpowers/specs/2026-11-01-monitoring-orders.md.
+
 ## Problem
 
 The OS ships many PRs, in every project it runs. Nothing checks that each one works in

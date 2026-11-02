@@ -2234,8 +2234,9 @@ def create_app() -> FastAPI:
                   every_minutes: str = Form("")):
         """A monitoring order watching no PR, armed by the daemon's next pass"""
         try:
-            every = int(every_minutes) if every_minutes.strip() else None
-            item = ops.mo_create(project.strip(), title, prompt=prompt, every_minutes=every)
+            # A bare number is minutes to ops.mo_create
+            item = ops.mo_create(project.strip(), title, prompt=prompt,
+                                 every=every_minutes.strip() or None)
         except (ops.OpsError, ValueError) as e:
             return RedirectResponse(_same_site_back("/mo", "/mo", str(e)), status_code=303)
         return RedirectResponse(f"/mo/{item['id']}", status_code=303)

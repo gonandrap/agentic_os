@@ -14077,6 +14077,8 @@ NAVIGATION_DAYS_POSITIVE = (
 _TARGET_FEATURE = "feature_order"
 _TARGET_WORK = "work_order"
 _TARGET_PROJECT = "<project>"
+_TARGET_MONITORING = "monitoring_order"
+MO_NO_TRANSCRIPT = "no transcript; see jarvis cost {id}"
 
 #: How an order id is spelled, taken from `_resolve_order_id` (ops.py:239) and...
 _ORDER_ID_PREFIXES = ("wo-", "fo-")
@@ -14087,6 +14089,17 @@ def _resolve_report_target(target: str, project: str | None = None, *,
                            ) -> tuple[str, str | None, str | None,
                                       dict[str, Any] | None]:
     """What one id means to a report: `(kind, project name, project path, record)`"""
+    from . import morpheus
+
+    if morpheus.is_monitoring_order_id(target):
+        central = CentralStore()
+        try:
+            row = central.morpheus_item(target)
+        finally:
+            central.close()
+        if row is None:
+            raise OpsError(f"no monitoring order {target}")
+        return _TARGET_MONITORING, row["project"] or None, None, row
     try:
         name, path, fo = find_feature_order(target, project)
     except OpsError:
@@ -14139,6 +14152,10 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
         elif kind == _TARGET_WORK:
             scope_project = scope_project or name
             session_ids = [(record["id"], record.get("session_id") or "")]
+            scope = record["id"]
+        elif kind == _TARGET_MONITORING:
+            scope_project = scope_project or name
+            session_ids = [(record["id"], record.get("last_session_id") or "")]
             scope = record["id"]
         else:
             scope_project = target
@@ -14397,9 +14414,9 @@ def inspect_report(target: str, project: str | None = None, *,
     # Resolved ONCE for the whole report
     floor = cold_prefix_floor()
     # The catalog decides the floors and the flags override them for one invocation: a project's setting...
-    configs: dict[str, Any] = {}
+    configs: dict[str | None, Any] = {}
 
-    def settings(project_name: str) -> Any:
+    def settings(project_name: str | None) -> Any:
         if project_name not in configs:
             cfg = inspect_config(project_name)
             overrides = {}
@@ -14434,6 +14451,25 @@ def inspect_report(target: str, project: str | None = None, *,
 
     # The one resolver `jarvis navigation` uses
     kind, name, path, record = _resolve_report_target(target, project)
+    if kind == _TARGET_MONITORING:
+        # Its last arm/judge session (docs/superpowers/specs/2026-11-01-monitoring-orders.md §7)
+        mo = record
+        cfg = settings(name)
+        title = mo["title"] or mo["pr_title"] or mo["id"]
+        head = {"scope": mo["id"], "title": title, "status": mo["state"],
+                "write_floor": cfg.report_write_floor,
+                "join_floor": cfg.report_join_floor}
+        session = mo.get("last_session_id") or ""
+        if not session:
+            return {**head, "units": [], "note": MO_NO_TRANSCRIPT.format(id=mo["id"])}
+        anatomy, provenance = autopsy.anatomy_for(
+            {"id": mo["id"], "session_id": session}, cfg, spans=[], index=index,
+            cold_prefix_floor=floor)
+        payload = anatomy.as_dict()
+        payload.update(provenance=provenance, wo_id=mo["id"], project=mo["project"],
+                       title=title, status=mo["state"], kind="monitoring",
+                       largest_os_input=_largest_os_input(mo["id"]))
+        return {**head, "units": [payload]}
     if kind == _TARGET_WORK:
         wo = record
         cfg = settings(name)

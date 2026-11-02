@@ -146,7 +146,7 @@ def test_decision_order_block_is_shorter_than_the_investigation_order_block(
         persona: str) -> None:
     investigate_at = persona.index("jarvis investigate")
     do_at = persona.index("jarvis do create")
-    morpheus_at = persona.index("jarvis morpheus status")
+    morpheus_at = persona.index("jarvis mo create")
     investigate_block = persona[investigate_at:do_at]
     do_block = persona[do_at:morpheus_at]
     assert investigate_at < do_at < persona.index(DEV_MODE_HEADING)
