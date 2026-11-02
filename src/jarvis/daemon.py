@@ -6397,8 +6397,7 @@ class Daemon:
         """Record ONCE, per (assumption, reason), that the OS declined to decide"""
         if not settling and decision.code in (suppress or ()):
             return
-        # THE ROUND IS PART OF THE KEY, and the hold that needs it is `panel_gave_up`: two consecutive... (#975)
-        # `early` too: the delivery pass's hold is news after the early pass's (#1482)
+        # THE ROUND (#975) AND THE PASS (#1482) ARE PART OF THE KEY
         key = (int(decision.assumption_id or 0), str(decision.code or ""),
                int(decision.round or 0), str(decision.reason or ""), early)
         if not _hold_is_news(store, wo_id, "autoreview_held", key,
