@@ -673,3 +673,75 @@ def test_the_exhausted_hold_is_not_overwritten_by_a_lesser_reading(started, proj
     assert row["code"] == "base_moved" and row["catch_up"] == ops.CATCH_UP_EXHAUSTED
     assert invariants.CATCH_UP_EXHAUSTED_BLOCKER in invariants.true_blockers(
         store, store.get_work_order(wo["id"]))
+
+
+# -- 21. a proposal that lost the race with another merge (#873)
+
+
+def denied_stale(started, project, fake_gh, local_proof):
+    """Filed on an up-to-date base, then `main` moved and the reviewer refused it as stale"""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh, base_oid=BASE_OID)
+    local_proof["contains"] = {BASE_OID}
+    poll(started, store)                      # armed -> a request is filed
+    [approval] = store.list_approvals(wo["id"])
+    gates.apply_decision(store, approval["id"], "denied",
+                         "main has moved since this request was written", "neo",
+                         project="proj_a")
+    # GitHub's cached `baseRefOid` still names the contained commit
+    local_proof["tip"] = BASE_OID2
+    return store, wo
+
+
+def test_a_stale_base_denial_is_caught_up_and_re_proposed_without_the_user(
+        started, project, fake_gh, local_proof):
+    """THE MEASURED CASE, issue #873: wo-3312682f / PR #825"""
+    store, wo = denied_stale(started, project, fake_gh, local_proof)
+
+    poll(started, store)                      # denied -> caught up
+    assert fake_gh.updates == [PR]
+    assert invariants.AUTOMERGE_DENIED_BLOCKER not in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))
+
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=UPDATED,
+                   base_oid=BASE_OID2)
+    local_proof["contains"] = {BASE_OID, BASE_OID2}
+    poll(started, store)                      # green -> carried -> re-proposed
+
+    fresh = [a for a in store.list_approvals(wo["id"]) if UPDATED in a["command"]]
+    assert len(fresh) == 1 and fresh[0]["status"] == "pending"
+    list(invariants.check_blocked_work_is_surfaced(store))
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+
+
+def test_a_denial_on_an_up_to_date_base_still_asks_the_user(started, project, fake_gh,
+                                                            local_proof):
+    """The control: a refusal the base did not cause is not chased"""
+    store, wo = denied_stale(started, project, fake_gh, local_proof)
+    local_proof["tip"] = BASE_OID
+
+    poll(started, store)
+
+    assert fake_gh.updates == []
+    assert invariants.AUTOMERGE_DENIED_BLOCKER in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))
+
+
+def test_a_denial_past_the_cap_asks_the_user_naming_the_races(started, project,
+                                                              fake_gh, local_proof):
+    """The bound: the cap's catch-ups are the races, and the hold names them"""
+    store, wo = denied_stale(started, project, fake_gh, local_proof)
+    for i in range(CATCH_UP_MAX):
+        ops.record_base_update(store, wo, base="main", base_sha=f"{i}" * 40,
+                               head_before=JUDGED, head_after=JUDGED, checks=(),
+                               cause=ops.BASE_UPDATE_BEHIND)
+
+    poll(started, store)
+
+    assert fake_gh.updates == []
+    assert held(store, wo)[-1]["catch_up"] == ops.CATCH_UP_EXHAUSTED
+    assert f"the cap ({CATCH_UP_MAX})" in held(store, wo)[-1]["reason"]
+    assert invariants.CATCH_UP_EXHAUSTED_BLOCKER in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))

@@ -1520,8 +1520,10 @@ def run_session_turn(prompt: str, session_id: str, *, resume: bool, cwd: Path,
                      model: str | None = None, append_system_prompt: str | None = None,
                      permission_mode: str | None = None,
                      add_dirs: list[Path] | None = None,
-                     timeout: int = 900) -> HeadlessResult:
+                     timeout: int = 900,
+                     previous: dict[str, Any] | None = None) -> HeadlessResult:
     """One waited-for turn of a LONG-LIVED OS session (Morpheus): `--session-id` first, `--resume` after"""
+    # `previous`: last turn's usage, since the envelope is a session running total (#1462)
     args = turn_args(prompt, session_id, resume, model=model,
                      permission_mode=permission_mode,
                      append_system_prompt=append_system_prompt, add_dirs=add_dirs or None)
@@ -1536,7 +1538,7 @@ def run_session_turn(prompt: str, session_id: str, *, resume: bool, cwd: Path,
         return HeadlessResult(text=out, model=model or "", prompt_chars=len(prompt),
                               latency_ms=latency_ms, session_id=session_id)
     served = list(data.get("modelUsage") or {})
-    usage = derive_turn_usage(data)
+    usage = derive_turn_usage(data, previous)
     if usage is not None:
         usage["prompt_chars"] = len(prompt)
         usage["latency_ms"] = latency_ms

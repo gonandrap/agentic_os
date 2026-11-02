@@ -38,7 +38,9 @@ requires, so do not rename or drop any of them.
 ## 2. Fill every section
 
 Write the body to a file and pass `--body-file`; a body this shape does not survive
-being typed as a shell argument.
+being typed as a shell argument. Write it with the Write tool in its own call, to a path
+named after your work order (`pr-body-<wo-id>.md`, never a shared `pr.md`): a command
+that writes the file and runs `gh pr create` together is denied.
 
 **Summary** — what changed and why, a few sentences. Longer rationale is a spec:
 write it under `docs/superpowers/specs/YYYY-MM-DD-<name>.md` and link it.

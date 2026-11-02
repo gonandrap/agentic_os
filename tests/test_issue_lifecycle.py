@@ -110,10 +110,14 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, mon
         def land(self, wo_id, pr_url=PR):
             """The work order's code reaches `main`, and the tracker is reconciled"""
             from jarvis import ops
+            from jarvis.catalog import load_catalog
+            from jarvis.daemon import Daemon
             store = ProjectStore(project)
             try:
                 store.update_work_order(wo_id, pr_url=pr_url)
                 ops.complete_merged(store, store.get_work_order(wo_id))
+                Daemon(load_catalog(catalog)).ship_expedited(
+                    self.spec(), store, store.get_work_order(wo_id))
             finally:
                 store.close()
             self.sweep()
@@ -708,6 +712,58 @@ def test_a_merged_pull_request_closes_the_issue_with_the_record_on_it(fleet):
     # Review round 1: the work order id, the title and the PR — and NOTHING ELSE
     assert "/home/gonzalo" not in body and "secret_client" not in body, \
         "worker prose must never reach a public issue unread"
+
+
+def _tracker_alerts(fleet) -> list:
+    store = fleet.store()
+    try:
+        return [dict(r) for r in store.conn.execute(
+            "SELECT level, title, body FROM notifications WHERE source='issue-sync'")]
+    finally:
+        store.close()
+
+
+def test_an_account_that_cannot_triage_stops_every_write_and_says_so_once(fleet):
+    """#1346: a READ account could comment but not close — ~790 duplicate comments"""
+    from jarvis import invariants, ops
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    wo_id = fleet.blocker_wo()
+    fleet.gh.set_permission("READ")
+    before = list(fleet.gh.issue()["comments"])
+    daemon = Daemon(load_catalog(fleet.catalog_path))
+    store = fleet.store()
+    try:
+        store.update_work_order(wo_id, pr_url=PR)
+        ops.complete_merged(store, store.get_work_order(wo_id))
+        for _ in range(2):  # the daemon's own sweeps: one alert per run, not per sweep
+            daemon.sync_issues(fleet.spec(), store)
+    finally:
+        store.close()
+
+    issue = fleet.gh.issue()
+    assert issue["state"] == "OPEN" and issue["comments"] == before
+    alerts = _tracker_alerts(fleet)
+    assert len(alerts) == 1 and alerts[0]["level"] == "critical"
+    for said in (fleet.gh.login, fleet.gh.repo, "READ", "TRIAGE", "GH_CONFIG_DIR"):
+        assert said in alerts[0]["body"]
+    found = [v for v in invariants.check_os() if v.invariant == "INV-TRACKER-ACCESS"]
+    assert len(found) == 1 and found[0].context["permission"] == "READ"
+
+    fleet.gh.set_permission("TRIAGE")
+    fleet.sweep()
+    assert fleet.gh.issue()["state"] == "CLOSED"
+    assert [v for v in invariants.check_os() if v.invariant == "INV-TRACKER-ACCESS"] == []
+
+
+def test_an_unreadable_permission_is_not_a_denial(fleet):
+    """kn-40db1828: a failed probe fabricates no verdict; the sweep runs as before"""
+    wo_id = fleet.blocker_wo()
+    fleet.gh.fail_privacy_read()
+    fleet.land(wo_id)
+    assert fleet.gh.issue()["state"] == "CLOSED"
+    assert _tracker_alerts(fleet) == []
 
 
 def test_the_issue_is_not_closed_while_the_work_order_is_merely_completed(fleet):
@@ -1511,6 +1567,65 @@ def test_two_expedited_fixes_landing_make_one_release(fleet):
         store.close()
 
 
+# -- an expedited merge ships alone (2026-10-31 spec)
+
+
+def _plain_order(fleet, title="tweak the dashboard"):
+    store = fleet.store()
+    try:
+        return store.create_work_order(title=title, status="running")["id"]
+    finally:
+        store.close()
+
+
+def test_an_order_flagged_on_the_fly_ships_alone_on_merge(fleet):
+    """§1-§2: no issue behind it, the pr url batches; the release cherry-picks"""
+    from jarvis import db, ops
+    from jarvis.daemon import Daemon
+    wo_id = _plain_order(fleet)
+    assert ops.expedite_work_order(wo_id, project_name="proj_a")["expedited"]
+    fleet.land(wo_id, pr_url=PR)
+
+    rel = fleet.releases()
+    assert len(rel) == 1
+    meta = db.from_json(rel[0]["metadata"], {})
+    assert meta[Daemon.RELEASE_BATCH_KEY] == [PR]
+    assert meta[Daemon.CHERRY_PICK_KEY] is True
+    assert "--cherry-pick" in rel[0]["description"]
+
+
+def test_a_cherry_pick_release_never_batches_with_a_main_release(fleet):
+    """§3: a blocker fix ships main; an expedited one ships alone, in its own order"""
+    from jarvis import db, ops
+    from jarvis.daemon import Daemon
+    fleet.land(fleet.blocker_wo(), pr_url=PR)
+    wo_id = _plain_order(fleet)
+    ops.expedite_work_order(wo_id, project_name="proj_a")
+    fleet.land(wo_id, pr_url=PR_2)
+
+    kinds = sorted(bool(db.from_json(r["metadata"], {}).get(Daemon.CHERRY_PICK_KEY))
+                   for r in fleet.releases())
+    assert kinds == [False, True]
+
+
+def test_unexpediting_before_merge_ships_nothing_alone(fleet):
+    from jarvis import ops
+    wo_id = _plain_order(fleet)
+    ops.expedite_work_order(wo_id, project_name="proj_a")
+    ops.expedite_work_order(wo_id, on=False, project_name="proj_a")
+    fleet.land(wo_id, pr_url=PR)
+    assert fleet.releases() == []
+
+
+def test_expediting_a_settled_order_is_refused(fleet):
+    """§1: the trigger is the merge; a closed order's merge is behind it"""
+    from jarvis import ops
+    wo_id = _plain_order(fleet)
+    fleet.land(wo_id, pr_url=PR)
+    with pytest.raises(ops.OpsError, match="completed"):
+        ops.expedite_work_order(wo_id, project_name="proj_a")
+
+
 def test_a_landed_fix_never_widens_a_user_cut_release(fleet):
     """docs/superpowers/specs/2026-11-01-release-console.md §2: a pinned base ships only itself"""
     from jarvis import db, release
@@ -1600,7 +1715,10 @@ def gap(fleet, monkeypatch):
 
     recorded = []
     monkeypatch.setattr(ops, "record_investigation_dispatch",
-                        lambda inv, wo, note, project=None: recorded.append((inv, wo, note)))
+                        lambda inv, wo, note, project=None, parked="": recorded.append(
+                            (inv, wo, note, parked))
+                        if project is None else pytest.fail(
+                            f"#1402: scoped to {project!r}; the investigation lives elsewhere"))
     pickup = bugreport.report_bug(title="gap", description="d", expected="e", actual="a",
                                   priority="high", investigation=dict(INV))["pickup"]
     return pickup, recorded
@@ -1646,6 +1764,7 @@ def test_a_steward_refusal_is_recorded_with_the_command_to_start_it(fleet, gap, 
     note = recorded[-1][2]
     assert "steward refused" in note and "ledger is spent" in note
     assert "jarvis issues start" in note
+    assert recorded[-1][3] == "steward `queue` (ledger)", "#1404: the investigation is parked"
 
 
 def test_neo_disagreeing_starts_nothing_and_says_so(fleet, gap):
@@ -1654,6 +1773,7 @@ def test_neo_disagreeing_starts_nothing_and_says_so(fleet, gap):
     _, recorded = gap
     note = recorded[-1][2]
     assert "Neo did not agree" in note and "jarvis issues start" in note
+    assert recorded[-1][3] == "", "Neo's ruling is not a steward hold"
 
 
 # Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
