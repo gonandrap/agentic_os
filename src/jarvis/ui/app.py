@@ -2234,7 +2234,6 @@ def create_app() -> FastAPI:
                   every_minutes: str = Form("")):
         """A monitoring order watching no PR, armed by the daemon's next pass"""
         try:
-            # A bare number is minutes to ops.mo_create
             item = ops.mo_create(project.strip(), title, prompt=prompt,
                                  every=every_minutes.strip() or None)
         except (ops.OpsError, ValueError) as e:
