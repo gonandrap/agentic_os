@@ -130,7 +130,9 @@ def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
     assert set(meter["outside"]) == {"total_usd", "n", "sessions"}
     assert set(meter["alerts"]) == {"outside", "residual", "unreliable", "suppressed",
                                     "thresholds", "min_usd"}
-    assert set(meter["timeline"][0]) == {"ts", "five_hour_pct", "seven_day_pct", "ok"}
+    assert set(meter["timeline"][0]) == {"ts", "five_hour_pct", "seven_day_pct", "ok",
+                                         "five_hour_calc_jarvis", "five_hour_calc_outside",
+                                         "seven_day_calc_jarvis", "seven_day_calc_outside"}
 
 
 def test_the_outside_rows_are_capped_in_rows_and_never_in_dollars(fleet_fixture):
@@ -160,6 +162,34 @@ def test_the_timeline_is_decimated_to_three_hundred_points(fleet_fixture):
 
     assert len(meter["timeline"]) <= 300
     assert meter["timeline"][0]["ts"] >= resolved["since"]
+
+
+def test_the_calculated_series_is_the_windows_spend_in_points_split_by_owner(fleet_fixture):
+    """Each point: $ spent since its window opened, over $/point; Jarvis and outside apart"""
+    resolved = scene(fleet_fixture)
+    meter = meter_of(fleet_fixture, resolved)
+    rate = meter["dollars_per_point"]["value"]
+    assert meter["dollars_per_point"]["source"] == "measured"
+    last = meter["timeline"][-1]
+
+    # The 5h window opened at until - 5h: one $8.20 calibration turn, the $6 turn, the $0.50 call
+    assert last["five_hour_calc_jarvis"] == pytest.approx((8.2 + 6.0 + 0.5) / rate, rel=1e-3)
+    assert last["five_hour_calc_outside"] == pytest.approx(2.48 / rate, rel=1e-3)
+    first = meter["timeline"][0]
+    assert first["five_hour_calc_jarvis"] == pytest.approx(8.2 / rate, rel=1e-3)
+    assert first["five_hour_calc_outside"] == 0.0
+    # The 7d meter never rose enough to calibrate, and a 5h rate is not a 7d one
+    assert last["seven_day_calc_jarvis"] is None
+    assert last["seven_day_calc_outside"] is None
+
+
+def test_the_zoom_endpoint_carries_the_calculated_series(fleet_fixture):
+    resolved = scene(fleet_fixture)
+
+    tl = ops.cost_meter_timeline(resolved["since"], resolved["until"])
+
+    assert tl[-1]["five_hour_calc_jarvis"] > tl[0]["five_hour_calc_jarvis"] > 0
+    assert tl[-1]["five_hour_calc_outside"] > 0
 
 
 # -- 30-32. the sentence
