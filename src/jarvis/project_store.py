@@ -50,6 +50,9 @@ OBJECTION_HANDED_BACK_REASON = "the order delivered its result and the decision 
 #: Branch pushed, no pull request yet; payload `Authored.record()` plus `was` (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §4)
 PR_PENDING_EVENT = "pr_pending"
 
+#: The finish declared a command only the user may run (GitHub issue #1506)
+USER_ACTION_EVENT = "user_action_pending"
+
 #: An OS-built prompt for this work order was past `claude_cli.MAX_OS_PROMPT_CHARS` (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 OS_PROMPT_REFUSED_EVENT = "os_prompt_refused"
 #: What settles one: the next OS call for this order that actually produced something
@@ -3066,6 +3069,17 @@ class ProjectStore:
         closed = any(float(e["ts"]) > since
                      for kind in ("finished", "abandoned", "pr_url_recorded",
                                   "pr_merged")
+                     for e in self.events_of_kind(wo_id, kind))
+        return None if closed else db.from_json(parked[-1]["payload"], {})
+
+    def user_action_open(self, wo_id: str) -> dict[str, Any] | None:
+        """The open park on a command only the user may run, or None (GitHub issue #1506)"""
+        parked = self.events_of_kind(wo_id, USER_ACTION_EVENT)
+        if not parked:
+            return None
+        since = float(parked[-1]["ts"])
+        closed = any(float(e["ts"]) > since
+                     for kind in ("finished", "abandoned", "pr_merged")
                      for e in self.events_of_kind(wo_id, kind))
         return None if closed else db.from_json(parked[-1]["payload"], {})
 
