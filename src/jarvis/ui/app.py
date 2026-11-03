@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from collections import Counter
@@ -543,8 +544,13 @@ def _cost_payloads(picked: dict, project: str) -> dict:
 
 REFRESH_SECONDS = 60
 
-#: How long startup may spend on round one before it gives up and serves anyway (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)
-FIRST_ROUND_SECONDS = 30
+#: Bumped whenever an entry's shape changes, which makes every older snapshot unreadable
+SNAPSHOT_VERSION = 1
+
+
+def cost_snapshot_path() -> Path:
+    """The last round's default-window entries, read at boot (docs/superpowers/specs/2026-11-01-the-dashboard-never-waits-for-the-cost-page.md)"""
+    return transcript_cache.cache_path().parent / f"cost-entries-v{SNAPSHOT_VERSION}.json"
 
 #: On-demand entries kept, and computes allowed to run at once
 MAX_ON_DEMAND = 8
@@ -660,14 +666,44 @@ class CostCache:
             await anyio.to_thread.run_sync(transcript_cache.save)
         except Exception as e:                          # noqa: BLE001
             uilog.record_error("TASK", "cost/cache/save", e)
+        try:
+            await anyio.to_thread.run_sync(self.save_snapshot)
+        except Exception as e:                          # noqa: BLE001
+            uilog.record_error("TASK", "cost/cache/snapshot", e)
+
+    def save_snapshot(self) -> None:
+        target = cost_snapshot_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        blob = json.dumps({"version": SNAPSHOT_VERSION, "entries": dict(self.entries)})
+        tmp = target.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            tmp.write_text(blob, encoding="utf-8")
+            os.replace(tmp, target)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
+
+    def load_snapshot(self) -> None:
+        """Last round's entries; `lookup`'s bound check drops any whose window rolled over"""
+        try:
+            saved = json.loads(cost_snapshot_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(saved, dict) or saved.get("version") != SNAPSHOT_VERSION:
+            return
+        entries = saved.get("entries")
+        if isinstance(entries, dict):
+            for name, entry in entries.items():
+                if isinstance(entry, dict) and isinstance(entry.get("window"), dict):
+                    self.entries.setdefault(name, entry)
 
     async def run(self) -> None:
         import anyio
 
         while True:
-            # Round one is `lifespan`'s, before it yields; this loop only keeps it fresh
-            await anyio.sleep(REFRESH_SECONDS)
+            # Round one runs AFTER lifespan yields (docs/superpowers/specs/2026-11-01-the-dashboard-never-waits-for-the-cost-page.md)
             await self.refresh()
+            await anyio.sleep(REFRESH_SECONDS)
 
 
 def _stale_link_hint(name: str, wo_id: str) -> str:
@@ -1089,9 +1125,8 @@ def create_app() -> FastAPI:
         watchdog.start()
         async with anyio.create_task_group() as tg:
             tg.start_soon(probe.run)
-            # Round one before the first request, bounded (docs/superpowers/specs/2026-10-29-the-cost-page-reuses-what-it-parsed.md)
-            with anyio.move_on_after(FIRST_ROUND_SECONDS):
-                await cost_cache.refresh()
+            # Warm from disk, never from a round (docs/superpowers/specs/2026-11-01-the-dashboard-never-waits-for-the-cost-page.md)
+            cost_cache.load_snapshot()
             tg.start_soon(cost_cache.run)
             try:
                 yield
@@ -2282,13 +2317,17 @@ def create_app() -> FastAPI:
     @app.get("/release", response_class=HTMLResponse)
     def release_page(request: Request):
         """Pending work, the cut, and every release by validation (docs/superpowers/specs/2026-11-01-release-console.md)"""
+        project = (request.query_params.get("project") or "").strip()
         try:
-            report = ops.release_overview()
+            report = ops.release_overview(project)
         except ops.OpsError as e:
             return render(request, "error.html", active="release", message=str(e),
                           status_code=503)
         pending, releases = report["pending"], report["releases"]
-        options = {"status": ["failed", "pending", "validated", "unwatched"],
+        # Spec 2026-11-01 §3: no `project` is the OS's own releases
+        options = {"project": [p for p in ops.release_projects()
+                               if p != (report["project"] if not project else "")],
+                   "status": ["failed", "pending", "validated", "unwatched"],
                    "origin": filter_options(pending, "origin"), "q": []}
         filters = query_filters(request, options)
         shown_pending = filter_rows(pending, {k: v for k, v in filters.items()
@@ -2304,19 +2343,20 @@ def create_app() -> FastAPI:
                       total=len(pending) + len(releases))
 
     @app.post("/release/cut")
-    def release_cut(base: str = Form("")):
+    def release_cut(base: str = Form(""), project: str = Form("")):
         """File the release order for pending work up to `base` (spec 2026-11-01 §2)"""
         try:
-            wo = ops.release_cut(base)
+            wo = ops.release_cut(base, project.strip())
         except ops.OpsError as e:
-            return RedirectResponse(f"/release?error={quote(str(e))}", status_code=303)
+            back = f"/release?project={quote(project.strip())}&" if project.strip() else "/release?"
+            return RedirectResponse(f"{back}error={quote(str(e))}", status_code=303)
         return RedirectResponse(f"/wo/{quote(wo['project'])}/{wo['id']}", status_code=303)
 
     @app.get("/release/{tag}", response_class=HTMLResponse)
     def release_item_page(request: Request, tag: str):
         """One release's contents traced to their orders, coloured by morpheus (spec 2026-11-01 §1)"""
         try:
-            d = ops.release_detail(tag)
+            d = ops.release_detail(tag, (request.query_params.get("project") or "").strip())
         except ops.OpsError as e:
             return render(request, "error.html", active="release", message=str(e),
                           status_code=404)
@@ -2327,6 +2367,7 @@ def create_app() -> FastAPI:
         rows = attention_first(filter_rows(every, filters, text_keys=("subject", "wo_id", "sha")),
                                lambda r: r["validation"] == "failed")
         return render(request, "release_item.html", active="release", d=d, rows=rows,
+                      project=(request.query_params.get("project") or "").strip(),
                       attention=[r for r in rows if r["validation"] == "failed"],
                       filters=filters, options=options, total=len(every))
 
