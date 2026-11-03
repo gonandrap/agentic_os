@@ -633,3 +633,14 @@ wo-1ee46481#1. Re-scored on the 1837 assumptions the CLI reaches (the §6 corpus
 174 holds to 127, 47 released, none added. Every named high row stays held except
 wo-f35e603e#10, an accidental hold on "the production constant" (Neo, question 3229).
 Detector `mention-held-as-act` (`rules._SEEDS`) reports a hold Neo's advice judged routine.
+
+## 10. Amendment 2026-11-03: `token`/`secret`/`auth` are tightened too (issue 1522)
+
+The bare credential row held "Dedupe stays token-free" and parked wo-34efa31b 60m with Neo
+advising approval. `_HST_CREDENTIAL` keeps `credential`, `password` and `api key` as nouns, and
+holds `token`/`secret` only with a credential qualifier before it (auth, access, API, production,
+service, client ...) or a credential act within three words (mint, rotate, reuse, revoke,
+hard-code, commit, print, log, leak, write, store ...), and `auth` only as disabling or
+bypassing it. Not another carve-out: §9's lesson, the act's verb or object on the pattern.
+Re-scored on the 1845 assumptions the CLI reaches: 128 holds to 109, 19 released, none added;
+none of the 19 commits to an act on a credential.

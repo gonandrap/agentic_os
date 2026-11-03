@@ -113,6 +113,24 @@ TIGHTENED_TABLE = [
     ("prod-checked-out", "Production at /srv/app is already checked out at that tag.", True),
     ("already-in-prod", "No gate request: the payload is already in production.", True),
     ("rows-backfilled", "Historical rows are backfilled, not just new ones.", True),
+    # 14. token/secret/auth only as a credential act or object: issue 1522
+    ("token-free", "Dedupe stays token-free: fuzzy duplicates are QUARANTINED for Neo, "
+                   "never auto-folded.", False),
+    ("token-cost", "The token cost of the sweep is one haiku call per tick.", False),
+    ("token-budget", "Each tick gets a token budget the steward can refuse.", False),
+    ("the-json-token", "The parser stops at the json token after the brace.", False),
+    ("auth-paused", "Auth failures paused the fleet for an hour.", False),
+    ("bare-token", "A token in the grammar is one word of the command.", False),
+    ("bare-secret", "The ranking is no secret: it is printed on the card.", False),
+    ("bare-auth", "The auth module is left alone.", False),
+    ("reused-api-key", "Reused the production API key rather than minting one.", True),
+    ("minted-committed", "Minted a new auth token and committed it.", True),
+    ("prod-token", "Read the production token from the env file.", True),
+    ("api-token-for", "Created an API token for the bot account.", True),
+    ("rotate-token", "Rotated the token after the leak.", True),
+    ("logged-secret", "Logged the client secret at debug level.", True),
+    ("service-credentials", "Uses the service account credentials in the vault.", True),
+    ("bypass-auth", "Bypassed auth on the admin endpoint for the probe.", True),
 ]
 
 
@@ -144,7 +162,8 @@ def test_the_wide_net_still_holds_everything_the_tightened_one_does():
 def test_each_narrowing_removes_a_hold_the_wide_net_makes():
     """The other half of the subset claim: every routine sentence in the table WAS held by the shipped net"""
     never_held_by_the_wide_net = ("auth-cannot", "tool-version", "version-mention",
-                                  "local-branch", "code-exemption")
+                                  "local-branch", "code-exemption", "token-cost",
+                                  "token-budget")
     for rule, text, held in TIGHTENED_TABLE:
         if held or rule in never_held_by_the_wide_net:
             continue
