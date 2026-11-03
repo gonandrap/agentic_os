@@ -61,31 +61,31 @@ which of the USER'S OWN MCP servers, skills and plugins reach this project's wor
 
 check the OS's own post-conditions; read-only unless --repair. The daemon runs the same checks every reconcile tick.
 
-## `jarvis morpheus status / show <mv-id> / waive <mv-id> --reason "…" / requeue <mv-id>`
+## `jarvis mo create / list / show / cancel / waive / requeue / rewrite / confirm`
 
-Morpheus validates every PR that reaches production, in every project.
+A monitoring order (`mo-…`; older rows keep `mv-…`) watches one thing in production on a
+schedule. `jarvis morpheus …` is a permanent alias.
 
-* **What queues a PR.** For the OS itself that is a release. For any other project it
-  is a merge.
-* **How a check gets written.** A subagent turns the PR's `## How to validate in
-  production` hints into a read-only check.
+* **Who creates one.** A release (one per PR it newly carries; armed orders are never
+  re-armed), a merge in any other project, an investigation, the steward, or you:
+  `jarvis mo create <project> "title" --prompt "…"|--script f [--every 15m] [--deadline 3d]`.
+* **Arming.** One short, fresh session turns the prompt or the PR's `## How to validate
+  in production` hints into a read-only check, then ends. No session survives.
 * **How the check runs.** The daemon runs it with no model call: exit 0 = validated,
-  1 twice in a row = failed, anything else = not yet. A single exit 1 is a blip until
-  the next check repeats it.
-* **Failed and timed out.** Morpheus never diagnoses. `failed` is handed to an
-  investigation (or to Neo), and `timedout` (3 days by default) to Neo.
-* **What Neo may do about it.** Reading a transient failure, Neo requeues the item
-  itself — once per item, ever. It never waives: ruling a shipped PR fine with no
-  production evidence stays the user's.
-* **The two commands.** `waive` is the user ruling a PR fine. `requeue` watches it again
-  with a fresh deadline.
-* **Its own brake.** By default Morpheus's session pauses with the fleet's `jarvis pause`.
-  `jarvis morpheus pause --reason "…"` holds it while the fleet runs. `jarvis morpheus
-  unpause --reason "…"` lets it run even through a fleet pause. `jarvis morpheus
-  follow-fleet` drops either pin. Checks run either way; they spend nothing.
+  1 twice in a row = failed, anything else = not yet.
+* **Failed and timed out.** Another short session judges it from the row alone:
+  rewrite the script, confirm a real failure, or hand it to an investigation or Neo.
+  Neo may requeue once per order, ever; it never waives.
+* **Your commands.** `waive` rules a PR fine. `requeue` watches again with a fresh
+  deadline. `cancel` stops an open order; it is never judged.
+* **Its own brake.** By default it pauses with `jarvis pause`. `jarvis mo pause
+  --reason "…"` holds it while the fleet runs, `unpause` lets it run through a fleet
+  pause, `follow-fleet` drops either pin. Checks run either way; they spend nothing.
+* **What it cost.** `jarvis cost <mo-id>` is its sessions' calls;
+  `jarvis cost --release <tag>` sums one release's orders. `jarvis inspect <mo-id>`
+  reads its last session; `jarvis search` finds it.
 
-Dashboard: `/morpheus`. Spec:
-docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md.
+Dashboard: `/mo`. Spec: docs/superpowers/specs/2026-11-01-monitoring-orders.md.
 
 ## `jarvis ui`
 

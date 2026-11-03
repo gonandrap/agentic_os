@@ -591,7 +591,7 @@ EXAMPLES: dict[str, str] = {
     "morpheus.enabled": "On, a merged fix gets a read-only production check that runs every "
                         "15 minutes until it passes, fails or times out; off, nothing checks "
                         "it.",
-    "morpheus.model": "With sonnet, each check Morpheus writes costs one sonnet subagent.",
+    "morpheus.model": "With sonnet, arming or judging an order costs one short sonnet session.",
     "morpheus.on_failed": "With investigate, two failing checks in a row file an "
                           "investigation on the PR's order through the steward; with neo, "
                           "Neo gets a question and spends no worker.",

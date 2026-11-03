@@ -19,6 +19,7 @@ KINDS = (
     "alarm",
     "gate",
     "backlog",
+    "monitoring",
     "knowledge",
 )
 
@@ -154,7 +155,7 @@ def search(query: str, *, project: str | None = None,
             finally:
                 store.close()
 
-    if wanted & {"backlog", "knowledge"}:
+    if wanted & {"backlog", "monitoring", "knowledge"}:
         central = CentralStore()
         try:
             if "backlog" in wanted:
@@ -165,6 +166,17 @@ def search(query: str, *, project: str | None = None,
                                      body=row["description"], words=words,
                                      url=f"/backlog/{row['id']}",
                                      ref=f"jarvis backlog show {row['id']}"))
+            if "monitoring" in wanted:
+                # docs/superpowers/specs/2026-11-01-monitoring-orders.md §7
+                for row in central.search_monitoring_orders(words, project=project,
+                                                            limit=limit):
+                    hits.append(_hit("monitoring", id=row["id"], project=row["project"],
+                                     title=row["title"] or row["pr_title"] or row["id"],
+                                     status=row["state"], ts=row["created_ts"],
+                                     score=row["_score"],
+                                     body=row["resolution"] or row["prompt"] or row["hints"],
+                                     words=words, url=f"/mo/{row['id']}",
+                                     ref=f"jarvis mo show {row['id']}"))
             if "knowledge" in wanted:
                 rows = central.search_knowledge(query, limit=limit, project=project)
                 for rank, row in enumerate(rows):

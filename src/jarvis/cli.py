@@ -502,8 +502,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("cost", help="what the fleet's work has cost in tokens")
     sp.add_argument("target", nargs="?",
-                    help="a project, a work-order id, or a feature-order id "
-                         "(default: the whole fleet)")
+                    help="a project, a work-order, feature-order or monitoring-order "
+                         "id (default: the whole fleet)")
+    sp.add_argument("--release", metavar="TAG",
+                    help="every monitoring order of that release tag, summed")
     sp.add_argument("--limit", type=int, default=50,
                     help="work orders per project to measure (default: 50)")
     # The DISTRIBUTION, beside the listing rather than instead of it: what a typical order costs (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)
@@ -2747,6 +2749,9 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     if args.json:
         _print(res, True)
         return 0
+    if res.get("note"):
+        print(f"{res['scope']} — {res['title']}\n{res['note']}")
+        return 0
     # A feature order is many units and needs a line saying which feature they are
     if len(res["units"]) != 1 or res["units"][0]["wo_id"] != res["scope"]:
         print(f"{res['scope']} — {res['title']}\n")
@@ -3237,12 +3242,22 @@ def _cost_meter(picked: dict, project: str | None) -> dict | None:
 
 
 def cmd_cost(args: argparse.Namespace) -> int:
-    from . import ops
+    from . import morpheus, ops
     # One argument, three kinds of thing (docs/superpowers/specs/2026-09-23-improvement-orders.md)
     from .project_store import is_feature_order_id
 
+    # A release's monitoring orders, summed (docs/superpowers/specs/2026-11-01-monitoring-orders.md §7)
+    if getattr(args, "release", None):
+        from . import bill as bill_mod
+        bill = bill_mod.for_release(args.release)
+        if args.json:
+            _print(bill, True)
+            return 0
+        _print_bill(bill)
+        return 0
     target = args.target
-    is_id = bool(target) and (target.startswith("wo-") or is_feature_order_id(target))
+    is_id = bool(target) and (target.startswith("wo-") or is_feature_order_id(target)
+                              or morpheus.is_monitoring_order_id(target))
     scope = args.project or (None if is_id else target) or None
     # THE ZONE, THEN THE WINDOW, ONCE at the top and handed to every payload builder below (kn-9ccc429b:...
     zone = ops.cost_zone(args.tz, scope)
