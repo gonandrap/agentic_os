@@ -286,6 +286,48 @@ def test_backlog_show_renders_the_origin(store, central, tick, capsys):
     assert "origin" not in capsys.readouterr().out
 
 
+def test_backlog_show_prints_each_origin_as_kind_label_href(central, capsys):
+    """2026-11-03-backlog-operability §6.3, primary first"""
+    item = central.propose_backlog(
+        "proj_a", "two origins", item_type="task", severity="medium", suggested_kind="wo",
+        origin_refs=[{"kind": "neo_question", "id": 42},
+                     {"kind": "order", "id": "wo-0000bbbb"}])
+    capsys.readouterr()
+
+    assert cli.main(["backlog", "show", item["id"]]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    start = lines.index("origins:")
+    assert [ln.strip() for ln in lines[start + 1:start + 3]] == [
+        "neo_question Neo question q42 /neo/question/42", "order wo-0000bbbb /go/wo-0000bbbb"]
+
+
+def test_backlog_list_filters_by_status_type_severity_and_kind(central, capsys):
+    def proposal(title, **kw):
+        fields = {"item_type": "task", "severity": "medium", "suggested_kind": "wo",
+                  "origin_refs": []}
+        fields.update(kw)
+        return central.propose_backlog("proj_a", title, **fields)["id"]
+
+    bug = proposal("a crash", item_type="bug")
+    severe = proposal("a blocker", severity="blocker")
+    big = proposal("a rework", suggested_kind="fo")
+    opened = proposal("an open one")
+    central.review_backlog(opened, "open", rule="r", note="n")
+
+    def listed(*flags):
+        capsys.readouterr()
+        assert cli.main(["backlog", "list", "proj_a", *flags]) == 0
+        return {ln.split()[1] for ln in capsys.readouterr().out.splitlines()
+                if ln.startswith("• ")}
+
+    # Paired: without a status the default is still open only
+    assert listed() == {opened}
+    assert listed("--status", "proposed") == {bug, severe, big}
+    assert listed("--status", "proposed", "--type", "bug") == {bug}
+    assert listed("--status", "proposed", "--severity", "blocker") == {severe}
+    assert listed("--all", "--kind", "fo") == {big}
+
+
 # -- the two contracts
 
 

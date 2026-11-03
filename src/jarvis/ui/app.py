@@ -33,12 +33,13 @@ from .. import (
     ops,
     rules,
     specs,
+    steward,
     transcript_cache,
     uilog,
     wiring,
 )
 from ..bill import OWN_LABEL
-from ..central_store import KB_LINK_RELS, CentralStore
+from ..central_store import KB_LINK_RELS, SETTLED_BACKLOG_STATUSES, CentralStore
 from ..daemon import daemon_running
 from ..inspection import ALARM_KINDS, PARTS
 from ..paths import PRODUCTION, deployment_env
@@ -1899,11 +1900,21 @@ def create_app() -> FastAPI:
         """Intake, blocked items first (spec 2026-10-29 dashboard §6)"""
         every = ops.list_backlog(status=None)
         options = {"status": filter_options(every, "status"),
-                   "project": filter_options(every, "project")}
+                   "project": filter_options(every, "project"),
+                   "item_type": filter_options(every, "item_type"),
+                   "severity": sorted(filter_options(every, "severity"),
+                                      key=steward.severity_rank, reverse=True),
+                   "suggested_kind": filter_options(every, "suggested_kind")}
         filters = query_filters(request, options)
-        rows = attention_first(filter_rows(every, filters), lambda i: bool(i["blockers"]))
+        rows = filter_rows(every, filters)
+        # No status filter: settled rows stay out (2026-11-03-backlog-operability §6.1)
+        if "status" not in filters:
+            rows = [r for r in rows if r["status"] not in SETTLED_BACKLOG_STATUSES]
+        rows = attention_first(rows, lambda i: bool(i["blockers"]))
+        counts = {s: sum(1 for r in every if r["status"] == s)
+                  for s in ("open", "proposed", "quarantined")}
         return render(request, "backlog.html", active="backlog", rows=rows,
-                      attention=[i for i in rows if i["blockers"]],
+                      attention=[i for i in rows if i["blockers"]], counts=counts,
                       filters=filters, options=options, total=len(every))
 
     @app.get("/backlog/{item_id}", response_class=HTMLResponse)

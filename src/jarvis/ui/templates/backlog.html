@@ -3,8 +3,9 @@
 {% block title %}Backlog — Jarvis{% endblock %}
 {% block content %}
 
-{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6 #}
-{{ ui.page_head("Backlog", (attention | length) ~ " blocked · " ~ total ~ " items") }}
+{# docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md §6; 2026-11-03-backlog-operability.md §6 #}
+{{ ui.page_head("Backlog", counts.open ~ " open · " ~ counts.proposed ~ " proposed · "
+                ~ counts.quarantined ~ " quarantined · " ~ (attention | length) ~ " blocked") }}
 
 {% call(it) ui.needs_you(attention, "blocked by unfinished dependencies") %}
   {{ ui.row_id(it.id, "/backlog/" ~ it.id) }}
@@ -12,20 +13,29 @@
     {% for b in it.blockers %}{{ b.id }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}</span>
 {% endcall %}
 
-{{ ui.filter_bar("/backlog", filters, options, rows | length, total) }}
+{{ ui.filter_bar("/backlog", filters, options, rows | length, total,
+                 labels={"status": "unsettled (not done/dropped)", "item_type": "every type",
+                         "suggested_kind": "every kind"}) }}
 
 <div class="panel table-wrap">
   <table class="backlog-list">
-    <tr><th>id</th><th>project</th><th>title</th><th>status</th><th>became</th><th></th></tr>
+    <tr><th>id</th><th>project</th><th>title</th><th>type</th><th>severity</th><th>kind</th>
+      <th>status</th><th>origin</th><th>became</th><th></th></tr>
     {% for it in rows %}
     <tr id="{{ it.id }}">
       <td>{{ ui.row_id(it.id, "/backlog/" ~ it.id) }}</td>
       <td class="mono">{{ it.project }}</td>
       <td class="prose"><div class="clamp" title="{{ it.description or it.title }}">{{ it.title }}</div>
         {% if it.blockers %}<div class="sub tone-warn">◭ blocked by
-          {% for b in it.blockers %}{{ b.id }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}</td>
+          {% for b in it.blockers %}{{ b.id }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}
+        {% if it.duplicate_of %}<div class="sub">duplicate of {{ ui.row_id(it.duplicate_of, "/backlog/" ~ it.duplicate_of) }}</div>{% endif %}</td>
+      <td class="mono">{{ it.item_type }}</td>
+      <td class="mono">{{ it.severity }}</td>
+      <td class="mono">{{ it.suggested_kind }}</td>
       <td class="when"><span class="st tone-{{ 'active' if it.status == 'open' else 'muted' }}">
         <span class="i">{{ '◌' if it.status == 'open' else '✓' if it.status == 'done' else '→' }}</span>{{ it.status }}</span></td>
+      <td>{% if it.origins %}{% set o = it.origins[0] %}<a class="origin" href="{{ o.href }}" title="{{ o.kind }}">{{ o.label }}</a>
+        {%- if it.origins | length > 1 %} <span class="sub">+{{ it.origins | length - 1 }}</span>{% endif %}{% else %}—{% endif %}</td>
       <td>{% if it.promoted_wo_id %}{{ ui.row_id(it.promoted_wo_id, "/go/" ~ it.promoted_wo_id) }}{% else %}—{% endif %}</td>
       <td>{% if it.status == 'open' %}
         <form class="inline" method="post" action="/backlog/promote/{{ it.id }}">
@@ -34,7 +44,7 @@
         </form>{% endif %}</td>
     </tr>
     {% else %}
-    <tr><td colspan="6" class="empty">{{ 'nothing matches these filters' if filters else 'backlog empty — workers file deferred work here automatically' }}</td></tr>
+    <tr><td colspan="10" class="empty">{{ 'nothing matches these filters' if filters else 'nothing unsettled — pick a status to see done or dropped items' if total else 'backlog empty — workers file deferred work here automatically' }}</td></tr>
     {% endfor %}
   </table>
 </div>
