@@ -62,6 +62,29 @@ def test_report_writes_nothing_and_apply_stops_everything(started, fake_claude, 
     assert ops.quiesce_project("proj_a")["open"] == []
 
 
+def test_apply_drops_proposed_and_quarantined_items_and_leaves_settled_ones(started):
+    central = CentralStore()
+    fields = dict(item_type="task", severity="medium", suggested_kind="wo", origin_refs=[])
+    proposed = central.propose_backlog("proj_a", "a proposal", **fields)
+    quarantined = central.propose_backlog("proj_a", "a risky one", **fields)
+    central.review_backlog(quarantined["id"], "quarantined", rule="r", note="ask Neo")
+    done = central.add_backlog("proj_a", "already done")
+    central.mark_backlog(done["id"], "done")
+    elsewhere = central.propose_backlog("proj_b", "another project's", **fields)
+    assert {"proj_a"} <= {p for t, p, _ in central.live_rows_by_project() if t == "backlog"}
+    central.close()
+
+    out = ops.quiesce_project("proj_a", apply=True)
+
+    central = CentralStore()
+    assert out["backlog_dropped"] == 2
+    assert central.get_backlog(proposed["id"])["status"] == "dropped"
+    assert central.get_backlog(quarantined["id"])["status"] == "dropped"
+    assert central.get_backlog(done["id"])["status"] == "done"
+    assert central.get_backlog(elsewhere["id"])["status"] == "proposed"
+    assert "proj_a" not in {p for t, p, _ in central.live_rows_by_project() if t == "backlog"}
+
+
 def test_open_decision_order_refuses_before_any_cancel_inside_a_work_order(
         started, project, monkeypatch):
     wo = ops.create_work_order("proj_a", "open task")

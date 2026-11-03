@@ -230,6 +230,25 @@ def test_project_scope(started, tmp_path, jarvis_home):
         search.search("login", project="proj_nope")
 
 
+def test_a_duplicate_names_what_it_restates_and_every_status_is_found(started):
+    central = CentralStore()
+    try:
+        fields = dict(item_type="task", severity="medium", suggested_kind="wo", origin_refs=[])
+        keep = central.add_backlog("proj_a", "retire the login spinner")
+        dup = central.propose_backlog("proj_a", "remove the login spinner", **fields)
+        central.review_backlog(dup["id"], "dropped", rule="duplicate", note="restates it",
+                               duplicate_of=keep["id"])
+        waiting = central.propose_backlog("proj_a", "login spinner, proposed", **fields)
+    finally:
+        central.close()
+    hits = {h["id"]: h for h in search.search("login spinner", kinds=("backlog",))}
+    assert hits[dup["id"]]["title"] == f"remove the login spinner (duplicate of {keep['id']})"
+    # Paired: neither the original nor an undecided proposal is suffixed
+    assert hits[keep["id"]]["title"] == "retire the login spinner"
+    assert hits[waiting["id"]]["status"] == "proposed"
+    assert "duplicate" not in hits[waiting["id"]]["title"]
+
+
 def test_snippet_shows_the_match_not_the_opening(started):
     _wo("a quiet title", "x" * 400 + f" {LOGIN}")
     snippet = search.search("spinner")[0]["snippet"]
