@@ -223,13 +223,16 @@ def render(payload: Payload, *, project: str = "",
         lines += ["", payload.description]
     if payload.neo_question_id is not None:
         lines += ["", f"(raised against Neo question {payload.neo_question_id})"]
-    cmd = [f"    jarvis backlog add {project or '<project>'} {_q(payload.title)} \\"]
+    cmd = [f"    jarvis backlog propose {project or '<project>'} {_q(payload.title)} \\",
+           "        --type task --severity medium \\"]
     if payload.description:
         cmd.append(f"        -d {_q(payload.description)} \\")
     if origin_wo_id:
         cmd.append(f"        --origin-wo {origin_wo_id} \\")
     if origin_fo_id:
         cmd.append(f"        --origin-fo {origin_fo_id} \\")
+    if payload.neo_question_id is not None:
+        cmd.append(f"        --ref q{payload.neo_question_id} \\")
     cmd.append(f"        --origin-note {_q(origin_note(payload))}")
     lines += ["", "File this on the backlog with where it came from recorded — the "
                   "flags ARE the record, so run it as it stands:", "", *cmd, "",
@@ -309,9 +312,13 @@ def _unfilled(store: ProjectStore, central: CentralStore, envelope: dict[str, An
 
     if envelope["kind"] == "deferral_request" and isinstance(payload, DeferralRequest):
         name = project or project_name(store, central)
-        # The SAME three columns the manager's `jarvis backlog add` invocation fills in
-        item = central.add_backlog(
+        # The SAME three columns the manager's `jarvis backlog propose` invocation fills in
+        item = central.propose_backlog(
             name, payload.title, payload.description or payload.why,
+            item_type="task", severity="medium", suggested_kind="wo",
+            origin_refs=[{"kind": "envelope", "project": name, "id": env_id,
+                          "subject_wo_id": envelope["subject_wo_id"]},
+                         {"kind": "order", "id": envelope["subject_wo_id"]}],
             origin_wo_id=envelope["subject_wo_id"],
             origin_fo_id=_feature_of(store, envelope),
             origin_note=origin_note(payload))

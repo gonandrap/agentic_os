@@ -224,8 +224,13 @@ def test_record_section_carries_the_full_record_rule():
         "--pr <url>",
         "waiting for",
         "never a substitute for the final message",
+        # moved from `backlog add` (spec 2026-11-03-backlog-operability §4.5)
+        "jarvis backlog propose <project>",
+        "--severity",
+        "with `--ref`",
     ):
         assert phrase in text, f"lost from the record section: {phrase!r}"
+    assert "jarvis backlog add" not in text
     assert "ceases to exist" not in text, (
         "the summary/final-message contradiction is back — see spec 2026-09-19 SS7")
 

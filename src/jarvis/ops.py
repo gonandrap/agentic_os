@@ -10217,7 +10217,9 @@ def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | Non
                     # A backlog row has no metadata: origin_fo_id is its back-link
                     row = central.add_backlog(target, title, description=description,
                                               origin_fo_id=do_id,
-                                              origin_note=f"decision order {do_id}")
+                                              origin_note=f"decision order {do_id}",
+                                              origin_refs=[{"kind": "decision",
+                                                            "do_id": do_id, "key": key}])
                 finally:
                     central.close()
             else:
@@ -12563,7 +12565,9 @@ def _refuse_worker_write(verb: str) -> None:
     raise OpsError(
         f"{wo_id} is a worker session — a worker may not `jarvis config {verb}`. "
         "The fleet's configuration is the user's. Ask on the work order record "
-        "(`jarvis wo ask`), or file it: `jarvis backlog add jarvis_os \"…\"`."
+        "(`jarvis wo ask`), or file it: `jarvis backlog propose jarvis_os \"…\" -d \"…\" "
+        "--type task --severity … [--ref …]`. The steward reviews it; name the Neo "
+        "question or message that led to it with `--ref`."
     )
 
 
@@ -13679,6 +13683,88 @@ def parse_origin_ref(token: str) -> dict[str, Any]:
     if ref is None:
         raise OpsError(f"--ref {t!r} is not a ref; accepted forms: {', '.join(_ORIGIN_REF_FORMS)}")
     return normalise_origin_refs([ref])[0]
+
+
+def require_origin_ref(ref: Mapping[str, Any]) -> None:
+    """Refuse a `--ref` whose id does not exist (2026-11-03-backlog-operability §4.2)"""
+    kind, p = ref["kind"], ref.get("project")
+    try:
+        if kind == "neo_question":
+            from .neo_store import NeoStore
+
+            neo = NeoStore()
+            try:
+                found = neo.get(int(ref["id"])) is not None
+            finally:
+                neo.close()
+        elif kind == "message":
+            _, path, _ = find_work_order(ref["wo_id"], p)
+            store = ProjectStore(path)
+            try:
+                m = store.get_message(int(ref["id"]))
+            finally:
+                store.close()
+            found = bool(m) and m.get("wo_id") == ref["wo_id"]
+        elif kind == "monitoring_order":
+            central = CentralStore()
+            try:
+                found = central.morpheus_item(ref["id"]) is not None
+            finally:
+                central.close()
+        elif kind == "alarm":
+            found = bool(_find_alarm(ref["id"], p))
+        elif kind in ("decision", "finding"):
+            found = bool(find_feature_order(ref.get("do_id") or ref["order_id"]))
+        elif kind == "gate":
+            found = bool(_find_approval(int(ref["id"]), p))
+        elif kind == "validation":
+            found = bool(find_work_order(ref["wo_id"], p))
+        elif kind == "order":
+            finder = find_work_order if ref["id"].startswith("wo-") else find_feature_order
+            found = bool(finder(ref["id"]))
+        else:  # turn and envelope are minted by the OS, never typed
+            found = True
+    except OpsError:
+        found = False
+    if not found:
+        label = origin_url(ref)[1].removesuffix(" (not found)")
+        raise OpsError(f"--ref names {label}, which does not exist")
+
+
+def propose_backlog(project: str, title: str, description: str = "", *,
+                    item_type: str, severity: str, suggested_kind: str = "wo",
+                    depends_on: Sequence[str] = (), ref_tokens: Sequence[str] = (),
+                    origin_wo_id: str | None = None, origin_fo_id: str | None = None,
+                    origin_note: str = "") -> dict[str, Any]:
+    """`jarvis backlog propose`: a turn ref first inside a work order (2026-11-03-backlog-operability §4.1)"""
+    require_registered_project(project)
+    refs = [parse_origin_ref(t) for t in ref_tokens]
+    for ref in refs:
+        require_origin_ref(ref)
+    session_wo = os.environ.get("JARVIS_WO_ID", "")
+    session_project = os.environ.get("JARVIS_PROJECT", "")
+    if session_wo and session_project:
+        refs.insert(0, {"kind": "turn", "project": session_project, "wo_id": session_wo,
+                        "ts": db.now()})
+    # an explicit origin wins: a manager files on a child's behalf (Neo q3295)
+    origin_wo_id = origin_wo_id or session_wo or None
+    if origin_wo_id and not origin_fo_id:
+        try:
+            parent = find_work_order(origin_wo_id)[2].get("parent_id")
+            origin_fo_id = parent and find_feature_order(parent)[2]["id"]
+        except OpsError:
+            origin_fo_id = None
+    central = CentralStore()
+    try:
+        return central.propose_backlog(
+            project, title, description, item_type=item_type, severity=severity,
+            suggested_kind=suggested_kind, origin_refs=refs, depends_on=list(depends_on),
+            origin_wo_id=origin_wo_id, origin_fo_id=origin_fo_id or None,
+            origin_note=origin_note)
+    except (ValueError, KeyError) as e:
+        raise OpsError(str(e.args[0] if e.args else e)) from e
+    finally:
+        central.close()
 
 
 def promote_backlog(item_id: str, force: bool = False,
