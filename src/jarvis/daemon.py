@@ -814,6 +814,18 @@ class Daemon:
         if offered:
             log.info("[%s] findings offered to Neo: %s", project.name, ", ".join(offered))
 
+    def review_backlog_proposals(self) -> int:
+        """Settle proposed backlog items mechanically, oldest first (2026-11-03-backlog-operability §3.1)"""
+        reviewed = 0
+        for item in self.central.list_backlog(status="proposed")[:steward.BACKLOG_REVIEW_PER_TICK]:
+            try:
+                steward.apply_review(self.central, item,
+                                     steward.review_proposal(self.central, item))
+                reviewed += 1
+            except Exception:  # noqa: BLE001 — the item stays proposed; next tick retries it
+                log.exception("backlog review of %s failed", item["id"])
+        return reviewed
+
     def steward_drain(self) -> None:
         """Queued self-work is deferred, not dropped: re-offer it when there is room (#1181)"""
         if fleet.load_pause(self.central) is not None:
@@ -1209,6 +1221,8 @@ class Daemon:
         # After the project loop, so `running_turns` reflects the turns settlement just reaped: the...
         self.release_tick()
 
+        # Before `neo_tick`: an item quarantined here is one Neo can be asked about this tick
+        self.review_backlog_proposals()
         self.neo_tick()
         # After the drain is kicked, never before: a question digested this tick is one whose answer has...
         self.digest_tick()

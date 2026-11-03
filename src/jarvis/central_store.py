@@ -1269,6 +1269,18 @@ class CentralStore:
             raise ValueError(f"backlog item {item_id} changed status during review")
         return self.get_backlog(item_id)  # type: ignore[return-value]
 
+    def append_backlog_origin_refs(self, item_id: str,
+                                   refs: list[dict[str, Any]]) -> dict[str, Any]:
+        """Add sightings to a kept item; one already there is not repeated (2026-11-03-backlog-operability §3.2 rule 2)"""
+        item = self.get_backlog(item_id)
+        if not item:
+            raise KeyError(f"backlog item {item_id!r} not found")
+        merged = list(item["origin_refs"])
+        merged += [r for r in normalise_origin_refs(refs) if r not in merged]
+        self.conn.execute("UPDATE backlog SET origin_refs=? WHERE id=?",
+                          (db.to_json(merged), item_id))
+        return self.get_backlog(item_id)  # type: ignore[return-value]
+
     def get_backlog(self, item_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM backlog WHERE id=?", (item_id,)).fetchone()
         return _decode_backlog(row) if row else None

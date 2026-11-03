@@ -1045,3 +1045,110 @@ def send_digest(catalog: Catalog, central: CentralStore, *, now: float | None = 
         return 0
     return central.add_inbox("", "steward: the week in self-evolution",
                              render_digest(d), level="info")
+
+
+# --- Backlog proposals: docs/superpowers/specs/2026-11-03-backlog-operability.md §3 ---
+
+#: Stricter than SAME_DEFECT_OVERLAP and over the LARGER wording: a whole backlog, not one file (§3.2 rule 4)
+BACKLOG_OVERLAP = 0.6
+BACKLOG_MIN_WORDS = 3
+BACKLOG_WORDING_CHARS = 300
+#: Rule 6: a `wo` proposal past either bound may be a feature order
+KIND_MAX_CHARS = 2500
+KIND_MAX_FILES = 6
+_FILE_RE = re.compile(r"\S+\.(?:py|html|md|js|toml)\b")
+_TITLE_RE = re.compile(r"[\W_]+")
+BACKLOG_REVIEW_PER_TICK = 50
+MAX_NAMED_CANDIDATES = 3
+
+
+@dataclass(frozen=True)
+class Review:
+    """What the steward decided for one proposal; `status` is the row's new status"""
+
+    status: str
+    rule: str
+    note: str
+    duplicate_of: str | None = None
+
+
+def normalised_title(title: str) -> str:
+    return _TITLE_RE.sub(" ", (title or "").lower()).strip()
+
+
+def _wording(item: Mapping[str, Any]) -> set[str]:
+    return _defect_words(f"{item.get('title') or ''} "
+                         f"{(item.get('description') or '')[:BACKLOG_WORDING_CHARS]}")
+
+
+def similar_wording(a: set[str], b: set[str]) -> bool:
+    """§3.2 rule 4; unlike `same_defect`, a thin wording matches nothing"""
+    if len(a) < BACKLOG_MIN_WORDS or len(b) < BACKLOG_MIN_WORDS:
+        return False
+    return len(a & b) / max(len(a), len(b)) >= BACKLOG_OVERLAP
+
+
+def _peers(central: CentralStore, item: Mapping[str, Any],
+           statuses: Sequence[str]) -> list[dict[str, Any]]:
+    """Same-project items in `statuses`; a proposal younger than `item` is not a peer yet"""
+    key = (item["created_at"], item["id"])
+    return [o for o in central.list_backlog(item["project"], status=None)
+            if o["id"] != item["id"] and o["status"] in statuses
+            and (o["status"] != "proposed" or (o["created_at"], o["id"]) < key)]
+
+
+def review_proposal(central: CentralStore, item: Mapping[str, Any]) -> Review:
+    """The steward's verdict on one backlog proposal, first rule wins (§3.2); writes nothing"""
+    from . import ops
+
+    if item["status"] != "proposed":
+        return Review(item["status"], "origin-user", "not proposed: not reviewed")
+    title = normalised_title(item["title"])
+    for kept in _peers(central, item, ("proposed", "quarantined", "open", "promoted")):
+        if normalised_title(kept["title"]) == title:
+            note = f"same title as {kept['id']}"
+            if kept["status"] == "promoted":
+                note += f", already promoted to {kept.get('promoted_wo_id') or 'an order'}"
+            return Review("dropped", "exact-duplicate", note, duplicate_of=kept["id"])
+    lost = [label for _href, label in map(ops.origin_url, item["origin_refs"])
+            if label.endswith("(not found)")]
+    if lost:
+        return Review("quarantined", "unresolved-ref", f"origin does not resolve: {lost[0]}")
+    words = _wording(item)
+    near = [o["id"] for o in _peers(central, item, ("proposed", "quarantined", "open"))
+            if similar_wording(words, _wording(o))]
+    if near:
+        return Review("quarantined", "possible-duplicate",
+                      f"may restate {', '.join(near[:MAX_NAMED_CANDIDATES])}")
+    if item.get("severity") in URGENT:
+        return Review("quarantined", "severity-claim",
+                      f"claims {item['severity']}: Neo re-assesses that")
+    desc = item.get("description") or ""
+    if item.get("suggested_kind") == "wo" and (
+            len(desc) > KIND_MAX_CHARS or len(set(_FILE_RE.findall(desc))) > KIND_MAX_FILES):
+        return Review("quarantined", "kind-mismatch", "may be a feature order")
+    for dep_id in item.get("depends_on") or ():
+        dep = central.get_backlog(dep_id)
+        if dep is None or dep["status"] == "dropped":
+            return Review("quarantined", "dangling-dependency",
+                          f"depends on {dep_id}, which is {'dropped' if dep else 'missing'}")
+    return Review("open", "accepted", "no rule held it back")
+
+
+def fold_duplicate(central: CentralStore, item: Mapping[str, Any], kept_id: str, *,
+                   rule: str, note: str) -> dict[str, Any]:
+    """Drop `item` as a duplicate of `kept_id` and carry its sightings over (§3.2 rule 2, §5.2)"""
+    # The guarded drop first: of two racing reviewers only one appends
+    out = central.review_backlog(item["id"], "dropped", rule=rule, note=note,
+                                 duplicate_of=kept_id)
+    central.append_backlog_origin_refs(kept_id, item["origin_refs"])
+    return out
+
+
+def apply_review(central: CentralStore, item: Mapping[str, Any], review: Review) -> None:
+    if review.rule == "origin-user":
+        return
+    if review.duplicate_of:
+        fold_duplicate(central, item, review.duplicate_of, rule=review.rule, note=review.note)
+    else:
+        central.review_backlog(item["id"], review.status, rule=review.rule, note=review.note)
