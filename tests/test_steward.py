@@ -511,6 +511,21 @@ def test_same_defect_tells_rewordings_from_a_different_defect():
     assert steward.same_defect(EDGE, EVERY_RUN, file="src/jarvis/uilog.py")
 
 
+def test_backlog_wording_overlap_is_stricter_than_same_defect():
+    """2026-11-03-backlog-operability §3.2 rule 4: over the LARGER set, >= 0.6, >= 3 words"""
+    w = steward._defect_words
+    assert steward.similar_wording(w("alpha bravo charlie"), w("alpha bravo charlie delta"))
+    # 3/5 is exactly the threshold; 2/5 is not, though same_defect folds 2 of the smaller 2
+    assert steward.similar_wording(w("alpha bravo charlie"), w("alpha bravo charlie delta echo"))
+    assert steward.same_defect("alpha bravo", "alpha bravo charlie delta")
+    assert not steward.similar_wording(w("alpha bravo charlie"),
+                                       w("alpha bravo delta echo foxtrot"))
+    # Thin or empty wordings never match, where same_defect folds them
+    assert steward.same_defect("", "alpha bravo charlie")
+    assert not steward.similar_wording(set(), w("alpha bravo charlie"))
+    assert not steward.similar_wording(w("alpha bravo"), w("alpha bravo"))
+
+
 def test_a_different_defect_in_the_same_file_is_its_own_decision(fleet):
     """Decision #55 of 2026-10-22: an escalation rewrote the wrong defect's decision"""
     make, store = fleet
