@@ -1,4 +1,4 @@
-"""A module-level def/class defined twice silently shadows the first (issue 1502)."""
+"""A module-level def/class defined twice silently shadows the first (issue 1502)"""
 import ast
 from collections import Counter
 from pathlib import Path
