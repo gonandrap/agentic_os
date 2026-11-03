@@ -43,11 +43,11 @@ def test_create_with_a_prompt_inserts_a_queued_mo_row_and_no_session(central, ca
     assert "armed by the daemon on its next pass" in capsys.readouterr().out
 
 
-def test_create_with_a_script_is_monitoring_at_once(central, capsys, tmp_path):
+def test_create_with_a_script_is_queued_for_its_validating_session(central, capsys, tmp_path):
     (tmp_path / "s.sh").write_text("exit 75\n")
     item = _created(capsys, "--script", str(tmp_path / "s.sh"))
     row = central.morpheus_item(item["id"])
-    assert row["state"] == "monitoring" and row["script"] == "exit 75"
+    assert row["state"] == "queued" and row["script"] == "exit 75"
     assert row["script_source"] == "user" and row["prompt"] == ""
 
 
