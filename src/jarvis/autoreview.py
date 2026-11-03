@@ -215,6 +215,20 @@ _HST_PRODUCTION = (
     r"deployed)\s+(?:\S+\s+){0,2}?(?:(?:jarvis-|v)?\d+\.\d+|tag\b)"
     rf"|\b{_P}\s+(?:\S+\s+){{0,5}}?checked\s+out\b|\bwhich\s+{_P}\s+runs\b"
     rf"|\balready\s+(?:live\s+)?in\s+{_P}\b")
+#: `token`/`secret`/`auth` only with the credential act or object, never the bare noun (issue 1522)
+_HST_SECRET_NOUN = (r"(?:token\b(?!-|\s+(?:budget|cost|count|usage|economics|spend|"
+                    r"accounting|limit|per|used|efficien)\w*)|secrets?\b(?!-))")
+_HST_CREDENTIAL = (
+    r"credential|password|\bapi[ -]?key\b"
+    r"|\b(?:auth|access|api|bearer|oauth|github|gh|personal\s+access|session|refresh|"
+    r"production|prod|live|deploy|service|bot|telegram|slack|npm|pypi|signing|jwt|"
+    r"client|webhook|shared|aws|repo|repository)\s+" + _HST_SECRET_NOUN
+    + r"|\b(?:mint|rotat|reus|revok|hard-?cod|commit|print|logs\b|logged|logging|leak|"
+    r"expos|paste|embed|stor(?:e|es|ed|ing)\b|wr(?:ite|ites|ote|iting|itten)\b|"
+    r"regenerat|issu(?:e|es|ed|ing)\b|export|inject)\w*\s+(?:[\w'-]+\s+){0,3}?"
+    + _HST_SECRET_NOUN
+    + r"|\b(?:disabl|bypass|remov|skip|strip)\w*\s+(?:(?:the|its|all)\s+)?"
+    r"auth(?:entication)?\b(?![\s-](?:failure|error|blocker|paused))")
 #: ADDITION 2: moving a remote ref (`wo-29d99c67#3`, a force-push with a lease)
 _HST_REMOTE_REF = (r"\bforce[- ]?push\w*|--force-with-lease|\bforce[- ]updat\w+"
                    r"|\b(?:updat|mov|repoint|push|reset)\w*\s+(?:only\s+)?"
@@ -226,7 +240,7 @@ _HST_GATE_CONTROL = (r"\brule-retract\b"
                      r"|\bre-?arm(?:s|ed|ing)?\s+(?:(?:a|the)\s+)?gate")
 
 HIGH_STAKES_TIGHTENED = (
-    _HS_CREDENTIAL,
+    _HST_CREDENTIAL,
     _HST_PRODUCTION,
     _HST_DESTRUCTIVE,
     _HST_MIGRATION,
