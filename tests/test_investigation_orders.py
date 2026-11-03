@@ -797,6 +797,45 @@ def test_a_gap_is_filed_by_ops_as_an_unexpedited_bug(started, store):
     assert store.events_of_kind(investigator, "verdict_submitted")
 
 
+def _project_gap_fix() -> dict:
+    fix = dict(a_verdict("GAP")["proposed_fix"])
+    fix.pop("detector")
+    fix.pop("remedy")
+    return fix
+
+
+def test_a_project_gap_is_filed_on_the_project_tracker_off_the_os_rails(started, store,
+                                                                       project):
+    """io-ab244036: painforwisdom's bug landed on the OS tracker as #1521"""
+    import subprocess
+
+    subprocess.run(["git", "remote", "set-url", "origin",
+                    "https://github.com/acme/proj-a.git"], cwd=project, check=True)
+    inv_id, _, out = _submitted(started, store, "GAP", owner="project",
+                                proposed_fix=_project_gap_fix())
+    assert out["classification"] == "GAP"
+    created = [c["argv"] for c in started.calls if c["argv"][:2] == ["issue", "create"]]
+    assert len(created) == 1
+    assert created[0][created[0].index("--repo") + 1] == "acme/proj-a"
+    filed = out["filed"]
+    assert filed["issue_url"] and filed["repo"] == "acme/proj-a"
+    assert not filed["wo_id"] and not filed["neo_question_id"], "never the OS bug rails"
+    assert store.get_feature_order(inv_id)["status"] == "completed"
+
+
+def test_a_project_gap_with_no_tracker_is_a_filing_failure_never_the_os_repo(started,
+                                                                            store, project):
+    import subprocess
+
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=project, check=True)
+    inv_id, _, out = _submitted(started, store, "GAP", owner="project",
+                                proposed_fix=_project_gap_fix())
+    assert "bugs.repo" in out["filing_error"]
+    assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls)
+    row = store.get_feature_order(inv_id)
+    assert row["status"] == "planning" and row["needs_attention"]
+
+
 def test_a_gap_asks_neo_and_its_view_follows_the_fix_order(started, store):
     """#1344: the GAP is triaged at any level, and the chain reads forward to the fix"""
     inv_id, _, out = _submitted(started, store, "GAP")

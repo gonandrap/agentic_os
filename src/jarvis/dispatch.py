@@ -982,7 +982,10 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "held seconds wherever the status is judged on time in status — and the stuck "
         "entity is the sweep, not the subject (`kn-4fb740a9`). Name the bug to file in "
         "`proposed_fix`. THE OS FILES IT as an issue, after its own duplicate search — "
-        "which is why you do not file it and cannot.",
+        "which is why you do not file it and cannot. A GAP also names its `owner`: "
+        "`os` when the defect is in Jarvis OS itself (filed on the OS tracker), "
+        "`project` when it is in the subject project's own code (filed on THAT "
+        "project's tracker, never the OS's).",
         "- **WAITING_ON_USER** — nothing is broken; a person owes a decision. Name it BY "
         "ID in `user_owes`: the assumption, the gate, the Neo question. This is the ONE "
         "classification that spends the user's attention.",
@@ -1001,7 +1004,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         gaps.render_registry(),
         "",
         "",
-        "# A GAP also owes a detector and a remedy",
+        "# An `os` GAP also owes a detector and a remedy",
+        "Only when `owner` is `os`; a `project` GAP carries neither. "
         "`proposed_fix.detector`: the predicate over STATE that would have recognised "
         "this — a reconciler invariant or a `jarvis doctor` check, MECHANICAL, no model "
         "call. `proposed_fix.remedy`: which existing remedy id makes the next occurrence "
@@ -1031,7 +1035,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         '  "evidence": [',
         f'    {{"source": "{read_subject}", "quote": "the verbatim line"}}',
         "  ],",
-        '  "proposed_fix": {          // GAP only, and all seven fields',
+        '  "owner": "os",             // GAP only: os or project',
+        '  "proposed_fix": {          // GAP only; detector and remedy only when owner is os',
         '    "title": "what the bug report is titled",',
         '    "description": "the brief, standing alone",',
         '    "expected": "what should happen",',
