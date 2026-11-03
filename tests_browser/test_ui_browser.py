@@ -1858,7 +1858,9 @@ def test_a_needing_you_gate_and_a_blocked_backlog_item_sit_above_the_others(page
     assert r["tower"] in page.locator(".needs-you").inner_text()
     rows = page.locator("table.backlog-list a.rowid")
     tower = rows.filter(has_text=r["tower"]).first.bounding_box()
-    assert tower["y"] < rows.filter(has_text=r["done"]).first.bounding_box()["y"]
+    # dep is older and unblocked; done is settled, out of the default view (backlog-operability §6.1)
+    assert tower["y"] < rows.filter(has_text=r["dep"]).first.bounding_box()["y"]
+    assert rows.filter(has_text=r["done"]).count() == 0
 
 
 def test_clicking_a_record_row_id_opens_its_detail(page, server):
