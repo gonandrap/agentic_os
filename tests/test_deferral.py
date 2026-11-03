@@ -83,9 +83,12 @@ def test_a_deferral_with_no_manager_is_filed_by_the_router_and_one_with_a_manage
     tick(store)
 
     # No manager: the ROUTER files it, and tells nobody
-    filed = [b for b in central.list_backlog("proj_a")
+    filed = [b for b in central.list_backlog("proj_a", status=None)
              if b["title"] == "rate limit the exporter"]
     assert len(filed) == 1
+    assert filed[0]["status"] == "proposed"  # the steward reviews it (spec 2026-11-03 §4.4)
+    assert [r["kind"] for r in filed[0]["origin_refs"]] == ["envelope", "order"]
+    assert filed[0]["origin_refs"][0]["subject_wo_id"] == orphan
     assert filed[0]["origin_wo_id"] == orphan
     assert "nothing breaks without it" in filed[0]["origin_note"]
     assert not messages(store, orphan)
@@ -94,7 +97,7 @@ def test_a_deferral_with_no_manager_is_filed_by_the_router_and_one_with_a_manage
     assert orphan_env["delivered_wo_id"] is None
 
     # A manager: it is the manager's job, so the router files NOTHING itself
-    assert not [b for b in central.list_backlog("proj_a")
+    assert not [b for b in central.list_backlog("proj_a", status=None)
                 if b["title"] == "cache the catalog read"]
     queued = messages(store, manager)
     assert len(queued) == 1
@@ -150,7 +153,7 @@ def test_with_validation_off_a_feature_child_takes_the_router_path_too(
     ops.defer(child, "document the exporter", "no user-facing docs yet")
     tick(store)
 
-    item = central.list_backlog("proj_a")[0]
+    item = central.list_backlog("proj_a", status=None)[0]
     assert item["origin_wo_id"] == child
     assert item["origin_fo_id"] == fo_id  # the plan it came out of, manager or not
     assert next(iter(envelopes(store)))["state"] == "handled_by_router"
@@ -159,13 +162,13 @@ def test_with_validation_off_a_feature_child_takes_the_router_path_too(
 # -- the relationship, whichever path files it
 
 
-def test_both_filing_paths_record_the_same_relationship(store, central, tick):
+def test_both_filing_paths_record_the_same_relationship(store, central, tick, monkeypatch):
     """One deferral filed by the router and one filed the way the manager is told to"""
     fo_a, _, child_a = a_feature_child(store, with_manager=False)
     ops.defer(child_a, "rate limit the exporter", "out of scope here",
               neo_question_id=41)
     tick(store)
-    by_router = central.list_backlog("proj_a")[0]
+    by_router = central.list_backlog("proj_a", status=None)[0]
 
     fo_b, manager, child_b = a_feature_child(store, with_manager=True)
     ops.defer(child_b, "rate limit the importer", "out of scope here",
@@ -174,19 +177,29 @@ def test_both_filing_paths_record_the_same_relationship(store, central, tick):
     told = messages(store, manager)[0]["content"]
 
     # What the manager is handed is the command itself, values already in it
+    assert "jarvis backlog propose proj_a" in told
     assert f"--origin-wo {child_b}" in told
     assert f"--origin-fo {fo_b}" in told
     assert "--origin-note" in told
-    assert cli.main(["backlog", "add", "proj_a", "rate limit the importer",
+    assert "--ref q41" in told
+    # the manager runs it from its own session: the explicit origin beats the session's
+    monkeypatch.setenv("JARVIS_WO_ID", manager)
+    monkeypatch.setenv("JARVIS_PROJECT", "proj_a")
+    monkeypatch.setattr("jarvis.neo_store.NeoStore.get", lambda self, qid: {"id": qid})
+    assert cli.main(["backlog", "propose", "proj_a", "rate limit the importer",
+                     "--type", "task", "--severity", "medium", "--ref", "q41",
                      "--origin-wo", child_b, "--origin-fo", fo_b,
                      "--origin-note", bus.origin_note(
                          bus.DeferralRequest("rate limit the importer",
                                              "out of scope here", 41))]) == 0
-    by_manager = [b for b in central.list_backlog("proj_a")
+    by_manager = [b for b in central.list_backlog("proj_a", status=None)
                   if b["title"] == "rate limit the importer"][0]
 
+    assert by_router["status"] == by_manager["status"] == "proposed"
     assert (by_router["origin_wo_id"], by_router["origin_fo_id"]) == (child_a, fo_a)
     assert (by_manager["origin_wo_id"], by_manager["origin_fo_id"]) == (child_b, fo_b)
+    assert [r["kind"] for r in by_manager["origin_refs"]] == ["turn", "neo_question"]
+    assert by_manager["origin_refs"][0]["wo_id"] == manager
     assert by_router["origin_note"] == by_manager["origin_note"]
     assert by_router["origin_note"] == "out of scope here (Neo question 41)"
 
@@ -201,7 +214,7 @@ def test_a_neo_question_id_lands_in_the_origin_note(store, central, tick):
 
     tick(store)
 
-    notes = {b["title"]: b["origin_note"] for b in central.list_backlog("proj_a")}
+    notes = {b["title"]: b["origin_note"] for b in central.list_backlog("proj_a", status=None)}
     assert notes["rate limit the exporter"] == (
         "Neo agreed it is a separate job (Neo question 137)")
     assert notes["cache the catalog read"] == "nobody had to decide this"
@@ -242,7 +255,7 @@ def test_every_existing_add_backlog_caller_is_unaffected(central):
     assert item["origin_fo_id"] is None
     assert item["origin_note"] == ""
     assert central.get_backlog(item["id"])["origin_wo_id"] is None
-    assert central.list_backlog("proj_a")[0]["origin_note"] == ""
+    assert central.list_backlog("proj_a", status=None)[0]["origin_note"] == ""
 
 
 def test_backlog_list_shows_an_origin_and_leaves_a_typed_item_alone(
@@ -254,8 +267,8 @@ def test_backlog_list_shows_an_origin_and_leaves_a_typed_item_alone(
     tick(store)
     capsys.readouterr()
 
-    assert cli.main(["backlog", "list", "proj_a"]) == 0
-    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    assert cli.main(["backlog", "list", "proj_a", "--all"]) == 0  # the router's is proposed
+    lines =[ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
 
     typed = [ln for ln in lines if "something somebody typed" in ln]
     assert len(typed) == 1
@@ -273,7 +286,7 @@ def test_backlog_show_renders_the_origin(store, central, tick, capsys):
     wo_id = a_work_order(store)
     ops.defer(wo_id, "rate limit the exporter", "out of scope for this work order")
     tick(store)
-    item = central.list_backlog("proj_a")[0]
+    item = central.list_backlog("proj_a", status=None)[0]
     capsys.readouterr()
 
     assert cli.main(["backlog", "show", item["id"]]) == 0
@@ -284,6 +297,52 @@ def test_backlog_show_renders_the_origin(store, central, tick, capsys):
     plain = central.add_backlog("proj_a", "something somebody typed")
     assert cli.main(["backlog", "show", plain["id"]]) == 0
     assert "origin" not in capsys.readouterr().out
+
+
+def test_add_from_a_work_order_is_a_proposal_and_from_the_user_is_open(
+        store, central, monkeypatch, capsys):
+    """Spec 2026-11-03-backlog-operability §4.3, paired so neither half passes alone"""
+    assert cli.main(["backlog", "add", "proj_a", "the user typed it"]) == 0
+    fo_id, _, wo_id = a_feature_child(store, with_manager=False)
+    monkeypatch.setenv("JARVIS_WO_ID", wo_id)
+    monkeypatch.setenv("JARVIS_PROJECT", "proj_a")
+    capsys.readouterr()
+    assert cli.main(["backlog", "add", "proj_a", "a worker typed it"]) == 0
+    assert "proposed" in capsys.readouterr().out
+
+    rows = {b["title"]: b for b in central.list_backlog("proj_a", status=None)}
+    assert rows["the user typed it"]["status"] == "open"
+    assert rows["the user typed it"]["origin_refs"] == []
+    worker = rows["a worker typed it"]
+    assert worker["status"] == "proposed"
+    assert (worker["item_type"], worker["severity"]) == ("task", "medium")
+    assert (worker["origin_wo_id"], worker["origin_fo_id"]) == (wo_id, fo_id)
+    assert worker["origin_refs"][0]["kind"] == "turn"
+    assert worker["origin_refs"][0]["wo_id"] == wo_id
+
+
+def test_propose_refuses_a_ref_that_does_not_exist_and_keeps_one_that_does(
+        store, central, monkeypatch):
+    """§4.2: a missing id is refused, not stored; paired with a real one"""
+    wo_id = a_work_order(store)
+    monkeypatch.setenv("JARVIS_WO_ID", wo_id)
+    monkeypatch.setenv("JARVIS_PROJECT", "proj_a")
+    base = ["backlog", "propose", "proj_a", "x", "--type", "bug", "--severity", "major"]
+    assert cli.main([*base, "--ref", "wo-doesnotexist"]) != 0
+    assert cli.main([*base, "--ref", "not-a-ref"]) != 0
+    assert central.list_backlog("proj_a", status=None) == []
+
+    assert cli.main([*base, "--ref", wo_id]) == 0
+    [row] = central.list_backlog("proj_a", status=None)
+    assert row["origin_refs"][1] == {"kind": "order", "id": wo_id}
+    assert (row["item_type"], row["severity"], row["status"]) == ("bug", "major", "proposed")
+
+
+def test_propose_requires_type_and_severity(store):
+    with pytest.raises(SystemExit):
+        cli.main(["backlog", "propose", "proj_a", "x", "--type", "task"])
+    with pytest.raises(SystemExit):
+        cli.main(["backlog", "propose", "proj_a", "x", "--severity", "minor"])
 
 
 # -- the two contracts

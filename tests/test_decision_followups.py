@@ -98,6 +98,10 @@ def test_as_overrides_and_filing_after_the_user_decided_keeps_it_decided(started
     finally:
         central.close()
     assert item["origin_fo_id"] == do["id"]
+    # user-typed, so open, and it names the proposal (spec 2026-11-03-backlog-operability §4.4)
+    assert item["status"] == "open"
+    assert item["origin_refs"] == [{"kind": "decision", "do_id": do["id"],
+                                    "key": out["filed"][0]["key"]}]
     assert store.get_feature_order(do["id"])["status"] == "completed"
 
 

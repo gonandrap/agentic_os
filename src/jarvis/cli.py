@@ -23,7 +23,7 @@ Grouped commands:
                                           person-only verbs that arm one or call a fire
                                           wrong (not the gate rules)
   jarvis neo list|show|review|answer|learnings|learn|export
-  jarvis backlog add|list|show|promote|done
+  jarvis backlog add|propose|list|show|promote|done
   jarvis learn add|list|search|show|topics|stats|pin|unpin
   jarvis notify / jarvis inbox
   jarvis bug report                       file a Jarvis OS bug (GitHub issue + ping)
@@ -1728,6 +1728,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the feature order whose plan it came out of")
     b.add_argument("--origin-note", dest="origin_note", default="",
                    help="why it was deferred, and the Neo question id if there was one")
+    _backlog_proposal_args(b, required=False)
+    b = bl.add_parser("propose", help="file an item for the steward to review; inside a "
+                                      "work order it records the turn that filed it")
+    b.add_argument("project")
+    b.add_argument("title")
+    b.add_argument("--description", "-d", default="")
+    b.add_argument("--depends-on", default="", help="comma-separated backlog ids")
+    b.add_argument("--origin-wo", dest="origin_wo", metavar="WO-ID",
+                   help="the work order that suggested this (default: this session's)")
+    b.add_argument("--origin-fo", dest="origin_fo", metavar="FO-ID",
+                   help="the feature order it came out of (default: the origin's parent)")
+    b.add_argument("--origin-note", dest="origin_note", default="",
+                   help="why it was deferred")
+    _backlog_proposal_args(b, required=True)
     b = bl.add_parser("list")
     b.add_argument("project", nargs="?")
     b.add_argument("--all", action="store_true", help="include non-open items")
@@ -5393,19 +5407,48 @@ def _backlog_origin(item: dict) -> str:
     return " ".join(bits)
 
 
+def _backlog_proposal_args(b: argparse.ArgumentParser, *, required: bool) -> None:
+    """The classification and ref flags `propose` requires and `add` takes optionally"""
+    b.add_argument("--type", dest="item_type", choices=["bug", "task"], required=required,
+                   default=None if required else "task")
+    b.add_argument("--severity", required=required, default=None if required else "medium",
+                   help="cosmetic|minor|medium|major|critical|blocker")
+    b.add_argument("--kind", dest="suggested_kind", choices=["wo", "fo"], default="wo",
+                   help="what promotion should create")
+    b.add_argument("--ref", dest="refs", action="append", default=[], metavar="TOKEN",
+                   help="what led to it: q<n>, msg:<id>, do-…[:key], wo-…, … (repeatable)")
+
+
 def cmd_backlog(args: argparse.Namespace) -> int:
     from . import ops
     from .central_store import CentralStore
     central = CentralStore()
     try:
-        if args.bl_cmd == "add":
-            deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
+        deps = [d.strip() for d in getattr(args, "depends_on", "").split(",") if d.strip()]
+        # a work order's `add` is a proposal: older prompts and bus.render still say add (§4.3)
+        if args.bl_cmd == "propose" or (args.bl_cmd == "add" and os.environ.get("JARVIS_WO_ID")):
+            item = ops.propose_backlog(
+                args.project, args.title, args.description, item_type=args.item_type,
+                severity=args.severity, suggested_kind=args.suggested_kind,
+                depends_on=deps, ref_tokens=args.refs, origin_wo_id=args.origin_wo,
+                origin_fo_id=args.origin_fo, origin_note=args.origin_note)
+            if args.json:
+                _print(item, True)
+            else:
+                print(f"{item['id']} proposed — the steward reviews it within a minute")
+        elif args.bl_cmd == "add":
             ops.require_registered_project(args.project)
+            refs = [ops.parse_origin_ref(t) for t in args.refs]
+            for ref in refs:
+                ops.require_origin_ref(ref)
             item = central.add_backlog(args.project, args.title,
                                        description=args.description, depends_on=deps,
                                        origin_wo_id=args.origin_wo,
                                        origin_fo_id=args.origin_fo,
-                                       origin_note=args.origin_note)
+                                       origin_note=args.origin_note,
+                                       item_type=args.item_type, severity=args.severity,
+                                       suggested_kind=args.suggested_kind,
+                                       origin_refs=refs)
             _print(item, args.json)
         elif args.bl_cmd == "list":
             items = ops.list_backlog(project=args.project,
