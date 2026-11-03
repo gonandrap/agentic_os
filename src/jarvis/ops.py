@@ -1396,7 +1396,13 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
     wo_id = wo["id"]
     round_note = invariants.parallel_round_note(store, wo_id)
     pending = store.pending_assumptions(wo_id)
-    if pending:
+    turn = store.latest_turn(wo_id)
+    working = (turn is not None and turn["state"] == "running"
+               and wo["status"] != "waiting_input")
+    # A working order's assumptions are Neo's on delivery, not the user's yet (#711, #1482)
+    deferred = len(pending) if (pending and working
+                                and invariants.neo_reviews_later(store, wo)) else 0
+    if pending and not deferred:
         return {"what": "assumptions", "stalled": False,
                 "detail": f"{len(pending)} assumption(s) await your review — "
                           f"`jarvis wo review {wo_id}`{round_note}"}
@@ -1462,11 +1468,11 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
                           f"{worker_session.PAUSE_NOUN[pause.reason]} error and the OS "
                           f"relaunches it by itself"}
     # A live turn means "working" for every status EXCEPT `waiting_input`
-    turn = store.latest_turn(wo_id)
-    if (turn is not None and turn["state"] == "running"
-            and wo["status"] != "waiting_input"):
+    if working:
+        later = (f"; {deferred} assumption(s) go to review on delivery"
+                 if deferred else "")
         return {"what": "turn_running", "stalled": False,
-                "detail": "a turn is in flight — the worker is working"}
+                "detail": f"a turn is in flight — the worker is working{later}"}
     # Before the statuses below, because since issue 212 a round runs in PARALLEL with a `needs_review`...
     if round_note:
         return {"what": "validating", "stalled": False,
@@ -3384,13 +3390,12 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = {**newest, "resolved_status": status,
                       "resolved_decider": assumption_decider(row or {})}
     line = _autoreview_line(newest)
-    # The newest event names ONE assumption: name every other pending one still owed by the user too
-    if newest["kind"] in (*_AUTOREVIEW_OWED_BY_USER, "autoreview_held"):
-        held = newest.get("held") if isinstance(newest.get("held"), list) else []
-        named = {int(h.get("n") or 0) for h in held} | {int(newest.get("n") or 0)}
-        others = [n for n in _owed_pending(store, wo["id"], stale) if n not in named]
-        if others:
-            line += "; also left with you: " + ", ".join(f"#{n}" for n in others)
+    # The newest event names ONE assumption: name every other one still owed by the user (#1470)
+    held = newest.get("held") if isinstance(newest.get("held"), list) else []
+    named = {int(h.get("n") or 0) for h in held} | {int(newest.get("n") or 0)}
+    others = [n for n in _owed_pending(store, wo["id"], stale) if n not in named]
+    if others:
+        line += "; also left with you: " + ", ".join(f"#{n}" for n in others)
     return {**newest, "line": line}
 
 
@@ -4266,6 +4271,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
                 return park_pr_pending(store, wo, stranding)
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
+    if status == "completed" and (owed := declared_user_action(store, wo_id)):
+        return park_user_action(store, wo, owed)
     # Spec §C of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md
     store.set_status(wo_id, status, trigger="landed")
     store.clear_attention(wo_id)
@@ -4365,6 +4372,35 @@ def park_pr_pending(store: ProjectStore, wo: dict[str, Any],
     store.add_event(wo["id"], PR_PENDING_EVENT, park)
     store.set_status(wo["id"], "needs_review")
     store.flag_attention(wo["id"], pr_pending_blocker(wo["id"], park))
+    return "needs_review"
+
+
+def declared_user_action(store: ProjectStore, wo_id: str) -> str:
+    """The command only the user may run that the latest finish declared, else "" (#1352)"""
+    finished = store.events_of_kind(wo_id, "finished")
+    if not finished:
+        return ""
+    return str(db.from_json(finished[-1]["payload"], {}).get("needs_user") or "")
+
+
+def park_user_action(store: ProjectStore, wo: dict[str, Any], command: str) -> str:
+    """Hold an order whose result waits on a command only the user may run (GitHub issue #1506)"""
+    from .invariants import user_action_owed_blocker
+    from .project_store import UNGOVERNED_ORIGINS, USER_ACTION_EVENT
+
+    wo_id = wo["id"]
+    blocker = user_action_owed_blocker(command)
+    if store.user_action_open(wo_id) is None:
+        store.add_event(wo_id, USER_ACTION_EVENT,
+                        {"command": command, "was": wo["status"]})
+    store.set_status(wo_id, "needs_review", trigger="user_action")
+    store.flag_attention(wo_id, blocker)
+    fresh = store.get_work_order(wo_id) or wo
+    if not (launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS):
+        store.add_notification(
+            title=f"{wo_id} waits on you: {fresh.get('title') or 'untitled'}",
+            body=f"{fresh.get('result_summary') or 'No summary on record.'}\n\n{blocker}",
+            level="warning", wo_id=wo_id, source="completion", paired=True)
     return "needs_review"
 
 
@@ -5740,6 +5776,9 @@ def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int |
     said = [str(fresh.get("result_summary") or "No summary on record.")]
     if fresh.get("pr_url"):
         said.append(f"Pull request: {fresh['pr_url']}")
+    owed = declared_user_action(store, wo["id"])
+    if owed:
+        said.append(f"Still yours to run: `{owed}`")
     replies = store.agent_replies(wo["id"])
     last = str(replies[-1]["content"] or "").strip() if replies else ""
     if last:
@@ -5748,7 +5787,8 @@ def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int |
         said.append(f"Worker's final message (end):\n{tail}")
     return store.add_notification(
         title=f"{wo['id']} completed ({how}): {fresh.get('title') or 'untitled'}",
-        body="\n\n".join(said), level="info", wo_id=wo["id"], source="completion")
+        body="\n\n".join(said), level="warning" if owed else "info",
+        wo_id=wo["id"], source="completion")
 
 
 def mark_backlog_done(wo: dict[str, Any]) -> None:
@@ -5791,8 +5831,12 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
                                  **({"merge_commit": merge_commit}
                                     if merge_commit else {})})
     mark_backlog_done(wo)
-    notify_completed(store, wo, "its pull request merged")
-    return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
+    status = "completed"
+    if owed := declared_user_action(store, wo["id"]):
+        status = park_user_action(store, wo, owed)
+    else:
+        notify_completed(store, wo, "its pull request merged")
+    return {"wo_id": wo["id"], "status": status, "was": wo["status"],
             "pr_url": wo.get("pr_url"), "merged_at": merged_at,
             "session_stopped": stopped["stopped"]}
 
@@ -6083,6 +6127,8 @@ CATCH_UP_DEFER_HEAD_MOVED = "head_moved"
 CATCH_UP_DEFER_CARRY_UNPROVEN = "carry_unproven"
 #: The last catch-up was too recent: `catch_up_backoff` has not run out
 CATCH_UP_DEFER_BACKOFF = "backoff"
+#: `CatchUp.cause` on an EXHAUSTED outcome: the laps are losing to the base (#1512)
+CATCH_UP_LIVELOCK = "livelock"
 
 
 @dataclass(frozen=True)
@@ -6278,6 +6324,23 @@ def catch_up_attempts(store: ProjectStore, wo_id: str, *, now: float = 0.0,
                       policy: Any = None) -> int:
     """How often the OS has caught this pull request up within `pull_requests.catch_up_window_minutes`"""
     return len(_catch_up_times(store, wo_id, now=now, policy=policy))
+
+
+def base_chase_laps(store: ProjectStore, wo_id: str) -> list[str]:
+    """Base tips this branch was caught up to since its latest round was judged, oldest first (#1512)"""
+    from . import invariants as invariants_mod
+
+    # A new round resets the count: only a verdict carried lap after lap is losing to the base
+    row = store.latest_validation_round(wo_id=wo_id)
+    if row is None:
+        return []
+    since = float(row["ts"] or 0.0)
+    tips = []
+    for event in store.events_of_kind(wo_id, invariants_mod.PR_BASE_UPDATED_EVENT):
+        payload = db.from_json(event.get("payload"), {}) or {}
+        if payload.get("cause") == BASE_UPDATE_BEHIND and float(event["ts"] or 0.0) >= since:
+            tips.append(str(payload.get("base_sha") or ""))
+    return tips
 
 
 def catch_up_delay(attempts: int, policy: Any) -> int:
@@ -7162,7 +7225,7 @@ def resolve_ref(ref: str) -> str:
     from . import morpheus
 
     if morpheus.is_monitoring_order_id(rid):
-        return f"/morpheus/{rid}"
+        return f"/mo/{rid}"
     return {"kn": "/knowledge", "bl": "/backlog"}[prefix] + f"/{rid}"
 
 
@@ -8656,6 +8719,20 @@ def _script_wrong_rewrite(item_id: str, inv_id: str,
         central.close()
 
 
+def _rewrite_ask(item_id: str, script_fix: str) -> dict[str, Any]:
+    """The user's half of a SCRIPT_WRONG past its cap, `--why` pre-filled (#1481)"""
+    import shlex
+
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id) or {}
+    finally:
+        central.close()
+    # shlex, never double quotes: a script_fix quoting code carries backticks the shell would run
+    return {"item": item_id, "pr_number": item.get("pr_number"),
+            "command": f"jarvis morpheus rewrite {item_id} --why {shlex.quote(script_fix)}"}
+
+
 def investigation_chain(name: str, path: Path, fo: Mapping[str, Any]) -> dict[str, Any]:
     """validation -> investigation -> issue -> fix order -> production -> re-validation (#1344)"""
     from . import morpheus
@@ -8746,7 +8823,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
                                 UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                plan_hold_spans, precondition_hold_spans,
+                                dependency_hold_spans, plan_hold_spans, precondition_hold_spans,
                                 validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -8814,11 +8891,16 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             pre_held = bool(pstore.open_preconditions(wo["id"]))
             pre_spans = precondition_hold_spans(
                 pstore.preconditions_of(wo["id"]), since, now)
+        # A WAIT ON A DEPENDENCY THAT HAS SINCE COMPLETED IS NOT STUCK (issue 1488, kn-0a222b38)
+        dep_spans = (dependency_hold_spans(
+            [pstore.state_spans(d) for d in pstore.dependencies(wo)],
+            float(wo.get("created_at") or 0.0), since, now)
+            if wo["status"] == "pending" else [])
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
             + ci_spans + base_red_spans + plan_spans + automerge_spans
-            + budget_spans + pre_spans)
+            + budget_spans + pre_spans + dep_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9112,6 +9194,8 @@ def submit_verdict(inv_id: str, doc: Any,
     if verdict["classification"] == "SCRIPT_WRONG":
         settled, verdict["rewrite"] = _script_wrong_rewrite(morpheus_item_id, inv_id, verdict)
         escalate = not settled
+        if escalate:
+            verdict["rewrite_ask"] = _rewrite_ask(morpheus_item_id, verdict["script_fix"])
 
     classification = verdict["classification"]
     store = ProjectStore(path)
@@ -11538,6 +11622,18 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
         values["depends_on_count"] = len(store.dependencies(wo))
         values["dead_dependency_count"] = len(
             invariants_mod.dead_dependencies(store, wo))
+
+    if need("assumption_holds"):
+        from . import autoreview as autoreview_mod
+
+        pending = {int(a["id"]) for a in store.all_assumptions(wo_id)
+                   if a.get("status") == "pending"}
+        disputed = {int(p.get("assumption_id") or 0)
+                    for p in (db.from_json(e["payload"], {})
+                              for e in store.events_of_kind(wo_id, "autoreview_escalated"))
+                    if p.get("advisory") and p.get("code") == autoreview_mod.HELD_HIGH_STAKES
+                    and p.get("stakes") in autoreview_mod.ROUTINE_STAKES}
+        values["stakes_disputed_holds"] = len(pending & disputed)
 
     if need("neo_question"):
         question = invariants_mod.awaiting_neo(wo_id)
@@ -14056,6 +14152,8 @@ NAVIGATION_DAYS_POSITIVE = (
 _TARGET_FEATURE = "feature_order"
 _TARGET_WORK = "work_order"
 _TARGET_PROJECT = "<project>"
+_TARGET_MONITORING = "monitoring_order"
+MO_NO_TRANSCRIPT = "no transcript; see jarvis cost {id}"
 
 #: How an order id is spelled, taken from `_resolve_order_id` (ops.py:239) and...
 _ORDER_ID_PREFIXES = ("wo-", "fo-")
@@ -14066,6 +14164,17 @@ def _resolve_report_target(target: str, project: str | None = None, *,
                            ) -> tuple[str, str | None, str | None,
                                       dict[str, Any] | None]:
     """What one id means to a report: `(kind, project name, project path, record)`"""
+    from . import morpheus
+
+    if morpheus.is_monitoring_order_id(target):
+        central = CentralStore()
+        try:
+            row = central.morpheus_item(target)
+        finally:
+            central.close()
+        if row is None:
+            raise OpsError(f"no monitoring order {target}")
+        return _TARGET_MONITORING, row["project"] or None, None, row
     try:
         name, path, fo = find_feature_order(target, project)
     except OpsError:
@@ -14118,6 +14227,10 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
         elif kind == _TARGET_WORK:
             scope_project = scope_project or name
             session_ids = [(record["id"], record.get("session_id") or "")]
+            scope = record["id"]
+        elif kind == _TARGET_MONITORING:
+            scope_project = scope_project or name
+            session_ids = [(record["id"], record.get("last_session_id") or "")]
             scope = record["id"]
         else:
             scope_project = target
@@ -14376,9 +14489,9 @@ def inspect_report(target: str, project: str | None = None, *,
     # Resolved ONCE for the whole report
     floor = cold_prefix_floor()
     # The catalog decides the floors and the flags override them for one invocation: a project's setting...
-    configs: dict[str, Any] = {}
+    configs: dict[str | None, Any] = {}
 
-    def settings(project_name: str) -> Any:
+    def settings(project_name: str | None) -> Any:
         if project_name not in configs:
             cfg = inspect_config(project_name)
             overrides = {}
@@ -14413,6 +14526,25 @@ def inspect_report(target: str, project: str | None = None, *,
 
     # The one resolver `jarvis navigation` uses
     kind, name, path, record = _resolve_report_target(target, project)
+    if kind == _TARGET_MONITORING:
+        # Its last arm/judge session (docs/superpowers/specs/2026-11-01-monitoring-orders.md §7)
+        mo = record
+        cfg = settings(name)
+        title = mo["title"] or mo["pr_title"] or mo["id"]
+        head = {"scope": mo["id"], "title": title, "status": mo["state"],
+                "write_floor": cfg.report_write_floor,
+                "join_floor": cfg.report_join_floor}
+        session = mo.get("last_session_id") or ""
+        if not session:
+            return {**head, "units": [], "note": MO_NO_TRANSCRIPT.format(id=mo["id"])}
+        anatomy, provenance = autopsy.anatomy_for(
+            {"id": mo["id"], "session_id": session}, cfg, spans=[], index=index,
+            cold_prefix_floor=floor)
+        payload = anatomy.as_dict()
+        payload.update(provenance=provenance, wo_id=mo["id"], project=mo["project"],
+                       title=title, status=mo["state"], kind="monitoring",
+                       largest_os_input=_largest_os_input(mo["id"]))
+        return {**head, "units": [payload]}
     if kind == _TARGET_WORK:
         wo = record
         cfg = settings(name)
@@ -16610,12 +16742,99 @@ def morpheus_rewrite(item_id: str, why: str) -> dict[str, Any]:
     return item
 
 
+# -- `jarvis mo`: monitoring orders (docs/superpowers/specs/2026-11-01-monitoring-orders.md §5)
+
+_MO_SPAN = re.compile(r"^(\d+(?:\.\d+)?)([mhd]?)$")
+_MO_UNIT_SECONDS = {"m": 60.0, "h": 3600.0, "d": 86400.0}
+
+
+def _mo_span(text: str, unit: str) -> float:
+    """`15m`/`2h`/`3d` (a bare number is in `unit`), as a count of `unit`s"""
+    m = _MO_SPAN.match((text or "").strip())
+    if not m or float(m.group(1)) <= 0:
+        raise OpsError(f"{text!r} is not a duration like 15m, 2h or 3d")
+    return float(m.group(1)) * _MO_UNIT_SECONDS[m.group(2) or unit] / _MO_UNIT_SECONDS[unit]
+
+
+def require_mo_id(mo_id: str) -> str:
+    from . import morpheus
+
+    if not morpheus.is_monitoring_order_id(mo_id):
+        raise OpsError(f"{mo_id!r} is not a monitoring order id (mo-… or mv-…)")
+    return mo_id
+
+
+def mo_create(project: str, title: str, prompt: str = "", script: str = "",
+              every: str | None = None, deadline: str | None = None) -> dict[str, Any]:
+    """Insert the row only; the daemon arms a prompt order on its next pass (§5)"""
+    from . import morpheus
+
+    if not project:
+        raise OpsError("a monitoring order needs a project")
+    name = _morpheus_project(_morpheus_catalog(), project)
+    every_minutes = max(1, round(_mo_span(every, "m"))) if every else None
+    days = _mo_span(deadline, "d") if deadline else None
+    central = CentralStore()
+    try:
+        return morpheus.create(central, project=name, title=title, prompt=prompt,
+                               script=script, every_minutes=every_minutes,
+                               deadline_days=days, origin="user")
+    except ValueError as e:
+        raise OpsError(str(e)) from e
+    finally:
+        central.close()
+
+
+def mo_list(project: str | None = None, include_all: bool = False,
+            state: str | None = None) -> list[dict[str, Any]]:
+    """Open orders and the failed/timed-out ones owed a look; `include_all` adds the settled"""
+    from . import morpheus
+
+    if state and state not in morpheus.STATES:
+        raise OpsError(f"no state {state!r}; one of {', '.join(morpheus.STATES)}")
+    states = [state] if state else (None if include_all else
+                                    [*morpheus.OPEN_STATES, *morpheus.ACTION_STATES])
+    central = CentralStore()
+    try:
+        items = central.morpheus_items(states)
+    finally:
+        central.close()
+    return [i for i in items if not project or i.get("project") == project]
+
+
+def mo_show(mo_id: str) -> dict[str, Any]:
+    return morpheus_detail(require_mo_id(mo_id))
+
+
+def mo_cancel(mo_id: str) -> dict[str, Any]:
+    """Cancel an open order: terminal, never judged; a settled one is refused"""
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.cancel(central, require_mo_id(mo_id))
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+
+
 # -- the release console (docs/superpowers/specs/2026-11-01-release-console.md)
 
-def _release_repo() -> tuple[str, Path]:
-    """The OS project's name and checkout; production's clone when no catalog names one"""
+def release_projects() -> list[str]:
+    """Projects whose checkout is a git repository: the `/release` picker (spec §3)"""
+    return sorted(n for n, p in registered_project_paths().items() if (p / ".git").exists())
+
+
+def _release_repo(project: str = "") -> tuple[str, Path]:
+    """`project`'s checkout; unnamed, the OS project's, else production's clone"""
     from . import schedule
 
+    if project:
+        path = registered_project_paths().get(project)
+        if path is None or not (path / ".git").exists():
+            raise OpsError(f"no project {project!r} with a git checkout — /release lists them")
+        return project, path
     catalog = _morpheus_catalog()
     name = schedule.os_project((p.name, p.path) for p in catalog.projects) or ""
     for p in catalog.projects:
@@ -16710,18 +16929,34 @@ def _open_release_orders(project: str) -> list[dict[str, Any]]:
     store = ProjectStore(paths[project])
     try:
         return [w for w in store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True)
-                if release.is_release_order(w)]
+                if release.is_release_order(w)
+                or (db.from_json(w.get("metadata"), {}) or {}).get(release.BASE_KEY)]
     finally:
         store.close()
 
 
-def release_overview() -> dict[str, Any]:
+def _release_scope(project: str) -> tuple[str, Path, bool, str]:
+    """Name, checkout, is-it-the-OS, and the tag glob its releases use (spec §3)"""
+    from . import release, release_view
+
+    os_name, _ = _release_repo()
+    name, repo = _release_repo(project)
+    if not project or name == os_name:
+        return name, repo, True, release.RELEASE_TAG_GLOB
+    own = f"{name}-*"
+    try:
+        return name, repo, False, own if release_view.tags(repo, own) else "*"
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OpsError(f"cannot read the tags in {repo}: {e}") from e
+
+
+def release_overview(project: str = "") -> dict[str, Any]:
     """Pending work since the newest tag, and every release with its validation verdict"""
     from . import release_view
 
-    project, repo = _release_repo()
+    project, repo, is_os, glob = _release_scope(project)
     try:
-        tags = release_view.tags(repo)
+        tags = release_view.tags(repo, glob)
         ref = release_view.main_ref(repo)
         newest = tags[0]["tag"] if tags else ""
         pending = _release_rows(release_view.commits(repo, newest, ref), project, repo)
@@ -16739,19 +16974,19 @@ def release_overview() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError) as e:
         raise OpsError(f"cannot read the release history in {repo}: {e}") from e
     return {"project": project, "repo": str(repo), "main_ref": ref, "newest": newest,
-            "pending": pending, "releases": releases,
+            "is_os": is_os, "tag_glob": glob, "pending": pending, "releases": releases,
             "in_flight": [{"id": w["id"], "title": w["title"], "status": w["status"],
                            "href": order_path(project, w["id"])}
                           for w in _open_release_orders(project)]}
 
 
-def release_detail(tag: str) -> dict[str, Any]:
+def release_detail(tag: str, project: str = "") -> dict[str, Any]:
     """One release's commits, each traced to its orders and its morpheus verdict"""
     from . import release_view
 
-    project, repo = _release_repo()
+    project, repo, _, glob = _release_scope(project)
     try:
-        known = {t["tag"]: t for t in release_view.tags(repo)}
+        known = {t["tag"]: t for t in release_view.tags(repo, glob)}
         if tag not in known:
             raise OpsError(f"no release {tag!r} in {repo} — /release lists them")
         rows = release_view.release_commits(repo, tag, known[tag]["previous"])
@@ -16776,13 +17011,34 @@ newer commit, do not drop `--stage`, and do not restart any service by hand. If 
 {base} is red, or a `jarvis-*` tag already contains it, stop and say so.
 """
 
+PROJECT_RELEASE_CUT_BRIEF = """\
+Ship a release of {project} the user cut from the dashboard (/release). It carries exactly \
+the pending commits on `main` up to and including the base below — the user chose that commit:
 
-def release_cut(base: str) -> dict[str, Any]:
+{lines}
+
+Tag `{base}` as the next `{project}-X.Y.Z` (newest tag so far: {newest}) and release it the \
+way this project documents its releases. Tagging, pushing and deploying are PRIVILEGED \
+ACTIONS and will be gated — correct and expected. Read `jarvis brief gates` and make your \
+case first (`jarvis gate request`). Do not move the base to a newer commit. If CI on {base} \
+is red, a tag already contains it, or the project documents no release process, stop and \
+say so instead of inventing one.
+"""
+
+
+def _release_brief(overview: dict[str, Any], lines: str, wo_id: str, base: str) -> str:
+    if overview["is_os"]:
+        return RELEASE_CUT_BRIEF.format(lines=lines, wo_id=wo_id, base=base)
+    return PROJECT_RELEASE_CUT_BRIEF.format(project=overview["project"], lines=lines, base=base,
+                                            newest=overview["newest"] or "none")
+
+
+def release_cut(base: str, project: str = "") -> dict[str, Any]:
     """File the release work order that ships pending work up to `base` (spec 2026-11-01 §2)"""
     from . import release, release_view
 
     base = (base or "").strip().lower()
-    overview = release_overview()
+    overview = release_overview(project)
     project = overview["project"]
     if not project:
         raise OpsError("no catalog project runs the OS itself, so there is nowhere to file "
@@ -16798,16 +17054,18 @@ def release_cut(base: str) -> dict[str, Any]:
     lines = "\n".join(
         f"- `{r['short']}` {r['subject']}" + (f" — `{r['wo_id']}`" if r["wo_id"] else "")
         for r in shipped)
+    # BATCH_KEY outside the OS parks the order as "shipped nothing" (spec §3)
+    meta = ({release.BATCH_KEY: [], release.BASE_KEY: base} if overview["is_os"]
+            else {release.BASE_KEY: base})
     # Usable even if dispatch reads it before the id is filled in below
     wo = create_work_order(
         project, f"Ship a release: {len(shipped)} commit(s) up to {base[:8]}",
-        description=RELEASE_CUT_BRIEF.format(lines=lines, wo_id="<your work-order id>",
-                                             base=base),
-        origin="ui", metadata={release.BATCH_KEY: [], release.BASE_KEY: base})
+        description=_release_brief(overview, lines, "<your work-order id>", base),
+        origin="ui", metadata=meta)
     store = ProjectStore(registered_project_paths()[project])
     try:
-        store.update_work_order(wo["id"], description=RELEASE_CUT_BRIEF.format(
-            lines=lines, wo_id=wo["id"], base=base))
+        store.update_work_order(wo["id"], description=_release_brief(overview, lines,
+                                                                     wo["id"], base))
     finally:
         store.close()
     return {**wo, "project": project, "commits": len(shipped)}

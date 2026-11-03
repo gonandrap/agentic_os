@@ -1,6 +1,6 @@
-{# Shared by morpheus.html and morpheus_item.html — spec 2026-10-29 dashboard §4 #}
+{# Shared by morpheus.html and morpheus_item.html — spec 2026-10-29 dashboard §4, 2026-11-01-monitoring-orders.md §6 #}
 {% set tone = {"queued": "tone-active", "monitoring": "tone-active", "validated": "tone-ok",
-               "failed": "tone-bad", "timedout": "tone-warn"} %}
+               "failed": "tone-bad", "timedout": "tone-warn", "cancelled": "tone-muted"} %}
 
 {# `item.action` is `neo:<qid>` / `investigation:<id>` / `improvement:<io-id>` / `none:<why>` #}
 {% macro handoff(action) -%}
@@ -9,4 +9,20 @@
 {%- elif kind == "none" %}none: {{ ref }}
 {%- elif kind == "neo" %}Neo <a href="/neo/question/{{ ref }}">q{{ ref }}</a>
 {%- else %}{{ kind }} <a href="/go/{{ ref }}">{{ ref }}</a>{% endif -%}
+{%- endmacro %}
+
+{# a PR order links its PR; a user's order has only its title #}
+{% macro subject(i) -%}
+{%- if i.pr_number %}<a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a> {% endif -%}
+{{ i.title or i.pr_title or "—" }}
+{%- endmacro %}
+
+{# NULL every_minutes = os.morpheus.check_every_minutes #}
+{% macro every(i) -%}{{ (i.every_minutes ~ " min") if i.every_minutes else "default" }}{%- endmacro %}
+
+{% macro cancel(id, back) -%}
+<form method="post" action="/mo/{{ id }}/cancel">
+  <input type="hidden" name="next" value="{{ back }}">
+  <button title="stop watching; never judged">cancel</button>
+</form>
 {%- endmacro %}

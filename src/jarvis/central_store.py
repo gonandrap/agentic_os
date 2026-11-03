@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -707,6 +708,13 @@ CREATE INDEX IF NOT EXISTS idx_steward_decisions_dedupe
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_queue ON steward_decisions(queue_state);
 """
 
+#: os.db's PRAGMA user_version; bump with every migration that drops or rewrites a table (docs/superpowers/specs/2026-11-01-os-db-schema-fence.md)
+SCHEMA_VERSION = 1  # 1: morpheus_items folded into monitoring_orders
+
+#: Opens racing another release's DDL retry this often, backing off by this many seconds per try
+SCHEMA_ATTEMPTS = 5
+SCHEMA_RETRY_SECONDS = 0.2
+
 #: Tables whose `project` is provenance, not scope: purge clears or retracts, never deletes (docs/superpowers/specs/2026-10-28-offboard-a-project.md §3)
 PROVENANCE_TABLES = ("detectors", "gate_rules")
 
@@ -731,16 +739,37 @@ class CentralStore:
         ensure_home()
         self.db_path = path or central_db_path()
         self.conn = db.connect(self.db_path)
-        self.conn.executescript(SCHEMA)
-        self._migrate()
+        self._build_schema()
         self.fts = self._ensure_fts()
         self._seed_gate_rules()
         self._seed_detectors()
+
+    def _build_schema(self, attempts: int = SCHEMA_ATTEMPTS) -> None:
+        """SCHEMA and migrations, unless a newer release owns os.db (docs/superpowers/specs/2026-11-01-os-db-schema-fence.md)"""
+        for attempt in range(1, attempts + 1):
+            try:
+                if self.conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
+                    return
+                self.conn.executescript(SCHEMA)
+                self._migrate()
+                return
+            except sqlite3.OperationalError as e:
+                # A locked database already waited out busy_timeout; retry only a schema moved under us
+                if attempt == attempts or "locked" in str(e):
+                    raise
+                time.sleep(SCHEMA_RETRY_SECONDS * attempt)
 
     def _migrate(self) -> None:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
         self.conn.executescript(POST_MIGRATION_SCHEMA)
         self._rebuild_morpheus_items()
+        with db.write_transaction(self.conn):
+            self._fence()
+
+    def _fence(self) -> None:
+        """Raise os.db's user_version to this release's; never lower it"""
+        if self.conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _rebuild_morpheus_items(self) -> None:
         """Move `morpheus_items` into `monitoring_orders`, once (docs/superpowers/specs/2026-11-01-monitoring-orders.md §2)"""
@@ -768,6 +797,7 @@ class CentralStore:
                     self.conn.execute(
                         "UPDATE monitoring_orders SET attempts=?, last_attempt_ts=? WHERE id=?",
                         (int(seen.get("n") or 0), seen.get("ts"), item_id))
+            self._fence()  # in the DROP's transaction: no fenced opener sees the drop unfenced
             self.conn.execute("DROP TABLE morpheus_items")
 
     def _ensure_fts(self) -> bool:
@@ -2403,15 +2433,33 @@ class CentralStore:
         return dict(row) if row else None
 
     def morpheus_items(self, states: Sequence[str] | None = None,
-                       limit: int = 500) -> list[dict[str, Any]]:
+                       limit: int = 500, release_tag: str | None = None
+                       ) -> list[dict[str, Any]]:
         """Newest first"""
-        where, params = "", []
+        clauses, params = [], []
         if states:
-            where = f"WHERE state IN ({','.join('?' * len(states))})"
+            clauses.append(f"state IN ({','.join('?' * len(states))})")
             params = list(states)
+        if release_tag is not None:
+            clauses.append("release_tag = ?")
+            params.append(release_tag)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return db.rows_to_dicts(self.conn.execute(
             f"SELECT * FROM monitoring_orders {where} ORDER BY created_ts DESC, pr_number DESC "
             f"LIMIT ?", (*params, limit)).fetchall())
+
+    def search_monitoring_orders(self, words: Sequence[str], project: str | None = None,
+                                 limit: int = 50) -> list[dict[str, Any]]:
+        """Monitoring orders matching `words`, every state"""
+        expr, params = db.score_sql(words, {
+            "id": 3, "title": 3, "pr_title": 2, "prompt": 1, "hints": 1, "resolution": 1,
+        })
+        q = [f"SELECT *, {expr} AS _score FROM monitoring_orders WHERE _score > 0"]
+        if project:
+            q.append("AND project=?")
+            params.append(project)
+        q.append("ORDER BY _score DESC, created_ts DESC LIMIT ?")
+        return db.rows_to_dicts(self.conn.execute(" ".join(q), (*params, limit)).fetchall())
 
     def morpheus_counts(self) -> dict[str, int]:
         return {r["state"]: r["n"] for r in self.conn.execute(

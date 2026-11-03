@@ -62,6 +62,13 @@ def parked(project_path, *, judged: str = JUDGED):
     return store, store.get_work_order(wo["id"])
 
 
+@pytest.fixture()
+def window_cap_only(monkeypatch):
+    """The window cap alone: these tests record more laps than `livelock_laps` (#1512)"""
+    policy = PullRequestsConfig(livelock_laps=CATCH_UP_MAX + 1)
+    monkeypatch.setattr(ops, "catch_up_policy", lambda store: policy)
+
+
 def poll(daemon, store):
     daemon.poll_pull_requests(daemon.catalog.project("proj_a"), store)
 
@@ -477,7 +484,8 @@ def test_a_deferred_catch_up_says_so_and_proposes_nothing(started, project, fake
 
 
 def test_an_exhausted_catch_up_names_the_cap_and_proposes_nothing(started, project,
-                                                                  fake_gh, local_proof):
+                                                                  fake_gh, local_proof,
+                                                                  window_cap_only):
     """§3.4 `EXHAUSTED`, AND THE REGRESSION THIS SPEC TURNS ON"""
     opt_in(started)
     store, wo = parked(project)
@@ -495,6 +503,39 @@ def test_an_exhausted_catch_up_names_the_cap_and_proposes_nothing(started, proje
     assert f"the cap ({CATCH_UP_MAX})" in row["reason"]
     assert "once that window clears" in row["reason"]
     assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []
+
+
+def test_losing_laps_raise_a_livelock_and_stop_the_chase_until_acked(
+        started, project, fake_gh, local_proof):
+    """#1512: under the window cap, N carried laps with no merge is a LIVELOCK the user decides"""
+    opt_in(started)
+    store, wo = parked(project)
+    laps = started.catalog.project("proj_a").pull_requests.livelock_laps
+    for i in range(laps):
+        ops.record_base_update(store, wo, base="main", base_sha=f"{i}" * 40,
+                               head_before=JUDGED, head_after=JUDGED, checks=(),
+                               cause=ops.BASE_UPDATE_BEHIND)
+    assert ops.catch_up_attempts(store, wo["id"]) < CATCH_UP_MAX
+    behind_pr(fake_gh, base_oid=BASE_OID2)
+    local_proof["tip"] = BASE_OID2
+
+    poll(started, store)
+
+    [row] = held(store, wo)
+    assert row["catch_up"] == ops.CATCH_UP_EXHAUSTED
+    assert row["catch_up_cause"] == ops.CATCH_UP_LIVELOCK
+    assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []
+    blocker = invariants.livelock_blocker(store, store.get_work_order(wo["id"]))
+    assert f"{laps} times" in blocker and "00000000, 11111111" in blocker
+    list(invariants.check_blocked_work_is_surfaced(store))
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"] == 1 and fresh["attention_reason"] == blocker
+    assert invariants.CATCH_UP_EXHAUSTED_BLOCKER not in invariants.true_blockers(store, fresh)
+
+    # The user's ack hands the chase back to the ordinary backoff
+    ops.ack_attention(wo["id"])
+    poll(started, store)
+    assert held(store, wo)[-1]["catch_up_cause"] == ops.CATCH_UP_DEFER_BACKOFF
 
 
 def test_a_base_commit_already_chased_once_is_exhausted_too(started, project, fake_gh,
@@ -572,7 +613,8 @@ def at_the_cap(started, project, fake_gh, local_proof):
 
 
 def test_a_base_that_outran_the_cached_reading_holds_at_the_cap(started, project,
-                                                                fake_gh, local_proof):
+                                                                fake_gh, local_proof,
+                                                                window_cap_only):
     """THE MEASURED CASE, issue #1173: the granted merge could only refuse, every tick"""
     store, wo = at_the_cap(started, project, fake_gh, local_proof)
 
@@ -657,7 +699,8 @@ def test_a_head_the_os_cannot_prove_asks_the_user_instead_of_deferring(
 
 
 def test_the_exhausted_hold_is_not_overwritten_by_a_lesser_reading(started, project,
-                                                                   fake_gh, local_proof):
+                                                                   fake_gh, local_proof,
+                                                                   window_cap_only):
     """§3.1's rule, one hold later: `mergeable` going UNKNOWN must not retire the ask (#1173)"""
     store, wo = at_the_cap(started, project, fake_gh, local_proof)
     poll(started, store)
@@ -730,7 +773,8 @@ def test_a_denial_on_an_up_to_date_base_still_asks_the_user(started, project, fa
 
 
 def test_a_denial_past_the_cap_asks_the_user_naming_the_races(started, project,
-                                                              fake_gh, local_proof):
+                                                              fake_gh, local_proof,
+                                                              window_cap_only):
     """The bound: the cap's catch-ups are the races, and the hold names them"""
     store, wo = denied_stale(started, project, fake_gh, local_proof)
     for i in range(CATCH_UP_MAX):

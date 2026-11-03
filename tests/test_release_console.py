@@ -54,7 +54,9 @@ def os_repo(tmp_path, monkeypatch):
         central.update_morpheus_item(item["id"], state="failed")
     finally:
         central.close()
-    monkeypatch.setattr(ops, "_release_repo", lambda: ("jarvis_os", repo))
+    real = ops._release_repo
+    monkeypatch.setattr(ops, "_release_repo",
+                        lambda project="": real(project) if project else ("jarvis_os", repo))
     return {"repo": repo, "io": io["id"], "child": child["id"], "plain": plain["id"],
             "mv": item["id"], "sha2": _git(repo, "rev-parse", "HEAD~1"),
             "sha3": _git(repo, "rev-parse", "HEAD")}
@@ -115,6 +117,56 @@ def test_the_pages_link_every_hop(os_repo):
     assert "release in flight" in page
 
 
+def test_another_project_is_picked_tagged_and_cut_outside_the_os_machinery(os_repo, tmp_path):
+    """Spec 2026-11-01 §3"""
+    repo = tmp_path / "app"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "one")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "two")
+    central = CentralStore()
+    try:
+        central.upsert_project("app", str(repo), "an app")
+        central.conn.commit()
+    finally:
+        central.close()
+    assert "app" in ops.release_projects()
+    report = ops.release_overview("app")
+    assert (report["project"], report["is_os"], len(report["pending"])) == ("app", False, 2)
+    _git(repo, "tag", "v1")  # no app-* tag yet: any tag counts
+    assert ops.release_overview("app")["newest"] == "v1"
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "three")
+    _git(repo, "tag", "app-0.1.0")
+    report = ops.release_overview("app")
+    assert (report["tag_glob"], report["newest"]) == ("app-*", "app-0.1.0")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "four")
+    wo = ops.release_cut(_git(repo, "rev-parse", "HEAD"), "app")
+    store = ProjectStore(repo)
+    try:
+        row = store.get_work_order(wo["id"])
+    finally:
+        store.close()
+    meta = db.from_json(row["metadata"], {})
+    assert release.BATCH_KEY not in meta and not release.is_release_order(row)
+    assert "app-X.Y.Z" in row["description"] and "shipit" not in row["description"]
+    with pytest.raises(ops.OpsError, match="already shipping a release"):
+        ops.release_cut(_git(repo, "rev-parse", "HEAD"), "app")
+    with pytest.raises(ops.OpsError, match="no project 'nope'"):
+        ops.release_overview("nope")
+
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    client = TestClient(create_app())
+    page = client.get("/release?project=app").text
+    assert "Release — app" in page and '/release/app-0.1.0?project=app' in page
+    assert client.get("/release/app-0.1.0?project=app").status_code == 200
+    assert 'name="project" value="app"' in client.get("/release/app-0.1.0?project=app").text
+
+
 def test_a_release_page_colours_a_failed_pr(os_repo):
     _git(os_repo["repo"], "tag", "jarvis-0.1.1")
     from fastapi.testclient import TestClient
@@ -122,5 +174,5 @@ def test_a_release_page_colours_a_failed_pr(os_repo):
     from jarvis.ui.app import create_app
 
     page = TestClient(create_app()).get("/release/jarvis-0.1.1").text
-    assert f'class="mono tone-bad" href="/morpheus/{os_repo["mv"]}"' in page
+    assert f'class="mono tone-bad" href="/mo/{os_repo["mv"]}"' in page
     assert "needs-you" in page

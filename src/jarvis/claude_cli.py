@@ -1422,7 +1422,8 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
                         permission_mode: str | None = None,
                         env_extra: dict[str, str] | None = None,
                         settings: Path | str | None = None,
-                        keep_default_context: bool = False) -> HeadlessResult:
+                        keep_default_context: bool = False,
+                        persist: bool = False) -> HeadlessResult:
     """One-shot headless call (`claude -p`), with its accounting kept (docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md)"""
     # FIRST, before any argument is built or any subprocess runs: a refused call spends nothing (spec §2)
     if isinstance(records_itself, Authorisation):
@@ -1446,8 +1447,9 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
             ceiling=MAX_OS_PROMPT_CHARS)
     # THE PROMPT'S SECOND DOOR, spec §2: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
     over = len(prompt.encode()) > PROMPT_ARGV_LIMIT
+    # persist: keep the transcript, for accounting and `jarvis inspect` (monitoring-orders spec §3)
     args: list[str] = ["-p", *([] if over else [prompt]), "--output-format", "json",
-                       "--no-session-persistence"]
+                       *([] if persist else ["--no-session-persistence"])]
     if model:
         args += ["--model", model]
     if settings:
@@ -1517,39 +1519,6 @@ def run_headless(prompt: str, system_prompt: str | None = None,
                                permission_mode=permission_mode,
                                env_extra=env_extra, settings=settings,
                                keep_default_context=keep_default_context).text
-
-
-def run_session_turn(prompt: str, session_id: str, *, resume: bool, cwd: Path,
-                     model: str | None = None, append_system_prompt: str | None = None,
-                     permission_mode: str | None = None,
-                     add_dirs: list[Path] | None = None,
-                     timeout: int = 900,
-                     previous: dict[str, Any] | None = None) -> HeadlessResult:
-    """One waited-for turn of a LONG-LIVED OS session (Morpheus): `--session-id` first, `--resume` after"""
-    # `previous`: last turn's usage, since the envelope is a session running total (#1462)
-    args = turn_args(prompt, session_id, resume, model=model,
-                     permission_mode=permission_mode,
-                     append_system_prompt=append_system_prompt, add_dirs=add_dirs or None)
-    started = time.monotonic()
-    out = _run(args, cwd=cwd, timeout=timeout)
-    latency_ms = int((time.monotonic() - started) * 1000)
-    try:
-        data: Any = json.loads(out)
-    except json.JSONDecodeError:
-        data = None
-    if not isinstance(data, dict):
-        return HeadlessResult(text=out, model=model or "", prompt_chars=len(prompt),
-                              latency_ms=latency_ms, session_id=session_id)
-    served = list(data.get("modelUsage") or {})
-    usage = derive_turn_usage(data, previous)
-    if usage is not None:
-        usage["prompt_chars"] = len(prompt)
-        usage["latency_ms"] = latency_ms
-    return HeadlessResult(
-        text=str(data.get("result") or ""), usage=usage,
-        session_id=str(data.get("session_id") or session_id),
-        model=(served[0] if len(served) == 1 else "") or model or "",
-        prompt_chars=len(prompt), latency_ms=latency_ms)
 
 
 def unpack_headless(value: HeadlessResult | str) -> tuple[str, dict[str, Any] | None]:

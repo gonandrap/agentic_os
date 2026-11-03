@@ -622,3 +622,14 @@ it instead of the net measured at precision 0.140. `regex` stays selectable per 
 numbers are §6-§7's (2026-09-25): the labelled production corpus was a temp file and
 never in this public repo, so it was not re-scored today. Tests that pin the wide net's
 wording or its 'migration' class now name `regex` explicitly rather than lean on the default.
+
+## 9. Amendment 2026-11-02: `production`/`prod` is tightened too (issue 1517)
+
+Reverses §7.1 item 8. The bare row held "ops.mo_create is the only production caller" and
+parked wo-8ab443cc 72m. `_HST_PRODUCTION` holds only an act on production (a verb with
+`to`/`into`/`under`/`in`/`against` production, a verb on "the production …", production plus a
+live object) or what production RUNS / is deployed or checked out at, which keeps
+wo-1ee46481#1. Re-scored on the 1837 assumptions the CLI reaches (the §6 corpus is gone):
+174 holds to 127, 47 released, none added. Every named high row stays held except
+wo-f35e603e#10, an accidental hold on "the production constant" (Neo, question 3229).
+Detector `mention-held-as-act` (`rules._SEEDS`) reports a hold Neo's advice judged routine.

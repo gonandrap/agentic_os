@@ -791,6 +791,8 @@ DEFAULT_PULL_REQUESTS_CATCH_UP_WINDOW_MINUTES = 120
 DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_BASE_SECONDS = 60
 #: ...and never longer than this between two catch-ups
 DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_MAX_SECONDS = 600
+#: Catch-ups of one judged round, at any rate, before the OS stops chasing and asks (#1512)
+DEFAULT_PULL_REQUESTS_LIVELOCK_LAPS = 4
 
 
 @dataclass
@@ -803,6 +805,7 @@ class PullRequestsConfig:
     catch_up_window_minutes: int = DEFAULT_PULL_REQUESTS_CATCH_UP_WINDOW_MINUTES
     catch_up_backoff_base_seconds: int = DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_BASE_SECONDS
     catch_up_backoff_max_seconds: int = DEFAULT_PULL_REQUESTS_CATCH_UP_BACKOFF_MAX_SECONDS
+    livelock_laps: int = DEFAULT_PULL_REQUESTS_LIVELOCK_LAPS
 
 
 # -- the scheduler: the OS filing a work order nobody typed
@@ -1079,8 +1082,9 @@ class MorpheusConfig:
     timeout_days: float = 3.0
     check_every_minutes: int = 15
     script_timeout_seconds: int = 60
-    #: Compact Morpheus's session once its context passes this share of the window
+    #: Ignored, no session to compact; parsed so old catalogs load (monitoring-orders §3)
     compact_at: float = 0.30
+    #: Where a judge's `confirm` goes: "investigate" files one, "neo" asks Neo (monitoring-orders §4)
     on_failed: str = "investigate"
     on_timeout: str = "neo"
     turn_timeout_seconds: int = 900

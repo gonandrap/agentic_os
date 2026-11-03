@@ -159,8 +159,8 @@ PR_POLL_EVERY_TICKS = 24
 #: One Morpheus pass every N ticks (~1 minute at the default 5s poll)
 MORPHEUS_EVERY_TICKS = 12
 
-#: Read the account's usage meter every N ticks — one minute at the default 5s interval (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)
-USAGE_SAMPLE_EVERY_TICKS = 12
+#: Read the account's usage meter every N ticks — 150s at the default 5s interval (kn-ff0b7bc2)
+USAGE_SAMPLE_EVERY_TICKS = 30
 
 #: Re-offer the steward's queued self-work every N ticks — ten minutes at the default 5s (#1181)
 STEWARD_DRAIN_EVERY_TICKS = 120
@@ -302,6 +302,9 @@ def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] not in PR_POLL_STATUSES:
         return False
     if not wo.get("pr_url"):
+        return False
+    # An order left open by its own merge has nothing left to learn from GitHub (#1506)
+    if str(wo.get("pr_state") or "") == "MERGED":
         return False
     if recorded is not None and wo["id"] not in recorded:
         return True
@@ -725,6 +728,8 @@ class Daemon:
         self.release_runner: Any = None
         # The usage meter's `urlopen` seam
         self.meter_opener: Any = None
+        self.meter_retry_at = 0.0
+        self.meter_refusals = 0
         # What the catalog file looked like when this catalog was loaded
         self._catalog_stamp = self._catalog_file_stamp()
         # Reload refused (unreadable, unparseable
@@ -831,6 +836,8 @@ class Daemon:
 
     def sample_usage_meter(self) -> None:
         """One reading of the account's meter, or one gap row saying why there is none"""
+        if db.now() < self.meter_retry_at:
+            return
         try:
             sample = usage_meter.sample_once(self.central, opener=self.meter_opener)
         except Exception as e:  # noqa: BLE001 — never the token, never the body
@@ -843,6 +850,13 @@ class Daemon:
             except Exception:  # noqa: BLE001 — a database that cannot be written is next
                 log.exception("usage meter gap row could not be recorded")
             return
+        if sample.http_status == 429:
+            self.meter_refusals += 1
+            wait = usage_meter.backoff_seconds(self.meter_refusals, sample.retry_after)
+            self.meter_retry_at = db.now() + wait
+        else:
+            self.meter_refusals = 0
+            self.meter_retry_at = 0.0
         if not sample.ok:
             log.warning("usage meter unreadable: %s", sample.reason)
         self.notice_meter_gap()
@@ -2402,9 +2416,7 @@ class Daemon:
                          project.name, wo_id, n)
                 return
             # NOTHING CHANGED BECAUSE THE REST IS THE USER'S TO RUN: name it (#1352)
-            finished = store.events_of_kind(wo_id, "finished")
-            needs_user = (str(db.from_json(finished[-1]["payload"], {}).get("needs_user")
-                              or "") if finished else "")
+            needs_user = ops.declared_user_action(store, wo_id)
             if empty == "escalate" and needs_user:
                 self._escalate(store, wo, round_id, n,
                                f"this submission changes no files because the rest is "
@@ -3309,7 +3321,7 @@ class Daemon:
         future.add_done_callback(lambda f: setattr(self, "morpheus_busy", False))
 
     def _morpheus_pass(self) -> None:
-        """Queue what reached production, run due scripts, hand off verdicts, then wake the session"""
+        """Queue what reached production, run due scripts, hand off verdicts, then arm what is owed"""
         from . import morpheus
         from .paths import production_code_dir
 
@@ -3349,23 +3361,30 @@ class Daemon:
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
             skip = archived_projects(central)
-            moved = morpheus.sweep(central, cfg,
-                                   lambda item: dirs.get(item.get("project") or "", fallback),
-                                   skip=skip)
+            def cwd_for(item: dict) -> Path:
+                return dirs.get(item.get("project") or "", fallback)
+
+            moved = morpheus.sweep(central, cfg, cwd_for, skip=skip)
             if any(moved.values()):
                 log.info("morpheus sweep: %s", {k: v for k, v in moved.items() if v})
+            # One short judging session per failed order, where it runs (§4)
             for item in morpheus.owed_actions(central):
                 if (item["project"] or "") in skip:
                     continue
+                if morpheus.held(central):
+                    break
                 try:
-                    log.info("morpheus %s (PR #%s) %s -> %s", item["id"], item["pr_number"],
-                             item["state"], morpheus.act(central, self.catalog, item))
+                    action = morpheus.act(central, self.catalog, item, cwd=cwd_for(item))
+                    if action:
+                        log.info("morpheus %s (PR #%s) %s -> %s", item["id"],
+                                 item["pr_number"], item["state"], action)
                 except Exception:  # noqa: BLE001 — one item must not starve the others
                     log.exception("morpheus: action for %s failed", item["id"])
-            # The session lives in the OS project's checkout; each batch adds the projects it touches
-            home = next((p.path for p in self.catalog.projects if p.name == os_name), fallback)
-            morpheus.wake(central, self.catalog, home, dirs=dirs,
-                          paused=morpheus.pause_state(central)["paused"], skip=skip)
+            # One short session per owed order, in that order's production directory (§3)
+            armed = morpheus.arm(central, self.catalog, cwd_for, skip=skip)
+            ran = {k: v for k, v in armed.items() if v and k not in ("paused", "usage_held")}
+            if ran:
+                log.info("morpheus arm: %s", ran)
         except Exception:  # noqa: BLE001 — the loop must survive anything
             log.exception("morpheus pass failed")
         finally:
@@ -6269,14 +6288,14 @@ class Daemon:
                                                  confirm(), confirm)
                 if not decision.armed:
                     self._note_autoreview_held(store, wo["id"], decision,
-                                               suppress=suppress)
+                                               suppress=suppress, early=early)
                     continue
                 # THE SECOND GATE, over the TEXTS rather than the row (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md)
                 evidence_ok = autoreview.decide_evidence(
                     a, summary=str(wo.get("result_summary") or ""))
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
-                                               suppress=suppress)
+                                               suppress=suppress, early=early)
                     continue
                 try:
                     autoreview.propose_confirmation(store, neo_store, project.name, wo,
@@ -6302,7 +6321,7 @@ class Daemon:
             decision = self._stakes_reviewed(project, store, wo, cfg, a, judge(), judge)
             if not decision.armed:
                 self._note_autoreview_held(store, wo["id"], decision,
-                                           suppress=suppress)
+                                           suppress=suppress, early=early)
                 if (not early and decision.code == autoreview.HELD_HIGH_STAKES
                         and (not linked or linked in dead_questions)):
                     # Neo ADVISES on a high-stakes hold; the user still decides (wo-6d90354c)
@@ -6392,24 +6411,28 @@ class Daemon:
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
                               decision: Any, *, settling: bool = False,
-                              suppress: tuple[str, ...] | None = None) -> None:
+                              suppress: tuple[str, ...] | None = None,
+                              early: bool = False) -> None:
         """Record ONCE, per (assumption, reason), that the OS declined to decide"""
         if not settling and decision.code in (suppress or ()):
             return
-        # THE ROUND IS PART OF THE KEY, and the hold that needs it is `panel_gave_up`: two consecutive... (#975)
+        # THE ROUND (#975) AND THE PASS (#1482) ARE PART OF THE KEY
         key = (int(decision.assumption_id or 0), str(decision.code or ""),
-               int(decision.round or 0), str(decision.reason or ""))
+               int(decision.round or 0), str(decision.reason or ""), early)
         if not _hold_is_news(store, wo_id, "autoreview_held", key,
                              lambda p: (int(p.get("assumption_id") or 0),
                                         str(p.get("code") or ""),
                                         int(p.get("round") or 0),
-                                        str(p.get("reason") or ""))):
+                                        str(p.get("reason") or ""),
+                                        bool(p.get("early")))):
             return
         store.add_event(wo_id, "autoreview_held", {
             "code": decision.code, "reason": decision.reason,
             "assumption_id": decision.assumption_id, "n": decision.n,
             # What the freshness check at the read side compares against the current round
-            "round": decision.round})
+            "round": decision.round,
+            # Held while the worker still works: the user meets it on delivery (#1482)
+            **({"early": True} if early else {})})
 
     def _deliver_assumption_verdict(self, central: CentralStore, neo_store: Any,
                                     pstore: ProjectStore | None, q: dict,
@@ -6761,6 +6784,13 @@ class Daemon:
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
                                f"this branch has already been rebuilt against "
                                f"{base_oid[:10]} once", base_tip=base_oid)
+        # #1512: no CI run per lap while the LIVELOCK blocker stands; an ack lets one more lap run
+        livelock = invariants_mod.livelock_blocker(store, wo)
+        if livelock and livelock not in invariants_mod.acknowledged(wo):
+            return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
+                               f"every one of its last {len(ops.base_chase_laps(store, wo_id))}"
+                               f" catch-ups lost to the next merge into `{base}`",
+                               base_tip=base_oid, cause=ops.CATCH_UP_LIVELOCK)
         policy = ops.catch_up_policy(store)
         attempts = ops.catch_up_attempts(store, wo_id, policy=policy)
         cap = policy.catch_up_max

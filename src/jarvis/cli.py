@@ -502,8 +502,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("cost", help="what the fleet's work has cost in tokens")
     sp.add_argument("target", nargs="?",
-                    help="a project, a work-order id, or a feature-order id "
-                         "(default: the whole fleet)")
+                    help="a project, a work-order, feature-order or monitoring-order "
+                         "id (default: the whole fleet)")
+    sp.add_argument("--release", metavar="TAG",
+                    help="every monitoring order of that release tag, summed")
     sp.add_argument("--limit", type=int, default=50,
                     help="work orders per project to measure (default: 50)")
     # The DISTRIBUTION, beside the listing rather than instead of it: what a typical order costs (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)
@@ -710,13 +712,34 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--project")
     sp.add_argument("--json", action="store_true")
 
-    # Morpheus: production validation of shipped PRs (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+    # `morpheus` is a permanent alias (docs/superpowers/specs/2026-11-01-monitoring-orders.md §5)
     mo = sub.add_parser(
-        "morpheus", help="Morpheus: every shipped PR watched in production until validated",
+        "mo", aliases=["morpheus"],
+        help="monitoring orders: shipped PRs and user watches checked in production",
     ).add_subparsers(dest="morpheus_cmd", required=True)
-    m = mo.add_parser("status", help="counts by state, the session, then every PR")
-    m.add_argument("--all", action="store_true", help="list settled PRs too")
-    m = mo.add_parser("show", help="one PR: its hints, script, last output and action")
+    m = mo.add_parser("create", help="watch something in production; the daemon arms a "
+                                     "--prompt order on its next pass")
+    m.add_argument("project")
+    m.add_argument("title")
+    what = m.add_mutually_exclusive_group(required=True)
+    what.add_argument("--prompt", help="what to monitor; a short session writes the script")
+    what.add_argument("--script", dest="script_file",
+                      help="the check script file (exit 0 validated, 1 failed, else keep "
+                           "watching), - for stdin")
+    m.add_argument("--every", help="check interval, e.g. 15m (default: "
+                                   "os.morpheus.check_every_minutes)")
+    m.add_argument("--deadline", help="give up after, e.g. 3d (default: "
+                                      "os.morpheus.timeout_days)")
+    m = mo.add_parser("list", help="open orders and those owed a look, newest first")
+    m.add_argument("project", nargs="?")
+    m.add_argument("--all", action="store_true", help="settled orders too")
+    m.add_argument("--state", help="only this state")
+    m = mo.add_parser("cancel", help="stop watching an open order; it is never judged")
+    m.add_argument("item_id")
+    m = mo.add_parser("status", help="counts by state, pause, activity, then every order")
+    m.add_argument("--all", action="store_true", help="list settled orders too")
+    m = mo.add_parser("show", help="one order: its hints or prompt, script, last output and "
+                                   "action")
     m.add_argument("item_id")
     m = mo.add_parser("enqueue-release",
                       help="queue every PR a release carries (shipit runs this)")
@@ -964,8 +987,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "THAT order's fix reaches production")
     f.add_argument("--needs-user", dest="needs_user", default="", metavar="COMMAND",
                    help="the exact command only the user may run that the rest of "
-                        "this work waits on (e.g. `jarvis config set …`): a "
-                        "submission that changes nothing escalates naming it")
+                        "this work waits on (e.g. `jarvis config set …`): the order "
+                        "parks for the user naming it instead of completing")
 
     r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
     r.add_argument("wo_id")
@@ -2726,6 +2749,9 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     if args.json:
         _print(res, True)
         return 0
+    if res.get("note"):
+        print(f"{res['scope']} — {res['title']}\n{res['note']}")
+        return 0
     # A feature order is many units and needs a line saying which feature they are
     if len(res["units"]) != 1 or res["units"][0]["wo_id"] != res["scope"]:
         print(f"{res['scope']} — {res['title']}\n")
@@ -3216,12 +3242,22 @@ def _cost_meter(picked: dict, project: str | None) -> dict | None:
 
 
 def cmd_cost(args: argparse.Namespace) -> int:
-    from . import ops
+    from . import morpheus, ops
     # One argument, three kinds of thing (docs/superpowers/specs/2026-09-23-improvement-orders.md)
     from .project_store import is_feature_order_id
 
+    # A release's monitoring orders, summed (docs/superpowers/specs/2026-11-01-monitoring-orders.md §7)
+    if getattr(args, "release", None):
+        from . import bill as bill_mod
+        bill = bill_mod.for_release(args.release)
+        if args.json:
+            _print(bill, True)
+            return 0
+        _print_bill(bill)
+        return 0
     target = args.target
-    is_id = bool(target) and (target.startswith("wo-") or is_feature_order_id(target))
+    is_id = bool(target) and (target.startswith("wo-") or is_feature_order_id(target)
+                              or morpheus.is_monitoring_order_id(target))
     scope = args.project or (None if is_id else target) or None
     # THE ZONE, THEN THE WINDOW, ONCE at the top and handed to every payload builder below (kn-9ccc429b:...
     zone = ops.cost_zone(args.tz, scope)
@@ -4235,9 +4271,10 @@ MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "fail
 
 def _morpheus_line(item: dict) -> str:
     action = f" → {item['action']}" if item.get("action") else ""
+    what = f"PR #{item['pr_number']} " if item.get("pr_number") else ""
     return (f"{MORPHEUS_ICON.get(item['state'], '•')} {item['id']} "
-            f"[{item.get('project') or '?'}] PR #{item['pr_number']} "
-            f"{item['state']}{action} — {item['pr_title'][:70]}")
+            f"[{item.get('project') or '?'}] {what}"
+            f"{item['state']}{action} — {(item.get('pr_title') or item.get('title') or '')[:70]}")
 
 
 def _fix_lines(fix: dict | None, dispatch: str) -> list[str]:
@@ -4280,6 +4317,36 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
     """`jarvis morpheus …` — a thin wrapper over `ops.morpheus_*`"""
     from . import ops
 
+    if getattr(args, "item_id", None) is not None:
+        ops.require_mo_id(args.item_id)
+    if args.morpheus_cmd == "create":
+        script = ""
+        if args.script_file:
+            script = (sys.stdin.read() if args.script_file == "-"
+                      else Path(args.script_file).read_text())
+        item = ops.mo_create(args.project, args.title, prompt=args.prompt or "",
+                             script=script, every=args.every, deadline=args.deadline)
+        if args.json:
+            _print(item, True)
+        else:
+            print(f"{item['id']} {item['state']}"
+                  + (" — armed by the daemon on its next pass" if item["state"] == "queued"
+                     else " — the daemon runs its script from production"))
+        return 0
+    if args.morpheus_cmd == "list":
+        items = ops.mo_list(args.project, args.all, args.state)
+        if args.json:
+            _print(items, True)
+            return 0
+        for item in items:
+            print(_morpheus_line(item))
+        if not items:
+            print("no monitoring orders" + ("" if args.all else " open — --all for settled"))
+        return 0
+    if args.morpheus_cmd == "cancel":
+        item = ops.mo_cancel(args.item_id)
+        _print({"id": item["id"], "state": item["state"]}, args.json)
+        return 0
     if args.morpheus_cmd == "status":
         rep = ops.morpheus_report()
         if not args.all:
@@ -4290,17 +4357,10 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             _print(rep, True)
             return 0
         c = rep["counts"]
-        sess = rep["session"]
         print(" · ".join(f"{n} {s}" for s, n in c.items()) +
               (f" · last release {rep['last_release']}" if rep["last_release"] else ""))
-        share = sess.get("context_share")
-        print(f"session: {sess.get('session_id') or 'not started'}"
-              f" · {sess.get('turns') or 0} turn(s)"
-              f" · {sess.get('compactions') or 0} compaction(s)"
-              + (f" · context {share:.0%}" if share is not None else "")
-              + f" · {_morpheus_pause_text(rep['pause'])}"
-              + f" · {_morpheus_activity_text(rep['activity'])}"
-              + (f" · last error: {sess['last_error']}" if sess.get("last_error") else ""))
+        print(f"{_morpheus_pause_text(rep['pause'])}"
+              f" · {_morpheus_activity_text(rep['activity'])}")
         for item in rep["items"]:
             print(_morpheus_line(item))
         return 0
@@ -4311,8 +4371,12 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             _print(item, True)
             return 0
         print(_morpheus_line(item))
-        print(f"{item['pr_url']}  first release with this PR {item['release_tag'] or '—'}"
-              f"  work order {item['wo_id'] or '—'}")
+        if item.get("pr_number"):
+            print(f"{item['pr_url']}  first release with this PR {item['release_tag'] or '—'}"
+                  f"  work order {item['wo_id'] or '—'}")
+        else:
+            print(f"origin {item.get('origin') or '—'}"
+                  f" · every {item.get('every_minutes') or 'default'} min")
         if item["last_check_ts"]:
             print(f"last check {_stamp(item['last_check_ts'])}"
                   f" on {item.get('last_check_version') or 'an unknown version'}")
@@ -4322,7 +4386,10 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
                  if item.get("auto_requeues") else ""))
         if item["resolution"]:
             print(f"\n{item['resolution']}")
-        print(f"\nhints:\n{item['hints'] or '(none)'}")
+        if item.get("prompt"):
+            print(f"\nprompt:\n{item['prompt']}")
+        else:
+            print(f"\nhints:\n{item['hints'] or '(none)'}")
         print(f"\nscript ({item['script_source'] or 'none yet'}):\n{item['script'] or '—'}")
         if item["last_output"]:
             print(f"\nlast output:\n{item['last_output']}")
@@ -4407,26 +4474,14 @@ def _morpheus_pause_text(pause: dict) -> str:
 
 
 def _morpheus_activity_text(act: dict) -> str:
-    """The pause mode says what is ALLOWED; this says what the session is doing (issue #1162)"""
-    if act["turn_in_flight"]:
-        return (f"{act['turn_kind'] or 'turn'} in flight since "
-                f"{_stamp(act['turn_started_ts'])}")
-    if act.get("abandoned_turn_ts"):
-        parts = [f"idle (the {act['turn_kind'] or 'turn'} started "
-                 f"{_stamp(act['abandoned_turn_ts'])} never finished)"]
-    else:
-        parts = [f"idle · {act['due']} queued due now" if act["due"] else "idle"]
+    """The pause mode says what is ALLOWED; this says what Morpheus is doing (issue #1162)"""
+    parts = [act["state"]]
+    if act["owed_arm"]:
+        parts.append(f"{act['owed_arm']} owed arming")
+    if act["owed_judge"]:
+        parts.append(f"{act['owed_judge']} owed judging")
     if act.get("usage_hold_until"):
         parts.append(f"held until {_stamp(act['usage_hold_until'])} (usage limit)")
-    if act.get("kill_hold_until"):
-        parts.append(f"held until {_stamp(act['kill_hold_until'])} or the next release "
-                     f"({act['kills']} killed turns in a row)")
-    for h in act["held"]:
-        why = {"error": " after a failed turn", "offer": " after an offer"}.get(h["cause"], "")
-        parts.append(f"{h['id']} offered {h['offers']} of {act['max_offers']}: "
-                     + ("no offer left, it will time out"
-                        if h["exhausted"]
-                        else f"held back{why} until {_stamp(h['next_offer_ts'])}"))
     return " · ".join(parts)
 
 
@@ -4552,14 +4607,16 @@ def cmd_investigate(args: argparse.Namespace) -> int:
         if args.json:
             _print(detail, True)
         else:
-            # THE CLASSIFICATION AND THE SUBJECT FIRST (§2.9), then the argument
+            # THE ASK FIRST (#1481), then the classification and the subject (§2.9), then the argument
             print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
                   f"[{detail['project']}] {detail['status_label']}")
-            print(f"\n{detail['classification'] or 'no verdict yet'} — "
-                  f"{detail['subject']}")
-            print(f"\n{detail['why']}\n")
             if detail["attention_reason"]:
-                print(f"⚠ {detail['attention_reason']}\n")
+                print(f"\n⚠ {detail['attention_reason']}")
+                ask = (detail["verdict"] or {}).get("rewrite_ask") or {}
+                if ask.get("command"):
+                    print(f"\n  {ask['command']}")
+            print(f"\n{detail['classification'] or 'no verdict yet'} — "
+                  f"{detail['subject']}\n")
             if detail["budget"]["budget_usd"]:
                 b = detail["budget"]
                 print(f"budget: ${b['spent_usd']:.2f} of ${b['budget_usd']:.2f}")
@@ -4577,6 +4634,7 @@ def cmd_investigate(args: argparse.Namespace) -> int:
                 print("\nchain:")
                 for line in _chain_lines(chain, detail["id"]):
                     print(f"  {line}")
+            print(f"\nwhy it was opened:\n{detail['why']}")
             if detail["assumptions"]:
                 print("\nthe investigator's calls (on record, for nobody's review):")
                 for a in detail["assumptions"]:
@@ -6162,7 +6220,7 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_investigate(args)
         if args.cmd == "do":
             return cmd_do(args)
-        if args.cmd == "morpheus":
+        if args.cmd in ("mo", "morpheus"):
             return cmd_morpheus(args)
         if args.cmd == "gate":
             return cmd_gate(args)

@@ -205,6 +205,26 @@ CATCH_UP_EXHAUSTED_BLOCKER = ("the base moved under the commit the panel accepte
                               "window clears — merge it by hand, or `jarvis wo send` the "
                               "worker to rebase")
 
+#: THE LAPS ARE LOSING TO THE BASE (#1512): nothing is exhausted, the base merges faster than one lap
+LIVELOCK_BLOCKER = ("base-chase livelock: the OS has caught this branch up {n} times since "
+                    "its verdict (base tips {tips}) and every lap lost to the next merge "
+                    "into the base, so it has stopped spending a CI run per lap — merge "
+                    "it by hand, or `jarvis wo ack {wo_id}` to let the OS chase it again")
+
+
+def livelock_blocker(store: ProjectStore, wo: dict[str, Any]) -> str | None:
+    """The LIVELOCK line, when this parked order has lost `pull_requests.livelock_laps` base chases"""
+    from . import ops as ops_mod
+
+    if wo["status"] != "waiting_pr_merge":
+        return None
+    tips = ops_mod.base_chase_laps(store, wo["id"])
+    if len(tips) < ops_mod.catch_up_policy(store).livelock_laps:
+        return None
+    return LIVELOCK_BLOCKER.format(n=len(tips), tips=", ".join(t[:8] for t in tips),
+                                   wo_id=wo["id"])
+
+
 #: THE HEAD MOVED OFF THE JUDGED COMMIT AND NO CARRY COULD BE PROVEN ONTO IT (#1188)
 CARRY_UNPROVEN_BLOCKER = ("the head of this pull request is not the commit the panel "
                           "accepted and the OS could not prove it is that commit plus "
@@ -478,6 +498,12 @@ def user_action_blocker(command: str) -> str:
     """The no-change escalation that waits on a command only the user may run (#1352)"""
     return (f"nothing was changed because the rest is yours to run: `{command}` — "
             f"then close it with `jarvis wo done`")
+
+
+def user_action_owed_blocker(command: str) -> str:
+    """The delivered order whose result still waits on the user's own command (#1506)"""
+    return (f"this order's result waits on a command only you may run: `{command}` "
+            f"— `jarvis wo ack` once you have run it, or `jarvis wo done` to close it")
 
 
 def escalated_user_action(store: ProjectStore, wo: dict[str, Any]) -> str:
@@ -813,8 +839,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # ...AND THE SAME STALL THE OS ALREADY SPENT ITS ROUND ON
     if wo["status"] == "waiting_pr_merge" and sha_unrecorded_rejudge_spent(store, wo):
         blockers.append(SHA_UNRECORDED_SPENT_BLOCKER)
-    # THE BASE MOVING FASTER THAN THE OS MAY CHASE IT
-    if (wo["status"] == "waiting_pr_merge"
+    # THE BASE MOVING FASTER THAN THE OS MAY CHASE IT: by lap count (#1512), else by window rate
+    livelock = livelock_blocker(store, wo)
+    if livelock and livelock not in acknowledged(wo):
+        blockers.append(livelock)
+    elif (wo["status"] == "waiting_pr_merge"
             and catch_up_exhausted_hold(store, wo["id"]) is not None):
         blockers.append(CATCH_UP_EXHAUSTED_BLOCKER)
     # A HEAD THE OS MOVED AND CANNOT PROVE (#1188)
@@ -839,6 +868,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         pr_pending = store.pr_pending_open(wo["id"])
         if pr_pending is not None:
             blockers.append(pr_pending_blocker(wo["id"], pr_pending))
+        # The finish declared a command only the user may run, so the order never completed (#1506)
+        owed_action = store.user_action_open(wo["id"])
+        if owed_action is not None:
+            blockers.append(user_action_owed_blocker(
+                str(owed_action.get("command") or "")))
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for something different (#224)
         if wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
@@ -862,7 +896,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
                             if wo.get("kind") in DOCUMENT_DELIVERY_KINDS
                             else REFUSAL_UNANSWERED_BLOCKER)
         # 4; a pushed-branch park always follows `finished`
-        elif not pending and pr_pending is None:
+        elif not pending and pr_pending is None and owed_action is None:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43)
     if stuck_message(store, wo, now=now) is not None:
@@ -3865,36 +3899,57 @@ def _stamp(ts: float | None) -> str:
 MORPHEUS_GRACE_SECONDS = 3600
 
 
-def check_morpheus_moves() -> Iterator[Violation]:
-    """INV-MORPHEUS-OVERDUE — a PR still open past its deadline, or an action never taken"""
+def check_morpheus_moves(repair: bool = False) -> Iterator[Violation]:
+    """INV-MORPHEUS-OVERDUE — an order overdue, unhanded-off or held by a dead judge's claim"""
     from . import morpheus
+    from .catalog import MorpheusConfig
     from .central_store import CentralStore
 
     catalog = _live_catalog()
     cfg = getattr(getattr(catalog, "os", None), "morpheus", None)
     if cfg is not None and not cfg.enabled:
         return
+    stale_claim = (cfg or MorpheusConfig()).turn_timeout_seconds * 3
     now = db.now()
     central = CentralStore()
     try:
         items = central.morpheus_items((*morpheus.OPEN_STATES, *morpheus.ACTION_STATES))
+        # A brake is deliberate, not a fault (Q3138)
+        held = morpheus.held(central, now)
+        found: list[Violation] = []
+        for item in items:
+            action = item["action"] or ""
+            repaired = False
+            if (item["state"] in morpheus.OPEN_STATES
+                    and now - float(item["deadline_ts"]) > MORPHEUS_GRACE_SECONDS):
+                why = f"is still {item['state']} {(now - float(item['deadline_ts'])) / 3600:.1f}h past its deadline"
+            elif (item["state"] in morpheus.ACTION_STATES
+                  and action.startswith(morpheus.JUDGE_CLAIM)
+                  and now - float(item["action_ts"] or 0) > stale_claim):
+                why = (f"has held its judging claim {(now - float(item['action_ts'] or 0)) / 3600:.1f}h:"
+                       " the judge died holding it")
+                if repair:
+                    central.update_morpheus_item(item["id"], action="", action_ts=None)
+                    repaired = True
+            elif (item["state"] in morpheus.ACTION_STATES and not action and not held
+                  and now - float(item["updated_ts"]) > MORPHEUS_GRACE_SECONDS):
+                why = f"{item['state']} {(now - float(item['updated_ts'])) / 3600:.1f}h ago and no action was taken"
+            else:
+                continue
+            found.append(_morpheus_overdue(item, why, repaired))
     finally:
         central.close()
-    for item in items:
-        if (item["state"] in morpheus.OPEN_STATES
-                and now - float(item["deadline_ts"]) > MORPHEUS_GRACE_SECONDS):
-            why = f"is still {item['state']} {(now - float(item['deadline_ts'])) / 3600:.1f}h past its deadline"
-        elif (item["state"] in morpheus.ACTION_STATES and not item["action"]
-              and now - float(item["updated_ts"]) > MORPHEUS_GRACE_SECONDS):
-            why = f"{item['state']} {(now - float(item['updated_ts'])) / 3600:.1f}h ago and no action was taken"
-        else:
-            continue
-        yield Violation(
-            invariant="INV-MORPHEUS-OVERDUE", subject_id=item["id"],
-            detail=(f"Morpheus item {item['id']} (PR #{item['pr_number']}) {why} — the "
-                    f"daemon's Morpheus pass is not running or is failing. `jarvis morpheus "
-                    f"show {item['id']}`; the daemon log names the error."),
-            context={"item": item["id"], "pr": item["pr_number"], "state": item["state"]})
+    yield from found
+
+
+def _morpheus_overdue(item: dict, why: str, repaired: bool) -> Violation:
+    return Violation(
+        invariant="INV-MORPHEUS-OVERDUE", subject_id=item["id"], repaired=repaired,
+        repair="cleared the claim; the next pass judges it again" if repaired else "",
+        detail=(f"Morpheus item {item['id']} (PR #{item['pr_number']}) {why} — the "
+                f"daemon's Morpheus pass is not running or is failing. `jarvis morpheus "
+                f"show {item['id']}`; the daemon log names the error."),
+        context={"item": item["id"], "pr": item["pr_number"], "state": item["state"]})
 
 
 #: libsqlite3 releases that deadlock in-process on WAL close vs open (io-6fdf5c66); fixed in 3.51.2
@@ -3971,7 +4026,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
 
 
 #: The OS-level checks that take `repair`
-OS_REPAIRABLE = (check_offboarded_activity,)
+OS_REPAIRABLE = (check_offboarded_activity, check_morpheus_moves)
 
 
 def check_os(repair: bool = False) -> list[Violation]:

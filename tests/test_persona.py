@@ -146,7 +146,7 @@ def test_decision_order_block_is_shorter_than_the_investigation_order_block(
         persona: str) -> None:
     investigate_at = persona.index("jarvis investigate")
     do_at = persona.index("jarvis do create")
-    morpheus_at = persona.index("jarvis morpheus status")
+    morpheus_at = persona.index("jarvis mo create")
     investigate_block = persona[investigate_at:do_at]
     do_block = persona[do_at:morpheus_at]
     assert investigate_at < do_at < persona.index(DEV_MODE_HEADING)
@@ -155,6 +155,18 @@ def test_decision_order_block_is_shorter_than_the_investigation_order_block(
         f"({len(investigate_block)} chars): a longer crib sheet buries the prime directives"
     )
     assert "jarvis do show|send|follow-up|done|cancel <id>" in do_block
+
+
+# monitoring orders: docs/superpowers/specs/2026-11-01-monitoring-orders.md §7
+@pytest.mark.parametrize("line", [
+    'jarvis mo create <project> "title" --prompt "…"|--script f [--every 15m] [--deadline 3d]',
+    "jarvis mo list|show|cancel|waive|requeue|rewrite|confirm / pause|unpause|follow-fleet",
+])
+def test_crib_carries_section_7_mo_lines_verbatim(persona: str, line: str) -> None:
+    """A narrowed line drops the brake (waive, requeue, pause) the morpheus line had"""
+    crib = persona[:persona.index(DEV_MODE_HEADING)]
+    assert line in crib
+    assert "`jarvis morpheus` = alias" in crib
 
 
 def test_investigation_orders_sit_with_the_other_order_types(persona: str) -> None:

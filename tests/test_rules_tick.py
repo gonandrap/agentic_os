@@ -369,6 +369,27 @@ def a_healthy_single_kill(store) -> dict:
     return store.get_work_order(wo["id"])
 
 
+def _held_with_advice(store, stakes: str) -> dict:
+    """Issue #1517: a needs_review order whose high-stakes hold carries Neo's advice"""
+    wo = store.create_work_order("an order held on a word")
+    store.set_status(wo["id"], "needs_review")
+    aid = store.add_assumption(wo["id"], "ops.mo_create is the only production caller.")
+    store.add_event(wo["id"], "autoreview_escalated", {
+        "assumption_id": aid, "n": 1, "reason": "Neo would approve it: call sites checked",
+        "stakes": stakes, "advisory": True, "code": "high_stakes"})
+    backdate_status(store, wo["id"], 2 * HOUR)
+    return store.get_work_order(wo["id"])
+
+
+def a_mention_held_as_act(store) -> dict:
+    return _held_with_advice(store, "routine")
+
+
+def a_real_high_stakes_hold(store) -> dict:
+    """Same hold, and Neo agrees the stakes are high: the net was right"""
+    return _held_with_advice(store, "high")
+
+
 SEEDS = [
     ("stale-panel-hold", a_stale_panel_hold, a_healthy_needs_review),
     ("unreachable-neo-question", an_unreachable_neo_question, a_healthy_waiting_input),
@@ -376,6 +397,7 @@ SEEDS = [
     ("red-base-inherited", a_red_base_inherited, a_healthy_parked_order),
     ("overtaken-release-order", an_overtaken_release_order, a_healthy_pending_order),
     ("killed-validation-panel", a_killed_validation_panel, a_healthy_single_kill),
+    ("mention-held-as-act", a_mention_held_as_act, a_real_high_stakes_hold),
 ]
 
 
@@ -664,10 +686,10 @@ def test_a_database_already_at_version_one_gains_exactly_the_sixth_seed(started,
     try:
         assert again.get_detector(sixth["id"])["gap_class"] == "killed-validation-panel"
         assert again.remedy_rules_for(sixth["id"])
-        assert again.get_state("detectors_seed") == "2"
+        assert again.get_state("detectors_seed") == str(rules.SEED_VERSION)
         assert again.get_detector(retracted["id"])["status"] == rules.RETRACTED, (
             "re-seeding resurrected a detector a person retracted")
-        assert len(again.list_detectors(include_retired=True)) == 6
+        assert len(again.list_detectors(include_retired=True)) == len(rules.seed_rows())
     finally:
         again.close()
 

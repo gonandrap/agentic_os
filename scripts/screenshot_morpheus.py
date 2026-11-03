@@ -34,21 +34,13 @@ def seed() -> None:
         store.update_morpheus_item(item["id"], script=SCRIPT, script_source="agent",
                                    state="monitoring", checks=3, last_exit=75,
                                    last_output="\n".join(f"line {k}: not yet" for k in range(40)))
-    # A usage-window hold, and an offer entry written before the cause was recorded (#1171)
+    # A queued order owed arming, behind the usage-window hold
     pr = morpheus.PullRequestBody(number=9, url="https://github.com/o/r/pull/9",
                                   title="[wo-1234abc9] thing 9",
                                   body="## How to validate in production\nlook\n")
-    waiting = morpheus.enqueue(store, MorpheusConfig(), pr, project="jarvis_os", repo="o/r")
-    morpheus._save_session(store, {"last_turn_kind": "scripts", "turns": 4,
-                                   "usage_hold_until": time.time() + 3600,
-                                   "last_error": "You've hit your session limit · resets 6:20am",
-                                   "offers": {waiting["id"]: {"n": 1, "ts": time.time()}}})
-    # And a kill hold on top of it: both are session-wide holds and can stand at once
-    store.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.1")  # the hold lifts when this tag moves
-    morpheus._save_session(store, {**morpheus.session_state(store),
-                                   "kills": morpheus.MAX_KILLS,
-                                   "kill_hold_until": time.time() + morpheus.KILL_HOLD_SECONDS,
-                                   "kill_hold_release": "jarvis-0.1.1"})
+    morpheus.enqueue(store, MorpheusConfig(), pr, project="jarvis_os", repo="o/r")
+    store.set_state(morpheus.USAGE_HOLD_KEY, str(time.time() + 3600))
+    store.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.1")
     store.close()
 
 

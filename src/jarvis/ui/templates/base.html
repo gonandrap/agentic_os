@@ -409,7 +409,7 @@
       <a href="/gates" class="{{ 'here' if active == 'gates' }}">gates{% if gate_badge %} <span class="nav-badge">{{ gate_badge }}</span>{% endif %}</a>
       <a href="/alarms" class="{{ 'here' if active == 'alarms' }}">alarms{% if alarm_badge %} <span class="nav-badge">{{ alarm_badge }}</span>{% endif %}</a>
       <a href="/stuck" class="{{ 'here' if active == 'stuck' }}">stuck</a>
-      <a href="/morpheus" class="{{ 'here' if active == 'morpheus' }}">morpheus</a>
+      <a href="/mo" class="{{ 'here' if active == 'morpheus' }}">monitors</a>
       <div class="side-group">work</div>
       <a href="/backlog" class="{{ 'here' if active == 'backlog' }}">backlog</a>
       <a href="/knowledge" class="{{ 'here' if active == 'knowledge' }}">knowledge</a>
@@ -517,7 +517,7 @@
       <span class="kbd">Esc</span> close · <span class="kbd">/</span> search ·
       <span class="kbd">g</span> then <span class="kbd">d</span> dashboard, <span class="kbd">i</span> inbox,
       <span class="kbd">n</span> neo, <span class="kbd">g</span> gates, <span class="kbd">a</span> alarms,
-      <span class="kbd">s</span> stuck, <span class="kbd">m</span> morpheus, <span class="kbd">b</span> backlog,
+      <span class="kbd">s</span> stuck, <span class="kbd">m</span> monitors, <span class="kbd">b</span> backlog,
       <span class="kbd">k</span> knowledge, <span class="kbd">c</span> config, <span class="kbd">$</span> cost,
       <span class="kbd">e</span> evolution, <span class="kbd">w</span> steward · <span class="kbd">[</span> <span class="kbd">]</span> previous / next section
     </div>
@@ -795,7 +795,7 @@
   document.querySelectorAll('[data-palette]').forEach(function (b) { b.addEventListener('click', open); });
 
   // 7. Shortcuts — never while typing (assumption 8).
-  var G = { d: '/', i: '/inbox', n: '/neo', g: '/gates', a: '/alarms', s: '/stuck', m: '/morpheus',
+  var G = { d: '/', i: '/inbox', n: '/neo', g: '/gates', a: '/alarms', s: '/stuck', m: '/mo',
             b: '/backlog', k: '/knowledge', c: '/config', $: '/cost', e: '/evolution',
             w: '/steward' };
   var pendingG = 0;

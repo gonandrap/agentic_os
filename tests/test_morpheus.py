@@ -458,6 +458,16 @@ def test_run_script_reads_the_real_exit_code_and_output(tmp_path):
 # -- 5. failed and timed out hand off: Morpheus never diagnoses
 
 
+PROD = Path("/prod")
+
+
+def CONFIRM(prompt, system_prompt=None, **kw):
+    """A judge that confirms the failure"""
+    return claude_cli.HeadlessResult(
+        text=json.dumps({"verdict": "confirm", "reason": "the job errors in the log"}),
+        usage={"input_tokens": 1, "output_tokens": 1}, session_id="s-c", model="sonnet")
+
+
 def _failed(central) -> dict:
     item = monitoring(central)
     central.update_morpheus_item(item["id"], state="failed", resolution="script exited 1",
@@ -468,7 +478,7 @@ def _failed(central) -> dict:
 def test_failed_with_a_work_order_files_an_investigation_once(central):
     item = _failed(central)
     asked = []
-    action = morpheus.act(central, catalog(), item,
+    action = morpheus.act(central, catalog(), item, cwd=PROD, call=CONFIRM,
                           investigate=lambda c, i: ("fo-inv00001", ""),
                           ask_neo=lambda *a: asked.append(1) or 9)
     assert action == "investigation:fo-inv00001" and asked == []
@@ -488,7 +498,7 @@ def test_the_hand_off_states_only_facts(central):
 
 def test_an_investigation_that_cannot_be_filed_asks_neo_instead(central):
     notes = []
-    action = morpheus.act(central, catalog(), _failed(central),
+    action = morpheus.act(central, catalog(), _failed(central), cwd=PROD, call=CONFIRM,
                           investigate=lambda c, i: ("", "the steward said no"),
                           ask_neo=lambda c, i, note: notes.append(note) or 9)
     assert action == "neo:9" and notes == ["the steward said no"]
@@ -499,12 +509,13 @@ def test_timedout_asks_neo_by_default_and_the_route_is_configurable(central):
     central.update_morpheus_item(item["id"], state="timedout")
     filed = []
     assert morpheus.act(central, catalog(), central.morpheus_item(item["id"]),
+                        cwd=PROD, call=CONFIRM,
                         investigate=lambda c, i: filed.append(1) or ("x", ""),
                         ask_neo=lambda *a: 3) == "neo:3"
     assert filed == []
     central.update_morpheus_item(item["id"], action="")
     assert morpheus.act(central, catalog(on_timeout="investigate"),
-                        central.morpheus_item(item["id"]),
+                        central.morpheus_item(item["id"]), cwd=PROD, call=CONFIRM,
                         investigate=lambda c, i: ("fo-x", ""),
                         ask_neo=lambda *a: 3) == "investigation:fo-x"
 
@@ -552,7 +563,7 @@ def test_an_improvement_order_the_steward_refuses_asks_neo(central, monkeypatch)
 
 
 def test_an_improvement_order_is_recorded_as_one_not_as_an_investigation(central):
-    assert morpheus.act(central, catalog(), _failed(central),
+    assert morpheus.act(central, catalog(), _failed(central), cwd=PROD, call=CONFIRM,
                         investigate=lambda c, i: ("io-abcd1234", ""),
                         ask_neo=lambda *a: 9) == "improvement:io-abcd1234"
 
@@ -682,8 +693,8 @@ def test_neo_s_rewrite_verdict_sends_the_script_back_to_morpheus(central):
             after["script_rewrites"]) == ("queued", "", None, "", 1)
     assert "keys on resolution; use state" in after["rewrite_brief"]
     assert "echo old; exit 1" in after["rewrite_brief"]
-    assert [i["id"] for i in morpheus.wanting_scripts(central)] == [item["id"]]
-    assert "A REWRITE" in morpheus.build_prompt([after], {})
+    assert [i["id"] for i in morpheus.owed_arming(central)] == [item["id"]]
+    assert "A REWRITE" in morpheus._arm_prompt(after)
     assert morpheus.set_script(central, item["id"], "exit 0", "agent")["state"] == "monitoring"
 
 
@@ -776,152 +787,39 @@ def test_the_neo_tab_decides_a_validation_question_on_its_item(central):
     item, qid = _escalated(central)
     client = TestClient(create_app())
     page = client.get("/neo")
-    assert f'action="/morpheus/{item["id"]}/waive"' in page.text
-    assert f'action="/morpheus/{item["id"]}/requeue"' in page.text
+    assert f'action="/mo/{item["id"]}/waive"' in page.text
+    assert f'action="/mo/{item["id"]}/requeue"' in page.text
     assert "Send answer to worker" not in page.text
 
-    r = client.post(f"/morpheus/{item['id']}/waive", follow_redirects=False,
+    r = client.post(f"/mo/{item['id']}/waive", follow_redirects=False,
                     data={"reason": " ", "next": "/neo#tab-escalated"})
     assert "error=" in r.headers["location"] and _status(qid) == "escalated"
-    r = client.post(f"/morpheus/{item['id']}/waive", follow_redirects=False,
+    r = client.post(f"/mo/{item['id']}/waive", follow_redirects=False,
                     data={"reason": "works", "next": "/neo#tab-escalated"})
     assert r.headers["location"] == "/neo#tab-escalated"
     assert central.morpheus_item(item["id"])["state"] == "validated"
     assert _status(qid) == "answered"
 
 
-# -- 6. the only LLM: Morpheus's session turns hints into scripts
+# -- 6. arming in a short session (docs/superpowers/specs/2026-11-01-monitoring-orders.md §3)
 
 
-class FakeTurn:
-    def __init__(self, share: float = 0.1, fail: bool = False,
-                 error: BaseException | None = None):
+class FakeCall:
+    """Stands in for claude_cli.run_headless_result: one reply per call, or an error"""
+
+    def __init__(self, reply: object = None, error: BaseException | None = None):
         self.calls: list[dict] = []
-        self.share, self.fail, self.error = share, fail, error
+        self.reply = {"script": "exit 0", "notes": "checks it"} if reply is None else reply
+        self.error = error
 
-    def __call__(self, prompt, session_id, **kw):
-        self.calls.append({"prompt": prompt, "session_id": session_id, **kw})
+    def __call__(self, prompt, system_prompt=None, **kw):
+        self.calls.append({"prompt": prompt, "system_prompt": system_prompt, **kw})
         if self.error is not None:
             raise self.error
-        if self.fail:
-            raise claude_cli.ClaudeCliError("boom")
-        usage = {"context_peak": int(self.share * 200_000), "context_window": 200_000,
-                 "input_tokens": 10, "output_tokens": 5}
-        return claude_cli.HeadlessResult(text="mv-x: checks it", usage=usage,
-                                         session_id=session_id, model="sonnet")
-
-
-def test_no_queued_pr_means_no_turn(central, tmp_path):
-    turn = FakeTurn()
-    monitoring(central)
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn) == "idle"
-    assert turn.calls == []
-
-
-def test_a_queued_pr_wakes_one_turn_that_spawns_subagents(central, tmp_path):
-    turn = FakeTurn()
-    item = queued(central, 2, body("Watch the inbox."))
-    dirs = {"proj_a": tmp_path / "proj_a"}
-    assert morpheus.wake(central, catalog(), tmp_path, dirs=dirs, now=TEST_EPOCH,
-                         call=turn) == "scripts"
-    [call] = turn.calls
-    assert call["resume"] is False and item["id"] in call["prompt"]
-    assert "Watch the inbox." in call["prompt"]
-    assert f"production directory: {tmp_path / 'proj_a'}" in call["prompt"]
-    assert call["add_dirs"] == [tmp_path / "proj_a"]
-    assert "spawn ONE subagent" in call["append_system_prompt"]
-    assert "never diagnose a failure" in call["append_system_prompt"]
-    assert "jarvis morpheus script" in call["append_system_prompt"]
-    assert call["model"] == "sonnet"
-    rows = central.conn.execute("SELECT kind, label FROM agent_calls").fetchall()
-    assert [(r["kind"], r["label"]) for r in rows] == [("morpheus", "scripts")]
-    # Offered once: not again until REOFFER_SECONDS, never past MAX_OFFERS
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60, call=turn) == "idle"
-    for n in range(1, morpheus.MAX_OFFERS):
-        morpheus.wake(central, catalog(), tmp_path,
-                      now=TEST_EPOCH + n * morpheus.REOFFER_SECONDS + 1, call=turn)
-    assert len(turn.calls) == morpheus.MAX_OFFERS
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 10 * DAY,
-                         call=turn) == "idle"
-    assert all(c["session_id"] == call["session_id"] for c in turn.calls)
-    assert all(c["resume"] for c in turn.calls[1:])
-
-
-def test_a_resumed_turn_records_its_own_dollars_not_the_session_total(central, tmp_path):
-    """#1462: the envelope's cost is a session running total; each turn bills its delta"""
-    totals = iter([(47.23, 300_000), (56.59, 360_000)])
-
-    def turn(prompt, session_id, **kw):
-        cost, read = next(totals)
-        envelope = {"session_id": session_id, "total_cost_usd": cost,
-                    "usage": {"input_tokens": 10, "output_tokens": 5},
-                    "modelUsage": {"claude-sonnet-5-5": {
-                        "inputTokens": 100, "outputTokens": 50, "cacheReadInputTokens": read,
-                        "cacheCreationInputTokens": 0, "costUSD": cost}}}
-        usage = claude_cli.derive_turn_usage(envelope, kw.get("previous"))
-        return claude_cli.HeadlessResult(text="ok", usage=usage, session_id=session_id)
-
-    queued(central, 2, body("Watch the inbox."))
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn) == "scripts"
-    assert morpheus.wake(central, catalog(), tmp_path,
-                         now=TEST_EPOCH + morpheus.REOFFER_SECONDS + 1, call=turn) == "scripts"
-    rows = central.conn.execute("SELECT cost_usd FROM agent_calls ORDER BY id").fetchall()
-    assert [round(r["cost_usd"], 2) for r in rows] == [47.23, 9.36]
-
-
-def test_past_the_compact_share_the_next_turn_is_a_compaction(central, tmp_path):
-    turn = FakeTurn(share=0.31)
-    queued(central, 2)
-    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn)
-    assert morpheus.session_state(central)["compact_due"] is True
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60,
-                         call=turn) == "compact"
-    assert turn.calls[-1]["prompt"] == claude_cli.COMPACT_PROMPT and turn.calls[-1]["resume"]
-    state = morpheus.session_state(central)
-    assert state["compactions"] == 1 and state["compact_due"] is False
-
-
-def test_under_the_share_nothing_compacts(central, tmp_path):
-    turn = FakeTurn(share=0.29)
-    queued(central, 2)
-    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn)
-    assert morpheus.session_state(central)["compact_due"] is False
-
-
-def test_a_pause_stops_the_session_and_nothing_else(central, tmp_path):
-    turn = FakeTurn()
-    queued(central, 2)
-    assert morpheus.wake(central, catalog(), tmp_path, paused=True, now=TEST_EPOCH,
-                         call=turn) == "paused"
-    assert turn.calls == []
-
-
-def test_a_failed_turn_is_recorded_and_still_counts_as_an_offer(central, tmp_path):
-    turn = FakeTurn(fail=True)
-    queued(central, 2)
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn) == "error"
-    state = morpheus.session_state(central)
-    assert state["last_error"] == "boom" and state["errors"] == 1
-    # The CLI may have half-created the session: the next first turn mints a fresh id
-    assert "session_id" not in state
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60, call=turn) == "idle"
-
-
-def test_a_turn_killed_before_it_answered_costs_no_offer(central, tmp_path):
-    """The release restart SIGTERMs the turn it just enqueued work for (#1161)"""
-    killed = claude_cli.KilledError(claude_cli.Killed(
-        message="claude -p --output-format json... was killed by a signal (rc=143) "
-                "and wrote nothing", rc=143))
-    turn = FakeTurn(error=killed)
-    queued(central, 2)
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn) == "killed"
-    state = morpheus.session_state(central)
-    assert state["kills"] == 1 and "rc=143" in state["last_error"]
-    assert not state.get("offers") and not state.get("errors")
-    # The next pass after the restart offers it again at once, not in REOFFER_SECONDS
-    turn.error = None
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 10,
-                         call=turn) == "scripts"
+        text = self.reply if isinstance(self.reply, str) else json.dumps(self.reply)
+        return claude_cli.HeadlessResult(
+            text=text, usage={"input_tokens": 10, "output_tokens": 5},
+            session_id=f"s-{len(self.calls)}", model="sonnet")
 
 
 def sigkilled(rc: int = 143) -> "claude_cli.KilledError":
@@ -930,223 +828,425 @@ def sigkilled(rc: int = 143) -> "claude_cli.KilledError":
                 "and wrote nothing", rc=rc))
 
 
-def kill_until_held(central, tmp_path, *, now: float = TEST_EPOCH) -> str:
-    """MAX_KILLS kills in a row, each its own pass; returns the last pass's verdict"""
-    turn = FakeTurn(error=sigkilled())
-    verdict = ""
-    for n in range(morpheus.MAX_KILLS):
-        verdict = morpheus.wake(central, catalog(), tmp_path, now=now + n, call=turn)
-    return verdict
-
-
-def test_consecutive_kills_hold_the_session_instead_of_retrying_every_wake(central, tmp_path):
-    queued(central, 2)
-    assert kill_until_held(central, tmp_path) == "killed"
-    state = morpheus.session_state(central)
-    assert state["kills"] == morpheus.MAX_KILLS
-    assert state["kill_hold_until"] == TEST_EPOCH + 2 + morpheus.KILL_HOLD_SECONDS
-    assert f"held after {morpheus.MAX_KILLS} killed turns in a row" in state["last_error"]
-    # Not one further turn is attempted while the hold stands
-    turn = FakeTurn()
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60,
-                         call=turn) == "kill_held"
-    assert turn.calls == []
-    act = morpheus.activity(central, now=TEST_EPOCH + 60)
-    assert act["kill_hold_until"] == state["kill_hold_until"]
-    assert act["kills"] == morpheus.MAX_KILLS and act["max_kills"] == morpheus.MAX_KILLS
-    # And the user is told, not left with nothing happening
-    titles = [i["title"] for i in central.unacked_inbox("warning")]
-    assert f"Morpheus held after {morpheus.MAX_KILLS} killed turns in a row" in titles
-    # The hold expires: one retry, and it holds again if that one dies too
-    assert morpheus.wake(central, catalog(), tmp_path,
-                         now=TEST_EPOCH + morpheus.KILL_HOLD_SECONDS + 3,
-                         call=turn) == "scripts"
-
-
-def test_an_answered_turn_resets_the_kill_counter(central, tmp_path):
-    queued(central, 2)
-    killer = FakeTurn(error=sigkilled())
-    for n in range(morpheus.MAX_KILLS - 1):
-        assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + n,
-                             call=killer) == "killed"
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 10,
-                         call=FakeTurn()) == "scripts"
-    assert morpheus.session_state(central)["kills"] == 0
-    # So the next kill starts counting from one again: no hold
-    queued(central, 3)
-    assert morpheus.wake(central, catalog(), tmp_path,
-                         now=TEST_EPOCH + morpheus.REOFFER_SECONDS, call=killer) == "killed"
-    state = morpheus.session_state(central)
-    assert state["kills"] == 1 and "kill_hold_until" not in state
-
-
-def test_a_new_release_lifts_the_kill_hold(central, tmp_path):
-    """A release restart is both the usual cause of the kills and the usual fix (#1161)"""
-    central.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.1")
-    queued(central, 2)
-    kill_until_held(central, tmp_path)
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60,
-                         call=FakeTurn()) == "kill_held"
-    central.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.2")
-    turn = FakeTurn()
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 120,
-                         call=turn) == "scripts"
-    assert len(turn.calls) == 1
-    assert morpheus.activity(central, now=TEST_EPOCH + 120)["kill_hold_until"] is None
-
-
-def test_a_release_lifted_hold_starts_the_kill_count_again(central, tmp_path):
-    """Decision #52 of 2026-10-22: one restart after the release must not re-arm the hold"""
-    central.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.1")
-    queued(central, 2)
-    kill_until_held(central, tmp_path)
-    central.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.2")
-    # Lifted on a pass with nothing to do: the reset is kept all the same
-    for item in central.morpheus_items():
-        central.update_morpheus_item(item["id"], state="validated")
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60,
-                         call=FakeTurn()) == "idle"
-    assert morpheus.session_state(central)["kills"] == 0
-    queued(central, 3)
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 120,
-                         call=FakeTurn(error=sigkilled())) == "killed"
-    state = morpheus.session_state(central)
-    assert state["kills"] == 1 and "kill_hold_until" not in state
-
-
-def test_the_status_line_says_the_session_is_held_after_the_kills(central, tmp_path, capsys,
-                                                                  clock):
-    from jarvis.cli import main
-
-    queued(central, 2)
-    kill_until_held(central, tmp_path, now=db.now())
-    assert main(["morpheus", "status"]) == 0
-    out = capsys.readouterr().out
-    assert "held until" in out and f"({morpheus.MAX_KILLS} killed turns in a row)" in out
-    assert "or the next release" in out
-
-
 def refused(reset_at: float | None) -> "claude_cli.UsageLimitError":
     return claude_cli.UsageLimitError(claude_cli.UsageLimit(
         message="You've hit your session limit · resets 6:20am (America/Los_Angeles)",
         reset_at=reset_at))
 
 
-def test_a_turn_refused_by_the_usage_window_costs_no_offer_and_waits_for_the_reset(central,
-                                                                                   tmp_path):
-    """The model never answered: the same class as a kill (#1171)"""
+def test_no_queued_order_means_no_session(central, tmp_path):
+    call = FakeCall()
+    monitoring(central)
+    assert morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=call) == \
+        {"armed": 0, "refused": 0, "failed": 0, "killed": 0}
+    assert call.calls == []
+
+
+def test_a_release_of_three_beside_fifteen_monitoring_makes_exactly_three_calls(central,
+                                                                                tmp_path):
+    watched = {}
+    for n in range(100, 115):
+        watched[monitoring(central, script=f"exit 75 # {n}", n=n)["id"]] = f"exit 75 # {n}"
+    new = [queued(central, n, body(f"Watch hint {n}."), project="proj_b",
+                  now=TEST_EPOCH + n) for n in (1, 2, 3)]
+    call = FakeCall()
+    dirs = {"proj_b": tmp_path / "proj_b"}
+    assert morpheus.arm(central, catalog(), lambda i: dirs[i["project"]], now=TEST_EPOCH + 9,
+                        call=call)["armed"] == 3
+    assert len(call.calls) == 3
+    # Oldest first, each a fresh call that keeps its transcript, built only from its row
+    for c, item in zip(call.calls, new):
+        assert c["persist"] is True and c["tools"] == morpheus.SESSION_TOOLS
+        assert c["cwd"] == tmp_path / "proj_b" and c["model"] == "sonnet"
+        assert c["system_prompt"] == morpheus.MORPHEUS_PERSONA
+        assert item["id"] in c["prompt"] and item["pr_url"] in c["prompt"]
+        assert f"Watch hint {item['pr_number']}." in c["prompt"]
+        assert "exits 1 ONLY" in c["prompt"] and "exits 75" in c["prompt"]
+        assert not any(o["id"] in c["prompt"] for o in new if o is not item)
+        assert "resume" not in c and "session_id" not in c
+    for item_id, script in watched.items():
+        assert central.morpheus_item(item_id)["script"] == script
+    for n, item in enumerate(new, 1):
+        after = central.morpheus_item(item["id"])
+        assert (after["state"], after["script"], after["script_source"], after["attempts"],
+                after["last_session_id"]) == ("monitoring", "exit 0", "agent", 0, f"s-{n}")
+    rows = central.conn.execute(
+        "SELECT kind, label, wo_id, project FROM agent_calls ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [("morpheus", "arm", i["id"], "proj_b") for i in new]
+
+
+@pytest.mark.parametrize("call", [FakeCall(reply="I wrote it to /tmp, done."),
+                                  FakeCall(error=claude_cli.ClaudeCliError("boom"))],
+                         ids=["unparseable", "cli-error"])
+def test_a_session_with_no_answer_spends_one_attempt_and_changes_no_state(central, tmp_path,
+                                                                          call):
+    item = queued(central, 2)
+    assert morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=call)["failed"] == 1
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["script"], after["attempts"], after["last_attempt_ts"]) == \
+        ("queued", "", 1, TEST_EPOCH)
+    # Not again until REOFFER_SECONDS, and never past MAX_OFFERS
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH + 60, call=call)
+    assert len(call.calls) == 1
+    for n in range(1, morpheus.MAX_OFFERS + 2):
+        morpheus.arm(central, catalog(), tmp_path, call=call,
+                     now=TEST_EPOCH + n * (morpheus.REOFFER_SECONDS + 1))
+    assert len(call.calls) == morpheus.MAX_OFFERS
+    assert central.morpheus_item(item["id"])["attempts"] == morpheus.MAX_OFFERS
+    assert morpheus.activity(central, now=TEST_EPOCH + 10 * DAY)["owed_arm"] == 0
+
+
+def test_a_refusal_spends_an_attempt_and_says_why(central, tmp_path):
+    item = queued(central, 2)
+    call = FakeCall(reply={"refuse": "the hints name no production signal"})
+    assert morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=call)["refused"] == 1
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["attempts"]) == ("queued", 1)
+    assert "the hints name no production signal" in after["resolution"]
+
+
+def test_the_usage_window_holds_every_order_and_costs_none_an_attempt(central, tmp_path):
+    first, second = queued(central, 2, now=TEST_EPOCH), queued(central, 3, now=TEST_EPOCH + 1)
     reset_at = TEST_EPOCH + 4000
-    turn = FakeTurn(error=refused(reset_at))
-    queued(central, 2)
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH,
-                         call=turn) == "usage_limit"
-    state = morpheus.session_state(central)
-    assert state["usage_limits"] == 1 and state["usage_hold_until"] == reset_at
-    assert not state.get("offers") and not state.get("errors")
-    assert morpheus.activity(central, now=TEST_EPOCH + 60)["usage_hold_until"] == reset_at
-    # Not one turn is attempted while the window is spent, whatever is queued
-    turn.error = None
-    assert morpheus.wake(central, catalog(), tmp_path, now=reset_at - 1,
-                         call=turn) == "usage_held"
-    assert len(turn.calls) == 1
-    # The first pass after the reset offers the same batch again
-    assert morpheus.wake(central, catalog(), tmp_path, now=reset_at, call=turn) == "scripts"
-    assert len(turn.calls) == 2
-    assert morpheus.activity(central, now=reset_at)["usage_hold_until"] is None
+    call = FakeCall(error=refused(reset_at))
+    assert morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=call) == \
+        {"armed": 0, "refused": 0, "failed": 0, "killed": 0, "usage_held": 1}
+    # The second order was never tried: the window is the account's
+    assert len(call.calls) == 1
+    assert all(central.morpheus_item(i["id"])["attempts"] == 0 for i in (first, second))
+    assert morpheus.usage_hold_until(central, TEST_EPOCH) == reset_at
+    act = morpheus.activity(central, now=TEST_EPOCH + 60)
+    assert (act["state"], act["usage_hold_until"]) == ("usage_held", reset_at)
+    call.error = None
+    assert morpheus.arm(central, catalog(), tmp_path, now=reset_at - 1, call=call) == \
+        {"usage_held": 1}
+    assert len(call.calls) == 1
+    assert morpheus.arm(central, catalog(), tmp_path, now=reset_at, call=call)["armed"] == 2
 
 
 def test_a_refusal_that_named_no_reset_holds_for_the_fallback_delay(central, tmp_path):
     from jarvis.worker_session import RATE_LIMIT_FALLBACK_DELAY
 
     queued(central, 2)
-    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeTurn(error=refused(None)))
-    state = morpheus.session_state(central)
-    assert state["usage_hold_until"] == TEST_EPOCH + RATE_LIMIT_FALLBACK_DELAY
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeCall(error=refused(None)))
+    hold = morpheus.usage_hold_until(central, TEST_EPOCH)
+    assert hold is not None and hold >= TEST_EPOCH + RATE_LIMIT_FALLBACK_DELAY - 5
 
 
-def test_the_status_line_says_the_session_is_held_by_the_usage_window(central, tmp_path, capsys,
-                                                                     clock):
-    from jarvis.cli import main
+def test_kills_cost_no_attempt_until_max_kills_in_a_row_cost_one(central, tmp_path):
+    """kn-1e43fe1a: the exemption has its own bound, so a deterministic kill still ends"""
+    item = queued(central, 2)
+    killer = FakeCall(error=sigkilled())
+    for n in range(morpheus.MAX_KILLS - 1):
+        assert morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH + n,
+                            call=killer)["killed"] == 1
+    after = central.morpheus_item(item["id"])
+    assert (after["kills"], after["attempts"]) == (morpheus.MAX_KILLS - 1, 0)
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH + 10, call=killer)
+    after = central.morpheus_item(item["id"])
+    assert (after["kills"], after["attempts"], after["last_attempt_ts"]) == \
+        (0, 1, TEST_EPOCH + 10)
+    # Spent: no retry until REOFFER_SECONDS
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH + 20, call=killer)
+    assert len(killer.calls) == morpheus.MAX_KILLS
+
+
+def test_an_answered_session_resets_the_kill_count(central, tmp_path):
+    item = queued(central, 2)
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeCall(error=sigkilled()))
+    assert central.morpheus_item(item["id"])["kills"] == 1
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH + 1, call=FakeCall())
+    after = central.morpheus_item(item["id"])
+    assert (after["kills"], after["state"]) == (0, "monitoring")
+
+
+@pytest.mark.parametrize("pause", ["pin", "fleet"])
+def test_a_pause_stops_arming_and_nothing_else(central, tmp_path, pause):
+    from jarvis import fleet
 
     queued(central, 2)
-    morpheus.wake(central, catalog(), tmp_path, now=db.now(),
-                  call=FakeTurn(error=refused(db.now() + 4000)))
-    assert main(["morpheus", "status"]) == 0
-    out = capsys.readouterr().out
-    assert "(usage limit)" in out and "held until" in out
+    if pause == "pin":
+        morpheus.set_pause(central, "paused", "quiet", now=TEST_EPOCH)
+    else:
+        fleet.pause(central, reason="spend")
+    call = FakeCall()
+    assert morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=call) == {"paused": 1}
+    assert call.calls == []
+    assert morpheus.activity(central, now=TEST_EPOCH)["state"] == "paused"
+    if pause == "fleet":
+        morpheus.set_pause(central, "running", "validate the release", now=TEST_EPOCH)
+        assert morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH,
+                            call=call)["armed"] == 1
 
 
-# -- 6b. the surfaces say what the session is DOING, not only what it is allowed to do (#1162)
+def test_a_user_script_returned_unchanged_stays_the_users(central, tmp_path):
+    item = queued(central, 2)
+    central.update_morpheus_item(item["id"], script="exit 0", script_source="user")
+    call = FakeCall(reply={"script": "exit 0\n", "notes": "fine"})
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=call)
+    assert "The user wrote this script" in call.calls[0]["prompt"]
+    assert central.morpheus_item(item["id"])["script_source"] == "user"
+    other = queued(central, 3)
+    central.update_morpheus_item(other["id"], script="exit 1", script_source="user")
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=call)
+    assert central.morpheus_item(other["id"])["script_source"] == "agent"
 
 
-def test_a_turn_in_flight_is_visible_while_it_runs_and_gone_after(central, tmp_path):
+def test_a_rewrite_requeues_with_a_fresh_count_and_keeps_a_users_script(central, cfg, tmp_path):
+    item = monitoring(central, script="exit 1")
+    central.update_morpheus_item(item["id"], script_source="user", state="failed", attempts=2,
+                                 kills=1, last_attempt_ts=TEST_EPOCH)
+    after = morpheus.rewrite(central, cfg, item["id"], "reads the wrong field")
+    assert (after["state"], after["script"], after["script_source"], after["attempts"],
+            after["kills"], after["last_attempt_ts"]) == ("queued", "exit 1", "user", 0, 0, None)
+    call = FakeCall(reply={"script": "exit 0", "notes": "fixed"})
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=call)
+    assert "A REWRITE" in call.calls[0]["prompt"] and "reads the wrong field" in \
+        call.calls[0]["prompt"]
+    assert central.morpheus_item(item["id"])["state"] == "monitoring"
+
+
+def test_the_first_pass_drops_the_long_lived_sessions_record(central, tmp_path):
+    central.set_state("morpheus.session", json.dumps({"turns": 9}))
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeCall())
+    assert not central.get_state("morpheus.session")
+
+
+def test_an_unknown_purpose_is_refused_before_any_call(central, tmp_path):
+    call = FakeCall()
+    with pytest.raises(ValueError, match="no session purpose"):
+        morpheus.run_session(central, catalog(), queued(central, 2), purpose="nope",
+                             cwd=tmp_path, call=call)
+    assert call.calls == []
+
+
+def test_the_long_lived_session_is_gone():
+    """Grep pin: nothing resumes a Morpheus session any more"""
+    assert not hasattr(claude_cli, "run_session_turn")
+    for name in ("SESSION_KEY", "wake", "session_state", "wanting_scripts", "build_prompt",
+                 "kill_hold", "KILL_HOLD_SECONDS"):
+        assert not hasattr(morpheus, name), name
+    src = REPO_ROOT / "src" / "jarvis"
+    assert not [p for p in src.rglob("*.py") if "run_session_turn" in p.read_text()]
+
+
+# -- 7. judging a failure in a short session (docs/superpowers/specs/2026-11-01-monitoring-orders.md §4)
+
+
+def _judge(central, item, call, **kw) -> str:
+    asked = kw.pop("asked", [])
+    return morpheus.act(central, kw.pop("catalog", catalog()), item, cwd=PROD, call=call,
+                        now=kw.pop("now", TEST_EPOCH),
+                        investigate=kw.pop("investigate", lambda c, i: ("fo-inv00001", "")),
+                        ask_neo=lambda c, i, note: asked.append((i, note)) or 9)
+
+
+def test_a_rewrite_sets_the_judges_script_and_watches_again(central):
+    item = _failed(central)
+    central.add_morpheus_run(item["id"], exit=1, output="FAIL the job errored", now=TEST_EPOCH)
+    call = FakeCall(reply={"verdict": "rewrite", "reason": "keys on the wrong field",
+                           "script": "exit 0"})
+    assert _judge(central, central.morpheus_item(item["id"]), call) == "rewrite"
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["script"], after["script_source"], after["script_rewrites"],
+            after["action"], after["attempts"]) == ("monitoring", "exit 0", "agent", 1, "", 0)
+    assert after["deadline_ts"] == TEST_EPOCH + 3 * DAY and after["next_check_ts"] == TEST_EPOCH
+    # Built from the row: its script, its runs, its counters
+    prompt = call.calls[0]["prompt"]
+    assert "exit 75" in prompt and "FAIL the job errored" in prompt
+    assert "script exited 1" in prompt and "Script rewrites so far: 0 of 1" in prompt
+    assert call.calls[0]["persist"] is True and call.calls[0]["cwd"] == PROD
+    # No arming session follows: the row is not queued
+    assert morpheus.owed_arming(central, now=TEST_EPOCH + 10 * DAY) == []
+    [row] = central.conn.execute("SELECT label, wo_id FROM agent_calls").fetchall()
+    assert tuple(row) == ("judge", item["id"])
+
+
+def test_a_rewrite_at_the_cap_escalates_and_keeps_the_script(central):
+    item = _failed(central)
+    assert central.claim_morpheus_script_rewrite(item["id"], morpheus.MAX_SCRIPT_REWRITES)
+    asked = []
+    call = FakeCall(reply={"verdict": "rewrite", "reason": "wrong", "script": "exit 0"})
+    assert _judge(central, central.morpheus_item(item["id"]), call, asked=asked) == "neo:9"
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["script"], after["action"]) == ("failed", "exit 75", "neo:9")
+    assert "rewrite(s) are spent" in asked[0][1]
+
+
+def test_confirm_hands_off_with_the_judges_reading_marked_as_one(central):
+    item = _failed(central)
+    seen = []
+    action = _judge(central, item, CONFIRM,
+                    investigate=lambda c, i: seen.append(morpheus._why(i)) or ("fo-inv00001", ""))
+    assert action == "investigation:fo-inv00001"
+    assert central.morpheus_item(item["id"])["action"] == action
+    assert "reading — NOT a diagnosis:\nthe job errors in the log" in seen[0]
+
+
+def test_escalate_asks_neo_with_the_judges_reason(central):
+    item = _failed(central)
+    asked = []
+    call = FakeCall(reply={"verdict": "escalate", "reason": "production is half deployed"})
+    assert _judge(central, item, call, asked=asked) == "neo:9"
+    assert asked[0][0]["judge_reason"] == "production is half deployed" and asked[0][1] == ""
+    assert central.morpheus_item(item["id"])["action"] == "neo:9"
+
+
+def test_a_confirm_with_no_pull_request_escalates(central):
+    order = morpheus.create(central, project="proj_a", title="the nightly job", prompt="it runs")
+    central.update_morpheus_item(order["id"], state="failed", resolution="script exited 1",
+                                 script="exit 1", script_source="agent", last_exit=1)
+    filed, asked = [], []
+    assert _judge(central, central.morpheus_item(order["id"]), CONFIRM, asked=asked,
+                  investigate=lambda c, i: filed.append(1) or ("x", "")) == "neo:9"
+    assert filed == [] and "no pull request" in asked[0][1]
+    assert "Monitoring order" in morpheus._why(asked[0][0])
+
+
+@pytest.mark.parametrize("call", [FakeCall(reply="no JSON here"), FakeCall(error=sigkilled()),
+                                  FakeCall(error=claude_cli.ClaudeCliError("timed out"))],
+                         ids=["unparseable", "killed", "timeout"])
+def test_a_judge_that_fails_releases_its_claim_then_escalates_without_a_verdict(central, call):
+    item = _failed(central)
+    asked = []
+    for n in range(1, morpheus.MAX_OFFERS):
+        assert _judge(central, central.morpheus_item(item["id"]), call, asked=asked) == ""
+        after = central.morpheus_item(item["id"])
+        assert (after["action"], after["attempts"], after["state"]) == ("", n, "failed")
+    assert asked == []
+    assert _judge(central, central.morpheus_item(item["id"]), call, asked=asked) == "neo:9"
+    assert len(call.calls) == morpheus.MAX_OFFERS
+    [(seen, note)] = asked
+    assert "could not judge it" in note and "judge_reason" not in seen
+
+
+def test_a_pre_claimed_order_gets_no_session(central):
+    item = _failed(central)
+    central.claim_morpheus_action(item["id"], "judge:1")
+    call = FakeCall()
+    assert morpheus.owed_actions(central) == []
+    assert _judge(central, item, call) == "" and call.calls == []
+    assert central.morpheus_item(item["id"])["action"] == "judge:1"
+
+
+@pytest.mark.parametrize("state", ["cancelled", "validated"])
+def test_a_settled_order_is_never_judged(central, state):
+    item = _failed(central)
+    central.update_morpheus_item(item["id"], state=state, action="")
+    call = FakeCall()
+    assert morpheus.owed_actions(central) == []
+    assert _judge(central, central.morpheus_item(item["id"]), call) == "" and call.calls == []
+
+
+def test_the_brake_and_the_usage_window_hold_judging_and_spend_nothing(central):
+    item = _failed(central)
+    morpheus.set_pause(central, "paused", "quiet", now=TEST_EPOCH)
+    call = FakeCall()
+    assert _judge(central, item, call) == "" and call.calls == []
+    morpheus.set_pause(central, "running", "go", now=TEST_EPOCH)
+    call = FakeCall(error=refused(TEST_EPOCH + 4000))
+    assert _judge(central, item, call) == "usage_held"
+    after = central.morpheus_item(item["id"])
+    assert (after["action"], after["attempts"]) == ("", 0)
+    assert _judge(central, after, call) == "" and len(call.calls) == 1
+
+
+def test_a_hand_off_that_crashes_gives_its_claim_back(central):
+    item = _failed(central)
+
+    def boom(c, i):
+        raise RuntimeError("steward down")
+
+    with pytest.raises(RuntimeError):
+        _judge(central, item, CONFIRM, investigate=boom)
+    assert central.morpheus_item(item["id"])["action"] == ""
+
+
+def test_a_stale_judging_claim_trips_the_invariant_and_is_cleared(central, monkeypatch):
+    from jarvis import invariants
+
+    item = _failed(central)
+    central.claim_morpheus_action(item["id"], "judge:1")
+    claimed = central.morpheus_item(item["id"])["action_ts"]
+    stale = MorpheusConfig().turn_timeout_seconds * 3
+    monkeypatch.setattr("jarvis.db.now", lambda: claimed + stale - 1)
+    assert list(invariants.check_morpheus_moves(repair=True)) == []
+    monkeypatch.setattr("jarvis.db.now", lambda: claimed + stale + 1)
+    [v] = list(invariants.check_morpheus_moves(repair=True))
+    assert v.invariant == "INV-MORPHEUS-OVERDUE" and v.repaired and "judging claim" in v.detail
+    assert central.morpheus_item(item["id"])["action"] == ""
+    assert invariants.check_morpheus_moves in invariants.OS_REPAIRABLE
+
+
+def test_a_held_brake_is_not_an_overdue_action(central, monkeypatch):
+    from jarvis import invariants
+
+    item = _failed(central)
+    morpheus.set_pause(central, "paused", "quiet", now=TEST_EPOCH)
+    monkeypatch.setattr("jarvis.db.now",
+                        lambda: float(central.morpheus_item(item["id"])["updated_ts"]) + 2 * 3600)
+    assert list(invariants.check_morpheus_moves()) == []
+    morpheus.set_pause(central, "running", "go", now=TEST_EPOCH)
+    assert [v.invariant for v in invariants.check_morpheus_moves()] == ["INV-MORPHEUS-OVERDUE"]
+
+
+@pytest.mark.parametrize("persist", [True, False])
+def test_persist_alone_decides_whether_the_transcript_is_kept(monkeypatch, persist):
     seen = {}
 
-    def turn(prompt, session_id, **kw):
-        seen["activity"] = morpheus.activity(central, now=TEST_EPOCH + 5)
-        return claude_cli.HeadlessResult(text="ok", usage={}, session_id=session_id,
-                                         model="sonnet")
+    def fake_run(args, **kw):
+        seen["args"] = list(args)
+        return json.dumps({"result": "{}", "session_id": "s-1"})
 
+    monkeypatch.setattr(claude_cli, "_run", fake_run)
+    claude_cli.run_headless_result("hi", persist=persist)
+    assert ("--no-session-persistence" in seen["args"]) is (not persist)
+    assert "--output-format" in seen["args"]
+
+
+# -- 6b. the surfaces say what Morpheus is DOING, from the rows (#1162, monitoring-orders §1.3)
+
+
+def test_the_report_has_no_session_and_activity_has_the_contract_shape(central):
     queued(central, 2)
-    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn)
-    assert seen["activity"]["turn_in_flight"] is True
-    assert seen["activity"]["turn_started_ts"] == TEST_EPOCH
-    after = morpheus.activity(central, now=TEST_EPOCH + 10)
-    assert after["turn_in_flight"] is False and after["abandoned_turn_ts"] is None
+    rep = morpheus.report(central, catalog())
+    assert set(rep) == {"enabled", "counts", "paused", "pause", "activity", "last_release",
+                        "items"}
+    assert rep["activity"] == {"state": "arming", "owed_arm": 1, "owed_judge": 0,
+                               "usage_hold_until": None, "max_offers": morpheus.MAX_OFFERS}
 
 
-def test_a_turn_marker_older_than_the_timeout_is_a_crash_not_work_in_flight(central, tmp_path):
-    queued(central, 2)
-    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeTurn(fail=True))
-    central.set_state(morpheus.SESSION_KEY, json.dumps(
-        {**morpheus.session_state(central), "turn_started_ts": TEST_EPOCH}))
-    act = morpheus.activity(central, timeout=900, now=TEST_EPOCH + 901)
-    assert act["turn_in_flight"] is False and act["abandoned_turn_ts"] == TEST_EPOCH
-
-
-def test_a_queued_item_in_the_reoffer_backoff_says_when_and_why(central, tmp_path):
-    item = queued(central, 2)
-    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeTurn(fail=True))
-    act = morpheus.activity(central, now=TEST_EPOCH + 60)
-    assert act["due"] == 0 and act["turn_in_flight"] is False
-    assert act["held"] == [{"id": item["id"], "offers": 1, "exhausted": False,
-                            "cause": "error",
-                            "next_offer_ts": TEST_EPOCH + morpheus.REOFFER_SECONDS}]
-    for n in range(1, morpheus.MAX_OFFERS):
-        morpheus.wake(central, catalog(), tmp_path, call=FakeTurn(fail=True),
-                      now=TEST_EPOCH + n * morpheus.REOFFER_SECONDS + 1)
-    spent = morpheus.activity(central, now=TEST_EPOCH + 10 * DAY)["held"]
-    assert spent == [{"id": item["id"], "offers": morpheus.MAX_OFFERS, "exhausted": True,
-                      "cause": "error", "next_offer_ts": None}]
-
-
-def test_an_offer_entry_written_before_the_cause_was_recorded_claims_no_cause(central, capsys,
-                                                                             clock):
-    """Pre-#1161 entries were killed turns rendered as 'after an offer'"""
-    from jarvis.cli import main
-
-    item = queued(central, 2)
-    central.set_state(morpheus.SESSION_KEY, json.dumps(
-        {"offers": {item["id"]: {"n": 1, "ts": db.now()}}}))
-    assert morpheus.activity(central, now=db.now() + 60)["held"][0]["cause"] is None
-    assert main(["morpheus", "status"]) == 0
-    out = capsys.readouterr().out
-    assert "held back until" in out and "after an offer" not in out
+def test_activity_reads_judging_then_idle_from_the_rows(central):
+    item = _failed(central)
+    assert morpheus.activity(central)["state"] == "judging"
+    central.claim_morpheus_action(item["id"], "neo:1")
+    assert morpheus.activity(central)["state"] == "idle"
 
 
 def test_the_status_line_separates_the_pause_mode_from_the_activity(central, tmp_path, capsys,
                                                                     clock):
     from jarvis.cli import main
 
-    item = queued(central, 2)
+    queued(central, 2)
     assert main(["morpheus", "status"]) == 0
     out = capsys.readouterr().out
-    assert "unpaused (follows the fleet) · idle · 1 queued due now" in out
-    assert "running (follows the fleet" not in out
-    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeTurn(fail=True))
+    assert "unpaused (follows the fleet) · arming · 1 owed arming" in out
+    morpheus.arm(central, catalog(), tmp_path, now=db.now(),
+                 call=FakeCall(error=refused(db.now() + 4000)))
     assert main(["morpheus", "status"]) == 0
-    assert f"{item['id']} offered 1 of 3: held back after a failed turn until" \
-        in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "usage_held" in out and "(usage limit)" in out and "held until" in out
+
+
+def test_the_dashboard_renders_without_a_session(central):
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    queued(central, 2)
+    page = TestClient(create_app()).get("/mo")
+    assert page.status_code == 200
+    assert "1 owed arming" in page.text and "compaction" not in page.text
 
 
 # -- 7. enforcing the section, in every project
@@ -1249,11 +1349,19 @@ def test_the_daemon_pass_runs_each_check_in_its_project_and_hands_off(
     bad = monitoring(central, n=2, script="exit 1", title="no wo")
     central.update_morpheus_item(bad["id"], last_exit=1)  # its first exit 1 is behind it
     monkeypatch.setattr(morpheus, "_ask_neo", lambda c, i, note="": 42)
+    judged = []
+
+    def judge(central, catalog, item, *, purpose, cwd, call=None):
+        judged.append((item["id"], purpose, cwd))
+        return {"verdict": "escalate", "reason": "cannot tell"}
+
+    monkeypatch.setattr(morpheus, "run_session", judge)
     daemon._morpheus_pass()
     assert central.morpheus_item(good["id"])["state"] == "validated"
     assert (project / "ran-here").read_text().strip() == str(project)
     after = central.morpheus_item(bad["id"])
     assert after["state"] == "failed" and after["action"] == "neo:42"
+    assert judged == [(bad["id"], "judge", project)]
 
 
 def test_cli_status_and_script(central, tmp_path, capsys):
@@ -1289,7 +1397,7 @@ def test_the_dashboard_shows_a_link_not_the_pr_s_text(central):
     from jarvis.ui.app import create_app
 
     item = _failed(central)
-    page = TestClient(create_app()).get("/morpheus")
+    page = TestClient(create_app()).get("/mo")
     assert page.status_code == 200
     assert '<a href="https://github.com/o/r/pull/7" title="[wo-1234abcd] thing">#7</a>' \
         in page.text
@@ -1344,8 +1452,8 @@ def test_the_dashboard_links_each_item_s_id_to_its_detail(central):
 
     item = _failed(central)
     morpheus.set_pause(central, "running", "validate the release", now=TEST_EPOCH)
-    page = TestClient(create_app()).get("/morpheus")
-    assert f'<a class="rowid" href="/morpheus/{item["id"]}">{item["id"]}</a>' in page.text
+    page = TestClient(create_app()).get("/mo")
+    assert f'<a class="rowid" href="/mo/{item["id"]}">{item["id"]}</a>' in page.text
     assert "jarvis morpheus unpause" in page.text and "validate the release" in page.text
 
 
@@ -1357,12 +1465,12 @@ def test_the_dashboard_shows_the_activity_and_its_backoff_not_only_the_pause_mod
     from jarvis.ui.app import create_app
 
     item = queued(central, 2)
-    morpheus.wake(central, catalog(), tmp_path, now=db.now(),
-                  call=FakeTurn(error=refused(db.now() + 4000)))
-    page = TestClient(create_app()).get("/morpheus").text
+    morpheus.arm(central, catalog(), tmp_path, now=db.now(),
+                 call=FakeCall(error=refused(db.now() + 4000)))
+    page = TestClient(create_app()).get("/mo").text
     assert "unpaused (follows the fleet)" in page and "(usage limit)" in page
-    # Nothing was offered, so the item is not held back on its own account
-    assert f"{item['id']} offered" not in page
+    # The refusal cost the order nothing
+    assert central.morpheus_item(item["id"])["attempts"] == 0
 
 
 def test_check_and_output_live_on_the_detail_not_in_the_list(central):
@@ -1373,8 +1481,8 @@ def test_check_and_output_live_on_the_detail_not_in_the_list(central):
     item = _failed(central)
     central.update_morpheus_item(item["id"], last_output="boom <x>")
     client = TestClient(create_app())
-    assert "boom" not in client.get("/morpheus").text
-    page = client.get(f"/morpheus/{item['id']}").text
+    assert "boom" not in client.get("/mo").text
+    page = client.get(f"/mo/{item['id']}").text
     assert "boom &lt;x&gt;" in page and 'id="tab-output"' in page
     assert item["script"] in page and 'id="tab-script"' in page
 
@@ -1388,12 +1496,12 @@ def test_the_list_filters_by_state_and_puts_failures_first(central):
     later = queued(central, 8)
     central.update_morpheus_item(later["id"], hints="newer than the failure")
     client = TestClient(create_app())
-    page = client.get("/morpheus").text
+    page = client.get("/mo").text
     table = page.split('class="mv-list"')[1]
     assert table.index(failed["id"]) < table.index(later["id"])
-    narrowed = client.get("/morpheus?state=queued").text.split('class="mv-list"')[1]
+    narrowed = client.get("/mo?state=queued").text.split('class="mv-list"')[1]
     assert later["id"] in narrowed and failed["id"] not in narrowed
-    assert failed["id"] not in client.get("/morpheus?state=bogus").text.split('class="mv-list"')[1]
+    assert failed["id"] not in client.get("/mo?state=bogus").text.split('class="mv-list"')[1]
 
 
 def test_a_confirmed_failure_leaves_the_needs_you_strip(central):
@@ -1403,7 +1511,7 @@ def test_a_confirmed_failure_leaves_the_needs_you_strip(central):
 
     item = _failed(central)
     central.update_morpheus_item(item["id"], resolution="confirmed failed: fix filed")
-    assert "needs-you\">" not in TestClient(create_app()).get("/morpheus").text
+    assert "needs-you\">" not in TestClient(create_app()).get("/mo").text
 
 
 def test_the_detail_shows_runs_questions_and_handoff(central):
@@ -1414,12 +1522,12 @@ def test_the_detail_shows_runs_questions_and_handoff(central):
     item, qid = _escalated(central)
     central.add_morpheus_run(item["id"], exit=1, output="tail <y>", kind="check",
                              state_after="failed")
-    page = TestClient(create_app()).get(f"/morpheus/{item['id']}").text
+    page = TestClient(create_app()).get(f"/mo/{item['id']}").text
     assert "tail &lt;y&gt;" in page
     assert f'href="/neo/question/{qid}"' in page and "escalated" in page
     assert f'Neo <a href="/neo/question/{qid}">q{qid}</a>' in page
-    assert f'action="/morpheus/{item["id"]}/confirm"' in page
-    assert f'name="next" value="/morpheus/{item["id"]}"' in page
+    assert f'action="/mo/{item["id"]}/confirm"' in page
+    assert f'name="next" value="/mo/{item["id"]}"' in page
 
 
 def test_the_detail_says_history_starts_when_checks_predate_runs(central):
@@ -1429,7 +1537,7 @@ def test_the_detail_says_history_starts_when_checks_predate_runs(central):
 
     item = _failed(central)
     central.update_morpheus_item(item["id"], checks=3)
-    page = TestClient(create_app()).get(f"/morpheus/{item['id']}").text
+    page = TestClient(create_app()).get(f"/mo/{item['id']}").text
     assert "history starts with this release" in page
 
 
@@ -1438,7 +1546,7 @@ def test_an_unknown_item_detail_is_a_404(central):
 
     from jarvis.ui.app import create_app
 
-    r = TestClient(create_app()).get("/morpheus/mv-deadbeef")
+    r = TestClient(create_app()).get("/mo/mv-deadbeef")
     assert r.status_code == 404 and "mv-deadbeef" in r.text
 
 
@@ -1448,9 +1556,9 @@ def test_a_detail_action_lands_back_on_the_detail(central):
     from jarvis.ui.app import create_app
 
     item = _failed(central)
-    r = TestClient(create_app()).post(f"/morpheus/{item['id']}/requeue", follow_redirects=False,
-                                     data={"next": f"/morpheus/{item['id']}"})
-    assert r.headers["location"] == f"/morpheus/{item['id']}"
+    r = TestClient(create_app()).post(f"/mo/{item['id']}/requeue", follow_redirects=False,
+                                     data={"next": f"/mo/{item['id']}"})
+    assert r.headers["location"] == f"/mo/{item['id']}"
 
 
 def test_a_failed_item_offers_all_three_decisions_and_links_its_neo_question(central):
@@ -1462,10 +1570,10 @@ def test_a_failed_item_offers_all_three_decisions_and_links_its_neo_question(cen
     item = _failed(central)
     central.claim_morpheus_action(item["id"], "neo:2259")
     client = TestClient(create_app())
-    assert 'Neo <a href="/neo/question/2259">q2259</a>' in client.get("/morpheus").text
-    page = client.get(f"/morpheus/{item['id']}").text
+    assert 'Neo <a href="/neo/question/2259">q2259</a>' in client.get("/mo").text
+    page = client.get(f"/mo/{item['id']}").text
     for verb in ("confirm", "waive", "requeue"):
-        assert f'action="/morpheus/{item["id"]}/{verb}"' in page
+        assert f'action="/mo/{item["id"]}/{verb}"' in page
 
 
 # -- monitoring orders: the record (docs/superpowers/specs/2026-11-01-monitoring-orders.md §2)
@@ -1528,7 +1636,7 @@ def _old_home() -> Path:
     session = {"turns": 3, "offers": {"mv-aaaa1111": {"n": 2, "ts": TEST_EPOCH + 5,
                                                       "cause": "offer"}}}
     conn.execute("INSERT OR REPLACE INTO os_state (key, value) VALUES (?, ?)",
-                 (morpheus.SESSION_KEY, json.dumps(session)))
+                 ("morpheus.session", json.dumps(session)))
     conn.commit()
     conn.close()
     return path
@@ -1625,4 +1733,81 @@ def test_go_opens_both_id_shapes_on_the_morpheus_page():
     from jarvis import ops
 
     for rid in ("mv-1234abcd", "mo-1234abcd"):
-        assert ops.resolve_ref(rid) == f"/morpheus/{rid}"
+        assert ops.resolve_ref(rid) == f"/mo/{rid}"
+
+
+# -- monitoring orders: the dashboard (docs/superpowers/specs/2026-11-01-monitoring-orders.md §6)
+
+
+def _client():
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    return TestClient(create_app())
+
+
+def test_the_old_morpheus_paths_redirect_permanently(central):
+    item = _failed(central)
+    client = _client()
+    r = client.get("/morpheus?state=failed", follow_redirects=False)
+    assert (r.status_code, r.headers["location"]) == (301, "/mo?state=failed")
+    r = client.get(f"/morpheus/{item['id']}", follow_redirects=False)
+    assert (r.status_code, r.headers["location"]) == (301, f"/mo/{item['id']}")
+    # Both old paths still land on a rendered page
+    assert item["id"] in client.get("/morpheus").text
+    assert client.get(f"/morpheus/{item['id']}").status_code == 200
+
+
+def test_the_list_shows_origin_title_and_frequency_and_creates_a_monitor(central):
+    client = _client()
+    r = client.post("/mo/new", follow_redirects=False,
+                    data={"project": "proj_a", "title": "nightly backup ran",
+                          "prompt": "the backup log has today's line", "every_minutes": "30"})
+    assert r.status_code == 303
+    [item] = central.morpheus_items()
+    assert r.headers["location"] == f"/mo/{item['id']}"
+    assert item["id"].startswith("mo-") and item["every_minutes"] == 30
+    row = client.get("/mo").text.split(f'<tr id="{item["id"]}">')[1].split("</tr>")[0]
+    assert "nightly backup ran" in row and ">user<" in row and "30 min" in row
+    assert f'action="/mo/{item["id"]}/cancel"' in row
+    detail = client.get(r.headers["location"]).text
+    assert "the backup log has today&#39;s line" in detail
+
+
+def test_a_monitor_without_a_prompt_is_refused_and_creates_nothing(central):
+    r = _client().post("/mo/new", follow_redirects=False,
+                       data={"project": "proj_a", "title": "t", "prompt": " "})
+    assert r.status_code == 303 and "error=" in r.headers["location"]
+    assert central.morpheus_items() == []
+
+
+def test_cancel_stops_an_open_order_and_is_offered_only_on_open_ones(central):
+    open_item, settled = queued(central, 3), _failed(central)
+    client = _client()
+    page = client.get("/mo").text
+    assert f'action="/mo/{open_item["id"]}/cancel"' in page
+    assert f'action="/mo/{settled["id"]}/cancel"' not in page
+    r = client.post(f"/mo/{open_item['id']}/cancel", follow_redirects=False,
+                    data={"next": f"/mo/{open_item['id']}"})
+    assert r.headers["location"] == f"/mo/{open_item['id']}"
+    assert central.morpheus_item(open_item["id"])["state"] == "cancelled"
+    r = client.post(f"/mo/{settled['id']}/cancel", follow_redirects=False, data={})
+    assert "error=" in r.headers["location"]
+    assert central.morpheus_item(settled["id"])["state"] == "failed"
+
+
+def test_the_detail_shows_its_session_and_cost_only_when_the_bill_exists(central, monkeypatch):
+    from jarvis import bill
+
+    item = _failed(central)
+    central.update_morpheus_item(item["id"], last_session_id="sess-42")
+    client = _client()
+    monkeypatch.delattr(bill, "for_monitoring_order")
+    page = client.get(f"/mo/{item['id']}").text
+    assert "sess-42" in page and f"jarvis cost {item['id']}" not in page
+    monkeypatch.setattr(bill, "for_monitoring_order",
+                        lambda mo_id: {"total": {"calls": 2, "cost": {"list_usd": 1.5}}},
+                        raising=False)
+    page = client.get(f"/mo/{item['id']}").text
+    assert "$1.50" in page and f"jarvis cost {item['id']}" in page

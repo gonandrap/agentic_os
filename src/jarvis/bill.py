@@ -675,8 +675,10 @@ def _actor_label(segment: Any) -> str:
 def build(target: str, project: str | None = None, *,
           live: bool = False) -> dict[str, Any]:
     """The bill for one order, work or feature, resolved by id"""
-    from . import ops
+    from . import morpheus, ops
 
+    if morpheus.is_monitoring_order_id(target):
+        return for_monitoring_order(target)
     try:
         name, path, order = ops.find_feature_order(target, project)
         feature = True
@@ -987,6 +989,77 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
     payload["accuracy"] = {"sealed_at": None, "live": True,
                            "complete": not gaps, "gaps": gaps}
     payload["floor_reason"] = ops.COST_FLOOR_NOTE
+    return payload
+
+
+def _calls_bill(kind: str, scope: str, title: str, status: str, project: str,
+                items: list[Item], orders: list[dict[str, Any]] | None = None
+                ) -> dict[str, Any]:
+    """A bill made only of `agent_calls` rows: no turns, never sealed"""
+    from . import ops
+
+    payload: dict[str, Any] = {
+        "kind": kind, "payload_v": PAYLOAD_VERSION,
+        "scope": scope, "id": scope, "title": title, "status": status,
+        "project": project,
+        "total": _total_line(items, scope),
+        "actors": _fold(items, key=lambda i: i.path,
+                        label=lambda p: _actor_label(p[-1]),
+                        note=lambda p: ACTOR_NOTES.get(p[-1], "") if len(p) == 1 else ""),
+        "turns": [], "agents": [], "orders": orders or [], "notes": [], "checks": {},
+    }
+    payload["checks"] = reconcile(payload)
+    payload["accuracy"] = {"sealed_at": None, "live": True, "complete": True, "gaps": []}
+    payload["floor_reason"] = ops.COST_FLOOR_NOTE
+    return payload
+
+
+def _monitoring_items(central: Any, mo_id: str) -> list[Item]:
+    return _call_items(central.agent_calls(wo_id=mo_id, limit=CALL_LIMIT),
+                       lambda ts: None)
+
+
+def _monitoring_bill(row: dict[str, Any], items: list[Item]) -> dict[str, Any]:
+    return _calls_bill("monitoring_order", row["id"],
+                       row["title"] or row["pr_title"] or row["id"], row["state"],
+                       row["project"], items)
+
+
+def for_monitoring_order(mo_id: str) -> dict[str, Any]:
+    """The calls its arm and judge sessions recorded (docs/superpowers/specs/2026-11-01-monitoring-orders.md §7)"""
+    from . import ops
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        row = central.morpheus_item(mo_id)
+        if row is None:
+            raise ops.OpsError(f"no monitoring order {mo_id}")
+        return _monitoring_bill(row, _monitoring_items(central, mo_id))
+    finally:
+        central.close()
+
+
+def for_release(tag: str) -> dict[str, Any]:
+    """Every monitoring order of one release, summed: intake cost per release (same spec §7)"""
+    from . import ops
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        # Filtered in SQL, unbounded (LIMIT -1): a newest-N window dropped older orders of the tag
+        rows = central.morpheus_items(release_tag=tag, limit=-1)
+        per_order = [(r, _monitoring_items(central, r["id"])) for r in rows]
+    finally:
+        central.close()
+    if not per_order:
+        raise ops.OpsError(f"no monitoring order carries release tag {tag!r}")
+    orders = [_monitoring_bill(row, items) for row, items in per_order]
+    items = [item for _row, order_items in per_order for item in order_items]
+    payload = _calls_bill("release", tag,
+                          f"{len(orders)} monitoring order{'s' if len(orders) != 1 else ''} "
+                          f"for {tag}", "", "", items, orders)
+    payload["count"] = len(orders)
     return payload
 
 

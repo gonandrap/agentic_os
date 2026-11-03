@@ -1272,6 +1272,21 @@ def test_an_escalation_names_every_other_assumption_left_with_you(started):
     assert _line(store, wo["id"]).endswith("r3; also left with you: #2")
 
 
+def test_a_neutral_newest_event_still_names_what_is_left_with_you(started):
+    """Issue #1470, wo-762091cc: #1 left with you, then the OS confirmed #2 — banner named neither owed one"""
+    wo = ops.create_work_order("proj_a", "owed under confirmed")
+    for text in ("used CSV for export one", "used CSV for export two"):
+        ops.assume(wo["id"], text)
+    store = ProjectStore(started.catalog.project("proj_a").path)
+    a1, a2 = store.pending_assumptions(wo["id"])
+    store.add_event(wo["id"], "autoreview_escalated",
+                    {"assumption_id": a1["id"], "n": 1, "reason": "r1"})
+    store.add_event(wo["id"], "autoreview_confirmed",
+                    {"assumption_id": a2["id"], "n": 2, "reason": "r2", "model": "m"})
+
+    assert _line(store, wo["id"]).endswith("r2; also left with you: #1")
+
+
 def test_an_event_written_before_the_payload_carried_the_id_is_unchanged(started):
     """Unresolvable, and a banner is not the place to guess"""
     wo = ops.create_work_order("proj_a", "older event")

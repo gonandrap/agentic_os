@@ -468,6 +468,86 @@ def test_a_user_order_that_merges_tells_the_user_with_its_final_message(started,
     assert "want me to file them?" in note["body"]
 
 
+USER_COMMAND = "jarvis config set proj_a worker.launcher claude"
+
+
+def test_a_finish_that_names_a_user_command_parks_instead_of_completing(
+        started, project):
+    """Issue #1506: wo-3ad2281f completed with the command it owed the user in prose only"""
+    wo = _order(project, "which launcher")
+    result = ops.finish(wo["id"], "the launcher is yours to set",
+                        needs_user=USER_COMMAND)
+
+    assert result["status"] == "needs_review"
+    row = _row(project, wo["id"])
+    assert row["needs_attention"] == 1
+    assert USER_COMMAND in row["attention_reason"]
+    store = ProjectStore(project)
+    try:
+        assert invariants.true_blockers(store, row)[0] == row["attention_reason"]
+    finally:
+        store.close()
+    [note] = _completions(project, wo["id"])
+    assert note["level"] == "warning"
+    assert USER_COMMAND in note["body"]
+
+
+def test_acking_the_owed_command_lowers_the_flag_and_leaves_the_order_open(
+        started, project):
+    """It closes on the user's `ack` or `done`, never on the worker's finish"""
+    wo = _order(project, "which launcher")
+    ops.finish(wo["id"], "the launcher is yours to set", needs_user=USER_COMMAND)
+
+    ops.ack_attention(wo["id"])
+
+    row = _row(project, wo["id"])
+    assert row["needs_attention"] == 0
+    assert row["status"] == "needs_review"
+    store = ProjectStore(project)
+    try:
+        assert invariants.true_blockers(store, row) == []
+    finally:
+        store.close()
+
+
+def test_a_merge_that_leaves_the_user_a_command_parks_instead_of_completing(
+        started, project):
+    """No route completes an order the user still owes a command: the merge parks too"""
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR, needs_user=USER_COMMAND)
+    store = ProjectStore(project)
+    try:
+        result = ops.complete_merged(store, store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+    assert result["status"] == "needs_review"
+    row = _row(project, wo["id"])
+    assert row["status"] == "needs_review"
+    assert row["needs_attention"] == 1
+    assert USER_COMMAND in row["attention_reason"]
+    [note] = _completions(project, wo["id"])
+    assert note["level"] == "warning"
+    assert USER_COMMAND in note["body"]
+
+
+def test_a_parked_order_whose_pull_request_merged_is_never_polled_again(
+        started, project):
+    """Else every tick re-raises the flag the user just acked"""
+    from jarvis import daemon
+
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR, needs_user=USER_COMMAND)
+    store = ProjectStore(project)
+    try:
+        ops.complete_merged(store, store.get_work_order(wo["id"]))
+        row = store.get_work_order(wo["id"])
+        assert row["status"] == "needs_review" and row["pr_state"] == "MERGED"
+        assert daemon.polls_pull_request(store, row) is False
+    finally:
+        store.close()
+
+
 def test_an_order_the_os_opened_completes_without_an_inbox_item(started, project):
     wo = _order(project, "launcher contract", code="launcher")
     ops.finish(wo["id"], "opened a PR", pr_url=PR)

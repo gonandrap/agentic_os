@@ -105,11 +105,11 @@ _NOT_A_PREPOSITION = (r"(?:(?!from\b|in\b|into\b|out\b|off\b|on\b|to\b|by\b|for\
 
 _HS_CREDENTIAL = r"credential|secret|password|\bapi[ -]?key\b|\btoken\b|\bauth\b"
 # `live` only as a live THING; `production`/`prod` name it on their own
-_HS_PRODUCTION = (r"\bproduction\b|\bprod\b"
-                  r"|\blive\s+(?:credential|key|secret|token|data|database|db|"
-                  r"environment|env|traffic|system|server|fleet|user|account|customer|"
-                  r"instance|deployment|service)"
-                  r"|\bgo(?:es|ing|ne)?\s+live\b")
+_HS_LIVE = (r"\blive\s+(?:credential|key|secret|token|data|database|db|"
+            r"environment|env|traffic|system|server|fleet|user|account|customer|"
+            r"instance|deployment|service)"
+            r"|\bgo(?:es|ing|ne)?\s+live\b")
+_HS_PRODUCTION = r"\bproduction\b|\bprod\b|" + _HS_LIVE
 # `drop` only with a data object AFTER it — "dropped from the record" is not one
 _HS_DESTRUCTIVE = (r"\bdelet|\bdestroy|\btruncat|\birreversib|\bpurge"
                    r"|\bdrop(?:s|ped|ping)?\s+(?:(?:the|a|an|all|this|these|its)\s+)?"
@@ -182,6 +182,8 @@ _HST_MIGRATION = (r"\b(?:run|runs|ran|running|appl(?:y|ies|ied|ying)|"
                   r"(?:\w+\s+){0,2}(?:migrations?|backfill\w*)\b"
                   r"|\b(?:migrations?|backfill\w*)(?:\s+\w+){0,3}?\s+(?:was|were|is|are|"
                   r"be|been|gets?|got)\s+(?:\w+\s+){0,2}?(?:run|ran|applied|executed)\b"
+                  # wo-c24e05e3#2, held only by bare `production` before issue 1517
+                  r"|\b(?:rows?|records?|data)\s+(?:are|is|were|was|gets?|got)\s+backfill\w*"
                   + _HS_SCHEMA)
 #: `make/makes/making a release` is 1 false positive ("what makes a release verifiable") and no high...
 _HST_SHIPPING = (r"\bpublish\w*\s+(?:\S+\s+){0,3}?to\b"
@@ -195,6 +197,24 @@ _HST_VERSION = (r"\b(?:patch|minor|major)[\s-]?bump\w*"
                 r"|\b(?:release\s+)?version\s+v?\d+\.\d+\.\d+\b"
                 r"|\b(?:tag|tags|tagged|tagging)\s+[\w./-]*\d+\.\d+\.\d+"
                 r"|\brelease/[\w.-]*\d+\.\d+\.\d+")
+#: `production`/`prod` only as an ACT on it or its deployed state, never the bare noun (issue 1517)
+_P = r"(?:production|prod)"
+_HST_PRODUCTION = (
+    _HS_LIVE
+    + r"|\b(?:deploy|ship|releas|push|publish|writ|wrote|point|roll|sync|upload)\w*\s+"
+    rf"(?:\S+\s+){{0,3}}?(?:to|into|under)\s+(?:the\s+)?{_P}\b"
+    r"|\b(?:run|runs|ran|running|execut\w*|appl(?:y|ies|ied|ying))\s+(?:\S+\s+){0,3}?"
+    rf"(?:in|on|against)\s+(?:the\s+)?{_P}\b"
+    r"|\b(?:deploy|restart|delet|downgrad|upgrad|rollback|wip|drop|truncat|migrat|modif|"
+    r"chang|writ|edit|touch|mutat|overwrit|reset|stop|kill)\w*\s+"
+    rf"(?:(?:the|a|an|its|our|live)\s+)?{_P}\b"
+    rf"|\b{_P}\s+(?:databases?|db|stores?|data|rows?|fleet|services?|credentials?|"
+    r"secrets?|env(?:ironment)?|traffic|users?|customers?|accounts?|servers?|instances?)\b"
+    # what production RUNS is the release decision the user named (wo-1ee46481#1)
+    rf"|\b{_P}\s+(?:\S+\s+){{0,5}}?(?:runs|is\s+on|(?:is\s+)?deployed\s+at|has\s+not\s+"
+    r"deployed)\s+(?:\S+\s+){0,2}?(?:(?:jarvis-|v)?\d+\.\d+|tag\b)"
+    rf"|\b{_P}\s+(?:\S+\s+){{0,5}}?checked\s+out\b|\bwhich\s+{_P}\s+runs\b"
+    rf"|\balready\s+(?:live\s+)?in\s+{_P}\b")
 #: ADDITION 2: moving a remote ref (`wo-29d99c67#3`, a force-push with a lease)
 _HST_REMOTE_REF = (r"\bforce[- ]?push\w*|--force-with-lease|\bforce[- ]updat\w+"
                    r"|\b(?:updat|mov|repoint|push|reset)\w*\s+(?:only\s+)?"
@@ -207,7 +227,7 @@ _HST_GATE_CONTROL = (r"\brule-retract\b"
 
 HIGH_STAKES_TIGHTENED = (
     _HS_CREDENTIAL,
-    _HS_PRODUCTION,     # deliberately untightened — see above
+    _HST_PRODUCTION,
     _HST_DESTRUCTIVE,
     _HST_MIGRATION,
     _HST_MONEY,
