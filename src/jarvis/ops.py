@@ -16757,6 +16757,8 @@ def mo_create(project: str, title: str, prompt: str = "", script: str = "",
     """Insert the row only; the daemon arms a prompt order on its next pass (§5)"""
     from . import morpheus
 
+    if not project:
+        raise OpsError("a monitoring order needs a project")
     name = _morpheus_project(_morpheus_catalog(), project)
     every_minutes = max(1, round(_mo_span(every, "m"))) if every else None
     days = _mo_span(deadline, "d") if deadline else None
