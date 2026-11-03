@@ -11623,6 +11623,18 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
         values["dead_dependency_count"] = len(
             invariants_mod.dead_dependencies(store, wo))
 
+    if need("assumption_holds"):
+        from . import autoreview as autoreview_mod
+
+        pending = {int(a["id"]) for a in store.all_assumptions(wo_id)
+                   if a.get("status") == "pending"}
+        disputed = {int(p.get("assumption_id") or 0)
+                    for p in (db.from_json(e["payload"], {})
+                              for e in store.events_of_kind(wo_id, "autoreview_escalated"))
+                    if p.get("advisory") and p.get("code") == autoreview_mod.HELD_HIGH_STAKES
+                    and p.get("stakes") in autoreview_mod.ROUTINE_STAKES}
+        values["stakes_disputed_holds"] = len(pending & disputed)
+
     if need("neo_question"):
         question = invariants_mod.awaiting_neo(wo_id)
         if question is not None:

@@ -280,9 +280,9 @@ def test_validate_params_reads_a_tuple_of_param_objects_as_a_schema():
 # -- the seed rows
 
 
-def test_seed_rows_are_six_builtin_fleet_wide_detectors_in_dry_run():
+def test_seed_rows_are_seven_builtin_fleet_wide_detectors_in_dry_run():
     rows = rules.seed_rows()
-    assert len(rows) == 6
+    assert len(rows) == 7
     for entry in rows:
         det = entry["detector"]
         assert det["status"] == rules.DRY_RUN
@@ -308,14 +308,15 @@ def test_every_seed_condition_parses():
 def test_seed_ids_are_stable_across_calls():
     first = [e["detector"]["id"] for e in rules.seed_rows()]
     second = [e["detector"]["id"] for e in rules.seed_rows()]
-    assert first == second and len(set(first)) == 6
+    assert first == second and len(set(first)) == 7
     assert all(i.startswith("dt-") for i in first)
 
 
 def test_the_six_gap_classes_are_the_ones_the_spec_names():
     assert [e["detector"]["gap_class"] for e in rules.seed_rows()] == [
         "stale-panel-hold", "unreachable-neo-question", "catch-up-round-burn",
-        "red-base-inherited", "overtaken-release-order", "killed-validation-panel"]
+        "red-base-inherited", "overtaken-release-order", "killed-validation-panel",
+        "mention-held-as-act"]
 
 
 def test_the_killed_panel_detector_is_the_sixth_and_ships_dry_run():
@@ -336,7 +337,7 @@ def test_the_killed_panel_detector_is_the_sixth_and_ships_dry_run():
 
 def test_the_seed_version_is_bumped_so_the_sixth_reaches_a_live_os_db():
     """The seeding pass returns early on a matching version"""
-    assert rules.SEED_VERSION == 2
+    assert rules.SEED_VERSION == 3
 
 
 def test_the_new_fact_field_is_declared_with_its_own_source():
