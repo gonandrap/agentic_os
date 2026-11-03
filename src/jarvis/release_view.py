@@ -28,11 +28,10 @@ def main_ref(repo: Path) -> str:
     return "HEAD"
 
 
-def tags(repo: Path) -> list[dict[str, Any]]:
-    """Every `jarvis-*` tag, newest version first, each with its previous one"""
+def tags(repo: Path, glob: str = release.RELEASE_TAG_GLOB) -> list[dict[str, Any]]:
+    """Every tag matching `glob`, newest version first, each with its previous one"""
     out = _git(repo, "for-each-ref", "--sort=version:refname",
-               "--format=%(refname:short)%1f%(creatordate:unix)",
-               f"refs/tags/{release.RELEASE_TAG_GLOB}")
+               "--format=%(refname:short)%1f%(creatordate:unix)", f"refs/tags/{glob}")
     rows, previous = [], ""
     for line in out.splitlines():
         name, _, ts = line.partition("\x1f")
