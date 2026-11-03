@@ -159,8 +159,8 @@ PR_POLL_EVERY_TICKS = 24
 #: One Morpheus pass every N ticks (~1 minute at the default 5s poll)
 MORPHEUS_EVERY_TICKS = 12
 
-#: Read the account's usage meter every N ticks — one minute at the default 5s interval (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)
-USAGE_SAMPLE_EVERY_TICKS = 12
+#: Read the account's usage meter every N ticks — 150s at the default 5s interval (kn-ff0b7bc2)
+USAGE_SAMPLE_EVERY_TICKS = 30
 
 #: Re-offer the steward's queued self-work every N ticks — ten minutes at the default 5s (#1181)
 STEWARD_DRAIN_EVERY_TICKS = 120
@@ -302,6 +302,9 @@ def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] not in PR_POLL_STATUSES:
         return False
     if not wo.get("pr_url"):
+        return False
+    # An order left open by its own merge has nothing left to learn from GitHub (#1506)
+    if str(wo.get("pr_state") or "") == "MERGED":
         return False
     if recorded is not None and wo["id"] not in recorded:
         return True
@@ -725,6 +728,8 @@ class Daemon:
         self.release_runner: Any = None
         # The usage meter's `urlopen` seam
         self.meter_opener: Any = None
+        self.meter_retry_at = 0.0
+        self.meter_refusals = 0
         # What the catalog file looked like when this catalog was loaded
         self._catalog_stamp = self._catalog_file_stamp()
         # Reload refused (unreadable, unparseable
@@ -831,6 +836,8 @@ class Daemon:
 
     def sample_usage_meter(self) -> None:
         """One reading of the account's meter, or one gap row saying why there is none"""
+        if db.now() < self.meter_retry_at:
+            return
         try:
             sample = usage_meter.sample_once(self.central, opener=self.meter_opener)
         except Exception as e:  # noqa: BLE001 — never the token, never the body
@@ -843,6 +850,13 @@ class Daemon:
             except Exception:  # noqa: BLE001 — a database that cannot be written is next
                 log.exception("usage meter gap row could not be recorded")
             return
+        if sample.http_status == 429:
+            self.meter_refusals += 1
+            wait = usage_meter.backoff_seconds(self.meter_refusals, sample.retry_after)
+            self.meter_retry_at = db.now() + wait
+        else:
+            self.meter_refusals = 0
+            self.meter_retry_at = 0.0
         if not sample.ok:
             log.warning("usage meter unreadable: %s", sample.reason)
         self.notice_meter_gap()
@@ -2402,9 +2416,7 @@ class Daemon:
                          project.name, wo_id, n)
                 return
             # NOTHING CHANGED BECAUSE THE REST IS THE USER'S TO RUN: name it (#1352)
-            finished = store.events_of_kind(wo_id, "finished")
-            needs_user = (str(db.from_json(finished[-1]["payload"], {}).get("needs_user")
-                              or "") if finished else "")
+            needs_user = ops.declared_user_action(store, wo_id)
             if empty == "escalate" and needs_user:
                 self._escalate(store, wo, round_id, n,
                                f"this submission changes no files because the rest is "

@@ -480,6 +480,12 @@ def user_action_blocker(command: str) -> str:
             f"then close it with `jarvis wo done`")
 
 
+def user_action_owed_blocker(command: str) -> str:
+    """The delivered order whose result still waits on the user's own command (#1506)"""
+    return (f"this order's result waits on a command only you may run: `{command}` "
+            f"— `jarvis wo ack` once you have run it, or `jarvis wo done` to close it")
+
+
 def escalated_user_action(store: ProjectStore, wo: dict[str, Any]) -> str:
     """The user-only command the latest escalated round named, else ``""`` (#1352)"""
     judged = store.last_judged_round(wo_id=wo["id"])
@@ -839,6 +845,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         pr_pending = store.pr_pending_open(wo["id"])
         if pr_pending is not None:
             blockers.append(pr_pending_blocker(wo["id"], pr_pending))
+        # The finish declared a command only the user may run, so the order never completed (#1506)
+        owed_action = store.user_action_open(wo["id"])
+        if owed_action is not None:
+            blockers.append(user_action_owed_blocker(
+                str(owed_action.get("command") or "")))
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for something different (#224)
         if wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
@@ -862,7 +873,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
                             if wo.get("kind") in DOCUMENT_DELIVERY_KINDS
                             else REFUSAL_UNANSWERED_BLOCKER)
         # 4; a pushed-branch park always follows `finished`
-        elif not pending and pr_pending is None:
+        elif not pending and pr_pending is None and owed_action is None:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43)
     if stuck_message(store, wo, now=now) is not None:
