@@ -1536,19 +1536,38 @@ def _investigator_git_read(segment: str) -> bool:
     return True
 
 
+#: A redirect that writes no file: fd duplication (`2>&1`) or a discard to `/dev/null` (issue 1480)
+_DISCARD_REDIRECT = re.compile(
+    r"(?<![^\s|;&(])\d*(?:>&\d+|>>?\s*/dev/null)(?=[\s|;&)]|\Z)")
+
+
+def _without_discard_redirects(command: str) -> str:
+    """`command` with its file-free redirects blanked, positions preserved; quoted text untouched"""
+    out = list(command)
+    for found in _DISCARD_REDIRECT.finditer(_mask_shell_text(command)):
+        out[found.start():found.end()] = " " * (found.end() - found.start())
+    return "".join(out)
+
+
+def _investigator_jarvis_permitted(verbs: tuple[tuple[str, str], ...]) -> bool:
+    """Whether every `(verb, subverb)` pair is one an investigator may run"""
+    permitted = INVESTIGATOR_JARVIS_READS | INVESTIGATOR_JARVIS_MUTATIONS
+    return bool(verbs) and all(
+        pair in permitted
+        or (pair[0] in INVESTIGATOR_JARVIS_ARG_VERBS
+            and pair not in INVESTIGATOR_JARVIS_DENIED)
+        for pair in verbs)
+
+
 def _investigator_may_run(command: str) -> bool:
     """The jarvis-chain test, else every segment a read"""
     from . import gate_rules
 
+    command = _without_discard_redirects(command)
     verbs = jarvis_verbs(command)
     if verbs:
-        permitted = INVESTIGATOR_JARVIS_READS | INVESTIGATOR_JARVIS_MUTATIONS
         # EVERY segment, so `jarvis wo show … && jarvis wo finish …` loses the exemption on the second one...
-        return all(
-            pair in permitted
-            or (pair[0] in INVESTIGATOR_JARVIS_ARG_VERBS
-                and pair not in INVESTIGATOR_JARVIS_DENIED)
-            for pair in verbs)
+        return _investigator_jarvis_permitted(verbs)
     # A REDIRECTION IS A WRITE, and `gate_rules.reads_only` does not ask: `cat > file <<EOF` is every...
     masked = _mask_shell_text(command)
     if ">" in masked or "<" in masked:
@@ -1563,6 +1582,9 @@ def _investigator_may_run(command: str) -> bool:
             return False
         if _investigator_writer(segment):
             return False
+        # A jarvis segment of a pipeline (`jarvis wo show … | head`) is judged as it is alone (issue 1480)
+        if _investigator_jarvis_permitted(jarvis_verbs(segment)):
+            continue
         if not (_investigator_git_read(segment) or gate_rules.reads_only(segment)):
             return False
     return True
