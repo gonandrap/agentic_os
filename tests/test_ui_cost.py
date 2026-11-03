@@ -889,7 +889,8 @@ def test_the_meter_chart_endpoint_serves_any_span_and_refuses_a_bad_one(client, 
     # The wheel refuses a span past the endpoint's cap rather than blanking the chart on a 400
     assert embedded["max_span"] == cap
     assert 'data-shift="span"' in page.text and 'data-series="seven_day_pct"' in page.text
-    assert 'data-calc="five_hour"' in page.text and 'data-calc="seven_day"' in page.text
+    assert 'data-calc="five_hour" checked' in page.text
+    assert 'data-calc="seven_day" checked' in page.text
     assert "five_hour_calc_jarvis" in embedded["timeline"][0]
 
 

@@ -24,7 +24,7 @@
     <label><input type="checkbox" data-series="five_hour_pct" checked> 5h</label>
     <label><input type="checkbox" data-series="seven_day_pct" checked> 7d</label>
     <label><input type="checkbox" data-calc="five_hour" checked> 5h calculated</label>
-    <label><input type="checkbox" data-calc="seven_day"> 7d calculated</label>
+    <label><input type="checkbox" data-calc="seven_day" checked> 7d calculated</label>
     <span class="sub">compare with:</span>
     <label><input type="checkbox" data-shift="span"> previous window</label>
     <label><input type="checkbox" data-shift="span2"> 2 windows back</label>
@@ -68,7 +68,7 @@
     var OVERLAY_COLORS = ['#f2a33c', '#56c8e8', '#46d69a', '#e85d5d'];
     var CALC = { five_hour: { label: '5h', meter: 'five_hour_pct', opacity: 0.3 },
                  seven_day: { label: '7d', meter: 'seven_day_pct', opacity: 0.18 } };
-    var calcShown = { five_hour: true, seven_day: false };
+    var calcShown = { five_hour: true, seven_day: true };
     var span = data.until - data.since, MAX_SPAN = data.max_span;
     var view = { a: data.since, b: data.until };
     var main = data.timeline;
