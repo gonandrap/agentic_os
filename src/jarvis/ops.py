@@ -1396,7 +1396,13 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
     wo_id = wo["id"]
     round_note = invariants.parallel_round_note(store, wo_id)
     pending = store.pending_assumptions(wo_id)
-    if pending:
+    turn = store.latest_turn(wo_id)
+    working = (turn is not None and turn["state"] == "running"
+               and wo["status"] != "waiting_input")
+    # A working order's assumptions are Neo's on delivery, not the user's yet (#711, #1482)
+    deferred = len(pending) if (pending and working
+                                and invariants.neo_reviews_later(store, wo)) else 0
+    if pending and not deferred:
         return {"what": "assumptions", "stalled": False,
                 "detail": f"{len(pending)} assumption(s) await your review — "
                           f"`jarvis wo review {wo_id}`{round_note}"}
@@ -1462,11 +1468,11 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
                           f"{worker_session.PAUSE_NOUN[pause.reason]} error and the OS "
                           f"relaunches it by itself"}
     # A live turn means "working" for every status EXCEPT `waiting_input`
-    turn = store.latest_turn(wo_id)
-    if (turn is not None and turn["state"] == "running"
-            and wo["status"] != "waiting_input"):
+    if working:
+        later = (f"; {deferred} assumption(s) go to review on delivery"
+                 if deferred else "")
         return {"what": "turn_running", "stalled": False,
-                "detail": "a turn is in flight — the worker is working"}
+                "detail": f"a turn is in flight — the worker is working{later}"}
     # Before the statuses below, because since issue 212 a round runs in PARALLEL with a `needs_review`...
     if round_note:
         return {"what": "validating", "stalled": False,
