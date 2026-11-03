@@ -65,8 +65,7 @@ jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settl
 jarvis investigate list / show <inv-id> / cancel <inv-id>
 jarvis do create <project> "title" -d "<the decision; what data settles it>"  # "do" = decision order: data for YOUR call; never self-closes
 jarvis do show|send|follow-up|done|cancel <id>
-jarvis mo create <project> "title" --prompt "…"|--script f [--every 15m] [--deadline 3d]
-jarvis mo list|show|cancel|waive|requeue|rewrite|confirm / pause|unpause|follow-fleet   # `jarvis morpheus` = alias
+jarvis mo create <project> "title" --prompt "…" [--every 15m] / list|show|cancel <id>   # prod watches
 jarvis backlog promote <id> --as feature   # intake -> feature order
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
