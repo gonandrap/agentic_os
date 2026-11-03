@@ -698,9 +698,10 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         worker_brief.assume_shape(wo["id"],
                                   tail=" Record every one, including the small ones."),
         f"- Work only inside your worktree (you start in it).",
-        f"- File deferred work instead of leaving notes: `jarvis backlog add "
-        f"{project.name} \"...\"` — including anything you decided was OUT of this "
-        f"feature's scope.",
+        f"- File deferred work instead of leaving notes: `jarvis backlog propose "
+        f"{project.name} \"…\" -d \"…\" --type bug|task --severity <s> [--ref …]` — "
+        f"including anything you decided was OUT of this feature's scope. The steward "
+        f"reviews it; name the Neo question or message that led to it with `--ref`.",
         # conditional for the same reason as the worker's: no index, no instruction to go and read one
         *([f"- READ the OS knowledge base before you decompose — it is indexed at the "
            f"end of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
@@ -1165,7 +1166,7 @@ def _researcher_prompt(wo: dict[str, Any], project: ProjectSpec,
         "# Present, never act",
         "- Lay out the options and recommend one, with why. Never act on any option.",
         "- `proposed_orders` are PROPOSALS the user may file. You file nothing — no "
-        "`jarvis wo create`, `jarvis fo create` or `jarvis backlog add`.",
+        "`jarvis wo create`, `jarvis fo create` or `jarvis backlog propose`.",
         "- If the user asks for more, their message arrives as a new turn: revise and "
         "submit the report again with the same command.",
         "",
@@ -1263,9 +1264,13 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
         "the backlog, recording where it came from — which work order suggested it, and "
         f"that it came out of {fo_id}:",
         "",
-        f"    jarvis backlog add {project.name} \"<title>\" -d \"<the brief>\" \\",
+        f"    jarvis backlog propose {project.name} \"<title>\" -d \"<the brief>\" \\",
+        "        --type task --severity medium \\",
         f"        --origin-wo <the work order that suggested it> --origin-fo {fo_id} \\",
         "        --origin-note \"<why it was deferred>\"",
+        "",
+        "The steward reviews it; name the Neo question or message that led to it with "
+        "`--ref`.",
         "",
         "The message you receive spells that command out with its values already filled "
         "in; run it as it stands. Use the flags rather than writing the relationship "

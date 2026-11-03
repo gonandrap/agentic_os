@@ -517,8 +517,10 @@ def record_section(wo_id: str = WO_PLACEHOLDER,
         "order's id in the reason so the record points at it, and do not hand the "
         "user steps the OS takes by itself (merging, releasing, re-watching a "
         "check). If something truly still needs doing that no running order "
-        "covers, file it — `jarvis backlog add` or ask Neo — rather than writing it "
-        "into prose that ends with your session.",
+        "covers, file it — `jarvis backlog propose <project> \"…\" -d \"…\" --type … "
+        "--severity … [--ref …]` or ask Neo — rather than writing it into prose that "
+        "ends with your session. The steward reviews it; name the Neo question or "
+        "message that led to it with `--ref`.",
         "",
         "# Evidence",
         f"Pass `--evidence \"<what you ran and what it showed>\"` to `jarvis wo "
