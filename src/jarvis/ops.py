@@ -6128,6 +6128,8 @@ CATCH_UP_DEFER_HEAD_MOVED = "head_moved"
 CATCH_UP_DEFER_CARRY_UNPROVEN = "carry_unproven"
 #: The last catch-up was too recent: `catch_up_backoff` has not run out
 CATCH_UP_DEFER_BACKOFF = "backoff"
+#: `CatchUp.cause` on an EXHAUSTED outcome: the laps are losing to the base (#1512)
+CATCH_UP_LIVELOCK = "livelock"
 
 
 @dataclass(frozen=True)
@@ -6323,6 +6325,23 @@ def catch_up_attempts(store: ProjectStore, wo_id: str, *, now: float = 0.0,
                       policy: Any = None) -> int:
     """How often the OS has caught this pull request up within `pull_requests.catch_up_window_minutes`"""
     return len(_catch_up_times(store, wo_id, now=now, policy=policy))
+
+
+def base_chase_laps(store: ProjectStore, wo_id: str) -> list[str]:
+    """Base tips this branch was caught up to since its latest round was judged, oldest first (#1512)"""
+    from . import invariants as invariants_mod
+
+    # A new round resets the count: only a verdict carried lap after lap is losing to the base
+    row = store.latest_validation_round(wo_id=wo_id)
+    if row is None:
+        return []
+    since = float(row["ts"] or 0.0)
+    tips = []
+    for event in store.events_of_kind(wo_id, invariants_mod.PR_BASE_UPDATED_EVENT):
+        payload = db.from_json(event.get("payload"), {}) or {}
+        if payload.get("cause") == BASE_UPDATE_BEHIND and float(event["ts"] or 0.0) >= since:
+            tips.append(str(payload.get("base_sha") or ""))
+    return tips
 
 
 def catch_up_delay(attempts: int, policy: Any) -> int:
