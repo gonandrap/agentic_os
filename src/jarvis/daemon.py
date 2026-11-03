@@ -6784,6 +6784,13 @@ class Daemon:
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
                                f"this branch has already been rebuilt against "
                                f"{base_oid[:10]} once", base_tip=base_oid)
+        # #1512: no CI run per lap while the LIVELOCK blocker stands; an ack lets one more lap run
+        livelock = invariants_mod.livelock_blocker(store, wo)
+        if livelock and livelock not in invariants_mod.acknowledged(wo):
+            return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
+                               f"every one of its last {len(ops.base_chase_laps(store, wo_id))}"
+                               f" catch-ups lost to the next merge into `{base}`",
+                               base_tip=base_oid, cause=ops.CATCH_UP_LIVELOCK)
         policy = ops.catch_up_policy(store)
         attempts = ops.catch_up_attempts(store, wo_id, policy=policy)
         cap = policy.catch_up_max

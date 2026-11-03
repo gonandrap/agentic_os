@@ -205,6 +205,26 @@ CATCH_UP_EXHAUSTED_BLOCKER = ("the base moved under the commit the panel accepte
                               "window clears — merge it by hand, or `jarvis wo send` the "
                               "worker to rebase")
 
+#: THE LAPS ARE LOSING TO THE BASE (#1512): nothing is exhausted, the base merges faster than one lap
+LIVELOCK_BLOCKER = ("base-chase livelock: the OS has caught this branch up {n} times since "
+                    "its verdict (base tips {tips}) and every lap lost to the next merge "
+                    "into the base, so it has stopped spending a CI run per lap — merge "
+                    "it by hand, or `jarvis wo ack {wo_id}` to let the OS chase it again")
+
+
+def livelock_blocker(store: ProjectStore, wo: dict[str, Any]) -> str | None:
+    """The LIVELOCK line, when this parked order has lost `pull_requests.livelock_laps` base chases"""
+    from . import ops as ops_mod
+
+    if wo["status"] != "waiting_pr_merge":
+        return None
+    tips = ops_mod.base_chase_laps(store, wo["id"])
+    if len(tips) < ops_mod.catch_up_policy(store).livelock_laps:
+        return None
+    return LIVELOCK_BLOCKER.format(n=len(tips), tips=", ".join(t[:8] for t in tips),
+                                   wo_id=wo["id"])
+
+
 #: THE HEAD MOVED OFF THE JUDGED COMMIT AND NO CARRY COULD BE PROVEN ONTO IT (#1188)
 CARRY_UNPROVEN_BLOCKER = ("the head of this pull request is not the commit the panel "
                           "accepted and the OS could not prove it is that commit plus "
@@ -819,8 +839,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # ...AND THE SAME STALL THE OS ALREADY SPENT ITS ROUND ON
     if wo["status"] == "waiting_pr_merge" and sha_unrecorded_rejudge_spent(store, wo):
         blockers.append(SHA_UNRECORDED_SPENT_BLOCKER)
-    # THE BASE MOVING FASTER THAN THE OS MAY CHASE IT
-    if (wo["status"] == "waiting_pr_merge"
+    # THE BASE MOVING FASTER THAN THE OS MAY CHASE IT: by lap count (#1512), else by window rate
+    livelock = livelock_blocker(store, wo)
+    if livelock and livelock not in acknowledged(wo):
+        blockers.append(livelock)
+    elif (wo["status"] == "waiting_pr_merge"
             and catch_up_exhausted_hold(store, wo["id"]) is not None):
         blockers.append(CATCH_UP_EXHAUSTED_BLOCKER)
     # A HEAD THE OS MOVED AND CANNOT PROVE (#1188)
