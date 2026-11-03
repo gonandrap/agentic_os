@@ -791,6 +791,9 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return ("Pushed, with no pull request yet",
                 f"`{p.get('branch') or 'its branch'}` against "
                 f"`{p.get('base') or 'the default branch'}`{where}")
+    if kind == "user_action_pending":
+        # The order's whole ending: it did not complete (GitHub issue #1506)
+        return ("Waiting on a command only you may run", p.get("command") or "")
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "marked_done":

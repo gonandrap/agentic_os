@@ -82,8 +82,9 @@ class FakeOpener:
         return self.body if isinstance(self.body, bytes) else json.dumps(self.body).encode()
 
 
-def http_error(status: int) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError(usage_meter.ENDPOINT, status, "nope", {}, None)
+def http_error(status: int, headers: dict | None = None) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(usage_meter.ENDPOINT, status, "nope",
+                                  headers or {}, None)
 
 
 def rows(central: CentralStore) -> list[dict]:
@@ -263,17 +264,18 @@ def test_a_seven_day_reset_runs_through_the_same_path():
 
 
 def test_gap_rows_are_excluded_from_segments_and_counted_in_coverage():
+    period = usage_meter.SAMPLE_SECONDS
     rows_ = ([sample(T0, 10.0, T0 + 3600)]
-             + [sample(T0 + i * MINUTE, None, 0.0, ok=False) for i in (1, 2, 3)]
-             + [sample(T0 + 4 * MINUTE, 17.0, T0 + 3600)])
-    found = usage_meter.segments(rows_, since=T0, until=T0 + 5 * MINUTE,
+             + [sample(T0 + i * period, None, 0.0, ok=False) for i in (1, 2, 3)]
+             + [sample(T0 + 4 * period, 17.0, T0 + 3600)])
+    found = usage_meter.segments(rows_, since=T0, until=T0 + 5 * period,
                                  key="five_hour")
 
     assert found.delta_points == pytest.approx(7.0)
     assert found.coverage.gap_rows == 3
     assert found.coverage.samples == 2
     assert found.coverage.share == pytest.approx(2 / 5)
-    assert found.coverage.longest_gap_seconds == pytest.approx(4 * MINUTE)
+    assert found.coverage.longest_gap_seconds == pytest.approx(4 * period)
 
 
 # -- the reset tolerance and the segment bound
@@ -323,9 +325,10 @@ def test_resets_at_moving_backwards_is_an_anomaly_and_not_a_boundary():
     assert found.delta_points == pytest.approx(34.0)
 
 
-@pytest.mark.parametrize("advance,resets", [(59.0, 0), (61.0, 1)])
-def test_the_tolerance_edges_are_pinned(advance, resets):
-    assert usage_meter.RESET_TOLERANCE_SECONDS == 60.0
+@pytest.mark.parametrize("offset,resets", [(-1.0, 0), (1.0, 1)])
+def test_the_tolerance_edges_are_pinned(offset, resets):
+    assert usage_meter.RESET_TOLERANCE_SECONDS == usage_meter.SAMPLE_SECONDS
+    advance = usage_meter.RESET_TOLERANCE_SECONDS + offset
     rows_ = (series(T0, [10.0, 12.0], T0 + 3600)
              + series(T0 + 2 * MINUTE, [13.0, 14.0], T0 + 3600 + advance))
 
@@ -463,6 +466,74 @@ def gap_rows(central: CentralStore, count: int, *, start: float = T0) -> None:
     central.conn.commit()
 
 
+def test_the_cadence_stays_under_the_endpoints_allowance():
+    """30 reads/hour is the measured allowance; a 60s poll 429'd every other read"""
+    from jarvis.daemon import USAGE_SAMPLE_EVERY_TICKS
+
+    assert usage_meter.SAMPLE_SECONDS == 150.0
+    assert USAGE_SAMPLE_EVERY_TICKS == 30
+    assert 3600 / usage_meter.SAMPLE_SECONDS < 30
+    # One missed reading must not end a calibration run
+    assert usage_meter.MAX_SPAN_GAP_SECONDS == 2 * usage_meter.SAMPLE_SECONDS
+
+
+def test_a_429_carries_its_retry_after_onto_the_sample(central, credentials):
+    usage_meter.sample_once(
+        central, opener=FakeOpener(None, raises=http_error(429, {"Retry-After": "90"})))
+
+    (row,) = rows(central)
+    assert row["ok"] == 0 and row["http_status"] == 429
+
+
+def test_retry_after_seconds_reach_the_caller_and_an_unparseable_one_does_not(
+        credentials):
+    with pytest.raises(usage_meter.MeterError) as seen:
+        usage_meter.fetch(opener=FakeOpener(None,
+                                            raises=http_error(429, {"Retry-After": "90"})))
+    assert seen.value.retry_after == pytest.approx(90.0)
+
+    with pytest.raises(usage_meter.MeterError) as later:
+        usage_meter.fetch(opener=FakeOpener(
+            None, raises=http_error(429, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})))
+    assert later.value.retry_after is None
+
+
+def test_the_backoff_doubles_from_one_period_and_is_capped():
+    assert usage_meter.backoff_seconds(1, None) == usage_meter.SAMPLE_SECONDS
+    assert usage_meter.backoff_seconds(2, None) == 2 * usage_meter.SAMPLE_SECONDS
+    assert usage_meter.backoff_seconds(99, None) == usage_meter.BACKOFF_MAX_SECONDS
+    assert usage_meter.backoff_seconds(1, 90.0) == 90.0
+    assert usage_meter.backoff_seconds(1, 10 * usage_meter.BACKOFF_MAX_SECONDS) \
+        == usage_meter.BACKOFF_MAX_SECONDS
+
+
+def test_a_429_holds_the_sampler_off_and_a_reading_releases_it(
+        jarvis_home, catalog_file, credentials, fake_claude, monkeypatch):
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    clock = {"now": T0}
+    monkeypatch.setattr(db, "now", lambda: clock["now"])
+    daemon = Daemon(load_catalog(catalog_file))
+    refused = FakeOpener(None, raises=http_error(429, {"Retry-After": "300"}))
+    daemon.meter_opener = refused
+
+    daemon.sample_usage_meter()
+    clock["now"] += usage_meter.SAMPLE_SECONDS
+    daemon.sample_usage_meter()
+    assert len(refused.requests) == 1, "the sampler kept polling through the backoff"
+
+    clock["now"] += 300
+    ok = FakeOpener(payload())
+    daemon.meter_opener = ok
+    daemon.sample_usage_meter()
+    assert len(ok.requests) == 1
+
+    clock["now"] += usage_meter.SAMPLE_SECONDS
+    daemon.sample_usage_meter()
+    assert len(ok.requests) == 2, "a reading did not clear the backoff"
+
+
 def test_the_sampler_fires_once_per_tick_not_once_per_project(
         jarvis_home, catalog_file, credentials, fake_claude, monkeypatch):
     from jarvis.catalog import load_catalog
@@ -470,7 +541,6 @@ def test_the_sampler_fires_once_per_tick_not_once_per_project(
 
     from jarvis.testing import make_git_project
 
-    assert USAGE_SAMPLE_EVERY_TICKS == 12
     data = json.loads(catalog_file.read_text())
     second = make_git_project(catalog_file.parent, "proj_b")
     data["projects"].append({"name": "proj_b", "path": str(second)})
