@@ -155,6 +155,10 @@ FACT_FIELDS: dict[str, FactField] = _fields(
     ("dead_dependency_count", NUM, "dependencies",
      "edges that can never clear — `invariants.dead_dependencies`"),
 
+    ("stakes_disputed_holds", NUM, "assumption_holds",
+     "PENDING assumptions the stakes net held whose advisory Neo ruling judged the stakes "
+     "routine — a vocabulary-only hold (issue 1517)"),
+
     ("neo_question_status", STR, "neo_question", "the row's status; `invariants.awaiting_neo`"),
     ("neo_question_attempts", NUM, "neo_question", "attempts already spent on it"),
 
@@ -869,7 +873,7 @@ def _param_specs(schema: Any) -> dict[str, tuple[str, bool]]:
 # -- the seeds
 
 #: `detectors.seed_version` is INTEGER, so this is an int and not `gate_rules`' string
-SEED_VERSION = 2
+SEED_VERSION = 3
 
 #: `invariants.VALIDATION_STUCK_BLOCKER`, INLINED
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
@@ -1036,6 +1040,30 @@ _SEEDS: tuple[dict[str, Any], ...] = (
                           "rather than flipping a state. The investigation already filed "
                           "on the order carries the per-seat facts; what this orders is "
                           "the fix for whatever it finds.")},
+        ],
+    },
+    {
+        "gap_class": "mention-held-as-act",
+        "issue_url": f"{_TRACKER}/1517",
+        "summary": ("a `needs_review` order held for the user by the high-stakes net on an "
+                    "assumption Neo's own advice judged ROUTINE — the net matched a word, "
+                    "not an act (issue #1517)"),
+        "condition": {"all": [
+            {"field": "status", "op": "eq", "value": "needs_review"},
+            {"field": "stakes_disputed_holds", "op": "gte", "value": 1},
+            {"field": "seconds_in_status", "op": "gte", "value": 1800},
+        ]},
+        "remedies": [
+            {"primitive": "file_work_order", "params": {},
+             "argument": ("The high-stakes net held an assumption on this order for the "
+                          "user, and Neo's advisory ruling on the same assumption judged "
+                          "its stakes routine. The two disagree, and the net is the one "
+                          "that matches words: the pattern that fired matched a MENTION, "
+                          "not an act. The hold itself stays the user's — the fix is to "
+                          "narrow that pattern in autoreview.HIGH_STAKES_TIGHTENED so it "
+                          "needs the act's verb or object, with the held sentence as its "
+                          "false-positive test and the acts it must still hold beside it "
+                          "(kn-ccde42c2).")},
         ],
     },
 )
