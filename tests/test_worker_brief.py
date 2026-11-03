@@ -224,8 +224,13 @@ def test_record_section_carries_the_full_record_rule():
         "--pr <url>",
         "waiting for",
         "never a substitute for the final message",
+        # moved from `backlog add` (spec 2026-11-03-backlog-operability §4.5)
+        "jarvis backlog propose <project>",
+        "--severity",
+        "with `--ref`",
     ):
         assert phrase in text, f"lost from the record section: {phrase!r}"
+    assert "jarvis backlog add" not in text
     assert "ceases to exist" not in text, (
         "the summary/final-message contradiction is back — see spec 2026-09-19 SS7")
 
@@ -633,7 +638,7 @@ def test_the_planner_briefing_names_wo_finish_as_the_redelivery():
     """§5 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md: `jarvis fo plan`..."""
     p = _planner_prompt()
 
-    assert "`jarvis fo plan fo-1 --from-file <file>` IS your finish" in p
+    assert "`jarvis fo plan fo-1 --from-file plan.json` IS your finish" in p
     assert "Do not run `jarvis wo finish`" not in p
     assert "jarvis wo finish" in p
     assert "does not touch" in p

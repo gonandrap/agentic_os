@@ -137,7 +137,8 @@ def test_the_manager_route_and_what_the_router_does_without_one(store, central):
     row = env(store, without)
     assert row["delivered_wo_id"] is None
     assert not messages(store, orphan)
-    titles = [b["title"] for b in central.list_backlog("proj_a")]
+    # filed as a proposal the steward reviews (spec 2026-11-03-backlog-operability §4.4)
+    titles = [b["title"] for b in central.list_backlog("proj_a", status="proposed")]
     assert "cache the catalog read" in titles
     assert "filed backlog item" in row["note"]
 
