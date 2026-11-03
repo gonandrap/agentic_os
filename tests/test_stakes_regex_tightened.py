@@ -90,6 +90,29 @@ TIGHTENED_TABLE = [
     ("retract-exemption", "Retracted four more live exemptions than the one named.",
      True),
     ("rearm-gate", "Re-armed the gate the learned rule had been bypassing.", True),
+    # 13. production as an act on it, never the bare noun: issue 1517
+    ("prod-caller", "ops.mo_create is the only production caller (CLI and /mo POST both "
+                    "use it).", False),
+    ("prod-checkout", "The refusal string exists nowhere in the production checkout.",
+     False),
+    ("prod-path", "The corpus lives in a path under production, never in the repo.",
+     False),
+    ("prod-name", "Read the version from production jarvis_os read-only.", False),
+    ("prod-code", "It is not production code: no module imports it.", False),
+    ("prod-runs-config", "Prod runs self_dispatch=true, so reported bugs start at once.",
+     False),
+    ("deploy-to-prod", "Deploy to production once the round passes.", True),
+    ("restart-prod-service", "Restart the production service after the tag lands.", True),
+    ("prod-credentials", "Read the production credentials from the vault.", True),
+    ("prod-database", "_migrate() runs over live production databases on every call.",
+     True),
+    ("writes-to-prod", "The release script writes to production as a subprocess.", True),
+    ("downgrade-prod", "Unwinding would mean downgrading production to the old tag.", True),
+    ("prod-runs-version", "No release cut: production runs 0.10.45, which carries it.",
+     True),
+    ("prod-checked-out", "Production at /srv/app is already checked out at that tag.", True),
+    ("already-in-prod", "No gate request: the payload is already in production.", True),
+    ("rows-backfilled", "Historical rows are backfilled, not just new ones.", True),
 ]
 
 
