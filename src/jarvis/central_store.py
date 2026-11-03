@@ -73,6 +73,71 @@ MISSED_MIN_WORDS = 3
 #: Backlog statuses that SATISFY a `bl-` precondition (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md §2.6)
 SETTLED_BACKLOG_STATUSES = ("done", "dropped")
 
+# The backlog record, docs/superpowers/specs/2026-11-03-backlog-operability.md §1.3
+BACKLOG_STATUSES = ("proposed", "quarantined", "open", "promoted", "done", "dropped")
+#: Items the OS would still act on; offboarding drops them (§2.5)
+LIVE_BACKLOG_STATUSES = ("proposed", "quarantined", "open")
+BACKLOG_ITEM_TYPES = ("bug", "task")
+BACKLOG_SUGGESTED_KINDS = ("wo", "fo")
+#: Each origin-ref kind: (required keys, optional keys)
+ORIGIN_REF_KEYS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "turn": (("project", "wo_id", "ts"), ("seq",)),
+    "message": (("project", "wo_id", "id"), ()),
+    "neo_question": (("id",), ()),
+    "envelope": (("project", "id", "subject_wo_id"), ()),
+    "decision": (("do_id",), ("key",)),
+    "monitoring_order": (("id",), ()),
+    "alarm": (("project", "id"), ()),
+    "validation": (("project", "wo_id"), ("round",)),
+    "finding": (("order_id", "key"), ()),
+    "gate": (("project", "id"), ()),
+    "order": (("id",), ()),
+}
+ORIGIN_REF_KINDS = tuple(ORIGIN_REF_KEYS)
+#: The only transitions `review_backlog` writes (§2.2)
+REVIEW_TRANSITIONS = {"proposed": ("open", "quarantined", "dropped"),
+                      "quarantined": ("open", "dropped")}
+
+
+def normalise_origin_refs(refs: Iterable[Mapping[str, Any]] | None) -> list[dict[str, Any]]:
+    """Validated refs, unknown keys dropped; raises ValueError (a trust boundary, §2.3)"""
+    out = []
+    for ref in refs or ():
+        if not isinstance(ref, Mapping):
+            raise ValueError(f"origin ref must be a dict, got {ref!r}")
+        kind = ref.get("kind")
+        if kind not in ORIGIN_REF_KEYS:
+            raise ValueError(f"unknown origin ref kind {kind!r} (known: {', '.join(ORIGIN_REF_KINDS)})")
+        required, optional = ORIGIN_REF_KEYS[kind]
+        missing = [k for k in required if ref.get(k) in (None, "")]
+        if missing:
+            raise ValueError(f"origin ref {kind!r} is missing {', '.join(missing)}")
+        out.append({"kind": kind, **{k: ref[k] for k in (*required, *optional)
+                                     if ref.get(k) not in (None, "")}})
+    return out
+
+
+def _check_backlog_fields(item_type: str | None = None, severity: str | None = None,
+                          suggested_kind: str | None = None) -> None:
+    from .steward import SEVERITIES
+
+    for name, value, allowed in (("item_type", item_type, BACKLOG_ITEM_TYPES),
+                                 ("severity", severity, SEVERITIES),
+                                 ("suggested_kind", suggested_kind, BACKLOG_SUGGESTED_KINDS)):
+        if value is not None and value not in allowed:
+            raise ValueError(f"{name} {value!r} not one of {', '.join(allowed)}")
+
+
+def _decode_backlog(row: Mapping[str, Any]) -> dict[str, Any]:
+    d = dict(row)
+    d["depends_on"] = db.from_json(d["depends_on"], [])
+    d["origin_refs"] = db.from_json(d.get("origin_refs"), [])
+    if not d["origin_refs"]:
+        # Older rows: navigate as far as the legacy columns reach (§2.1)
+        d["origin_refs"] = [{"kind": "order", "id": d[k]}
+                            for k in ("origin_wo_id", "origin_fo_id") if d.get(k)]
+    return d
+
 
 def split_tags(tags: str) -> list[str]:
     return [t for t in (s.strip() for s in (tags or "").split(",")) if t]
@@ -151,7 +216,7 @@ CREATE TABLE IF NOT EXISTS backlog (
     project TEXT NOT NULL,
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'open',    -- open | promoted | done | dropped
+    status TEXT NOT NULL DEFAULT 'open',    -- BACKLOG_STATUSES
     depends_on TEXT NOT NULL DEFAULT '[]',  -- JSON list of backlog ids
     promoted_wo_id TEXT,
     created_at REAL NOT NULL,
@@ -159,7 +224,17 @@ CREATE TABLE IF NOT EXISTS backlog (
     -- work order deferred it, whoever ends up filing the row (see ADDED_COLUMNS).
     origin_wo_id TEXT,                      -- the work order that suggested it
     origin_fo_id TEXT,                      -- the feature order whose plan it came from
-    origin_note TEXT NOT NULL DEFAULT ''    -- the why, and the Neo question id if given
+    origin_note TEXT NOT NULL DEFAULT '',   -- the why, and the Neo question id if given
+    -- Proposal review and provenance; also in ADDED_COLUMNS
+    item_type TEXT NOT NULL DEFAULT 'task',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    suggested_kind TEXT NOT NULL DEFAULT 'wo',
+    origin_refs TEXT NOT NULL DEFAULT '[]',
+    duplicate_of TEXT,
+    review_rule TEXT NOT NULL DEFAULT '',
+    review_note TEXT NOT NULL DEFAULT '',
+    neo_question_id INTEGER,
+    reviewed_at REAL
 );
 CREATE TABLE IF NOT EXISTS knowledge (
     id TEXT PRIMARY KEY,
@@ -674,6 +749,16 @@ ADDED_COLUMNS = {
         "origin_wo_id": "TEXT",
         "origin_fo_id": "TEXT",
         "origin_note": "TEXT NOT NULL DEFAULT ''",
+        # docs/superpowers/specs/2026-11-03-backlog-operability.md §1.3
+        "item_type": "TEXT NOT NULL DEFAULT 'task'",
+        "severity": "TEXT NOT NULL DEFAULT 'medium'",
+        "suggested_kind": "TEXT NOT NULL DEFAULT 'wo'",
+        "origin_refs": "TEXT NOT NULL DEFAULT '[]'",
+        "duplicate_of": "TEXT",
+        "review_rule": "TEXT NOT NULL DEFAULT ''",
+        "review_note": "TEXT NOT NULL DEFAULT ''",
+        "neo_question_id": "INTEGER",
+        "reviewed_at": "REAL",
     },
     "agent_calls": {
         # Which session the call ran in, so its per-API-call detail can be read back from the transcript
@@ -1058,7 +1143,7 @@ class CentralStore:
             "detectors": "status = 'armed' AND retired_at IS NULL AND project != ''",
             "rule_fires": "cleared_at IS NULL",
             "inbox": "status != 'acked'",
-            "backlog": "status = 'open'",
+            "backlog": f"status IN {LIVE_BACKLOG_STATUSES!r}",
         }
         return [(table, r["project"], r["n"]) for table, where in live.items()
                 for r in self.conn.execute(
@@ -1112,8 +1197,15 @@ class CentralStore:
     def add_backlog(self, project: str, title: str, description: str = "",
                     depends_on: list[str] | None = None, item_id: str | None = None,
                     origin_wo_id: str | None = None, origin_fo_id: str | None = None,
-                    origin_note: str = "") -> dict[str, Any]:
+                    origin_note: str = "", *, item_type: str = "task",
+                    severity: str = "medium", suggested_kind: str = "wo",
+                    origin_refs: list[dict[str, Any]] | None = None,
+                    status: str = "open") -> dict[str, Any]:
         """File a backlog item"""
+        if status not in BACKLOG_STATUSES:
+            raise ValueError(f"backlog status {status!r} not one of {', '.join(BACKLOG_STATUSES)}")
+        _check_backlog_fields(item_type, severity, suggested_kind)
+        refs = normalise_origin_refs(origin_refs)
         item_id = item_id or db.new_id("bl")
         deps = depends_on or []
         for dep in deps:
@@ -1121,20 +1213,65 @@ class CentralStore:
                 raise KeyError(f"backlog dependency {dep!r} does not exist")
         self.conn.execute(
             "INSERT INTO backlog (id, project, title, description, depends_on, "
-            "created_at, origin_wo_id, origin_fo_id, origin_note) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "created_at, origin_wo_id, origin_fo_id, origin_note, status, item_type, "
+            "severity, suggested_kind, origin_refs) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (item_id, project, title, description, db.to_json(deps), db.now(),
-             origin_wo_id, origin_fo_id, origin_note),
+             origin_wo_id, origin_fo_id, origin_note, status, item_type, severity,
+             suggested_kind, db.to_json(refs)),
         )
+        return self.get_backlog(item_id)  # type: ignore[return-value]
+
+    def propose_backlog(self, project: str, title: str, description: str = "", *,
+                        item_type: str, severity: str, suggested_kind: str,
+                        origin_refs: list[dict[str, Any]],
+                        depends_on: list[str] | None = None,
+                        origin_wo_id: str | None = None, origin_fo_id: str | None = None,
+                        origin_note: str = "") -> dict[str, Any]:
+        """File an item for the steward to review (spec 2026-11-03-backlog-operability §1.3)"""
+        return self.add_backlog(project, title, description, depends_on=depends_on,
+                                origin_wo_id=origin_wo_id, origin_fo_id=origin_fo_id,
+                                origin_note=origin_note, item_type=item_type,
+                                severity=severity, suggested_kind=suggested_kind,
+                                origin_refs=origin_refs, status="proposed")
+
+    def review_backlog(self, item_id: str, status: str, *, rule: str, note: str,
+                       duplicate_of: str | None = None, suggested_kind: str | None = None,
+                       depends_on: list[str] | None = None,
+                       neo_question_id: int | None = None) -> dict[str, Any]:
+        """The ONLY writer of a review outcome; refuses a transition outside REVIEW_TRANSITIONS"""
+        item = self.get_backlog(item_id)
+        if not item:
+            raise KeyError(f"backlog item {item_id!r} not found")
+        if status not in REVIEW_TRANSITIONS.get(item["status"], ()):
+            raise ValueError(f"backlog item {item_id} is {item['status']!r}: "
+                             f"review cannot move it to {status!r}")
+        _check_backlog_fields(suggested_kind=suggested_kind)
+        if duplicate_of is not None:
+            if status != "dropped":
+                raise ValueError("duplicate_of is only set on a dropped item")
+            if duplicate_of == item_id or not self.get_backlog(duplicate_of):
+                raise KeyError(f"duplicate_of {duplicate_of!r} is not another backlog item")
+        for dep in depends_on or ():
+            if dep == item_id or not self.get_backlog(dep):
+                raise KeyError(f"backlog dependency {dep!r} does not exist")
+        # Guarded on the status read above: two reviewers never both win
+        n = self.conn.execute(
+            "UPDATE backlog SET status=?, review_rule=?, review_note=?, reviewed_at=?, "
+            "duplicate_of=COALESCE(?, duplicate_of), "
+            "suggested_kind=COALESCE(?, suggested_kind), "
+            "depends_on=COALESCE(?, depends_on), "
+            "neo_question_id=COALESCE(?, neo_question_id) WHERE id=? AND status=?",
+            (status, rule, note, db.now(), duplicate_of, suggested_kind,
+             None if depends_on is None else db.to_json(depends_on), neo_question_id,
+             item_id, item["status"])).rowcount
+        if not n:
+            raise ValueError(f"backlog item {item_id} changed status during review")
         return self.get_backlog(item_id)  # type: ignore[return-value]
 
     def get_backlog(self, item_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM backlog WHERE id=?", (item_id,)).fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        d["depends_on"] = db.from_json(d["depends_on"], [])
-        return d
+        return _decode_backlog(row) if row else None
 
     def list_backlog(self, project: str | None = None, status: str | None = "open") -> list[dict[str, Any]]:
         q = "SELECT * FROM backlog"
@@ -1146,12 +1283,7 @@ class CentralStore:
         if conds:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY created_at"
-        out = []
-        for row in self.conn.execute(q, params).fetchall():
-            d = dict(row)
-            d["depends_on"] = db.from_json(d["depends_on"], [])
-            out.append(d)
-        return out
+        return [_decode_backlog(row) for row in self.conn.execute(q, params).fetchall()]
 
     def unfinished_dependencies(self, item_id: str) -> list[dict[str, Any]]:
         """Dependencies of item that are not yet done (blockers for promotion)"""
