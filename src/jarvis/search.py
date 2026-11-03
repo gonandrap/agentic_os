@@ -160,8 +160,11 @@ def search(query: str, *, project: str | None = None,
         try:
             if "backlog" in wanted:
                 for row in central.search_backlog(words, project=project, limit=limit):
+                    title = row["title"]
+                    if row["status"] == "dropped" and row.get("duplicate_of"):
+                        title += f" (duplicate of {row['duplicate_of']})"
                     hits.append(_hit("backlog", id=row["id"], project=row["project"],
-                                     title=row["title"], status=row["status"],
+                                     title=title, status=row["status"],
                                      ts=row["created_at"], score=row["_score"],
                                      body=row["description"], words=words,
                                      url=f"/backlog/{row['id']}",

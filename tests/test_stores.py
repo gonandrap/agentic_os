@@ -173,6 +173,101 @@ def test_backlog_dependencies(jarvis_home):
     assert central.unfinished_dependencies(b["id"]) == []
 
 
+# -- backlog record (docs/superpowers/specs/2026-11-03-backlog-operability.md §2)
+
+TURN = {"kind": "turn", "project": "p", "wo_id": "wo-11111111", "ts": 5.0}
+
+
+def test_backlog_defaults_and_an_older_row_still_navigates(jarvis_home):
+    central = CentralStore()
+    typed = central.add_backlog("p", "typed by a human")
+    assert (typed["status"], typed["item_type"], typed["severity"], typed["suggested_kind"],
+            typed["origin_refs"], typed["duplicate_of"]) == ("open", "task", "medium", "wo",
+                                                             [], None)
+    old = central.add_backlog("p", "deferred", origin_wo_id="wo-22222222",
+                              origin_fo_id="fo-33333333")
+    assert old["origin_refs"] == [{"kind": "order", "id": "wo-22222222"},
+                                  {"kind": "order", "id": "fo-33333333"}]
+    # Paired: a stored ref wins over the legacy columns
+    new = central.add_backlog("p", "with a ref", origin_wo_id="wo-22222222",
+                              origin_refs=[TURN])
+    assert central.list_backlog("p")[-1]["origin_refs"] == [TURN] == new["origin_refs"]
+
+
+def test_backlog_migration_defaults_an_existing_row(jarvis_home):
+    from jarvis.paths import central_db_path
+
+    path = central_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE IF EXISTS backlog")
+    conn.execute("CREATE TABLE backlog (id TEXT PRIMARY KEY, project TEXT NOT NULL, "
+                 "title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', "
+                 "status TEXT NOT NULL DEFAULT 'open', depends_on TEXT NOT NULL DEFAULT '[]', "
+                 "promoted_wo_id TEXT, created_at REAL NOT NULL)")
+    conn.execute("INSERT INTO backlog (id, project, title, created_at) "
+                 "VALUES ('bl-old00001', 'p', 'from last year', 1.0)")
+    conn.commit()
+    conn.close()
+
+    row = CentralStore().get_backlog("bl-old00001")
+
+    assert (row["item_type"], row["severity"], row["suggested_kind"], row["origin_refs"],
+            row["review_rule"], row["reviewed_at"]) == ("task", "medium", "wo", [], "", None)
+
+
+def test_propose_validates_at_the_store_boundary(jarvis_home):
+    central = CentralStore()
+    fields = dict(item_type="bug", severity="major", suggested_kind="fo")
+    item = central.propose_backlog(
+        "p", "flaky retry", origin_refs=[{**TURN, "junk": "dropped"}], **fields)
+    assert item["status"] == "proposed" and item["origin_refs"] == [TURN]
+    assert (item["item_type"], item["severity"], item["suggested_kind"]) == ("bug", "major", "fo")
+    for bad in ({"item_type": "epic"}, {"severity": "huge"}, {"suggested_kind": "io"}):
+        with pytest.raises(ValueError):
+            central.propose_backlog("p", "x", origin_refs=[], **{**fields, **bad})
+    for ref in ({"kind": "nonsense", "id": "x"}, {"kind": "turn", "project": "p", "ts": 1.0},
+                {"kind": "message", "project": "p", "wo_id": "wo-1", "id": ""}):
+        with pytest.raises(ValueError):
+            central.propose_backlog("p", "x", origin_refs=[ref], **fields)
+    assert [i["title"] for i in central.list_backlog("p", status=None)] == ["flaky retry"]
+    # A proposal is not open: not listed, not promotable
+    assert central.list_backlog("p") == []
+
+
+def test_review_backlog_only_walks_its_transitions(jarvis_home):
+    central = CentralStore()
+    fields = dict(item_type="task", severity="medium", suggested_kind="wo", origin_refs=[])
+    keep = central.add_backlog("p", "the original")
+    prop = central.propose_backlog("p", "restated", **fields)
+    out = central.review_backlog(prop["id"], "quarantined", rule="risky", note="ask Neo",
+                                 neo_question_id=42)
+    assert (out["status"], out["review_rule"], out["neo_question_id"]) == ("quarantined", "risky", 42)
+    assert out["reviewed_at"]
+    out = central.review_backlog(prop["id"], "dropped", rule="duplicate", note="restates it",
+                                 duplicate_of=keep["id"])
+    assert (out["status"], out["duplicate_of"], out["neo_question_id"]) == (
+        "dropped", keep["id"], 42)
+    # Refused: out of a settled status, from open, to promoted, and a duplicate that is not dropped
+    with pytest.raises(ValueError):
+        central.review_backlog(prop["id"], "open", rule="r", note="n")
+    with pytest.raises(ValueError):
+        central.review_backlog(keep["id"], "dropped", rule="r", note="n")
+    other = central.propose_backlog("p", "another", **fields)
+    for status, extra in (("promoted", {}), ("done", {}),
+                          ("open", {"duplicate_of": keep["id"]}),
+                          ("open", {"suggested_kind": "xx"})):
+        with pytest.raises(ValueError):
+            central.review_backlog(other["id"], status, rule="r", note="n", **extra)
+    with pytest.raises(KeyError):
+        central.review_backlog(other["id"], "open", rule="r", note="n", depends_on=["bl-nope"])
+    assert central.get_backlog(other["id"])["status"] == "proposed"
+    # Paired positive: proposed -> open, re-kinded and given a dependency
+    out = central.review_backlog(other["id"], "open", rule="clean", note="fine",
+                                 suggested_kind="fo", depends_on=[keep["id"]])
+    assert (out["status"], out["suggested_kind"], out["depends_on"]) == ("open", "fo", [keep["id"]])
+
+
 def test_inbox_ack(jarvis_home):
     central = CentralStore()
     i1 = central.add_inbox("p", "alert 1", level="critical")

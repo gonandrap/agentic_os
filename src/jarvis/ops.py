@@ -45,8 +45,9 @@ from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
-from .central_store import (ARCHIVED, MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES,
-                            CentralStore, UnknownProjectError)
+from .central_store import (ARCHIVED, LIVE_BACKLOG_STATUSES, MISSED_MIN_WORDS,
+                            SETTLED_BACKLOG_STATUSES, CentralStore, UnknownProjectError,
+                            normalise_origin_refs)
 from .daemon import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
@@ -4003,16 +4004,22 @@ def assumption_routing_line(a: dict[str, Any]) -> str:
     return "With you because the automatic review has not reached it yet"
 
 
+def first_reply_at_or_after(ts: float, replies: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The first reply at or after `ts`: the one that ended the turn `ts` fell in"""
+    for m in replies:
+        if float(m.get("ts") or 0.0) >= ts:
+            return m
+    return None
+
+
 def assumption_source_ref(a: dict[str, Any],
                           replies: list[dict[str, Any]]) -> dict[str, Any] | None:
     """The worker turn this assumption was recorded during, as a `timeline` ref, or None"""
     # `jarvis wo assume` always runs BEFORE the reply that ends its turn (#1265)
-    ts = float(a.get("ts") or 0.0)
-    for m in replies:
-        if float(m.get("ts") or 0.0) >= ts:
-            return {"kind": "message", "id": int(m["id"]),
-                    "label": "the turn that raised it"}
-    return None
+    m = first_reply_at_or_after(float(a.get("ts") or 0.0), replies)
+    if m is None:
+        return None
+    return {"kind": "message", "id": int(m["id"]), "label": "the turn that raised it"}
 
 
 def overtaken_line(a: dict[str, Any]) -> str:
@@ -10326,9 +10333,10 @@ def quiesce_project(name: str, apply: bool = False,
         store.close()
     central = CentralStore()
     try:
-        for item in central.list_backlog(name, "open"):
-            central.mark_backlog(item["id"], "dropped")
-            out["backlog_dropped"] += 1
+        for item in central.list_backlog(name, status=None):
+            if item["status"] in LIVE_BACKLOG_STATUSES:
+                central.mark_backlog(item["id"], "dropped")
+                out["backlog_dropped"] += 1
         out["inbox_acked"] = central.ack_project_inbox(name)
     finally:
         central.close()
@@ -13571,6 +13579,8 @@ def list_backlog(project: str | None = None, status: str | None = "open"
                               if it["status"] == "open" else [])
     finally:
         central.close()
+    for it in items:
+        it["origins"] = backlog_origins(it)
     return items
 
 
@@ -13588,7 +13598,115 @@ def show_backlog(item_id: str) -> dict[str, Any]:
             if item["status"] == "open" else []
     finally:
         central.close()
+    item["origins"] = backlog_origins(item)
     return item
+
+
+def backlog_origins(item: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Each origin ref resolved at render time (2026-11-03-backlog-operability §2.4)"""
+    out = []
+    for ref in item.get("origin_refs") or ():
+        href, label = origin_url(ref)
+        out.append({"kind": str(ref.get("kind") or ""), "href": href, "label": label})
+    return out
+
+
+def _turn_href(project: str, wo_id: str, ts: float) -> str | None:
+    """The reply ending the turn at `ts`; the WO page while it runs; None for no such WO"""
+    paths = registered_project_paths()
+    if project not in paths:
+        return None
+    store = ProjectStore(paths[project])
+    try:
+        try:
+            store.get_work_order(wo_id)
+        except KeyError:
+            return None
+        m = first_reply_at_or_after(ts, store.agent_replies(wo_id))
+    finally:
+        store.close()
+    base = f"/wo/{project}/{wo_id}"
+    return f"{base}#msg-{int(m['id'])}" if m else base
+
+
+def origin_url(ref: Mapping[str, Any]) -> tuple[str, str]:
+    """(href, label) of one origin ref; never raises (2026-11-03-backlog-operability §1.3)"""
+    kind = str(ref.get("kind") or "") if isinstance(ref, Mapping) else ""
+    r: Mapping[str, Any] = ref if isinstance(ref, Mapping) else {}
+    key = str(r.get("id") or r.get("wo_id") or r.get("order_id") or r.get("do_id") or "")
+    try:
+        p = r.get("project")
+        if kind == "turn":
+            href = _turn_href(str(p), str(r["wo_id"]), float(r["ts"]))
+            if href is not None:
+                return href, f"turn of {r['wo_id']}"
+        elif kind == "message":
+            return f"/wo/{p}/{r['wo_id']}#msg-{int(r['id'])}", f"message {r['id']} of {r['wo_id']}"
+        elif kind == "neo_question":
+            return f"/neo/question/{int(r['id'])}", f"Neo question q{r['id']}"
+        elif kind == "envelope":
+            return f"/wo/{p}/{r['subject_wo_id']}", f"deferral {r['id']} on {r['subject_wo_id']}"
+        elif kind == "decision":
+            label = f"{r['do_id']} {r['key']}" if r.get("key") else str(r["do_id"])
+            return f"/go/{r['do_id']}", label
+        elif kind == "monitoring_order":
+            return f"/mo/{r['id']}", str(r["id"])
+        elif kind == "alarm":
+            return f"/alarms/{p}/{r['id']}", f"alarm {r['id']}"
+        elif kind == "validation":
+            rnd = f" round {r['round']}" if r.get("round") not in (None, "") else ""
+            return f"/wo/{p}/{r['wo_id']}#validation", f"validation of {r['wo_id']}{rnd}"
+        elif kind == "finding":
+            return f"/go/{r['order_id']}", f"{r['order_id']} finding {r['key']}"
+        elif kind == "gate":
+            return f"/gates/{int(r['id'])}?project={quote(str(p))}", f"gate {r['id']}"
+        elif kind == "order":
+            return f"/go/{r['id']}", str(r["id"])
+    except Exception as exc:  # a render path: one bad ref never breaks the page
+        log.warning("origin ref %r did not resolve: %s", dict(r), exc)
+    return f"/search?q={quote(key)}", f"{kind or 'ref'} {key} (not found)"
+
+
+_ORIGIN_REF_FORMS = ("neo:<n>", "q<n>", "msg:<id>", "mo-…", "mv-…", "al-…", "do-…[:key]",
+                     "io-…:key", "inv-…:key", "gate-<n>", "validation[:round]", "wo-…", "fo-…")
+
+
+def parse_origin_ref(token: str) -> dict[str, Any]:
+    """One `--ref` token as an origin ref; no lookup (2026-11-03-backlog-operability §4.2)"""
+    t =(token or "").strip()
+    wo_id = os.environ.get("JARVIS_WO_ID", "")
+    project = os.environ.get("JARVIS_PROJECT", "")
+
+    def here(what: str, need_wo: bool) -> dict[str, str]:
+        if not project or (need_wo and not wo_id):
+            raise OpsError(f"--ref {t!r} names {what} of the current work order; "
+                           f"only a work-order session has one (JARVIS_WO_ID, JARVIS_PROJECT)")
+        return {"project": project, "wo_id": wo_id} if need_wo else {"project": project}
+
+    ref: dict[str, Any] | None = None
+    head, _, tail = t.partition(":")
+    if m := re.fullmatch(r"(?:neo:|q)(\d+)", t):
+        ref = {"kind": "neo_question", "id": int(m.group(1))}
+    elif head == "msg" and tail.isdigit():
+        ref = {"kind": "message", **here("a message", True), "id": int(tail)}
+    elif re.fullmatch(r"m[ov]-[\w-]+", t):
+        ref = {"kind": "monitoring_order", "id": t}
+    elif re.fullmatch(r"al-[\w-]+", t):
+        ref = {"kind": "alarm", **here("an alarm", False), "id": t}
+    elif re.fullmatch(r"do-[\w-]+", head):
+        ref = {"kind": "decision", "do_id": head, **({"key": tail} if tail else {})}
+    elif re.fullmatch(r"(?:io|inv)-[\w-]+", head) and tail:
+        ref = {"kind": "finding", "order_id": head, "key": tail}
+    elif m := re.fullmatch(r"gate-(\d+)", t):
+        ref = {"kind": "gate", **here("a gate", False), "id": int(m.group(1))}
+    elif head == "validation" and (not tail or tail.isdigit()):
+        ref = {"kind": "validation", **here("the validation", True),
+               **({"round": int(tail)} if tail else {})}
+    elif re.fullmatch(r"(?:wo|fo)-[\w-]+", t):
+        ref = {"kind": "order", "id": t}
+    if ref is None:
+        raise OpsError(f"--ref {t!r} is not a ref; accepted forms: {', '.join(_ORIGIN_REF_FORMS)}")
+    return normalise_origin_refs([ref])[0]
 
 
 def promote_backlog(item_id: str, force: bool = False,
@@ -16794,14 +16912,16 @@ def require_mo_id(mo_id: str) -> str:
 
 def mo_create(project: str, title: str, prompt: str = "", script: str = "",
               every: str | None = None, deadline: str | None = None) -> dict[str, Any]:
-    """Insert the row only; the daemon arms a prompt order on its next pass (§5)"""
+    """Insert the row only; the daemon arms it on its next pass (§5)"""
     from . import morpheus
 
     if not project:
         raise OpsError("a monitoring order needs a project")
-    name = _morpheus_project(_morpheus_catalog(), project)
+    catalog = _morpheus_catalog()
+    name = _morpheus_project(catalog, project)
     every_minutes = max(1, round(_mo_span(every, "m"))) if every else None
-    days = _mo_span(deadline, "d") if deadline else None
+    # The fleet's own timeout, not the built-in default (§1.3 create)
+    days = _mo_span(deadline, "d") if deadline else catalog.os.morpheus.timeout_days
     central = CentralStore()
     try:
         return morpheus.create(central, project=name, title=title, prompt=prompt,

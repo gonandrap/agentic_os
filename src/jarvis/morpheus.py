@@ -250,7 +250,7 @@ def is_monitoring_order_id(x: object) -> bool:
 def create(central: CentralStore, *, project: str, title: str, prompt: str = "",
            script: str = "", every_minutes: int | None = None,
            deadline_days: float | None = None, origin: str = "user") -> dict:
-    """An order watching no PR: exactly one of `prompt` (armed later) or `script`"""
+    """An order watching no PR, queued: an arm session writes (prompt) or validates (script) it"""
     from .catalog import MorpheusConfig
 
     prompt, script = (prompt or "").strip(), (script or "").strip()
@@ -260,15 +260,16 @@ def create(central: CentralStore, *, project: str, title: str, prompt: str = "",
         raise ValueError("a monitoring order needs a title")
     if every_minutes is not None and int(every_minutes) < 1:
         raise ValueError("every_minutes must be at least 1")
+    # Callers holding the catalog pass its timeout (ops.mo_create); this is the bare default
     days = MorpheusConfig().timeout_days if deadline_days is None else deadline_days
     now = db.now()
     item = central.add_morpheus_item(
         project=project, repo="", pr_number=None, pr_url="", pr_title="", wo_id="",
-        release_tag="", hints="", script="", script_source="", state="queued",
-        deadline_ts=now + float(days) * SECONDS_PER_DAY, title=title.strip(), origin=origin,
-        prompt=prompt, every_minutes=every_minutes, now=now)
+        release_tag="", hints="", script=script, script_source="user" if script else "",
+        state="queued", deadline_ts=now + float(days) * SECONDS_PER_DAY, title=title.strip(),
+        origin=origin, prompt=prompt, every_minutes=every_minutes, now=now)
     assert item is not None  # no PR, so no uniqueness to collide with
-    return set_script(central, item["id"], script, "user") if script else item
+    return item
 
 
 def cancel(central: CentralStore, mo_id: str) -> dict:
@@ -510,6 +511,13 @@ def _item_or_raise(central: CentralStore, item_id: str) -> dict[str, Any]:
     return item
 
 
+def _kill_spends_attempt(central: CentralStore, item: dict[str, Any]) -> bool:
+    """Count a kill; a kill is no answer, so only MAX_KILLS in a row cost an attempt (kn-1e43fe1a)"""
+    kills = int(item.get("kills") or 0) + 1
+    central.update_morpheus_item(item["id"], kills=0 if kills >= MAX_KILLS else kills)
+    return kills >= MAX_KILLS
+
+
 # -- the mechanical half: running scripts
 
 @dataclass(frozen=True)
@@ -653,6 +661,11 @@ def _judge(central: CentralStore, catalog: Catalog, item: dict[str, Any], *, cwd
             return "usage_held"
         except claude_cli.KilledError as e:
             log.warning("morpheus judge %s killed before it answered: %s", item["id"], e)
+            if not _kill_spends_attempt(central, item):
+                central.update_morpheus_item(item["id"], action="", action_ts=None)
+                return ""
+        if reply is not None and item.get("kills"):
+            central.update_morpheus_item(item["id"], kills=0)
         if reply is None:
             # No answer is no verdict (kn-40db1828): the claim goes back, one attempt spent
             attempts += 1
@@ -959,7 +972,8 @@ SESSION_TOOLS = "Bash,Read,Glob,Grep"
 def _arm_prompt(item: dict[str, Any]) -> str:
     title = item.get("title") or item.get("pr_title") or "(untitled)"
     what = (item.get("hints") or item.get("prompt")
-            or "(the PR gave no hints at all: read the PR)")
+            or ("(only the user's script below)" if item.get("script_source") == "user"
+                else "(the PR gave no hints at all: read the PR)"))
     parts = [ARM_CONTRACT,
              f"## Order {item['id']} — {item.get('project') or '?'}: {title}"
              + (f"\n{item['pr_url']}" if item.get("pr_url") else ""),
@@ -1136,13 +1150,9 @@ def arm(central: CentralStore, catalog: Catalog, cwd_for: CwdFor, *,
             break
         except claude_cli.KilledError as e:
             out["killed"] += 1
-            kills = int(item["kills"] or 0) + 1
-            # A kill is no answer, so it costs no attempt; MAX_KILLS in a row cost one (kn-1e43fe1a)
-            if kills >= MAX_KILLS:
-                central.update_morpheus_item(item["id"], kills=0, last_attempt_ts=now,
+            if _kill_spends_attempt(central, item):
+                central.update_morpheus_item(item["id"], last_attempt_ts=now,
                                              attempts=int(item["attempts"] or 0) + 1)
-            else:
-                central.update_morpheus_item(item["id"], kills=kills)
             log.warning("morpheus arm %s killed before it answered: %s", item["id"], e)
             continue
         if reply is None or "refuse" in reply:
