@@ -1047,8 +1047,8 @@ def for_release(tag: str) -> dict[str, Any]:
 
     central = CentralStore()
     try:
-        rows = [r for r in central.morpheus_items(limit=CALL_LIMIT)
-                if r["release_tag"] == tag]
+        # Filtered in SQL, unbounded (LIMIT -1): a newest-N window dropped older orders of the tag
+        rows = central.morpheus_items(release_tag=tag, limit=-1)
         per_order = [(r, _monitoring_items(central, r["id"])) for r in rows]
     finally:
         central.close()
