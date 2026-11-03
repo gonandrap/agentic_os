@@ -16754,12 +16754,14 @@ def require_mo_id(mo_id: str) -> str:
 
 def mo_create(project: str, title: str, prompt: str = "", script: str = "",
               every: str | None = None, deadline: str | None = None) -> dict[str, Any]:
-    """Insert the row only; the daemon arms a prompt order on its next pass (§5)"""
+    """Insert the row only; the daemon arms it on its next pass (§5)"""
     from . import morpheus
 
-    name = _morpheus_project(_morpheus_catalog(), project)
+    catalog = _morpheus_catalog()
+    name = _morpheus_project(catalog, project)
     every_minutes = max(1, round(_mo_span(every, "m"))) if every else None
-    days = _mo_span(deadline, "d") if deadline else None
+    # The fleet's own timeout, not the built-in default (§1.3 create)
+    days = _mo_span(deadline, "d") if deadline else catalog.os.morpheus.timeout_days
     central = CentralStore()
     try:
         return morpheus.create(central, project=name, title=title, prompt=prompt,
