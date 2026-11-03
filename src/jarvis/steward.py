@@ -1047,9 +1047,9 @@ def send_digest(catalog: Catalog, central: CentralStore, *, now: float | None = 
                              render_digest(d), level="info")
 
 
-# --- Backlog proposals: docs/superpowers/specs/2026-11-03-backlog-operability.md §3 ---
+# --- Backlog proposals: docs/superpowers/specs/2026-11-03-backlog-operability.md §3
 
-#: Stricter than SAME_DEFECT_OVERLAP and over the LARGER wording: a whole backlog, not one file (§3.2 rule 4)
+#: Stricter than SAME_DEFECT_OVERLAP, over the LARGER wording (§3.2 rule 4)
 BACKLOG_OVERLAP = 0.6
 BACKLOG_MIN_WORDS = 3
 BACKLOG_WORDING_CHARS = 300

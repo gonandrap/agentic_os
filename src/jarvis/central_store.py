@@ -1271,7 +1271,7 @@ class CentralStore:
 
     def append_backlog_origin_refs(self, item_id: str,
                                    refs: list[dict[str, Any]]) -> dict[str, Any]:
-        """Add sightings to a kept item; one already there is not repeated (2026-11-03-backlog-operability §3.2 rule 2)"""
+        """Add sightings to a kept item, none repeated (backlog-operability §3.2 rule 2)"""
         item = self.get_backlog(item_id)
         if not item:
             raise KeyError(f"backlog item {item_id!r} not found")
