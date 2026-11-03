@@ -72,6 +72,8 @@ HELD_BASE_RED = "base_red"
 HELD_BASE_MOVED = "base_moved"
 #: Another pull request holds this base's merge lease (#1459)
 HELD_MERGE_QUEUED = "merge_queued"
+#: The grant for this head expired unspent; a fresh request is filed (#1513)
+HELD_GRANT_LAPSED = "grant_lapsed"
 
 #: WHY the merge command did not succeed on a pull request that merged anyway (§5.5)
 CLEANUP = "cleanup"
@@ -281,6 +283,20 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
     return _held(HELD_BASE_MOVED, reason,
                  head_sha=str(getattr(pr, "head_oid", "") or ""),
                  catch_up=str(catch_up.outcome or ""), catch_up_cause=cause)
+
+
+def lapsed_unspent(approval: dict[str, Any] | None) -> bool:
+    """A grant whose clock ran out with no use: it authorised nothing, so it is no live grant (#1513)"""
+    return (approval is not None and approval.get("status") == "expired"
+            and approval.get("closed_as") == "lapsed" and not approval.get("uses"))
+
+
+def held_grant_lapsed(approval: dict[str, Any], decision: Decision) -> Decision:
+    """The hold naming the lapsed grant, written before its fresh request (#1513)"""
+    return _held(HELD_GRANT_LAPSED,
+                 f"gate request {approval['id']} for {decision.judged_sha[:10]} was "
+                 f"approved but expired unspent; a fresh request is filed",
+                 head_sha=decision.judged_sha, round_n=decision.round_n)
 
 
 def merge_queued(store: Any, wo: dict[str, Any], pr: Any) -> Decision | None:
@@ -582,7 +598,8 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
     """File the `auto_merge` approval and its Neo question"""
     pr_url = str(wo.get("pr_url") or "")
     command = merge_command(pr_url, decision.judged_sha)
-    if store.latest_approval_for(wo["id"], GATE_KIND, command) is not None:
+    prior = store.latest_approval_for(wo["id"], GATE_KIND, command)
+    if prior is not None and not lapsed_unspent(prior):
         return None
     # Spec 2026-09-28 §3.5: the base this request was filed against, ON the request
     base = str(getattr(pr, "base_ref", "") or "the base")

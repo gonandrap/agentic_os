@@ -5985,6 +5985,11 @@ class Daemon:
         approval = store.latest_approval_for(
             wo_id, automerge.GATE_KIND,
             automerge.merge_command(str(wo.get("pr_url") or ""), decision.judged_sha))
+        if approval is not None and automerge.lapsed_unspent(approval):
+            # #1513: an unspent lapsed grant authorised nothing; the decision goes back to Neo
+            self._note_automerge_held(store, wo_id,
+                                      automerge.held_grant_lapsed(approval, decision))
+            approval = None
         if approval is None:
             # #1459: one merge request in flight per base tip
             queued = automerge.merge_queued(store, wo, pr)
