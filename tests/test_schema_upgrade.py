@@ -700,3 +700,41 @@ def test_the_backfill_is_idempotent_across_opens(tmp_path):
         assert spans_of(second, "wo-old") == before
     finally:
         second.close()
+
+
+def test_an_older_release_abstains_from_ddl_on_a_fenced_os_db(tmp_path, monkeypatch):
+    """Issue 1500: the previous release must not re-create a table the new one dropped"""
+    from jarvis import central_store
+    path = tmp_path / "os.db"
+    CentralStore(path).close()
+    monkeypatch.setattr(central_store, "SCHEMA_VERSION", 0)
+    monkeypatch.setattr(central_store, "SCHEMA", central_store.SCHEMA
+                        + "\nCREATE TABLE IF NOT EXISTS morpheus_items (id TEXT);")
+    monkeypatch.setattr(CentralStore, "_rebuild_morpheus_items", lambda self: None)  # pre-0.14.6
+    store = CentralStore(path)
+    try:
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert "morpheus_items" not in schema_of(store.conn)
+        assert "monitoring_orders" in schema_of(store.conn)
+    finally:
+        store.close()
+
+
+def test_an_open_racing_another_releases_ddl_retries(tmp_path, monkeypatch):
+    from jarvis import central_store
+    monkeypatch.setattr(central_store, "SCHEMA_RETRY_SECONDS", 0)
+    real = CentralStore._migrate
+    calls = []
+
+    def flaky(self):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("no such table: main.morpheus_items")
+        real(self)
+    monkeypatch.setattr(CentralStore, "_migrate", flaky)
+    store = CentralStore(tmp_path / "os.db")
+    try:
+        assert len(calls) == 2
+        assert store.conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    finally:
+        store.close()
