@@ -985,8 +985,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "THAT order's fix reaches production")
     f.add_argument("--needs-user", dest="needs_user", default="", metavar="COMMAND",
                    help="the exact command only the user may run that the rest of "
-                        "this work waits on (e.g. `jarvis config set …`): a "
-                        "submission that changes nothing escalates naming it")
+                        "this work waits on (e.g. `jarvis config set …`): the order "
+                        "parks for the user naming it instead of completing")
 
     r = wo.add_parser("review", help="accept/reject a work order's pending assumptions")
     r.add_argument("wo_id")
