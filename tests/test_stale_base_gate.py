@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from jarvis import automerge, db, gates, ops
-from jarvis.catalog import load_catalog
+from jarvis.catalog import PullRequestsConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
@@ -241,6 +241,9 @@ def test_the_propose_supersede_loop_is_bounded_and_ends_in_one_exhausted_hold(
     """§3.6's three bounds, driven on a base that moves on every tick"""
     # The ticks here are instants apart: the backoff between them is not what this bounds
     monkeypatch.setattr(ops, "catch_up_backoff", lambda *a, **k: 0.0)
+    # The window cap alone: the livelock guard (#1512) stops this loop at fewer laps
+    policy = PullRequestsConfig(livelock_laps=CATCH_UP_MAX + 1)
+    monkeypatch.setattr(ops, "catch_up_policy", lambda store: policy)
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
