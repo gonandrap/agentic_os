@@ -2433,12 +2433,17 @@ class CentralStore:
         return dict(row) if row else None
 
     def morpheus_items(self, states: Sequence[str] | None = None,
-                       limit: int = 500) -> list[dict[str, Any]]:
+                       limit: int = 500, release_tag: str | None = None
+                       ) -> list[dict[str, Any]]:
         """Newest first"""
-        where, params = "", []
+        clauses, params = [], []
         if states:
-            where = f"WHERE state IN ({','.join('?' * len(states))})"
+            clauses.append(f"state IN ({','.join('?' * len(states))})")
             params = list(states)
+        if release_tag is not None:
+            clauses.append("release_tag = ?")
+            params.append(release_tag)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return db.rows_to_dicts(self.conn.execute(
             f"SELECT * FROM monitoring_orders {where} ORDER BY created_ts DESC, pr_number DESC "
             f"LIMIT ?", (*params, limit)).fetchall())
