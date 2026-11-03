@@ -982,10 +982,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "held seconds wherever the status is judged on time in status — and the stuck "
         "entity is the sweep, not the subject (`kn-4fb740a9`). Name the bug to file in "
         "`proposed_fix`. THE OS FILES IT as an issue, after its own duplicate search — "
-        "which is why you do not file it and cannot. A GAP also names its `owner`: "
-        "`os` when the defect is in Jarvis OS itself (filed on the OS tracker), "
-        "`project` when it is in the subject project's own code (filed on THAT "
-        "project's tracker, never the OS's).",
+        "which is why you do not file it and cannot. `owner`: `os`, or `project` when "
+        "the defect is the subject project's own code.",
         "- **WAITING_ON_USER** — nothing is broken; a person owes a decision. Name it BY "
         "ID in `user_owes`: the assumption, the gate, the Neo question. This is the ONE "
         "classification that spends the user's attention.",
@@ -1005,13 +1003,11 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "",
         "# An `os` GAP also owes a detector and a remedy",
-        "Only when `owner` is `os`; a `project` GAP carries neither. "
         "`proposed_fix.detector`: the predicate over STATE that would have recognised "
         "this — a reconciler invariant or a `jarvis doctor` check, MECHANICAL, no model "
-        "call. `proposed_fix.remedy`: which existing remedy id makes the next occurrence "
-        "self-heal, or the word `none` with the reason it is unsafe to automate. Both are "
-        "the fix order's acceptance criteria: a fix that turns the symptom green and "
-        "leaves the OS blind is refused.",
+        "call. `proposed_fix.remedy`: the existing remedy id that makes the next occurrence "
+        "self-heal, or `none` with why automating it is unsafe. Both are the fix order's "
+        "acceptance criteria.",
         "",
         "# The verdict",
         f"Create it with the **`Write` tool** on `verdict.json` in your worktree root — "
@@ -1035,8 +1031,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         '  "evidence": [',
         f'    {{"source": "{read_subject}", "quote": "the verbatim line"}}',
         "  ],",
-        '  "owner": "os",             // GAP only: os or project',
-        '  "proposed_fix": {          // GAP only; detector and remedy only when owner is os',
+        '  "owner": "os",             // GAP only',
+        '  "proposed_fix": {          // GAP only',
         '    "title": "what the bug report is titled",',
         '    "description": "the brief, standing alone",',
         '    "expected": "what should happen",',
@@ -1056,8 +1052,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "`evidence` entry are "
         "required for all five. CARRY ONLY YOUR CLASSIFICATION'S FIELD: the validator "
         "refuses a GAP with no `proposed_fix`, and a TRANSIENT that also says the user "
-        "owes something. It names every problem at once, so one revision fixes all of "
-        "them. Comments are not JSON — the `//` notes above are for you, not for the file.",
+        "owes something; it names every problem at once. The `//` notes are not JSON: "
+        "leave them out of the file.",
         "",
         "# Bounded inputs",
         f"- Never paste a diff, a transcript or a log into the verdict: cite the command "
