@@ -69,6 +69,10 @@ reader never sees half a file.
 
 ## Round one happens before the first request
 
+> Superseded by `2026-11-01-the-dashboard-never-waits-for-the-cost-page.md` (issue 1495):
+> blocking startup took every page down; lifespan now yields at once and boots warm from a
+> snapshot.
+
 `lifespan` put `CostCache.run` in the task group and yielded at once, so `entries` was
 empty for the whole first round: the current-window request fell through `lookup` to
 `serve`, got `None`, and rendered `computing.html`. That is exactly what mv-d58a1b67
