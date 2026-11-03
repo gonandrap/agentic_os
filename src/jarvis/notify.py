@@ -58,6 +58,12 @@ def check_wo_link(central: CentralStore, catalog: Catalog, project: str,
     path = paths[project]
     if not path.is_dir():
         return None, f"project {project!r} has no directory at {path}"
+    # Central row, not a project one (docs/superpowers/specs/2026-11-01-monitoring-orders.md §7)
+    from . import morpheus
+    if morpheus.is_monitoring_order_id(wo_id):
+        if central.morpheus_item(wo_id) is None:
+            return None, f"monitoring order {wo_id} does not exist"
+        return ui_base_url(catalog) + f"/mo/{urllib.parse.quote(wo_id)}", ""
     # A decision order's notification names the order itself (decision-orders spec §7)
     is_fo = is_feature_order_id(wo_id)
     store = ProjectStore(path)
