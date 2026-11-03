@@ -412,6 +412,35 @@ def test_a_branch_behind_the_base_is_not_caught_up_while_another_merge_is_in_fli
     assert store.list_approvals(second["id"]) == []
 
 
+# -- #1513: a grant that lapses unspent is re-requested
+
+
+def test_a_grant_that_lapses_unspent_is_filed_again(started, project, fake_gh, local):
+    """#1513 / gate 821: the expired grant authorised nothing, so the same head is proposed afresh"""
+    opt_in(started)
+    store, wo = parked(project)
+    green_pr(fake_gh)
+    poll(started, store)
+    [first] = store.list_approvals(wo["id"])
+    gates.apply_decision(store, first["id"], "approved", "ok", "neo", project="proj_a")
+    store.conn.execute("UPDATE approvals SET expires_at=? WHERE id=?",
+                       (db.now() - 1, first["id"]))
+    store.expire_approvals()
+    assert automerge.lapsed_unspent(store.get_approval(first["id"]))
+
+    poll(started, store)
+    poll(started, store)
+
+    assert merges(fake_gh) == []
+    approvals = store.list_approvals(wo["id"])
+    assert len(approvals) == 2
+    assert approvals[0]["status"] == "pending" and approvals[0]["command"] == first["command"]
+    held = [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(wo["id"], "automerge_held")]
+    assert [h["code"] for h in held].count(automerge.HELD_GRANT_LAPSED) == 1
+    assert str(first["id"]) in held[-1]["reason"]
+
+
 def test_an_escalated_request_holds_no_lease(started, project, fake_gh, local):
     """Neo Q3020: a request waiting on the user does not stall the queue"""
     opt_in(started)
