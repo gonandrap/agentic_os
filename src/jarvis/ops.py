@@ -14506,6 +14506,25 @@ def inspect_report(target: str, project: str | None = None, *,
 
 
 @observability.metered(OBSERVE_LIVE, target="target", project="project")
+def live_stream(target: str, project: str | None = None, *,
+                after: int = 0) -> dict[str, Any]:
+    """The CURRENT turn's events, line by line — what the debugging page's terminal modal tails"""
+    from . import live
+
+    name, _path, wo = find_work_order(target, project)
+    session = str(wo.get("session_id") or "")
+    path = live.transcript_of(session)
+    window = live.turn_lines(path)
+    return {"wo_id": wo["id"], "project": name, "session_id": session,
+            "found": path is not None,
+            "note": "" if path is not None else live.no_transcript_note(session),
+            "turn": window["turn"], "after": after, "cursor": window["cursor"],
+            "dropped": window["dropped"],
+            "lines": [row for row in window["lines"] if row["seq"] > after],
+            "params_cap": live.PARAMS_CAP, "text_cap": live.STREAM_CHARS}
+
+
+@observability.metered(OBSERVE_LIVE, target="target", project="project")
 def live_report(target: str, project: str | None = None, *,
                 reader: Any = None, now: float | None = None) -> dict[str, Any]:
     """What this work order's turn is doing RIGHT NOW — `jarvis watch`'s one entry point"""

@@ -533,6 +533,92 @@ def test_tool_parameters_are_html_escaped(client, dispatched, transcripts):
     assert "<script>alert(1)</script>" not in page
 
 
+# -- 11. the terminal modal: the current turn, line by line
+
+
+def _streamed(client, wo_id: str, after: int = 0):
+    return client.get(f"/api/wo/proj_a/{wo_id}/stream", params={"after": after})
+
+
+def test_the_stream_json_route_is_the_payload_verbatim(client, dispatched, transcripts):
+    """`ops.live_stream` and nothing reshaped — the same contract the live route keeps"""
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    at = _inside(store, wo_id, 1)
+    transcripts(dispatched["session"],
+                [prompt_row(at, "go"),
+                 *tool_rows(at, at + 1, "t1", "Bash", {"command": "uv run pytest -q"})])
+
+    got = _streamed(client, wo_id)
+
+    assert got.status_code == 200
+    assert got.json() == ops.live_stream(wo_id, "proj_a")
+    assert [line["kind"] for line in got.json()["lines"]] == ["prompt", "tool", "result"]
+    assert got.json()["session_id"] == dispatched["session"]
+    assert got.json()["found"] is True
+
+
+def test_the_stream_route_returns_only_the_lines_after_the_cursor(client, dispatched,
+                                                                  transcripts):
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    at = _inside(store, wo_id, 1)
+    transcripts(dispatched["session"],
+                [prompt_row(at, "go"),
+                 *tool_rows(at, at + 1, "t1", "Bash", {"command": "uv run pytest -q"})])
+
+    whole = _streamed(client, wo_id).json()
+    rest = _streamed(client, wo_id, after=1).json()
+
+    assert [line["seq"] for line in whole["lines"]] == [1, 2, 3]
+    assert [line["seq"] for line in rest["lines"]] == [2, 3]
+    assert rest["after"] == 1 and rest["cursor"] == whole["cursor"] == 3
+
+
+def test_an_order_with_no_transcript_streams_a_note_rather_than_an_error(client):
+    wo = ops.create_work_order("proj_a", "never dispatched")
+
+    got = client.get(f"/api/wo/proj_a/{wo['id']}/stream")
+
+    assert got.status_code == 200
+    assert got.json()["found"] is False
+    assert got.json()["lines"] == []
+    assert "nothing can be read" in got.json()["note"]
+
+
+def test_the_stream_route_404s_for_an_unknown_work_order(client):
+    gone = client.get("/api/wo/proj_a/wo-nope/stream")
+    assert gone.status_code == 404
+    assert "wo-nope" in gone.json()["error"]
+
+
+def test_the_stream_poll_is_quiet_while_it_succeeds(client, dispatched):
+    """Same reason `/live` is quiet: a 2s poll would be most of the access log"""
+    assert _streamed(client, dispatched["wo_id"]).status_code == 200
+
+    logged = (uilog.access_log_path().read_text()
+              if uilog.access_log_path().exists() else "")
+    assert "/stream" not in logged
+
+
+def test_the_live_block_opens_a_terminal_modal_that_polls_the_stream_route(client,
+                                                                          dispatched):
+    wo_id = dispatched["wo_id"]
+
+    page = client.get(f"/wo/proj_a/{wo_id}/debug").text
+
+    assert 'id="pty-modal"' in page
+    assert f"/api/wo/proj_a/{wo_id}/stream" in page
+    assert "from the start of this turn" in page
+
+
+def test_the_streamed_lines_are_html_escaped_by_the_modal_never_interpolated(client,
+                                                                             dispatched):
+    """Every line is a worker's text: the modal writes textContent and builds no markup"""
+    script = (TEMPLATES / "_debug_live.html").read_text()
+
+    assert "innerHTML" not in script
+    assert "textContent" in script
+
+
 def test_the_anatomy_page_shows_the_navigation_counts(client, dispatched, transcripts):
     """§3: the page and `jarvis inspect` read the SAME literals"""
     store, wo_id = dispatched["store"], dispatched["wo_id"]

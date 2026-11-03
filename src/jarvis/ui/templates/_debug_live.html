@@ -14,6 +14,7 @@
     <span class="kv" style="width: 120px;">state</span>
     <span class="grow mono" id="live-state">{{ f.state }}</span>
     <span class="kv">silent <span class="mono" id="live-stale">{{ fmt_dur(f.stale_seconds) }}</span></span>
+    <button type="button" id="pty-open">open the terminal</button>
   </div>
   <div class="row"><span class="sub" id="live-note">{{ f.note }}</span></div>
   {% if f.turn %}
@@ -64,4 +65,78 @@
     {{ f.params_cap }} characters and credentials are replaced before they are cut.</div>
 </div>
 {% endif %}
+{# THE TERMINAL: the same transcript, event by event instead of as one frame
+   (`ops.live_stream`). READ-ONLY — a worker is a `claude --bg` session with no tty to
+   attach to, and feedback still goes through `jarvis wo send`. It composes nothing:
+   every line is a payload key, redacted server-side by `live.redact_params`. #}
+<dialog id="pty-modal" style="width: min(1100px, 95vw); max-height: 90vh; background: var(--surface);
+  color: var(--ink); border: 1px solid var(--line);">
+  <div class="row">
+    <span class="grow mono" id="pty-modal-title">from the start of this turn</span>
+    <button type="button" id="pty-modal-close">close</button>
+  </div>
+  <div class="sub" id="pty-modal-note"></div>
+  <pre id="pty-log" style="white-space: pre-wrap; overflow: auto; max-height: 70vh;"></pre>
+  <div class="sub" style="padding: 8px 16px;">Read-only: this is the worker's transcript,
+    not a prompt. Send it feedback with <code>jarvis wo send {{ wo.id }} "…"</code>.</div>
+</dialog>
+<script id="pty-modal-js">
+(function () {
+  var modal = document.getElementById("pty-modal");
+  var opener = document.getElementById("pty-open");
+  var log = document.getElementById("pty-log");
+  if (!opener) { return; }  // no live payload, nothing to tail
+  var url = "/api/wo/{{ project }}/{{ wo.id }}/stream";
+  var after = 0, started = null, timer = null;
+  var put = function (id, text) { document.getElementById(id).textContent = text; };
+  // textContent on every node: each line is text a worker (or whatever it read) wrote
+  var write = function (line) {
+    var row = document.createElement("div");
+    var head = line.clock + "  " + line.kind.padEnd(6, " ") + "  " + line.text;
+    row.textContent = line.detail ? head + "  " + line.detail : head;
+    log.appendChild(row);
+    Object.keys(line.params).forEach(function (key) {
+      var param = document.createElement("div");
+      param.textContent = "        " + key + ": " + line.params[key];
+      log.appendChild(param);
+    });
+  };
+  var poll = function () {
+    fetch(url + "?after=" + after).then(function (r) {
+      if (!r.ok) { return null; }
+      return r.json();
+    }).then(function (d) {
+      if (!d) { return; }
+      put("pty-modal-title", d.turn
+        ? "turn " + d.turn.seq + " — from the start of this turn" : "no turn yet");
+      var turn = d.turn ? d.turn.started : null;
+      if (turn !== started) {
+        log.textContent = "";
+        started = turn;
+        // A NEW turn renumbers from 1, so a batch filtered against the old cursor is
+        // short by its first lines — drop it and let the next poll ask from zero.
+        if (after) { after = 0; return; }
+      }
+      put("pty-modal-note", d.note || (d.dropped
+        ? d.dropped + " earlier line(s) of this turn are not in this window" : ""));
+      d.lines.forEach(write);
+      if (d.lines.length) { after = d.lines[d.lines.length - 1].seq; }
+      log.scrollTop = log.scrollHeight;
+    }).catch(function () {});
+  };
+  document.getElementById("pty-open").onclick = function () {
+    log.textContent = "";
+    after = 0;
+    started = null;
+    modal.showModal();
+    poll();
+    timer = setInterval(poll, 2000);
+  };
+  document.getElementById("pty-modal-close").onclick = function () {
+    clearInterval(timer);
+    timer = null;
+    modal.close();
+  };
+})();
+</script>
 </section>

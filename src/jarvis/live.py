@@ -33,6 +33,12 @@ REDACTED = "[redacted]"
 #: Same width `jarvis inspect` quotes a prompt at by default, borrowed as a literal
 QUOTE_CHARS = DEFAULT_INSPECT_QUOTE_CHARS
 
+#: How many lines of the current turn one `turn_lines` window carries
+STREAM_LINES = 400
+
+#: The width a streamed message or tool result is rendered at
+STREAM_CHARS = 2000
+
 _HEAD_BYTES = 512
 _WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
 
@@ -246,14 +252,8 @@ class Reader:
         self.session_id = session_id
         self._ident = ""
         self._reset()
-        self.path = None
-        if not session_id:
-            return
-        if index is None:
-            index = usage_mod.index_sessions(root)
-        paths = index.get(session_id) or []
-        if paths:
-            self.path = max(paths, key=lambda p: _mtime(p))
+        self.path = transcript_of(session_id, root=root, index=index)
+        if self.path is not None:
             self._subagents = subagent_labels(self.path)
 
     # -- polling
@@ -430,10 +430,7 @@ class Reader:
     def _note(self, state: str, now: float, stale: float | None) -> str:
         """The frame's sentence, composed once — see `Live.note`"""
         if state == NO_TRANSCRIPT:
-            # Spec 2026-09-27 §7: this reader falls back to NO seal
-            return (f"no transcript on disk for session {self.session_id or '(none)'} "
-                    "— nothing can be read live; `jarvis inspect` can still answer from "
-                    "a sealed autopsy if this order has one")
+            return no_transcript_note(self.session_id)
         silence = (f"nothing has been written since {clock(self._last_ts)}"
                    f" ({_secs(stale)} ago)" if self._last_ts
                    else "nothing has been written to this transcript at all")
@@ -449,6 +446,90 @@ class Reader:
             return ("this work order has settled — the last frame, not a live reading; "
                     + silence)
         return f"no turn is in flight — {silence}"
+
+
+def no_transcript_note(session_id: str) -> str:
+    """Spec 2026-09-27 §7: this reader falls back to NO seal"""
+    return (f"no transcript on disk for session {session_id or '(none)'} "
+            "— nothing can be read live; `jarvis inspect` can still answer from "
+            "a sealed autopsy if this order has one")
+
+
+def transcript_of(session_id: str, *, root: Path | None = None,
+                  index: dict[str, list[Path]] | None = None) -> Path | None:
+    """The newest transcript file a session has, or None"""
+    if not session_id:
+        return None
+    if index is None:
+        index = usage_mod.index_sessions(root)
+    paths = index.get(session_id) or []
+    return max(paths, key=_mtime) if paths else None
+
+
+# -- the current turn, line by line (the debugging page's terminal modal)
+
+
+def turn_lines(path: Path | str | None, *, cap: int = STREAM_LINES,
+               chars: int = STREAM_CHARS) -> dict[str, Any]:
+    """Every event since the CURRENT turn's prompt, oldest first — a previous turn's lines are dropped, not scrolled past"""
+    empty: dict[str, Any] = {"turn": None, "lines": [], "cursor": 0, "dropped": 0}
+    if path is None:
+        return empty
+    turn: dict[str, Any] | None = None
+    lines: list[dict[str, Any]] = []
+    cursor = dropped = 0
+    saw_assistant = False
+    tools: dict[str, str] = {}
+
+    def add(kind: str, ts: float, text: str, detail: str = "",
+            params: dict[str, str] | None = None) -> None:
+        nonlocal cursor, dropped
+        cursor += 1
+        lines.append({"seq": cursor, "ts": ts, "clock": clock(ts), "kind": kind,
+                      "text": text, "detail": detail, "params": params or {}})
+        del lines[:max(0, len(lines) - cap)]
+        dropped = cursor - len(lines)
+
+    for row in usage_mod.rows(path):
+        if not isinstance(row, dict) or row.get("type") in usage_mod.REPLAY_ROW_TYPES:
+            continue
+        ts = usage_mod.parse_stamp(row.get("timestamp"))
+        prompt = _prompt_of(row, ts)
+        if prompt is not None:
+            # The turn boundary is `Reader._row`'s, which is `inspection.read_transcript`'s
+            if turn is None or saw_assistant:
+                turn = {"seq": (turn["seq"] + 1 if turn else 1), "started": ts}
+                lines.clear()
+                cursor = dropped = 0
+                saw_assistant = False
+            add("prompt", ts, prompt.quote)
+            continue
+        if turn is None:
+            continue
+        if row.get("type") == "assistant":
+            saw_assistant = True
+        for block in usage_mod.blocks_of(row, "text"):
+            said = " ".join(str(block.get("text") or "").split())
+            if said:
+                add("text", ts, _render(said, chars))
+        for block in usage_mod.blocks_of(row, "tool_use"):
+            name = str(block.get("name") or "")
+            tools[str(block.get("id") or "")] = name
+            add("tool", ts, name, detail_of(block.get("input")),
+                redact_params(block.get("input")))
+        for block in usage_mod.blocks_of(row, "tool_result"):
+            add("result", ts, tools.get(str(block.get("tool_use_id") or ""), ""),
+                _result_head(block, chars))
+    return (empty if turn is None
+            else {"turn": turn, "lines": lines, "cursor": cursor, "dropped": dropped})
+
+
+def _result_head(block: dict[str, Any], chars: int) -> str:
+    content = block.get("content")
+    if isinstance(content, list):
+        content = " ".join(str(b.get("text") or "") for b in content
+                           if isinstance(b, dict))
+    return _render(" ".join(str(content or "").split()), chars)
 
 
 def _secs(seconds: float | None) -> str:

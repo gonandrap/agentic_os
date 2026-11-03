@@ -296,7 +296,7 @@ def _in_zone(raw: str, zone: str) -> float | str:
 QUIET_PATHS = ("/api/status", "/healthz")
 
 #: The same rule for polls whose path carries an id (docs/superpowers/specs/2026-09-24-order-observability.md)
-QUIET_SUFFIXES = ("/live",)
+QUIET_SUFFIXES = ("/live", "/stream")
 
 
 def _quiet(path: str) -> bool:
@@ -1769,6 +1769,14 @@ def create_app() -> FastAPI:
         """`ops.live_report` as JSON, nothing reshaped — what the debugging page polls"""
         try:
             return JSONResponse(ops.live_report(wo_id, name))
+        except ops.OpsError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+
+    @app.get("/api/wo/{name}/{wo_id}/stream")
+    def work_order_stream(name: str, wo_id: str, after: int = 0):
+        """`ops.live_stream` as JSON, nothing reshaped — what the terminal modal tails"""
+        try:
+            return JSONResponse(ops.live_stream(wo_id, name, after=after))
         except ops.OpsError as e:
             return JSONResponse({"error": str(e)}, status_code=404)
 

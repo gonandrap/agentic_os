@@ -1255,6 +1255,67 @@ def test_debug_prompt_spec_and_sessions_pages_read_at_desktop_and_phone_width(
             _shot(page, f"{name}-{size['width']}")
 
 
+def test_the_terminal_modal_tails_the_current_turn_of_the_worker_session(
+        page, server, project, monkeypatch, tmp_path):
+    """The debugging page's terminal: one click, the turn's own events, nothing to type into"""
+    import json
+    import time as _time
+
+    from jarvis import usage
+
+    root = tmp_path / "pty-transcripts"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+
+    wo = ops.create_work_order("proj_a", "an order whose turn is running right now")
+    store = ProjectStore(project)
+    try:
+        store.create_turn(wo["id"], "dispatch", "go")
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+    finally:
+        store.close()
+
+    at = _time.time() - 60
+
+    def stamp(t):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(t))
+
+    (root / "-proj" / f"{wo['id']}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"type": "user", "timestamp": stamp(at), "promptSource": "sdk",
+         "message": {"content": "You are the worker agent for " + wo["id"]}},
+        {"type": "assistant", "timestamp": stamp(at + 2),
+         "message": {"id": "m1", "model": "claude-opus-5",
+                     "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0, "output_tokens": 1},
+                     "content": [{"type": "text", "text": "reading the failing test"}]}},
+        {"type": "assistant", "timestamp": stamp(at + 3),
+         "message": {"id": "m2", "model": "claude-opus-5",
+                     "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0, "output_tokens": 1},
+                     "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                  "input": {"command": "uv run pytest tests/test_live.py -q"}}]}},
+        {"type": "user", "timestamp": stamp(at + 9),
+         "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                  "content": "28 passed in 1.69s"}]}},
+    ]))
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}/debug")
+    assert not page.locator("#pty-modal").is_visible()
+
+    page.click("#pty-open")
+    page.wait_for_selector("#pty-log div")
+    terminal = page.locator("#pty-log").inner_text()
+
+    assert "from the start of this turn" in page.locator("#pty-modal-title").inner_text()
+    assert "reading the failing test" in terminal
+    assert "uv run pytest tests/test_live.py -q" in terminal
+    assert "28 passed in 1.69s" in terminal
+    # Read-only: the modal offers no way to speak to the session
+    assert not page.locator("#pty-modal input, #pty-modal textarea").count()
+    assert "jarvis wo send" in page.locator("#pty-modal").inner_text()
+    _shot(page, "debug-terminal-modal")
+
+
 def test_the_operation_jump_opens_its_tab_on_the_worker_prompt_page(page, server):
     page.goto(f"{server}/project/proj_a/prompt#operation")
     assert page.locator("#operation").is_visible()
