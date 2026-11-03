@@ -549,6 +549,26 @@ def test_a_consumed_artifact_tracked_on_main_does_not_keep_a_planner_session(
     assert (tree / "plan.json").read_text() == '{"old": true}\n'
 
 
+def test_the_path_a_submission_was_read_from_is_pruned_whatever_its_name(
+        bg_fleet, fake_claude, settle_turns):
+    """Planner wo-34efa31b submitted .jarvis-plan.json; prune follows the recorded path (#1528)"""
+    from jarvis.project_store import SUBMITTED_ARTIFACT_EVENT
+
+    store = bg_fleet["store"]
+    wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {"sub/.jarvis-plan.json": "{}"})
+    store.conn.execute("UPDATE work_orders SET kind='planner' WHERE id=?", (wo["id"],))
+    store.add_event(wo["id"], SUBMITTED_ARTIFACT_EVENT,
+                    {"path": str((tree / "sub/.jarvis-plan.json").resolve())})
+    store.add_event(wo["id"], SUBMITTED_ARTIFACT_EVENT, {"path": "/elsewhere/plan.json"})
+    store.conn.commit()
+    store.set_status(wo["id"], "completed")
+
+    worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] is None
+    assert not (tree / "sub/.jarvis-plan.json").exists()
+
+
 def test_read_only_directories_are_made_removable(tmp_path):
     """A read-only __pycache__ failed the removal half-way with EACCES (wo-b6e2ddda)"""
     from jarvis import disk

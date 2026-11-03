@@ -15,7 +15,8 @@ from . import (background, budget, claude_cli, context, db, session_dispatch,
                systemd_units, usage)
 from .catalog import ProjectSpec
 from .project_store import (COMPACT_TURN, COST_FROM_TRANSCRIPT, SESSION_KEPT_EVENT,
-                            TERMINAL_STATUSES, ProjectStore, submission_artifacts)
+                            SUBMITTED_ARTIFACT_EVENT, TERMINAL_STATUSES, ProjectStore,
+                            submission_artifacts)
 
 log = logging.getLogger("jarvisd")
 
@@ -738,6 +739,17 @@ def remove_closed_sessions(store: ProjectStore) -> list[str]:
     return removed
 
 
+def _submitted_paths(store: ProjectStore, wo_id: str, tree: Path) -> tuple[str, ...]:
+    """Each file a `--from-file` submission read, relative to `tree` when inside it (#1528)"""
+    root = tree.resolve()
+    out = []
+    for event in store.events_of_kind(wo_id, SUBMITTED_ARTIFACT_EVENT):
+        recorded = (db.from_json(event.get("payload"), None) or {}).get("path")
+        if recorded and Path(recorded).is_relative_to(root):
+            out.append(Path(recorded).relative_to(root).as_posix())
+    return tuple(out)
+
+
 def _prune_worktree_caches(store: ProjectStore, wo: dict[str, Any]) -> None:
     """A build cache `pytest` left untracked is not work, and `claude rm` keeps a worktree for it (#1257)"""
     from . import disk
@@ -748,7 +760,8 @@ def _prune_worktree_caches(store: ProjectStore, wo: dict[str, Any]) -> None:
     if not tree.is_dir():
         return
     # Completed means its contract command already read the file; a cancelled one may not have
-    consumed = submission_artifacts(wo) if wo["status"] == "completed" else ()
+    consumed = (submission_artifacts(wo) + _submitted_paths(store, wo["id"], tree)
+                if wo["status"] == "completed" else ())
     pruned = disk.prune_build_caches(tree, consumed)
     kept = store.last_event_of_kind(wo["id"], SESSION_KEPT_EVENT)
     # Walk once, and again only after an EACCES refusal — not every poll of a kept tree
