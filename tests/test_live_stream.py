@@ -226,6 +226,44 @@ def test_a_session_with_no_transcript_resolves_to_no_path(tmp_path, monkeypatch)
     assert live.transcript_of("nobody-here") is None
 
 
+# -- nothing reaches the browser unscrubbed
+
+
+def test_a_tool_result_that_printed_a_credential_names_it_instead_of_quoting_it(transcript):
+    """kn-e97f6b51: a result head is where a secret surfaces — a read of `.env`, a printed token"""
+    write(transcript, [
+        prompt_row(1000, "go"),
+        tool_use_row(1010, "t1", "Read", {"file_path": ".env"}),
+        tool_result_row(1015, "t1", "api_key=sk-abcdef123456 and nothing else"),
+    ])
+
+    payload = live.conversation_lines(transcript, limit=10)
+
+    assert "sk-abcdef123456" not in json.dumps(payload)
+    assert "<redacted:" in payload["lines"][-1]["detail"]
+
+
+def test_an_assistant_line_that_quoted_a_credential_names_it_instead(transcript):
+    write(transcript, [
+        prompt_row(1000, "go"),
+        text_row(1010, "m1", "the token is Authorization: Bearer sk-abcdef123456"),
+    ])
+
+    payload = live.conversation_lines(transcript, limit=10)
+
+    assert "sk-abcdef123456" not in json.dumps(payload)
+
+
+def test_a_prompt_line_that_carried_a_credential_names_it_instead(transcript):
+    """The user's own message is streamed too, and it is where a pasted token lands"""
+    write(transcript, [prompt_row(1000, "deploy with api_key=sk-abcdef123456")])
+
+    payload = live.conversation_lines(transcript, limit=10)
+
+    assert "sk-abcdef123456" not in json.dumps(payload)
+    assert "<redacted:" in payload["lines"][0]["text"]
+
+
 # -- the page size is the catalog's
 
 

@@ -177,11 +177,12 @@
     reset();
     timer = setInterval(poll, 2000);
   };
-  document.getElementById("pty-modal-close").onclick = function () {
+  document.getElementById("pty-modal-close").onclick = function () { modal.close(); };
+  // On `close`, not on the button: Esc closes a `<dialog>` and would leak the interval
+  modal.addEventListener("close", function () {
     clearInterval(timer);
     timer = null;
-    modal.close();
-  };
+  });
 })();
 </script>
 </section>

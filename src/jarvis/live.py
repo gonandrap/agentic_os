@@ -512,7 +512,7 @@ def conversation_lines(path: Path | str | None, *, limit: int = STREAM_LINES,
                 turn_seq += 1
                 turn = {"seq": turn_seq, "started": ts}
                 saw_assistant = False
-            add("prompt", ts, prompt.quote)
+            add("prompt", ts, _scrub_text(prompt.quote))
             continue
         if turn is None:
             continue

@@ -1358,6 +1358,87 @@ def test_the_terminal_modal_loads_one_older_page_per_click(
     assert "step 11 of the plan" not in after_one_click, "ONE page per click, not all of them"
 
 
+def test_closing_the_terminal_with_escape_stops_the_poll(
+        page, server, project, monkeypatch, tmp_path):
+    """A `<dialog>` closes on Esc without the close button, and the interval must go with it"""
+    from jarvis import usage
+
+    root = tmp_path / "pty-escape"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    wo = _talkative_order(project, root, 4)
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}/debug")
+    page.click("#pty-open")
+    page.wait_for_selector("#pty-log div")
+
+    polls = []
+    page.on("request", lambda r: polls.append(r.url) if "/stream" in r.url else None)
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(4500)
+
+    assert not page.locator("#pty-modal").is_visible()
+    assert polls == [], f"the poll outlived the modal: {polls}"
+
+
+def test_the_terminal_restarts_its_window_when_the_transcript_is_rewritten(
+        page, server, project, monkeypatch, tmp_path):
+    """A compaction renumbers from line 1, so appending across the seam would interleave"""
+    import json
+
+    from jarvis import usage
+
+    root = tmp_path / "pty-compaction"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    wo = _talkative_order(project, root, 8)
+    transcript = root / "-proj" / f"{wo['id']}.jsonl"
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}/debug")
+    page.click("#pty-open")
+    page.wait_for_selector("#pty-log div")
+    assert "step 7 of the plan" in page.locator("#pty-log").inner_text()
+
+    kept = [json.loads(line) for line in transcript.read_text().splitlines()][:2]
+    kept[1]["message"]["content"] = [{"type": "text", "text": "a summary of what came before"}]
+    transcript.write_text("".join(json.dumps(r) + "\n" for r in kept))
+    page.wait_for_function(
+        "() => document.getElementById('pty-log').innerText.includes('a summary of what')",
+        timeout=10000)
+
+    after = page.locator("#pty-log").inner_text()
+    assert "step 7 of the plan" not in after, "the pre-compaction lines were not dropped"
+
+
+def test_loading_an_older_page_keeps_the_reader_where_they_were(
+        page, server, project, monkeypatch, tmp_path):
+    """Prepending pushes everything down; the line under the eye must not move with it"""
+    from jarvis import ops as _ops
+    from jarvis import usage
+
+    root = tmp_path / "pty-scroll"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    _ops.set_config("inspect.stream_lines", 30, "proj_a", reason="a page taller than the log")
+    wo = _talkative_order(project, root, 90)
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}/debug")
+    page.click("#pty-open")
+    page.wait_for_selector("#pty-log div")
+    page.evaluate("() => { document.getElementById('pty-log').scrollTop = 0; }")
+
+    page.click("#pty-more")
+    page.wait_for_function(
+        "() => document.getElementById('pty-log').innerText.includes('step 32 of the plan')")
+
+    held = page.evaluate("""() => {
+      var log = document.getElementById('pty-log');
+      return {top: log.scrollTop, height: log.scrollHeight};
+    }""")
+    assert held["top"] > 0, "the view snapped back to the top of the newly loaded page"
+
+
 def test_the_operation_jump_opens_its_tab_on_the_worker_prompt_page(page, server):
     page.goto(f"{server}/project/proj_a/prompt#operation")
     assert page.locator("#operation").is_visible()
