@@ -1803,6 +1803,7 @@ def test_the_detail_shows_its_session_and_cost_only_when_the_bill_exists(central
     item = _failed(central)
     central.update_morpheus_item(item["id"], last_session_id="sess-42")
     client = _client()
+    monkeypatch.delattr(bill, "for_monitoring_order")
     page = client.get(f"/mo/{item['id']}").text
     assert "sess-42" in page and f"jarvis cost {item['id']}" not in page
     monkeypatch.setattr(bill, "for_monitoring_order",
