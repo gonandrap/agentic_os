@@ -1035,6 +1035,11 @@ def test_the_refusal_templates_render_verbatim():
         assert key in remedies.ATTENTION_TEMPLATES and key in choices
 
 
+def test_the_user_owed_command_blocker_is_not_a_template_key():
+    """A command the user is told to type is free text, never a template key (#1506)"""
+    assert "user_action" not in remedies.ATTENTION_TEMPLATES
+
+
 def test_the_pushed_branch_blocker_is_not_a_template_key():
     """A compare URL is derived state, never a template key (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §6)"""
     assert "pr_pending" not in remedies.ATTENTION_TEMPLATES
