@@ -489,6 +489,8 @@ WORKTREE_RECLAIMED_EVENT = "worktree_reclaimed"
 
 #: Why `claude rm` would not take a closed order's session — written once per refusal (#1257)
 SESSION_KEPT_EVENT = "background_session_kept"
+#: The resolved path a `--from-file` submission was read from (#1528)
+SUBMITTED_ARTIFACT_EVENT = "submitted_artifact"
 
 #: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
 MAX_PER_SWEEP_ROWS = 50
