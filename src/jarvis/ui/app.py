@@ -852,6 +852,8 @@ def _decorate_question(q: dict) -> dict:
     q["issue_url"] = (issues.triage_payload(q) or {}).get("issue_url") or ""
     # `validation` and `findings` are decided on their own record, so the block links to it
     q["morpheus_item"] = morpheus.item_of_question(q) if q.get("kind") == "validation" else ""
+    item = ops._backlog_item_of_question(q["id"]) if q.get("kind") == "backlog" else None
+    q["backlog_item"] = item["id"] if item else ""
     located = ops._finding_for_question(q) if q.get("kind") == "findings" else None
     q["io_url"] = f"/io/{located[0]}/{located[2]['id']}" if located else ""
     return q

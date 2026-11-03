@@ -1238,7 +1238,8 @@ class CentralStore:
     def review_backlog(self, item_id: str, status: str, *, rule: str, note: str,
                        duplicate_of: str | None = None, suggested_kind: str | None = None,
                        depends_on: list[str] | None = None,
-                       neo_question_id: int | None = None) -> dict[str, Any]:
+                       neo_question_id: int | None = None,
+                       severity: str | None = None) -> dict[str, Any]:
         """The ONLY writer of a review outcome; refuses a transition outside REVIEW_TRANSITIONS"""
         item = self.get_backlog(item_id)
         if not item:
@@ -1246,7 +1247,7 @@ class CentralStore:
         if status not in REVIEW_TRANSITIONS.get(item["status"], ()):
             raise ValueError(f"backlog item {item_id} is {item['status']!r}: "
                              f"review cannot move it to {status!r}")
-        _check_backlog_fields(suggested_kind=suggested_kind)
+        _check_backlog_fields(suggested_kind=suggested_kind, severity=severity)
         if duplicate_of is not None:
             if status != "dropped":
                 raise ValueError("duplicate_of is only set on a dropped item")
@@ -1260,14 +1261,27 @@ class CentralStore:
             "UPDATE backlog SET status=?, review_rule=?, review_note=?, reviewed_at=?, "
             "duplicate_of=COALESCE(?, duplicate_of), "
             "suggested_kind=COALESCE(?, suggested_kind), "
+            "severity=COALESCE(?, severity), "
             "depends_on=COALESCE(?, depends_on), "
             "neo_question_id=COALESCE(?, neo_question_id) WHERE id=? AND status=?",
-            (status, rule, note, db.now(), duplicate_of, suggested_kind,
+            (status, rule, note, db.now(), duplicate_of, suggested_kind, severity,
              None if depends_on is None else db.to_json(depends_on), neo_question_id,
              item_id, item["status"])).rowcount
         if not n:
             raise ValueError(f"backlog item {item_id} changed status during review")
-        return self.get_backlog(item_id)  # type: ignore[return-value]
+        return self.get_backlog(item_id)
+
+    def set_backlog_question(self, item_id: str, question_id: int) -> bool:
+        """Point a quarantined item at its Neo question; False if it moved or has one (§5.1)"""
+        return bool(self.conn.execute(
+            "UPDATE backlog SET neo_question_id=? WHERE id=? AND status='quarantined' "
+            "AND neo_question_id IS NULL", (question_id, item_id)).rowcount)
+
+    def backlog_for_question(self, question_id: int) -> dict[str, Any] | None:
+        """The item whose `neo_question_id` names this question (kn-106106a1)"""
+        row = self.conn.execute("SELECT * FROM backlog WHERE neo_question_id=?",
+                                (question_id,)).fetchone()
+        return _decode_backlog(row) if row else None  # type: ignore[return-value]
 
     def append_backlog_origin_refs(self, item_id: str,
                                    refs: list[dict[str, Any]]) -> dict[str, Any]:

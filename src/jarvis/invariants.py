@@ -2073,9 +2073,10 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
                 if q["kind"] in ("approval", "plan", "alarm", "triage",
-                                 "assumption", "question", "findings", "validation")]
-        # `triage` and `validation` are the kinds whose subject is not a row in THIS database (#240)
-        elsewhere = ("triage", "validation")
+                                 "assumption", "question", "findings", "validation",
+                                 "backlog")]
+        # `triage`, `validation` and `backlog` are the kinds whose subject is not a row in THIS database (#240)
+        elsewhere = ("triage", "validation", "backlog")
         mine = (registered_project_paths()
                 if any(q["kind"] in elsewhere for q in held) else {})
         for q in held:
@@ -2088,7 +2089,8 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
                     "assumption": _stale_assumption_question,
                     "question": _stale_worker_question,
                     "findings": _stale_findings_question,
-                    "validation": _stale_validation_question}[q["kind"]](store, q)
+                    "validation": _stale_validation_question,
+                    "backlog": _stale_backlog_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -2176,6 +2178,19 @@ def _stale_validation_question(store: ProjectStore,
     finally:
         central.close()
     return morpheus.stale_question(item, q)
+
+
+def _stale_backlog_question(store: ProjectStore,
+                            q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) once the item it decides is no longer quarantined"""
+    from . import backlog_neo
+    from .central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return backlog_neo.stale_question(central, q)
+    finally:
+        central.close()
 
 
 def _stale_alarm_question(store: ProjectStore,

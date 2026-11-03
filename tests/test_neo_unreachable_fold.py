@@ -78,6 +78,22 @@ def test_neo_answering_again_revives_the_questions_the_outage_stranded(jarvis_ho
         neo.close()
 
 
+def test_a_stranded_backlog_question_is_revived_and_is_no_attention_row(jarvis_home):
+    """No worker behind it: revival may re-ask it, and its item, not Neo's list, asks the user"""
+    neo = NeoStore()
+    try:
+        backlog = _strand(neo, "backlog", "BACKLOG PROPOSAL — bl-1")
+        morpheus = _strand(neo, "validation", "MORPHEUS — PR #3")
+        rows = [a for a in ops.os_status()["attention"] if a["status"] == "neo_escalated"]
+        held = {i for r in rows for i in r.get("neo_question_ids") or [r["neo_question_id"]]}
+        assert morpheus in held and backlog not in held
+        neo.ask("proj_a", "", "a healthy one", kind="triage")
+        neo_mod.drain_queue(neo, "m", answer=_ok)
+        assert neo.get(backlog)["revivals"] == 1
+    finally:
+        neo.close()
+
+
 def test_revival_is_capped_so_a_broken_transport_cannot_loop(jarvis_home):
     neo = NeoStore()
     try:

@@ -826,6 +826,16 @@ class Daemon:
                 log.exception("backlog review of %s failed", item["id"])
         return reviewed
 
+    def ask_neo_about_quarantine(self) -> int:
+        """One Neo question per quarantined item still unasked (backlog-operability §5.1)"""
+        from . import backlog_neo
+
+        try:
+            return len(backlog_neo.ask_quarantined(self.central))
+        except Exception:  # noqa: BLE001 — the items stay unasked; next tick retries them
+            log.exception("asking Neo about quarantined backlog items failed")
+            return 0
+
     def steward_drain(self) -> None:
         """Queued self-work is deferred, not dropped: re-offer it when there is room (#1181)"""
         if fleet.load_pause(self.central) is not None:
@@ -1223,6 +1233,7 @@ class Daemon:
 
         # Before `neo_tick`: an item quarantined here is one Neo can be asked about this tick
         self.review_backlog_proposals()
+        self.ask_neo_about_quarantine()
         self.neo_tick()
         # After the drain is kicked, never before: a question digested this tick is one whose answer has...
         self.digest_tick()
@@ -3455,6 +3466,10 @@ class Daemon:
             # The analyst behind it has settled: the finding, on its io, is what the user decides
             self._findings_question_unanswered(q, f"Neo could not be reached: {detail}")
             return
+        if q.get("kind") == "backlog":
+            # No work order to flag; revival re-asks it once Neo answers again
+            self._backlog_question_unanswered(central, q, f"Neo could not be reached: {detail}")
+            return
         head = q["question"].strip().splitlines()[0][:200]
         central.add_inbox(
             project=q["project"], level="warning",
@@ -3476,6 +3491,22 @@ class Daemon:
                     invariants.neo_question_blocker({**q, "status": "failed"}))
             finally:
                 pstore.close()
+
+    def _backlog_question_unanswered(self, central: CentralStore, q: dict,
+                                     detail: str) -> None:
+        """A `backlog` question nobody judged: the item stays quarantined (kn-40db1828)"""
+        from . import backlog_neo
+
+        item = central.backlog_for_question(int(q["id"]))
+        if not item or item["status"] != "quarantined":
+            return
+        central.add_inbox(
+            project=q["project"], level="warning",
+            title=f"Neo could not decide backlog proposal {item['id']}",
+            body=f"NOBODY HAS JUDGED THIS — {detail[:200]}\nThe item stays quarantined.\n"
+                 f"{notify.neo_question_url(self.catalog, q['id'])}\n"
+                 f"Decide it: {backlog_neo.REVIEW_HINT.format(id=item['id'])}",
+            wo_id=None)
 
     @staticmethod
     def prompt_refusal_payload(
@@ -3560,6 +3591,13 @@ class Daemon:
                         central, self.catalog.os.morpheus, q, verdict,
                         notify.neo_question_url(self.catalog, q["id"]))
                     return
+                if q.get("kind") == "backlog":
+                    # Nobody waits either: the quarantined item is the subject (backlog-operability §5.2)
+                    from . import backlog_neo
+                    backlog_neo.record_neo_verdict(
+                        central, store, q, verdict,
+                        notify.neo_question_url(self.catalog, q["id"]))
+                    return
                 if q.get("kind") == "approval":
                     self._deliver_gate_verdict(central, pstore, q, verdict)
                 elif q.get("kind") == "plan":
@@ -3614,7 +3652,7 @@ class Daemon:
                     invariants.end_wait_if_nothing_is_out(pstore, q["wo_id"])
                 # `alarm` joins the two exclusions for a reason of its own: a cleanup work order dispatched off a...
                 if pstore and q.get("kind") not in ("approval", "plan", "alarm",
-                                                    "assumption", "findings"):
+                                                    "assumption", "findings", "backlog"):
                     self._dispatch_neo_cleanup(pstore, q, verdict)
             finally:
                 if pstore:
@@ -3624,6 +3662,9 @@ class Daemon:
             """The OS built a prompt past its own ceiling (spec §4)"""
             if q.get("kind") == "findings":
                 self._findings_question_unanswered(q, f"its prompt was too large: {error}")
+                return
+            if q.get("kind") == "backlog":
+                self._backlog_question_unanswered(central, q, f"its prompt was too large: {error}")
                 return
             ppath = paths.get(q["project"])
             if not (ppath and ppath.is_dir() and q.get("wo_id")):

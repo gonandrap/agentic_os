@@ -1421,6 +1421,43 @@ def test_a_transient_drop_strands_no_question_in_neo_attention(started):
     assert list(invariants.check_neo_escalations_are_live(store)) == []
 
 
+def test_a_backlog_question_goes_stale_once_its_item_leaves_quarantine(started, project):
+    """backlog-operability §5.3: closed only through `backlog.neo_question_id`"""
+    from jarvis.central_store import CentralStore
+    from jarvis.neo_store import NeoStore
+
+    central, neo = CentralStore(), NeoStore()
+    try:
+        asked = {}
+        for title in ("Exporter drops rows on retry", "Uploader retry storm"):
+            item = central.propose_backlog("proj_a", title, item_type="bug",
+                                           severity="critical", suggested_kind="wo",
+                                           origin_refs=[])
+            central.review_backlog(item["id"], "quarantined", rule="severity-claim",
+                                   note="claims critical")
+            q = neo.ask("proj_a", "", f"decide {item['id']}", kind="backlog")
+            neo.mark(q["id"], "escalated", reason="the user's call")
+            assert central.set_backlog_question(item["id"], q["id"])
+            asked[item["id"]] = q["id"]
+        live, gone = asked
+        central.review_backlog(gone, "dropped", rule="user", note="not a bug")
+    finally:
+        central.close()
+        neo.close()
+    store = ProjectStore(project)
+    try:
+        found = list(invariants.check_neo_escalations_are_live(store))
+    finally:
+        store.close()
+    assert [v.context["question_id"] for v in found] == [asked[gone]]
+    neo = NeoStore()
+    try:
+        assert neo.get(asked[gone])["answered_by"] == "os"
+        assert neo.get(asked[live])["status"] == "escalated"
+    finally:
+        neo.close()
+
+
 # -- a rebind: the round the OS's own merge costs nobody
 
 
