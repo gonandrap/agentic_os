@@ -1103,9 +1103,30 @@ def test_a_confirm_with_no_pull_request_escalates(central):
     assert "Monitoring order" in morpheus._why(asked[0][0])
 
 
-@pytest.mark.parametrize("call", [FakeCall(reply="no JSON here"), FakeCall(error=sigkilled()),
+def test_a_killed_judge_costs_no_attempt_until_max_kills_in_a_row(central):
+    """A release restart kills once: same rule as arming (kn-1e43fe1a, kn-40db1828)"""
+    item = _failed(central)
+    killer, asked = FakeCall(error=sigkilled()), []
+    for n in range(1, morpheus.MAX_KILLS):
+        assert _judge(central, central.morpheus_item(item["id"]), killer, asked=asked) == ""
+        after = central.morpheus_item(item["id"])
+        assert (after["action"], after["attempts"], after["kills"], after["state"]) == \
+            ("", 0, n, "failed")
+    assert [i["id"] for i in morpheus.owed_actions(central)] == [item["id"]]
+    _judge(central, central.morpheus_item(item["id"]), killer, asked=asked)
+    after = central.morpheus_item(item["id"])
+    assert (after["attempts"], after["kills"], after["action"]) == (1, 0, "")
+    assert asked == []
+    # An answer resets the run of kills
+    central.update_morpheus_item(item["id"], kills=1)
+    call = FakeCall(reply={"verdict": "escalate", "reason": "half deployed"})
+    _judge(central, central.morpheus_item(item["id"]), call, asked=asked)
+    assert central.morpheus_item(item["id"])["kills"] == 0
+
+
+@pytest.mark.parametrize("call", [FakeCall(reply="no JSON here"),
                                   FakeCall(error=claude_cli.ClaudeCliError("timed out"))],
-                         ids=["unparseable", "killed", "timeout"])
+                         ids=["unparseable", "timeout"])
 def test_a_judge_that_fails_releases_its_claim_then_escalates_without_a_verdict(central, call):
     item = _failed(central)
     asked = []
@@ -1683,7 +1704,8 @@ def test_orders_with_no_pr_coexist_and_mint_mo_ids(central):
     assert a["pr_number"] is None and b["pr_number"] is None
     assert (a["state"], a["script"], a["origin"], a["prompt"]) == \
         ("queued", "", "user", "watch the disk")
-    assert (b["state"], b["script_source"], b["every_minutes"]) == ("monitoring", "user", 5)
+    assert (b["state"], b["script"], b["script_source"], b["every_minutes"]) == \
+        ("queued", "exit 75", "user", 5)
     for bad in ({}, {"prompt": "x", "script": "exit 0"}):
         with pytest.raises(ValueError):
             morpheus.create(central, project="jarvis_os", title="t", **bad)
@@ -1691,10 +1713,44 @@ def test_orders_with_no_pr_coexist_and_mint_mo_ids(central):
     assert queued(central, 9)["id"].startswith("mo-")
 
 
+def test_a_user_script_is_queued_until_one_arm_session_validates_it(central, tmp_path,
+                                                                    monkeypatch):
+    """Spec §1: creating a script order opens a short session that validates it"""
+    item = morpheus.create(central, project="jarvis_os", title="cpu", script="exit 75")
+    assert morpheus.owed_arming(central, now=TEST_EPOCH)[0]["id"] == item["id"]
+    seen = []
+
+    def fake_run(args, **kw):
+        seen.append(list(args))
+        reply = json.dumps({"script": "exit 75\n", "notes": "keeps the contract"})
+        return json.dumps({"result": reply, "session_id": "s-1"})
+
+    monkeypatch.setattr(claude_cli, "_run", fake_run)
+    assert morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH)["armed"] == 1
+    assert len(seen) == 1 and "The user wrote this script" in " ".join(seen[0])
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["script"], after["script_source"]) == \
+        ("monitoring", "exit 75", "user")
+
+
+def test_mo_create_defaults_the_deadline_from_the_live_catalog(central, monkeypatch):
+    from jarvis import ops
+
+    assert MorpheusConfig().timeout_days != 5
+    monkeypatch.setattr(ops, "_morpheus_catalog", lambda: catalog(timeout_days=5))
+    monkeypatch.setattr("jarvis.db.now", lambda: TEST_EPOCH)
+    item = ops.mo_create("jarvis_os", "disk", prompt="watch the disk")
+    assert item["deadline_ts"] == TEST_EPOCH + 5 * DAY
+    # An explicit deadline still wins
+    item = ops.mo_create("jarvis_os", "cpu", prompt="watch the cpu", deadline="2d")
+    assert item["deadline_ts"] == TEST_EPOCH + 2 * DAY
+
+
 def test_check_honours_the_orders_own_interval(central, cfg, tmp_path):
     assert cfg.check_every_minutes != 7
     own = morpheus.create(central, project="jarvis_os", title="t", script="exit 75",
                           every_minutes=7)
+    morpheus.set_script(central, own["id"], "exit 75", "user")  # armed
     default = monitoring(central)
     for item in (own, default):
         morpheus.check(central, cfg, central.morpheus_item(item["id"]), tmp_path,
