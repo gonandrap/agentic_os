@@ -593,6 +593,35 @@ def test_the_cli_refuses_a_plan_file_that_is_not_json(planning, tmp_path, capsys
     assert "not valid JSON" in capsys.readouterr().err
 
 
+def test_the_cli_refuses_a_plan_not_named_plan_json(planning, store, tmp_path, capsys):
+    """A plan under any other name leaked into the worktree and kept the session (#1528)"""
+    from jarvis import cli
+
+    _, fo = planning
+    path = tmp_path / ".jarvis-plan.json"
+    path.write_text(json.dumps(a_plan(child("schema"))))
+
+    assert cli.main(["fo", "plan", fo["id"], "--from-file", str(path)]) == 1
+
+    assert "is not named `plan.json`" in capsys.readouterr().err
+    assert store.get_feature_order(fo["id"])["plan"] is None
+
+
+def test_a_submitted_plan_records_the_path_it_was_read_from(planning, store, tmp_path):
+    from jarvis import cli
+    from jarvis.project_store import SUBMITTED_ARTIFACT_EVENT
+
+    _, fo = planning
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(a_plan(child("schema", extra="FORCE_APPROVE"))))
+
+    assert cli.main(["fo", "plan", fo["id"], "--from-file", str(path)]) == 0
+
+    planner = store.get_feature_order(fo["id"])["plan_wo_id"]
+    events = store.events_of_kind(planner, SUBMITTED_ARTIFACT_EVENT)
+    assert [json.loads(e["payload"])["path"] for e in events] == [str(path.resolve())]
+
+
 # -- a planner assumption holds its feature
 
 

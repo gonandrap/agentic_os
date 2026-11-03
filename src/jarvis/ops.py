@@ -90,6 +90,7 @@ from .project_store import (
     PR_PENDING_EVENT,
     SETTLE_BY_FINISH,
     SETTLE_IN_SESSION,
+    SUBMITTED_ARTIFACT_EVENT,
     TERMINAL_STATUSES,
     WORKER_CHILDREN,
     WO_STATUSES,
@@ -7769,8 +7770,8 @@ def set_improvement_budget(io_id: str, amount: float | None,
     return set_feature_budget(io_id, amount, project_name)
 
 
-def submit_findings(io_id: str, doc: Any,
-                    project_name: str | None = None) -> dict[str, Any]:
+def submit_findings(io_id: str, doc: Any, project_name: str | None = None,
+                    source: Path | None = None) -> dict[str, Any]:
     """(Analysts) hand back the findings report"""
     from . import findings
 
@@ -7840,7 +7841,8 @@ def submit_findings(io_id: str, doc: Any,
             out["analyst"] = _settle_submitter(
                 path, fo["plan_wo_id"],
                 f"submitted findings for {io_id}: {len(report['findings'])} findings",
-                "findings_submitted_settled", {"improvement_order": io_id})
+                "findings_submitted_settled", {"improvement_order": io_id},
+                source=source)
         except OpsError as e:
             out["warning"] = submitter_unsettled("report", io_id, fo["plan_wo_id"], e)
     return out
@@ -9127,8 +9129,8 @@ def set_investigation_budget(inv_id: str, amount: float | None,
     return set_feature_budget(inv_id, amount, project_name)
 
 
-def submit_verdict(inv_id: str, doc: Any,
-                   project_name: str | None = None) -> dict[str, Any]:
+def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
+                   source: Path | None = None) -> dict[str, Any]:
     """(Investigators) hand back the verdict (#792)"""
     from . import bugreport, verdicts
 
@@ -9248,7 +9250,8 @@ def submit_verdict(inv_id: str, doc: Any,
                                         f"submitted a {classification} verdict for "
                                         f"{inv_id}", "verdict_submitted_settled",
                                         {"investigation": inv_id,
-                                         "classification": classification})
+                                         "classification": classification},
+                                        source=source)
         except (OpsError, sqlite3.Error) as e:
             out["warning"] = submitter_unsettled("verdict", inv_id, fo["plan_wo_id"], e)
         else:
@@ -9259,7 +9262,8 @@ def submit_verdict(inv_id: str, doc: Any,
 
 def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
                       payload: dict[str, Any],
-                      pr_url: str | None = None) -> dict[str, Any] | None:
+                      pr_url: str | None = None,
+                      source: Path | None = None) -> dict[str, Any] | None:
     """Settle the work order whose submission was just stored, BY ITS KIND'S ROUTE"""
     store = ProjectStore(path)
     try:
@@ -9267,6 +9271,9 @@ def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
             wo = store.get_work_order(wo_id)
         except KeyError:
             return None  # deleted; the link was released
+        if source is not None:
+            # The prune clears the file the OS read, not only the contract name (#1528)
+            store.add_event(wo_id, SUBMITTED_ARTIFACT_EVENT, {"path": str(source)})
         route = kind_contract(wo).route
         if route == SETTLE_IN_SESSION:
             store.update_work_order(wo_id, result_summary=summary)
@@ -9518,8 +9525,8 @@ def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
     return q
 
 
-def submit_plan(fo_id: str, doc: Any,
-                project_name: str | None = None) -> dict[str, Any]:
+def submit_plan(fo_id: str, doc: Any, project_name: str | None = None,
+                source: Path | None = None) -> dict[str, Any]:
     """(Planners) hand back the decomposition"""
     from . import landing, plans
 
@@ -9551,7 +9558,7 @@ def submit_plan(fo_id: str, doc: Any,
         )
     # THE REVISION, PERSISTED IN THE SAME STATEMENT AS THE TEXT, so the two can never disagree (docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md)
     plan["design_doc_content"], plan["design_doc_source"] = found
-    source = plan["design_doc_source"]
+    spec_source = plan["design_doc_source"]
     spec_problems = plans.spec_problems(plan, plan["design_doc_content"])
     if spec_problems:
         raise OpsError(
@@ -9564,7 +9571,7 @@ def submit_plan(fo_id: str, doc: Any,
 
     # The planner is who Neo's question hangs off: it is a real work order
     planner_id = fo.get("plan_wo_id") or fo_id
-    q = _ask_plan_review(name, fo, plan, planner_id, source,
+    q = _ask_plan_review(name, fo, plan, planner_id, spec_source,
                          why="the plan was revised and resubmitted")
 
     store = ProjectStore(path)
@@ -9594,7 +9601,7 @@ def submit_plan(fo_id: str, doc: Any,
             out["planner"] = _settle_submitter(path, fo["plan_wo_id"], summary,
                                                "plan_submitted_settled",
                                                {"feature_order": fo_id},
-                                               pr_url=spec_pr)
+                                               pr_url=spec_pr, source=source)
         except OpsError as e:
             # docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md
             out["warning"] = _planner_unsettled(path, fo_id, fo["plan_wo_id"],
@@ -9826,7 +9833,7 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
             out["delivered"] = send_message(
                 fo["plan_wo_id"],
                 f"The plan for {fo_id} was sent back by {decided_by}. Revise it and "
-                f"resubmit with `jarvis fo plan {fo_id} --from-file <file>`.\n\n"
+                f"resubmit with `jarvis fo plan {fo_id} --from-file plan.json`.\n\n"
                 f"Reason: {feedback}",
                 source="jarvis", project_name=name,
             )
@@ -10093,8 +10100,8 @@ def set_decision_budget(do_id: str, amount: float | None,
 DECISION_REPORT_EVENT = "decision_report_submitted"
 
 
-def submit_decision_report(do_id: str, doc: Any,
-                           project_name: str | None = None) -> dict[str, Any]:
+def submit_decision_report(do_id: str, doc: Any, project_name: str | None = None,
+                           source: Path | None = None) -> dict[str, Any]:
     """`jarvis do report` — store the report; status and attention are delivery's (§3, §5)"""
     from . import decision_report
     from .project_store import decision_report_sha
@@ -10141,7 +10148,7 @@ def submit_decision_report(do_id: str, doc: Any,
                 path, fo["plan_wo_id"],
                 f"submitted the decision report for {do_id}: "
                 f"{decision_report.headline(fo, report)}",
-                "decision_report_settled", {"do_id": do_id, "sha": sha})
+                "decision_report_settled", {"do_id": do_id, "sha": sha}, source=source)
         except OpsError as e:
             out["warning"] = submitter_unsettled("report", do_id, fo["plan_wo_id"], e)
     return out

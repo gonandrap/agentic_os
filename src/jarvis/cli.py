@@ -50,6 +50,27 @@ def _print(data: Any, as_json: bool) -> None:
         _pretty(data)
 
 
+def _read_submission(from_file: str, kind: str, noun: str) -> tuple[Any, Path]:
+    """Read a `--from-file` submission; only the kind's contract filename is taken (#1528)"""
+    from . import ops
+    from .project_store import WO_KIND_CONTRACTS
+
+    path = Path(from_file)
+    if not path.is_file():
+        raise ops.OpsError(f"no such {noun} file: {path}")
+    artifact = WO_KIND_CONTRACTS[kind].artifact
+    if path.name != artifact:
+        raise ops.OpsError(
+            f"{path} is not named `{artifact}`, and nothing was submitted: the {noun} "
+            f"must be written to `{artifact}` in your worktree root and submitted with "
+            f"`--from-file {artifact}`")
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
+    return doc, path.resolve()
+
+
 def _readable_conversation(detail: dict[str, Any]) -> dict[str, Any]:
     """A work order's document with the empty `void` markers dropped"""
     row = dict(detail)
@@ -1161,7 +1182,8 @@ def build_parser() -> argparse.ArgumentParser:
                                    "action, and what settles its work order")
     f.add_argument("fo_id")
     f.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
-                   help="the plan, as JSON. A file rather than an argument on purpose: "
+                   help="the plan, as JSON, in a file named plan.json. A file rather "
+                        "than an argument on purpose: "
                         "a plan is a long string full of repo paths, which is exactly "
                         "what trips the privileged-action classifier")
     f.add_argument("--project")
@@ -1257,7 +1279,8 @@ def build_parser() -> argparse.ArgumentParser:
                                      "work order")
     i.add_argument("io_id")
     i.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
-                   help="the report, as JSON. A file rather than an argument on purpose: "
+                   help="the report, as JSON, in a file named report.json. A file "
+                        "rather than an argument on purpose: "
                         "a report is a long string full of quoted output, which is "
                         "exactly what trips the privileged-action classifier")
     i.add_argument("--project")
@@ -1350,7 +1373,8 @@ def build_parser() -> argparse.ArgumentParser:
                                        "the order")
     v.add_argument("inv_id")
     v.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
-                   help="the verdict, as JSON. A file rather than an argument on purpose: "
+                   help="the verdict, as JSON, in a file named verdict.json. A file "
+                        "rather than an argument on purpose: "
                         "a verdict is full of repo paths and quoted log lines, which is "
                         "exactly what trips the privileged-action classifier")
     v.add_argument("--project")
@@ -1390,7 +1414,8 @@ def build_parser() -> argparse.ArgumentParser:
                                       "researcher's finish; the order stays open for you")
     d.add_argument("do_id")
     d.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
-                   help="the report, as JSON; `-` reads stdin. A file rather than an "
+                   help="the report, as JSON, in a file named report.json; `-` reads "
+                        "stdin. A file rather than an "
                         "argument: a report full of quoted output trips the "
                         "privileged-action classifier")
     d.add_argument("--project")
@@ -4015,8 +4040,6 @@ FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executi
 
 
 def cmd_fo(args: argparse.Namespace) -> int:
-    import json as _json
-
     from . import ops
 
     if args.fo_cmd == "create":
@@ -4111,14 +4134,9 @@ def cmd_fo(args: argparse.Namespace) -> int:
                           f"({c['status_label']}{sup}){att}")
 
     elif args.fo_cmd == "plan":
-        path = Path(args.from_file)
-        if not path.is_file():
-            raise ops.OpsError(f"no such plan file: {path}")
-        try:
-            doc = _json.loads(path.read_text())
-        except _json.JSONDecodeError as e:
-            raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
-        _print(ops.submit_plan(args.fo_id, doc, project_name=args.project), args.json)
+        doc, source = _read_submission(args.from_file, "planner", "plan")
+        _print(ops.submit_plan(args.fo_id, doc, project_name=args.project,
+                               source=source), args.json)
 
     elif args.fo_cmd == "submit":
         _print(ops.submit_feature(args.fo_id, args.summary, evidence=args.evidence,
@@ -4250,15 +4268,9 @@ def cmd_io(args: argparse.Namespace) -> int:
         _print(ops.ask_neo_about_findings(args.io_id, args.project), args.json)
 
     elif args.io_cmd == "report":
-        path = Path(args.from_file)
-        if not path.is_file():
-            raise ops.OpsError(f"no such report file: {path}")
-        try:
-            doc = json.loads(path.read_text())
-        except json.JSONDecodeError as e:
-            raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
-        _print(ops.submit_findings(args.io_id, doc, project_name=args.project),
-               args.json)
+        doc, source = _read_submission(args.from_file, "analyst", "report")
+        _print(ops.submit_findings(args.io_id, doc, project_name=args.project,
+                                   source=source), args.json)
 
     elif args.io_cmd == "cancel":
         _print(ops.cancel_improvement_order(args.io_id, args.project), args.json)
@@ -4549,19 +4561,16 @@ def cmd_do(args: argparse.Namespace) -> int:
                                            all_=args.all, again=args.again), args.json)
 
     elif args.do_cmd == "report":
+        source = None
         if args.from_file == "-":
-            text, where = sys.stdin.read(), "stdin"
+            try:
+                doc = json.loads(sys.stdin.read())
+            except json.JSONDecodeError as e:
+                raise ops.OpsError(f"stdin is not valid JSON: {e}") from e
         else:
-            path = Path(args.from_file)
-            if not path.is_file():
-                raise ops.OpsError(f"no such report file: {path}")
-            text, where = path.read_text(), str(path)
-        try:
-            doc = json.loads(text)
-        except json.JSONDecodeError as e:
-            raise ops.OpsError(f"{where} is not valid JSON: {e}") from e
-        _print(ops.submit_decision_report(args.do_id, doc, project_name=args.project),
-               args.json)
+            doc, source = _read_submission(args.from_file, "researcher", "report")
+        _print(ops.submit_decision_report(args.do_id, doc, project_name=args.project,
+                                          source=source), args.json)
 
     elif args.do_cmd == "send":
         _print(ops.send_decision_message(args.do_id, args.message, args.project,
@@ -4663,15 +4672,9 @@ def cmd_investigate(args: argparse.Namespace) -> int:
                    args.json)
 
     elif args.inv_cmd == "verdict":
-        path = Path(args.from_file)
-        if not path.is_file():
-            raise ops.OpsError(f"no such verdict file: {path}")
-        try:
-            doc = json.loads(path.read_text())
-        except json.JSONDecodeError as e:
-            raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
-        _print(ops.submit_verdict(args.inv_id, doc, project_name=args.project),
-               args.json)
+        doc, source = _read_submission(args.from_file, "investigator", "verdict")
+        _print(ops.submit_verdict(args.inv_id, doc, project_name=args.project,
+                                  source=source), args.json)
 
     return 0
 
