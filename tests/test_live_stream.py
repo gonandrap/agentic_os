@@ -1,4 +1,4 @@
-"""The current turn's events, line by line — what the debug page's terminal modal tails"""
+"""The worker conversation, line by line and a page at a time"""
 
 from __future__ import annotations
 
@@ -59,29 +59,114 @@ def append(path: Path, rows: list[dict]) -> None:
         handle.write("".join(json.dumps(r) + "\n" for r in rows))
 
 
+def steps(path: Path, count: int, *, start: float = 1000.0) -> None:
+    write(path, [prompt_row(start, "go"),
+                 *[text_row(start + n, f"m{n}", f"step {n}") for n in range(count)]])
+
+
+def texts(payload: dict) -> list[str]:
+    return [line["text"] for line in payload["lines"]]
+
+
 def kinds(payload: dict) -> list[str]:
     return [line["kind"] for line in payload["lines"]]
 
 
-# -- the window is ONE turn
+# -- one numbering, over the whole conversation
 
 
-def test_only_the_current_turns_events_are_returned_anchored_at_its_prompt(transcript):
-    """"from the start of this turn" — the previous turn's lines are gone, not scrolled past"""
+def test_every_event_is_numbered_forward_and_names_the_turn_it_belongs_to(transcript):
+    """Paging back crosses turn boundaries, so the seq cannot restart at each one"""
     write(transcript, [
         prompt_row(1000, "the first ask"),
         text_row(1005, "m1", "done with that"),
         prompt_row(1010, "the second ask"),
-        *[tool_use_row(1020, "t1", "Bash", {"command": "pytest -q"})],
+        tool_use_row(1020, "t1", "Bash", {"command": "pytest -q"}),
         tool_result_row(1025, "t1"),
     ])
 
-    payload = live.turn_lines(transcript)
+    payload = live.conversation_lines(transcript, limit=10)
 
+    assert [line["seq"] for line in payload["lines"]] == [1, 2, 3, 4, 5]
+    assert [line["turn"] for line in payload["lines"]] == [1, 1, 2, 2, 2]
+    assert kinds(payload) == ["prompt", "text", "prompt", "tool", "result"]
     assert payload["turn"] == {"seq": 2, "started": 1010.0}
-    assert kinds(payload) == ["prompt", "tool", "result"]
-    assert payload["lines"][0]["text"] == "the second ask"
-    assert "the first ask" not in json.dumps(payload)
+    assert payload["total"] == 5
+
+
+def test_the_default_window_is_the_tail_and_says_there_is_more_before_it(transcript):
+    """A modal opened an hour in shows the end of the conversation, not its start"""
+    steps(transcript, 20)
+
+    payload = live.conversation_lines(transcript, limit=5)
+
+    assert texts(payload) == [f"step {n}" for n in range(15, 20)]
+    assert payload["first"] == 17 and payload["cursor"] == 21
+    assert payload["more_before"] is True
+    assert payload["total"] == 21
+
+
+def test_a_window_that_reaches_the_first_line_says_there_is_nothing_before_it(transcript):
+    steps(transcript, 3)
+
+    payload = live.conversation_lines(transcript, limit=50)
+
+    assert payload["first"] == 1 and payload["more_before"] is False
+    assert len(payload["lines"]) == payload["total"] == 4
+
+
+def test_before_returns_the_page_immediately_preceding_that_line(transcript):
+    """The "load more" button: one page older, on demand, never the whole conversation"""
+    steps(transcript, 20)
+    tail = live.conversation_lines(transcript, limit=5)
+
+    older = live.conversation_lines(transcript, limit=5, before=tail["first"])
+
+    assert texts(older) == [f"step {n}" for n in range(10, 15)]
+    assert older["cursor"] == tail["first"] - 1
+    assert older["more_before"] is True
+    # …and the page before THAT one reaches the prompt the conversation opened with
+    oldest = live.conversation_lines(transcript, limit=50, before=older["first"])
+    assert oldest["lines"][0]["kind"] == "prompt"
+    assert oldest["more_before"] is False
+
+
+def test_after_returns_only_what_arrived_since_the_cursor(transcript):
+    """The live poll: the modal appends rather than re-rendering what it already holds"""
+    steps(transcript, 3)
+    seen = live.conversation_lines(transcript, limit=50)
+    append(transcript, [text_row(1100, "m-new", "step 3")])
+
+    fresh = live.conversation_lines(transcript, limit=50, after=seen["cursor"])
+
+    assert texts(fresh) == ["step 3"]
+    assert fresh["first"] == fresh["cursor"] == seen["cursor"] + 1
+
+
+def test_a_poll_that_fell_behind_takes_one_page_at_a_time(transcript):
+    """`after` is capped like every other window: nothing returns the whole conversation"""
+    steps(transcript, 20)
+
+    caught_up = live.conversation_lines(transcript, limit=5, after=1)
+
+    assert texts(caught_up) == [f"step {n}" for n in range(0, 5)]
+    assert caught_up["cursor"] == 6
+    assert caught_up["total"] == 21  # and the payload says how far behind it still is
+
+
+def test_a_lines_number_does_not_shift_when_the_conversation_grows(transcript):
+    write(transcript, [prompt_row(1000, "go"), text_row(1010, "m1", "first")])
+    before = live.conversation_lines(transcript, limit=50)["lines"]
+
+    append(transcript, [text_row(1020, "m2", "second")])
+    after = live.conversation_lines(transcript, limit=50)["lines"]
+
+    assert [line["seq"] for line in before] == [1, 2]
+    assert [line["seq"] for line in after] == [1, 2, 3]
+    assert after[:2] == before
+
+
+# -- what one line carries
 
 
 def test_a_tool_call_carries_its_name_its_detail_and_its_redacted_parameters(transcript):
@@ -92,7 +177,7 @@ def test_a_tool_call_carries_its_name_its_detail_and_its_redacted_parameters(tra
                      {"command": "deploy --now", "api_key": "sk-abcdef123456"}),
     ])
 
-    (_prompt, call) = live.turn_lines(transcript)["lines"]
+    (_prompt, call) = live.conversation_lines(transcript, limit=10)["lines"]
 
     assert call["kind"] == "tool"
     assert call["text"] == "Bash"
@@ -108,7 +193,7 @@ def test_a_result_line_names_the_tool_it_closed_and_quotes_its_head(transcript):
         tool_result_row(1015, "t1", "3 passed"),
     ])
 
-    result = live.turn_lines(transcript)["lines"][-1]
+    result = live.conversation_lines(transcript, limit=10)["lines"][-1]
 
     assert result["kind"] == "result"
     assert result["text"] == "Bash"
@@ -118,45 +203,18 @@ def test_a_result_line_names_the_tool_it_closed_and_quotes_its_head(transcript):
 def test_an_assistant_message_is_a_line_of_its_own(transcript):
     write(transcript, [prompt_row(1000, "go"), text_row(1010, "m1", "reading the code")])
 
-    said = live.turn_lines(transcript)["lines"][-1]
+    said = live.conversation_lines(transcript, limit=10)["lines"][-1]
 
     assert said["kind"] == "text"
     assert said["text"] == "reading the code"
 
 
-def test_a_long_turn_keeps_the_last_lines_and_says_how_many_it_dropped(transcript):
-    """A modal opened an hour into a turn must not ship the whole hour"""
-    rows = [prompt_row(1000, "go")]
-    for n in range(20):
-        rows.append(text_row(1000 + n, f"m{n}", f"step {n}"))
-    write(transcript, rows)
-
-    payload = live.turn_lines(transcript, cap=5)
-
-    assert len(payload["lines"]) == 5
-    assert payload["dropped"] == 16  # the prompt and the first 15 steps
-    assert payload["lines"][-1]["text"] == "step 19"
-    assert payload["cursor"] == 21
-
-
-def test_a_lines_number_does_not_shift_when_the_turn_grows(transcript):
-    """The cursor the modal polls with: a seq that renumbered would replay or skip lines"""
-    write(transcript, [prompt_row(1000, "go"), text_row(1010, "m1", "first")])
-    before = live.turn_lines(transcript)["lines"]
-
-    append(transcript, [text_row(1020, "m2", "second")])
-    after = live.turn_lines(transcript)["lines"]
-
-    assert [line["seq"] for line in before] == [1, 2]
-    assert [line["seq"] for line in after] == [1, 2, 3]
-    assert after[:2] == before
-
-
 def test_a_transcript_that_is_not_there_is_an_empty_window_and_not_an_error(tmp_path):
-    payload = live.turn_lines(tmp_path / "gone.jsonl")
+    empty = {"turn": None, "lines": [], "first": 0, "cursor": 0, "total": 0,
+             "more_before": False}
 
-    assert payload == {"turn": None, "lines": [], "cursor": 0, "dropped": 0}
-    assert live.turn_lines(None) == payload
+    assert live.conversation_lines(tmp_path / "gone.jsonl", limit=10) == empty
+    assert live.conversation_lines(None, limit=10) == empty
 
 
 def test_a_session_with_no_transcript_resolves_to_no_path(tmp_path, monkeypatch):
@@ -166,3 +224,40 @@ def test_a_session_with_no_transcript_resolves_to_no_path(tmp_path, monkeypatch)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
 
     assert live.transcript_of("nobody-here") is None
+
+
+# -- the page size is the catalog's
+
+
+def test_the_page_size_is_a_per_project_catalog_setting(tmp_path):
+    from jarvis.catalog import InspectConfig, load_catalog
+
+    assert InspectConfig().stream_lines == live.STREAM_LINES
+
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({
+        "os": {"inspect": {"stream_lines": 50}},
+        "projects": [{"name": "proj_a", "path": str(tmp_path),
+                      "inspect": {"stream_lines": 25}},
+                     {"name": "proj_b", "path": str(tmp_path)}],
+    }))
+
+    catalog = load_catalog(path)
+
+    assert catalog.os.inspect.stream_lines == 50
+    assert {p.name: p.inspect.stream_lines for p in catalog.projects} == {
+        "proj_a": 25, "proj_b": 50}
+
+
+def test_a_page_size_below_one_is_refused(tmp_path):
+    """`_parse_inspect`'s floor: a window of zero lines is a modal that never fills"""
+    from jarvis.catalog import CatalogError, load_catalog
+
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({
+        "os": {"inspect": {"stream_lines": 0}},
+        "projects": [{"name": "proj_a", "path": str(tmp_path)}],
+    }))
+
+    with pytest.raises(CatalogError, match="stream_lines"):
+        load_catalog(path)

@@ -374,6 +374,9 @@ DEFAULT_INSPECT_REPORT_JOIN_FLOOR = 30
 #: How much of a turn's triggering prompt is quoted
 DEFAULT_INSPECT_QUOTE_CHARS = 140
 
+#: How many lines of a worker conversation one window of the terminal modal carries
+DEFAULT_INSPECT_STREAM_LINES = 400
+
 #: A turn still running after this long is burning money now
 DEFAULT_INSPECT_ALARM_TURN_MINUTES = 60
 
@@ -441,6 +444,7 @@ class InspectConfig:
     report_write_floor: int = DEFAULT_INSPECT_REPORT_WRITE_FLOOR
     report_join_floor: int = DEFAULT_INSPECT_REPORT_JOIN_FLOOR
     quote_chars: int = DEFAULT_INSPECT_QUOTE_CHARS
+    stream_lines: int = DEFAULT_INSPECT_STREAM_LINES
     alarm_turn_minutes: int = DEFAULT_INSPECT_ALARM_TURN_MINUTES
     alarm_stalled_minutes: int = DEFAULT_INSPECT_ALARM_STALLED_MINUTES
     alarm_awaiting_minutes: int = DEFAULT_INSPECT_ALARM_AWAITING_MINUTES
@@ -1505,6 +1509,7 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                        base.report_write_floor)),
         report_join_floor=int(raw.get("report_join_floor", base.report_join_floor)),
         quote_chars=int(raw.get("quote_chars", base.quote_chars)),
+        stream_lines=int(raw.get("stream_lines", base.stream_lines)),
         alarm_turn_minutes=int(raw.get("alarm_turn_minutes",
                                        base.alarm_turn_minutes)),
         alarm_stalled_minutes=int(raw.get("alarm_stalled_minutes",

@@ -13,7 +13,8 @@ from typing import Any, Sequence
 
 from . import inspection
 from . import usage as usage_mod
-from .catalog import DEFAULT_INSPECT_QUOTE_CHARS, DEFAULT_INSPECT_REPORT_WRITE_FLOOR
+from .catalog import (DEFAULT_INSPECT_QUOTE_CHARS, DEFAULT_INSPECT_REPORT_WRITE_FLOOR,
+                      DEFAULT_INSPECT_STREAM_LINES)
 from .holds import Hold
 
 #: Every state a frame can be in, in the order they are decided (Neo q678)
@@ -33,8 +34,8 @@ REDACTED = "[redacted]"
 #: Same width `jarvis inspect` quotes a prompt at by default, borrowed as a literal
 QUOTE_CHARS = DEFAULT_INSPECT_QUOTE_CHARS
 
-#: How many lines of the current turn one `turn_lines` window carries
-STREAM_LINES = 400
+#: One window of `conversation_lines`, when no project config says otherwise
+STREAM_LINES = DEFAULT_INSPECT_STREAM_LINES
 
 #: The width a streamed message or tool result is rendered at
 STREAM_CHARS = 2000
@@ -466,29 +467,39 @@ def transcript_of(session_id: str, *, root: Path | None = None,
     return max(paths, key=_mtime) if paths else None
 
 
-# -- the current turn, line by line (the debugging page's terminal modal)
+# -- the conversation, line by line and a page at a time (the terminal modal)
 
 
-def turn_lines(path: Path | str | None, *, cap: int = STREAM_LINES,
-               chars: int = STREAM_CHARS) -> dict[str, Any]:
-    """Every event since the CURRENT turn's prompt, oldest first — a previous turn's lines are dropped, not scrolled past"""
-    empty: dict[str, Any] = {"turn": None, "lines": [], "cursor": 0, "dropped": 0}
+def conversation_lines(path: Path | str | None, *, limit: int = STREAM_LINES,
+                       after: int | None = None, before: int | None = None,
+                       chars: int = STREAM_CHARS) -> dict[str, Any]:
+    """One page of a worker conversation, oldest line first"""
+    # No window named is the TAIL; `after` pages forward from a cursor, `before` back
+    empty: dict[str, Any] = {"turn": None, "lines": [], "first": 0, "cursor": 0,
+                             "total": 0, "more_before": False}
     if path is None:
         return empty
     turn: dict[str, Any] | None = None
     lines: list[dict[str, Any]] = []
-    cursor = dropped = 0
+    total = turn_seq = 0
     saw_assistant = False
     tools: dict[str, str] = {}
 
     def add(kind: str, ts: float, text: str, detail: str = "",
             params: dict[str, str] | None = None) -> None:
-        nonlocal cursor, dropped
-        cursor += 1
-        lines.append({"seq": cursor, "ts": ts, "clock": clock(ts), "kind": kind,
-                      "text": text, "detail": detail, "params": params or {}})
-        del lines[:max(0, len(lines) - cap)]
-        dropped = cursor - len(lines)
+        nonlocal total
+        total += 1
+        if (before is not None and total >= before) or (after is not None
+                                                        and total <= after):
+            return
+        lines.append({"seq": total, "turn": turn_seq, "ts": ts, "clock": clock(ts),
+                      "kind": kind, "text": text, "detail": detail,
+                      "params": params or {}})
+        # `after` pages FORWARD from the cursor, so it keeps the oldest of the window
+        if after is not None:
+            del lines[limit:]
+        else:
+            del lines[:max(0, len(lines) - limit)]
 
     for row in usage_mod.rows(path):
         if not isinstance(row, dict) or row.get("type") in usage_mod.REPLAY_ROW_TYPES:
@@ -498,9 +509,8 @@ def turn_lines(path: Path | str | None, *, cap: int = STREAM_LINES,
         if prompt is not None:
             # The turn boundary is `Reader._row`'s, which is `inspection.read_transcript`'s
             if turn is None or saw_assistant:
-                turn = {"seq": (turn["seq"] + 1 if turn else 1), "started": ts}
-                lines.clear()
-                cursor = dropped = 0
+                turn_seq += 1
+                turn = {"seq": turn_seq, "started": ts}
                 saw_assistant = False
             add("prompt", ts, prompt.quote)
             continue
@@ -520,8 +530,12 @@ def turn_lines(path: Path | str | None, *, cap: int = STREAM_LINES,
         for block in usage_mod.blocks_of(row, "tool_result"):
             add("result", ts, tools.get(str(block.get("tool_use_id") or ""), ""),
                 _result_head(block, chars))
-    return (empty if turn is None
-            else {"turn": turn, "lines": lines, "cursor": cursor, "dropped": dropped})
+    if turn is None:
+        return empty
+    first = lines[0]["seq"] if lines else 0
+    return {"turn": turn, "lines": lines, "first": first,
+            "cursor": lines[-1]["seq"] if lines else 0, "total": total,
+            "more_before": first > 1}
 
 
 def _result_head(block: dict[str, Any], chars: int) -> str:

@@ -536,8 +536,18 @@ def test_tool_parameters_are_html_escaped(client, dispatched, transcripts):
 # -- 11. the terminal modal: the current turn, line by line
 
 
-def _streamed(client, wo_id: str, after: int = 0):
-    return client.get(f"/api/wo/proj_a/{wo_id}/stream", params={"after": after})
+def _streamed(client, wo_id: str, **params):
+    return client.get(f"/api/wo/proj_a/{wo_id}/stream", params=params)
+
+
+def _said(store, wo_id: str, transcripts, session: str, count: int) -> None:
+    """A conversation of `count` assistant lines after the turn's own prompt"""
+    at = _inside(store, wo_id, 1)
+    transcripts(session, [prompt_row(at, "go"),
+                          *[assistant_row(at + n, f"m{n}",
+                                          content=[{"type": "text",
+                                                    "text": f"step {n}"}])
+                            for n in range(count)]])
 
 
 def test_the_stream_json_route_is_the_payload_verbatim(client, dispatched, transcripts):
@@ -555,6 +565,27 @@ def test_the_stream_json_route_is_the_payload_verbatim(client, dispatched, trans
     assert [line["kind"] for line in got.json()["lines"]] == ["prompt", "tool", "result"]
     assert got.json()["session_id"] == dispatched["session"]
     assert got.json()["found"] is True
+    assert got.json()["more_before"] is False
+
+
+def test_the_stream_route_pages_back_through_the_conversation_on_demand(
+        client, dispatched, transcripts, monkeypatch):
+    """The modal asks for one page at a time; nothing returns the whole conversation"""
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    _said(store, wo_id, transcripts, dispatched["session"], 20)
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    ops.set_config("inspect.stream_lines", 5, "proj_a", reason="a small page")
+
+    tail = _streamed(client, wo_id).json()
+    older = _streamed(client, wo_id, before=tail["first"]).json()
+
+    assert tail["limit"] == 5
+    assert [line["text"] for line in tail["lines"]] == [f"step {n}"
+                                                        for n in range(15, 20)]
+    assert tail["more_before"] is True and tail["total"] == 21
+    assert [line["text"] for line in older["lines"]] == [f"step {n}"
+                                                         for n in range(10, 15)]
+    assert older["cursor"] == tail["first"] - 1
 
 
 def test_the_stream_route_returns_only_the_lines_after_the_cursor(client, dispatched,
@@ -607,7 +638,9 @@ def test_the_live_block_opens_a_terminal_modal_that_polls_the_stream_route(clien
 
     assert 'id="pty-modal"' in page
     assert f"/api/wo/proj_a/{wo_id}/stream" in page
-    assert "from the start of this turn" in page
+    # The on-demand half: a button that asks for the page before the one on screen
+    assert 'id="pty-more"' in page
+    assert "before=" in page
 
 
 def test_the_streamed_lines_are_html_escaped_by_the_modal_never_interpolated(client,

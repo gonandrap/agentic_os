@@ -1773,10 +1773,12 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": str(e)}, status_code=404)
 
     @app.get("/api/wo/{name}/{wo_id}/stream")
-    def work_order_stream(name: str, wo_id: str, after: int = 0):
+    def work_order_stream(name: str, wo_id: str, after: int | None = None,
+                          before: int | None = None):
         """`ops.live_stream` as JSON, nothing reshaped — what the terminal modal tails"""
         try:
-            return JSONResponse(ops.live_stream(wo_id, name, after=after))
+            return JSONResponse(ops.live_stream(wo_id, name, after=after,
+                                                before=before))
         except ops.OpsError as e:
             return JSONResponse({"error": str(e)}, status_code=404)
 
