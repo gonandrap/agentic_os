@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from jarvis import ops, search
+from jarvis import morpheus, ops, search
 from jarvis.cli import build_parser
 from jarvis.central_store import CentralStore
 from jarvis.neo_store import NeoStore
@@ -119,6 +119,8 @@ def _one_of_every_kind():
         item = central.add_backlog("proj_a", "retire the login spinner")
         kn = central.add_knowledge("the login spinner is driven by a cold cache",
                                    project="proj_a", topic="ui")
+        mo = morpheus.create(central, project="proj_a", title="watch the login spinner",
+                             prompt="it stops within a second")
     finally:
         central.close()
     neo = NeoStore()
@@ -130,7 +132,7 @@ def _one_of_every_kind():
     return {"work_order": wo_id, "feature_order": fo["id"], "decision": do["id"],
             "alarm": alarm["id"],
             "gate": gate_id, "backlog": item["id"], "neo_question": str(qid),
-            "knowledge": kn["id"]}
+            "knowledge": kn["id"], "monitoring": mo["id"]}
 
 
 def test_every_kind_is_searched(started):

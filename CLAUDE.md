@@ -38,19 +38,19 @@ operator: route, don't do.
 
 ## Command crib sheet
 
-One line each. Before using a command you have not used this session, read its
+Before using a command you have not used this session, read its
 `jarvis <command> --help`; the reasoning behind each one is in `docs/os/operator/*.md`
 (map: `docs/os/index.md`).
 
 ```bash
 jarvis status [--json] [--attention]       # whole-OS pulse; --attention = the short list
-jarvis start --catalog <path> / jarvis stop  # boot / shut down the OS (catalogs/ is untracked)
+jarvis start --catalog <path> / jarvis stop  # boot / shut down (catalogs/ is untracked)
 jarvis pause [--allow <wo-id,...>] [--reason "…"]   # THE BRAKE when spend runs away; never kill processes
 jarvis resume <wo-id...> | --all           # let named orders through a pause, or lift it
 jarvis wo create <project> "title" -d "details" [--model m] [--budget usd]
 jarvis wo create ... --depends-on <wo-id,...>   # dispatch only after those COMPLETE (same project)
 jarvis wo unblock <id> [--all]             # cut dead dependency edges; --all cuts live ones too
-jarvis fo create <project> "title" -d "..."     # FEATURE order: too big for one session; it plans itself
+jarvis fo create <project> "title" -d "..."     # FEATURE order: too big for one session; plans itself
 jarvis fo list [project] / show <id>       # show = the plan + the child tree
 jarvis fo approve <id> [--reject] [--feedback "why"]   # only when Neo escalated the plan
 jarvis fo cancel <id>                      # stops the planner and every child
@@ -63,9 +63,10 @@ jarvis io ask-neo <id>                     # put findings awaiting you (back) to
 jarvis io cancel <id>                      # filed orders from accepted findings stay
 jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settles itself; a GAP files an issue, dispatches nothing
 jarvis investigate list / show <inv-id> / cancel <inv-id>
-jarvis do create <project> "title" -d "<the decision; what data settles it>"  # "do" = decision order: data for YOUR call; never self-closes
+jarvis do create <project> "title" -d "<the decision; what data settles it>"  # decision order: data for YOUR call; never self-closes
 jarvis do show|send|follow-up|done|cancel <id>
-jarvis morpheus status / show|waive|requeue <mv-id> / pause|unpause|follow-fleet   # PRs validated in prod; own brake
+jarvis mo create <project> "title" --prompt "…"|--script f [--every 15m] [--deadline 3d]
+jarvis mo list|show|cancel|waive|requeue|rewrite|confirm / pause|unpause|follow-fleet   # `jarvis morpheus` = alias
 jarvis backlog promote <id> --as feature   # intake -> feature order
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
@@ -74,13 +75,13 @@ jarvis wo budget <id> [<usd>] [--clear]    # dollar ceiling on one order; raisin
 jarvis fo budget <id> [<usd>] [--clear]    # family budget for a whole feature
 jarvis wo ack <id> / --all                 # "seen it" — refuses on pending assumptions
 jarvis wo done <id>                        # user closes it; PR-parked orders close themselves on merge
-jarvis wo pr <id> <url>                    # record a PR the user opened by hand for a pushed branch
+jarvis wo pr <id> <url>                    # record a hand-opened PR for a pushed branch
 jarvis wo hide <id> / unhide <id>          # declutter, record kept
 jarvis wo expedite <id> [--off]            # its merge ships ALONE: latest tag + cherry-pick
 jarvis wo delete <id> --yes                # irreversible
 jarvis wo resume-auto <id>                 # what is it ACTUALLY waiting on?
 jarvis wo retry <id> [--message "…"]       # relaunch a FAILED order in its own session; never automatic
-jarvis wo inject <session-id>              # hand the user's own Claude session to Jarvis
+jarvis wo inject <session-id>              # hand the user's Claude session to Jarvis
 jarvis validation show <wo-id|fo-id>       # WHY a unit was judged as it was (on demand only)
 jarvis validation force <wo-id> --reason "…"    # re-judge a delivered order against the current PR
 jarvis search "<words>" [--project p] [--kind k]   # find any record again, settled and hidden included
@@ -97,15 +98,15 @@ jarvis learn add "insight" [--project p] [--pin] / search <term> [--project p]
 jarvis learn show <kn-id> / list [--topic t] / topics / pin <id> / unpin <id>
 jarvis learn stats [--project p] [--days n] / retract <id> --reason "…"
 jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority> [--expedite]
-jarvis config wiring [project]             # which of the user's MCP servers/skills/plugins reach workers
+jarvis config wiring [project]             # which user MCP servers/skills/plugins reach workers
 jarvis config set <project> <key> <value> --reason "…"
 jarvis doctor [project] [--repair]         # the OS's own post-conditions
-jarvis cost [project|wo-id|fo-id]          # tokens: worker half + Jarvis's own half
+jarvis cost [project|wo-id|fo-id|mo-id]    # tokens: worker half + Jarvis's own half
 jarvis inspect <wo-id|fo-id>               # where the TIME went, and why each cache write happened
 jarvis alarms [project]                    # turns the OS flagged while they burned
-jarvis steward ledger|decisions|why <wo-id>|digest   # what the OS may spend on ITSELF, and each decision's rule
+jarvis steward ledger|decisions|why <wo-id>|digest   # OS spend on ITSELF, and each decision's rule
 jarvis adopt <path>                        # migrate a project into the OS
-jarvis offboard <name> [--dry-run] [--force] [--purge --yes] --reason "…"   # take it out; archive keeps history, purge is irreversible
+jarvis offboard <name> [--dry-run] [--force] [--purge --yes] --reason "…"   # archive keeps history; purge is irreversible
 jarvis onboard start <path>                # interview: user picks its settings, one config version
 jarvis ui                                  # dashboard at http://127.0.0.1:8787
 ```
@@ -132,8 +133,7 @@ Rules that cost the user if forgotten:
 ## Understanding the code — never re-derive it
 
 The knowledge map is `docs/os/index.md` (an OKF bundle: index, then playbooks, then
-concepts). Serena is activated for this project and the code map is committed, so it
-ships with every release. Read the memories before exploring the tree:
+concepts). Serena is activated; its code map is committed and ships with every release. Read the memories before exploring the tree:
 
 | Memory | What it answers |
 |---|---|

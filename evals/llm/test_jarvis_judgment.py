@@ -60,6 +60,9 @@ ROUTING = [
     # Decision orders (docs/superpowers/specs/2026-10-31-decision-orders.md §7)
     ("decision-data", "In jarvis_os, gather the cost data so I can decide whether to "
      "drop the validation panel.", ["jarvis do create jarvis_os"]),
+    # Monitoring orders: the crib keeps Morpheus's brake (2026-11-01-monitoring-orders.md §7)
+    ("monitoring-brake", "Stop Morpheus validating releases in production for now.",
+     ["jarvis mo pause", "jarvis morpheus pause"]),
 ]
 
 
