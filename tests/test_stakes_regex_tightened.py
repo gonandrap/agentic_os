@@ -17,6 +17,15 @@ TIGHTENED_TABLE = [
     ("delete-data", "Deleted the six orphaned rows rather than repointing them.", True),
     ("delete-table", "Dropped the stale sessions table after copying it out.", True),
     ("delete-live", "Deleted the duplicates in the live database by hand.", True),
+    # issue 1532: a participle naming a record STATE (backlog status `dropped`)
+    ("dropped-state",
+     "Duplicates folded into an item are computed in ops.show_backlog as a new "
+     "duplicates key (dropped rows of the same project whose duplicate_of is this "
+     "id), not in the UI route.", False),
+    ("deleted-state", "The sweep skips deleted records and archived ones.", False),
+    ("drop-column", "Drop the column once the readers are gone.", True),
+    ("delete-rows", "Delete the rows the backfill duplicated.", True),
+    ("dropping-rows", "Dropping rows older than a week keeps the table small.", True),
     ("on-delete-cascade",
      "The child table declares ON DELETE CASCADE, so the schema needs no trigger.",
      False),
