@@ -4266,6 +4266,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
                 return park_pr_pending(store, wo, stranding)
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
+    if status == "completed" and (owed := declared_user_action(store, wo_id)):
+        return park_user_action(store, wo, owed)
     # Spec §C of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md
     store.set_status(wo_id, status, trigger="landed")
     store.clear_attention(wo_id)
@@ -4365,6 +4367,35 @@ def park_pr_pending(store: ProjectStore, wo: dict[str, Any],
     store.add_event(wo["id"], PR_PENDING_EVENT, park)
     store.set_status(wo["id"], "needs_review")
     store.flag_attention(wo["id"], pr_pending_blocker(wo["id"], park))
+    return "needs_review"
+
+
+def declared_user_action(store: ProjectStore, wo_id: str) -> str:
+    """The command only the user may run that the latest finish declared, else "" (#1352)"""
+    finished = store.events_of_kind(wo_id, "finished")
+    if not finished:
+        return ""
+    return str(db.from_json(finished[-1]["payload"], {}).get("needs_user") or "")
+
+
+def park_user_action(store: ProjectStore, wo: dict[str, Any], command: str) -> str:
+    """Hold an order whose result waits on a command only the user may run (GitHub issue #1506)"""
+    from .invariants import user_action_owed_blocker
+    from .project_store import UNGOVERNED_ORIGINS, USER_ACTION_EVENT
+
+    wo_id = wo["id"]
+    blocker = user_action_owed_blocker(command)
+    if store.user_action_open(wo_id) is None:
+        store.add_event(wo_id, USER_ACTION_EVENT,
+                        {"command": command, "was": wo["status"]})
+    store.set_status(wo_id, "needs_review", trigger="user_action")
+    store.flag_attention(wo_id, blocker)
+    fresh = store.get_work_order(wo_id) or wo
+    if not (launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS):
+        store.add_notification(
+            title=f"{wo_id} waits on you: {fresh.get('title') or 'untitled'}",
+            body=f"{fresh.get('result_summary') or 'No summary on record.'}\n\n{blocker}",
+            level="warning", wo_id=wo_id, source="completion", paired=True)
     return "needs_review"
 
 
@@ -5740,6 +5771,9 @@ def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int |
     said = [str(fresh.get("result_summary") or "No summary on record.")]
     if fresh.get("pr_url"):
         said.append(f"Pull request: {fresh['pr_url']}")
+    owed = declared_user_action(store, wo["id"])
+    if owed:
+        said.append(f"Still yours to run: `{owed}`")
     replies = store.agent_replies(wo["id"])
     last = str(replies[-1]["content"] or "").strip() if replies else ""
     if last:
@@ -5748,7 +5782,8 @@ def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int |
         said.append(f"Worker's final message (end):\n{tail}")
     return store.add_notification(
         title=f"{wo['id']} completed ({how}): {fresh.get('title') or 'untitled'}",
-        body="\n\n".join(said), level="info", wo_id=wo["id"], source="completion")
+        body="\n\n".join(said), level="warning" if owed else "info",
+        wo_id=wo["id"], source="completion")
 
 
 def mark_backlog_done(wo: dict[str, Any]) -> None:
@@ -5791,8 +5826,12 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
                                  **({"merge_commit": merge_commit}
                                     if merge_commit else {})})
     mark_backlog_done(wo)
-    notify_completed(store, wo, "its pull request merged")
-    return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
+    status = "completed"
+    if owed := declared_user_action(store, wo["id"]):
+        status = park_user_action(store, wo, owed)
+    else:
+        notify_completed(store, wo, "its pull request merged")
+    return {"wo_id": wo["id"], "status": status, "was": wo["status"],
             "pr_url": wo.get("pr_url"), "merged_at": merged_at,
             "session_stopped": stopped["stopped"]}
 
@@ -16710,10 +16749,20 @@ def mo_cancel(mo_id: str) -> dict[str, Any]:
 
 # -- the release console (docs/superpowers/specs/2026-11-01-release-console.md)
 
-def _release_repo() -> tuple[str, Path]:
-    """The OS project's name and checkout; production's clone when no catalog names one"""
+def release_projects() -> list[str]:
+    """Projects whose checkout is a git repository: the `/release` picker (spec §3)"""
+    return sorted(n for n, p in registered_project_paths().items() if (p / ".git").exists())
+
+
+def _release_repo(project: str = "") -> tuple[str, Path]:
+    """`project`'s checkout; unnamed, the OS project's, else production's clone"""
     from . import schedule
 
+    if project:
+        path = registered_project_paths().get(project)
+        if path is None or not (path / ".git").exists():
+            raise OpsError(f"no project {project!r} with a git checkout — /release lists them")
+        return project, path
     catalog = _morpheus_catalog()
     name = schedule.os_project((p.name, p.path) for p in catalog.projects) or ""
     for p in catalog.projects:
@@ -16808,18 +16857,34 @@ def _open_release_orders(project: str) -> list[dict[str, Any]]:
     store = ProjectStore(paths[project])
     try:
         return [w for w in store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True)
-                if release.is_release_order(w)]
+                if release.is_release_order(w)
+                or (db.from_json(w.get("metadata"), {}) or {}).get(release.BASE_KEY)]
     finally:
         store.close()
 
 
-def release_overview() -> dict[str, Any]:
+def _release_scope(project: str) -> tuple[str, Path, bool, str]:
+    """Name, checkout, is-it-the-OS, and the tag glob its releases use (spec §3)"""
+    from . import release, release_view
+
+    os_name, _ = _release_repo()
+    name, repo = _release_repo(project)
+    if not project or name == os_name:
+        return name, repo, True, release.RELEASE_TAG_GLOB
+    own = f"{name}-*"
+    try:
+        return name, repo, False, own if release_view.tags(repo, own) else "*"
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OpsError(f"cannot read the tags in {repo}: {e}") from e
+
+
+def release_overview(project: str = "") -> dict[str, Any]:
     """Pending work since the newest tag, and every release with its validation verdict"""
     from . import release_view
 
-    project, repo = _release_repo()
+    project, repo, is_os, glob = _release_scope(project)
     try:
-        tags = release_view.tags(repo)
+        tags = release_view.tags(repo, glob)
         ref = release_view.main_ref(repo)
         newest = tags[0]["tag"] if tags else ""
         pending = _release_rows(release_view.commits(repo, newest, ref), project, repo)
@@ -16837,19 +16902,19 @@ def release_overview() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError) as e:
         raise OpsError(f"cannot read the release history in {repo}: {e}") from e
     return {"project": project, "repo": str(repo), "main_ref": ref, "newest": newest,
-            "pending": pending, "releases": releases,
+            "is_os": is_os, "tag_glob": glob, "pending": pending, "releases": releases,
             "in_flight": [{"id": w["id"], "title": w["title"], "status": w["status"],
                            "href": order_path(project, w["id"])}
                           for w in _open_release_orders(project)]}
 
 
-def release_detail(tag: str) -> dict[str, Any]:
+def release_detail(tag: str, project: str = "") -> dict[str, Any]:
     """One release's commits, each traced to its orders and its morpheus verdict"""
     from . import release_view
 
-    project, repo = _release_repo()
+    project, repo, _, glob = _release_scope(project)
     try:
-        known = {t["tag"]: t for t in release_view.tags(repo)}
+        known = {t["tag"]: t for t in release_view.tags(repo, glob)}
         if tag not in known:
             raise OpsError(f"no release {tag!r} in {repo} — /release lists them")
         rows = release_view.release_commits(repo, tag, known[tag]["previous"])
@@ -16874,13 +16939,34 @@ newer commit, do not drop `--stage`, and do not restart any service by hand. If 
 {base} is red, or a `jarvis-*` tag already contains it, stop and say so.
 """
 
+PROJECT_RELEASE_CUT_BRIEF = """\
+Ship a release of {project} the user cut from the dashboard (/release). It carries exactly \
+the pending commits on `main` up to and including the base below — the user chose that commit:
 
-def release_cut(base: str) -> dict[str, Any]:
+{lines}
+
+Tag `{base}` as the next `{project}-X.Y.Z` (newest tag so far: {newest}) and release it the \
+way this project documents its releases. Tagging, pushing and deploying are PRIVILEGED \
+ACTIONS and will be gated — correct and expected. Read `jarvis brief gates` and make your \
+case first (`jarvis gate request`). Do not move the base to a newer commit. If CI on {base} \
+is red, a tag already contains it, or the project documents no release process, stop and \
+say so instead of inventing one.
+"""
+
+
+def _release_brief(overview: dict[str, Any], lines: str, wo_id: str, base: str) -> str:
+    if overview["is_os"]:
+        return RELEASE_CUT_BRIEF.format(lines=lines, wo_id=wo_id, base=base)
+    return PROJECT_RELEASE_CUT_BRIEF.format(project=overview["project"], lines=lines, base=base,
+                                            newest=overview["newest"] or "none")
+
+
+def release_cut(base: str, project: str = "") -> dict[str, Any]:
     """File the release work order that ships pending work up to `base` (spec 2026-11-01 §2)"""
     from . import release, release_view
 
     base = (base or "").strip().lower()
-    overview = release_overview()
+    overview = release_overview(project)
     project = overview["project"]
     if not project:
         raise OpsError("no catalog project runs the OS itself, so there is nowhere to file "
@@ -16896,16 +16982,18 @@ def release_cut(base: str) -> dict[str, Any]:
     lines = "\n".join(
         f"- `{r['short']}` {r['subject']}" + (f" — `{r['wo_id']}`" if r["wo_id"] else "")
         for r in shipped)
+    # BATCH_KEY outside the OS parks the order as "shipped nothing" (spec §3)
+    meta = ({release.BATCH_KEY: [], release.BASE_KEY: base} if overview["is_os"]
+            else {release.BASE_KEY: base})
     # Usable even if dispatch reads it before the id is filled in below
     wo = create_work_order(
         project, f"Ship a release: {len(shipped)} commit(s) up to {base[:8]}",
-        description=RELEASE_CUT_BRIEF.format(lines=lines, wo_id="<your work-order id>",
-                                             base=base),
-        origin="ui", metadata={release.BATCH_KEY: [], release.BASE_KEY: base})
+        description=_release_brief(overview, lines, "<your work-order id>", base),
+        origin="ui", metadata=meta)
     store = ProjectStore(registered_project_paths()[project])
     try:
-        store.update_work_order(wo["id"], description=RELEASE_CUT_BRIEF.format(
-            lines=lines, wo_id=wo["id"], base=base))
+        store.update_work_order(wo["id"], description=_release_brief(overview, lines,
+                                                                     wo["id"], base))
     finally:
         store.close()
     return {**wo, "project": project, "commits": len(shipped)}

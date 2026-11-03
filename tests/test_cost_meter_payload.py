@@ -50,7 +50,7 @@ def store_samples(rows) -> None:
 
 def series(start: float, *, n: int, first: float, last: float, resets: float):
     step = (last - first) / (n - 1) if n > 1 else 0.0
-    return [usage_meter.Sample(ts=start + i * MINUTE, ok=True,
+    return [usage_meter.Sample(ts=start + i * usage_meter.SAMPLE_SECONDS, ok=True,
                                five_hour_pct=first + i * step,
                                five_hour_resets_at=resets,
                                seven_day_pct=5.0 + i * step / 10,
@@ -73,7 +73,8 @@ def scene(f, *, since: float = SPAN_SINCE, until: float = SPAN_SINCE + HOUR,
           outside: bool = True) -> dict:
     """The worked example, as records"""
     calibrate(f, since)
-    n = samples if samples is not None else int((until - since) / MINUTE)
+    n = samples if samples is not None else int((until - since)
+                                                / usage_meter.SAMPLE_SECONDS)
     store_samples(series(since, n=n, first=10.0, last=10.0 + points, resets=until))
     wo = f.order("the order that spent in this span")
     f.turn(wo, started_at=since + 2 * MINUTE, ended_at=since + 3 * MINUTE,
@@ -259,11 +260,11 @@ def test_an_unscoped_query_carries_the_scope_keys_as_none(fleet_fixture):
 
 def test_a_span_the_meter_barely_covers_derives_no_dollar_figure(fleet_fixture):
     """3% covered: the rise is not a bound in either direction, so nothing is derived"""
-    meter = meter_of(fleet_fixture, scene(fleet_fixture, until=SPAN_UNTIL, samples=9))
+    meter = meter_of(fleet_fixture, scene(fleet_fixture, until=SPAN_UNTIL, samples=4))
     said = meter["sentence"]
     spend = meter["spend"]
 
-    assert meter["coverage"]["share"] == pytest.approx(0.03)
+    assert meter["coverage"]["share"] == pytest.approx(4 / 120, abs=1e-4)
     assert meter["reliable"] is False
     assert "low_coverage" in meter["unreliable"]
     assert usage_meter.UNRELIABLE in said
@@ -280,7 +281,7 @@ def test_a_span_the_meter_barely_covers_derives_no_dollar_figure(fleet_fixture):
 
 def test_between_the_thresholds_the_figure_stands_and_the_coverage_is_incomplete(
         fleet_fixture):
-    meter = meter_of(fleet_fixture, scene(fleet_fixture, until=SPAN_UNTIL, samples=210))
+    meter = meter_of(fleet_fixture, scene(fleet_fixture, until=SPAN_UNTIL, samples=84))
     said = meter["sentence"]
 
     assert meter["coverage"]["share"] == pytest.approx(0.7)
@@ -293,7 +294,7 @@ def test_between_the_thresholds_the_figure_stands_and_the_coverage_is_incomplete
 def test_an_unreliable_span_suppresses_both_alarms_and_the_daemon_writes_nothing(
         fleet_fixture, fixed_now):
     fleet_fixture.order("the carrier", status="completed")
-    scene(fleet_fixture, until=SPAN_UNTIL, samples=120)        # 40% covered
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=48)         # 40% covered
     meter = meter_of(fleet_fixture, {"since": SPAN_SINCE, "until": SPAN_UNTIL,
                                      "source": "session-meter"})
 
@@ -325,8 +326,8 @@ def test_a_gap_longer_than_the_window_derives_nothing(fleet_fixture):
     """A whole 5h window could have opened and closed inside the hole"""
     since, until = SPAN_SINCE, SPAN_SINCE + 24 * HOUR
     calibrate(fleet_fixture, since)
-    store_samples(series(since, n=540, first=10.0, last=19.0, resets=until))
-    store_samples(series(since + 15 * HOUR, n=540, first=19.0, last=28.0, resets=until))
+    store_samples(series(since, n=216, first=10.0, last=19.0, resets=until))
+    store_samples(series(since + 15 * HOUR, n=216, first=19.0, last=28.0, resets=until))
 
     meter = meter_of(fleet_fixture, {"since": since, "until": until,
                                      "source": "session-meter"})
@@ -475,7 +476,7 @@ def test_the_outside_alarm_fires_once_per_window_for_the_os_owner(
         fleet_fixture, fixed_now):
     assert METER_RECONCILE_EVERY_TICKS == 360
     fleet_fixture.order("the carrier", status="completed")
-    scene(fleet_fixture, until=SPAN_UNTIL, samples=300)
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=120)
     daemon = daemon_for(fleet_fixture)
 
     reconcile(fleet_fixture, daemon)
@@ -502,7 +503,7 @@ def test_the_outside_alarm_fires_once_per_window_for_the_os_owner(
 
 def test_the_alarm_is_silent_below_the_floor_and_on_the_seed(fleet_fixture, fixed_now):
     fleet_fixture.order("the carrier", status="completed")
-    scene(fleet_fixture, until=SPAN_UNTIL, samples=300)
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=120)
     fleet_fixture.set_cost(meter_alert_min_usd=50.0)
 
     reconcile(fleet_fixture, daemon_for(fleet_fixture))
@@ -533,7 +534,7 @@ def test_a_second_project_in_the_same_catalog_raises_nothing(fleet_fixture, fixe
     data["projects"].append({"name": "proj_b", "path": str(second)})
     fleet_fixture.catalog_path.write_text(json.dumps(data))
     fleet_fixture.order("the carrier", status="completed")
-    scene(fleet_fixture, until=SPAN_UNTIL, samples=300)
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=120)
     daemon = daemon_for(fleet_fixture)
 
     store = ProjectStore(second)

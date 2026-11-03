@@ -22,11 +22,14 @@ FIRST_CLASS = ("five_hour", "seven_day")   #: the two windows with their own col
 #: Same shape as `notify.sink_telegram`, so the OS has one HTTP idiom (§1)
 TIMEOUT = 10
 
-#: The sampler's own period, a UNIT and not a setting: `daemon.USAGE_SAMPLE_EVERY_TICKS` is one minute...
-SAMPLE_SECONDS = 60.0
+#: The sampler's own period, a UNIT and not a setting: the endpoint allows ~30 reads/hour (kn-ff0b7bc2)
+SAMPLE_SECONDS = 150.0
 
-#: Two missed minutes end a calibration span (§5)
-MAX_SPAN_GAP_SECONDS = 120.0
+#: Two missed readings end a calibration span (§5)
+MAX_SPAN_GAP_SECONDS = 2 * SAMPLE_SECONDS
+
+#: The longest the sampler ever sits out a rate limit
+BACKOFF_MAX_SECONDS = 1800.0
 
 #: A pct fall this large with `resets_at` UNCHANGED is a reset the endpoint reported late (§4 rule 2)
 DROP_TOLERANCE = 1.0
@@ -47,11 +50,13 @@ class MeterError(Exception):
     """Network, auth, or a payload that is not a meter"""
 
     def __init__(self, reason: str, *, http_status: int | None = None,
-                 latency_ms: int | None = None) -> None:
+                 latency_ms: int | None = None,
+                 retry_after: float | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
         self.http_status = http_status
         self.latency_ms = latency_ms
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -66,6 +71,7 @@ class Sample:
     seven_day_pct: float | None = None
     seven_day_resets_at: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    retry_after: float | None = None   #: the header, never a column
 
     def pct(self, key: str) -> float | None:
         return getattr(self, f"{key}_pct")
@@ -139,6 +145,22 @@ def parse(payload: dict, *, ts: float) -> Sample:
     return sample
 
 
+def _retry_after(headers: Any) -> float | None:
+    """`Retry-After` in seconds; the HTTP-date form is left to the backoff"""
+    value = headers.get("Retry-After") if headers is not None else None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def backoff_seconds(consecutive: int, retry_after: float | None) -> float:
+    """How long the sampler sits out after `consecutive` refusals"""
+    if retry_after is not None:
+        return min(retry_after, BACKOFF_MAX_SECONDS)
+    return min(SAMPLE_SECONDS * 2 ** max(0, consecutive - 1), BACKOFF_MAX_SECONDS)
+
+
 def fetch(*, now: float | None = None, opener: Callable[..., Any] | None = None) -> Sample:
     """One reading of the endpoint"""
     ts = db.now() if now is None else now
@@ -157,7 +179,8 @@ def fetch(*, now: float | None = None, opener: Callable[..., Any] | None = None)
             body = resp.read()
     except urllib.error.HTTPError as e:
         raise MeterError(f"http {e.code} from the usage endpoint",
-                         http_status=int(e.code), latency_ms=elapsed()) from None
+                         http_status=int(e.code), latency_ms=elapsed(),
+                         retry_after=_retry_after(getattr(e, "headers", None))) from None
     except Exception as e:  # noqa: BLE001 — a transport failure is a gap row, not a crash
         raise MeterError(f"the usage endpoint did not answer ({type(e).__name__})",
                          latency_ms=elapsed()) from None
@@ -201,7 +224,7 @@ def sample_once(central: Any, *, opener: Callable[..., Any] | None = None,
         sample = fetch(now=ts, opener=opener)
     except MeterError as e:
         sample = Sample(ts=ts, ok=False, reason=e.reason, http_status=e.http_status,
-                        latency_ms=e.latency_ms)
+                        latency_ms=e.latency_ms, retry_after=e.retry_after)
     record(central, sample)
     central.conn.commit()
     return sample
