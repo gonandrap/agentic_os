@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Union
@@ -613,29 +614,85 @@ def owed_actions(central: CentralStore) -> list[dict[str, Any]]:
     return [i for i in central.morpheus_items(ACTION_STATES) if not i["action"]]
 
 
-def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
+def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *, cwd: Path,
+        call: Callable[..., Any] | None = None, now: float | None = None,
         investigate: Callable[..., tuple[str, str]] | None = None,
         ask_neo: Callable[..., int] | None = None) -> str:
-    """Hand the item off exactly once; returns what was recorded"""
+    """Judge the item in one short session, then hand it off once; returns what was recorded (§4)"""
+    now = db.now() if now is None else now
+    if (item["state"] not in ACTION_STATES or held(central, now)
+            or not central.claim_morpheus_action(item["id"], f"{JUDGE_CLAIM}{now:.0f}")):
+        return ""
+    try:
+        return _judge(central, catalog, item, cwd=cwd, call=call, now=now,
+                      investigate=investigate, ask_neo=ask_neo)
+    except BaseException:
+        # A hand-off that crashed is still owed: the claim goes back for the next pass
+        central.update_morpheus_item(item["id"], action="", action_ts=None)
+        raise
+
+
+def _judge(central: CentralStore, catalog: Catalog, item: dict[str, Any], *, cwd: Path,
+           call: Callable[..., Any] | None, now: float,
+           investigate: Callable[..., tuple[str, str]] | None,
+           ask_neo: Callable[..., int] | None) -> str:
+    from . import claude_cli
+
     cfg = catalog.os.morpheus
-    route = cfg.on_failed if item["state"] == "failed" else cfg.on_timeout
     investigate = investigate or _investigate
     ask_neo = ask_neo or _ask_neo
-    note = ""
-    if route == "investigate":
-        inv_id, note = investigate(catalog, item)
-        if inv_id:
-            action = f"{_action_kind(inv_id)}:{inv_id}"
-            if central.claim_morpheus_action(item["id"], action):
+    attempts = int(item.get("attempts") or 0)
+    reply = None
+    if attempts < MAX_OFFERS:
+        runs = central.morpheus_runs(item["id"], JUDGE_RUNS)
+        try:
+            reply = run_session(central, catalog, {**item, "runs": runs}, purpose="judge",
+                                cwd=cwd, call=call)
+        except claude_cli.UsageLimitError:
+            central.update_morpheus_item(item["id"], action="", action_ts=None)
+            return "usage_held"
+        except claude_cli.KilledError as e:
+            log.warning("morpheus judge %s killed before it answered: %s", item["id"], e)
+        if reply is None:
+            # No answer is no verdict (kn-40db1828): the claim goes back, one attempt spent
+            attempts += 1
+            central.update_morpheus_item(item["id"], attempts=attempts, last_attempt_ts=now)
+            if attempts < MAX_OFFERS:
+                central.update_morpheus_item(item["id"], action="", action_ts=None)
+                return ""
+    note = (f"the monitoring agent could not judge it in {attempts} session(s)"
+            if reply is None else "")
+    verdict = reply["verdict"] if reply else "escalate"
+    if reply:
+        item = {**item, "judge_reason": reply["reason"]}
+    if verdict == "rewrite":
+        if central.claim_morpheus_script_rewrite(item["id"], MAX_SCRIPT_REWRITES):
+            # The judge wrote the script, so no arming session follows
+            central.update_morpheus_item(
+                item["id"], state="monitoring", script=reply["script"].strip(),
+                script_source="agent", last_exit=None, attempts=0, kills=0,
+                deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY, next_check_ts=now,
+                resolution=f"script rewritten by the monitoring agent: {reply['reason'][:600]}",
+                action="", action_ts=None)
+            return "rewrite"
+        note = f"its {MAX_SCRIPT_REWRITES} automatic script rewrite(s) are spent"
+    elif verdict == "confirm":
+        route = cfg.on_failed if item["state"] == "failed" else cfg.on_timeout
+        if item.get("pr_number") is None:
+            note = "it has no pull request to investigate"
+        elif route == "investigate":
+            inv_id, note = investigate(catalog, item)
+            if inv_id:
+                action = f"{_action_kind(inv_id)}:{inv_id}"
+                central.update_morpheus_item(item["id"], action=action, action_ts=now)
                 central.add_inbox(
                     project=item.get("project") or _os_project(catalog), level="warning",
                     title=f"PR #{item['pr_number']} {item['state']} production validation "
                           f"({item['resolution']})",
                     body=f"{item['pr_url']}\n{inv_id} is finding out why.")
-            return action
-    qid = ask_neo(catalog, item, note)
-    action = f"neo:{qid}"
-    central.claim_morpheus_action(item["id"], action)
+                return action
+    action = f"neo:{ask_neo(catalog, item, note)}"
+    central.update_morpheus_item(item["id"], action=action, action_ts=now)
     return action
 
 
@@ -718,14 +775,23 @@ def _improve(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
 
 def _why(item: dict[str, Any]) -> str:
     """The facts Morpheus has, and nothing it does not: it ran a script and read an exit code"""
-    return (f"Morpheus: PR #{item['pr_number']} ({item['pr_url']}) of project "
+    if item.get("pr_number") is not None:
+        subject = f"PR #{item['pr_number']} ({item['pr_url']})"
+        what = f"The PR's hints, under `## {SECTION}`:\n{(item.get('hints') or '')[:3000]}"
+    else:
+        subject = f"Monitoring order {item['id']} ({item.get('title') or 'untitled'})"
+        what = f"What it watches:\n{(item.get('prompt') or '')[:3000]}"
+    reading = (f"\n\nThe monitoring agent's reading — NOT a diagnosis:\n"
+               f"{item['judge_reason'][:1500]}" if item.get("judge_reason") else "")
+    return (f"Morpheus: {subject} of project "
             f"{item.get('project') or '?'} {item['state']} its production validation: "
             f"{item['resolution']}. Morpheus only runs the validation script and reads its "
             f"exit code — it has NOT diagnosed anything, and the script itself may be wrong.\n\n"
-            f"The PR's hints, under `## {SECTION}`:\n{item['hints'][:3000]}\n\n"
+            f"{what}\n\n"
             f"The script (written by {item['script_source'] or 'nobody yet'}):\n"
             f"{item['script'][:3000] or '(none)'}\n\n"
-            f"Last exit {item['last_exit']}, output tail:\n{item['last_output'][-1500:]}")
+            f"Last exit {item['last_exit']}, output tail:\n{item['last_output'][-1500:]}"
+            f"{reading}")
 
 
 VALIDATION_QUESTION = """MORPHEUS — a shipped change has no passing production validation.
@@ -917,9 +983,70 @@ def _arm_reply(data: dict[str, Any]) -> dict[str, str]:
     return {"script": script, "notes": str(data.get("notes") or "")}
 
 
-#: purpose: (prompt built from the row, reply validator); §4 adds "judge"
+#: What a judge session may answer (monitoring-orders §4)
+JUDGE_VERDICTS = ("rewrite", "confirm", "escalate")
+#: The `action` a judging pass holds while its session runs: `judge:<ts>`
+JUDGE_CLAIM = "judge:"
+#: How many of the order's last runs the judge is shown
+JUDGE_RUNS = 5
+
+#: Opens every judging prompt: identical text, so it caches
+JUDGE_CONTRACT = """This monitoring order ended without passing. Read the record below and
+production, then say which of three it is:
+- the SCRIPT is wrong, not the change: {"verdict": "rewrite", "reason": "<what the script got
+  wrong>", "script": "<a new bash script>"}; the new script keeps the rules below;
+- the change looks broken in production: {"verdict": "confirm", "reason": "<what production
+  shows>"}; the OS files an investigation;
+- you cannot tell, or a human must look: {"verdict": "escalate", "reason": "<what to look at>"}.
+Your reason is a reading, never a diagnosis.
+
+The rules a script keeps:
+""" + ARM_CONTRACT.split("\n\nReply ")[0].split("\n", 1)[1]
+
+
+def _when(ts: Any) -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(ts))) if ts else "never"
+
+
+def _judge_prompt(item: dict[str, Any]) -> str:
+    title = item.get("title") or item.get("pr_title") or "(untitled)"
+    what = item.get("hints") or item.get("prompt") or "(none given)"
+    runs = "\n".join(f"- {_when(r['ts'])}: exit {r['exit']}\n{(r['output'] or '')[-600:]}"
+                     for r in item.get("runs") or ()) or "(none)"
+    return "\n\n".join([
+        JUDGE_CONTRACT,
+        f"## Order {item['id']} — {item.get('project') or '?'}: {title}"
+        + (f"\n{item['pr_url']}" if item.get("pr_url") else ""),
+        f"What to watch:\n{what[:4000]}",
+        f"The script (written by {item.get('script_source') or 'nobody'}):\n"
+        f"{(item.get('script') or '(none)')[:4000]}",
+        f"Its last runs, newest first:\n{runs}",
+        f"It is {item['state']}: {item.get('resolution') or '?'} "
+        f"(deadline {_when(item.get('deadline_ts'))}).",
+        f"Script rewrites so far: {int(item.get('script_rewrites') or 0)} of "
+        f"{MAX_SCRIPT_REWRITES}; automatic requeues so far: "
+        f"{int(item.get('auto_requeues') or 0)} of {MAX_AUTO_REQUEUES}."])
+
+
+def _judge_reply(data: dict[str, Any]) -> dict[str, str]:
+    verdict = str(data.get("verdict") or "").strip().lower()
+    if verdict not in JUDGE_VERDICTS:
+        raise ValueError(f"verdict must be one of {list(JUDGE_VERDICTS)}")
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("a verdict needs its reason")
+    out = {"verdict": verdict, "reason": reason.strip()}
+    if verdict == "rewrite":
+        script = data.get("script")
+        if not isinstance(script, str) or not script.strip():
+            raise ValueError("a rewrite needs its script")
+        out["script"] = script
+    return out
+
+
+#: purpose: (prompt built from the row, reply validator)
 SESSION_PROMPTS: dict[str, tuple[Callable[[dict], str], Callable[[dict], Any]]] = {
-    "arm": (_arm_prompt, _arm_reply)}
+    "arm": (_arm_prompt, _arm_reply), "judge": (_judge_prompt, _judge_reply)}
 
 
 def usage_hold_until(central: CentralStore, now: float | None = None) -> float | None:
@@ -930,6 +1057,11 @@ def usage_hold_until(central: CentralStore, now: float | None = None) -> float |
     except ValueError:
         until = 0.0
     return until if now < until else None
+
+
+def held(central: CentralStore, now: float | None = None) -> bool:
+    """Morpheus's brake or the usage hold stands: no session runs, none is owed (Q3138)"""
+    return bool(pause_state(central)["paused"] or usage_hold_until(central, now))
 
 
 def run_session(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,

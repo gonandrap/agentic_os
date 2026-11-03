@@ -1084,6 +1084,7 @@ class MorpheusConfig:
     script_timeout_seconds: int = 60
     #: Ignored, no session to compact; parsed so old catalogs load (monitoring-orders §3)
     compact_at: float = 0.30
+    #: Where a judge's `confirm` goes: "investigate" files one, "neo" asks Neo (monitoring-orders §4)
     on_failed: str = "investigate"
     on_timeout: str = "neo"
     turn_timeout_seconds: int = 900
