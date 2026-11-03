@@ -638,7 +638,7 @@ def test_the_planner_briefing_names_wo_finish_as_the_redelivery():
     """§5 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md: `jarvis fo plan`..."""
     p = _planner_prompt()
 
-    assert "`jarvis fo plan fo-1 --from-file <file>` IS your finish" in p
+    assert "`jarvis fo plan fo-1 --from-file plan.json` IS your finish" in p
     assert "Do not run `jarvis wo finish`" not in p
     assert "jarvis wo finish" in p
     assert "does not touch" in p

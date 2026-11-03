@@ -573,7 +573,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "so in your final answer rather than quietly picking one.",
         "",
         "# The plan",
-        f"Write it to a JSON file in your worktree and submit it with:",
+        "Write it to `plan.json` in your worktree root — the submit refuses any other "
+        "filename — and submit it with:",
         f"    jarvis fo plan {fo_id} --from-file plan.json",
         "",
         "```json",
@@ -678,7 +679,7 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "# Operating contract",
         # §5, docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
-        f"- `jarvis fo plan {fo_id} --from-file <file>` IS your finish, and you submit "
+        f"- `jarvis fo plan {fo_id} --from-file plan.json` IS your finish, and you submit "
         f"the plan ONCE. If the user refuses an assumption afterwards, do NOT resubmit "
         f"the plan: it would replace the stored one and discard the decisions already "
         f"recorded on it. Answer the refusal in this session, then run `jarvis wo "
@@ -816,7 +817,8 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "# The report",
         # §5, docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
-        "Write it to a JSON file in your worktree and submit it with the command below, "
+        "Write it to `report.json` in your worktree root — the submit refuses any other "
+        "filename — and submit it with the command below, "
         "which IS your finish, and submit it ONCE. If the user refuses an assumption "
         "afterwards, do NOT resubmit the report: the OS refuses it, and it would replace "
         "the document and discard the decisions already recorded on it. Answer the "
