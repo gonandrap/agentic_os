@@ -1760,6 +1760,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --as feature: cap how many of its children run at once")
     b = bl.add_parser("done", help="mark a backlog item done without a work order")
     b.add_argument("item_id")
+    b = bl.add_parser("review", help="decide a quarantined proposal (escalated by Neo or "
+                                     "not); closes its Neo question")
+    b.add_argument("item_id")
+    verdict = b.add_mutually_exclusive_group(required=True)
+    verdict.add_argument("--accept", action="store_true", help="it becomes an open item")
+    verdict.add_argument("--reject", action="store_true", help="it is dropped")
+    verdict.add_argument("--duplicate-of", dest="duplicate_of", metavar="BL-ID",
+                         help="dropped, its origins folded into this item")
+    b.add_argument("--kind", choices=["wo", "fo"], help="what promotion creates")
+    b.add_argument("--feedback", default="", help="why: recorded as a Neo learning")
 
     # knowledge
     kn = sub.add_parser("learn", help="central knowledge base").add_subparsers(
@@ -5482,6 +5492,23 @@ def cmd_backlog(args: argparse.Namespace) -> int:
         elif args.bl_cmd == "done":
             central.mark_backlog(args.item_id, "done")
             _print({"item": args.item_id, "status": "done"}, args.json)
+        elif args.bl_cmd == "review":
+            decision = ("duplicate" if args.duplicate_of
+                        else "accept" if args.accept else "reject")
+            out = ops.review_backlog_item(args.item_id, decision,
+                                          duplicate_of=args.duplicate_of, kind=args.kind,
+                                          feedback=args.feedback)
+            if args.json:
+                _print(out, True)
+            else:
+                item = out["item"]
+                print(f"{item['id']} is now {item['status']}"
+                      + (f" (duplicate of {item['duplicate_of']})"
+                         if item.get("duplicate_of") else ""))
+                if out["question_id"]:
+                    print(f"closed Neo question {out['question_id']}")
+                if out["learning_recorded"]:
+                    print("recorded your reason as a Neo learning")
     finally:
         central.close()
     return 0

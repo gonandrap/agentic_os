@@ -1098,3 +1098,235 @@ def test_a_usage_limit_hold_writes_no_cause(jarvis_home):
         assert neo.get(q["id"])["escalation_cause"] is None
     finally:
         neo.close()
+
+
+# -- kind `backlog`: Neo decides a quarantined proposal (2026-11-03-backlog-operability §5)
+
+
+def _quarantined(daemon, title="Exporter drops rows on retry", **kw):
+    """A proposal the steward quarantined (severity claim), asked of Neo"""
+    central = CentralStore()
+    try:
+        item = central.propose_backlog(
+            "proj_a", title, kw.pop("description", "rows vanish after a 503"),
+            item_type="bug", severity=kw.pop("severity", "critical"), suggested_kind="wo",
+            origin_refs=kw.pop("origin_refs", []))
+    finally:
+        central.close()
+    daemon.review_backlog_proposals()
+    daemon.ask_neo_about_quarantine()
+    return _item(item["id"])
+
+
+def _item(item_id):
+    central = CentralStore()
+    try:
+        return central.get_backlog(item_id)
+    finally:
+        central.close()
+
+
+def _neo_says(monkeypatch, **verdict):
+    raw = json.dumps({"escalate": False, "reason": "checked it", **verdict})
+    monkeypatch.setattr(neo_mod, "answer_question",
+                        lambda *a, **k: neo_mod.parse_verdict(raw))
+
+
+def _inbox():
+    central = CentralStore()
+    try:
+        return central.unacked_inbox()
+    finally:
+        central.close()
+
+
+def _question(qid):
+    neo = NeoStore()
+    try:
+        return neo.get(qid)
+    finally:
+        neo.close()
+
+
+def test_a_quarantined_proposal_is_asked_once_with_no_worker_behind_it(started):
+    item = _quarantined(started)
+    open_one = _quarantined(started, title="Rename the export flag", severity="minor")
+
+    assert (item["status"], item["review_rule"]) == ("quarantined", "severity-claim")
+    q = _question(item["neo_question_id"])
+    assert (q["kind"], q["wo_id"], q["status"]) == ("backlog", "", "queued")
+    assert item["title"] in q["question"] and "severity-claim" in q["question"]
+    assert q["question"].rstrip().endswith('"depends_on": ["bl-…"] (optional)}')
+    # Not quarantined, so not asked: the pass picks only what the steward held back
+    assert open_one["status"] == "open" and open_one["neo_question_id"] is None
+    started.ask_neo_about_quarantine()
+    neo = NeoStore()
+    try:
+        assert [x["id"] for x in neo.list_questions() if x["kind"] == "backlog"] == [q["id"]]
+    finally:
+        neo.close()
+
+
+def test_neo_accepting_a_proposal_opens_it_and_messages_nobody(started, monkeypatch,
+                                                              project):
+    item = _quarantined(started)
+    _neo_says(monkeypatch, answer=json.dumps(
+        {"decision": "accept", "kind": "fo", "severity": "major"}))
+
+    drain(started)
+
+    after = _item(item["id"])
+    assert (after["status"], after["suggested_kind"], after["severity"],
+            after["review_rule"]) == ("open", "fo", "major", "neo")
+    assert _question(item["neo_question_id"])["status"] == "answered"
+    store = ProjectStore(project)
+    try:
+        # No worker exists: no cleanup order, no message (the item moved, so the drain ran)
+        assert store.list_work_orders() == []
+    finally:
+        store.close()
+
+
+def test_an_object_answer_is_read_too(started, monkeypatch):
+    item = _quarantined(started)
+    _neo_says(monkeypatch, answer={"decision": "reject"})
+
+    drain(started)
+
+    assert _item(item["id"])["status"] == "dropped"
+
+
+def test_a_duplicate_verdict_folds_the_origins_into_the_kept_item(started, monkeypatch):
+    kept = _quarantined(started, title="Rename the export flag", severity="minor")
+    ref = {"kind": "neo_question", "id": 77}
+    item = _quarantined(started, origin_refs=[ref])
+    _neo_says(monkeypatch, answer=json.dumps(
+        {"decision": "duplicate", "duplicate_of": kept["id"]}))
+
+    drain(started)
+
+    after = _item(item["id"])
+    assert (after["status"], after["duplicate_of"]) == ("dropped", kept["id"])
+    assert ref in _item(kept["id"])["origin_refs"]
+
+
+@pytest.mark.parametrize("answer", ["sure, accept it",
+                                    json.dumps({"decision": "maybe"}),
+                                    json.dumps({"decision": "duplicate"}),
+                                    json.dumps({"decision": "duplicate",
+                                                "duplicate_of": "bl-0000dead"})])
+def test_an_unusable_answer_is_never_a_verdict(started, monkeypatch, answer):
+    """kn-40db1828: the item stays quarantined and the question goes back in the queue"""
+    item = _quarantined(started)
+    _neo_says(monkeypatch, answer=answer)
+
+    drain(started)
+
+    assert _item(item["id"])["status"] == "quarantined"
+    assert _question(item["neo_question_id"])["status"] == "queued"
+
+
+def test_an_unusable_answer_past_its_attempts_goes_to_the_user(started, monkeypatch):
+    item = _quarantined(started)
+    _neo_says(monkeypatch, answer="no idea")
+    neo = NeoStore()
+    try:
+        for _ in range(5):
+            neo.conn.execute("UPDATE questions SET retry_after=NULL")
+            drain(started)
+    finally:
+        neo.close()
+
+    q = _question(item["neo_question_id"])
+    assert (q["status"], q["escalation_cause"]) == ("failed", "unparseable-reply")
+    assert _item(item["id"])["status"] == "quarantined"
+    inbox = [r for r in _inbox() if item["id"] in r["body"]]
+    assert inbox and "jarvis backlog review" in inbox[0]["body"]
+
+
+def test_an_escalation_leaves_it_quarantined_and_names_the_users_verb(started,
+                                                                     monkeypatch):
+    item = _quarantined(started)
+    _neo_says(monkeypatch, escalate=True, answer="", reason="the user's call")
+
+    drain(started)
+
+    assert _item(item["id"])["status"] == "quarantined"
+    assert _question(item["neo_question_id"])["status"] == "escalated"
+    inbox = [r for r in _inbox() if item["id"] in r["body"]]
+    assert inbox and f"jarvis backlog review {item['id']}" in inbox[0]["body"]
+
+
+def test_the_user_reviews_an_escalated_item_and_teaches_neo(started, monkeypatch,
+                                                           project, capsys):
+    from jarvis import cli
+
+    item = _quarantined(started)
+    _neo_says(monkeypatch, escalate=True, answer="", reason="the user's call")
+    drain(started)
+    neo = NeoStore()
+    try:
+        before = len(neo.learnings("proj_a", limit=500))
+    finally:
+        neo.close()
+
+    assert cli.main(["backlog", "review", item["id"], "--accept", "--kind", "fo",
+                     "--feedback", "a data-loss bug is never cosmetic"]) == 0
+
+    after = _item(item["id"])
+    assert (after["status"], after["suggested_kind"], after["review_rule"]) == \
+        ("open", "fo", "user")
+    q = _question(item["neo_question_id"])
+    assert (q["status"], q["answered_by"]) == ("answered", "user")
+    neo = NeoStore()
+    try:
+        learnings = neo.learnings("proj_a", limit=500)
+    finally:
+        neo.close()
+    assert len(learnings) == before + 1
+    assert "a data-loss bug is never cosmetic" in learnings[0]["content"] + \
+        learnings[-1]["content"]
+    store = ProjectStore(project)
+    try:
+        assert store.list_work_orders() == []
+    finally:
+        store.close()
+    with pytest.raises(ops.OpsError, match="not quarantined"):
+        ops.review_backlog_item(item["id"], "reject")
+
+
+def test_answering_or_correcting_a_backlog_question_messages_no_worker(started,
+                                                                       monkeypatch):
+    escalated = _quarantined(started)
+    _neo_says(monkeypatch, escalate=True, answer="", reason="the user's call")
+    drain(started)
+
+    with pytest.raises(ops.OpsError,
+                       match=f"jarvis backlog review {escalated['id']}"):
+        ops.neo_answer_escalated(escalated["neo_question_id"], "accept it")
+    assert _question(escalated["neo_question_id"])["status"] == "escalated"
+    # The template's half: no reply box, a pointer at the item
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    qid = escalated["neo_question_id"]
+    page = TestClient(create_app(), follow_redirects=False).get(f"/neo/question/{qid}").text
+    assert 'action="/neo/%d/answer"' % qid not in page
+    assert f'href="/backlog/{escalated["id"]}"' in page
+
+    answered = _quarantined(started, title="Retry storm on the uploader")
+    _neo_says(monkeypatch, answer=json.dumps({"decision": "reject"}))
+    drain(started)
+    out = ops.neo_review(answered["neo_question_id"], approved=False,
+                         feedback="this one was real")
+    assert out["learning_recorded"] and out["forwarded_to_worker"] is False
+
+
+def test_the_user_may_decide_before_neo_answers_and_that_closes_the_question(started):
+    item = _quarantined(started)
+    ops.review_backlog_item(item["id"], "reject")
+
+    q = _question(item["neo_question_id"])
+    assert (q["status"], q["answered_by"]) == ("answered", "user")

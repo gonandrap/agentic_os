@@ -115,6 +115,13 @@
     order was created, so there is nobody to reply to. The report is on the tracker;
     start work on it with <code>jarvis issues start {{ q.issue_url or '&lt;issue-url&gt;' }}</code>.
     {% if q.issue_url %}<a href="{{ q.issue_url }}">open the issue →</a>{% endif %}</div>
+  {% elif q.kind == 'backlog' %}
+  {# A quarantined backlog proposal: no worker is waiting, so a reply would reach nobody.
+     `ops.neo_answer_escalated` refuses it too (backlog-operability §5.3). #}
+  <div class="sub" style="margin-top:8px">This decides a quarantined backlog proposal —
+    no worker is waiting for a reply. Decide the item:
+    <code>jarvis backlog review {{ q.backlog_item or '&lt;bl-id&gt;' }} --accept|--reject|--duplicate-of &lt;bl-id&gt;</code>
+    {% if q.backlog_item %}<a href="/backlog/{{ q.backlog_item }}">open the item →</a>{% endif %}</div>
   {% elif q.kind == 'validation' and q.morpheus_item %}
   {# Morpheus asking about a shipped PR: no worker is waiting, and the only decisions are
      the item's own two. Either one closes this question (`ops.morpheus_waive`/`_requeue`).

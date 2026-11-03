@@ -27,9 +27,9 @@ USER_HELD_Q_STATUSES = ("escalated", "failed")
 OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 
 # What Neo is being asked for (docs/superpowers/specs/2026-08-31-the-supervisor.md)
-#: `validation` is Morpheus asking about a shipped PR
+#: `validation` is Morpheus asking about a shipped PR; `backlog` a quarantined proposal
 Q_KINDS = ("question", "approval", "plan", "alarm", "triage", "assumption", "validation",
-           "findings")
+           "findings", "backlog")
 
 # The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md
 SEATS = ("premise", "record", "blast", "taste", "chair")
@@ -85,7 +85,7 @@ MAX_ANSWER_ATTEMPTS = 3
 MAX_REVIVALS = 2
 
 #: Kinds a revival may re-ask: no worker behind them, so a late answer reaches no one stale
-REVIVABLE_KINDS = ("validation", "triage")
+REVIVABLE_KINDS = ("validation", "triage", "backlog")
 
 #: `answer_reason` on a question nobody could put to a model (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)
 UNREACHABLE_PREFIX = "neo could not be reached: "

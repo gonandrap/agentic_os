@@ -440,7 +440,9 @@ def _neo_attention() -> tuple[dict[str, int], list[dict[str, Any]]]:
                 [q for q in neo.list_questions(statuses=("escalated", "failed"))
                  if q.get("kind") not in ("approval", "plan", "alarm", "assumption",
                                           # its improvement order carries the attention
-                                          "findings")])
+                                          "findings",
+                                          # its quarantined item does (backlog-operability §8)
+                                          "backlog")])
     finally:
         neo.close()
 
@@ -10648,8 +10650,8 @@ def neo_review(question_id: int, approved: bool, feedback: str = "",
     finally:
         neo.close()
     forwarded = False
-    # THREE KINDS HAVE NO WORKER TO FORWARD A CORRECTION TO (#240)
-    if not approved and q.get("kind") in ("triage", "assumption", "findings"):
+    # FOUR KINDS HAVE NO WORKER TO FORWARD A CORRECTION TO (#240)
+    if not approved and q.get("kind") in ("triage", "assumption", "findings", "backlog"):
         return {"question_id": question_id, "review": "corrected",
                 "learning_recorded": learning is not None,
                 "learning_seat": seat or "all seats",
@@ -10749,6 +10751,15 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
                 f"check again (after fixing what made it fail): "
                 f"jarvis morpheus requeue {item}. If it is broken and needs a fix: "
                 f"jarvis morpheus confirm {item} --fix \"...\". Each closes this question.")
+        # Nor a backlog one: the quarantined item is decided on itself (backlog-operability §5.4)
+        if q.get("kind") == "backlog":
+            from . import backlog_neo
+
+            item = _backlog_item_of_question(question_id)
+            raise OpsError(
+                f"neo question {question_id} decides a quarantined backlog proposal, and no "
+                f"worker is waiting on it — decide the item instead: "
+                f"{backlog_neo.REVIEW_HINT.format(id=item['id'] if item else '<bl-id>')}")
         neo.record_answer(question_id, answer, answered_by="user")
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:
@@ -13583,6 +13594,64 @@ def show_backlog(item_id: str) -> dict[str, Any]:
         central.close()
     item["origins"] = backlog_origins(item)
     return item
+
+
+def _backlog_item_of_question(question_id: int) -> dict[str, Any] | None:
+    central = CentralStore()
+    try:
+        return central.backlog_for_question(question_id)
+    finally:
+        central.close()
+
+
+def review_backlog_item(item_id: str, decision: str, *, duplicate_of: str | None = None,
+                        kind: str | None = None, feedback: str = "") -> dict[str, Any]:
+    """The user decides a quarantined proposal and closes its Neo question (backlog-operability §5.4)"""
+    from . import backlog_neo
+    from .neo_store import OPEN_Q_STATUSES, NeoStore
+
+    checked = backlog_neo.check_decision(
+        {"decision": decision, "duplicate_of": duplicate_of, "kind": kind})
+    if checked is None:
+        raise OpsError(f"not a backlog decision: {decision!r} (duplicate needs a bl- id, "
+                       f"--kind is wo or fo)")
+    feedback = feedback.strip()
+    central = CentralStore()
+    try:
+        item = central.get_backlog(item_id)
+        if not item:
+            raise OpsError(f"backlog item {item_id!r} not found")
+        if item["status"] != "quarantined":
+            raise OpsError(f"backlog item {item_id} is {item['status']}, not quarantined — "
+                           f"only a quarantined proposal takes a review")
+        try:
+            out = backlog_neo.apply_decision(
+                central, item, checked, rule="user",
+                note=feedback[:300] or f"the user decided: {decision}")
+        except (KeyError, ValueError) as e:
+            raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+    qid = item.get("neo_question_id")
+    learning = None
+    neo = NeoStore()
+    try:
+        q = neo.get(int(qid)) if qid else None
+        if q and q["status"] in OPEN_Q_STATUSES:
+            neo.record_answer(int(qid), decision.upper(), answered_by="user", reason=feedback)
+            neo.review(int(qid), approved=True)  # user-authored: nothing to review
+        if feedback:
+            # The `neo review --correct` path, minus the worker forward: nobody is waiting
+            learning = neo.add_learning(
+                f"On backlog proposal \"{item['title'][:200]}\", quarantined by the steward "
+                f"({item.get('review_rule') or '?'}: {item.get('review_note') or ''}), the "
+                f"user decided {decision}: {feedback}",
+                project=item["project"], source="review",
+                question_id=int(qid) if qid else None,
+                origin_kind="question" if qid else "", origin_id=str(qid or ""))
+    finally:
+        neo.close()
+    return {"item": out, "question_id": qid, "learning_recorded": learning is not None}
 
 
 def backlog_origins(item: Mapping[str, Any]) -> list[dict[str, str]]:
