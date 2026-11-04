@@ -3483,7 +3483,7 @@ class Daemon:
             return
         ppath = {p.name: p.path for p in self.catalog.projects}.get(q["project"])
         if q.get("kind") == "assumption" and ppath and ppath.is_dir():
-            # The row's own ping, once: the pass re-asks a dead question, so each failure must not add one (io-ed253c2b)
+            # The row's ping, once: the pass re-asks a dead question (io-ed253c2b)
             from . import ops
 
             pstore = ProjectStore(ppath)

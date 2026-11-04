@@ -709,7 +709,7 @@ def _confirmation_is_open(question_id: int) -> bool:
 
 
 def _neo_still_rules(a: dict[str, Any]) -> bool:
-    """Is Neo holding this assumption, or about to be asked? A closed question means it is not (#833)"""
+    """Is Neo holding this assumption or about to be asked, not done with a closed question? (#833)"""
     verdict = str(a.get("provisional_verdict") or "")
     if verdict == "object":
         return bool(a.get("objection_delivered_ts"))
@@ -737,7 +737,7 @@ def reviewable_assumptions(store: ProjectStore,
 
 def assumptions_owed_to_user(store: ProjectStore,
                              wo: dict[str, Any]) -> list[dict[str, Any]]:
-    """The ONE answer to "is this row the user's yet?": the flag, the ping and the blockers ask it (io-ed253c2b)"""
+    """The rows that are the user's now: the ONE answer flag, ping and blockers ask (io-ed253c2b)"""
     pending = reviewable_assumptions(store, wo)
     if not pending or neo_reviews_later(store, wo):
         return []
