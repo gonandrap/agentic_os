@@ -271,12 +271,13 @@
     <div class="grow"><span class="mono">{{ item.id }}</span> {{ item.title }}
       {% if item.depends_on %}<span class="sub">deps: {{ item.depends_on | join(', ') }}</span>{% endif %}
     </div>
-    <form class="inline" method="post" action="/backlog/promote/{{ item.id }}">
-      <button>Promote to work order</button>
+    <form class="inline" method="post" action="/backlog/promote/{{ item.id }}" data-promote-plan="/backlog/{{ item.id }}/promote-plan">
+      <button>Promote</button>
     </form>
   </div>
   {% endfor %}
 </div>
+{% include "_promote_dialog.html" %}
 {% endif %}
 
 {% endblock %}

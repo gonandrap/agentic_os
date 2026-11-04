@@ -826,16 +826,142 @@ def test_backlog_promotion_with_dependencies(started, project):
     a = central.add_backlog("proj_a", "build auth")
     b = central.add_backlog("proj_a", "build profile page", depends_on=[a["id"]])
 
-    with pytest.raises(ops.OpsError, match="unfinished dependencies"):
-        ops.promote_backlog(b["id"])
+    result = ops.promote_backlog(b["id"])
+    assert [m["id"] for m in result["members"]] == [a["id"], b["id"]]
+    assert central.get_backlog(a["id"])["status"] == "promoted"
+    a_wo = result["members"][0]["order_id"]
 
-    result = ops.promote_backlog(b["id"], force=True)
-    assert result["forced_over_blockers"] == [a["id"]]
-
-    # completing the promoted WO marks the backlog item done
+    # the dependent waits on the backlog item: it runs once its dependency's order closed it
+    store = ProjectStore(project)
+    assert [r["ref"] for r in store.open_preconditions(result["wo_id"])] == [a["id"]]
+    daemon.tick()
+    ops.finish(a_wo, "auth shipped")
+    assert central.get_backlog(a["id"])["status"] == "done"
+    daemon.clear_settled_preconditions(daemon.catalog.projects[0], store)
+    assert store.open_preconditions(result["wo_id"]) == []
     daemon.tick()
     ops.finish(result["wo_id"], "profile page shipped")
     assert central.get_backlog(b["id"])["status"] == "done"
+
+
+def test_a_promotion_plan_is_dependency_ordered_and_creates_nothing(started, project):
+    central = CentralStore()
+    a = central.add_backlog("proj_a", "a")
+    b = central.add_backlog("proj_a", "b", depends_on=[a["id"]])
+    c = central.add_backlog("proj_a", "c", depends_on=[a["id"]])
+    d = central.add_backlog("proj_a", "d", depends_on=[b["id"], c["id"]])
+
+    plan = ops.promote_backlog(d["id"], dry_run=True)
+
+    assert plan[0]["id"] == a["id"] and plan[-1]["id"] == d["id"]
+    assert len(plan) == 4, "a diamond's shared dependency appears once"
+    assert plan[-1]["waits_on"] == [b["id"], c["id"]]
+    assert plan[-1] == {"id": d["id"], "title": "d", "project": "proj_a", "kind": "wo",
+                        "waits_on": [b["id"], c["id"]]}
+    assert central.get_backlog(a["id"])["status"] == "open"
+    assert ProjectStore(project).list_work_orders() == []
+
+
+def test_a_promoted_dependency_holds_but_is_not_promoted_again(started, project):
+    central = CentralStore()
+    a = central.add_backlog("proj_a", "a")
+    first = ops.promote_backlog(a["id"])
+    finished = central.add_backlog("proj_a", "finished")
+    central.mark_backlog(finished["id"], "done")
+    b = central.add_backlog("proj_a", "b", depends_on=[a["id"], finished["id"]])
+
+    result = ops.promote_backlog(b["id"])
+
+    assert [m["id"] for m in result["members"]] == [b["id"]]
+    assert central.get_backlog(a["id"])["promoted_wo_id"] == first["wo_id"]
+    store = ProjectStore(project)
+    assert [r["ref"] for r in store.open_preconditions(result["wo_id"])] == [a["id"]]
+
+
+@pytest.mark.parametrize("status", ["dropped", "proposed", "quarantined"])
+def test_a_dependency_that_cannot_be_promoted_refuses_the_whole_closure(started, project, status):
+    central = CentralStore()
+    bad = central.add_backlog("proj_a", "bad", status=status)
+    a = central.add_backlog("proj_a", "a", depends_on=[bad["id"]])
+    b = central.add_backlog("proj_a", "b", depends_on=[a["id"]])
+
+    for dry_run in (True, False):
+        with pytest.raises(ops.OpsError, match=f"{bad['id']} \\({status}\\)"):
+            ops.promote_backlog(b["id"], dry_run=dry_run)
+
+    assert central.get_backlog(a["id"])["status"] == "open"
+    assert central.get_backlog(b["id"])["status"] == "open"
+    assert ProjectStore(project).list_work_orders() == []
+
+
+def test_a_feature_with_unsettled_dependencies_is_refused_up_front(started, project):
+    central = CentralStore()
+    a = central.add_backlog("proj_a", "a")
+    b = central.add_backlog("proj_a", "b", description="the ask", depends_on=[a["id"]])
+
+    with pytest.raises(ops.OpsError, match="promote its dependencies first"):
+        ops.promote_backlog(b["id"], as_feature=True)
+    assert central.get_backlog(a["id"])["status"] == "open", "nothing created"
+
+    # the positive: the same override with its dependency settled goes through
+    central.mark_backlog(a["id"], "done")
+    assert "fo_id" in ops.promote_backlog(b["id"], as_feature=True)
+
+
+def test_suggested_kind_decides_and_as_feature_overrides_only_the_root(started, project):
+    central = CentralStore()
+    big = central.add_backlog("proj_a", "big", description="the ask", suggested_kind="fo")
+    small = central.add_backlog("proj_a", "small", depends_on=[big["id"]])
+    other = central.add_backlog("proj_a", "other", suggested_kind="fo")
+
+    out = ops.promote_backlog(small["id"])
+    assert [m["kind"] for m in out["members"]] == ["fo", "wo"]
+    store = ProjectStore(project)
+    assert [r["ref"] for r in store.open_preconditions(out["wo_id"])] == [big["id"]]
+    assert "wo_id" in ops.promote_backlog(other["id"], as_feature=False)
+
+
+def test_a_bare_feature_member_refuses_before_any_member_is_created(started, project):
+    central = CentralStore()
+    first = central.add_backlog("proj_a", "first")
+    bare = central.add_backlog("proj_a", "bare", suggested_kind="fo")
+    root = central.add_backlog("proj_a", "root", depends_on=[first["id"], bare["id"]])
+
+    with pytest.raises(ops.OpsError, match=f"needs a description, and {bare['id']}"):
+        ops.promote_backlog(root["id"])
+    assert central.get_backlog(first["id"])["status"] == "open"
+    assert ProjectStore(project).list_work_orders() == []
+
+
+def test_a_dependency_cycle_is_refused_not_deadlocked(started, project):
+    central = CentralStore()
+    a = central.add_backlog("proj_a", "a", status="proposed")
+    b = central.add_backlog("proj_a", "b", depends_on=[a["id"]])
+    central.review_backlog(a["id"], "open", rule="test", note="test", depends_on=[b["id"]])
+
+    with pytest.raises(ops.OpsError, match="dependency cycle"):
+        ops.promote_backlog(b["id"])
+
+
+def test_cli_promote_needs_yes_for_more_than_one_member(started, project, capsys):
+    from jarvis import cli
+    central = CentralStore()
+    a = central.add_backlog("proj_a", "a title")
+    b = central.add_backlog("proj_a", "b title", depends_on=[a["id"]])
+
+    assert cli.main(["backlog", "promote", b["id"]]) == 1
+    out = capsys.readouterr().out
+    assert "a title" in out and "b title" in out and "--yes" in out
+    assert central.get_backlog(a["id"])["status"] == "open"
+
+    assert cli.main(["backlog", "promote", b["id"], "--yes", "--force"]) == 0
+    captured = capsys.readouterr()
+    assert "deprecated" in captured.err
+    assert central.get_backlog(a["id"])["status"] == "promoted"
+    assert central.get_backlog(b["id"])["status"] == "promoted"
+
+    solo = central.add_backlog("proj_a", "solo")
+    assert cli.main(["backlog", "promote", solo["id"]]) == 0, "one member needs no --yes"
 
 
 def test_wo_not_found(started):

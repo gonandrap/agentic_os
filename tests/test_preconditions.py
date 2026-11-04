@@ -191,6 +191,18 @@ def test_promote_backlog_of_a_held_item_succeeds_and_the_order_is_held(
     assert store.claim_next_pending() is None
 
 
+def test_promoting_a_held_item_with_dependencies_keeps_both_holds(started, store, central):
+    """§7.2 trap: passing blocked_by switches off create_work_order's own backlog hold"""
+    dep = central.add_backlog("proj_a", "the actor")
+    item = central.add_backlog("proj_a", "wire the actor", description=HOLD_BRIEF,
+                               depends_on=[dep["id"]])
+
+    out = ops.promote_backlog(item["id"])
+
+    assert ({r["ref"] for r in store.open_preconditions(out["wo_id"])}
+            == {dep["id"], item["id"]})
+
+
 def test_the_matched_sentence_is_the_note_on_the_attached_row(started, store, central):
     item = central.add_backlog("proj_a", "wire the actor", description=HOLD_BRIEF)
 

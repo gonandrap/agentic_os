@@ -933,21 +933,57 @@ def test_dashboard_is_never_cached(client):
     assert r.headers.get("cache-control", "") == "no-store"
 
 
-def test_backlog_page_promote_blocked_then_forced(client, project):
+def test_backlog_page_promote_blocked_then_confirmed(client, project):
     central = CentralStore()
     a = central.add_backlog("proj_a", "foundation")
     b = central.add_backlog("proj_a", "tower", depends_on=[a["id"]])
 
     r = client.get("/backlog")
     assert "blocked by" in r.text and a["id"] in r.text
+    assert 'name="force"' not in r.text
+    assert f'data-promote-plan="/backlog/{b["id"]}/promote-plan"' in r.text
+    assert 'id="promote-dialog"' in r.text and "alert(" not in r.text
 
-    r = client.post(f"/backlog/promote/{b['id']}", data={})
+    # the popup is not client-only: unconfirmed, the server names the members, creates nothing
+    r = client.post(f"/backlog/promote/{b['id']}", data={}, follow_redirects=False)
     from urllib.parse import unquote
-    assert "unfinished dependencies" in unquote(r.headers["location"])
+    flash = unquote(r.headers["location"])
+    assert flash.startswith("/backlog?error=") and a["id"] in flash and b["id"] in flash
+    assert central.get_backlog(a["id"])["status"] == "open"
+    assert central.get_backlog(b["id"])["status"] == "open"
 
-    r = client.post(f"/backlog/promote/{b['id']}", data={"force": "1"})
+    r = client.post(f"/backlog/promote/{b['id']}", data={"confirm": "1"}, follow_redirects=False)
     assert r.headers["location"].startswith("/wo/proj_a/")
+    assert central.get_backlog(a["id"])["status"] == "promoted"
     assert central.get_backlog(b["id"])["status"] == "promoted"
+
+
+def test_a_single_member_promotion_needs_no_confirm_and_a_feature_lands_on_its_page(client, project):
+    central = CentralStore()
+    solo = central.add_backlog("proj_a", "solo")
+    feature = central.add_backlog("proj_a", "big", description="the ask", suggested_kind="fo")
+
+    r = client.post(f"/backlog/promote/{solo['id']}", data={}, follow_redirects=False)
+    assert r.headers["location"].startswith("/wo/proj_a/")
+    r = client.post(f"/backlog/promote/{feature['id']}", data={}, follow_redirects=False)
+    assert r.headers["location"].startswith("/fo/proj_a/")
+
+
+def test_the_promote_plan_route_lists_every_member_or_says_why_not(client, project):
+    central = CentralStore()
+    a = central.add_backlog("proj_a", "foundation")
+    b = central.add_backlog("proj_a", "tower", depends_on=[a["id"]])
+    gone = central.add_backlog("proj_a", "gone")
+    central.mark_backlog(gone["id"], "dropped")
+    c = central.add_backlog("proj_a", "shed", depends_on=[gone["id"]])
+
+    plan = client.get(f"/backlog/{b['id']}/promote-plan").json()["plan"]
+    assert [(m["id"], m["title"], m["kind"], m["project"]) for m in plan] == [
+        (a["id"], "foundation", "wo", "proj_a"), (b["id"], "tower", "wo", "proj_a")]
+
+    r = client.get(f"/backlog/{c['id']}/promote-plan")
+    assert r.status_code == 409 and gone["id"] in r.json()["error"]
+    assert central.get_backlog(a["id"])["status"] == "open"  # a plan creates nothing
 
 
 # -- backlog filters and origins (2026-11-03-backlog-operability §6)
@@ -3707,7 +3743,7 @@ def test_a_backlog_item_page_links_its_dependencies_and_promotes(client, project
     page = client.get(f"/backlog/{item['id']}").text
     assert "build it tall" in page
     assert f'href="/backlog/{dep["id"]}"' in page
-    assert f'action="/backlog/promote/{item["id"]}"' in page and 'name="force"' in page
+    assert f'action="/backlog/promote/{item["id"]}"' in page and 'id="promote-dialog"' in page
     assert client.get("/backlog/bl-nope").status_code == 404
 
     shown = ops.show_backlog(item["id"])

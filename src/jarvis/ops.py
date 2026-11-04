@@ -13845,46 +13845,114 @@ def propose_backlog(project: str, title: str, description: str = "", *,
         central.close()
 
 
-def promote_backlog(item_id: str, force: bool = False,
-                    as_feature: bool = False,
-                    max_parallel: int | None = None) -> dict[str, Any]:
-    """Turn an intake item into committed work"""
-    if max_parallel is not None and not as_feature:
-        # Refused rather than ignored: a work order has no children to cap
-        raise OpsError("--max-parallel applies to a feature order; add --as feature")
+def _promotion_plan(central: CentralStore, item_id: str,
+                    as_feature: bool | None) -> list[dict[str, Any]]:
+    """Open closure, dependencies first (docs/superpowers/specs/2026-11-03-backlog-operability.md §7.1, §7.2)"""
+    root = central.get_backlog(item_id)
+    if not root:
+        raise OpsError(f"backlog item {item_id!r} not found")
+    if root["status"] != "open":
+        raise OpsError(f"backlog item {item_id} is {root['status']}, not open")
+    plan: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    path: list[str] = []
+    refused: list[str] = []
+
+    def visit(item: dict[str, Any]) -> None:
+        seen.add(item["id"])
+        path.append(item["id"])
+        waits_on = []
+        for dep_id in item["depends_on"]:
+            dep = central.get_backlog(dep_id)
+            status = dep["status"] if dep else "missing"
+            if status == "done":
+                continue
+            if status not in ("open", "promoted"):
+                refused.append(f"{dep_id} ({status})")
+                continue
+            waits_on.append(dep_id)
+            if status == "promoted":
+                continue
+            if dep_id in path:  # mutual holds would never clear
+                refused.append(f"{dep_id} (dependency cycle)")
+            elif dep_id not in seen:
+                visit(dep)
+        path.pop()
+        kind = item["suggested_kind"]
+        if item["id"] == item_id and as_feature is not None:
+            kind = "fo" if as_feature else "wo"
+        plan.append({"id": item["id"], "title": item["title"], "project": item["project"],
+                     "kind": kind, "waits_on": waits_on})
+
+    visit(root)
+    if refused:
+        raise OpsError(f"cannot promote {item_id}, nothing was created: its dependencies "
+                       f"cannot be promoted: {', '.join(sorted(set(refused)))}")
+    waiting_features = [m for m in plan if m["kind"] == "fo" and m["waits_on"]]
+    if waiting_features:
+        raise OpsError(
+            f"cannot promote {item_id}, nothing was created: a feature order starts planning "
+            "at once and cannot wait, so " + "; ".join(
+                f"{m['id']} waits on {', '.join(m['waits_on'])}" for m in waiting_features)
+            + " — promote its dependencies first")
+    # create_feature_order refuses these; caught here, a late member cannot strand the early ones
+    bare = [m["id"] for m in plan if m["kind"] == "fo"
+            and not (central.get_backlog(m["id"])["description"] or "").strip()]
+    if bare:
+        raise OpsError(f"cannot promote {item_id}, nothing was created: a feature order needs "
+                       f"a description, and {', '.join(bare)} has none")
+    known = registered_project_paths()
+    strays = sorted({m["project"] for m in plan} - set(known))
+    if strays:
+        raise OpsError(f"cannot promote {item_id}, nothing was created: "
+                       f"project not registered: {', '.join(strays)}")
+    return plan
+
+
+def promote_backlog(item_id: str, *, as_feature: bool | None = None, dry_run: bool = False,
+                    max_parallel: int | None = None) -> dict[str, Any] | list[dict[str, Any]]:
+    """Turn an intake item and its open dependencies into committed work (2026-11-03-backlog-operability §7)"""
+    from . import preconditions
+
     central = CentralStore()
     try:
-        item = central.get_backlog(item_id)
-        if not item:
-            raise OpsError(f"backlog item {item_id!r} not found")
-        if item["status"] != "open":
-            raise OpsError(f"backlog item {item_id} is {item['status']}, not open")
-        blockers = central.unfinished_dependencies(item_id)
-        if blockers and not force:
-            raise OpsError(
-                f"backlog item {item_id} has unfinished dependencies: "
-                + ", ".join(f"{b['id']} ({b['status']})" for b in blockers)
-                + " — finish them first or use --force"
-            )
-        if as_feature:
-            fo = create_feature_order(
-                item["project"], item["title"], description=item["description"],
-                origin="jarvis", backlog_id=item_id, max_parallel=max_parallel,
-            )
-            # `promoted_wo_id` takes the feature order's id: the column records what the item BECAME
-            central.mark_backlog(item_id, "promoted", promoted_wo_id=fo["id"])
-            return {"backlog_id": item_id, "fo_id": fo["id"],
-                    "project": item["project"],
-                    "forced_over_blockers": [b["id"] for b in blockers] if force else [],
-                    "note": "a planner will decompose it; the plan comes back for "
-                            "review before any work order is created"}
-        wo = create_work_order(
-            item["project"], item["title"], description=item["description"],
-            origin="jarvis", backlog_id=item_id,
-        )
-        central.mark_backlog(item_id, "promoted", promoted_wo_id=wo["id"])
-        return {"backlog_id": item_id, "wo_id": wo["id"], "project": item["project"],
-                "forced_over_blockers": [b["id"] for b in blockers] if force else []}
+        plan = _promotion_plan(central, item_id, as_feature)
+        root_kind = plan[-1]["kind"]
+        if max_parallel is not None and root_kind != "fo":
+            # Refused rather than ignored: a work order has no children to cap
+            raise OpsError("--max-parallel applies to a feature order; add --as feature")
+        if dry_run:
+            return plan
+        members = []
+        for member in plan:
+            item = central.get_backlog(member["id"])
+            if member["kind"] == "fo":
+                order = create_feature_order(
+                    item["project"], item["title"], description=item["description"],
+                    origin="jarvis", backlog_id=item["id"],
+                    max_parallel=max_parallel if item["id"] == item_id else None,
+                )
+            else:
+                holds = list(member["waits_on"])
+                # blocked_by switches off create_work_order's own backlog_hold (§7.2)
+                if holds and preconditions.states_hold(item["title"], item["description"] or ""):
+                    holds.append(item["id"])
+                order = create_work_order(
+                    item["project"], item["title"], description=item["description"],
+                    origin="jarvis", backlog_id=item["id"], blocked_by=holds or None,
+                )
+            # `promoted_wo_id` takes a feature order's id too: the column records what the item BECAME
+            central.mark_backlog(item["id"], "promoted", promoted_wo_id=order["id"])
+            members.append({**member, "order_id": order["id"]})
+        out: dict[str, Any] = {"backlog_id": item_id, "project": plan[-1]["project"],
+                               "members": members}
+        if root_kind == "fo":
+            out["fo_id"] = members[-1]["order_id"]
+            out["note"] = ("a planner will decompose it; the plan comes back for "
+                           "review before any work order is created")
+        else:
+            out["wo_id"] = members[-1]["order_id"]
+        return out
     finally:
         central.close()
 

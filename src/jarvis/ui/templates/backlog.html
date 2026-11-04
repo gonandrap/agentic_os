@@ -38,8 +38,7 @@
         {%- if it.origins | length > 1 %} <span class="sub">+{{ it.origins | length - 1 }}</span>{% endif %}{% else %}—{% endif %}</td>
       <td>{% if it.promoted_wo_id %}{{ ui.row_id(it.promoted_wo_id, "/go/" ~ it.promoted_wo_id) }}{% else %}—{% endif %}</td>
       <td>{% if it.status == 'open' %}
-        <form class="inline" method="post" action="/backlog/promote/{{ it.id }}">
-          {% if it.blockers %}<label class="sub"><input type="checkbox" name="force" value="1"> force</label>{% endif %}
+        <form class="inline" method="post" action="/backlog/promote/{{ it.id }}" data-promote-plan="/backlog/{{ it.id }}/promote-plan">
           <button {{ 'class=primary' if not it.blockers }}>Promote</button>
         </form>{% endif %}</td>
     </tr>
@@ -49,4 +48,5 @@
   </table>
 </div>
 
+{% include "_promote_dialog.html" %}
 {% endblock %}

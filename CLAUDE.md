@@ -68,7 +68,7 @@ jarvis do show|send|follow-up|done|cancel <id>
 jarvis mo create <project> "title" --prompt "…"|--script f [--every 15m] [--deadline 3d]
 jarvis mo list|show|cancel|waive|requeue|rewrite|confirm / pause|unpause|follow-fleet   # `jarvis morpheus` = alias
 jarvis backlog promote <id> --as feature   # intake -> feature order
-jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
+jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--yes]   # --yes: its open dependencies are promoted too
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on reject it reaches the worker
 jarvis wo budget <id> [<usd>] [--clear]    # dollar ceiling on one order; raising it resumes it

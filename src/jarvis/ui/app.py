@@ -2967,12 +2967,27 @@ def create_app() -> FastAPI:
             ops.ack_inbox(int(inbox_id) if inbox_id else None)
         return RedirectResponse(_same_site_back(next, "/inbox"), status_code=303)
 
-    @app.post("/backlog/promote/{item_id}")
-    def promote(item_id: str, force: str = Form("")):
+    @app.get("/backlog/{item_id}/promote-plan")
+    def promote_plan(item_id: str):
+        """What a promotion would create: feeds _promote_dialog.html (2026-11-03-backlog-operability §7.3)"""
         try:
-            result = ops.promote_backlog(item_id, force=bool(force))
+            return {"plan": ops.promote_backlog(item_id, dry_run=True)}
         except ops.OpsError as e:
-            return RedirectResponse(f"/backlog?error={e}", status_code=303)
+            return JSONResponse({"error": str(e)}, status_code=409)
+
+    @app.post("/backlog/promote/{item_id}")
+    def promote(item_id: str, confirm: str = Form("")):
+        try:
+            plan = ops.promote_backlog(item_id, dry_run=True)
+            if len(plan) > 1 and not confirm:
+                raise ops.OpsError(f"promoting {item_id} creates {len(plan)} orders ("
+                                   + ", ".join(m["id"] for m in plan)
+                                   + ") — confirm the list first")
+            result = ops.promote_backlog(item_id)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/backlog?error={quote(str(e))}", status_code=303)
+        if "fo_id" in result:
+            return RedirectResponse(f"/fo/{result['project']}/{result['fo_id']}", status_code=303)
         return RedirectResponse(f"/wo/{result['project']}/{result['wo_id']}", status_code=303)
 
     return app

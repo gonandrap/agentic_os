@@ -1752,14 +1752,16 @@ def build_parser() -> argparse.ArgumentParser:
     b = bl.add_parser("show", help="one backlog item in full, including where it "
                                    "came from")
     b.add_argument("item_id")
-    b = bl.add_parser("promote", help="turn a backlog item into a work order (or, with "
-                                      "--as feature, into a feature order the project "
-                                      "plans for itself)")
+    b = bl.add_parser("promote", help="turn a backlog item and its open dependencies into "
+                                      "orders, each of its suggested kind")
     b.add_argument("item_id")
-    b.add_argument("--as", dest="as_kind", default="work", choices=["work", "feature"],
-                   help="`work` (default) dispatches one worker; `feature` opens a "
-                        "planner that decomposes it first")
-    b.add_argument("--force", action="store_true", help="ignore unfinished dependencies")
+    b.add_argument("--as", dest="as_kind", choices=["work", "feature"],
+                   help="override this item's suggested kind: `work` dispatches one worker; "
+                        "`feature` opens a planner that decomposes it first")
+    b.add_argument("--yes", action="store_true",
+                   help="required when dependencies would be promoted with it")
+    b.add_argument("--force", action="store_true",
+                   help="deprecated, no effect: dependencies are promoted, not skipped")
     b.add_argument("--max-parallel", dest="max_parallel", type=int, metavar="N",
                    help="with --as feature: cap how many of its children run at once")
     b = bl.add_parser("done", help="mark a backlog item done without a work order")
@@ -5500,9 +5502,24 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                 if item.get("duplicate_of"):
                     print(f"duplicate of: {item['duplicate_of']}")
         elif args.bl_cmd == "promote":
-            _print(ops.promote_backlog(args.item_id, force=args.force,
-                                       as_feature=args.as_kind == "feature",
-                                       max_parallel=args.max_parallel), args.json)
+            if args.force:
+                print("--force is deprecated and has no effect: dependencies are promoted now, "
+                      "not skipped", file=sys.stderr)
+            how = {"as_feature": {"feature": True, "work": False}.get(args.as_kind),
+                   "max_parallel": args.max_parallel}
+            plan = ops.promote_backlog(args.item_id, dry_run=True, **how)
+            confirmed = args.yes or len(plan) == 1
+            if args.json and not confirmed:
+                _print({"refused": "needs --yes", "plan": plan}, True)
+            elif not args.json:
+                for m in plan:
+                    waits = f" (waits on {', '.join(m['waits_on'])})" if m["waits_on"] else ""
+                    print(f"• {m['id']} [{m['project']}] {m['kind']}: {m['title']}{waits}")
+            if not confirmed:
+                if not args.json:
+                    print(f"this creates {len(plan)} orders; re-run with --yes")
+                return 1
+            _print(ops.promote_backlog(args.item_id, **how), args.json)
         elif args.bl_cmd == "done":
             central.mark_backlog(args.item_id, "done")
             _print({"item": args.item_id, "status": "done"}, args.json)
