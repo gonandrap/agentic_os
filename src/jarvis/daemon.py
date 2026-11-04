@@ -7951,6 +7951,9 @@ conflicts, shipit refuses: report its reason and stop. Never fall back to releas
         # §7.5: a marker naming this order, in ANY state including failed_verification
         if str(marker.get("wo_id") or "") == wo_id:
             return
+        # Issue #1485: its own shipit may be mid-deploy, checkout moved and marker not yet written
+        if any(t["wo_id"] == wo_id for t in store.running_turns()):
+            return
         shas = self._release_payload(project, store, wo_id, batch)
         if shas is None:
             return
