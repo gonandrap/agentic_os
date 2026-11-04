@@ -209,7 +209,8 @@ CREATE TABLE IF NOT EXISTS inbox (
     wo_id TEXT,
     status TEXT NOT NULL DEFAULT 'new',     -- new | notified | acked
     sink_results TEXT,
-    paired_reason TEXT                      -- also in ADDED_COLUMNS
+    paired_reason TEXT,                     -- also in ADDED_COLUMNS
+    push INTEGER NOT NULL DEFAULT 1         -- also in ADDED_COLUMNS
 );
 CREATE TABLE IF NOT EXISTS backlog (
     id TEXT PRIMARY KEY,
@@ -735,6 +736,8 @@ ADDED_COLUMNS = {
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
         "paired_reason": "TEXT",
+        # 0: on the record, never pushed to phone or desktop (io-ed253c2b)
+        "push": "INTEGER NOT NULL DEFAULT 1",
     },
     "knowledge": {
         # Retraction
@@ -1047,11 +1050,12 @@ class CentralStore:
         return float(row["c"] or 0.0)
 
     def add_inbox(self, project: str, title: str, body: str = "", level: str = "info",
-                  wo_id: str | None = None, paired_reason: str | None = None) -> int:
+                  wo_id: str | None = None, paired_reason: str | None = None,
+                  push: bool = True) -> int:
         cur = self.conn.execute(
-            "INSERT INTO inbox (ts, project, level, title, body, wo_id, paired_reason) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (db.now(), project, level, title, body, wo_id, paired_reason),
+            "INSERT INTO inbox (ts, project, level, title, body, wo_id, paired_reason, push) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (db.now(), project, level, title, body, wo_id, paired_reason, int(push)),
         )
         return int(cur.lastrowid)
 
@@ -1251,8 +1255,12 @@ class CentralStore:
         if duplicate_of is not None:
             if status != "dropped":
                 raise ValueError("duplicate_of is only set on a dropped item")
-            if duplicate_of == item_id or not self.get_backlog(duplicate_of):
+            target = self.get_backlog(duplicate_of)
+            if duplicate_of == item_id or not target:
                 raise KeyError(f"duplicate_of {duplicate_of!r} is not another backlog item")
+            if target["status"] in SETTLED_BACKLOG_STATUSES:
+                raise ValueError(f"duplicate_of {duplicate_of} is {target['status']}: "
+                                 f"a settled item cannot take a duplicate")
         for dep in depends_on or ():
             if dep == item_id or not self.get_backlog(dep):
                 raise KeyError(f"backlog dependency {dep!r} does not exist")

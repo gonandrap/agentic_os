@@ -182,7 +182,7 @@ SINKS: dict[str, Callable[[dict[str, Any], Catalog], str]] = {
 
 
 def route_new_inbox(central: CentralStore, catalog: Catalog) -> int:
-    """Send every 'new' inbox item through the configured sinks"""
+    """Send every 'new' inbox item through the configured sinks; a push=False row only logs"""
     sinks = list(dict.fromkeys(["log", *catalog.os.notification_sinks]))
     count = 0
     for item in central.new_inbox():
@@ -191,7 +191,7 @@ def route_new_inbox(central: CentralStore, catalog: Catalog) -> int:
             item["wo_link"], item["wo_link_problem"] = check_wo_link(
                 central, catalog, item["project"], item["wo_id"])
         results = {}
-        for name in sinks:
+        for name in sinks if item["push"] else ["log"]:
             fn = SINKS.get(name)
             results[name] = fn(item, catalog) if fn else f"unknown sink {name!r}"
         central.mark_inbox(item["id"], "notified", sink_results=results)

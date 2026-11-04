@@ -327,7 +327,14 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
     if verdict.get("rewrite"):
         lines.append(f"    {verdict['rewrite']}")
     if verdict.get("duplicate_of"):
-        lines.append(f"  duplicate of: {verdict['duplicate_of']}")
+        lines.append(f"  duplicate of: {verdict['duplicate_of']}"
+                     + (f" (by {verdict['duplicate_link']})"
+                        if verdict.get("duplicate_link") else ""))
+        settled = verdict.get("duplicate_settled") or {}
+        if settled:
+            lines.append("  target settled: " + (
+                f"proposed as {settled['backlog']}" if settled.get("backlog")
+                else f"tracked by {settled.get('issue_url', '')}"))
     fix = verdict.get("proposed_fix") or {}
     if fix:
         lines += [f"  proposed fix: {fix.get('title', '')}",

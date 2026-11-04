@@ -24,6 +24,11 @@ def test_go_sends_a_feature_order_through_order_path(client):  # noqa: F811
     assert client.get(f"/go/{fo['id']}").headers["location"] == f"/fo/proj_a/{fo['id']}"
 
 
+def test_go_sends_a_decision_order_to_its_page(client):  # noqa: F811
+    do = ops.create_decision_order("proj_a", "which cache", "compare the two caches")
+    assert client.get(f"/go/{do['id']}").headers["location"] == f"/do/proj_a/{do['id']}"
+
+
 @pytest.mark.parametrize("ref, where", [
     ("q12", "/neo/question/12"),
     ("12", "/neo/question/12"),

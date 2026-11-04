@@ -17,6 +17,12 @@ from jarvis.project_store import ProjectStore
 pytestmark = pytest.mark.usefixtures("neo_projects")
 
 
+@pytest.fixture(autouse=True)
+def not_a_worker(monkeypatch):
+    """The suite is routinely run BY a worker, which inherits `JARVIS_WO_ID`"""
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+
+
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
     result = ops.start_os(str(catalog_file), foreground=True)
@@ -1226,6 +1232,41 @@ def test_an_unusable_answer_is_never_a_verdict(started, monkeypatch, answer):
     assert _question(item["neo_question_id"])["status"] == "queued"
 
 
+@pytest.mark.parametrize("settled", ["done", "dropped"])
+def test_a_duplicate_verdict_on_a_settled_item_is_never_a_verdict(started, monkeypatch, settled):
+    kept = _quarantined(started, title="Rename the export flag", severity="minor")
+    central = CentralStore()
+    try:
+        central.mark_backlog(kept["id"], settled)
+    finally:
+        central.close()
+    ref = {"kind": "neo_question", "id": 77}
+    item = _quarantined(started, origin_refs=[ref])
+    _neo_says(monkeypatch, answer=json.dumps(
+        {"decision": "duplicate", "duplicate_of": kept["id"]}))
+
+    drain(started)
+
+    assert _item(item["id"])["status"] == "quarantined"
+    assert _question(item["neo_question_id"])["status"] == "queued"
+    assert ref not in _item(kept["id"])["origin_refs"]
+
+
+def test_the_user_folding_into_a_settled_item_is_refused(started):
+    kept = _quarantined(started, title="Rename the export flag", severity="minor")
+    central = CentralStore()
+    try:
+        central.mark_backlog(kept["id"], "done")
+    finally:
+        central.close()
+    item = _quarantined(started)
+
+    with pytest.raises(ops.OpsError, match=rf"{kept['id']}.*done"):
+        ops.review_backlog_item(item["id"], "duplicate", duplicate_of=kept["id"])
+
+    assert _item(item["id"])["status"] == "quarantined"
+
+
 def test_an_unusable_answer_past_its_attempts_goes_to_the_user(started, monkeypatch):
     item = _quarantined(started)
     _neo_says(monkeypatch, answer="no idea")
@@ -1330,6 +1371,49 @@ def test_the_user_may_decide_before_neo_answers_and_that_closes_the_question(sta
 
     q = _question(item["neo_question_id"])
     assert (q["status"], q["answered_by"]) == ("answered", "user")
+
+
+def _learning_count():
+    neo = NeoStore()
+    try:
+        return len(neo.learnings("proj_a", limit=500))
+    finally:
+        neo.close()
+
+
+def test_a_worker_session_may_not_decide_a_quarantined_proposal(started, monkeypatch, capsys):
+    """Paired with the same call outside a worker: the refusal is what stops it"""
+    from jarvis import cli
+
+    item = _quarantined(started)
+    review = ["backlog", "review", item["id"], "--accept", "--feedback", "ship it, trust me"]
+    before = _learning_count()
+
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-deadbeef")
+    assert cli.main(review) != 0
+    assert "wo-deadbeef is a worker session" in capsys.readouterr().err
+    with pytest.raises(ops.OpsError, match="goes to the steward and Neo"):
+        ops.review_backlog_item(item["id"], "accept", feedback="ship it, trust me")
+
+    assert _item(item["id"])["status"] == "quarantined"
+    q = _question(item["neo_question_id"])
+    assert (q["status"], q["answered_by"]) == ("queued", None)
+    assert _learning_count() == before
+
+    monkeypatch.delenv("JARVIS_WO_ID")
+    assert cli.main(review) == 0
+    assert _item(item["id"])["status"] == "open"
+    assert _question(item["neo_question_id"])["answered_by"] == "user"
+    assert _learning_count() == before + 1
+
+
+def test_a_worker_session_does_not_stop_neo_deciding_a_quarantined_proposal(started,
+                                                                            monkeypatch):
+    item = _quarantined(started)
+    _neo_says(monkeypatch, answer=json.dumps({"decision": "reject"}))
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-deadbeef")
+    drain(started)
+    assert _item(item["id"])["status"] == "dropped"
 
 
 # -- the pulse (backlog-operability §8)

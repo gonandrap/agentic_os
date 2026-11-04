@@ -1221,6 +1221,7 @@ class Daemon:
                 if reconcile:
                     # Immediately after the settlement above
                     self.clear_answered_investigations(project, store)
+                    self.raise_settled_duplicates(project)
                     # Beside it: the investigator's half of a settled investigation
                     self.settle_landed_investigators(project, store)
                     # A researcher's validated report reaches the user; the order itself stays open
@@ -1617,6 +1618,16 @@ class Daemon:
                 self._complete_feature(store, fo)
                 log.info("[%s] feature %s completed (%d work orders)", project.name,
                          fo["id"], len(children))
+
+    def raise_settled_duplicates(self, project: ProjectSpec) -> None:
+        """Investigation spec §2.5: a downgraded GAP whose target settled must come back up"""
+        from . import ops
+
+        try:
+            for item_id in ops.raise_settled_duplicates(project.name, project.path):
+                log.info("[%s] proposed %s from settled duplicates", project.name, item_id)
+        except Exception:  # noqa: BLE001 — unmarked verdicts retry on the next reconcile
+            log.exception("[%s] could not raise settled duplicates", project.name)
 
     def clear_answered_investigations(self, project: ProjectSpec,
                                       store: ProjectStore) -> None:
@@ -3968,7 +3979,7 @@ class Daemon:
             project=q["project"], level="info",
             title=supervisor.ADVICE_INBOX_TITLE.format(wo_id=q["wo_id"]),
             body=f"{note}\n{supervisor.ALARM_PATH.format(project=q['project'], alarm_id=alarm['id'])}",
-            wo_id=q["wo_id"])
+            wo_id=q["wo_id"], push=False)
         log.info("neo answered alarm %s", alarm["id"])
 
     def _supervisor_config(self, project: str) -> Any:
@@ -4052,6 +4063,9 @@ class Daemon:
                       f"Command: {approval['command']}\n"
                       f"Review Neo's call with: jarvis neo review {q['id']}"),
                 wo_id=q["wo_id"],
+                # A settled merge or release asks nothing of the user (io-ed253c2b)
+                push=not (ruling == "approved" and not decided["contested"]
+                          and approval["kind"] in ("auto_merge", "release")),
             )
         log.info("gate %s %s by neo for %s", approval["id"], ruling, q["wo_id"])
 
@@ -6711,7 +6725,7 @@ class Daemon:
                  f"What it accepted, and why: jarvis wo show {wo['id']}\n"
                  f"If any of it was wrong: jarvis neo review {q['id']} "
                  f"--correct \"…\" teaches Neo not to do it again.",
-            wo_id=wo["id"])
+            wo_id=wo["id"], push=False)
 
     def _asked_early(self, pstore: ProjectStore, wo_id: str, question_id: int) -> bool:
         """Was this assumption question filed by the EARLY pass?"""

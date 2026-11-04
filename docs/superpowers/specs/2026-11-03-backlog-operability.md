@@ -65,12 +65,12 @@ are what older rows have.
 | `turn` | `project, wo_id, ts, seq?` | the first `agent_to_user` message of that WO with `ts >=` ref ts: `/wo/<p>/<wo>#msg-<id>`; while none exists yet, `/wo/<p>/<wo>` |
 | `message` | `project, wo_id, id` | `/wo/<p>/<wo>#msg-<id>` |
 | `neo_question` | `id` | `/neo/question/<id>` |
-| `envelope` | `project, id, subject_wo_id` | the subject WO page (the deferral) |
-| `decision` | `do_id, key?` | `/go/<do_id>` (proposal key shown as label) |
+| `envelope` | `project, id, subject_wo_id` | `/wo/<p>/<subject_wo_id>#envelope-<id>` (the deferral, in the Timeline tab) |
+| `decision` | `do_id, key?` | `/go/<do_id>#proposal-<key>`; without a key, `/go/<do_id>` |
 | `monitoring_order` | `id` (`mo-`/`mv-`) | `/mo/<id>` |
 | `alarm` | `project, id` | `/alarms/<p>/<id>` |
-| `validation` | `project, wo_id, round?` | the WO page's validation panel |
-| `finding` | `order_id` (`io-`/`inv-`/`do-`), `key` | `/go/<order_id>` |
+| `validation` | `project, wo_id, round?` | `/wo/<p>/<wo>#round-<round>`; without a round, `/wo/<p>/<wo>#validation` |
+| `finding` | `order_id` (`io-`/`inv-`/`do-`), `key` | `/go/<order_id>#finding-<key>`; an `inv-` order has no keyed findings, so `/go/<order_id>#verdict` |
 | `gate` | `project, id` | `/gates/<id>?project=<p>` |
 | `order` | `id` (any `wo-`/`fo-`) | `/go/<id>` — the weakest ref, used only when nothing finer is known |
 
@@ -255,7 +255,7 @@ parses `answer` with `structured.parse_json_object` and validates it. `escalate:
 leaves the item `quarantined` and the question escalated to the user (§5.4, §8). Copy the `kind="validation"` / `kind="triage"` pattern: delivered
 first in `Daemon._neo_drain.deliver` with an early return into a module-level
 `record_neo_verdict`-style applier that calls `review_backlog`. A `duplicate` verdict
-folds `origin_refs` exactly as §3.2 rule 2. An unparseable or failed answer is never
+folds `origin_refs` exactly as §3.2 rule 2; `review_backlog` refuses a settled `duplicate_of`. An unparseable or failed answer is never
 turned into a verdict (kn-40db1828): the item stays `quarantined`, the question retryable.
 
 ### 5.3 Every switch site of a new kind (kn-4edb0eb7)
@@ -278,7 +278,8 @@ forward to a worker — it applies the user's answer or points at `jarvis backlo
 [--feedback "why"]`, and `ops.review_backlog_item(...)` behind it (the UI in §8 calls the
 same function). Works on any `quarantined` item, escalated or not; records the user's
 reason as a Neo learning when `--feedback` is given (the `neo review --correct` path,
-without the worker forward); closes the Neo question.
+without the worker forward); closes the Neo question. A worker session (`JARVIS_WO_ID`
+set) is refused in `ops.review_backlog_item` before anything changes.
 
 ## 6. The backlog list and item page: filters and navigation
 

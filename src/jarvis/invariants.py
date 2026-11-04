@@ -4384,6 +4384,32 @@ def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+INV_FIX_GAP_UNREGISTERED = "INV-FIX-GAP-UNREGISTERED"
+
+
+def check_fix_registered_its_gap(store: ProjectStore) -> Iterator[Violation]:
+    """INV-FIX-GAP-UNREGISTERED — a completed GAP fix left its class out of `gaps.py` (io-38a4354f)"""
+    from . import gaps
+    from .bugreport import VERDICT_GAP_CLASS_KEY
+
+    rows = store.conn.execute(
+        "SELECT id, metadata FROM work_orders WHERE status='completed' "
+        "AND instr(metadata, ?) > 0", (VERDICT_GAP_CLASS_KEY,)).fetchall()
+    for row in rows:
+        metadata = db.from_json(row["metadata"], {}) or {}
+        gap_class = str(metadata.get(VERDICT_GAP_CLASS_KEY) or "")
+        if not gap_class or gaps.registered(gap_class) or store.work_abandoned(row["id"]):
+            continue
+        yield Violation(
+            invariant=INV_FIX_GAP_UNREGISTERED,
+            wo_id=row["id"],
+            detail=(f"completed, but gap class `{gap_class}` its verdict named is not "
+                    f"registered in src/jarvis/gaps.py, so the detector and remedy it owed "
+                    f"are unproven: register them or file the follow-up"),
+            context={"gap_class": gap_class},
+        )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
                                    # reading, repairing nothing and touching no flag any other check derives
@@ -4457,6 +4483,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 #: Invariants whose cost scales with the SETTLED BACKLOG rather than with live work
 SLOW_INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_work_lands,
+    check_fix_registered_its_gap,  # population: every completed order, like the one above
     check_spec_pointer_resolves,  # both properties of this class and neither of the fast
                                   # one: its population is every feature order a project has ever had
 )

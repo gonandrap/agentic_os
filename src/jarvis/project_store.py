@@ -277,6 +277,11 @@ def submission_artifacts(wo: Mapping[str, Any]) -> tuple[str, ...]:
     artifact = kind_contract(wo).artifact
     return (artifact,) if artifact else ()
 
+
+def pr_body_file(wo_id: str) -> str:
+    """The worktree file `hooks.pr_body_decision` orders a PR body written to (#1538)"""
+    return f"pr-body-{wo_id}.md"
+
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on somebody else (#134)
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 
@@ -491,6 +496,8 @@ WORKTREE_RECLAIMED_EVENT = "worktree_reclaimed"
 SESSION_KEPT_EVENT = "background_session_kept"
 #: The resolved path a `--from-file` submission was read from (#1528)
 SUBMITTED_ARTIFACT_EVENT = "submitted_artifact"
+#: The resolved path a `--from-file` submit refused for its name (#1538)
+REFUSED_ARTIFACT_EVENT = "refused_artifact"
 
 #: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
 MAX_PER_SWEEP_ROWS = 50
@@ -1706,6 +1713,17 @@ class ProjectStore:
         return db.rows_to_dicts(rows)
 
     # -- the issue <-> work order relation
+
+    def live_orders_on_cause(self, gap_class: str,
+                             issue_urls: Iterable[str] = ()) -> list[dict[str, Any]]:
+        """Unsettled work orders carrying this gap class or working one of these issues"""
+        urls = list(issue_urls)
+        held = ",".join("?" for _ in TERMINAL_STATUSES)
+        rows = self.conn.execute(
+            f"SELECT * FROM work_orders WHERE status NOT IN ({held}) AND (gap_class=? "
+            f"OR issue_url IN ({','.join('?' for _ in urls)})) ORDER BY created_at DESC",
+            (*TERMINAL_STATUSES, gap_class, *urls)).fetchall()
+        return db.rows_to_dicts(rows)
 
     def link_issue(self, issue_url: str, unit_id: str, kind: str, *,
                    round_no: int = 0, seat: str = "", announced: bool = False) -> bool:
