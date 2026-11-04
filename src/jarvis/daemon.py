@@ -1190,6 +1190,7 @@ class Daemon:
                 if reconcile:
                     # Immediately after the settlement above
                     self.clear_answered_investigations(project, store)
+                    self.raise_settled_duplicates(project)
                     # Beside it: the investigator's half of a settled investigation
                     self.settle_landed_investigators(project, store)
                     # A researcher's validated report reaches the user; the order itself stays open
@@ -1586,6 +1587,16 @@ class Daemon:
                 self._complete_feature(store, fo)
                 log.info("[%s] feature %s completed (%d work orders)", project.name,
                          fo["id"], len(children))
+
+    def raise_settled_duplicates(self, project: ProjectSpec) -> None:
+        """Investigation spec §2.5: a downgraded GAP whose target settled must come back up"""
+        from . import ops
+
+        try:
+            for item_id in ops.raise_settled_duplicates(project.name, project.path):
+                log.info("[%s] proposed %s from settled duplicates", project.name, item_id)
+        except Exception:  # noqa: BLE001 — unmarked verdicts retry on the next reconcile
+            log.exception("[%s] could not raise settled duplicates", project.name)
 
     def clear_answered_investigations(self, project: ProjectSpec,
                                       store: ProjectStore) -> None:
