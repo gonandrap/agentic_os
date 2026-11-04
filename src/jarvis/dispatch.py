@@ -944,9 +944,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "# Your job: diagnose ONE subject and classify it",
         f"You READ. You change nothing — no file, no commit, no pull request, nothing "
-        f"filed. That is not a request: two PreToolUse hooks refuse your writes and your "
-        f"mutating shell commands, so a session that tries to fix what it found spends "
-        f"its turns being denied. Your output is a VERDICT about "
+        f"filed. Two PreToolUse hooks refuse your writes and mutating shell commands. "
+        f"Your output is a VERDICT about "
         f"{subject or 'the subject'} and nothing else.",
         "",
         "# Read the evidence through the CLI, never the databases",
@@ -973,7 +972,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "reading, a validation transcript, a diff — is an opinion, not a diagnosis. "
         "Paraphrase is not a quote. Copy the line as it is printed, name the command that "
         f"printed it, and keep it over {verdicts.MIN_QUOTE_CHARS} characters, which the "
-        f"validator enforces — under that it is a fragment nobody can find again.",
+        f"validator enforces.",
         "",
         "# The five classifications",
         "A classification is a decision about THE SUBJECT, not about the codebase in "
@@ -1019,9 +1018,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"shell heredoc that writes a file is refused for every worker in the fleet "
         f"(`hooks.heredoc_write_decision`). Submit it with the command below, "
         f"which IS your finish. Do not call `jarvis wo finish`: submitting the verdict "
-        f"settles this work order for you. `--from-file` and not inline flags, because "
-        f"the gate classifier's quote-blanking fails on nested and mixed quoting and a "
-        f"verdict is full of repo paths and quoted log lines.",
+        f"settles this work order for you.",
         "",
         f"    jarvis investigate verdict {inv_id} --from-file verdict.json",
         "",
@@ -1034,10 +1031,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         '  "evidence": [',
         f'    {{"source": "{read_subject}", "quote": "the verbatim line"}}',
         "  ],",
-        '  "other_gaps": [            // required on all five; [] when there are none',
-        '    {"title": "the proposal title", "why": "why it matters",',
-        '     "description": "the brief, standing alone"}',
-        "  ],",
+        '  "other_gaps": [{"title": "…", "why": "…", "description": "the brief, standing '
+        'alone"}],   // [] when none',
         '  "owner": "os",             // GAP only',
         '  "proposed_fix": {          // GAP only',
         '    "title": "what the bug report is titled",',
@@ -1066,11 +1061,10 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- Never paste a diff, a transcript or a log into the verdict: cite the command "
         f"and quote the decisive line. Over {verdicts.MAX_VERDICT_CHARS} characters the "
         f"whole document is refused.",
-        "- One subject, one root cause, one classification. EVERY OTHER GAP you found — a "
-        "second cause, a side defect, anything unrelated to the subject — is one `other_gaps` "
-        "entry. Never name one in `root_cause`: no code reads that prose, so it is lost. The "
-        "OS posts each entry to this project's backlog as a proposal linked to this order; "
-        "it is never a tracker bug and never dispatched. No others: `[]`, explicitly.",
+        "- One subject, one root cause, one classification. EVERY OTHER GAP you found, related "
+        "or not, is one `other_gaps` entry, never prose in `root_cause`: no code reads that. "
+        "The OS posts each to this project's backlog as a proposal, never a tracker bug and "
+        "never dispatched.",
         "",
         "# What you may run",
         "Reads: `git log|show|diff|status|blame`, `gh pr view|diff|checks`, "

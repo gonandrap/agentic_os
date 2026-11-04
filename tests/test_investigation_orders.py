@@ -844,7 +844,7 @@ def test_the_brief_sends_every_side_gap_to_other_gaps(started, store, catalog_fi
     prompt = dispatch._investigator_prompt(store.get_work_order(investigator),
                                            load_catalog(catalog_file).projects[0])
     assert "and in `other_gaps` if it is not" in prompt
-    assert '"other_gaps": [' in prompt
+    assert '"other_gaps": [{' in prompt
     assert "last sentence" not in prompt
 
 
