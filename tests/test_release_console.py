@@ -176,3 +176,68 @@ def test_a_release_page_colours_a_failed_pr(os_repo):
     page = TestClient(create_app()).get("/release/jarvis-0.1.1").text
     assert f'class="mono tone-bad" href="/mo/{os_repo["mv"]}"' in page
     assert "needs-you" in page
+
+
+def _with_origin(repo: Path, bare: Path, *tags: tuple[str, str]) -> None:
+    """A real `origin` carrying `(tag, rev)`s that this clone has never fetched"""
+    _git(bare.parent, "init", "-q", "--bare", bare.name)
+    _git(repo, "remote", "add", "origin", str(bare))
+    _git(repo, "push", "-q", "origin", "main")
+    for name, rev in tags:
+        _git(repo, "tag", name, rev)
+        _git(repo, "push", "-q", "origin", name)
+        _git(repo, "tag", "-d", name)
+
+
+def test_the_page_states_what_origin_has_and_what_production_runs(os_repo, tmp_path,
+                                                                  monkeypatch):
+    """Finding release-page-provenance: three 'current versions' existed at once"""
+    _with_origin(os_repo["repo"], tmp_path / "origin.git", ("jarvis-0.2.0", "HEAD"))
+    prod = tmp_path / "prod"
+    prod.mkdir()
+    _git(prod, "init", "-q", "-b", "main")
+    _git(prod, "config", "user.email", "t@t")
+    _git(prod, "config", "user.name", "t")
+    _git(prod, "commit", "-q", "--allow-empty", "-m", "deployed")
+    _git(prod, "tag", "jarvis-0.0.9")
+    _git(prod, "checkout", "-q", "--detach", "jarvis-0.0.9")
+    monkeypatch.setattr(release, "production_code_dir", lambda: prod)
+
+    report = ops.release_overview()
+    prov = report["provenance"]
+    assert report["newest"] == "jarvis-0.1.0"  # what this clone can see
+    assert prov["origin_newest"] == "jarvis-0.2.0" and not prov["error"]
+    assert prov["checked_at"] > 0 and prov["production"] == "jarvis-0.0.9"
+
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    page = TestClient(create_app()).get("/release").text
+    assert "jarvis-0.2.0" in page and "jarvis-0.0.9" in page
+
+
+def test_an_unreachable_origin_is_named_never_passed_off_as_origins_tag(os_repo):
+    report = ops.release_overview()  # the fixture's clone has no `origin` at all
+    prov = report["provenance"]
+    assert prov["origin_newest"] == "" and prov["error"]
+
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    page = TestClient(create_app()).get("/release").text
+    assert "origin could not be read" in page and "jarvis-0.1.0 (local)" in page
+
+
+def test_a_cut_a_release_tag_already_carries_is_refused_by_tag_name(os_repo, tmp_path):
+    """The local clone is behind origin, so /release offers already-released commits"""
+    _with_origin(os_repo["repo"], tmp_path / "origin.git", ("jarvis-0.1.1", os_repo["sha2"]))
+    assert ops.release_overview()["newest"] == "jarvis-0.1.0"  # the clone cannot see it
+    with pytest.raises(ops.OpsError, match="jarvis-0.1.1 already"):
+        ops.release_cut(os_repo["sha3"])
+    store = ProjectStore(os_repo["repo"])
+    try:
+        assert not [w for w in store.list_work_orders() if "Ship a release" in w["title"]]
+    finally:
+        store.close()

@@ -17593,6 +17593,22 @@ def _release_scope(project: str) -> tuple[str, Path, bool, str]:
         raise OpsError(f"cannot read the tags in {repo}: {e}") from e
 
 
+def _release_provenance(repo: Path, glob: str, is_os: bool) -> dict[str, Any]:
+    """What this page compared itself against: origin, and what production runs (Q46)"""
+    from . import release, release_view
+
+    origin, error = release_view.origin_newest(repo, glob)
+    row = {"checked_at": time.time(), "origin_newest": origin, "error": error,
+           "production": "", "production_error": ""}
+    if not is_os:  # another project's releases are not what the OS checkout runs
+        return row
+    status = release.production_status()
+    row["production"] = "" if status.ref == "HEAD" else status.ref
+    row["production_error"] = status.error or (
+        "the production checkout is not at a release tag" if status.ref == "HEAD" else "")
+    return row
+
+
 def release_overview(project: str = "") -> dict[str, Any]:
     """Pending work since the newest tag, and every release with its validation verdict"""
     from . import release_view
@@ -17618,6 +17634,7 @@ def release_overview(project: str = "") -> dict[str, Any]:
         raise OpsError(f"cannot read the release history in {repo}: {e}") from e
     return {"project": project, "repo": str(repo), "main_ref": ref, "newest": newest,
             "is_os": is_os, "tag_glob": glob, "pending": pending, "releases": releases,
+            "provenance": _release_provenance(repo, glob, is_os),
             "in_flight": [{"id": w["id"], "title": w["title"], "status": w["status"],
                            "href": order_path(project, w["id"])}
                           for w in _open_release_orders(project)]}
@@ -17651,7 +17668,7 @@ Run the ordinary release path, with this exact base and nothing else:
 That is a PRIVILEGED ACTION and it will be gated — correct and expected. Read `jarvis \
 brief gates` and make your case first (`jarvis gate request`). Do not move the base to a \
 newer commit, do not drop `--stage`, and do not restart any service by hand. If CI on \
-{base} is red, or a `jarvis-*` tag already contains it, stop and say so.
+{base} is red, stop and say so.
 """
 
 PROJECT_RELEASE_CUT_BRIEF = """\
@@ -17694,6 +17711,14 @@ def release_cut(base: str, project: str = "") -> dict[str, Any]:
     if not shipped:
         raise OpsError(f"{base[:12] or 'no commit'} is not pending on "
                        f"{overview['main_ref']} — reload /release and pick again")
+    if overview["is_os"]:
+        oldest = shipped[-1]
+        carried, _ = release.tags_containing(Path(overview["repo"]), [oldest["sha"]])
+        if carried:
+            raise OpsError(
+                f"{carried[0]} already carries {oldest['short']}, which a cut at "
+                f"{base[:8]} would ship again — this checkout is behind origin, which "
+                f"has {overview['provenance']['origin_newest'] or 'tags it cannot read'}")
     lines = "\n".join(
         f"- `{r['short']}` {r['subject']}" + (f" — `{r['wo_id']}`" if r["wo_id"] else "")
         for r in shipped)
