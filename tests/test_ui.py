@@ -521,6 +521,23 @@ def test_the_question_page_reviews_the_answer_and_stays_put(client, daemon, proj
     assert "you corrected this" in client.get("/neo/question/1").text
 
 
+def test_a_lapsed_question_says_why_and_offers_no_answer_box(client, daemon, project):
+    wo = ops.create_work_order("proj_a", "prod thing")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: touch prod?")
+    daemon._neo_drain()
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "cancelled")
+    finally:
+        store.close()
+
+    page = client.get("/neo/question/1").text
+
+    assert "never answered" in page and "reached cancelled" in page
+    assert 'action="/neo/1/answer"' not in page
+
+
 def test_the_question_page_answers_an_escalation_and_stays_put(client, daemon, project):
     wo = ops.create_work_order("proj_a", "prod thing")
     daemon.tick()
