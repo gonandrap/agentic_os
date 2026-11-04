@@ -766,7 +766,7 @@ CREATE TABLE IF NOT EXISTS assumptions (
     wo_id TEXT NOT NULL REFERENCES work_orders(id),
     ts REAL NOT NULL,
     content TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected | refined
+    status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected | refined | lapsed
     -- WHO settled it, why, under which model and configuration, and the Neo question
     -- that ruled. All in ADDED_COLUMNS, where the reasoning is — this table already
     -- ships, so a live database gets them only there. So are the PROVISIONAL verdict
@@ -1285,6 +1285,12 @@ ASSUMPTION_DECIDER_USER = "user"
 
 #: `assumptions.decided_by` when the OS did — `autoreview`
 ASSUMPTION_DECIDER_OS = "neo"
+
+#: `assumptions.status` when its order ended unruled: NOT a verdict (io-d5e62d4d)
+ASSUMPTION_LAPSED = "lapsed"
+
+#: Order statuses that lapse a pending row; never `failed`: `wo retry` can resume it
+ASSUMPTION_LAPSE_STATUSES = ("completed", "cancelled")
 
 #: What an early verdict may say
 PROVISIONAL_VERDICTS = ("accept", "object")
@@ -2172,6 +2178,8 @@ class ProjectStore:
             at = db.now()
             self._record_span(wo_id, "wo", was, status, trigger, ts=at)
             self.add_event(wo_id, "status", {"status": status}, ts=at)
+            if status in ASSUMPTION_LAPSE_STATUSES:
+                self.lapse_pending_assumptions(wo_id, status)
             # THE CHOKEPOINT, ENFORCED (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
             tail = self.conn.execute(
                 "SELECT to_status FROM wo_state_spans WHERE order_id=? AND "
@@ -3748,6 +3756,30 @@ class ProjectStore:
             """UPDATE assumptions SET status=?, decided_by=?, decided_reason=?,
                    decided_model=?, decided_config_version=? WHERE id=?""",
             (status, decided_by, reason, model, config_version, assumption_id))
+
+    def lapse_pending_assumptions(self, wo_id: str, status: str) -> int:
+        """Retire this order's unruled rows now it ended: no verdict, no decider (io-d5e62d4d)"""
+        ids = [int(r["id"]) for r in self.conn.execute(
+            "SELECT id FROM assumptions WHERE wo_id=? AND status='pending' ORDER BY id",
+            (wo_id,)).fetchall()]
+        if not ids:
+            return 0
+        self.conn.execute(
+            "UPDATE assumptions SET status=?, decided_reason=? "
+            "WHERE wo_id=? AND status='pending'",
+            (ASSUMPTION_LAPSED, f"its order reached {status} before anyone ruled", wo_id))
+        self.add_event(wo_id, "assumptions_lapsed",
+                       {"count": len(ids), "assumption_ids": ids, "status": status})
+        return len(ids)
+
+    def ended_orders_with_pending_assumptions(self) -> list[dict[str, Any]]:
+        """Ended orders holding rows `set_status` did not lapse (io-d5e62d4d)"""
+        marks = ",".join("?" for _ in ASSUMPTION_LAPSE_STATUSES)
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT DISTINCT w.id, w.status FROM assumptions a "
+            "JOIN work_orders w ON w.id = a.wo_id "
+            f"WHERE a.status='pending' AND w.status IN ({marks}) ORDER BY w.id",
+            ASSUMPTION_LAPSE_STATUSES).fetchall())
 
     def get_assumption(self, assumption_id: int) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM assumptions WHERE id=?",

@@ -2027,6 +2027,24 @@ def check_assumptions_persisted(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+def check_ended_orders_hold_no_pending_assumption(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ASSUMPTION-LAPSED — nobody can rule on a row whose order ended (io-d5e62d4d)"""
+    for wo in store.ended_orders_with_pending_assumptions():
+        status = str(wo["status"])
+        n = len(store.pending_assumptions(wo["id"]))
+        if not getattr(store, "readonly", False) and not store.repair_while(
+                wo["id"], status,
+                lambda w=wo["id"], s=status: store.lapse_pending_assumptions(w, s)):
+            continue  # it moved under the sweep: the row is ruleable again
+        yield Violation(
+            invariant="INV-ASSUMPTION-LAPSED",
+            wo_id=wo["id"],
+            detail=f"{status} work order still held {n} pending assumption(s)",
+            repaired=True,
+            repair=f"{n} assumption(s) lapsed, no verdict recorded",
+        )
+
+
 def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-BLANK — a flagged work order must say what it wants"""
     for wo in store.list_work_orders(include_hidden=True):
@@ -4472,6 +4490,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
                                    # reading, repairing nothing and touching no flag any other check derives
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
+    check_ended_orders_hold_no_pending_assumption,  # ...and after it, whose rebuilt row may
+                                   # be on an ended order; before the phantom check clears its flag
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
                                     # request is a blocker they would otherwise believe
     check_gate_requests_have_a_reviewer,  # ...and beside it, for the mirror reason: it

@@ -16,7 +16,7 @@ from .catalog import (
     DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
     DEFAULT_VALIDATION_DECISION_RECORD_CHARS,
 )
-from .project_store import turn_end_is_delivery
+from .project_store import ASSUMPTION_LAPSED, turn_end_is_delivery
 from .stakes import Stakes
 
 log = logging.getLogger(__name__)
@@ -1023,7 +1023,8 @@ def _message_item(m: dict[str, Any]) -> str:
 def _user_ruling_item(s: dict[str, Any]) -> str:
     """A sibling assumption the USER settled, with the reasoning they gave, or `''`"""
     status = str(s.get("status") or "")
-    if status in ("", "pending") or str(s.get("decided_by") or "") == DECIDER:
+    if (status in ("", "pending", ASSUMPTION_LAPSED)
+            or str(s.get("decided_by") or "") == DECIDER):
         return ""
     raw = str(s.get("decided_reason") or "")
     reason = " ".join(raw.split())[:400]
