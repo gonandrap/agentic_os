@@ -4388,8 +4388,8 @@ def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
         matched = preconditions.states_hold(wo["title"], wo["description"] or "")
         if not matched and (db.from_json(wo.get("metadata"), {}) or {}).get("origin_io"):
             # An OS filing: the wider family, since no human command is at stake (issue 1567)
-            matched = next(iter(preconditions.states_sequence(wo["title"],
-                                                              wo["description"] or "")), None)
+            matched = next(iter(preconditions.states_sequence(wo["title"], wo["description"] or "")),
+                           "")[:preconditions.MAX_SENTENCE]
         if not matched:
             continue
         if store.dependencies(wo) or store.open_preconditions(wo["id"]):

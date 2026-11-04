@@ -7933,6 +7933,9 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
         # The ONE re-decision allowed: a finding whose decision stands but whose orders did not file (§5.2)
         if key in accepted_keys and (f.get("filing_error") or f.get("orders_held")):
             continue
+        # A refusal retrying cannot clear (a misread sequence) needs a way out: the user's rejection
+        if key in rejections and f.get("filing_error") and decided_by == "user":
+            continue
         raise OpsError(
             f"{key!r} is already {f['status']} on {io_id} — a decision is taken once. "
             f"`jarvis io show {io_id}` for what was decided."
@@ -7982,6 +7985,7 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
                 errors.remove(failed)
 
     for key, reason in rejections.items():
+        by_key[key].pop("filing_error", None)
         by_key[key].update(status="rejected", decided_by=decided_by, decided_at=db.now(),
                            feedback=reason)
     if rejections and decided_by == "user":
@@ -8078,7 +8082,8 @@ def _sequence_holds(target: str, io_id: str, f: Mapping[str, Any],
 
     def refused(clause: str, why: str) -> OpsError:
         return OpsError(
-            f"cannot file this order: \"{clause}\" states a sequence and {why}, so nothing "
+            f"cannot file this order: \"{clause[:preconditions.MAX_SENTENCE]}\" states a sequence "
+            f"and {why}, so nothing "
             f"would hold it back and jarvisd would dispatch it (wo-87e007eb cost 0.78 USD "
             f"this way). File the prerequisite, then retry `jarvis io review {io_id} "
             f"--accept {f.get('key', '<key>')}`, or reject the finding and file the order "
@@ -8101,12 +8106,13 @@ def _sequence_holds(target: str, io_id: str, f: Mapping[str, Any],
             refs = [r for r in preconditions.sequence_refs(clause) if r != ("io", io_id)]
             if not refs and not named:
                 raise refused(clause, "names no order, pull request or finding")
+            found_by_clause: list[str] = []
             for finding in named:
                 filed = _filed_work(finding, target)
                 if not filed:
                     raise refused(clause, f"finding {finding.get('key')} has no order filed "
                                           f"in {target}")
-                depends += filed
+                found_by_clause += filed
             for kind, value in refs:
                 if kind == "bl":
                     holds.append(value)
@@ -8115,7 +8121,9 @@ def _sequence_holds(target: str, io_id: str, f: Mapping[str, Any],
                     owners = store.work_orders_for_pr_number(int(value))
                     if not owners:
                         raise refused(clause, f"no order in {target} owns PR {value}")
-                    found = [str(owners[0]["id"])]
+                    # Newest first; a live owner still carries the PR even if a newer one died
+                    live = [o for o in owners if o["status"] not in DEPENDENCY_DEAD_STATUSES]
+                    found_by_clause.append(str((live or owners)[0]["id"]))
                 elif kind == "io":
                     try:
                         other = db.from_json(store.get_feature_order(value).get("plan"),
@@ -8127,17 +8135,18 @@ def _sequence_holds(target: str, io_id: str, f: Mapping[str, Any],
                     found = [i for x in (keyed or entries) for i in _filed_work(x, target)]
                     if not found:
                         raise refused(clause, f"{value} has no order filed in {target}")
+                    found_by_clause += found
                 else:
-                    found = [value]
-                for wo_id in found:
-                    try:
-                        holder = store.get_work_order(wo_id)
-                    except KeyError:
-                        raise refused(clause, f"{wo_id} is not in {target}") from None
-                    if holder["status"] in DEPENDENCY_DEAD_STATUSES:
-                        raise refused(clause, f"{wo_id} is {holder['status']} and can never "
-                                              f"complete")
-                    depends.append(wo_id)
+                    found_by_clause.append(value)
+            for wo_id in found_by_clause:
+                try:
+                    holder = store.get_work_order(wo_id)
+                except KeyError:
+                    raise refused(clause, f"{wo_id} is not in {target}") from None
+                if holder["status"] in DEPENDENCY_DEAD_STATUSES:
+                    raise refused(clause, f"{wo_id} is {holder['status']} and can never "
+                                          f"complete")
+                depends.append(wo_id)
     finally:
         store.close()
     return list(dict.fromkeys(depends)), list(dict.fromkeys(holds))
