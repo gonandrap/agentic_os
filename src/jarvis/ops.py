@@ -14610,8 +14610,9 @@ def cost_report(project: str | None = None, target: str | None = None,
             continue
         store = ProjectStore(path)
         try:
+            # Uncapped in a window: a dropped order would leave the list short of the meter
             rows = store.list_work_orders(
-                limit=limit, include_hidden=include_hidden,
+                limit=-1 if window else limit, include_hidden=include_hidden,
                 active_between=(since, until) if window else None)
             # An order whose only in-window activity is an `agent_call`
             seen = {wo["id"] for wo in rows}
@@ -14630,9 +14631,14 @@ def cost_report(project: str | None = None, target: str | None = None,
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
+    listed = {u["id"] for u in units}
+    # In a window, a call naming an order no store still holds is declared too, or the meter outruns the list
+    unattributed = (_os_spend([g for wo_id, group in os_groups.items()
+                               if wo_id not in listed for g in group])
+                    if window else _os_unattributed(os_groups))
     # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/ `totals` keys...
     return {"scope": project or "fleet", "units": units, "window": window,
-            **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
+            **_rollup(units), "os_unattributed": unattributed,
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 

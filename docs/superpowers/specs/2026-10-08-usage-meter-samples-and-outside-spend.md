@@ -260,8 +260,10 @@ span containing an unseen phone session is an outlier that must not move the est
 **The uncertainty is quantisation, and it is stated as a band, never as a ± on a single
 number.** The meter reports whole percent, so each span's point count is uncertain by ±1
 point, and a 30-minute span that moved 5 points is a ±20% figure. With `n` contributing
-spans, `low = total_usd / (total_points + n)` and `high = total_usd / max(total_points - n,
-0.5)`. `source` is:
+spans and `value * total_points` as the dollars, `low = usd / (total_points + n)` and
+`high = usd / max(total_points - n, 0.5)`: the band is quantisation around the median, so
+it always holds it. Bracketing `total_usd` instead put 1.97 outside 2.21-2.34 (io-82bcb830):
+an outlier the median ignores still moved the band. `source` is:
 
 * `"measured"` — 3 or more clean spans. The band is printed.
 * `"thin"` — 1 or 2 clean spans. The band is printed AND the sentence in §9 says
@@ -335,14 +337,18 @@ is merged. This is reused, not reimplemented, and §10 pins it with a test.
 
 ### 7. Reconciliation, and the residual
 
-Jarvis spend for the span, from the records it already has, with no new reader:
+Jarvis spend for the span is the order list's own per-call ledger, so a range's list
+sums to what the meter and the plot show (io-82bcb830; the turn-row reader counted
+compactions twice and booked a whole turn at its start):
 
-* **workers** — `fleetcost.turn_rows` over every registered project, summed as
-  `fleetcost.report` already does;
-* **jarvis calls** — the by-kind rows of `fleetcost.os_by_kind(since, until, project)`,
-  which is how the OS's own calls are already attributed. The payload does NOT add
-  `os_unattributed`: that line is a SUBSET of the by-kind rows, so adding it would count
-  Neo's between-turn answers twice.
+* **workers** — each transcript call inside the span, subagents included, of the orders
+  `ops.cost_report` lists for it: a turn overlapping the span
+  (`project_store.TURN_OVERLAPS_WINDOW`), or an `agent_calls` row inside it;
+* **jarvis calls** — every `agent_calls` row inside the span, at list price. The list's
+  `totals` plus its `os_unattributed` is this same figure, so `os_unattributed` is NOT
+  added to it again.
+
+An order whose transcript was pruned counts nothing here and shows as unmeasured on the list.
 
 **The residual is computed FLEET-WIDE whatever the query's scope.** `jarvis cost
 <project>` and `/cost?project=X` scope the LISTING; the meter is an account-wide reading,

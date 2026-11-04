@@ -496,6 +496,11 @@ DISPATCH_RETRY_BACKOFF_SECONDS = ALARM_RETRY_BACKOFF_SECONDS
 # A subject-level finding judges the unit rather than a turn, so it has no `seq` to carry
 NO_TURN = -1
 
+# The order ran during `(until, since)`: the one predicate the cost list and the meter select by
+TURN_OVERLAPS_WINDOW = """EXISTS (SELECT 1 FROM wo_turns t WHERE t.wo_id = work_orders.id
+                                  AND t.started_at < ?
+                                  AND (t.ended_at IS NULL OR t.ended_at >= ?))"""
+
 # The `wo_events` kinds that carry an alarm's life, and their payloads
 ALARM_EVENT_KINDS = ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_advice",
                      "health_finding", "health_reviewed",
@@ -1914,10 +1919,9 @@ class ProjectStore:
         if not include_hidden:
             conds.append("hidden=0")
         if active_between is not None:
-            conds.append("""EXISTS (SELECT 1 FROM wo_turns t WHERE t.wo_id =
-                                    work_orders.id AND t.started_at >= ?
-                                    AND t.started_at < ?)""")
-            params.extend(active_between)
+            since, until = active_between
+            conds.append(TURN_OVERLAPS_WINDOW)
+            params.extend((until, since))
         where = f" WHERE {' AND '.join(conds)}" if conds else ""
         rows = self.conn.execute(
             f"SELECT * FROM work_orders{where} ORDER BY created_at DESC LIMIT ?",

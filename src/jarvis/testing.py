@@ -3044,7 +3044,7 @@ class FleetCostFixture:
 
     def os_call(self, kind: str, *, ts: float, wo_id: str = "", cost_usd: float = 0.0,
                 label: str = "", model: str = "claude-opus-5",
-                project: str | None = None, session_id: str = "") -> None:
+                project: str | None = None, session_id: str = "", output: int = 0) -> None:
         from .central_store import CentralStore
 
         central = CentralStore()
@@ -3053,9 +3053,9 @@ class FleetCostFixture:
                 """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model, ok,
                                             cost_usd, input, cache_write, cache_read,
                                             output, session_id)
-                   VALUES (?,?,?,?,?,?,1,?,0,0,0,0,?)""",
+                   VALUES (?,?,?,?,?,?,1,?,0,0,0,?,?)""",
                 (ts, self.name if project is None else project, wo_id, kind, label,
-                 model, cost_usd, session_id))
+                 model, cost_usd, output, session_id))
             central.conn.commit()
         finally:
             central.close()
@@ -3099,6 +3099,22 @@ class FleetCostFixture:
                                      "input": arguments}
                                     for tid, name, arguments in tools]},
         }
+
+    @staticmethod
+    def output_for(usd: float, model: str = "claude-opus-5") -> int:
+        """Output tokens that price at `usd` on the list"""
+        return round(usd * 1_000_000 / usage.priced(model, output=1_000_000).list_cost_usd)
+
+    def spend(self, title: str, usd: float, *, at: float, session_id: str = "",
+              ended_at: float | None = None, kind: str = "dispatch") -> str:
+        """An order whose one turn made one transcript call worth `usd`, at `at`"""
+        session_id = session_id or f"session-{title}-{at}"
+        wo = self.order(title, session_id=session_id)
+        self.turn(wo, started_at=at, ended_at=at + 60 if ended_at is None else ended_at,
+                  kind=kind, cost_usd=usd)
+        self.transcript(session_id, [self.call_row(at=at, out=self.output_for(usd),
+                                                   mid=f"m-{session_id}")])
+        return wo
 
     def placeholder_call_rows(self, *, at: float, read: int = 0, write: int = 0,
                               out: int = 5, mid: str = "",
