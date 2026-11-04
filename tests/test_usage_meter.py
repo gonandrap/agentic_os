@@ -254,6 +254,30 @@ def test_the_nearest_earlier_sample_is_the_start_and_beyond_it_the_head_is_uncov
     assert far.coverage.head_uncovered_seconds == pytest.approx(600.0)
 
 
+def test_a_reset_between_the_head_and_the_first_sample_does_not_seed_the_old_percent():
+    """io-82bcb830: the meter went 0 to 100 and the page said it rose 63"""
+    head = sample(T0 - MINUTE, 37.0, T0)
+    inside = series(T0 + MINUTE, [0.0, 100.0], T0 + 18000)
+    found = usage_meter.segments([head, *inside], since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert [s.start_pct for s in found.segments] == [0.0]
+    assert found.segments[0].start_ts == T0 + MINUTE
+    assert found.delta_points == pytest.approx(100.0)
+    assert found.coverage.head_uncovered_seconds == pytest.approx(MINUTE)
+    assert found.anomalies == 0
+
+
+def test_a_drop_between_the_head_and_the_first_sample_is_a_boundary_and_an_anomaly():
+    head = sample(T0 - MINUTE, 37.0, T0 + 3600)
+    inside = series(T0 + MINUTE, [2.0, 9.0], T0 + 3600)
+    found = usage_meter.segments([head, *inside], since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert found.delta_points == pytest.approx(7.0)
+    assert found.anomalies == 1
+
+
 def test_a_seven_day_reset_runs_through_the_same_path():
     rows_ = (series(T0, [10.0, 40.0], T0 + 3600, key="seven_day")
              + series(T0 + 2 * MINUTE, [3.0, 9.0], T0 + 7200, key="seven_day"))
