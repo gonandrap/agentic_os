@@ -540,6 +540,26 @@ def _visible_usd(*, since: float, until: float, home: Path) -> float:
     return total
 
 
+def _scaled_from_five_hour(rows: Sequence[Sample], key: str, *, now: float, cfg: Any,
+                           home: Path, visible: Callable[..., float] | None
+                           ) -> dict[str, Any]:
+    """`key`'s point priced as the 5h rate times how many 5h points moved per `key` point"""
+    five_points = key_points = 0.0
+    for run in _runs(rows, "five_hour"):
+        for sub in _runs(run, key):
+            five_points += float(sub[-1].pct("five_hour")) - float(sub[0].pct("five_hour"))
+            key_points += float(sub[-1].pct(key)) - float(sub[0].pct(key))
+    five = dollars_per_point(now=now, cfg=cfg, home=home, visible=visible)
+    if five_points <= 0 or key_points <= 0:
+        return {"value": None, "low": None, "high": None, "source": "none",
+                "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
+    scale = five_points / key_points
+    return {"value": five["value"] * scale, "low": five["low"] * scale,
+            "high": five["high"] * scale, "source": "scaled",
+            "basis_spans": five["basis_spans"], "basis_points": key_points,
+            "basis_usd": five["basis_usd"]}
+
+
 def dollars_per_point(*, now: float, cfg: Any, home: Path,
                       visible: Callable[..., float] | None = None,
                       key: str = "five_hour") -> dict[str, Any]:
@@ -561,9 +581,7 @@ def dollars_per_point(*, now: float, cfg: Any, home: Path,
         total_usd += usd
         total_points += points
     if not ratios and key != "five_hour":
-        # The shipped seed prices a 5h point; it says nothing about any other window
-        return {"value": None, "low": None, "high": None, "source": "none",
-                "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
+        return _scaled_from_five_hour(rows, key, now=now, cfg=cfg, home=home, visible=visible)
     if not ratios:
         seed = float(cfg.meter_dollars_per_point)
         return {"value": seed, "low": seed, "high": seed, "source": "seed",

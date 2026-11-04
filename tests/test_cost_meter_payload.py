@@ -178,9 +178,9 @@ def test_the_calculated_series_is_the_windows_spend_in_points_split_by_owner(fle
     first = meter["timeline"][0]
     assert first["five_hour_calc_jarvis"] == pytest.approx(8.2 / rate, rel=1e-3)
     assert first["five_hour_calc_outside"] == 0.0
-    # The 7d meter never rose enough to calibrate, and a 5h rate is not a 7d one
-    assert last["seven_day_calc_jarvis"] is None
-    assert last["seven_day_calc_outside"] is None
+    # 7d never calibrated on its own, so it is the 5h rate scaled; a 7d point costs more
+    assert 0 < last["seven_day_calc_jarvis"] < last["five_hour_calc_jarvis"]
+    assert last["seven_day_calc_outside"] is not None
 
 
 def test_the_zoom_endpoint_carries_the_calculated_series(fleet_fixture):
