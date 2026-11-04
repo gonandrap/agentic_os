@@ -12,6 +12,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from . import gaps
+
 #: The OS's own issue tracker
 DEFAULT_BUG_REPO = "gonandrap/agentic_os"
 BUG_REPO_ENV = "JARVIS_BUG_REPO"
@@ -19,6 +21,12 @@ BUG_LABEL = "bug"
 
 #: The last line of every body this module files (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §4)
 FILED_MARKER = "<!-- Filed automatically by `jarvis bug report`. -->"
+
+#: Metadata key for a GAP fix order, as the `gap_class` column arms a precheck (Q3413)
+VERDICT_GAP_CLASS_KEY = "verdict_gap_class"
+
+#: How a GAP verdict's filing opens, the only place its gap class is read back from
+_ACCEPTANCE_RE = re.compile(r"### Acceptance criteria\s+- \*\*Gap class:\*\* `([a-z0-9-]+)`")
 
 #: `gh` location override, mirroring JARVIS_CLAUDE_BIN
 GH_BIN_ENV = "JARVIS_GH_BIN"
@@ -147,11 +155,32 @@ def gh_missing_message(consequence: str) -> str:
     )
 
 
+def _acceptance(gap_class: str, detector: str, remedy: str) -> list[str]:
+    """What a GAP verdict makes the fix owe, or nothing for any other filing (io-38a4354f)"""
+    if not gap_class.strip():
+        return []
+    parts = ["### Acceptance criteria", "", f"- **Gap class:** `{gap_class.strip()}`"]
+    if not gaps.registered(gap_class):
+        parts.append("- Not registered yet: add it to `src/jarvis/gaps.py`, or `jarvis doctor` "
+                     "reports this order once it completes.")
+    return parts + ["", "**Detector:**", "", detector.strip(), "",
+                    "**Remedy:**", "", remedy.strip(), ""]
+
+
+def verdict_gap_class(body: str) -> str:
+    """The gap class a filed body's acceptance section names, or `""`"""
+    found = _ACCEPTANCE_RE.match(body or "")
+    return found.group(1) if found else ""
+
+
 def render_body(*, description: str, expected: str, actual: str, version: str,
                 project: str = "", wo_id: str = "", steps: str = "",
-                priority: str = "") -> str:
+                priority: str = "", gap_class: str = "", detector: str = "",
+                remedy: str = "") -> str:
     """The bug template"""
+    # FIRST: a triage question carries only `body[:4000]`, and the fix order's brief is built from it
     parts = [
+        *_acceptance(gap_class, detector, remedy),
         "### Description",
         "",
         description.strip() or "_(none given)_",
@@ -336,7 +365,8 @@ AGENT_EXPEDITE_NOTE = ("--expedite ignored: filed from a work-order session, so 
 def report_bug(*, title: str, description: str, expected: str, actual: str,
                priority: str = "", steps: str = "", project: str = "",
                wo_id: str = "", expedite: bool = False,
-               investigation: dict[str, str] | None = None) -> dict[str, Any]:
+               investigation: dict[str, str] | None = None, gap_class: str = "",
+               detector: str = "", remedy: str = "") -> dict[str, Any]:
     """File a Jarvis OS bug, put it on the OS's rails, and tell the user about it"""
     from .issues import checked_priority
 
@@ -361,7 +391,8 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
     repo = bug_repo()
     body = render_body(description=description, expected=expected, actual=actual,
                        version=version, project=project, wo_id=wo_id, steps=steps,
-                       priority=priority)
+                       priority=priority, gap_class=gap_class, detector=detector,
+                       remedy=remedy)
     existing = _already_filed(repo, body, title)
     if existing:
         from .issues import comment

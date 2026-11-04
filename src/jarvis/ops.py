@@ -9215,6 +9215,9 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
                     expected=verdict["proposed_fix"]["expected"],
                     actual=verdict["proposed_fix"]["actual"],
                     priority=verdict["proposed_fix"]["priority"],
+                    gap_class=verdict["gap_class"],
+                    detector=verdict["proposed_fix"]["detector"],
+                    remedy=verdict["proposed_fix"]["remedy"],
                     project=name, wo_id=fo.get("plan_wo_id") or "",
                     # Neo agreeing plus the steward starts it, through the triage question (#1344)
                     expedite=False, investigation={
