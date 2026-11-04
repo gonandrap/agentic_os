@@ -13951,6 +13951,21 @@ def propose_backlog(project: str, title: str, description: str = "", *,
         central.close()
 
 
+def _live_dependency(central: CentralStore, dep_id: str,
+                     dead: list[str]) -> tuple[str | None, dict[str, Any] | None]:
+    """What a dependency stands for once dropped ids are in `dead`; id None when nothing does (§7.1)"""
+    while True:
+        dep = central.get_backlog(dep_id)
+        if not dep or dep["status"] != "dropped":
+            return dep_id, dep
+        if dep_id not in dead:
+            dead.append(dep_id)
+        kept = dep["duplicate_of"]
+        if not kept or kept in dead:
+            return None, None
+        dep_id = kept
+
+
 def _promotion_plan(central: CentralStore, item_id: str,
                     as_feature: bool | None) -> list[dict[str, Any]]:
     """Open closure, dependencies first (docs/superpowers/specs/2026-11-03-backlog-operability.md §7.1)"""
@@ -13967,9 +13982,12 @@ def _promotion_plan(central: CentralStore, item_id: str,
     def visit(item: dict[str, Any]) -> None:
         seen.add(item["id"])
         path.append(item["id"])
-        waits_on = []
+        waits_on: list[str] = []
+        dead_deps: list[str] = []
         for dep_id in item["depends_on"]:
-            dep = central.get_backlog(dep_id)
+            dep_id, dep = _live_dependency(central, dep_id, dead_deps)
+            if dep_id is None or dep_id in waits_on:
+                continue
             status = dep["status"] if dep else "missing"
             if status == "done":
                 continue
@@ -13988,7 +14006,7 @@ def _promotion_plan(central: CentralStore, item_id: str,
         if item["id"] == item_id and as_feature is not None:
             kind = "fo" if as_feature else "wo"
         plan.append({"id": item["id"], "title": item["title"], "project": item["project"],
-                     "kind": kind, "waits_on": waits_on})
+                     "kind": kind, "waits_on": waits_on, "dead_deps": dead_deps})
 
     visit(root)
     if refused:
@@ -14000,7 +14018,8 @@ def _promotion_plan(central: CentralStore, item_id: str,
             f"cannot promote {item_id}, nothing was created: a feature order starts planning "
             "at once and cannot wait, so " + "; ".join(
                 f"{m['id']} waits on {', '.join(m['waits_on'])}" for m in waiting_features)
-            + " — promote its dependencies first")
+            + " — those dependencies must reach done or dropped first: they can be promoted "
+            "on their own now, then promote this item once they settle")
     # create_feature_order refuses these; caught here, a late member cannot strand the early ones
     bare = [m["id"] for m in plan if m["kind"] == "fo"
             and not (central.get_backlog(m["id"])["description"] or "").strip()]
