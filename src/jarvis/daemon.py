@@ -3513,6 +3513,17 @@ class Daemon:
             # No work order to flag; revival re-asks it once Neo answers again
             self._backlog_question_unanswered(central, q, f"Neo could not be reached: {detail}")
             return
+        ppath = {p.name: p.path for p in self.catalog.projects}.get(q["project"])
+        if q.get("kind") == "assumption" and ppath and ppath.is_dir():
+            # The row's ping, once: the pass re-asks a dead question (io-ed253c2b)
+            from . import ops
+
+            pstore = ProjectStore(ppath)
+            try:
+                ops.flag_assumptions_pending(pstore, q["wo_id"])
+            finally:
+                pstore.close()
+            return
         head = q["question"].strip().splitlines()[0][:200]
         central.add_inbox(
             project=q["project"], level="warning",
@@ -3525,7 +3536,6 @@ class Daemon:
                  f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
             wo_id=q["wo_id"],
         )
-        ppath = {p.name: p.path for p in self.catalog.projects}.get(q["project"])
         if ppath and ppath.is_dir():
             pstore = ProjectStore(ppath)
             try:
@@ -6415,6 +6425,7 @@ class Daemon:
         dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
+        holds_before = len(store.events_of_kind(wo["id"], "autoreview_held"))
         for a in assumptions:
             # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.1
             if str(a.get("status") or "") != "pending":
@@ -6480,6 +6491,9 @@ class Daemon:
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
                                early=early, cfg=cfg)
+        # After the loop: one pass's holds are one ping
+        if len(store.events_of_kind(wo["id"], "autoreview_held")) > holds_before:
+            ops.flag_assumptions_pending(store, wo["id"])
 
     def _stakes_reviewed(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                          cfg: Any, a: dict, decision: Any,
@@ -6649,6 +6663,7 @@ class Daemon:
                 {**payload, **prior} if confirming else payload)
             log.info("auto-review left assumption #%s of %s with the user: %s",
                      numbered.get("n"), wo["id"], ruling.reason)
+            ops.flag_assumptions_pending(pstore, wo["id"])
             return
 
         project = next((p for p in self.catalog.projects if p.name == q["project"]), None)
@@ -6696,6 +6711,8 @@ class Daemon:
                     pstore.clear_assumption_confirmation(assumption["id"])
                 else:
                     pstore.clear_assumption_question(assumption["id"])
+            else:
+                ops.flag_assumptions_pending(pstore, wo["id"])
             log.info("auto-review dropped its ruling on assumption #%s of %s: %s",
                      numbered.get("n"), wo["id"], still.reason)
             return

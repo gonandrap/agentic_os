@@ -2525,15 +2525,29 @@ def fix_flag_notice(flag: str) -> str | None:
 ASSUMPTIONS_PENDING_REASON = "assumptions pending review"
 
 
+#: Records which assumptions the user was already pinged about: the flag cannot, validating clears it
+ASSUMPTIONS_PINGED_EVENT = "assumptions_pinged"
+
+
 def flag_assumptions_pending(store: ProjectStore, wo_id: str) -> None:
-    """Flag AND notify: the flag reaches only who already looks (issue #244)"""
-    row = store.get_work_order(wo_id) or {}
+    """Flag AND notify (#244), only for rows that are the user's, each row once (io-ed253c2b)"""
+    row = store.get_work_order(wo_id)
+    owed = invariants.assumptions_owed_to_user(store, row)
+    if not owed:
+        return
     already = (row.get("needs_attention")
                and row.get("attention_reason") == ASSUMPTIONS_PENDING_REASON)
     store.flag_attention(wo_id, ASSUMPTIONS_PENDING_REASON)
-    if already:
+    # Without auto-review every assumption of a raised flag is one ping, as it always was
+    if already and not auto_review_at(store.project_path):
         return
-    n = sum(1 for a in store.all_assumptions(wo_id) if a["status"] == "pending")
+    pinged = {int(aid) for e in store.events_of_kind(wo_id, ASSUMPTIONS_PINGED_EVENT)
+              for aid in db.from_json(e["payload"], {}).get("assumption_ids", [])}
+    fresh = [int(a["id"]) for a in owed if int(a["id"]) not in pinged]
+    if not fresh:
+        return
+    n = len(fresh)
+    store.add_event(wo_id, ASSUMPTIONS_PINGED_EVENT, {"assumption_ids": fresh})
     store.add_notification(
         title=f"{wo_id} is waiting on your review of {n} assumption{'s' if n != 1 else ''}",
         body=f"{row.get('title') or ''}\n"
@@ -3439,6 +3453,28 @@ def _owed_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[int]:
             if (kind == "autoreview_held" or kind in _AUTOREVIEW_OWED_BY_USER)
             and not payload.get("re_asked")]
     return sorted(owed)
+
+
+def assumptions_held_final(store: ProjectStore, wo: dict[str, Any]) -> set[int]:
+    """Ids whose newest live review event is a delivered-pass hold no later pass retries (io-ed253c2b)"""
+    from . import autoreview, db
+
+    wo_id = wo["id"]
+    stale = _stale_ruling(store, wo_id, status=str(wo.get("status") or ""))
+    events = [(float(r["ts"]), kind, db.from_json(r["payload"], {}))
+              for kind in ("autoreview_held", "autoreview_asked")
+              for r in store.events_of_kind(wo_id, kind)]
+    final: set[int] = set()
+    for _, kind, payload in sorted(events, key=lambda e: e[0]):
+        # An early hold is re-decided on delivery, so that pass writes its own
+        if payload.get("early") or stale(kind, payload):
+            continue
+        aid = int(payload.get("assumption_id") or 0)
+        if kind == "autoreview_held" and payload.get("code") not in autoreview.TRANSIENT_HOLDS:
+            final.add(aid)
+        else:
+            final.discard(aid)
+    return final
 
 
 def _held_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[dict[str, Any]]:
