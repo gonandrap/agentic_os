@@ -10906,6 +10906,9 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
         q = neo.get(question_id)
         if q is None:
             raise OpsError(f"neo question {question_id} not found")
+        if q["status"] == "lapsed":
+            raise OpsError(f"neo question {question_id} has lapsed, so it takes no answer "
+                           f"and nothing was sent: {q['lapsed_reason']}")
         if q["status"] not in ("escalated", "failed", "queued"):
             raise OpsError(f"neo question {question_id} is {q['status']} — "
                            "only escalated/failed/queued questions take a user answer")
@@ -16481,7 +16484,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     scope = {project: paths[project]} if project else paths
 
     questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
-                 "superseded": 0, "refined": 0, "escalation_rate": None,
+                 "superseded": 0, "refined": 0, "lapsed": 0, "escalation_rate": None,
                  "unreachable_rate": None}
     by_kind: dict[str, dict[str, Any]] = {}
     by_project: dict[str, dict[str, Any]] = {}
@@ -16514,6 +16517,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         elif row["status"] == "refined":
             # Bounced to the asker to split: not an escalation (wo-ea3c6f0c)
             questions["refined"] += n
+        elif row["status"] == "lapsed":
+            # Its order ended first: nobody ruled (io-d5e62d4d)
+            questions["lapsed"] += n
         elif row["status"] in ("escalated", "failed"):
             for bucket in buckets:
                 bucket[row["status"]] += n
