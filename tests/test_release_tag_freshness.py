@@ -41,6 +41,9 @@ def clone(tmp_path, monkeypatch):
     _git(seed, "tag", "jarvis-0.2.0")
     _git(seed, "push", "-q", "origin", "release/jarvis-0.2.0", "jarvis-0.2.0")
 
+    from jarvis import gitrefs
+
+    gitrefs.forget()
     central = CentralStore()
     try:
         central.upsert_project("jarvis_os", str(path), "the OS")
@@ -74,3 +77,20 @@ def test_a_refresh_that_fails_still_renders_and_says_so(clone):
     from jarvis.ui.app import create_app
 
     assert TestClient(create_app()).get("/release").status_code == 200
+
+
+def test_a_refresh_that_times_out_still_renders_and_says_so(clone, monkeypatch):
+    from jarvis import gitrefs
+
+    real = subprocess.run
+
+    def hang(cmd, *args, **kwargs):
+        if "fetch" in cmd:
+            raise subprocess.TimeoutExpired(cmd, gitrefs.FETCH_TIMEOUT)
+        return real(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", hang)
+    report = ops.release_overview()
+    assert report["newest"] == "jarvis-0.1.0"
+    assert report["refresh"]["ok"] is False
+    assert "TimeoutExpired" in report["refresh"]["error"]

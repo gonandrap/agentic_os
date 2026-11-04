@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from . import morpheus, release
+from . import gitrefs, morpheus, release
 
 #: (repo, previous tag, tag) to its commits; tags never move, so this never goes stale
 _RANGE_CACHE: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
@@ -15,6 +15,12 @@ _RANGE_CACHE: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
                           text=True, timeout=60).stdout
+
+
+def freshness(repo: Path) -> dict[str, Any]:
+    """How current `repo`'s refs are with origin, for a caller that must say so (io-c1bbfff4)"""
+    out = gitrefs.refresh(repo)
+    return {"ok": out.ok, "ts": out.ts, "error": out.error}
 
 
 def main_ref(repo: Path) -> str:

@@ -17618,6 +17618,7 @@ def release_overview(project: str = "") -> dict[str, Any]:
         raise OpsError(f"cannot read the release history in {repo}: {e}") from e
     return {"project": project, "repo": str(repo), "main_ref": ref, "newest": newest,
             "is_os": is_os, "tag_glob": glob, "pending": pending, "releases": releases,
+            "refresh": release_view.freshness(repo),
             "in_flight": [{"id": w["id"], "title": w["title"], "status": w["status"],
                            "href": order_path(project, w["id"])}
                           for w in _open_release_orders(project)]}
@@ -17635,7 +17636,8 @@ def release_detail(tag: str, project: str = "") -> dict[str, Any]:
         rows = release_view.release_commits(repo, tag, known[tag]["previous"])
     except (OSError, subprocess.SubprocessError) as e:
         raise OpsError(f"cannot read {tag} in {repo}: {e}") from e
-    return {**known[tag], "project": project, "rows": _release_rows(rows, project, repo)}
+    return {**known[tag], "project": project, "rows": _release_rows(rows, project, repo),
+            "refresh": release_view.freshness(repo)}
 
 
 RELEASE_CUT_BRIEF = """\
