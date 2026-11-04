@@ -341,9 +341,10 @@ Jarvis spend for the span is the order list's own per-call ledger, so a range's 
 sums to what the meter and the plot show (io-82bcb830; the turn-row reader counted
 compactions twice and booked a whole turn at its start):
 
-* **workers** — each transcript call inside the span, subagents included, of the orders
-  `ops.cost_report` lists for it: a turn overlapping the span
-  (`project_store.TURN_OVERLAPS_WINDOW`), or an `agent_calls` row inside it;
+* **workers** — each transcript call inside the span, subagents included, of any order.
+  User ruling (kn-58e36cf1): `ops.cost_report` lists an order if and only if it spent
+  inside the span, at its start, middle or end, and counts only that portion. Turn
+  timestamps select nothing, except a turn whose transcript was pruned;
 * **jarvis calls** — every `agent_calls` row inside the span, at list price. The list's
   `totals` plus its `os_unattributed` is this same figure, so `os_unattributed` is NOT
   added to it again.

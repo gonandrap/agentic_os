@@ -803,11 +803,9 @@ def _priced_agent_calls(root: Path, *, since: float, until: float,
 
 
 def _worker_spend(root: Path, *, since: float, until: float,
-                  calls: Sequence[tuple[float, float, str, str]],
                   project: str | None = None) -> list[tuple[float, float]]:
-    """`(ts, usd)` per transcript call of the very orders `ops.cost_report` lists for this window"""
+    """`(ts, usd)` per in-window transcript call of every order, as `ops.cost_report` lists them"""
     from . import fleetcost
-    from .project_store import TURN_OVERLAPS_WINDOW
 
     transcripts = usage.transcript_root()
     if not transcripts.is_dir():
@@ -821,18 +819,14 @@ def _worker_spend(root: Path, *, since: float, until: float,
         conn = _connect_ro(paths.project_db_path(path))
         if conn is None:
             continue
-        os_only = {wo_id for _, _, wo_id, owner in calls if wo_id and owner in ("", name)}
         try:
-            rows = conn.execute(
-                f"""SELECT id, session_id, {TURN_OVERLAPS_WINDOW} AS active
-                    FROM work_orders""", (until, since)).fetchall()
+            rows = conn.execute("SELECT session_id FROM work_orders").fetchall()
         except sqlite3.Error:
             rows = []
         finally:
             conn.close()
         for row in rows:
-            if row["session_id"] and (row["active"] or row["id"] in os_only):
-                found.extend(usage.session_spend(row["session_id"], since, until, index))
+            found.extend(usage.session_spend(row["session_id"] or "", since, until, index))
     return found
 
 
@@ -841,7 +835,7 @@ def jarvis_spend(*, since: float, until: float, home: Path | str | None = None,
     """`(workers_usd, jarvis_calls_usd)` over the span, from the order list's per-call records (§7)"""
     root = _home_path(home)
     calls = _priced_agent_calls(root, since=since, until=until, project=project)
-    workers = _worker_spend(root, since=since, until=until, calls=calls, project=project)
+    workers = _worker_spend(root, since=since, until=until, project=project)
     return (sum(usd for _, usd in workers), sum(c[1] for c in calls))
 
 
@@ -872,10 +866,9 @@ def spend_events(*, since: float, until: float,
                  home: Path | str | None = None) -> list[tuple[float, float, bool]]:
     """`(ts, usd, is_jarvis)` for every priced call on this machine over the span"""
     root = _home_path(home)
-    calls = _priced_agent_calls(root, since=since, until=until)
-    found: list[tuple[float, float, bool]] = [(c[0], c[1], True) for c in calls]
-    found.extend((ts, usd, True)
-                 for ts, usd in _worker_spend(root, since=since, until=until, calls=calls))
+    found: list[tuple[float, float, bool]] = [
+        (c[0], c[1], True) for c in _priced_agent_calls(root, since=since, until=until)]
+    found.extend((ts, usd, True) for ts, usd in _worker_spend(root, since=since, until=until))
     transcripts = usage.transcript_root()
     if transcripts.is_dir():
         index = usage.index_sessions(transcripts)

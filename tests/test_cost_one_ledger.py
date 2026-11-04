@@ -110,6 +110,45 @@ def test_a_transcript_that_grows_is_read_again(fleet_fixture):
     assert plot_total(fleet_fixture, picked)[0] == pytest.approx(3.0, abs=0.01)
 
 
+def test_an_order_is_listed_iff_it_spent_inside_the_window_and_only_for_that_part(fleet_fixture):
+    """User ruling kn-58e36cf1, whichever part of the order the window catches"""
+    f = fleet_fixture
+    picked = window(T0, T0 + HOUR)
+
+    def session(title: str, *costs: tuple[float, float], turn: tuple[float, float]) -> None:
+        wo = f.order(title, session_id=title)
+        f.turn(wo, started_at=turn[0], ended_at=turn[1], cost_usd=99.0)
+        f.transcript(title, [f.call_row(at=at, out=f.output_for(usd), mid=f"m-{title}-{at}")
+                             for at, usd in costs])
+
+    # Its beginning, its end, its middle, all of it
+    session("beginning", (T0 + HOUR - 9, 1.0), (T0 + HOUR + 9, 8.0), turn=(T0 + HOUR - 9, T0 + 2 * HOUR))
+    session("ending", (T0 - 9, 8.0), (T0 + 9, 2.0), turn=(T0 - 9, T0 + 9))
+    session("middle", (T0 - 9, 8.0), (T0 + 9, 3.0), (T0 + HOUR + 9, 8.0),
+            turn=(T0 - 9, T0 + HOUR + 9))
+    session("whole", (T0 + 9, 4.0), (T0 + 19, 1.0), turn=(T0 + 9, T0 + 19))
+    # A call past its turn's recorded end: no turn says so, the transcript does
+    session("past its turn", (T0 + 9, 5.0), turn=(T0 - 3 * HOUR, T0 - 2 * HOUR))
+    # A turn across the window that spent only outside it
+    session("spent elsewhere", (T0 - 9, 8.0), turn=(T0 - 9, T0 + HOUR + 9))
+
+    report = ops.cost_report(window=picked)
+
+    assert {u["title"]: round(u["total_cost_usd"], 2) for u in report["units"]} == {
+        "beginning": 1.0, "ending": 2.0, "middle": 3.0, "whole": 5.0, "past its turn": 5.0}
+    assert meter_total(f, picked) == pytest.approx(16.0, abs=0.01)
+
+
+def test_a_pruned_transcript_still_shows_as_unmeasured(fleet_fixture):
+    wo = fleet_fixture.order("pruned", session_id="gone")
+    fleet_fixture.turn(wo, started_at=T0 + 9, ended_at=T0 + 19, cost_usd=1.0)
+
+    report = ops.cost_report(window=window(T0, T0 + HOUR))
+
+    assert [u["title"] for u in report["units"]] == ["pruned"]
+    assert report["unmeasured"] == 1
+
+
 def test_a_window_lists_every_order_however_many(fleet_fixture):
     for i in range(3):
         fleet_fixture.spend(f"order {i}", 1.0, at=T0 + i)

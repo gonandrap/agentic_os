@@ -861,12 +861,21 @@ def _call_spend(path: Path) -> list[tuple[float, float]]:
     return transcript_cache.light_product(path, "call_spend", build)
 
 
+def _written_since(path: Path, since: float) -> bool:
+    try:
+        return path.stat().st_mtime >= since
+    except OSError:
+        return False        # pruned mid-walk
+
+
 def session_spend(session_id: str, since: float, until: float,
                   index: dict[str, list[Path]]) -> list[tuple[float, float]]:
     """The calls `read_session` totals over this window, one `(ts, usd)` each, subagents included"""
     return [(ts, usd)
             for path in sorted(index.get(session_id) or [])
             for file in (path, *_subagent_files(path))
+            # A file last written before the window cannot hold a call inside it, and most orders are that old
+            if _written_since(file, since)
             for ts, usd in _call_spend(file) if ts and _inside(ts, since, until)]
 
 
