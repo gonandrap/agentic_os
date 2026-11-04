@@ -9246,10 +9246,13 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
     classification = verdict["classification"]
     store = ProjectStore(path)
     try:
-        # Before the status: a failed post leaves the verdict resubmittable, so no gap is lost
+        # Before the status, so a failed post stays resubmittable; a resubmit skips titles already posted
+        posted = ({d["title"] for d in deferrals_of(store, fo["plan_wo_id"])}
+                  if verdict["other_gaps"] else set())
         for gap in verdict["other_gaps"]:
-            _post_deferral(store, fo["plan_wo_id"], gap["title"], gap["why"],
-                           gap["description"])
+            if gap["title"] not in posted:
+                _post_deferral(store, fo["plan_wo_id"], gap["title"], gap["why"],
+                               gap["description"])
         store.update_feature_order(inv_id, plan=db.to_json(verdict))
         store.set_feature_status(inv_id, "completed")
         # THE ONE CLASSIFICATION THAT SPENDS ATTENTION

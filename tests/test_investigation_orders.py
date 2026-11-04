@@ -716,8 +716,6 @@ def _other_gap(n: int) -> dict[str, str]:
 def test_each_other_gap_becomes_one_origin_linked_backlog_proposal(started, store, catalog_file,
                                                                   monkeypatch, classification):
     """io-38a4354f one-fix-slot: the `done` line, end to end through the router"""
-    from jarvis.central_store import CentralStore
-
     monkeypatch.setattr(ops, "_verdict_duplicate", lambda *a, **k: "#790")  # no tracker call
     inv_id, investigator, out = _submitted(started, store, classification,
                                            other_gaps=[_other_gap(1), _other_gap(2)])
@@ -725,9 +723,15 @@ def test_each_other_gap_becomes_one_origin_linked_backlog_proposal(started, stor
     assert json.loads(store.get_feature_order(inv_id)["plan"])["other_gaps"][1]["title"] == (
         "side defect 2")
 
+    _assert_two_proposals(store, catalog_file, inv_id, investigator)
+
+
+def _assert_two_proposals(store, catalog_file, inv_id: str, investigator: str) -> None:
+    """One routing tick, then exactly the two origin-linked `proposed` rows"""
+    from jarvis.central_store import CentralStore
+
     catalog = load_catalog(catalog_file)
     Daemon(catalog).deliver_envelopes(catalog.projects[0], store)
-
     central = CentralStore()
     try:
         rows = sorted((b for b in central.list_backlog("proj_a", status=None)
@@ -740,6 +744,86 @@ def test_each_other_gap_becomes_one_origin_linked_backlog_proposal(started, stor
         assert row["origin_wo_id"] == investigator and row["origin_fo_id"] == inv_id
         assert [r["kind"] for r in row["origin_refs"]] == ["envelope", "order"]
         assert f"reason {n}" in row["origin_note"] and f"Side defect {n}" in row["description"]
+
+
+def test_other_gaps_with_no_investigator_are_refused_and_nothing_is_stored(started, store):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    store.set_feature_status(inv["id"], "planning")
+    before = store.get_feature_order(inv["id"])
+    assert not before["plan_wo_id"]
+
+    with pytest.raises(ops.OpsError, match="no investigator work order"):
+        ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject,
+                                                other_gaps=[_other_gap(1)]))
+    after = store.get_feature_order(inv["id"])
+    assert after["plan"] == before["plan"]
+    assert after["status"] == "planning"
+    assert not store.envelopes()
+
+    out = ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject, other_gaps=[]))
+    assert out["status"] == "completed" and out["other_gaps_proposed"] == 0
+    assert not store.envelopes()
+
+
+def test_a_failed_filing_posts_no_gap_and_the_retry_posts_each_once(started, store, catalog_file,
+                                                                    monkeypatch, tmp_path, capsys):
+    from jarvis import bugreport
+
+    real = bugreport.report_bug
+
+    def boom(**_kw):
+        raise bugreport.BugReportError("gh: could not resolve host github.com")
+
+    monkeypatch.setattr(bugreport, "report_bug", boom)
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    path = tmp_path / "verdict.json"
+    path.write_text(json.dumps(a_verdict("GAP", subject=subject,
+                                         other_gaps=[_other_gap(1), _other_gap(2)])))
+    retry = ["investigate", "verdict", inv["id"], "--from-file", str(path), "--json"]
+
+    assert cli.main(retry) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert "could not resolve host" in first["filing_error"]
+    assert f"jarvis investigate verdict {inv['id']} --from-file verdict.json" in first["note"]
+    assert store.get_feature_order(inv["id"])["status"] == "planning"
+    assert not store.envelopes()
+
+    monkeypatch.setattr(bugreport, "report_bug", real)
+    assert cli.main(retry) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["status"] == "completed" and second["filed"]["issue_url"]
+    assert len(store.envelopes()) == 2
+    _assert_two_proposals(store, catalog_file, inv["id"], investigator)
+
+
+def test_a_partial_post_failure_does_not_duplicate_a_proposal_on_resubmit(started, store,
+                                                                         catalog_file, monkeypatch):
+    real = ops._post_deferral
+    calls = []
+
+    def fail_on_second(*args, **kw):
+        calls.append(args)
+        if len(calls) == 2:
+            raise RuntimeError("database is locked")
+        return real(*args, **kw)
+
+    monkeypatch.setattr(ops, "_post_deferral", fail_on_second)
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    doc = a_verdict("TRANSIENT", subject=subject, other_gaps=[_other_gap(1), _other_gap(2)])
+
+    with pytest.raises(RuntimeError, match="database is locked"):
+        ops.submit_verdict(inv["id"], doc)
+    assert store.get_feature_order(inv["id"])["status"] == "planning"
+    assert len(store.envelopes()) == 1
+
+    assert ops.submit_verdict(inv["id"], doc)["status"] == "completed"
+    assert len(store.envelopes()) == 2
+    _assert_two_proposals(store, catalog_file, inv["id"], investigator)
 
 
 def test_a_refused_verdict_posts_nothing(started, store):
