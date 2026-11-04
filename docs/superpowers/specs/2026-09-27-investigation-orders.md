@@ -293,11 +293,19 @@ for that function's stated reason:
      the opposite error: `gh` search is token-AND, so an existing issue about the same
      cause in different words is missed and a duplicate gets filed. That is the right
      direction to fail in — a duplicate issue is visible and closable, a `GAP` that was
-     never filed is not. (The live-order half below keys the other way, on the subject id;
-     the asymmetry is deliberate.)
-   * Live orders: `search.search(query, kinds=…)` (src/jarvis/search.py:120) for work and
-     feature orders, plus `issues.live_work_order` (src/jarvis/issues.py:1260) for "an
-     order is already on this issue".
+     never filed is not.
+   * Live orders: only a structural link counts, never a text mention (io-38a4354f: 39 of
+     85 GAP verdicts were lost to orders that merely named the subject). A live work order
+     counts when its `gap_class` equals the verdict's, or its `issue_url` is the
+     `filed.issue_url` of an earlier verdict with that `gap_class`. Feature orders have no
+     `gap_class`. The link is kept in `duplicate_link` and as a `verdict_duplicate_linked`
+     event on the target.
+   * Target settles: `ops.raise_settled_duplicates`, on the daemon's reconcile cadence. A
+     verdict submitted as `GAP` whose order target is terminal or gone, with no issue
+     matching `proposed_fix.title`, becomes one backlog proposal per `gap_class`, never an
+     issue. `duplicate_settled` on the verdict makes this once only; the same pass covers
+     verdicts recorded before this rule. Completed targets count: nothing mechanical says
+     an order fixed the cause, and a proposal can be dismissed.
    * A hit -> **the verdict is recorded as `ALREADY_TRACKED`** with `duplicate_of` set to
      what was found, `classified_by: "ops"` and `submitted_classification: "GAP"`. The
      record must never read as though the investigator classified it that way; and it must
