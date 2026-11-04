@@ -191,7 +191,7 @@ An escalation may carry one optional label, which is grouped and reported:
   "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
 evidence-insufficient | user-decision>\""""
 
-#: User-facing copy: inbox rows reach every sink, Telegram included
+#: User-facing copy; both cleared titles are written push=False: inbox and log only
 ACK_INBOX_TITLE = "Supervisor cleared an alarm on {wo_id}"
 ADVICE_INBOX_TITLE = "Neo cleared an alarm on {wo_id}"
 ESCALATED_INBOX_TITLE = "A cost alarm needs you: {alarm_id}"
@@ -1043,7 +1043,7 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
 
     central.add_inbox(project=project, level="info",
                       title=ACK_INBOX_TITLE.format(wo_id=wo["id"]),
-                      body=verdict["note"], wo_id=wo["id"])
+                      body=verdict["note"], wo_id=wo["id"], push=False)
 
 
 def _propose(pstore: Any, neo_store: Any, central: Any, project: str,
