@@ -15,7 +15,7 @@ whole-OS pulse; --attention for the short list
 
 ## `jarvis search "<words>" [--project p]`
 
-FIND A RECORD AGAIN — work orders, feature orders, Neo questions, alarms, gates, backlog items and knowledge, across the fleet or inside one project. SETTLED AND HIDDEN RECORDS INCLUDED: the listings hide completed work behind a count, and this is what replaces expanding it. `--kind` narrows to one kind, an id typed in full jumps straight to it, and each hit prints the `jarvis` command that shows it. Same box sits in the dashboard's header, and on each project page scoped to that project.
+FIND A RECORD AGAIN — work orders, feature orders, Neo questions, alarms, gates, backlog items and knowledge, across the fleet or inside one project. SETTLED AND HIDDEN RECORDS INCLUDED: the dashboard hides completed work behind a count, a project page's order list behind its status filter, and this searches past both. `--kind` narrows to one kind, an id typed in full jumps straight to it, and each hit prints the `jarvis` command that shows it. Same box sits in the dashboard's header, and on each project page scoped to that project.
 
 ## `jarvis issues [project]`
 
