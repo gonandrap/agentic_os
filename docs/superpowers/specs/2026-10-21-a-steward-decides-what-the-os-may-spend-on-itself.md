@@ -314,8 +314,11 @@ drain re-offers it once there is room (#1305).
 }
 ```
 
-The ledger is fleet-wide, so the steward reads these keys from `os.evolution` only. A
-project's `evolution` block keeps its existing `min_samples` meaning.
+The steward reads these keys from the candidate's project: `projects.<p>.evolution`,
+which inherits `os.evolution` field by field (issue #1553 reversed this section's first
+text). The ledger stays fleet-wide, so a project's cap is measured against the one
+fleet-wide spend figure, not the project's own; `jarvis steward ledger` prints each
+project's caps beside it.
 
 `min_refs_by_kind` is merged over the shipped default, so naming one kind keeps
 `neo_rider: 1`. An unknown origin kind or a negative count is refused at load.

@@ -3055,7 +3055,8 @@ def cmd_steward(args: argparse.Namespace) -> int:
                                   "weekly_usd": cfg.weekly_usd,
                                   "bug_weekly_usd": cfg.bug_weekly_usd,
                                   "critical_weekly_usd": cfg.critical_weekly_usd,
-                                  "yield_above_usd": cfg.yield_above_usd}))
+                                  "yield_above_usd": cfg.yield_above_usd,
+                                  "projects": steward.project_caps(catalog)}))
                 return 0
             print(f"mode {cfg.mode}; self_dispatch "
                   f"{'on' if catalog.os.autonomy.self_dispatch else 'off'}")
@@ -3067,6 +3068,11 @@ def cmd_steward(args: argparse.Namespace) -> int:
                   f"${cfg.critical_weekly_usd:.2f}")
             print(f"fleet          ${book.fleet_usd:8.2f} (new follow-ups wait above "
                   f"${cfg.yield_above_usd:.2f}; reported bugs never do)")
+            caps = steward.project_caps(catalog)
+            if caps:
+                print("caps in force per project, against the spend above:")
+                for name, own in caps.items():
+                    print(steward.cap_line(name, own))
             return 0
         rows = (ops.steward_why(args.wo_id) if args.steward_cmd == "why"
                 else central.steward_decisions(limit=args.limit))
