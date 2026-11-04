@@ -152,8 +152,12 @@ and the operator's habits do not change.
 |---|---|---|
 | `JARVIS_ROLE` | `master` | `runner` |
 | `JARVIS_MASTER_URL` | unset | `https://<master>:8788` |
-| `JARVIS_RUNNER_TOKEN` | — | the shared secret |
+| `JARVIS_RUNNER_TOKEN` | — | the machine's token (§5.1) |
 | `JARVIS_RUNNER_NAME` | — | stable machine name (`gonzalo-mbp`) |
+
+The operator credential is **not** in this table: it lives in
+`$JARVIS_HOME/credentials.json` and is never an environment variable, so that the
+environment a runner hands a worker cannot carry it (§3.3, §5.1).
 
 Default with both unset: today's behaviour, byte for byte. A single-machine fleet
 never learns any of this exists.
@@ -184,6 +188,28 @@ session cannot move. A runner that stops reporting for `N` minutes marks its ord
 stalled through the existing supervisor path — the health probes and the `INV-*`
 invariants need a new symptom, not a new concept.
 
+**`JARVIS_RUNNER_TOKEN` is withheld from the environment of every worker the runner
+spawns.** This is a change, not a property the code already has: a worker **inherits
+the spawning process's environment today**. the background worker spawn builds it as
+`{k: v for k, v in os.environ.items() if k not in CACHE_TTL_KEYS}`
+(`claude_cli.py:843`) — a copy of the whole environment minus one named set — and
+`_run`, the synchronous path, takes a bare `os.environ.copy()` (`claude_cli.py:178`).
+The env map in `dispatch.py:193` is the *settings* env, which only adds. So a runner
+token in the runner service's environment reaches every worker unless it is stripped.
+
+Where it lives: `CACHE_TTL_KEYS` (`claude_cli.py:47`, filtered at `:843`) is already
+the "variables a spawned process must not inherit" set and is the natural home for
+the runner token; `_run` needs the same filter rather than a bare copy. The feature
+must apply one excluded set on both paths and pin it with a test asserting the
+variable is absent from a spawned worker's environment.
+
+Why it matters: a worker that could read `JARVIS_RUNNER_TOKEN` could call the runner
+API as its own runner — claim other orders, report false status — and, if the master
+ever accepted that token for operator calls, approve the very gate it was asking for.
+The operator credential is never an environment variable at all (§5.1), so this strip
+is the only thing standing between a worker and the runner API, and the credential
+split in §5.1 is what keeps that from also being a worker and the *decision* API.
+
 ### 3.4 Hooks: the latency question, answered locally
 
 `hooks.handle_hook()` runs on **every tool call** inside a worker. Routing it to the
@@ -209,13 +235,20 @@ routing every hook write, trades a worker-blocking failure mode for tidiness.
 
 ### 3.5 What crosses the wire, and what does not
 
-| Call | Where it runs |
-|---|---|
-| `jarvis learn add / search / show`, `backlog`, `inbox`, `status`, `wo create/list/show/send/review/ack/done`, `fo`, `io`, `do`, `mo`, `gate`, `neo`, `cost`, `search` | master, via RPC |
-| `jarvis wo ask` (a worker's question to Neo) | master, via RPC |
-| gate preflight for a privileged action | master, via RPC; **deny on failure** |
-| hook event recording, turn capture, worker spawn, worktree creation, git | runner, locally |
-| `jarvis ui` | master only |
+| Call | Where it runs | Credential (§5) |
+|---|---|---|
+| `jarvis learn search/show`, `backlog list`, `inbox`, `status`, `wo list/show`, `cost`, `search`, `gate list/show` | master, via RPC | operator |
+| `jarvis learn add`, `backlog add/promote`, `wo create/send`, `fo`/`io`/`do`/`mo` creation, `bug report` | master, via RPC | operator |
+| **`jarvis gate approve/deny`, `wo review/ack/done`, `fo approve`, `io review`, `neo answer/review/retract`, `learn retract`, `config set`** | master, via RPC | **operator only — a runner token is refused** |
+| `jarvis wo ask` (a worker's question to Neo) | master, via RPC | runner |
+| gate preflight for a privileged action — *asking*, never deciding | master, via RPC; **deny on failure** | runner |
+| runner claim and report | master, via RPC | runner |
+| hook event recording, turn capture, worker spawn, worktree creation, git | runner, locally | none |
+| `jarvis ui` | master only | operator |
+
+The third row is the line that matters: every call that **decides something on the
+user's behalf** needs an operator credential, and the master refuses it when the
+caller presents only a runner token.
 
 ## 4. The seam in the code
 
@@ -238,13 +271,53 @@ the error is an `OpsError`.
 
 - **Network**: a private mesh (Tailscale or equivalent), not the public internet. The
   master binds to its mesh address; nothing is port-forwarded.
-- **Auth**: a per-runner bearer token, issued by `jarvis runner add <name>`, stored in
-  `os_state`, revocable with `jarvis runner revoke`. It authorises *runner*
-  operations; it is not an operator credential.
 - **TLS**: terminated by the mesh. No certificate management in Jarvis.
 - **Refusal to guess**: a runner that cannot reach the master does not fall back to
   local writes. It reports the outage and stops claiming. Split-brain is the one
   failure this design must never produce, and a local write queue is how you get it.
+
+### 5.1 Two credentials, because they answer two different questions
+
+A runner token answers *which machine is this*. An operator credential answers *is
+this the user*. Collapsing them would mean that anything able to read a machine's
+environment could decide on the user's behalf — and the thing most able to read that
+environment is a `claude` worker the runner itself spawned, mid-privileged-action,
+asking for the gate it would then approve.
+
+| | Runner token | Operator credential |
+|---|---|---|
+| Identifies | a machine | a human |
+| Issued by | `jarvis runner add <name>` on the master | `jarvis login` against the master, one per (human, machine) |
+| Held as | `JARVIS_RUNNER_TOKEN` in the runner service's environment | `$JARVIS_HOME/credentials.json`, mode 0600, **never an environment variable** |
+| Authorises | claim, report, `wo ask`, gate preflight (asking) | the operator surface of §3.5, including every decision |
+| Revoked by | `jarvis runner revoke <name>` | `jarvis logout --runner <name>` / `jarvis operator revoke` |
+| Stored on master as | a hash in `os_state` | a hash in `os_state`, with issue time and last use |
+
+**The rule the implementation must enforce:** *the master refuses `gate
+approve/deny` — and every other row marked operator-only in §3.5 — when the caller
+presents only a runner token.* The refusal is `403`, it names the missing credential,
+and it is recorded as a gate event rather than silently dropped, because a worker
+reaching for an approval endpoint is a signal the user wants to see. A runner token
+is never upgraded, never scoped up per-call and never accepted "because it came from
+a registered runner".
+
+The operator credential is deliberately **not** derived from the runner's identity
+and does not live beside it: a runner that is fully compromised can still only claim
+and report. Everything it could do then is something the master was going to let that
+machine do anyway.
+
+### 5.2 The alternative, and why it is the fallback rather than the design
+
+Approvals could instead be restricted to the master's dashboard — no operator
+credential, no remote decision, and the user walks to the master (or port-forwards
+its UI over the mesh) to approve anything. That is strictly safer and strictly less
+useful: the whole point of the order is to stop one machine being the only place the
+fleet can be operated from.
+
+It is worth stating because it is the correct fallback if Phase 2 slips. **If the
+operator credential is not built, the operator-only rows of §3.5 stay on the master's
+UI and are not exposed over RPC at all.** What must never happen is the third
+option — exposing them over RPC and letting the runner token stand in.
 
 ## 6. Durability
 
@@ -268,6 +341,14 @@ done`, `fo`/`io`/`do`/`mo` creation and review, `learn add`, `backlog add/promot
 `bug report`, `gate approve/deny`. After this phase both machines are full operator
 consoles; work still executes only on the master.
 
+**Phase 2 has a prerequisite, not an option: the operator credential of §5.1 ships
+first, in the same phase and before any operator-only row of §3.5 is exposed.** The
+decision rows (`gate approve/deny`, `wo review/ack/done`, `fo approve`, `io review`,
+`neo answer/review/retract`, `config set`) are the reason the credential exists; a
+Phase 2 that shipped them against the runner token would be a worker able to approve
+its own privileged action. If the credential slips, those rows stay on the master's
+UI (§5.2) and Phase 2 ships without them.
+
 **Phase 3 — runners execute.** `project_runners`, `assigned_runner`, the claim/report
 protocol, local hooks with remote gates, the stalled-runner symptom. This is where
 the development speed-up the order asks for actually arrives.
@@ -289,6 +370,10 @@ means the fleet is useful from two machines long before the scheduler changes.
   transcripts off the local filesystem; with workers on runners, the bill must be
   assembled from what the runner reports, not from what the master can read. The most
   under-specified corner of Phase 3; it deserves its own section in the feature plan.
+- **Who the operators are.** §5.1 issues one credential per (human, machine). If the
+  fleet ever has more than one operator, the master must also record *which* operator
+  decided a gate — today a decision has a timestamp and a reason, not an author.
+  Out of scope here; name it in the feature plan before the credential ships.
 - **Schema fence.** `docs/superpowers/specs/2026-11-01-os-db-schema-fence.md` governs
   changes to `os.db`; `project_runners` and `assigned_runner` must land through it.
 

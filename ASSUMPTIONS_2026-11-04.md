@@ -22,6 +22,17 @@
 4. **Gates fail closed.** A gate preflight that cannot reach the master denies rather
    than allowing locally. Rejected: a local fallback grant, which is a security hole.
 
-5. **Phasing is three steps, read-only first.** Rejected: one big change, because
+5. **Two credentials, not one (review round 1).** A runner token identifies a machine;
+   a separate operator credential identifies the user and is required for every call
+   that decides on their behalf — `gate approve/deny`, `wo review/ack/done`,
+   `fo approve`, `io review`, `neo answer/review/retract`, `config set`. The master
+   refuses those when the caller presents only a runner token. The operator credential
+   is a file (`$JARVIS_HOME/credentials.json`, 0600), never an environment variable.
+   Rejected: one scoped token (a worker inherits the runner's environment, so it could
+   approve the gate it is asking for); approvals on the master's UI only (safer, but it
+   is the fallback in §5.2, not the design, since remote operation is the point of the
+   order).
+
+6. **Phasing is three steps, read-only first.** Rejected: one big change, because
    phases 1 and 2 give a second operator console with no scheduler change and roll
    back by unsetting an environment variable.
