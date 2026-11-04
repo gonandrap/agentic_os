@@ -1232,6 +1232,41 @@ def test_an_unusable_answer_is_never_a_verdict(started, monkeypatch, answer):
     assert _question(item["neo_question_id"])["status"] == "queued"
 
 
+@pytest.mark.parametrize("settled", ["done", "dropped"])
+def test_a_duplicate_verdict_on_a_settled_item_is_never_a_verdict(started, monkeypatch, settled):
+    kept = _quarantined(started, title="Rename the export flag", severity="minor")
+    central = CentralStore()
+    try:
+        central.mark_backlog(kept["id"], settled)
+    finally:
+        central.close()
+    ref = {"kind": "neo_question", "id": 77}
+    item = _quarantined(started, origin_refs=[ref])
+    _neo_says(monkeypatch, answer=json.dumps(
+        {"decision": "duplicate", "duplicate_of": kept["id"]}))
+
+    drain(started)
+
+    assert _item(item["id"])["status"] == "quarantined"
+    assert _question(item["neo_question_id"])["status"] == "queued"
+    assert ref not in _item(kept["id"])["origin_refs"]
+
+
+def test_the_user_folding_into_a_settled_item_is_refused(started):
+    kept = _quarantined(started, title="Rename the export flag", severity="minor")
+    central = CentralStore()
+    try:
+        central.mark_backlog(kept["id"], "done")
+    finally:
+        central.close()
+    item = _quarantined(started)
+
+    with pytest.raises(ops.OpsError, match=rf"{kept['id']}.*done"):
+        ops.review_backlog_item(item["id"], "duplicate", duplicate_of=kept["id"])
+
+    assert _item(item["id"])["status"] == "quarantined"
+
+
 def test_an_unusable_answer_past_its_attempts_goes_to_the_user(started, monkeypatch):
     item = _quarantined(started)
     _neo_says(monkeypatch, answer="no idea")

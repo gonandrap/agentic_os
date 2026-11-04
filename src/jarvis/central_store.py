@@ -1251,8 +1251,12 @@ class CentralStore:
         if duplicate_of is not None:
             if status != "dropped":
                 raise ValueError("duplicate_of is only set on a dropped item")
-            if duplicate_of == item_id or not self.get_backlog(duplicate_of):
+            target = self.get_backlog(duplicate_of)
+            if duplicate_of == item_id or not target:
                 raise KeyError(f"duplicate_of {duplicate_of!r} is not another backlog item")
+            if target["status"] in SETTLED_BACKLOG_STATUSES:
+                raise ValueError(f"duplicate_of {duplicate_of} is {target['status']}: "
+                                 f"a settled item cannot take a duplicate")
         for dep in depends_on or ():
             if dep == item_id or not self.get_backlog(dep):
                 raise KeyError(f"backlog dependency {dep!r} does not exist")
