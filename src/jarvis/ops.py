@@ -102,7 +102,9 @@ from .project_store import (
     is_feature_order_id,
     kind_contract,
     order_path,
+    settles_idle,
     submission_artifacts,
+    turn_end_is_delivery,
     validation_standing,
 )
 
@@ -1404,6 +1406,8 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
     wo_id = wo["id"]
     round_note = invariants.parallel_round_note(store, wo_id)
     pending = store.pending_assumptions(wo_id)
+    if turn_end_is_delivery(wo):
+        pending = invariants.assumptions_left_with_user(store, wo, pending)
     turn = store.latest_turn(wo_id)
     working = (turn is not None and turn["state"] == "running"
                and wo["status"] != "waiting_input")
@@ -4594,6 +4598,10 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     delivered = store.events_of_kind(wo_id, "finished")
     if delivered and float(delivered[-1]["ts"]) > cut:
         return True
+    # A manager never finishes: its turn ending after the refusal is its answer (io-d5e62d4d)
+    if settles_idle(store.get_work_order(wo_id)):
+        turn = store.latest_turn(wo_id)
+        return bool(turn and float(turn["ended_at"] or 0) > cut)
     # One read of the rows, like `validated_head`'s one-read rule: the guard needs the prior counted row...
     counted = [r for r in store.validation_rounds(wo_id=wo_id)
                if str(r["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES]
@@ -6947,11 +6955,13 @@ def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any
         "decided_by": ASSUMPTION_DECIDER_OS})
     pending = store.pending_assumptions(wo_id)
     status = str(wo.get("status") or "")
-    if not pending:
+    # A manager settles with its feature, never on its assumptions (io-d5e62d4d)
+    settled = not pending and not settles_idle(wo)
+    if settled:
         status = _land_after_acceptance(store, project_path, wo_id, cfg)
     return {"wo_id": wo_id, "assumption_id": assumption["id"],
             "n": assumption.get("n"), "status": status, "pending": len(pending),
-            "settled": not pending}
+            "settled": settled}
 
 
 #: The one transport that ships
@@ -7100,13 +7110,20 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
     if park is not None:
         out["pr_pending"] = {k: park.get(k) or ""
                              for k in ("branch", "base", "compare_url")}
-    if not feedback:
+    # No review status will prompt the user for guidance on a manager: it hears either way (io-d5e62d4d)
+    if not feedback and not accept and pending and settles_idle(wo):
+        feedback_to_send = ("The user rejected assumption(s) "
+                            f"{', '.join('#' + str(a.get('n')) for a in pending)}: "
+                            "reconsider those calls and act on it.")
+    else:
+        feedback_to_send = feedback
+    if not feedback_to_send:
         return out
 
     # A rejection without guidance reaching the worker just strands it
     if not accept and wo["status"] in OPEN_STATUSES:
         try:
-            out["delivered"] = send_message(wo_id, feedback, source="jarvis",
+            out["delivered"] = send_message(wo_id, feedback_to_send, source="jarvis",
                                             project_name=name)
         except OpsError as e:
             out["delivery_error"] = str(e)
@@ -9230,6 +9247,9 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
                     expected=verdict["proposed_fix"]["expected"],
                     actual=verdict["proposed_fix"]["actual"],
                     priority=verdict["proposed_fix"]["priority"],
+                    gap_class=verdict["gap_class"],
+                    detector=verdict["proposed_fix"]["detector"],
+                    remedy=verdict["proposed_fix"]["remedy"],
                     project=name, wo_id=fo.get("plan_wo_id") or "",
                     # Neo agreeing plus the steward starts it, through the triage question (#1344)
                     expedite=False, investigation={
@@ -9531,6 +9551,11 @@ def show_feature_order(fo_id: str, project_name: str | None = None, *,
         mgr = store.manager_work_order(fo_id)
         manager = ({k: mgr[k] for k in ("id", "title", "status", "result_summary")}
                    if mgr else None)
+        if mgr:
+            # What the strip's "assumptions pending" points at (io-d5e62d4d)
+            manager["pending_assumptions"] = [
+                {k: a[k] for k in ("n", "content")}
+                for a in store.all_assumptions(mgr["id"]) if a["status"] == "pending"]
         return {
             "project": name, **fo,
             "plan": plan,
