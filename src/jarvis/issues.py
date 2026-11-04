@@ -11,7 +11,13 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .bugreport import bug_repo, gh_bin, gh_missing_message
+from .bugreport import (
+    VERDICT_GAP_CLASS_KEY,
+    bug_repo,
+    gh_bin,
+    gh_missing_message,
+    verdict_gap_class,
+)
 from .github import GhUnavailable, GitHubError
 
 log = logging.getLogger("jarvis.issues")
@@ -1131,6 +1137,11 @@ def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
     existing = live_work_order(spec, url)
     if existing:
         return existing
+
+    # From the body: the one input triage, the steward and `jarvis issues start` all share
+    gap_class = verdict_gap_class(payload.get("body") or "")
+    if gap_class:
+        metadata = {**(metadata or {}), VERDICT_GAP_CLASS_KEY: gap_class}
 
     wo = create_work_order(
         spec.name, payload.get("title") or url,
