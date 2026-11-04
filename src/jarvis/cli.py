@@ -5933,8 +5933,7 @@ def cmd_neo(args: argparse.Namespace) -> int:
             elif args.all:
                 qs = neo.list_questions()
             else:
-                # Open rows uncapped: the newest 200 of everything hid older escalations (io-d5e62d4d)
-                # `answered_by == "neo"` matches NeoStore.counts
+                # Open rows uncapped: the newest 200 hid older escalations; `answered_by` as NeoStore.counts
                 qs = sorted(
                     [*neo.list_questions(statuses=OPEN_Q_STATUSES, limit=-1),
                      *(q for q in neo.list_questions(statuses=("answered",),
