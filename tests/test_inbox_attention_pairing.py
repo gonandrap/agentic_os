@@ -223,11 +223,14 @@ def test_one_assumption_still_pending_keeps_the_ping(started, store):
     assert [i["wo_id"] for i in settle(started, store)] == [wo["id"]]
 
 
-def test_a_failed_order_still_owing_review_keeps_the_ping(started, store):
-    """`failed` can be retried and true_blockers still owes its assumptions: not over"""
+def test_a_failed_order_acks_its_ping_but_keeps_its_failed_turn_row(started, store):
+    """Terminal includes `failed`, pending assumptions or not; the turn's own row stays"""
     wo, _ = pinged(store, status="failed")
+    store.flag_attention(wo["id"], REASON)  # the failure path moves the flag before its row
+    store.add_notification(title=f"{wo['id']} worker turn failed", wo_id=wo["id"],
+                           level="warning", source="reconciler", paired=True)
 
-    assert [i["wo_id"] for i in settle(started, store)] == [wo["id"]]
+    assert [i["title"] for i in settle(started, store)] == [f"{wo['id']} worker turn failed"]
 
 
 def test_a_failed_turn_row_survives_on_the_same_settled_order(started, store):

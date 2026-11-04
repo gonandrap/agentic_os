@@ -4648,7 +4648,7 @@ class Daemon:
                 wo = store.get_work_order(wo_id)
             except KeyError:
                 wo = None       # deleted since the ping: nothing left to review
-            if (wo is None or wo["status"] in invariants_mod.TERMINAL_STATUSES
+            if (wo is None or wo["status"] in TERMINAL_STATUSES
                     or not invariants_mod.reviewable_assumptions(store, wo)):
                 self.central.ack_paired_reason(wo_id, reason)
 
