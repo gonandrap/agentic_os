@@ -881,13 +881,14 @@ def test_a_status_hold_stops_being_shown_once_a_review_is_owed_again(started):
     """A `status` hold claims the order is in no state this pass acts in"""
     store, wo = park(started, auto_review=True)
     (row,) = store.all_assumptions(wo["id"])
-    store.set_status(wo["id"], "cancelled")
+    # `failed`, the status a pending row survives: a cancelled order lapses it (io-d5e62d4d)
+    store.set_status(wo["id"], "failed")
     store.add_event(wo["id"], "autoreview_held",
                     {"code": autoreview.HELD_STATUS,
-                     "reason": "the work order is cancelled, not waiting on a review",
+                     "reason": "the work order is failed, not waiting on a review",
                      "assumption_id": row["id"], "n": 1})
 
-    assert "cancelled" in ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "failed" in ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
 
     store.set_status(wo["id"], "needs_review")
 
@@ -1310,12 +1311,11 @@ def test_a_work_order_cancelled_while_neo_is_thinking_is_not_settled_and_re_land
     drain(started)
 
     (row,) = store.all_assumptions(wo["id"])
-    assert row["status"] == "pending" and not row["decided_by"]
+    # Cancelling lapsed the row, so Neo's late ruling lands on nothing (io-d5e62d4d)
+    assert row["status"] == "lapsed" and not row["decided_by"]
     assert store.get_work_order(wo["id"])["status"] == "cancelled"
     assert events(store, wo["id"], "autoreview_accepted") == []
-    # `_note_autoreview_held` drops `status` at the ASK site, where it is unreachable
-    (held,) = events(store, wo["id"], "autoreview_held")
-    assert held["code"] == autoreview.HELD_STATUS and "cancelled" in held["reason"]
+    assert events(store, wo["id"], "autoreview_held") == []
 
 
 def test_permission_revoked_while_neo_is_thinking_stops_the_settle(started):
@@ -2657,9 +2657,9 @@ def test_an_ask_dropped_on_a_cancelled_order_is_not_re_armed(started):
     drain(started)
 
     assert store.all_assumptions(wo["id"])[0]["neo_question_id"] == first["id"]
-    assert questions()[0]["status"] == "escalated"
-    (escalated,) = events(store, wo["id"], "autoreview_escalated")
-    assert escalated["re_asked"] is False
+    # The row lapsed with the order, so nothing goes to the user either (io-d5e62d4d)
+    assert questions()[0]["status"] != "escalated"
+    assert events(store, wo["id"], "autoreview_escalated") == []
 
 
 def test_an_unseen_reference_is_asked_for_not_ruled_on():

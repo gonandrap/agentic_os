@@ -1351,7 +1351,7 @@ def test_a_verdict_settles_the_investigator_completed_in_its_own_session(
 
 def test_a_pending_assumption_does_not_hold_a_settled_investigator(started, store,
                                                                   catalog_file):
-    """§2.1, wo-1aa88b2f exactly: the row stays pending and holds nothing"""
+    """§2.1, wo-1aa88b2f exactly: the row holds nothing, and lapses with the order (io-d5e62d4d)"""
     _panel_on(catalog_file)
     subject = _subject(store)
     inv = ops.create_investigation_order("proj_a", subject, WHY)
@@ -1364,8 +1364,8 @@ def test_a_pending_assumption_does_not_hold_a_settled_investigator(started, stor
     row = store.get_work_order(investigator)
     assert row["status"] == "completed"
     assert not row["needs_attention"]
-    pending = store.pending_assumptions(investigator)
-    assert len(pending) == 1 and pending[0]["status"] == "pending"
+    (only,) = store.all_assumptions(investigator)
+    assert only["status"] == "lapsed"
 
 
 def test_an_investigator_assumption_is_never_put_to_neo(started, store, catalog_file):

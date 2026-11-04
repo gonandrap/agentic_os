@@ -77,6 +77,8 @@ from .project_store import (
     ALARM_REVIEWABLE_STATUSES,
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
+    ASSUMPTION_LAPSE_STATUSES,
+    ASSUMPTION_LAPSED,
     COUNTED_VALIDATION_OUTCOMES,
     DECISION_CLOSED_EVENT,
     FAMILY_CHILD_KINDS,
@@ -3460,7 +3462,9 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
     """The decision this work order owes the user, and what each button would do — or None (docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §2.)"""
     from .invariants import validation_escalated
 
-    pending_rows = store.pending_assumptions(wo["id"])
+    # An ended order offers no ruling, even on a row the sweep has not lapsed yet (io-d5e62d4d)
+    pending_rows = ([] if wo["status"] in ASSUMPTION_LAPSE_STATUSES
+                    else store.pending_assumptions(wo["id"]))
     pending = len(pending_rows)
     escalated = (wo["status"] == "needs_review" and validation_escalated(store, wo))
     if not pending and not escalated:
@@ -3602,6 +3606,8 @@ def review_lines(state: dict[str, Any]) -> list[str]:
 
 def assumption_decider(a: dict[str, Any]) -> str:
     """WHO decided this assumption, in words, for whoever is about to read the verdict"""
+    if str(a.get("status") or "") == ASSUMPTION_LAPSED:
+        return "nobody"
     by = str(a.get("decided_by") or "")
     if not by and str(a.get("status") or "") == "pending" \
             and str(a.get("provisional_verdict") or ""):
@@ -7075,6 +7081,9 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
     net = str(getattr(cfg, "stakes_classifier", "") or DEFAULT_STAKES_CLASSIFIER)
     store = ProjectStore(path)
     try:
+        # A row the sweep has not reached yet: ruling it would teach Neo from a choice that decided nothing
+        if wo["status"] in ASSUMPTION_LAPSE_STATUSES:
+            store.lapse_pending_assumptions(wo_id, wo["status"])
         pending = [a for a in store.all_assumptions(wo_id) if a["status"] == "pending"]
         alarms: frozenset[int] = frozenset()
         if false_alarm or FALSE_ALARM_RE.search(feedback or ""):
@@ -16377,6 +16386,7 @@ def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
     out: dict[str, Any] = {key: 0 for key in ASSUMPTION_BUCKETS}
     never_by_hold: dict[str, int] = {}
     unsettled = {"count": 0, "reached_neo": 0, "never_reached_neo": 0}
+    lapsed = 0
     ages: list[float] = []
     rows = high = alarms = 0
     dropped = {"total": 0, "re_asked": 0}
@@ -16388,6 +16398,10 @@ def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
         for a in f["rows"]:
             rows += 1
             aid = int(a["id"])
+            # Nobody decided it, so it is in no bucket and no rate (io-d5e62d4d)
+            if str(a.get("status") or "") == ASSUMPTION_LAPSED:
+                lapsed += 1
+                continue
             # Reached = a question was ever filed: the column, or the ask event a cleared link leaves behind
             reached = bool(a.get("neo_question_id") or a.get("confirm_question_id")
                            or aid in f["asked"])
@@ -16414,6 +16428,7 @@ def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
         "rates": {key: _share(out[key], settled) for key in ASSUMPTION_BUCKETS},
         "never_reached_by_hold": never_by_hold,
         "unsettled": unsettled,
+        "lapsed": lapsed,
         "dropped_rulings": dropped,
         # The net's own defect rate, the `jarvis gate rules` false-positive idiom
         "stakes_net": {"held": high, "false_alarms": alarms,

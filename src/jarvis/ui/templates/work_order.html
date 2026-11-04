@@ -436,8 +436,8 @@ the latest release tag plus its one commit cherry-picked, not whatever else is o
        actually reads. #}
     {# The badge is WHO; the reason is rendered above as text rather than hidden in a
        `title=` nobody hovers. #}
-    <span class="st tone-{{ 'ok' if a.status == 'accepted' else 'bad' }}">
-      <span class="i">{{ '✓' if a.status == 'accepted' else '✗' }}</span>{{ a.status }}
+    <span class="st tone-{{ 'ok' if a.status == 'accepted' else 'muted' if a.status == 'lapsed' else 'bad' }}">
+      <span class="i">{{ '✓' if a.status == 'accepted' else '◌' if a.status == 'lapsed' else '✗' }}</span>{{ a.status }}
       by {{ assumption_decider(a) }}</span>
     {% endif %}
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
