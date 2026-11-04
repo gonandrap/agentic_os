@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import catalog, ops, supervisor, usage
+from jarvis import catalog, invariants, ops, supervisor, usage
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
@@ -292,8 +292,19 @@ def test_neo_handing_the_alarm_back_leaves_it_escalated_and_flags_the_user(escal
     daemon, wo_id = escalated(extra="FORCE_ALARM_NEO_ESCALATE")
     before = _alarm(wo_id)
 
+    def derived() -> list[str]:
+        store = ProjectStore(ops.find_work_order(wo_id)[1])
+        try:
+            return invariants.true_blockers(store, store.get_work_order(wo_id))
+        finally:
+            store.close()
+
+    blocker = supervisor.ALARM_BLOCKER.format(alarm_id=before["id"])
+    assert blocker not in derived()   # still Neo's
+
     daemon._neo_drain()
 
+    assert blocker in derived()
     alarm = _alarm(wo_id)
     assert alarm["status"] == "escalated"
     assert alarm["neo_question_id"] == before["neo_question_id"]

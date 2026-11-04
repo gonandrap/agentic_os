@@ -15700,18 +15700,9 @@ def _settle_alarm_attention(name: str, path: Path, wo_id: str, alarm_id: str) ->
             return
         if wo.get("attention_reason") != ALARM_BLOCKER.format(alarm_id=alarm_id):
             return  # the flag names something else: not this review's to touch
-        owed = [a for a in store.alarms_of(wo_id)
-                if a["id"] != alarm_id and a["status"] in ("escalated", "failed")
-                and a["review_status"] == "unreviewed"]
     finally:
         store.close()
-    settled = ack_os_flag(wo_id, name)
-    if not settled["blockers"] and owed:
-        store = ProjectStore(path)
-        try:
-            store.flag_attention(wo_id, ALARM_BLOCKER.format(alarm_id=owed[0]["id"]))
-        finally:
-            store.close()
+    ack_os_flag(wo_id, name)  # re-derives, so another owed alarm takes the flag over
 
 
 def approve_alarm_queue(project_name: str | None = None,

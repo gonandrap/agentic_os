@@ -735,6 +735,37 @@ def reviewable_assumptions(store: ProjectStore,
     return store.pending_assumptions(wo["id"])
 
 
+def _neo_still_deciding(question_id: int) -> bool:
+    """Unreadable counts as deciding: a Neo DB hiccup must not ring the user"""
+    from .neo_store import NEO_HELD_Q_STATUSES, NeoStore
+
+    try:
+        neo = NeoStore()
+    except Exception:  # noqa: BLE001 — same contract as `awaiting_neo`
+        return True
+    try:
+        question = neo.get(question_id)
+    except Exception:  # noqa: BLE001
+        return True
+    finally:
+        neo.close()
+    return question is not None and question["status"] in NEO_HELD_Q_STATUSES
+
+
+def alarm_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
+    """One line per unreviewed alarm only the user can settle now (io-d5e62d4d)"""
+    from .supervisor import ALARM_BLOCKER, _machine_wide
+
+    # A wedged scope-drift finding already has its own line, naming the same alarm (#1063)
+    wedged = drift_review_failed(store, wo) if wo["status"] == "waiting_pr_merge" else ""
+    return [ALARM_BLOCKER.format(alarm_id=a["id"]) for a in store.alarms_of(wo["id"])
+            if a["status"] in ("escalated", "failed")
+            and a["review_status"] == "unreviewed"
+            and a["id"] not in wedged
+            and not _machine_wide(a)
+            and not (a["neo_question_id"] and _neo_still_deciding(a["neo_question_id"]))]
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone"""
@@ -916,6 +947,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         # NOBODY OWNS IT, AND NOTHING IS OWED
         elif governed and actor is None and not blockers:
             blockers.append(NO_ACTOR_BLOCKER.format(status=wo["status"]))
+    # Below everything above: the flag asks for the more specific fact first
+    blockers.extend(alarm_blockers(store, wo))
     # What the user has already looked at and dismissed stops being a blocker — but only exactly that
     return [b for b in blockers if b not in acknowledged(wo)]
 
@@ -1720,6 +1753,8 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
         # Only assumptions are enforced strictly (#705)
         if _mentions_assumptions(blockers[0]) == _mentions_assumptions(reason):
             continue
+        if reason in alarm_blockers(store, wo):
+            continue  # it names a real ask, and the rewrite is what hid al-86afc8b4 (io-d5e62d4d)
         if not getattr(store, "readonly", False) and not store.flag_attention_while(
                 wo["id"], blockers[0], str(wo["status"] or "")):
             continue  # it moved under the sweep: the writer that moved it owns the flag
@@ -1920,14 +1955,25 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
-def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ATTENTION-MISSING — work that needs the user must actually say so"""
+def _unflagged_blocked_orders(store: ProjectStore) -> Iterator[tuple[dict[str, Any], list[str]]]:
+    """Each unflagged order and what it should say; a completed or cancelled one, its alarms only (io-d5e62d4d, Q3446)"""
     # Every status `true_blockers` can derive for (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5c)
     statuses = OPEN_STATUSES + ("failed",)
     for wo in store.list_work_orders(statuses=statuses, include_hidden=True):
-        if wo["needs_attention"]:
-            continue
-        blockers = true_blockers(store, wo)
+        if not wo["needs_attention"]:
+            yield wo, true_blockers(store, wo)
+    # From the alarm rows, not the order rows: every settled order ever is too many for a tick
+    settled = {a["wo_id"] for a in store.alarms_across(limit=10_000,
+                                                       statuses=("escalated", "failed"))
+               if a["status"] in TERMINAL_STATUSES and not a["needs_attention"]}
+    for wo_id in settled:
+        wo = store.get_work_order(wo_id)
+        yield wo, [b for b in alarm_blockers(store, wo) if b not in acknowledged(wo)]
+
+
+def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ATTENTION-MISSING — work that needs the user must actually say so"""
+    for wo, blockers in _unflagged_blocked_orders(store):
         if not blockers:
             continue
         if not getattr(store, "readonly", False) and not store.flag_attention_while(
