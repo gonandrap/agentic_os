@@ -13715,6 +13715,12 @@ def _backlog_item_of_question(question_id: int) -> dict[str, Any] | None:
 def review_backlog_item(item_id: str, decision: str, *, duplicate_of: str | None = None,
                         kind: str | None = None, feedback: str = "") -> dict[str, Any]:
     """The user decides a quarantined proposal and closes its Neo question (backlog-operability §5.4)"""
+    wo_id = os.environ.get("JARVIS_WO_ID")
+    if wo_id:
+        raise OpsError(
+            f"{wo_id} is a worker session — a worker may not review a backlog proposal. "
+            "The user decides a quarantined proposal; a worker's proposal goes to the "
+            "steward and Neo.")
     from . import backlog_neo
     from .neo_store import OPEN_Q_STATUSES, NeoStore
 

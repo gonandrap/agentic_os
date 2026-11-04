@@ -278,7 +278,8 @@ forward to a worker — it applies the user's answer or points at `jarvis backlo
 [--feedback "why"]`, and `ops.review_backlog_item(...)` behind it (the UI in §8 calls the
 same function). Works on any `quarantined` item, escalated or not; records the user's
 reason as a Neo learning when `--feedback` is given (the `neo review --correct` path,
-without the worker forward); closes the Neo question.
+without the worker forward); closes the Neo question. A worker session (`JARVIS_WO_ID`
+set) is refused in `ops.review_backlog_item` before anything changes.
 
 ## 6. The backlog list and item page: filters and navigation
 
