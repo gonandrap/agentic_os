@@ -1000,21 +1000,136 @@ def test_an_issue_that_merely_names_the_subject_is_not_the_duplicate(started, st
     assert stored["filed"]["issue_url"] == out["filed"]["issue_url"]
 
 
-def test_a_live_order_already_on_the_subject_counts_as_the_duplicate(started, store):
-    """The second half of §2.5's check: the tracker holds nothing"""
+def test_a_live_order_that_merely_names_the_subject_does_not_stop_the_filing(started, store):
+    """§2.5, io-38a4354f: mentioning an id is not tracking a cause"""
     subject = _subject(store)
-    already = store.create_work_order(
-        "clear the stale panel hold",
-        description=f"the hold on {subject} is never re-derived; re-derive it on the tick")
+    store.create_work_order(
+        "steward queue cleanup",
+        description=f"pending orders: {subject}, wo-22222222, wo-33333333")
     inv = ops.create_investigation_order("proj_a", subject, WHY)
     _investigating(store, inv)
     out = ops.submit_verdict(inv["id"], a_verdict("GAP", subject=subject))
 
-    assert out["classification"] == "ALREADY_TRACKED"
-    stored = json.loads(store.get_feature_order(inv["id"])["plan"])
-    assert stored["duplicate_of"] == already["id"]
+    assert out["classification"] == "GAP"
+    assert out["filed"]["issue_url"]
+    assert any(c["argv"][:2] == ["issue", "create"] for c in started.calls)
+
+
+def _downgraded(store, *, gap_class="stale-hold", **order):
+    """A GAP that a live order with this gap class took, returning (inv id, target id)"""
+    subject = _subject(store)
+    target = store.create_work_order("clear the hold", gap_class=gap_class, **order)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+    verdict = a_verdict("GAP", subject=subject)
+    verdict["gap_class"] = gap_class
+    assert ops.submit_verdict(inv["id"], verdict)["classification"] == "ALREADY_TRACKED"
+    return inv["id"], target["id"]
+
+
+def test_a_live_order_of_the_same_gap_class_is_the_duplicate_and_the_link_is_kept(started,
+                                                                                 store):
+    inv_id, target = _downgraded(store)
+
+    stored = json.loads(store.get_feature_order(inv_id)["plan"])
+    assert (stored["duplicate_of"], stored["duplicate_link"]) == (target, "gap_class")
     assert stored["classified_by"] == "ops"
     assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls)
+    assert any(e["kind"] == "verdict_duplicate_linked" for e in store.list_events(target))
+
+
+def test_a_live_order_on_an_earlier_verdicts_issue_is_the_duplicate(started, store):
+    inv_id, _, first = _submitted(started, store, "GAP")
+    url = first["filed"]["issue_url"]
+    target = store.create_work_order("work the filed issue", issue_url=url)
+    gap_class = json.loads(store.get_feature_order(inv_id)["plan"])["gap_class"]
+    subject = store.create_work_order("another stuck order")["id"]
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+    verdict = a_verdict("GAP", subject=subject)
+    verdict["gap_class"] = gap_class
+    verdict["proposed_fix"]["title"] = "worded differently from the filed one"
+
+    assert ops.submit_verdict(inv["id"], verdict)["classification"] == "ALREADY_TRACKED"
+    stored = json.loads(store.get_feature_order(inv["id"])["plan"])
+    assert (stored["duplicate_of"], stored["duplicate_link"]) == (target["id"], "issue_url")
+
+
+def _proposals(project="proj_a"):
+    return ops.list_backlog(project, status="proposed")
+
+
+def test_a_target_settling_with_no_issue_raises_one_proposal_per_gap_class_once(started, store):
+    first, target = _downgraded(store)
+    second = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    _investigating(store, second)
+    verdict = a_verdict("GAP", subject=json.loads(second["metadata"])[ops.SUBJECT_KEY])
+    verdict["gap_class"] = "stale-hold"
+    ops.submit_verdict(second["id"], verdict)
+    path = store.project_path
+
+    assert ops.raise_settled_duplicates("proj_a", path) == [], "target still live: nothing yet"
+
+    store.set_status(target, "completed")
+    [item_id] = ops.raise_settled_duplicates("proj_a", path)
+    [item] = _proposals()
+    assert item["id"] == item_id and "stale-hold" in item["title"]
+    assert first in item["description"] and second["id"] in item["description"]
+    assert {r["order_id"] for r in item["origin_refs"]} == {first, second["id"]}
+    assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls), "no bulk issues"
+    assert json.loads(store.get_feature_order(first)["plan"])["duplicate_settled"] == {
+        "backlog": item_id}
+
+    assert ops.raise_settled_duplicates("proj_a", path) == [], "once only"
+    assert len(_proposals()) == 1
+
+
+def test_the_daemon_tick_raises_a_settled_duplicate(started, store, catalog_file):
+    from jarvis.daemon import RECONCILE_EVERY_TICKS
+
+    _, target = _downgraded(store)
+    store.set_status(target, "failed")
+    daemon = Daemon(load_catalog(catalog_file))
+    for _ in range(RECONCILE_EVERY_TICKS + 1):
+        daemon.tick()
+    # status=None: the same tick's steward review may already have moved it off `proposed`
+    assert len(ops.list_backlog("proj_a", status=None)) == 1
+
+
+def test_a_settled_target_whose_cause_has_an_issue_raises_nothing(started, store):
+    inv_id, target = _downgraded(store)
+    store.set_status(target, "cancelled")
+    cause = a_verdict("GAP")["proposed_fix"]["title"]
+    started.add_issue("https://github.com/x/y/issues/900", title="later", body=cause)
+
+    assert ops.raise_settled_duplicates("proj_a", store.project_path) == []
+    assert _proposals() == []
+    assert json.loads(store.get_feature_order(inv_id)["plan"])["duplicate_settled"] == {
+        "issue_url": "https://github.com/x/y/issues/900"}
+
+
+def test_a_legacy_downgrade_on_a_settled_order_with_an_unreadable_tracker_retries(started,
+                                                                                  store,
+                                                                                  monkeypatch):
+    """The one mechanical pass: old verdicts have no `duplicate_link`, and a failed read marks nothing"""
+    from jarvis import issues
+
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    gone = "wo-deadbeef"
+    plan = {**a_verdict("GAP"), "classification": "ALREADY_TRACKED", "classified_by": "ops",
+            "submitted_classification": "GAP", "duplicate_of": gone}
+    store.update_feature_order(inv["id"], plan=json.dumps(plan))
+    store.set_feature_status(inv["id"], "completed")
+
+    def boom(*_a):
+        raise RuntimeError("gh is down")
+
+    with monkeypatch.context() as m:
+        m.setattr(issues, "issues_mentioning", boom)
+        assert ops.raise_settled_duplicates("proj_a", store.project_path) == []
+    assert "duplicate_settled" not in json.loads(store.get_feature_order(inv["id"])["plan"])
+
+    assert len(ops.raise_settled_duplicates("proj_a", store.project_path)) == 1
 
 
 def test_waiting_on_user_is_the_only_classification_that_raises_attention(started,
