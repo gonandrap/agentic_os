@@ -120,7 +120,8 @@ def sweep(store: Any, project: Any, *, skip: Iterable[str] = (),
         return [], []
     held = set(skip)
     now = db.now() if now is None else now
-    rows = store.settled_worktrees(RECLAIMABLE_STATUSES, now - hours * SECONDS_PER_HOUR,
+    settled_before = now - hours * SECONDS_PER_HOUR
+    rows = store.settled_worktrees(RECLAIMABLE_STATUSES, settled_before,
                                    limit=limit + len(held))
     reclaimed: list[str] = []
     kept: list[str] = []
@@ -136,7 +137,24 @@ def sweep(store: Any, project: Any, *, skip: Iterable[str] = (),
             continue
         store.add_event(row["id"], EVENT, payload)
         reclaimed.append(row["id"])
+    _sweep_temproots(store, settled_before)
     return reclaimed, kept
+
+
+def _sweep_temproots(store: Any, settled_before: float) -> None:
+    """Remove settled orders' pytest roots by walking the directory (spec §1, #1574)"""
+    try:
+        roots = {p.name: p for p in pytest_temproot("").iterdir()
+                 if p.is_dir() and not p.is_symlink()}
+    except OSError as exc:
+        log.debug("no pytest temp roots to read: %s", exc)
+        return
+    for wo_id in store.settled_among(sorted(roots), RECLAIMABLE_STATUSES, settled_before):
+        make_dirs_writable(roots[wo_id])
+        try:
+            shutil.rmtree(roots[wo_id])
+        except OSError as exc:
+            log.warning("could not remove %s's pytest temp root: %s", wo_id, exc)
 
 
 def _reclaim_one(project_path: Path,
@@ -159,7 +177,6 @@ def _reclaim_one(project_path: Path,
                                       str(path))
     if out is None:
         return None, f"git would not remove it: {' '.join(stderr.split())[:200]}"
-    shutil.rmtree(pytest_temproot(str(row["id"])), ignore_errors=True)
     return {"worktree": name, "removed": True, "branch": authored.branch,
             "commits": authored.commits}, ""
 

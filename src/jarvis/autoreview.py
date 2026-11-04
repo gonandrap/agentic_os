@@ -85,6 +85,9 @@ HELD_CONFIRM_SPENT = "confirm_spent"
 TRANSIENT_DROPS = frozenset({HELD_STATUS, HELD_REFUSAL_UNANSWERED,
                              HELD_OBJECTION_IN_FLIGHT})
 
+#: Holds a later pass re-decides, so the row is not yet the user's; others are final (io-ed253c2b)
+TRANSIENT_HOLDS = TRANSIENT_DROPS | {HELD_ASKED, HELD_CONFIRMING, HELD_ROUND_OPEN}
+
 #: A round's outcome that means the panel has NOT finished with it
 _UNRESOLVED_OUTCOMES = ("", "pending")
 

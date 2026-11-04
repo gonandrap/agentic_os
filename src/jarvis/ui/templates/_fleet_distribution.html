@@ -37,7 +37,13 @@
     </tr>
     {% for name, m in fleet.metrics.items() %}
     <tr>
-      <td>{{ name }}</td>
+      <td>{{ name }}
+        {#- 0 envelope turns: `order_money` is left with the OS spend alone (io-82bcb830). -#}
+        {%- if name == 'cost_per_order_usd' and m.cost_basis and not m.cost_basis.envelope %}
+        <div class="sub" style="white-space: normal;">Jarvis half only — not what an order
+          cost; each order's whole cost is in the order list</div>
+        {%- endif -%}
+      </td>
       <td style="text-align: right;">{{ m.n }}</td>
       <td style="text-align: right;">{{ figure(m.avg, m.unit) }}</td>
       <td style="text-align: right;">{{ figure(m.p90, m.unit) }}</td>
