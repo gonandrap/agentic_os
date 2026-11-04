@@ -1,4 +1,4 @@
-"""One narrow seat before a GAP settles: is a gap named with no entry? (io-38a4354f, finding coverage-unchecked)"""
+"""One narrow seat before a GAP settles: is a gap named with no entry? (io-38a4354f coverage-unchecked)"""
 
 from __future__ import annotations
 
