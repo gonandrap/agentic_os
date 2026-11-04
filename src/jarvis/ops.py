@@ -1842,19 +1842,26 @@ def _derived_trigger(store: ProjectStore, wo_id: str, entered: float) -> str:
     return str(row["kind"]) if row else ""
 
 
+def _worker_transcript(store: ProjectStore, wo: dict[str, Any]) -> Path | None:
+    """Where this order's session writes its transcript, None before it has a session"""
+    from . import claude_cli
+    session_id = str(wo.get("session_id") or "")
+    if not session_id:
+        return None
+    # `worker_session.worktree_path`'s own computation
+    worktree = wo.get("worktree")
+    cwd = (store.project_path / ".claude" / "worktrees" / str(worktree)
+           if worktree else store.project_path)
+    return claude_cli.session_transcript_path(cwd, session_id)
+
+
 def _transcript_activity(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
     """The last write to the worker's transcript and to the subagent files beside it (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
-    from . import claude_cli, inspection
+    from . import inspection
     try:
-        wo = store.get_work_order(wo_id)
-        session_id = str(wo.get("session_id") or "")
-        if not session_id:
+        path = _worker_transcript(store, store.get_work_order(wo_id))
+        if path is None:
             return []
-        # `worker_session.worktree_path`'s own computation
-        worktree = wo.get("worktree")
-        cwd = (store.project_path / ".claude" / "worktrees" / str(worktree)
-               if worktree else store.project_path)
-        path = claude_cli.session_transcript_path(cwd, session_id)
         stamps = []
         for p in [path, *inspection._subagent_transcripts(path)]:
             # `stat()` and not `exists()`: `exists()` swallows a PermissionError into False
@@ -8850,7 +8857,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                base_red_until: float = 0.0,
                stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
     """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)"""
-    from . import budget, bus, holds, stuck, worker_session
+    from . import budget, bus, holds, inspection, stuck, worker_session
     from .central_store import base_red_hold_spans
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
@@ -8950,8 +8957,15 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # Issue 1451: a stalled turn lapses the exclusion and is judged stuck outright
         stalled = worker_session.is_stalled(turn, now)
         turn_in_flight = bool(turn) and not stalled
+        silence = now - (durations.last_activity_ts or since)
+        # Issue 1556: the transcript is read only once the silence would be judged
+        path = (_worker_transcript(pstore, wo) if turn_in_flight
+                and silence >= thresholds.get("running", cfg.fallback_minutes * 60.0)
+                else None)
+        tool_executing = bool(path) and inspection.tool_call_open(
+            path, float(turn["started_at"]))
         verdict = stuck.assess(
-            str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
+            str(wo["status"]), now - since, silence,
             discounted, thresholds, cfg.fallback_minutes * 60.0,
             # CI and base-red cannot collide: `validating` and `waiting_pr_merge` (§1 of the 2026-10-15 spec)
             excluded_cause=(PAUSE_USAGE_LIMIT
@@ -8973,6 +8987,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,
             turn_in_flight=turn_in_flight,
+            tool_executing=tool_executing,
             stalled_turn_seconds=(now - float(turn["started_at"])) if stalled else 0.0)
         if stuck_only and not verdict.stuck:
             continue
