@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from jarvis import ops, usage_meter
+from jarvis.project_store import ProjectStore
 
 HOUR = 3600.0
 T0 = datetime(2026, 9, 30, 12, tzinfo=timezone.utc).timestamp()
@@ -137,6 +138,31 @@ def test_an_order_is_listed_iff_it_spent_inside_the_window_and_only_for_that_par
     assert {u["title"]: round(u["total_cost_usd"], 2) for u in report["units"]} == {
         "beginning": 1.0, "ending": 2.0, "middle": 3.0, "whole": 5.0, "past its turn": 5.0}
     assert meter_total(f, picked) == pytest.approx(16.0, abs=0.01)
+
+
+def test_a_hidden_order_stays_on_the_list_the_meter_and_the_plot(fleet_fixture):
+    f = fleet_fixture
+    fleet(f)
+    hidden = f.spend("hidden", 7.0, at=T0 + 700, session_id="hidden")
+    os_hidden = f.order("hidden os call")
+    f.os_call("neo_answer", ts=T0 + 710, wo_id=os_hidden, cost_usd=0.5,
+              output=f.output_for(0.5))
+    store = ProjectStore(f.project_path)
+    try:
+        store.set_hidden(hidden)
+        store.set_hidden(os_hidden)
+    finally:
+        store.close()
+    picked = window(T0, T0 + HOUR)
+
+    listed = {u["id"]: u["total_cost_usd"] for u in ops.cost_report(window=picked)["units"]}
+    assert listed[hidden] == pytest.approx(7.0, abs=0.01)
+    assert listed[os_hidden] == pytest.approx(0.5, abs=0.01)
+
+    # 12 from the scene, 7.5 hidden
+    assert report_total(picked) == pytest.approx(19.5, abs=0.01)
+    assert plot_total(f, picked)[0] == pytest.approx(19.5, abs=0.01)
+    assert meter_total(f, picked) == pytest.approx(19.5, abs=0.01)
 
 
 def test_a_pruned_transcript_still_shows_as_unmeasured(fleet_fixture):
