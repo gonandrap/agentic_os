@@ -950,6 +950,89 @@ def test_backlog_page_promote_blocked_then_forced(client, project):
     assert central.get_backlog(b["id"])["status"] == "promoted"
 
 
+# -- backlog filters and origins (2026-11-03-backlog-operability §6)
+
+
+def _row_ids(html: str) -> set[str]:
+    import re
+    return set(re.findall(r'<tr id="(bl-[0-9a-f]+)"', html))
+
+
+def _proposal(central, title, **kw):
+    fields = {"item_type": "task", "severity": "medium", "suggested_kind": "wo",
+              "origin_refs": [{"kind": "order", "id": "wo-0000aaaa"}]}
+    fields.update(kw)
+    return central.propose_backlog("proj_a", title, **fields)
+
+
+def test_backlog_default_view_hides_settled_rows_and_a_status_filter_shows_exactly_it(
+        client, project):
+    central = CentralStore()
+    try:
+        live = {s: _proposal(central, f"a {s} item")["id"]
+                for s in ("proposed", "quarantined", "open")}
+        central.review_backlog(live["quarantined"], "quarantined", rule="r", note="n")
+        central.review_backlog(live["open"], "open", rule="r", note="n")
+        done = central.add_backlog("proj_a", "finished thing")["id"]
+        central.mark_backlog(done, "done")
+        dropped = _proposal(central, "rejected thing")["id"]
+        central.review_backlog(dropped, "dropped", rule="r", note="n")
+    finally:
+        central.close()
+
+    page = client.get("/backlog").text
+    assert _row_ids(page) == set(live.values())
+    assert "1 open · 1 proposed · 1 quarantined" in page
+
+    assert _row_ids(client.get("/backlog?status=done").text) == {done}
+    assert _row_ids(client.get("/backlog?status=dropped").text) == {dropped}
+    assert _row_ids(client.get("/backlog?status=proposed").text) == {live["proposed"]}
+
+
+def test_backlog_filters_by_type_severity_and_kind_and_ranks_severity(client, project):
+    central = CentralStore()
+    try:
+        bug = _proposal(central, "crash", item_type="bug", severity="critical")["id"]
+        nit = _proposal(central, "typo", severity="cosmetic")["id"]
+        big = _proposal(central, "rework", severity="major", suggested_kind="fo")["id"]
+    finally:
+        central.close()
+
+    page = client.get("/backlog").text
+    # Rank order, most severe first; alphabetical would be cosmetic, critical, major
+    pos = [page.index(f'<option value="{s}"') for s in ("critical", "major", "cosmetic")]
+    assert pos == sorted(pos)
+    assert _row_ids(client.get("/backlog?item_type=bug").text) == {bug}
+    assert _row_ids(client.get("/backlog?severity=cosmetic").text) == {nit}
+    assert _row_ids(client.get("/backlog?suggested_kind=fo").text) == {big}
+    assert _row_ids(page) == {bug, nit, big}
+
+
+def test_backlog_row_links_its_primary_origin_and_a_duplicate_its_kept_item(client, project):
+    central = CentralStore()
+    try:
+        kept = _proposal(central, "the real one", origin_refs=[
+            {"kind": "neo_question", "id": 42}, {"kind": "order", "id": "wo-0000bbbb"},
+            {"kind": "order", "id": "wo-0000cccc"}])["id"]
+        single = _proposal(central, "one origin only")["id"]
+        dup = _proposal(central, "the restatement")["id"]
+        central.review_backlog(dup, "dropped", rule="dedupe", note="same", duplicate_of=kept)
+    finally:
+        central.close()
+
+    page = client.get("/backlog").text
+    row = page[page.index(f'<tr id="{kept}"'):]
+    row = row[:row.index("</tr>")]
+    assert 'href="/neo/question/42"' in row and "+2" in row
+    assert "/go/wo-0000bbbb" not in row  # only the primary is linked
+    single_row = page[page.index(f'<tr id="{single}"'):]
+    single_row = single_row[:single_row.index("</tr>")]
+    assert 'href="/go/wo-0000aaaa"' in single_row and '<span class="sub">+' not in single_row
+
+    dropped = client.get("/backlog?status=dropped").text
+    assert "duplicate of" in dropped and f'href="/backlog/{kept}"' in dropped
+    assert "duplicate of" not in page
+
 def test_knowledge_page(client):
     central = CentralStore()
     central.add_knowledge("prefer uv for python installs", project="", topic="tooling")
@@ -3629,7 +3712,36 @@ def test_a_backlog_item_page_links_its_dependencies_and_promotes(client, project
 
     shown = ops.show_backlog(item["id"])
     assert [b["id"] for b in shown["blockers"]] == [dep["id"]]
+    # Typed by hand: no origin, no review line, no duplicates (paired with the test below)
+    assert "typed by hand" in page and "review:" not in page and "Duplicates" not in page
 
+
+def test_a_backlog_item_page_shows_origins_review_and_folded_duplicates(client, project):
+    """2026-11-03-backlog-operability §6.3"""
+    central = CentralStore()
+    try:
+        kept = central.propose_backlog(
+            "proj_a", "the real one", item_type="bug", severity="major",
+            suggested_kind="wo", origin_wo_id="wo-0000bbbb", origin_fo_id="fo-0000dddd",
+            origin_refs=[{"kind": "neo_question", "id": 42},
+                         {"kind": "order", "id": "wo-0000bbbb"}])["id"]
+        central.review_backlog(kept, "quarantined", rule="needs-neo", note="unclear scope",
+                               neo_question_id=77)
+        dup = _proposal(central, "the restatement")["id"]
+        central.review_backlog(dup, "dropped", rule="dedupe", note="same", duplicate_of=kept)
+        other = _proposal(central, "unrelated drop")["id"]
+        central.review_backlog(other, "dropped", rule="r", note="n")
+    finally:
+        central.close()
+
+    page = client.get(f"/backlog/{kept}").text
+    origin = page[page.index("<h2>Origin</h2>"):]
+    assert origin.index('href="/neo/question/42"') < origin.index('href="/go/wo-0000bbbb"')
+    assert "part of feature order" in origin and 'href="/go/fo-0000dddd"' in origin
+    assert "needs-neo" in page and "unclear scope" in page
+    assert 'href="/neo/question/77"' in page
+    folded = page[page.index("Duplicates folded"):]
+    assert f'href="/backlog/{dup}"' in folded and other not in folded
 
 def test_a_knowledge_entry_page_shows_the_body_and_pins_back_to_itself(client):
     central = CentralStore()

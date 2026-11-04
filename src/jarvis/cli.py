@@ -1745,6 +1745,10 @@ def build_parser() -> argparse.ArgumentParser:
     b = bl.add_parser("list")
     b.add_argument("project", nargs="?")
     b.add_argument("--all", action="store_true", help="include non-open items")
+    b.add_argument("--status", help="only this status (overrides --all)")
+    b.add_argument("--type", dest="item_type", help="only bug or task items")
+    b.add_argument("--severity", help="only this severity")
+    b.add_argument("--kind", dest="suggested_kind", help="only items suggested as wo or fo")
     b = bl.add_parser("show", help="one backlog item in full, including where it "
                                    "came from")
     b.add_argument("item_id")
@@ -5451,8 +5455,11 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                                        origin_refs=refs)
             _print(item, args.json)
         elif args.bl_cmd == "list":
-            items = ops.list_backlog(project=args.project,
-                                     status=None if args.all else "open")
+            items = ops.list_backlog(project=args.project, status=args.status or (
+                None if args.all else "open"))
+            wanted = {k: getattr(args, k) for k in ("item_type", "severity", "suggested_kind")
+                      if getattr(args, k)}
+            items = [it for it in items if all(it.get(k) == v for k, v in wanted.items())]
             if args.json:
                 _print(items, True)
             else:
@@ -5485,6 +5492,13 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                 origin = _backlog_origin(item)
                 if origin:
                     print(f"\norigin: {origin}")
+                # 2026-11-03-backlog-operability §6.3: `kind label href`, primary first
+                if item["origins"]:
+                    print("\norigins:")
+                    for o in item["origins"]:
+                        print(f"  {o['kind']} {o['label']} {o['href']}")
+                if item.get("duplicate_of"):
+                    print(f"duplicate of: {item['duplicate_of']}")
         elif args.bl_cmd == "promote":
             _print(ops.promote_backlog(args.item_id, force=args.force,
                                        as_feature=args.as_kind == "feature",

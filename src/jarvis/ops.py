@@ -13579,7 +13579,7 @@ def list_backlog(project: str | None = None, status: str | None = "open"
 
 
 def show_backlog(item_id: str) -> dict[str, Any]:
-    """One backlog item with its dependencies and blockers"""
+    """One backlog item with its dependencies, blockers and the duplicates folded into it"""
     central = CentralStore()
     try:
         item = central.get_backlog(item_id)
@@ -13590,6 +13590,8 @@ def show_backlog(item_id: str) -> dict[str, Any]:
             for d in item["depends_on"]]
         item["blockers"] = [d for d in item["dependencies"] if d["status"] != "done"] \
             if item["status"] == "open" else []
+        item["duplicates"] = [r for r in central.list_backlog(item["project"], status="dropped")
+                              if r.get("duplicate_of") == item_id]
     finally:
         central.close()
     item["origins"] = backlog_origins(item)

@@ -10,16 +10,50 @@
 {{ ui.page_head(item.id, item.project ~ " · " ~ item.status) }}
 <h2>{{ item.title }}</h2>
 <p class="kv">filed {{ fmt_ts(item.created_at) }} ({{ fmt_age(item.created_at) }} ago)
-  {% if item.origin_wo_id %}· from {{ ui.row_id(item.origin_wo_id, "/go/" ~ item.origin_wo_id) }}{% endif %}
-  {% if item.origin_fo_id %}· from {{ ui.row_id(item.origin_fo_id, "/go/" ~ item.origin_fo_id) }}{% endif %}
+  · {{ item.item_type }} · {{ item.severity }} · suggested {{ item.suggested_kind }}
+  {% if item.duplicate_of %}· duplicate of {{ ui.row_id(item.duplicate_of, "/backlog/" ~ item.duplicate_of) }}{% endif %}
   {% if item.promoted_wo_id %}· became {{ ui.row_id(item.promoted_wo_id, "/go/" ~ item.promoted_wo_id) }}{% endif %}
 </p>
-{% if item.origin_note %}<p class="sub">{{ item.origin_note }}</p>{% endif %}
 
 <div class="panel">
   {% if item.description %}<div class="kv bl-body">{{ item.description }}</div>
   {% else %}<p class="empty">no description</p>{% endif %}
 </div>
+
+{# 2026-11-03-backlog-operability.md §6.3 #}
+<h2>Origin</h2>
+<div class="panel bl-origin">
+  {% if item.origins %}
+  <ol>
+    {% for o in item.origins %}
+    <li><span class="mono">{{ o.kind }}</span> <a href="{{ o.href }}">{{ o.label }}</a></li>
+    {% endfor %}
+  </ol>
+  {% else %}<p class="empty">typed by hand — no origin</p>{% endif %}
+  {% if item.origin_fo_id %}<p class="kv">↑ part of feature order {{ ui.row_id(item.origin_fo_id, "/go/" ~ item.origin_fo_id) }}</p>{% endif %}
+  {% if item.origin_note %}<p class="sub">{{ item.origin_note }}</p>{% endif %}
+</div>
+
+{% if item.review_rule or item.reviewed_at %}
+<p class="kv bl-review">review: <span class="mono">{{ item.review_rule or '—' }}</span>
+  {% if item.review_note %}— {{ item.review_note }}{% endif %}
+  {% if item.reviewed_at %}· {{ fmt_ts(item.reviewed_at) }}{% endif %}
+  {% if item.neo_question_id %}· <a href="/neo/question/{{ item.neo_question_id }}">Neo question #{{ item.neo_question_id }}</a>{% endif %}
+</p>
+{% elif item.neo_question_id %}
+<p class="kv bl-review">review: awaiting <a href="/neo/question/{{ item.neo_question_id }}">Neo question #{{ item.neo_question_id }}</a></p>
+{% endif %}
+
+{% if item.duplicates %}
+<h2>Duplicates folded into this item</h2>
+<div class="panel">
+  <ul>
+    {% for d in item.duplicates %}
+    <li>{{ ui.row_id(d.id, "/backlog/" ~ d.id) }} {{ d.title }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
 
 <h2>Dependencies</h2>
 <div class="panel table-wrap">
