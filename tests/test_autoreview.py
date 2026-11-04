@@ -1091,6 +1091,7 @@ def test_the_user_is_told_once_when_the_last_assumption_leaves_their_list(starte
     (row,) = inbox(wo["id"])
     assert row["level"] == "info"
     assert "decided 2 assumption(s) for you" in row["title"]
+    assert row["push"] == 0
     assert f"jarvis wo show {wo['id']}" in row["body"]
     assert "jarvis neo review" in row["body"]
     assert not store.pending_assumptions(wo["id"])

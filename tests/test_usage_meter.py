@@ -426,6 +426,36 @@ def test_no_clean_span_falls_back_to_the_seed(central, jarvis_home):
     assert found["basis_spans"] == 0
 
 
+def test_an_unmeasured_seven_day_rate_is_the_five_hour_rate_scaled_by_meter_movement(
+        central, jarvis_home):
+    """7d moves too slowly for its own clean span, so price it off how far each meter moved"""
+    seven_resets = T0 + 5 * 86_400
+    rows_ = [usage_meter.Sample(ts=T0 + i * MINUTE, ok=True,
+                                five_hour_pct=10.0 * i / 39, five_hour_resets_at=RESETS,
+                                seven_day_pct=40.0 + 1.0 * i / 39,
+                                seven_day_resets_at=seven_resets)
+             for i in range(40)]
+    store_samples(central, rows_)
+    central.conn.commit()
+
+    found = usage_meter.dollars_per_point(now=T0 + 3600, cfg=cfg_for(),
+                                          home=Path(jarvis_home),
+                                          visible=lambda *, since, until: 20.0,
+                                          key="seven_day")
+    assert found["source"] == "scaled"
+    assert found["value"] == pytest.approx(2.0 * 10.0 / 1.0)
+
+
+def test_a_seven_day_meter_that_never_moved_still_has_no_rate(central, jarvis_home):
+    store_samples(central, run(T0, minutes=40, points=10.0))
+    central.conn.commit()
+    found = usage_meter.dollars_per_point(now=T0 + 3600, cfg=cfg_for(),
+                                          home=Path(jarvis_home),
+                                          visible=lambda *, since, until: 20.0,
+                                          key="seven_day")
+    assert found["value"] is None
+
+
 @pytest.mark.parametrize("case", ["reset", "gap", "short", "flat"])
 def test_each_exclusion_rule_empties_the_basis(case, central, jarvis_home):
     """Each construction is 40 minutes and 10 points — enough but for the ONE rule"""

@@ -11,7 +11,13 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .bugreport import bug_repo, gh_bin, gh_missing_message
+from .bugreport import (
+    VERDICT_GAP_CLASS_KEY,
+    bug_repo,
+    gh_bin,
+    gh_missing_message,
+    verdict_gap_class,
+)
 from .github import GhUnavailable, GitHubError
 
 log = logging.getLogger("jarvis.issues")
@@ -663,8 +669,13 @@ def self_dispatch_configured() -> bool:
 FILED_BY_KEY = "filed_by"
 #: `WORK_ORDER_BRIEF`'s `why` for a bug the steward dispatched
 STEWARD_WHY = """\
-This bug is `{priority}`, reported by work order {filed_by} and started by the steward \
+This bug is `{priority}`, reported by {filed_by} and started by the steward \
 within the OS's own budget."""
+
+
+def _reporter(filed_by: str) -> str:
+    """A filing's author in words: the OS's own passes are not work orders"""
+    return f"work order {filed_by}" if filed_by.startswith("wo-") else filed_by
 
 
 def steward_note(decision: Any, wo_id: str, public: bool = False) -> str:
@@ -716,7 +727,7 @@ def steward_why(held: dict[str, Any]) -> str:
     priority, filed_by = str(held.get("priority") or ""), str(held.get(FILED_BY_KEY) or "")
     if not filed_by or dispatches(priority):
         return ""
-    return STEWARD_WHY.format(priority=priority, filed_by=filed_by)
+    return STEWARD_WHY.format(priority=priority, filed_by=_reporter(filed_by))
 
 
 def route_filing(issue_url: str, title: str, body: str, priority: str,
@@ -787,7 +798,8 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
         out["steward_dispatched"] = bool(out["wo_id"])
         out["reason"] = f"`{priority}` filed by {filed_by} — {steward_note(decision, out['wo_id'])}"
         try:
-            comment(issue_url, f"Reported by a work order: "
+            who = "a work order" if filed_by.startswith("wo-") else filed_by
+            comment(issue_url, f"Reported by {who}: "
                                f"{steward_note(decision, out['wo_id'], public=True)}.")
         except GitHubError as e:
             out["comment_error"] = str(e)
@@ -1131,6 +1143,11 @@ def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
     existing = live_work_order(spec, url)
     if existing:
         return existing
+
+    # From the body: the one input triage, the steward and `jarvis issues start` all share
+    gap_class = verdict_gap_class(payload.get("body") or "")
+    if gap_class:
+        metadata = {**(metadata or {}), VERDICT_GAP_CLASS_KEY: gap_class}
 
     wo = create_work_order(
         spec.name, payload.get("title") or url,
