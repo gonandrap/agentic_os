@@ -9161,6 +9161,10 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
             f"the verdict was not accepted, and nothing was stored: SCRIPT_WRONG is only for "
             f"an investigation Morpheus opened on a failed production validation, and "
             f"{inv_id} was not. Pick one of the other four classifications and resubmit.")
+    if verdict["other_gaps"] and not fo.get("plan_wo_id"):
+        raise OpsError(
+            f"the verdict was not accepted, and nothing was stored: {inv_id} has no "
+            f"investigator work order yet, and `other_gaps` are filed against that order.")
 
     verdict["classified_by"] = "investigator"
     verdict["filed"] = None
@@ -9242,6 +9246,10 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
     classification = verdict["classification"]
     store = ProjectStore(path)
     try:
+        # Before the status: a failed post leaves the verdict resubmittable, so no gap is lost
+        for gap in verdict["other_gaps"]:
+            _post_deferral(store, fo["plan_wo_id"], gap["title"], gap["why"],
+                           gap["description"])
         store.update_feature_order(inv_id, plan=db.to_json(verdict))
         store.set_feature_status(inv_id, "completed")
         # THE ONE CLASSIFICATION THAT SPENDS ATTENTION
@@ -9272,6 +9280,7 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
         "project": name, "inv_id": inv_id, "status": "completed",
         "classification": classification, "filed": verdict.get("filed"),
         "classified_by": verdict["classified_by"],
+        "other_gaps_proposed": len(verdict["other_gaps"]),
         "note": "the investigation is settled — end your turn.",
     }
     if fo.get("plan_wo_id"):
@@ -13561,12 +13570,27 @@ def adopt_config(*, reason: str = "", catalog_path: str | None = None,
 
 # -- deferral
 
+def _post_deferral(store: ProjectStore, wo_id: str, title: str, why: str, description: str = "",
+                   neo_question_id: int | None = None) -> int:
+    """Put a deferral on the bus and on the work order's own record"""
+    from . import bus
+
+    env_id = bus.post(
+        store, subject=bus.Subject(wo_id=wo_id), from_role="implementor",
+        to_role="manager",
+        payload=bus.DeferralRequest(title=title, why=why,
+                                    neo_question_id=neo_question_id,
+                                    description=description))
+    store.add_event(wo_id, "deferral_submitted",
+                    {"title": title, "why": why, "envelope_id": env_id,
+                     "neo_question_id": neo_question_id})
+    return env_id
+
+
 def defer(wo_id: str, title: str, why: str, description: str = "",
           neo_question_id: int | None = None,
           project_name: str | None = None) -> dict[str, Any]:
     """(Workers) hand work found on the way to whoever owns deciding about it"""
-    from . import bus
-
     if not why.strip():
         raise OpsError(
             "--why is the whole argument for deferring: it is what a reader sees months "
@@ -13574,16 +13598,7 @@ def defer(wo_id: str, title: str, why: str, description: str = "",
     name, path, wo = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
     try:
-        env_id = bus.post(
-            store, subject=bus.Subject(wo_id=wo_id), from_role="implementor",
-            to_role="manager",
-            payload=bus.DeferralRequest(title=title, why=why,
-                                        neo_question_id=neo_question_id,
-                                        description=description))
-        # On the work order's own record
-        store.add_event(wo_id, "deferral_submitted",
-                        {"title": title, "why": why, "envelope_id": env_id,
-                         "neo_question_id": neo_question_id})
+        env_id = _post_deferral(store, wo_id, title, why, description, neo_question_id)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "envelope_id": env_id, "title": title,

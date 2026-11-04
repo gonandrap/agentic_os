@@ -111,6 +111,20 @@
   </div>
   {% endif %}
 </div>
+{% if v.other_gaps %}
+<h3 id="other-gaps">Other gaps — backlog proposals, never dispatched</h3>
+<div class="panel">
+  {% for g in v.other_gaps %}
+  <div class="row">
+    <div class="grow">
+      <strong>{{ g.title }}</strong>
+      <div class="sub">why: {{ g.why }}</div>
+      <div class="sub">{{ g.description }}</div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
 {% set c = inv.chain %}
 {% if c and (c.validation or c.fix) %}
 {# One chain, end to end (#1344) #}

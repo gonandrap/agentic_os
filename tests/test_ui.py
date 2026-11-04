@@ -2327,6 +2327,26 @@ def investigation(client, project):
     return client, ops.show_investigation_order(inv["id"]), investigator, subject
 
 
+def test_the_investigation_page_lists_other_gaps_and_an_old_verdict_shows_none(
+        investigation, project):
+    client, inv, _, _ = investigation
+    assert "Other gaps" not in client.get(f"/inv/proj_a/{inv['id']}").text
+
+    store = ProjectStore(project)
+    try:
+        plan = json.loads(store.get_feature_order(inv["id"])["plan"])
+        plan["other_gaps"] = [{"title": "search prints 744KB", "why": "nobody can read it",
+                               "description": "`jarvis search` has no output bound."}]
+        store.update_feature_order(inv["id"], plan=json.dumps(plan))
+    finally:
+        store.close()
+
+    page = client.get(f"/inv/proj_a/{inv['id']}").text
+    assert "Other gaps" in page
+    for words in ("search prints 744KB", "nobody can read it", "has no output bound"):
+        assert words in page
+
+
 def test_the_investigation_page_leads_with_the_classification_and_the_subject(
         investigation):
     client, inv, investigator, subject = investigation

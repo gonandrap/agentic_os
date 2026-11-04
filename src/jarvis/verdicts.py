@@ -46,6 +46,9 @@ FORBIDDEN_FIELDS: dict[str, tuple[str, ...]] = {
 PROPOSED_FIX_FIELDS = ("title", "description", "expected", "actual", "priority",
                        "detector", "remedy")
 
+#: Every field of one `other_gaps` entry: `bus.DeferralRequest`'s own words
+OTHER_GAP_FIELDS = ("title", "why", "description")
+
 #: Whose defect a GAP is: the OS's (OS tracker, OS bug rails) or the subject project's own
 OWNERS = ("os", "project")
 
@@ -108,6 +111,7 @@ def parse_verdict(raw: Any, subject: str = "") -> dict[str, Any]:
     gap_class = _gap_class(raw, problems)
 
     evidence = findings.parse_evidence(got_subject or "?", raw.get("evidence"), problems)
+    other_gaps = _parse_other_gaps(raw, problems)
 
     out: dict[str, Any] = {
         "subject": got_subject,
@@ -115,6 +119,7 @@ def parse_verdict(raw: Any, subject: str = "") -> dict[str, Any]:
         "gap_class": gap_class,
         "root_cause": root_cause,
         "evidence": evidence,
+        "other_gaps": other_gaps,
     }
     if classification in CLASSIFICATIONS:
         out.update(_payload(classification, raw, problems))
@@ -140,6 +145,36 @@ def _gap_class(raw: dict[str, Any], problems: list[str]) -> str:
     except gaps.GapClassError as exc:
         problems.append(f"`gap_class`: {exc}")
         return ""
+
+
+def _parse_other_gaps(raw: dict[str, Any], problems: list[str]) -> list[dict[str, str]]:
+    """Every gap beyond the root cause, required on every classification (io-38a4354f one-fix-slot)"""
+    if "other_gaps" not in raw:
+        problems.append(
+            "`other_gaps` is required on every classification — a list of every other gap "
+            "you found, each with title, why and description, or `[]` when there are none. "
+            "No code reads gaps out of prose, so one left in `root_cause` is lost")
+        return []
+    value = raw["other_gaps"]
+    if not isinstance(value, list):
+        problems.append(f"`other_gaps` must be a list, got {type(value).__name__}")
+        return []
+    out: list[dict[str, str]] = []
+    for n, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            problems.append(f"`other_gaps[{n}]` must be an object with "
+                            f"{', '.join(OTHER_GAP_FIELDS)}")
+            continue
+        gap = {name: str(entry.get(name) or "").strip() for name in OTHER_GAP_FIELDS}
+        problems.extend(f"`other_gaps[{n}].{name}` is required — the OS files it as a backlog "
+                        f"proposal, and this is what its reader decides from"
+                        for name in OTHER_GAP_FIELDS if not gap[name])
+        if gap["description"] and len(gap["description"]) < MIN_FIELD_CHARS:
+            problems.append(
+                f"`other_gaps[{n}].description` is {len(gap['description'])} characters, "
+                f"under the {MIN_FIELD_CHARS} it takes to brief a stranger")
+        out.append(gap)
+    return out
 
 
 def _payload(classification: str, raw: dict[str, Any],
@@ -335,6 +370,10 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
                   f"    actual: {fix.get('actual', '')}",
                   f"    priority: {fix.get('priority', '')}"]
         lines += [f"    {name}: {fix[name]}" for name in OS_ONLY_FIX_FIELDS if fix.get(name)]
+    other_gaps = verdict.get("other_gaps") or []
+    if other_gaps:
+        lines.append("  other gaps (backlog proposals, never dispatched):")
+        lines += [f"    - {gap.get('title', '')}: {gap.get('why', '')}" for gap in other_gaps]
     evidence = verdict.get("evidence") or []
     if evidence:
         lines.append("  evidence:")

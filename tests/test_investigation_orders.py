@@ -707,6 +707,63 @@ def _submitted(started, store, classification: str, **over):
     return inv["id"], investigator, out
 
 
+def _other_gap(n: int) -> dict[str, str]:
+    return {"title": f"side defect {n}", "why": f"reason {n} it matters",
+            "description": f"Side defect {n}: nothing tracks it, so it recurs unseen."}
+
+
+@pytest.mark.parametrize("classification", ["TRANSIENT", "GAP"])
+def test_each_other_gap_becomes_one_origin_linked_backlog_proposal(started, store, catalog_file,
+                                                                  monkeypatch, classification):
+    """io-38a4354f one-fix-slot: the `done` line, end to end through the router"""
+    from jarvis.central_store import CentralStore
+
+    monkeypatch.setattr(ops, "_verdict_duplicate", lambda *a, **k: "#790")  # no tracker call
+    inv_id, investigator, out = _submitted(started, store, classification,
+                                           other_gaps=[_other_gap(1), _other_gap(2)])
+    assert out["other_gaps_proposed"] == 2
+    assert json.loads(store.get_feature_order(inv_id)["plan"])["other_gaps"][1]["title"] == (
+        "side defect 2")
+
+    catalog = load_catalog(catalog_file)
+    Daemon(catalog).deliver_envelopes(catalog.projects[0], store)
+
+    central = CentralStore()
+    try:
+        rows = sorted((b for b in central.list_backlog("proj_a", status=None)
+                       if b["title"].startswith("side defect")), key=lambda b: b["title"])
+    finally:
+        central.close()
+    assert [b["title"] for b in rows] == ["side defect 1", "side defect 2"]
+    for n, row in enumerate(rows, 1):
+        assert row["status"] == "proposed"  # never dispatched: the steward reviews it
+        assert row["origin_wo_id"] == investigator and row["origin_fo_id"] == inv_id
+        assert [r["kind"] for r in row["origin_refs"]] == ["envelope", "order"]
+        assert f"reason {n}" in row["origin_note"] and f"Side defect {n}" in row["description"]
+
+
+def test_a_refused_verdict_posts_nothing(started, store):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+    doc = a_verdict("TRANSIENT", subject=subject, other_gaps=[_other_gap(1)])
+    del doc["unsticks"]
+    with pytest.raises(ops.OpsError, match="unsticks"):
+        ops.submit_verdict(inv["id"], doc)
+    assert not store.envelopes()
+
+
+def test_the_brief_sends_every_side_gap_to_other_gaps(started, store, catalog_file):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    prompt = dispatch._investigator_prompt(store.get_work_order(investigator),
+                                           load_catalog(catalog_file).projects[0])
+    assert "and in `other_gaps` if it is not" in prompt
+    assert '"other_gaps": [' in prompt
+    assert "last sentence" not in prompt
+
+
 def _failed_item(script_rewrites: int = 0) -> str:
     from jarvis.central_store import CentralStore
 

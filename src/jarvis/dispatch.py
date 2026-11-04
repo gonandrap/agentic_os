@@ -1034,6 +1034,10 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         '  "evidence": [',
         f'    {{"source": "{read_subject}", "quote": "the verbatim line"}}',
         "  ],",
+        '  "other_gaps": [            // required on all five; [] when there are none',
+        '    {"title": "the proposal title", "why": "why it matters",',
+        '     "description": "the brief, standing alone"}',
+        "  ],",
         '  "owner": "os",             // GAP only',
         '  "proposed_fix": {          // GAP only',
         '    "title": "what the bug report is titled",',
@@ -1051,8 +1055,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "}",
         "```",
         "",
-        "`subject`, `classification`, `gap_class`, `root_cause` and at least one "
-        "`evidence` entry are "
+        "`subject`, `classification`, `gap_class`, `root_cause`, `other_gaps` and at least "
+        "one `evidence` entry are "
         "required for all five. CARRY ONLY YOUR CLASSIFICATION'S FIELD: the validator "
         "refuses a GAP with no `proposed_fix`, and a TRANSIENT that also says the user "
         "owes something; it names every problem at once. The `//` notes are not JSON: "
@@ -1062,8 +1066,11 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- Never paste a diff, a transcript or a log into the verdict: cite the command "
         f"and quote the decisive line. Over {verdicts.MAX_VERDICT_CHARS} characters the "
         f"whole document is refused.",
-        "- One subject, one root cause, one classification. A symptom with two independent "
-        "causes is an improvement order, and belongs in the verdict as that recommendation.",
+        "- One subject, one root cause, one classification. EVERY OTHER GAP you found — a "
+        "second cause, a side defect, anything unrelated to the subject — is one `other_gaps` "
+        "entry. Never name one in `root_cause`: no code reads that prose, so it is lost. The "
+        "OS posts each entry to this project's backlog as a proposal linked to this order; "
+        "it is never a tracker bug and never dispatched. No others: `[]`, explicitly.",
         "",
         "# What you may run",
         "Reads: `git log|show|diff|status|blame`, `gh pr view|diff|checks`, "
@@ -1081,8 +1088,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "route around that check is how one cause gets two issues. So a bug you hit in "
         "Jarvis OS ITSELF while investigating — even one unrelated to your subject — "
         "cannot be filed from here and does not use your `report-jarvis-bug` skill. Put it "
-        "in the verdict: in `proposed_fix` if it IS the root cause, and in `root_cause`'s "
-        "last sentence if it is not.",
+        "in the verdict: in `proposed_fix` if it IS the root cause, and in `other_gaps` if "
+        "it is not.",
         "",
         "# Operating contract",
         f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "

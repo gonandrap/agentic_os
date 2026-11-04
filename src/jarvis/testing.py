@@ -2809,6 +2809,7 @@ def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
             {"source": f"jarvis wo show {subject}",
              "quote": "validating — the panel gave up after 3 rounds (round 3, 6h ago)"},
         ],
+        "other_gaps": [],
     }
     if classification == "GAP":
         doc["owner"] = "os"

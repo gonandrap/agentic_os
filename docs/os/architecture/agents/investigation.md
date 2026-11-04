@@ -61,3 +61,8 @@ A GAP is filed **without** expediting, so it does not jump the queue. The user p
 up with `jarvis issues start` unless Neo's triage confirms critical/blocker. If the
 tracker cannot be reached, the investigation raises attention and shows the retry
 command.
+
+Every verdict, whatever its classification, carries `other_gaps`: every gap beyond the root
+cause, or an explicit `[]`. `ops.submit_verdict` posts each entry through the bus as a
+deferral on the investigator work order, and the router files it as a `proposed` backlog
+row with an origin link. It is never a tracker bug and never dispatched.
