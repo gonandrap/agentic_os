@@ -255,7 +255,7 @@ parses `answer` with `structured.parse_json_object` and validates it. `escalate:
 leaves the item `quarantined` and the question escalated to the user (§5.4, §8). Copy the `kind="validation"` / `kind="triage"` pattern: delivered
 first in `Daemon._neo_drain.deliver` with an early return into a module-level
 `record_neo_verdict`-style applier that calls `review_backlog`. A `duplicate` verdict
-folds `origin_refs` exactly as §3.2 rule 2. An unparseable or failed answer is never
+folds `origin_refs` exactly as §3.2 rule 2; `review_backlog` refuses a settled `duplicate_of`. An unparseable or failed answer is never
 turned into a verdict (kn-40db1828): the item stays `quarantined`, the question retryable.
 
 ### 5.3 Every switch site of a new kind (kn-4edb0eb7)
