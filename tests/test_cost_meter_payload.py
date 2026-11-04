@@ -130,7 +130,9 @@ def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
     assert set(meter["outside"]) == {"total_usd", "n", "sessions"}
     assert set(meter["alerts"]) == {"outside", "residual", "unreliable", "suppressed",
                                     "thresholds", "min_usd"}
-    assert set(meter["timeline"][0]) == {"ts", "five_hour_pct", "seven_day_pct", "ok"}
+    assert set(meter["timeline"][0]) == {"ts", "five_hour_pct", "seven_day_pct", "ok",
+                                         "five_hour_calc_jarvis", "five_hour_calc_outside",
+                                         "seven_day_calc_jarvis", "seven_day_calc_outside"}
 
 
 def test_the_outside_rows_are_capped_in_rows_and_never_in_dollars(fleet_fixture):
@@ -160,6 +162,34 @@ def test_the_timeline_is_decimated_to_three_hundred_points(fleet_fixture):
 
     assert len(meter["timeline"]) <= 300
     assert meter["timeline"][0]["ts"] >= resolved["since"]
+
+
+def test_the_calculated_series_is_the_windows_spend_in_points_split_by_owner(fleet_fixture):
+    """Each point: $ spent since its window opened, over $/point; Jarvis and outside apart"""
+    resolved = scene(fleet_fixture)
+    meter = meter_of(fleet_fixture, resolved)
+    rate = meter["dollars_per_point"]["value"]
+    assert meter["dollars_per_point"]["source"] == "measured"
+    last = meter["timeline"][-1]
+
+    # The 5h window opened at until - 5h: one $8.20 calibration turn, the $6 turn, the $0.50 call
+    assert last["five_hour_calc_jarvis"] == pytest.approx((8.2 + 6.0 + 0.5) / rate, rel=1e-3)
+    assert last["five_hour_calc_outside"] == pytest.approx(2.48 / rate, rel=1e-3)
+    first = meter["timeline"][0]
+    assert first["five_hour_calc_jarvis"] == pytest.approx(8.2 / rate, rel=1e-3)
+    assert first["five_hour_calc_outside"] == 0.0
+    # 7d never calibrated on its own, so it is the 5h rate scaled; a 7d point costs more
+    assert 0 < last["seven_day_calc_jarvis"] < last["five_hour_calc_jarvis"]
+    assert last["seven_day_calc_outside"] is not None
+
+
+def test_the_zoom_endpoint_carries_the_calculated_series(fleet_fixture):
+    resolved = scene(fleet_fixture)
+
+    tl = ops.cost_meter_timeline(resolved["since"], resolved["until"])
+
+    assert tl[-1]["five_hour_calc_jarvis"] > tl[0]["five_hour_calc_jarvis"] > 0
+    assert tl[-1]["five_hour_calc_outside"] > 0
 
 
 # -- 30-32. the sentence
@@ -499,6 +529,176 @@ def test_the_outside_alarm_fires_once_per_window_for_the_os_owner(
 
     reconcile(fleet_fixture, daemon)
     assert len(alarms(fleet_fixture)) == 1, "one alarm per kind per window"
+
+
+def seed_occurrences(f, kind: str, ages_days: list[float]) -> None:
+    """Rows of `kind` already on the record, this many days old, with the review's verdict"""
+    store = ProjectStore(f.project_path)
+    try:
+        carrier = store.latest_settled_order()
+        for age in ages_days:
+            row = store.add_finding(carrier["id"], kind=kind, reason=f"seen {age}d ago")
+            store.update_alarm(row["id"], status="acked", verdict="escalate",
+                               verdict_reason=f"carrier cannot explain {age}",
+                               ts=T0 - age * 86_400)
+    finally:
+        store.close()
+
+
+def filings(monkeypatch) -> list[dict]:
+    from jarvis import bugreport
+
+    filed: list[dict] = []
+
+    def report(**kwargs):
+        filed.append(kwargs)
+        return {"url": "https://example.test/issues/1"}
+
+    monkeypatch.setattr(bugreport, "report_bug", report)
+    return filed
+
+
+def outside_scene(f) -> None:
+    f.order("the carrier", status="completed")
+    scene(f, until=SPAN_UNTIL, samples=120)
+
+
+def residual_scene(f, monkeypatch) -> Daemon:
+    """A residual that went negative, as wo-c9337339's did"""
+    f.order("the carrier", status="completed")
+    meter = {"alerts": {"outside": False, "residual": True},
+             "spend": {"residual_usd": -80.09, "implied_usd": 133.48,
+                       "residual_share": -0.6}}
+    monkeypatch.setattr(usage_meter, "reconciliation", lambda **_: {"meter": meter})
+    return daemon_for(f)
+
+
+def test_a_repeat_is_counted_and_reaches_nobody(fleet_fixture, fixed_now, monkeypatch):
+    outside_scene(fleet_fixture)
+    filed = filings(monkeypatch)
+    seed_occurrences(fleet_fixture, "cost_outside_spend_high", [3.0])
+
+    reconcile(fleet_fixture, daemon_for(fleet_fixture))
+
+    newest = alarms(fleet_fixture)[0]
+    assert "Occurrence 2 of this standing condition" in newest["reason"]
+    assert newest["alarm_status"] == "raised", "the supervisor still judges it"
+    central = CentralStore()
+    try:
+        assert central.unacked_inbox("warning") == []
+    finally:
+        central.close()
+    assert filed == []
+
+
+def test_a_gap_over_the_limit_starts_a_new_condition(fleet_fixture, fixed_now, monkeypatch):
+    outside_scene(fleet_fixture)
+    seed_occurrences(fleet_fixture, "cost_outside_spend_high", [20.0, 8.0])
+
+    reconcile(fleet_fixture, daemon_for(fleet_fixture))
+
+    assert "Occurrence" not in alarms(fleet_fixture)[0]["reason"]
+    central = CentralStore()
+    try:
+        assert len(central.unacked_inbox("warning")) == 1
+    finally:
+        central.close()
+
+
+def test_outside_spend_counts_and_never_files(fleet_fixture, fixed_now, monkeypatch):
+    outside_scene(fleet_fixture)
+    filed = filings(monkeypatch)
+    seed_occurrences(fleet_fixture, "cost_outside_spend_high", [6.0, 3.0])
+
+    reconcile(fleet_fixture, daemon_for(fleet_fixture))
+
+    newest = alarms(fleet_fixture)[0]
+    assert "Occurrence 3" in newest["reason"]
+    assert newest["alarm_status"] == "informational", "no model call on a known condition"
+    assert filed == []
+
+
+def test_a_standing_residual_files_once_and_silently(fleet_fixture, fixed_now, monkeypatch):
+    filed = filings(monkeypatch)
+    daemon = residual_scene(fleet_fixture, monkeypatch)
+    seed_occurrences(fleet_fixture, "cost_residual_high", [6.0, 3.0])
+
+    reconcile(fleet_fixture, daemon)
+    reconcile(fleet_fixture, daemon)
+
+    assert len(filed) == 1
+    assert filed[0]["notify"] is False and filed[0]["priority"] == "high"
+    assert "recurred 3 times" in filed[0]["description"]
+    assert "usage_meter" in filed[0]["description"]
+    kinds = [r["kind"] for r in alarms(fleet_fixture)]
+    assert kinds.count("cost_residual_diagnosed") == 1
+    central = CentralStore()
+    try:
+        assert central.unacked_inbox("warning") == []
+    finally:
+        central.close()
+
+
+def test_a_failed_filing_retries_on_the_next_pass(fleet_fixture, fixed_now, monkeypatch):
+    from jarvis import bugreport
+
+    daemon = residual_scene(fleet_fixture, monkeypatch)
+    seed_occurrences(fleet_fixture, "cost_residual_high", [6.0, 3.0])
+
+    def refuse(**kwargs):
+        raise bugreport.BugReportError("the tracker is down")
+
+    monkeypatch.setattr(bugreport, "report_bug", refuse)
+    reconcile(fleet_fixture, daemon)
+    assert "cost_residual_diagnosed" not in [r["kind"] for r in alarms(fleet_fixture)]
+
+    filed = filings(monkeypatch)
+    reconcile(fleet_fixture, daemon)
+    assert len(filed) == 1
+
+
+def test_the_packet_carries_prior_verdicts_and_a_verdict_stays_off_the_carrier(
+        fleet_fixture, fixed_now):
+    from jarvis import supervisor
+    from jarvis.catalog import SupervisorConfig
+
+    fleet_fixture.order("the carrier", status="completed")
+    seed_occurrences(fleet_fixture, "cost_residual_high", [3.0])
+    store = ProjectStore(fleet_fixture.project_path)
+    central = CentralStore()
+    try:
+        carrier = store.latest_settled_order()
+        alarm = store.add_finding(carrier["id"], kind="cost_residual_high", reason="again")
+
+        packet = supervisor.build_evidence(store, {"kind": "work_order", "row": carrier}, alarm)
+        assert "# This standing condition" in packet
+        assert "occurrence 2" in packet
+        assert "carrier cannot explain 3.0" in packet
+
+        supervisor._apply(store, None, central, "proj_a", carrier, alarm,
+                          {"decision": "escalate", "failed": False, "reason": "unexplained",
+                           "note": ""}, packet, SupervisorConfig())
+        row = store.get_alarm(alarm["id"])
+        assert (row["status"], row["verdict"]) == ("acked", "escalate")
+        assert not store.get_work_order(carrier["id"])["needs_attention"]
+        assert central.unacked_inbox("warning") == []
+    finally:
+        central.close()
+        store.close()
+
+
+def test_a_work_order_alarm_gets_no_standing_section(fleet_fixture, fixed_now):
+    from jarvis import supervisor
+
+    fleet_fixture.order("the carrier", status="completed")
+    store = ProjectStore(fleet_fixture.project_path)
+    try:
+        carrier = store.latest_settled_order()
+        alarm = store.add_finding(carrier["id"], kind="some_cost_kind", reason="x")
+        assert "# This standing condition" not in supervisor.build_evidence(
+            store, {"kind": "work_order", "row": carrier}, alarm)
+    finally:
+        store.close()
 
 
 def test_the_alarm_is_silent_below_the_floor_and_on_the_seed(fleet_fixture, fixed_now):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import json
 import sqlite3
 import statistics
@@ -528,6 +529,8 @@ def _visible_usd(*, since: float, until: float, home: Path) -> float:
 
     total = 0.0
     for name, path in fleetcost.registered_paths(home).items():
+        if not paths.project_db_path(path).exists():
+            continue
         for row in fleetcost.turn_rows(paths.project_db_path(path), since, until,
                                        project=name):
             total += row.cost_usd or 0.0
@@ -537,17 +540,38 @@ def _visible_usd(*, since: float, until: float, home: Path) -> float:
     return total
 
 
+def _scaled_from_five_hour(rows: Sequence[Sample], key: str, *, now: float, cfg: Any,
+                           home: Path, visible: Callable[..., float] | None
+                           ) -> dict[str, Any]:
+    """`key`'s point priced as the 5h rate times how many 5h points moved per `key` point"""
+    five_points = key_points = 0.0
+    for run in _runs(rows, "five_hour"):
+        for sub in _runs(run, key):
+            five_points += float(sub[-1].pct("five_hour")) - float(sub[0].pct("five_hour"))
+            key_points += float(sub[-1].pct(key)) - float(sub[0].pct(key))
+    five = dollars_per_point(now=now, cfg=cfg, home=home, visible=visible)
+    if five_points <= 0 or key_points <= 0:
+        return {"value": None, "low": None, "high": None, "source": "none",
+                "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
+    scale = five_points / key_points
+    return {"value": five["value"] * scale, "low": five["low"] * scale,
+            "high": five["high"] * scale, "source": "scaled",
+            "basis_spans": five["basis_spans"], "basis_points": key_points,
+            "basis_usd": five["basis_usd"]}
+
+
 def dollars_per_point(*, now: float, cfg: Any, home: Path,
-                      visible: Callable[..., float] | None = None) -> dict[str, Any]:
-    """What one 5h point costs, with its uncertainty stated as a band (§5)"""
+                      visible: Callable[..., float] | None = None,
+                      key: str = "five_hour") -> dict[str, Any]:
+    """What one point of `key`'s window costs, with its uncertainty stated as a band (§5)"""
     since = now - cfg.meter_calibration_days * 86_400
     rows = samples_between(Path(home), since=since, until=now)
     spend = visible or (lambda *, since, until: _visible_usd(since=since, until=until,
                                                              home=Path(home)))
     ratios: list[float] = []
     total_usd = total_points = 0.0
-    for run in _runs(rows, "five_hour"):
-        points = float(run[-1].pct("five_hour") or 0.0) - float(run[0].pct("five_hour") or 0.0)
+    for run in _runs(rows, key):
+        points = float(run[-1].pct(key) or 0.0) - float(run[0].pct(key) or 0.0)
         if run[-1].ts - run[0].ts < cfg.meter_calibration_min_minutes * 60:
             continue
         if points < cfg.meter_calibration_min_points:
@@ -556,6 +580,8 @@ def dollars_per_point(*, now: float, cfg: Any, home: Path,
         ratios.append(usd / points)
         total_usd += usd
         total_points += points
+    if not ratios and key != "five_hour":
+        return _scaled_from_five_hour(rows, key, now=now, cfg=cfg, home=home, visible=visible)
     if not ratios:
         seed = float(cfg.meter_dollars_per_point)
         return {"value": seed, "low": seed, "high": seed, "source": "seed",
@@ -678,12 +704,22 @@ def outside_sessions(*, since: float, until: float, home: Path,
         return []
     from . import fleetcost
 
-    owned = owned_session_ids(Path(home))
     slugs = {name: nav_volume.slug_of(path)
              for name, path in fleetcost.registered_paths(Path(home)).items()}
     if index is None:
         index = usage.index_sessions(root)
-    found: list[OutsideSession] = []
+    found = [_row_of(session_id, dir_name, _attribute(dir_name, slugs), inside,
+                     index.get(session_id) or [path])
+             for session_id, dir_name, path, inside in _outside_calls(
+                 root, since=since, until=until, home=home, index=index)]
+    found.sort(key=lambda s: s.usd, reverse=True)
+    return found
+
+
+def _outside_calls(root: Path, *, since: float, until: float, home: Path,
+                   index: dict[str, list[Path]]):
+    """`(session_id, dir_name, path, calls inside the span)` per session Jarvis did not mint"""
+    owned = owned_session_ids(Path(home))
     seen: set[str] = set()
     for project_dir in sorted(root.iterdir()):
         if not project_dir.is_dir():
@@ -704,11 +740,7 @@ def outside_sessions(*, since: float, until: float, home: Path,
             if not inside:
                 continue
             seen.add(session_id)
-            found.append(_row_of(session_id, project_dir.name,
-                                 _attribute(project_dir.name, slugs), inside,
-                                 index.get(session_id) or [path]))
-    found.sort(key=lambda s: s.usd, reverse=True)
-    return found
+            yield session_id, project_dir.name, path, inside
 
 
 # -- 7. reconciliation, and the residual
@@ -765,9 +797,87 @@ def jarvis_spend(*, since: float, until: float, home: Path | str | None = None,
     return (workers, calls)
 
 
-def timeline(samples: Sequence[Sample], *, points: int = TIMELINE_POINTS
-             ) -> list[dict[str, Any]]:
-    """The series, decimated to at most `points` buckets"""
+@dataclass
+class SpendSeries:
+    """Every priced call over a span as running totals, so any window's spend is one subtraction"""
+
+    ts: list[float]
+    jarvis: list[float]         #: cumulative, one longer than `ts`
+    outside: list[float]
+    rates: dict[str, float | None]
+
+    def points(self, key: str, at: float, resets_at: float | None
+               ) -> tuple[float | None, float | None]:
+        """`(jarvis, outside)` spend since `key`'s window opened, in that window's points"""
+        rate = self.rates.get(key)
+        if not rate or resets_at is None:
+            return (None, None)
+        lo = bisect.bisect_left(self.ts, resets_at - WINDOW_SECONDS[key])
+        hi = bisect.bisect_left(self.ts, at)
+        if hi < lo:
+            return (0.0, 0.0)
+        return (round((self.jarvis[hi] - self.jarvis[lo]) / rate, 3),
+                round((self.outside[hi] - self.outside[lo]) / rate, 3))
+
+
+def spend_events(*, since: float, until: float,
+                 home: Path | str | None = None) -> list[tuple[float, float, bool]]:
+    """`(ts, usd, is_jarvis)` for every priced call on this machine over the span"""
+    from . import fleetcost
+
+    root = _home_path(home)
+    found: list[tuple[float, float, bool]] = []
+    for name, path in fleetcost.registered_paths(root).items():
+        db_path = paths.project_db_path(path)
+        if not db_path.exists():
+            continue
+        found.extend((row.started_at, row.cost_usd or 0.0, True)
+                     for row in fleetcost.turn_rows(db_path, since, until, project=name))
+    conn = _connect_ro(root / "os.db")
+    if conn is not None:
+        try:
+            found.extend((float(r["ts"]), float(r["cost_usd"] or 0.0), True)
+                         for r in conn.execute(
+                             "SELECT ts, cost_usd FROM agent_calls WHERE ts >= ? AND ts < ?",
+                             (since, until)))
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+    transcripts = usage.transcript_root()
+    if transcripts.is_dir():
+        index = usage.index_sessions(transcripts)
+        for *_, calls in _outside_calls(transcripts, since=since, until=until,
+                                        home=root, index=index):
+            found.extend((c.ts, usage.priced(
+                c.model, input=c.input, cache_write=c.cache_write,
+                cache_read=c.cache_read, output=c.output, cache_1h=c.cache_1h,
+                cache_5m=c.cache_5m).list_cost_usd, False) for c in calls)
+    found.sort(key=lambda e: e[0])
+    return found
+
+
+def spend_series(samples: Sequence[Sample], *, rates: dict[str, float | None],
+                 home: Path | str | None = None) -> SpendSeries | None:
+    """The calls behind every window the samples sit in, back to the earliest window's opening"""
+    starts = [s.resets_at(key) - WINDOW_SECONDS[key]
+              for s in samples if s.ok for key, rate in rates.items()
+              if rate and s.resets_at(key) is not None]
+    if not starts:
+        return None
+    events = spend_events(since=min(starts), until=max(s.ts for s in samples) + 1,
+                          home=home)
+    jarvis, outside = [0.0], [0.0]
+    for _, usd, own in events:
+        jarvis.append(jarvis[-1] + (usd if own else 0.0))
+        outside.append(outside[-1] + (0.0 if own else usd))
+    return SpendSeries(ts=[e[0] for e in events], jarvis=jarvis, outside=outside,
+                       rates=rates)
+
+
+def timeline(samples: Sequence[Sample], *, points: int = TIMELINE_POINTS,
+             spend: SpendSeries | None = None) -> list[dict[str, Any]]:
+    """The series, decimated to at most `points` buckets, each with its calculated twin"""
     rows = sorted(samples, key=lambda s: s.ts)
     if not rows:
         return []
@@ -781,17 +891,32 @@ def timeline(samples: Sequence[Sample], *, points: int = TIMELINE_POINTS
             values = [s.pct(key) for s in of if s.pct(key) is not None]
             return sum(values) / len(values) if values else None
 
-        found.append({"ts": sum(s.ts for s in bucket) / len(bucket),
-                      "five_hour_pct": mean("five_hour"),
-                      "seven_day_pct": mean("seven_day"),
-                      "ok": len(ok) == len(bucket)})
+        point = {"ts": sum(s.ts for s in bucket) / len(bucket),
+                 "five_hour_pct": mean("five_hour"),
+                 "seven_day_pct": mean("seven_day"),
+                 "ok": len(ok) == len(bucket)}
+        for key in FIRST_CLASS:
+            resets = next((s.resets_at(key) for s in reversed(ok)
+                           if s.resets_at(key) is not None), None)
+            jarvis, outside = (spend.points(key, point["ts"], resets) if spend
+                               else (None, None))
+            point[f"{key}_calc_jarvis"] = jarvis
+            point[f"{key}_calc_outside"] = outside
+        found.append(point)
     return found
 
 
 def timeline_between(*, since: float, until: float,
                      home: Path | str | None = None) -> list[dict[str, Any]]:
     """`timeline` for any span — what the /cost chart fetches on zoom and overlay"""
-    return timeline(samples_between(_home_path(home), since=since, until=until))
+    from . import fleetcost
+
+    root = _home_path(home)
+    rows = samples_between(root, since=since, until=until)
+    cfg = fleetcost.cost_config(None)
+    rates = {key: dollars_per_point(now=db.now(), cfg=cfg, home=root, key=key)["value"]
+             for key in FIRST_CLASS}
+    return timeline(rows, spend=spend_series(rows, rates=rates, home=root))
 
 
 def sample_rows(*, since: float, until: float,
@@ -948,6 +1073,7 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
     seven = segments(rows, since=since, until=until, key="seven_day",
                      nearest_seconds=cfg.meter_nearest_seconds)
     dollars = dollars_per_point(now=now, cfg=cfg, home=root)
+    seven_rate = dollars_per_point(now=now, cfg=cfg, home=root, key="seven_day")["value"]
     covered = five.coverage.samples > 0
     # Coverage is the span's own reason to derive nothing
     span_unreliable: list[str] = []
@@ -1013,7 +1139,9 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
         "outside": {"total_usd": round(outside_usd, 2), "n": len(sessions),
                     "sessions": [s.as_dict()
                                  for s in sessions[:cfg.meter_outside_rows]]},
-        "timeline": timeline(in_span),
+        "timeline": timeline(in_span, spend=spend_series(
+            in_span, rates={"five_hour": dollars["value"], "seven_day": seven_rate},
+            home=root)),
         "sentence": sentence(five_hour=five_hour, spend=spend, sessions=sessions,
                              dollars=dollars, coverage=coverage, covered=covered,
                              derivable=derivable, unreliable=unreliable),

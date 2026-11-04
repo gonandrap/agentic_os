@@ -22,7 +22,7 @@ from .automerge import (
     HELD_SHA_UNRECORDED,
 )
 # Same leaf argument: `autoreview` imports only `navigation`
-from .autoreview import REFUSAL_UNANSWERED_REASON
+from .autoreview import REFUSAL_UNANSWERED_REASON, TRANSIENT_DROPS
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
@@ -40,6 +40,7 @@ from .project_store import (
     VALIDATION_HELD_CAUSE,
     WORKER_CHILDREN,
     kind_contract,
+    turn_end_is_delivery,
     validation_hold,
 )
 
@@ -667,7 +668,7 @@ def parked_on_a_give_up(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Are this order's pending assumptions Neo's to decide on delivery, not the user's? (#711)"""
-    if wo["status"] not in PRE_DELIVERY_STATUSES:
+    if wo["status"] not in PRE_DELIVERY_STATUSES or turn_end_is_delivery(wo):
         return False
     from .ops import auto_review_at
 
@@ -735,6 +736,24 @@ def reviewable_assumptions(store: ProjectStore,
     return store.pending_assumptions(wo["id"])
 
 
+def assumptions_left_with_user(store: ProjectStore, wo: dict[str, Any],
+                               pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Which of an idle manager's rows the OS has let go of: it has no review list to sit on (io-d5e62d4d)"""
+    from .ops import auto_review_at
+
+    if not auto_review_at(store.project_path):
+        return pending
+    left: set[int] = set()
+    for kind in ("autoreview_held", "autoreview_escalated", "autoreview_unconfirmed"):
+        for event in store.events_of_kind(wo["id"], kind):
+            payload = db.from_json(event["payload"], {})
+            if (payload.get("re_asked") or payload.get("code") in TRANSIENT_DROPS
+                    or (kind == "autoreview_held" and payload.get("early"))):
+                continue
+            left.add(int(payload.get("assumption_id") or 0))
+    return [a for a in pending if int(a["id"]) in left]
+
+
 def assumptions_owed_to_user(store: ProjectStore,
                              wo: dict[str, Any]) -> list[dict[str, Any]]:
     """The rows that are the user's now: the ONE answer flag, ping and blockers ask (io-ed253c2b)"""
@@ -743,6 +762,8 @@ def assumptions_owed_to_user(store: ProjectStore,
         return []
     from .ops import assumptions_held_final, auto_review_at
 
+    if wo["status"] != "needs_review" and turn_end_is_delivery(wo):
+        return assumptions_left_with_user(store, wo, pending)
     # Only a `needs_review` order is in Neo's delivered pass; no pass reaches any other status
     if wo["status"] != "needs_review" or not auto_review_at(store.project_path):
         return pending
@@ -1911,7 +1932,9 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
             continue
         if not _mentions_assumptions(wo.get("attention_reason")):
             continue
-        if not (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo)):
+        # An idle manager has no landing to clear its flag once its rows are settled (io-d5e62d4d)
+        if not (turn_end_is_delivery(wo)
+                or (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo))):
             continue
         # An undeliverable objection raises a real blocker on a RUNNING order
         if any(_mentions_assumptions(b) for b in true_blockers(store, wo)):
@@ -4394,6 +4417,32 @@ def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+INV_FIX_GAP_UNREGISTERED = "INV-FIX-GAP-UNREGISTERED"
+
+
+def check_fix_registered_its_gap(store: ProjectStore) -> Iterator[Violation]:
+    """INV-FIX-GAP-UNREGISTERED — a completed GAP fix left its class out of `gaps.py` (io-38a4354f)"""
+    from . import gaps
+    from .bugreport import VERDICT_GAP_CLASS_KEY
+
+    rows = store.conn.execute(
+        "SELECT id, metadata FROM work_orders WHERE status='completed' "
+        "AND instr(metadata, ?) > 0", (VERDICT_GAP_CLASS_KEY,)).fetchall()
+    for row in rows:
+        metadata = db.from_json(row["metadata"], {}) or {}
+        gap_class = str(metadata.get(VERDICT_GAP_CLASS_KEY) or "")
+        if not gap_class or gaps.registered(gap_class) or store.work_abandoned(row["id"]):
+            continue
+        yield Violation(
+            invariant=INV_FIX_GAP_UNREGISTERED,
+            wo_id=row["id"],
+            detail=(f"completed, but gap class `{gap_class}` its verdict named is not "
+                    f"registered in src/jarvis/gaps.py, so the detector and remedy it owed "
+                    f"are unproven: register them or file the follow-up"),
+            context={"gap_class": gap_class},
+        )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
                                    # reading, repairing nothing and touching no flag any other check derives
@@ -4467,6 +4516,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 #: Invariants whose cost scales with the SETTLED BACKLOG rather than with live work
 SLOW_INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_work_lands,
+    check_fix_registered_its_gap,  # population: every completed order, like the one above
     check_spec_pointer_resolves,  # both properties of this class and neither of the fast
                                   # one: its population is every feature order a project has ever had
 )

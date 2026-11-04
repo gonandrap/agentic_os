@@ -186,6 +186,7 @@ def test_the_ack_reaches_the_user_as_an_inbox_row_carrying_the_note(
 
     (row,) = rows
     assert row["title"] == f"Supervisor cleared an alarm on {wo_id}"
+    assert row["push"] == 0
     assert row["level"] == "info"
     assert row["body"] == _alarm(wo_id)["note"]
 

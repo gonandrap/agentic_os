@@ -741,6 +741,29 @@ def test_neo_dismisses_a_false_positive_and_the_command_runs(fleet):
     assert _decision(fleet.attempt(command)) == "allow"
 
 
+@pytest.mark.parametrize("kind,pushed", [("auto_merge", 0), ("release", 0),
+                                         ("service_restart", 1)])
+def test_only_a_neo_approved_merge_or_release_stays_off_the_phone(fleet, kind, pushed):
+    """io-ed253c2b"""
+    ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh",
+                              why="FORCE_APPROVE — all tests pass")
+    store = fleet.store()
+    try:
+        store.conn.execute("UPDATE approvals SET kind=? WHERE id=?",
+                           (kind, fleet.approval()["id"]))
+    finally:
+        store.close()
+    fleet.daemon._neo_drain()
+
+    central = CentralStore()
+    try:
+        (row,) = [i for i in central.unacked_inbox()
+                  if i["title"] == f"Neo approved {kind} for {fleet.wo_id}"]
+    finally:
+        central.close()
+    assert row["push"] == pushed
+
+
 def test_a_dismissal_costs_the_user_no_inbox_item(fleet):
     """Neo's approvals and denials both post to the inbox"""
     ops.request_gate_approval(fleet.wo_id, "uv run pytest tests/test_release_staging.py -k shipit",

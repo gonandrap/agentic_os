@@ -137,6 +137,39 @@ def test_the_log_sink_records_why_a_link_was_withheld(jarvis_home, fake_claude,
     assert "[no deep link: project 'proj_gone' is not registered" in log
 
 
+def test_a_push_false_row_reaches_log_and_inbox_only_and_is_not_resent(
+        jarvis_home, sent, monkeypatch):
+    """io-ed253c2b: the write site decides; a default row still reaches every sink"""
+    from jarvis.central_store import CentralStore
+    from jarvis.paths import logs_dir
+
+    desktop: list[str] = []
+    monkeypatch.setitem(notify.SINKS, "desktop",
+                        lambda it, _cat: desktop.append(it["title"]) or "sent")
+    catalog = parse_catalog({
+        "os": {"notifications": {"sinks": ["telegram", "desktop"]}}, "projects": [],
+    })
+    central = CentralStore()
+    try:
+        quiet = central.add_inbox(project="p", title="settled", push=False)
+        central.add_inbox(project="p", title="needs you")
+        assert notify.route_new_inbox(central, catalog) == 2
+        assert notify.route_new_inbox(central, catalog) == 0
+
+        row = central.get_inbox(quiet)
+        unacked = [i["title"] for i in central.unacked_inbox()]
+    finally:
+        central.close()
+
+    assert row["status"] == "notified"
+    assert list(json.loads(row["sink_results"])) == ["log"]
+    assert "settled" in unacked
+    log = (logs_dir() / "notifications.log").read_text()
+    assert "settled" in log and "needs you" in log
+    assert len(sent) == 1 and "needs you" in sent[0]["text"]
+    assert desktop == ["needs you"]
+
+
 def test_a_sink_called_directly_still_links(sent):
     """Validation needs a CentralStore"""
     notify.sink_telegram(item(), make_catalog())
