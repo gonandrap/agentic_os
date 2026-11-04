@@ -4388,7 +4388,7 @@ INV_FIX_GAP_UNREGISTERED = "INV-FIX-GAP-UNREGISTERED"
 
 
 def check_fix_registered_its_gap(store: ProjectStore) -> Iterator[Violation]:
-    """INV-FIX-GAP-UNREGISTERED — a GAP's completed fix left its class out of `gaps.py`; reports, never blocks (io-38a4354f)"""
+    """INV-FIX-GAP-UNREGISTERED — a completed GAP fix left its class out of `gaps.py` (io-38a4354f)"""
     from . import gaps
     from .bugreport import VERDICT_GAP_CLASS_KEY
 

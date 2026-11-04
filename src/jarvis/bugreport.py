@@ -22,7 +22,7 @@ BUG_LABEL = "bug"
 #: The last line of every body this module files (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §4)
 FILED_MARKER = "<!-- Filed automatically by `jarvis bug report`. -->"
 
-#: Work-order metadata naming the gap class a GAP verdict's fix order owes; not the `gap_class` column, which arms `ops.fix_order_precheck` (Q3413)
+#: Metadata key for a GAP fix order, as the `gap_class` column arms a precheck (Q3413)
 VERDICT_GAP_CLASS_KEY = "verdict_gap_class"
 
 #: How a GAP verdict's filing opens, the only place its gap class is read back from
