@@ -789,6 +789,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             finally:
                 store.close()
         attention.extend(gate_items)
+        backlog_escalated, _ = split_quarantined(central.list_backlog(status="quarantined"))
+        attention.extend(_backlog_escalated_attention(backlog_escalated))
         # The dashboard is part of the OS, so its failures belong in the OS's pulse
         ui = ui_health()
         if ui["errors"]:
@@ -821,6 +823,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "items": inbox[:10],
             },
             "backlog": {"open": len(backlog_open)},
+            "backlog_escalated": len(backlog_escalated),
             # Reported bugs and panel follow-ups counted apart (wo-5b96c9da)
             "steward": steward_track_counts(central),
             "investigations": {"fixes_parked": fixes_parked},
@@ -13624,6 +13627,50 @@ def show_backlog(item_id: str) -> dict[str, Any]:
         central.close()
     item["origins"] = backlog_origins(item)
     return item
+
+
+def split_quarantined(items: list[dict[str, Any]]
+                      ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """`(the user's, Neo's)` among quarantined rows (backlog-operability §8)"""
+    from .neo_store import MAX_REVIVALS, NeoStore
+
+    mine: list[dict[str, Any]] = []
+    neos: list[dict[str, Any]] = []
+    quarantined = [i for i in items if i["status"] == "quarantined"]
+    if not quarantined:
+        return mine, neos
+    neo = NeoStore()
+    try:
+        for item in quarantined:
+            qid = item.get("neo_question_id")
+            q = neo.get(int(qid)) if qid else None
+            # A transport failure re-asks itself until its revivals are spent: not yet the user's
+            handed_over = q is not None and (q["status"] == "escalated" or (
+                q["status"] == "failed"
+                and (q.get("escalation_cause") != "transport-unreachable"
+                     or (q.get("revivals") or 0) >= MAX_REVIVALS)))
+            (mine if handed_over else neos).append(
+                {**item, "neo_reason": (q or {}).get("answer_reason") or ""})
+    finally:
+        neo.close()
+    return mine, neos
+
+
+def _backlog_escalated_attention(escalated: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One line per project; `backlog_neo.REVIEW_HINT` is the command"""
+    from .backlog_neo import REVIEW_HINT
+
+    by_project: dict[str, list[str]] = {}
+    for item in escalated:
+        by_project.setdefault(item["project"], []).append(item["id"])
+    return [{
+        "project": project, "wo_id": None,
+        "title": (f"{len(ids)} quarantined backlog proposal"
+                  f"{'s' if len(ids) != 1 else ''} waiting on you"),
+        "status": "backlog_escalated",
+        "reason": f"Neo left the decision to you: {', '.join(ids)}",
+        "decide": REVIEW_HINT.format(id=ids[0] if len(ids) == 1 else "<bl-id>"),
+    } for project, ids in by_project.items()]
 
 
 def _backlog_item_of_question(question_id: int) -> dict[str, Any] | None:

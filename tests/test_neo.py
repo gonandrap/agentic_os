@@ -11,7 +11,7 @@ from jarvis import ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
-from jarvis.neo_store import SEATS, NeoStore
+from jarvis.neo_store import MAX_REVIVALS, SEATS, NeoStore
 from jarvis.project_store import ProjectStore
 
 pytestmark = pytest.mark.usefixtures("neo_projects")
@@ -1330,3 +1330,81 @@ def test_the_user_may_decide_before_neo_answers_and_that_closes_the_question(sta
 
     q = _question(item["neo_question_id"])
     assert (q["status"], q["answered_by"]) == ("answered", "user")
+
+
+# -- the pulse (backlog-operability §8)
+
+
+def _escalated_rows(st):
+    return [a for a in st["attention"] if a["status"] == "backlog_escalated"]
+
+
+def test_the_pulse_carries_a_proposal_only_once_neo_left_it_to_the_user(started, capsys):
+    item = _quarantined(started)
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 0 and _escalated_rows(st) == []
+
+    neo = NeoStore()
+    try:
+        neo.mark(item["neo_question_id"], "escalated", reason="the user's call")
+    finally:
+        neo.close()
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 1
+    row, = _escalated_rows(st)
+    assert row["project"] == "proj_a" and item["id"] in row["reason"]
+    assert row["decide"].startswith(f"jarvis backlog review {item['id']} ")
+    assert not st["healthy"]
+
+    from jarvis import cli
+    assert cli.main(["status", "--attention"]) == 0
+    assert f"jarvis backlog review {item['id']} " in capsys.readouterr().out
+
+    ops.review_backlog_item(item["id"], "accept")
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 0 and _escalated_rows(st) == []
+
+
+def test_two_escalated_proposals_of_one_project_fold_into_one_line(started):
+    items = [_quarantined(started), _quarantined(started, "Uploader retry storm melts disks")]
+    neo = NeoStore()
+    try:
+        for item in items:
+            neo.mark(item["neo_question_id"], "escalated", reason="the user's call")
+    finally:
+        neo.close()
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 2
+    row, = _escalated_rows(st)
+    assert row["title"].startswith("2 ") and "<bl-id>" in row["decide"]
+    assert all(i["id"] in row["reason"] for i in items)
+
+
+def test_an_outage_is_not_an_escalation_until_its_revivals_are_spent(started):
+    """kn-40db1828: `revive_unreachable` re-asks it, so it is not yet the user's"""
+    item = _quarantined(started)
+    qid = item["neo_question_id"]
+    neo = NeoStore()
+    try:
+        for _ in range(MAX_REVIVALS):
+            neo.mark(qid, "failed", reason="neo could not be reached: x",
+                     cause="transport-unreachable")
+            assert ops.os_status()["backlog_escalated"] == 0
+            assert neo.revive_unreachable() == [qid]
+        neo.mark(qid, "failed", reason="neo could not be reached: x",
+                 cause="transport-unreachable")
+        assert neo.revive_unreachable() == []
+    finally:
+        neo.close()
+    assert ops.os_status()["backlog_escalated"] == 1
+
+
+def test_an_unusable_answer_that_spent_its_attempts_is_the_users(started):
+    item = _quarantined(started)
+    neo = NeoStore()
+    try:
+        neo.mark(item["neo_question_id"], "failed", reason="backlog: nobody has judged this",
+                 cause="unparseable-reply")
+    finally:
+        neo.close()
+    assert ops.os_status()["backlog_escalated"] == 1
