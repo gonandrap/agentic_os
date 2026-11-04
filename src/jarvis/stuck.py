@@ -22,6 +22,9 @@ IDLE_MANAGER_CAUSE = "its feature's next message"
 #: §1 of docs/superpowers/specs/2026-10-14-a-worker-turn-in-flight-is-not-stuck.md
 TURN_IN_FLIGHT_CAUSE = "a worker turn is in flight"
 
+#: Issue 1556
+TOOL_CALL_CAUSE = "a tool call in flight"
+
 #: §1 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md
 BASE_RED_CAUSE = "the default branch is red"
 
@@ -49,6 +52,10 @@ EXCLUSION_REASON: Mapping[str, str] = {
                            "timeline while its tools run — its transcript is still "
                            "moving, so nothing is judged until it falls silent past the "
                            "threshold"),
+    TOOL_CALL_CAUSE: ("a worker turn is executing a tool call and nothing is written "
+                      "until that call returns, so silence says nothing about it — "
+                      "nothing is judged until it returns or the turn reaches the "
+                      "stalled-turn ceiling"),
     BASE_RED_CAUSE: ("the OS is holding this merge itself: the default branch's own build "
                      "is broken and nothing merges onto a red base — it clears when the "
                      "base goes green, with no decision from you, so nothing is judged "
@@ -121,6 +128,7 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
            exempt_kinds: Sequence[str] = (),
            by_design_idle: bool = False,
            turn_in_flight: bool = False,
+           tool_executing: bool = False,
            stalled_turn_seconds: float = 0.0) -> Verdict:
     """The whole decision, over scalars: no store, no config object, no row (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)"""
     on_activity = status in activity_statuses
@@ -139,6 +147,8 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
         cause = IDLE_MANAGER_CAUSE
     elif turn_in_flight and not silent_turn:
         cause = TURN_IN_FLIGHT_CAUSE
+    elif silent_turn and tool_executing:
+        cause = TOOL_CALL_CAUSE
     if cause:
         # One site composes the sentence
         return Verdict(stuck=False, clock=clock, active_seconds=active,
