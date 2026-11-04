@@ -146,7 +146,7 @@ rejection with no feedback, and it no-ops if the user got there first.
   orders are examined, and a failing one leaves `executing` in the same call that raises
   its flag. No dedupe set.
 * **No notification.** A failed child already pinged the user via `settle_work_order`,
-  and `notify.route_new_inbox` applies no level filter — every inbox row reaches every
+  and `notify.route_new_inbox` applies no level filter — every `push` inbox row reaches every
   sink — so a second row is the same event arriving on the phone twice.
 
 Feature-order attention is NOT re-derived by `invariants.true_blockers` (that function
