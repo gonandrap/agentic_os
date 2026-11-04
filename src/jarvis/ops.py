@@ -6944,6 +6944,19 @@ def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
     return land_when_cleared(store, fresh, panel_cleared=cleared)
 
 
+def lapse_moot_assumptions(store: ProjectStore, wo: dict[str, Any], reason: str) -> bool:
+    """INV-ASSUMPTION-LAPSED's repair on a live order: the review is over, so it lands (issue 1572)"""
+    wo_id, status = wo["id"], str(wo["status"])
+    # Resolved first: an order the OS cannot land keeps its rows and is retried
+    name, path, _ = find_work_order(wo_id)
+    if not store.repair_while(
+            wo_id, status, lambda: store.lapse_moot_assumptions(wo_id, status, reason)):
+        return False
+    if status == "needs_review":
+        _land_after_acceptance(store, path, wo_id, validation_config(name))
+    return True
+
+
 def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any],
                       assumption: dict[str, Any], *, reason: str, model: str,
                       question_id: int, cfg: Any,

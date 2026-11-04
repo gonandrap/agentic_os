@@ -415,6 +415,18 @@ class NeoStore:
              RETURNING id""",
             (db.now(), reason, wo_id, *LAPSABLE_Q_STATUSES)).fetchall()]
 
+    def lapse_questions(self, question_ids: list[int], reason: str) -> list[int]:
+        """Settle these open questions as nobody's ruling (issue 1572, kn-40db1828)"""
+        lapsed: list[int] = []
+        marks = ",".join("?" for _ in LAPSABLE_Q_STATUSES)
+        for question_id in question_ids:
+            lapsed += [int(r["id"]) for r in self.conn.execute(
+                f"""UPDATE questions SET status='lapsed', lapsed_at=?, lapsed_reason=?
+                     WHERE id=? AND status IN ({marks})
+                 RETURNING id""",
+                (db.now(), reason, question_id, *LAPSABLE_Q_STATUSES)).fetchall()]
+        return lapsed
+
     def mark(self, question_id: int, status: str, reason: str = "",
              cause: str = "") -> None:
         # `cause` is ESCALATION_CAUSES or "" for "not recorded" (docs/superpowers/specs/2026-10-01-neo-observability.md)

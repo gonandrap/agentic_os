@@ -2027,8 +2027,52 @@ def check_assumptions_persisted(store: ProjectStore) -> Iterator[Violation]:
             )
 
 
+def _moot_assumption_reason(wo: dict[str, Any], parent: dict[str, Any]) -> str:
+    """Why this child's rows ask for a decision nobody can take any more, or '' (issue 1572)"""
+    if parent.get("kind") == "improvement" and parent.get("plan_wo_id") == wo["id"]:
+        report = db.from_json(parent.get("plan"), None)
+        found = report.get("findings") if isinstance(report, dict) else None
+        accepted = [str(f.get("key")) for f in found or []
+                    if isinstance(f, dict) and f.get("status") == "accepted"]
+        if accepted:
+            return (f"finding {', '.join(accepted)} on {parent['id']} was accepted; "
+                    f"the decision was taken there, and nobody ruled on this row")
+    if parent["status"] in TERMINAL_STATUSES:
+        return (f"its parent {parent['id']} is {parent['status']} and nothing re-derives "
+                f"a settled parent; nobody ruled on this row")
+    return ""
+
+
+def _held_only_by_assumptions(store: ProjectStore, wo: dict[str, Any],
+                              parent: dict[str, Any]) -> bool:
+    """Is a pending row all that holds it, the settled parent's own line aside?"""
+    settled = SETTLED_FEATURE_BLOCKER.format(fo_id=parent["id"], status=parent["status"],
+                                             remedy="")
+    blockers = [b for b in true_blockers(store, wo) if not b.startswith(settled)]
+    return bool(blockers) and all(b.endswith(" pending your review") for b in blockers)
+
+
 def check_ended_orders_hold_no_pending_assumption(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ASSUMPTION-LAPSED — nobody can rule on a row whose order ended (io-d5e62d4d)"""
+    """INV-ASSUMPTION-LAPSED — nobody can rule on a row whose order ended or decision went (issue 1572)"""
+    from .ops import lapse_moot_assumptions
+
+    for wo in store.live_children_with_pending_assumptions():
+        parent = store.get_feature_order(wo["parent_id"])
+        reason = _moot_assumption_reason(wo, parent)
+        if not reason or not _held_only_by_assumptions(store, wo, parent):
+            continue
+        n = len(store.pending_assumptions(wo["id"]))
+        if not getattr(store, "readonly", False) and not lapse_moot_assumptions(
+                store, wo, reason):
+            continue  # it moved under the sweep: the row is ruleable again
+        yield Violation(
+            invariant="INV-ASSUMPTION-LAPSED",
+            wo_id=wo["id"],
+            detail=f"{wo['status']} work order held {n} assumption(s) nobody can answer: "
+                   f"{reason}",
+            repaired=True,
+            repair=f"{n} assumption(s) and their Neo questions lapsed, no verdict recorded",
+        )
     for wo in store.ended_orders_with_pending_assumptions():
         status = str(wo["status"])
         n = len(store.pending_assumptions(wo["id"]))
