@@ -943,8 +943,10 @@ def _drop_as_duplicate(central, kept_id):
 def test_a_dropped_duplicate_waits_on_the_kept_item_through_a_chain(started, project):
     central = CentralStore()
     kept = central.add_backlog("proj_a", "kept")
-    middle = _drop_as_duplicate(central, kept["id"])
+    middle = central.add_backlog("proj_a", "middle", status="proposed")
     first = _drop_as_duplicate(central, middle["id"])
+    central.review_backlog(middle["id"], "dropped", rule="test", note="test",
+                           duplicate_of=kept["id"])
     # both edges land on the kept item: it is waited on, and promoted, once
     b = central.add_backlog("proj_a", "b", depends_on=[first["id"], kept["id"]])
 
@@ -962,8 +964,8 @@ def test_a_dropped_duplicate_waits_on_the_kept_item_through_a_chain(started, pro
 def test_a_dropped_duplicate_takes_the_kept_items_state(started, project, kept_status):
     central = CentralStore()
     kept = central.add_backlog("proj_a", "kept")
-    central.mark_backlog(kept["id"], kept_status)
     copy = _drop_as_duplicate(central, kept["id"])
+    central.mark_backlog(kept["id"], kept_status)
     b = central.add_backlog("proj_a", "b", depends_on=[copy["id"]])
 
     plan = ops.promote_backlog(b["id"], dry_run=True)
@@ -988,7 +990,10 @@ def test_a_duplicate_chain_that_loops_ends_as_dead_edges(started, project):
     central = CentralStore()
     x = central.add_backlog("proj_a", "x", status="proposed")
     y = _drop_as_duplicate(central, x["id"])
-    central.review_backlog(x["id"], "dropped", rule="test", note="test", duplicate_of=y["id"])
+    central.review_backlog(x["id"], "dropped", rule="test", note="test")
+    # review_backlog now refuses a settled target (#1544): only a row older than that can loop
+    central.conn.execute("UPDATE backlog SET duplicate_of=? WHERE id=?", (y["id"], x["id"]))
+    central.conn.commit()
     b = central.add_backlog("proj_a", "b", depends_on=[y["id"]])
 
     plan = ops.promote_backlog(b["id"], dry_run=True)
