@@ -44,6 +44,18 @@
    the key as a different OS user reachable over a unix socket. Accepted residual risk:
    the session bearer token for reads and recording writes IS worker-readable.
 
-7. **Phasing is three steps, read-only first.** Rejected: one big change, because
+7. **A worker holds no credential; its two calls go through a runner-owned forwarder
+   (review round 4).** `jarvis wo ask` and the gate preflight reach the master over a
+   unix socket the runner creates per claimed order; the worker gets only the socket
+   path. The socket accepts `ask` and `gate_preflight` and no other verb, and the
+   runner attaches a per-order scoped token the master minted at claim. The master
+   refuses claim and report presented with that token, and refuses it for another
+   order's id. The runner token never reaches a worker. Rejected: handing the runner
+   token back to the worker (restores the harm the §3.3 strip exists to prevent); a
+   forwarder holding the runner token with verb filtering only (one local bug exposes
+   the whole runner identity). Accepted residual risk: same-user workers can use each
+   other's sockets, costing attribution between orders, not authority.
+
+8. **Phasing is three steps, read-only first.** Rejected: one big change, because
    phases 1 and 2 give a second operator console with no scheduler change and roll
    back by unsetting an environment variable.

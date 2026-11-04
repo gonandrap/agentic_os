@@ -216,6 +216,15 @@ every decision call that does not carry a signature over a fresh master-issued
 challenge, produced by a Keychain key whose use requires a human at the machine. A
 worker has no tty (`kn-e97f6b51`) and cannot answer that prompt.
 
+**The strip leaves two calls without a path, and they need one.** A worker legitimately
+makes exactly two calls to the master: `jarvis wo ask`, and the gate preflight that
+`hooks.handle_hook` runs in the worker's own environment (`kn-ec8463f1`). Both were
+specified as runner-token calls, and §3.3 takes that token away. Left there, every
+Phase 3 preflight fails closed (§3.4) and no worker can reach Neo — and the fix an
+implementer reaches for first is to hand the token back, which restores exactly the
+harm the strip exists to prevent. The path is §3.6, and it is part of the strip, not a
+follow-up to it.
+
 ### 3.4 Hooks: the latency question, answered locally
 
 `hooks.handle_hook()` runs on **every tool call** inside a worker. Routing it to the
@@ -230,7 +239,10 @@ So **hooks stay local and synchronous.** The runner keeps a local
 - **Gates** need the master. Latency is acceptable there and correctness is not
   negotiable: a gate decision is rare, it is already a wait, and one that failed open
   on a network error would be a security hole. A gate request that cannot reach the
-  master **denies**, and says why.
+  master **denies**, and says why. The hook does not reach the master directly — it
+  has no credential to do so (§3.3) — it goes through the runner's forwarder (§3.6),
+  and a forwarder that is down is the same thing as a master that is unreachable:
+  deny.
 
 Everything else a hook writes is a report, and reports batch: the runner flushes
 events to the master on its report tick.
@@ -246,9 +258,9 @@ routing every hook write, trades a worker-blocking failure mode for tidiness.
 | `jarvis learn search/show`, `backlog list`, `inbox`, `status`, `wo list/show`, `cost`, `search`, `gate list/show` | master, via RPC | operator session |
 | `jarvis learn add`, `backlog add/promote`, `wo create/send`, `fo`/`io`/`do`/`mo` creation, `bug report` | master, via RPC | operator session |
 | **`jarvis gate approve/deny`, `wo review/ack/done`, `fo approve`, `io review`, `neo answer/review/retract`, `learn retract`, `config set`** | master, via RPC | **operator presence key — a runner token is refused, and so is a session token alone** |
-| `jarvis wo ask` (a worker's question to Neo) | master, via RPC | runner |
-| gate preflight for a privileged action — *asking*, never deciding | master, via RPC; **deny on failure** | runner |
-| runner claim and report | master, via RPC | runner |
+| `jarvis wo ask` (a worker's question to Neo) | worker → runner forwarder → master (§3.6) | **per-order scoped token, added by the runner; the worker holds none** |
+| gate preflight for a privileged action — *asking*, never deciding | worker → runner forwarder → master (§3.6); **deny on failure** | **per-order scoped token, added by the runner; the worker holds none** |
+| runner claim and report | master, via RPC | runner token — **a scoped token is refused** |
 | hook event recording, turn capture, worker spawn, worktree creation, git | runner, locally | none |
 | `jarvis ui` | master only | operator |
 
@@ -257,6 +269,44 @@ user's behalf** needs a signature from the presence key, and the master refuses 
 when the caller presents only a runner token or only a session token. The first two
 rows ride a bearer token that a worker on the runner can read; §5.1 states that
 plainly and bounds what it is worth.
+
+### 3.6 How a worker reaches the master without a credential
+
+A worker holds no token at all. `JARVIS_RUNNER_TOKEN` is stripped (§3.3), and the
+operator credentials are the user's, not the machine's. Its two legitimate calls go
+through a **forwarder the runner owns**:
+
+- The runner listens on a **unix socket** it creates at spawn time, one per claimed
+  order, and passes only its **path** to the worker (`JARVIS_RUNNER_SOCKET`). A path
+  is not a credential: holding it grants nothing the forwarder does not choose to do.
+- The socket accepts exactly **two verbs**: `ask` and `gate_preflight`. Anything
+  else — claim, report, any ops call, any passthrough or "forward this request" verb —
+  is refused by the forwarder and not forwarded. **The forwarder has no general
+  proxy mode;** that is the whole point of it being a forwarder rather than a tunnel.
+- The runner attaches the credential itself. The request the master sees carries a
+  **per-order scoped token** the master minted at claim time (§3.3), bound to that
+  order's id, valid only for `ask` and `gate_preflight`, and expiring when the order
+  reaches a terminal state. **The master refuses claim and report presented with a
+  scoped token**, and refuses a scoped token for an order id other than the one it
+  was minted for. That refusal is server-side, so it holds even if the forwarder is
+  wrong or is replaced.
+- **The runner token itself never reaches a worker** — not in its environment, not in
+  a file in its worktree, and not in a forwarder response. A worker never sees a
+  credential of any kind.
+
+Why both halves. The socket is what keeps a secret out of the worker; the scoped token
+is what makes the restriction real at the master instead of a promise by the runner. A
+forwarder that simply held the runner token and filtered verbs would put the whole
+runner identity behind one local bug.
+
+**The residual risk, stated.** Every worker on a runner is the same OS user, so one
+worker can connect to another order's socket and ask Neo a question, or raise a
+preflight, in that order's name. The scoped token bounds the damage to the two verbs:
+no claiming, no reporting, no decision. The loss is attribution between orders on one
+machine, not authority — and a preflight raised under the wrong order id still ends at
+a human or Neo deciding the gate. Narrowing it further means per-worker authentication
+to its own runner, which is the same same-user problem as §5.1 and is not worth the
+machinery for an ask.
 
 ## 4. The seam in the code
 
@@ -284,7 +334,7 @@ the error is an `OpsError`.
   local writes. It reports the outage and stops claiming. Split-brain is the one
   failure this design must never produce, and a local write queue is how you get it.
 
-### 5.1 Three credentials, because file permissions are not a barrier against a worker
+### 5.1 Four credentials, because file permissions are not a barrier against a worker
 
 **Start from what does not work.** Review round 1 produced a two-credential design
 whose operator credential was a bearer token in `$JARVIS_HOME/credentials.json` at
@@ -307,7 +357,7 @@ three surfaces:
 | Issued by | `jarvis runner add <name>` on the master | `jarvis login`, one per (human, machine) | `jarvis login --enrol`, same moment |
 | Held as | `JARVIS_RUNNER_TOKEN`, stripped from workers (§3.3) | `$JARVIS_HOME/credentials.json`, mode 0600 | a private key in the macOS Keychain, created with `kSecAccessControlUserPresence`; the key material never leaves the Secure Enclave and every use raises a Touch ID / password prompt |
 | Readable by a worker | no, once stripped | **yes — assume it is compromised** | **no: the key cannot be exported, and a use needs a human at the machine** |
-| Authorises | claim, report, `wo ask`, gate preflight (asking) | reads, and writes that only *record* something | every **decision** row of §3.5 |
+| Authorises | claim and report, and nothing else — **not `wo ask`, not gate preflight**, which take the forwarder and a scoped token (§3.6) | reads, and writes that only *record* something | every **decision** row of §3.5 |
 | Revoked by | `jarvis runner revoke <name>` | `jarvis logout --runner <name>` | `jarvis operator revoke <name>` — the master forgets the public key |
 | Stored on master as | a hash in `os_state` | a hash in `os_state`, with issue time and last use | the enrolled **public** key, with issue time and last use |
 
@@ -364,6 +414,13 @@ read.
 The operator credentials are deliberately **not** derived from the runner's identity:
 a runner that is fully compromised can still only claim, report, read and record.
 
+**A fourth credential, and it is the weakest on purpose: the per-order scoped token**
+of §3.6. The runner holds it, never the worker; it authorises `ask` and
+`gate_preflight` for one order id and nothing else; the master refuses claim and
+report presented with it, and refuses it for any other order. It exists so that a
+worker needs no credential at all, and so that the restriction is enforced where it
+can be trusted — at the master — rather than by the forwarder being correct.
+
 ### 5.2 The alternative, and why it is the fallback rather than the design
 
 Approvals could instead be restricted to the master's dashboard — no operator
@@ -417,8 +474,16 @@ If the presence key slips, those rows stay on the master's UI (§5.2) and Phase 
 without them; the recording writes may still ship on the session token.
 
 **Phase 3 — runners execute.** `project_runners`, `assigned_runner`, the claim/report
-protocol, local hooks with remote gates, the stalled-runner symptom. This is where
-the development speed-up the order asks for actually arrives.
+protocol, local hooks with remote gates, the forwarder and the per-order scoped token
+of §3.6, the stalled-runner symptom. This is where the development speed-up the order
+asks for actually arrives.
+
+Phase 3 does not ship without a test that **a worker going through the forwarder
+cannot claim or report**: it asserts that the forwarder refuses every verb but `ask`
+and `gate_preflight`, and that the master refuses a claim and a report presented with
+a per-order scoped token. The companion test from §3.3 — `JARVIS_RUNNER_TOKEN` absent
+from a spawned worker's environment — is what makes the first one meaningful, so they
+land together.
 
 Phase 1 is mechanical. Phase 2 is not: the presence key is the one piece of this
 design with no precedent in the codebase, and it should be built and tested on its own
