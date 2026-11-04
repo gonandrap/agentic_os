@@ -14632,7 +14632,7 @@ def cost_report(project: str | None = None, target: str | None = None,
     # Dearest first, counting what Jarvis spent on the order as part of what it cost
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
     listed = {u["id"] for u in units}
-    # In a window, a call naming an order no store still holds is declared too, or the meter outruns the list
+    # A call naming an order no store holds is declared too, or the meter outruns the list
     unattributed = (_os_spend([g for wo_id, group in os_groups.items()
                                if wo_id not in listed for g in group])
                     if window else _os_unattributed(os_groups))
