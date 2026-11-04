@@ -354,7 +354,7 @@ def throttled(cfg: EvolutionConfig, counts: Mapping[str, tuple[int, int]]) -> se
 
 
 def evolution_for(catalog: Catalog, project: str) -> EvolutionConfig:
-    """The settings in force for `project`, against the one fleet-wide ledger; the fleet's if it is not catalogued"""
+    """The settings in force for `project`, else the fleet's; spend is still fleet-wide"""
     for spec in getattr(catalog, "projects", []) or []:
         if spec.name == project:
             return spec.evolution
@@ -508,7 +508,7 @@ def ask_body(c: Candidate, reason: str, decision_id: int, catalog: Catalog) -> s
 
 
 def ceiling_key(origin_kind: str, project: str = "") -> str:
-    """The config key that lifts the spent ceiling behind an `ask` of this kind: a project's own wins"""
+    """The config key that lifts the ceiling behind an `ask` of this kind"""
     leaf = "bug_weekly_usd" if track_of(origin_kind) == "bug" else "critical_weekly_usd"
     return f"projects.{project}.evolution.{leaf}" if project else f"os.evolution.{leaf}"
 

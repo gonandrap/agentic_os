@@ -1,4 +1,4 @@
-"""A project's value beats the fleet's: docs/superpowers/specs/2026-11-04-project-config-takes-precedence.md"""
+"""A project's value beats the fleet's (docs/superpowers/specs/2026-11-04-project-config-takes-precedence.md)"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from jarvis import ops
 from jarvis.catalog import ProjectSpec, parse_catalog
 from jarvis.daemon import Daemon
 
-#: Fleet reads of a block a project can override, and why each has no project to ask (spec's table)
+#: Fleet reads of a block a project can override, and why each has no project to ask
 FLEET_READS = {
     # `project=None` branches and not-catalogued fallbacks of the scoped accessors
     ("ops.py", "concision"), ("ops.py", "validation"), ("ops.py", "rules"),
@@ -41,7 +41,7 @@ def _fleet_reads() -> set[tuple[str, str]]:
 
 
 def test_no_new_code_reads_a_per_project_block_off_the_fleet():
-    """`catalog.os.<block>` silently ignores a project's value: read the project's, or refuse it there"""
+    """`catalog.os.<block>` ignores a project's value: read the project's, or refuse the key"""
     assert _fleet_reads() <= FLEET_READS, "read the project's block, or refuse the key on a project"
 
 
