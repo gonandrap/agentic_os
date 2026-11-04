@@ -766,6 +766,14 @@ def alarm_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
             and not (a["neo_question_id"] and _neo_still_deciding(a["neo_question_id"]))]
 
 
+def surfaced_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
+    """What a flag may say: on a completed or cancelled order, never its assumptions (io-d5e62d4d)"""
+    blockers = true_blockers(store, wo)
+    if wo["status"] in TERMINAL_STATUSES:
+        return [b for b in blockers if not _mentions_assumptions(b)]
+    return blockers
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone"""
@@ -1968,7 +1976,9 @@ def _unflagged_blocked_orders(store: ProjectStore) -> Iterator[tuple[dict[str, A
                if a["status"] in TERMINAL_STATUSES and not a["needs_attention"]}
     for wo_id in settled:
         wo = store.get_work_order(wo_id)
-        yield wo, [b for b in alarm_blockers(store, wo) if b not in acknowledged(wo)]
+        blockers = surfaced_blockers(store, wo)
+        if set(blockers) & set(alarm_blockers(store, wo)):
+            yield wo, blockers
 
 
 def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
@@ -4430,6 +4440,32 @@ def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+INV_FIX_GAP_UNREGISTERED = "INV-FIX-GAP-UNREGISTERED"
+
+
+def check_fix_registered_its_gap(store: ProjectStore) -> Iterator[Violation]:
+    """INV-FIX-GAP-UNREGISTERED — a completed GAP fix left its class out of `gaps.py` (io-38a4354f)"""
+    from . import gaps
+    from .bugreport import VERDICT_GAP_CLASS_KEY
+
+    rows = store.conn.execute(
+        "SELECT id, metadata FROM work_orders WHERE status='completed' "
+        "AND instr(metadata, ?) > 0", (VERDICT_GAP_CLASS_KEY,)).fetchall()
+    for row in rows:
+        metadata = db.from_json(row["metadata"], {}) or {}
+        gap_class = str(metadata.get(VERDICT_GAP_CLASS_KEY) or "")
+        if not gap_class or gaps.registered(gap_class) or store.work_abandoned(row["id"]):
+            continue
+        yield Violation(
+            invariant=INV_FIX_GAP_UNREGISTERED,
+            wo_id=row["id"],
+            detail=(f"completed, but gap class `{gap_class}` its verdict named is not "
+                    f"registered in src/jarvis/gaps.py, so the detector and remedy it owed "
+                    f"are unproven: register them or file the follow-up"),
+            context={"gap_class": gap_class},
+        )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
                                    # reading, repairing nothing and touching no flag any other check derives
@@ -4503,6 +4539,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 #: Invariants whose cost scales with the SETTLED BACKLOG rather than with live work
 SLOW_INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_work_lands,
+    check_fix_registered_its_gap,  # population: every completed order, like the one above
     check_spec_pointer_resolves,  # both properties of this class and neither of the fast
                                   # one: its population is every feature order a project has ever had
 )

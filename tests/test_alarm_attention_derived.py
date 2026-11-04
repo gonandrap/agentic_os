@@ -115,7 +115,44 @@ def test_a_settled_order_gains_a_flag_for_its_alarm_only(store):
     """Pending assumptions on a settled order stay unraised: the complaint behind io-d5e62d4d"""
     wo_id = _order(store, "completed")
     store.add_assumption(wo_id, "an assumption")
+    alarm = store.add_alarm(wo_id, "long-turn", 1, "a long turn", status="escalated")
 
     check_project(store, repair=True)
+
+    assert store.get_work_order(wo_id)["attention_reason"] == supervisor.ALARM_BLOCKER.format(
+        alarm_id=alarm["id"])
+
+    ops.review_alarm(alarm["id"], approved=True)
+
+    assert store.get_work_order(wo_id)["needs_attention"] == 0
+    check_project(store, repair=True)
+    assert store.get_work_order(wo_id)["needs_attention"] == 0
+
+
+def test_an_alarm_free_settled_order_is_not_raised_for_its_assumptions(store):
+    wo_id = _order(store, "completed")
+    store.add_assumption(wo_id, "an assumption")
+
+    check_project(store, repair=True)
+
+    assert store.get_work_order(wo_id)["needs_attention"] == 0
+
+
+def test_reviewing_one_of_two_alarms_on_a_settled_order_hands_the_flag_over(store):
+    wo_id = _order(store, "completed")
+    alarms = [store.add_alarm(wo_id, "long-turn", seq, "a long turn", status="escalated")
+              for seq in (1, 2)]
+
+    check_project(store, repair=True)
+
+    named, other = (alarms if store.get_work_order(wo_id)["attention_reason"]
+                    == supervisor.ALARM_BLOCKER.format(alarm_id=alarms[0]["id"])
+                    else reversed(alarms))
+    ops.review_alarm(named["id"], approved=True)
+
+    assert store.get_work_order(wo_id)["attention_reason"] == supervisor.ALARM_BLOCKER.format(
+        alarm_id=other["id"])
+
+    ops.review_alarm(other["id"], approved=True)
 
     assert store.get_work_order(wo_id)["needs_attention"] == 0

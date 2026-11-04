@@ -90,6 +90,7 @@ from .project_store import (
     PR_PENDING_EVENT,
     SETTLE_BY_FINISH,
     SETTLE_IN_SESSION,
+    REFUSED_ARTIFACT_EVENT,
     SUBMITTED_ARTIFACT_EVENT,
     TERMINAL_STATUSES,
     WORKER_CHILDREN,
@@ -6725,13 +6726,13 @@ def select_inbox(items: list[dict[str, Any]], *, level: str = "", project: str =
 
 def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Put down an attention flag the OS raised for ITSELF, acknowledging nothing"""
-    from .invariants import true_blockers
+    from .invariants import surfaced_blockers
 
     name, path, _ = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
     try:
         wo = store.get_work_order(wo_id)
-        blockers = true_blockers(store, wo)
+        blockers = surfaced_blockers(store, wo)
         if blockers:
             # Only when it would actually change: `flag_attention` writes a timeline row every call
             if not wo["needs_attention"] or wo.get("attention_reason") != blockers[0]:
@@ -9214,6 +9215,9 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
                     expected=verdict["proposed_fix"]["expected"],
                     actual=verdict["proposed_fix"]["actual"],
                     priority=verdict["proposed_fix"]["priority"],
+                    gap_class=verdict["gap_class"],
+                    detector=verdict["proposed_fix"]["detector"],
+                    remedy=verdict["proposed_fix"]["remedy"],
                     project=name, wo_id=fo.get("plan_wo_id") or "",
                     # Neo agreeing plus the steward starts it, through the triage question (#1344)
                     expedite=False, investigation={
@@ -9294,6 +9298,24 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
             if settled is not None:
                 out["investigator"] = settled
     return out
+
+
+def record_refused_artifact(kind: str, source: Path) -> None:
+    """The submitting session's own refused file is OS-ordered, so the prune can find it (#1538)"""
+    wo_id = os.environ.get(WORKER_SESSION_ENV)
+    if not wo_id:
+        return
+    try:
+        _, path, wo = find_work_order(wo_id)
+    except OpsError:
+        return  # the refusal itself must still reach the caller
+    if str(wo.get("kind") or "worker") != kind:
+        return  # only this kind was told to submit; any other's file may be real work
+    store = ProjectStore(path)
+    try:
+        store.add_event(wo_id, REFUSED_ARTIFACT_EVENT, {"path": str(source)})
+    finally:
+        store.close()
 
 
 def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
