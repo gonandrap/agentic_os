@@ -72,11 +72,11 @@
 </div>
 
 {% if item.status == 'open' %}
-<form class="inline" method="post" action="/backlog/promote/{{ item.id }}" style="margin-top:12px">
-  {% if item.blockers %}<span class="sub tone-warn">◭ {{ item.blockers | length }} unfinished</span>
-  <label class="sub"><input type="checkbox" name="force" value="1"> force</label>{% endif %}
+<form class="inline" method="post" action="/backlog/promote/{{ item.id }}" data-promote-plan="/backlog/{{ item.id }}/promote-plan" style="margin-top:12px">
+  {% if item.blockers %}<span class="sub tone-warn">◭ {{ item.blockers | length }} unfinished</span>{% endif %}
   <button {{ 'class=primary' if not item.blockers }}>Promote</button>
 </form>
+{% include "_promote_dialog.html" %}
 {% endif %}
 
 <p class="sub"><a href="/backlog">all backlog items</a> · from a terminal:

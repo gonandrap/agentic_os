@@ -89,9 +89,9 @@ a DECISION order ("do"): the deliverable is information for YOUR decision, not c
 
 show renders the report and the orders already filed from it. send asks the researcher for more; the order stays open and flagged. follow-up <id> <key>|--all files proposed orders as ordinary independent orders with a back-link, and leaves the order open. done [--note "what you decided"] and cancel are the only two closes, and only from your own session — an agent session is refused. The dashboard page `/do/<project>/<id>` has the same buttons, calling the same functions.
 
-## `jarvis backlog promote <id> --as feature`
+## `jarvis backlog promote <id> [--as feature] [--yes]`
 
-intake -> feature order, not a work order
+Intake -> orders: the item and every open dependency, each of its `suggested_kind`; `--as` overrides the item's own. More than one member needs `--yes`. A work order waits on its dependencies through `bl-` holds; a feature order cannot wait, so one with unsettled dependencies is refused. A dropped, missing, proposed or quarantined dependency refuses the whole promotion.
 
 ## `jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>`
 

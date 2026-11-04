@@ -342,20 +342,32 @@ def test_gate_escalation_decided_in_the_browser(page, gated_server, gated_daemon
     assert page.locator(".attention .quiet").is_visible()  # and the strip goes quiet
 
 
-def test_backlog_promote_blocked_then_forced(page, server, project):
+def test_backlog_promote_lists_the_closure_in_a_dialog(page, server, project):
     from jarvis.central_store import CentralStore
     central = CentralStore()
     try:
         dep = central.add_backlog("proj_a", "the foundation")
         item = central.add_backlog("proj_a", "the tower", depends_on=[dep["id"]])
+        page.goto(f"{server}/backlog")
+        assert "the tower" in page.locator("body").inner_text()
+        row = page.locator(f"form[action='/backlog/promote/{item['id']}']").first
+
+        row.locator("button:has-text('Promote')").click()
+        dialog = page.locator("#promote-dialog")
+        dialog.locator("td", has_text="the foundation").wait_for()
+        assert dep["id"] in dialog.inner_text() and item["id"] in dialog.inner_text()
+
+        dialog.locator("button:has-text('Cancel')").click()
+        assert not dialog.is_visible()
+        assert central.get_backlog(item["id"])["status"] == "open"
+
+        row.locator("button:has-text('Promote')").click()
+        dialog.locator("button:has-text('Confirm')").click()
+        page.wait_for_url("**/wo/proj_a/**")
+        assert central.get_backlog(dep["id"])["status"] == "promoted"
+        assert central.get_backlog(item["id"])["status"] == "promoted"
     finally:
         central.close()
-    page.goto(f"{server}/backlog")
-    assert "the tower" in page.locator("body").inner_text()
-    # promote the blocked item → error flash names the blocker
-    row = page.locator(f"form[action='/backlog/promote/{item['id']}']").first
-    row.locator("button:has-text('Promote')").click()
-    assert "unfinished dependencies" in page.locator(".error-flash").inner_text()
 
 
 def test_inbox_ack_in_browser(page, server, daemon, project):

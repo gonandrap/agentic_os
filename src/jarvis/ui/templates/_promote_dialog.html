@@ -1,0 +1,54 @@
+{# docs/superpowers/specs/2026-11-03-backlog-operability.md §7.3. The server refuses an
+   unconfirmed multi-member POST, so a failed plan fetch just submits and gets the flash. #}
+<dialog id="promote-dialog" style="width: min(800px, 95vw); max-height: 90vh; background: var(--surface);
+  color: var(--ink); border: 1px solid var(--line);">
+  <div class="row"><span class="grow" id="promote-dialog-note"></span></div>
+  <div class="table-wrap">
+    <table>
+      <tr><th>id</th><th>title</th><th>kind</th><th>project</th></tr>
+      <tbody id="promote-dialog-rows"></tbody>
+    </table>
+  </div>
+  <div class="row">
+    <span class="grow"></span>
+    <button type="button" id="promote-dialog-cancel">Cancel</button>
+    <button type="button" class="primary" id="promote-dialog-confirm">Confirm</button>
+  </div>
+</dialog>
+<script>
+(function () {
+  var modal = document.getElementById("promote-dialog");
+  var rows = document.getElementById("promote-dialog-rows");
+  var pending = null;
+  document.addEventListener("submit", function (ev) {
+    var form = ev.target;
+    if (!form.matches("form[data-promote-plan]")) { return; }
+    ev.preventDefault();
+    fetch(form.dataset.promotePlan).then(function (r) { return r.json(); }).then(function (out) {
+      if (!out.plan || out.plan.length < 2) { form.submit(); return; }
+      rows.textContent = "";
+      out.plan.forEach(function (m) {
+        var tr = rows.insertRow();
+        [m.id, m.title, m.kind, m.project].forEach(function (text) {
+          tr.insertCell().textContent = text;  // titles are text workers wrote
+        });
+      });
+      document.getElementById("promote-dialog-note").textContent =
+        "This creates " + out.plan.length + " orders, dependencies first:";
+      pending = form;
+      modal.showModal();
+    }).catch(function () { form.submit(); });
+  });
+  document.getElementById("promote-dialog-cancel").addEventListener("click", function () {
+    modal.close();
+  });
+  document.getElementById("promote-dialog-confirm").addEventListener("click", function () {
+    var flag = document.createElement("input");
+    flag.type = "hidden";
+    flag.name = "confirm";
+    flag.value = "1";
+    pending.appendChild(flag);
+    pending.submit();
+  });
+})();
+</script>

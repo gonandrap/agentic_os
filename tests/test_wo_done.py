@@ -86,7 +86,7 @@ def test_mark_done_leaves_the_workers_own_summary_alone(started, project):
 def test_mark_done_closes_the_backlog_item_it_came_from(started, project):
     central = CentralStore()
     item = central.add_backlog("proj_a", "tidy the parser")
-    result = ops.promote_backlog(item["id"], force=True)
+    result = ops.promote_backlog(item["id"])
 
     ops.mark_done(result["wo_id"])
 

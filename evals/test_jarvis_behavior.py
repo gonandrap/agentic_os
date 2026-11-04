@@ -265,18 +265,17 @@ def test_feedback_unknown_wo(fleet):
 
 # -- 4. safety rails
 
-@scenario("jarvis/safety-rails", "backlog promotion blocks on unfinished dependencies")
+@scenario("jarvis/safety-rails", "backlog promotion refuses a dependency it cannot promote")
 def test_backlog_dependency_rail(fleet):
     central = CentralStore()
     try:
         dep = central.add_backlog("proj_a", "foundation")
         item = central.add_backlog("proj_a", "tower", depends_on=[dep["id"]])
+        central.mark_backlog(dep["id"], "dropped")
     finally:
         central.close()
-    with pytest.raises(ops.OpsError, match="unfinished dependencies"):
+    with pytest.raises(ops.OpsError, match=dep["id"]):
         ops.promote_backlog(item["id"])
-    forced = ops.promote_backlog(item["id"], force=True)
-    assert forced["forced_over_blockers"] == [dep["id"]]
 
 
 @scenario("jarvis/safety-rails", "completing a promoted work order closes its backlog item")
