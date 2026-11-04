@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import sqlite3
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -13,6 +14,11 @@ from typing import Any
 
 from . import db, release
 from .paths import project_db_path
+
+log = logging.getLogger(__name__)
+
+#: Not `failed`: `wo retry` can resume that order, and its question with it (io-d5e62d4d)
+QUESTION_LAPSING_STATUSES = ("completed", "cancelled")
 
 # Work order lifecycle
 WO_STATUSES = (
@@ -270,6 +276,16 @@ WO_KIND_CONTRACTS: dict[str, KindContract] = {
 def kind_contract(wo: Mapping[str, Any]) -> KindContract:
     """The contract row for this work order's kind"""
     return WO_KIND_CONTRACTS[str(wo.get("kind") or "worker")]
+
+
+def settles_idle(wo: Mapping[str, Any]) -> bool:
+    """Does this kind idle between messages, never finishing?"""
+    return kind_contract(wo).route == SETTLE_IDLE
+
+
+def turn_end_is_delivery(wo: Mapping[str, Any]) -> bool:
+    """An idle manager has delivered: it never reaches `needs_review` (io-d5e62d4d)"""
+    return settles_idle(wo) and wo.get("status") == "idle"
 
 
 def submission_artifacts(wo: Mapping[str, Any]) -> tuple[str, ...]:
@@ -2162,6 +2178,27 @@ class ProjectStore:
                 "order_kind='wo' ORDER BY ts DESC, id DESC LIMIT 1", (wo_id,)).fetchone()
             assert tail is not None and tail["to_status"] == status, (
                 f"{wo_id} moved to {status!r} without a span beside it")
+        if status in QUESTION_LAPSING_STATUSES:
+            try:
+                self.lapse_open_questions(wo_id, status)
+            except Exception:  # noqa: BLE001 — a close never fails on Neo's DB; INV-NEO-QUESTION-LAPSED repairs it
+                log.exception("%s: could not lapse its open Neo questions", wo_id)
+
+    def lapse_open_questions(self, wo_id: str, status: str) -> list[int]:
+        """An ended order's open questions lapse, on Neo's DB and this record (io-d5e62d4d)"""
+        from .neo_store import NeoStore
+
+        why = (f"work order {wo_id} reached {status} before this was answered; "
+               f"nobody ruled on it")
+        neo = NeoStore()
+        try:
+            lapsed = neo.lapse_worker_questions(wo_id, why)
+        finally:
+            neo.close()
+        for question_id in lapsed:
+            self.add_event(wo_id, "question_lapsed",
+                           {"question_id": question_id, "reason": why})
+        return lapsed
 
     def _status_of(self, table: str, order_id: str) -> str:
         """The status an order is in right now, '' when the row is not there"""
@@ -2274,6 +2311,20 @@ class ProjectStore:
             "SELECT * FROM wo_alarms WHERE kind=? ORDER BY ts DESC LIMIT 1",
             (kind,)).fetchone()
         return dict(row) if row else None
+
+    def standing_alarms(self, kind: str, gap_seconds: float) -> list[dict[str, Any]]:
+        """One kind's rows still chained to now, OLDEST first (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)"""
+        rows = self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE kind=? ORDER BY ts DESC", (kind,)).fetchall()
+        chain: list[dict[str, Any]] = []
+        later = db.now()
+        for row in rows:
+            if later - float(row["ts"] or 0.0) >= gap_seconds:
+                break
+            chain.append(dict(row))
+            later = float(row["ts"] or 0.0)
+        chain.reverse()
+        return chain
 
     def latest_settled_order(self) -> dict[str, Any] | None:
         """The most recently settled work order, as a CARRIER and nothing more"""

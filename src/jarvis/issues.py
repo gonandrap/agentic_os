@@ -669,8 +669,13 @@ def self_dispatch_configured() -> bool:
 FILED_BY_KEY = "filed_by"
 #: `WORK_ORDER_BRIEF`'s `why` for a bug the steward dispatched
 STEWARD_WHY = """\
-This bug is `{priority}`, reported by work order {filed_by} and started by the steward \
+This bug is `{priority}`, reported by {filed_by} and started by the steward \
 within the OS's own budget."""
+
+
+def _reporter(filed_by: str) -> str:
+    """A filing's author in words: the OS's own passes are not work orders"""
+    return f"work order {filed_by}" if filed_by.startswith("wo-") else filed_by
 
 
 def steward_note(decision: Any, wo_id: str, public: bool = False) -> str:
@@ -722,7 +727,7 @@ def steward_why(held: dict[str, Any]) -> str:
     priority, filed_by = str(held.get("priority") or ""), str(held.get(FILED_BY_KEY) or "")
     if not filed_by or dispatches(priority):
         return ""
-    return STEWARD_WHY.format(priority=priority, filed_by=filed_by)
+    return STEWARD_WHY.format(priority=priority, filed_by=_reporter(filed_by))
 
 
 def route_filing(issue_url: str, title: str, body: str, priority: str,
@@ -793,7 +798,8 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
         out["steward_dispatched"] = bool(out["wo_id"])
         out["reason"] = f"`{priority}` filed by {filed_by} — {steward_note(decision, out['wo_id'])}"
         try:
-            comment(issue_url, f"Reported by a work order: "
+            who = "a work order" if filed_by.startswith("wo-") else filed_by
+            comment(issue_url, f"Reported by {who}: "
                                f"{steward_note(decision, out['wo_id'], public=True)}.")
         except GitHubError as e:
             out["comment_error"] = str(e)

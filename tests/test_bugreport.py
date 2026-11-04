@@ -218,6 +218,24 @@ def test_report_returns_the_issue_url(reporting):
     assert result["title"] == "t"
 
 
+def test_a_quiet_filing_tells_nobody_and_names_its_filer(reporting, monkeypatch):
+    from jarvis import issues
+
+    seen: dict = {}
+    monkeypatch.setattr(bugreport, "_route", lambda *a, **k: seen.update(k) or {})
+    told: list = []
+    monkeypatch.setattr(bugreport, "_notify", lambda *a, **k: told.append(a))
+
+    bugreport.report_bug(title="t", description="d", expected="e", actual="a", priority="high",
+                         filed_by="the meter reconciliation", notify=False)
+
+    assert told == []
+    assert seen["filed_by"] == "the meter reconciliation"
+    why = issues.steward_why({"priority": "high", "filed_by": "the meter reconciliation"})
+    assert "reported by the meter reconciliation" in why
+    assert "work order wo-1" in issues.steward_why({"priority": "high", "filed_by": "wo-1"})
+
+
 def test_report_targets_an_overridable_repo(reporting, monkeypatch):
     monkeypatch.setenv(bugreport.BUG_REPO_ENV, "someone/elsewhere")
     bugreport.report_bug(title="t", description="d", expected="e", actual="a", priority="low")

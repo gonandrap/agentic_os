@@ -2155,6 +2155,112 @@ def test_a_background_task_excuses_only_a_running_order_inside_the_stall_limit(
     assert "past the point the OS" in rows[stalled["id"]].reason
 
 
+def test_a_tool_call_in_flight_past_the_threshold_is_not_stuck():
+    """Issue 1556: wo-1ce051b0, 5m42s inside one Bash call"""
+    from jarvis import stuck
+
+    judged = stuck.assess("running", 342, 342, 0.0, {"running": 5 * 60}, HOUR,
+                          turn_in_flight=True, tool_executing=True)
+
+    assert judged.stuck is False
+    assert judged.excluded == stuck.TOOL_CALL_CAUSE
+    assert judged.reason == stuck.EXCLUSION_REASON[stuck.TOOL_CALL_CAUSE]
+
+
+def test_an_open_tool_call_excludes_only_a_running_order_with_a_live_turn():
+    """Issue 1556: a dead turn leaves its span open for ever (kn-73bcc2dd)"""
+    from jarvis import stuck
+
+    no_turn = stuck.assess("running", 342, 342, 0.0, {"running": 5 * 60}, HOUR,
+                           tool_executing=True)
+    parked = stuck.assess("idle", 2 * HOUR, 2 * HOUR, 0.0, {"idle": HOUR}, HOUR,
+                          tool_executing=True)
+    stalled = stuck.assess("running", 7 * HOUR, 7 * HOUR, 0.0, {"running": 5 * 60}, HOUR,
+                           tool_executing=True, stalled_turn_seconds=7 * HOUR)
+
+    for verdict in (no_turn, parked, stalled):
+        assert verdict.stuck is True and verdict.excluded == ""
+
+
+def _transcript(store, wo_id: str, rows: list[dict], at: float) -> None:
+    """A session file for one order, its mtime `at`: a fresh mtime would reset the activity clock"""
+    import os
+    import uuid
+    from datetime import datetime, timezone
+
+    from jarvis import claude_cli
+
+    session = str(uuid.uuid4())
+    store.update_work_order(wo_id, session_id=session)
+    path = claude_cli.session_transcript_path(store.project_path, session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps({
+        "type": row["type"],
+        "timestamp": datetime.fromtimestamp(row["ts"], timezone.utc).isoformat(),
+        "message": {"content": [row["block"]]}}) + "\n" for row in rows))
+    os.utime(path, (at, at))
+
+
+def _use(tool_id: str, ts: float) -> dict:
+    return {"type": "assistant", "ts": ts,
+            "block": {"type": "tool_use", "id": tool_id, "name": "Bash", "input": {}}}
+
+
+def _result(tool_id: str, ts: float) -> dict:
+    return {"type": "user", "ts": ts,
+            "block": {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}}
+
+
+def test_one_long_tool_call_buys_no_investigation(stuck_os, tmp_path, monkeypatch):
+    """Issue 1556: every order here has a turn in flight, silent 12 minutes on every clock"""
+    from jarvis import stuck
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    store = stuck_os["store"]
+
+    def parked(title: str, rows) -> str:
+        wo = ops.create_work_order("proj_a", title)
+        at = park_order(store, wo["id"], "running", hours=0.2)
+        running_turn(store, wo["id"], started=at)
+        _transcript(store, wo["id"], rows(at), at)
+        return wo["id"]
+
+    executing = parked("inside one pytest run", lambda at: [_use("t1", at + 1)])
+    parallel = parked("one of two parallel calls still out", lambda at: [
+        _use("t1", at + 1), _use("t2", at + 1), _result("t2", at + 2)])
+    returned = parked("the call came back, the model hung", lambda at: [
+        _use("t1", at + 1), _result("t1", at + 2)])
+    stale = parked("a span left open by the turn before this one", lambda at: [
+        _use("t1", at - 60)])
+
+    stuck_os["daemon"].stuck_tick(None)
+
+    assert not ops.live_investigation("proj_a", executing)
+    assert not ops.live_investigation("proj_a", parallel)
+    assert ops.live_investigation("proj_a", returned)
+    assert ops.live_investigation("proj_a", stale)
+    # The anti-`continue` assertion: an excluded row is still a judged row
+    rows = {r["wo"]["id"]: r["verdict"] for r in _judged(store, db.now())}
+    assert rows[executing].excluded == stuck.TOOL_CALL_CAUSE
+    assert rows[executing].stuck is False
+    assert rows[returned].excluded == ""
+
+
+def test_a_tool_call_past_the_stall_ceiling_is_stuck(stuck_os, tmp_path, monkeypatch):
+    """Issue 1556: the wo-803a3d37 hole stays shut — one call does not excuse 13 hours"""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    store = stuck_os["store"]
+    wo = ops.create_work_order("proj_a", "13 hours inside one call")
+    at = park_order(store, wo["id"], "running", hours=13)
+    running_turn(store, wo["id"], started=at)
+    _transcript(store, wo["id"], [_use("t1", at + 1)], at)
+
+    row = [r for r in _judged(store, db.now()) if r["wo"]["id"] == wo["id"]][0]
+
+    assert row["verdict"].stuck is True
+    assert row["verdict"].excluded == ""
+
+
 def test_a_live_turn_outside_running_is_still_judged(stuck_os):
     """§6: a `needs_review` wait is owed by the USER"""
     store = stuck_os["store"]

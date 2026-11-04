@@ -22,7 +22,7 @@ from .automerge import (
     HELD_SHA_UNRECORDED,
 )
 # Same leaf argument: `autoreview` imports only `navigation`
-from .autoreview import REFUSAL_UNANSWERED_REASON
+from .autoreview import REFUSAL_UNANSWERED_REASON, TRANSIENT_DROPS
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
@@ -40,6 +40,7 @@ from .project_store import (
     VALIDATION_HELD_CAUSE,
     WORKER_CHILDREN,
     kind_contract,
+    turn_end_is_delivery,
     validation_hold,
 )
 
@@ -667,7 +668,7 @@ def parked_on_a_give_up(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Are this order's pending assumptions Neo's to decide on delivery, not the user's? (#711)"""
-    if wo["status"] not in PRE_DELIVERY_STATUSES:
+    if wo["status"] not in PRE_DELIVERY_STATUSES or turn_end_is_delivery(wo):
         return False
     from .ops import auto_review_at
 
@@ -735,6 +736,24 @@ def reviewable_assumptions(store: ProjectStore,
     return store.pending_assumptions(wo["id"])
 
 
+def assumptions_left_with_user(store: ProjectStore, wo: dict[str, Any],
+                               pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Which of an idle manager's rows the OS has let go of: it has no review list to sit on (io-d5e62d4d)"""
+    from .ops import auto_review_at
+
+    if not auto_review_at(store.project_path):
+        return pending
+    left: set[int] = set()
+    for kind in ("autoreview_held", "autoreview_escalated", "autoreview_unconfirmed"):
+        for event in store.events_of_kind(wo["id"], kind):
+            payload = db.from_json(event["payload"], {})
+            if (payload.get("re_asked") or payload.get("code") in TRANSIENT_DROPS
+                    or (kind == "autoreview_held" and payload.get("early"))):
+                continue
+            left.add(int(payload.get("assumption_id") or 0))
+    return [a for a in pending if int(a["id"]) in left]
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone"""
@@ -749,6 +768,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         from .ops import auto_review_at
         if auto_review_at(store.project_path):
             owed = [a for a in pending if not _os_is_confirming(a)]
+    elif pending and turn_end_is_delivery(wo):
+        owed = assumptions_left_with_user(store, wo, pending)
     # ONE COMPOUND LINE when the order is also out of money
     compound = False
     if owed and not neo_reviews_later(store, wo):
@@ -1901,7 +1922,9 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
             continue
         if not _mentions_assumptions(wo.get("attention_reason")):
             continue
-        if not (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo)):
+        # An idle manager has no landing to clear its flag once its rows are settled (io-d5e62d4d)
+        if not (turn_end_is_delivery(wo)
+                or (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo))):
             continue
         # An undeliverable objection raises a real blocker on a RUNNING order
         if any(_mentions_assumptions(b) for b in true_blockers(store, wo)):
@@ -2109,6 +2132,39 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
             )
     finally:
         neo.close()
+
+
+def check_open_questions_lapse(store: ProjectStore) -> Iterator[Violation]:
+    """INV-NEO-QUESTION-LAPSED — an ended order's worker question must not stay open (io-d5e62d4d)"""
+    from .neo_store import LAPSABLE_Q_STATUSES, NeoStore
+    from .project_store import QUESTION_LAPSING_STATUSES
+
+    readonly = getattr(store, "readonly", False)
+    neo = NeoStore()
+    try:
+        # An empty `wo_id` has a subject of its own, and no order to end
+        rows = [q for q in neo.list_questions(statuses=LAPSABLE_Q_STATUSES, limit=-1)
+                if q["kind"] == "question" and q["wo_id"]]
+    finally:
+        neo.close()
+    for q in rows:
+        try:
+            wo = store.get_work_order(q["wo_id"])
+        except KeyError:
+            continue  # another project's order: Neo's store is OS-wide
+        if wo["status"] not in QUESTION_LAPSING_STATUSES:
+            continue
+        # `_ReadOnly` swallows this write
+        store.lapse_open_questions(wo["id"], str(wo["status"]))
+        yield Violation(
+            invariant="INV-NEO-QUESTION-LAPSED",
+            wo_id=wo["id"],
+            detail=(f"Neo question {q['id']} was still {q['status']}, but its work order "
+                    f"is {wo['status']}"),
+            repaired=True,
+            repair="would lapse it" if readonly else "lapsed",
+            context={"question_id": q["id"], "was": q["status"]},
+        )
 
 
 def _is_work_order(store: ProjectStore, wo_id: str) -> bool:
@@ -4464,6 +4520,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # settled; it reads child flags and writes only the parent's
     check_decisions_closed_by_user,  # order-free: a pure read that repairs nothing
     check_awaiting_decisions_flagged,  # after the orphan check: it raises only where no flag is up
+    check_open_questions_lapse,    # before the next check: it would write an answer on these rows
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
                                    # touches no flag any other check reads
     check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one
@@ -4512,6 +4569,8 @@ class _ReadOnly:
                 "clear_attention",
                 "add_assumption", "add_event",
                 "set_status", "update_work_order", "supersede_approval",
+                # INV-NEO-QUESTION-LAPSED's repair
+                "lapse_open_questions",
                 # INV-GATE-UNJUDGED's repair
                 "mark_approval_escalated",
                 # The bus

@@ -17,6 +17,7 @@ Q_STATUSES = (
     "escalated",  # Neo declined — the user must answer
     "failed",     # answering errored; surfaced as attention
     "refined",    # returned to the asker to split or narrow; nobody ruled (wo-ea3c6f0c)
+    "lapsed",     # its work order ended first; nobody ruled, and no answer exists (io-d5e62d4d)
 )
 # Review lifecycle of an answered question
 REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
@@ -25,6 +26,8 @@ REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 NEO_HELD_Q_STATUSES = ("queued", "answering")
 USER_HELD_Q_STATUSES = ("escalated", "failed")
 OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
+#: Not `answering`: Neo's reply would overwrite the row, so it lapses once Neo has settled it
+LAPSABLE_Q_STATUSES = ("queued", "escalated", "failed")
 
 # What Neo is being asked for (docs/superpowers/specs/2026-08-31-the-supervisor.md)
 #: `validation` is Morpheus asking about a shipped PR; `backlog` a quarantined proposal
@@ -182,6 +185,9 @@ ADDED_COLUMNS = {
         "escalation_cause": "TEXT",
         # How many times `revive_unreachable` re-queued it
         "revivals": "INTEGER NOT NULL DEFAULT 0",
+        # Their own columns: `answer_reason` keeps why Neo escalated (`lapse_worker_questions`)
+        "lapsed_at": "REAL",
+        "lapsed_reason": "TEXT",
     },
     "learnings": {
         "seat": "TEXT NOT NULL DEFAULT ''",
@@ -399,6 +405,15 @@ class NeoStore:
             return False
         self.record_answer(question_id, answer, answered_by="os", reason=reason)
         return True
+
+    def lapse_worker_questions(self, wo_id: str, reason: str) -> list[int]:
+        """Settle an ended order's open worker questions as nobody's ruling (kn-40db1828)"""
+        marks = ",".join("?" for _ in LAPSABLE_Q_STATUSES)
+        return [int(r["id"]) for r in self.conn.execute(
+            f"""UPDATE questions SET status='lapsed', lapsed_at=?, lapsed_reason=?
+                 WHERE wo_id=? AND kind='question' AND status IN ({marks})
+             RETURNING id""",
+            (db.now(), reason, wo_id, *LAPSABLE_Q_STATUSES)).fetchall()]
 
     def mark(self, question_id: int, status: str, reason: str = "",
              cause: str = "") -> None:

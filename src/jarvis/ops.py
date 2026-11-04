@@ -102,7 +102,9 @@ from .project_store import (
     is_feature_order_id,
     kind_contract,
     order_path,
+    settles_idle,
     submission_artifacts,
+    turn_end_is_delivery,
     validation_standing,
 )
 
@@ -1404,6 +1406,8 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
     wo_id = wo["id"]
     round_note = invariants.parallel_round_note(store, wo_id)
     pending = store.pending_assumptions(wo_id)
+    if turn_end_is_delivery(wo):
+        pending = invariants.assumptions_left_with_user(store, wo, pending)
     turn = store.latest_turn(wo_id)
     working = (turn is not None and turn["state"] == "running"
                and wo["status"] != "waiting_input")
@@ -1838,19 +1842,26 @@ def _derived_trigger(store: ProjectStore, wo_id: str, entered: float) -> str:
     return str(row["kind"]) if row else ""
 
 
+def _worker_transcript(store: ProjectStore, wo: dict[str, Any]) -> Path | None:
+    """Where this order's session writes its transcript, None before it has a session"""
+    from . import claude_cli
+    session_id = str(wo.get("session_id") or "")
+    if not session_id:
+        return None
+    # `worker_session.worktree_path`'s own computation
+    worktree = wo.get("worktree")
+    cwd = (store.project_path / ".claude" / "worktrees" / str(worktree)
+           if worktree else store.project_path)
+    return claude_cli.session_transcript_path(cwd, session_id)
+
+
 def _transcript_activity(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
     """The last write to the worker's transcript and to the subagent files beside it (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
-    from . import claude_cli, inspection
+    from . import inspection
     try:
-        wo = store.get_work_order(wo_id)
-        session_id = str(wo.get("session_id") or "")
-        if not session_id:
+        path = _worker_transcript(store, store.get_work_order(wo_id))
+        if path is None:
             return []
-        # `worker_session.worktree_path`'s own computation
-        worktree = wo.get("worktree")
-        cwd = (store.project_path / ".claude" / "worktrees" / str(worktree)
-               if worktree else store.project_path)
-        path = claude_cli.session_transcript_path(cwd, session_id)
         stamps = []
         for p in [path, *inspection._subagent_transcripts(path)]:
             # `stat()` and not `exists()`: `exists()` swallows a PermissionError into False
@@ -4587,6 +4598,10 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     delivered = store.events_of_kind(wo_id, "finished")
     if delivered and float(delivered[-1]["ts"]) > cut:
         return True
+    # A manager never finishes: its turn ending after the refusal is its answer (io-d5e62d4d)
+    if settles_idle(store.get_work_order(wo_id)):
+        turn = store.latest_turn(wo_id)
+        return bool(turn and float(turn["ended_at"] or 0) > cut)
     # One read of the rows, like `validated_head`'s one-read rule: the guard needs the prior counted row...
     counted = [r for r in store.validation_rounds(wo_id=wo_id)
                if str(r["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES]
@@ -6940,11 +6955,13 @@ def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any
         "decided_by": ASSUMPTION_DECIDER_OS})
     pending = store.pending_assumptions(wo_id)
     status = str(wo.get("status") or "")
-    if not pending:
+    # A manager settles with its feature, never on its assumptions (io-d5e62d4d)
+    settled = not pending and not settles_idle(wo)
+    if settled:
         status = _land_after_acceptance(store, project_path, wo_id, cfg)
     return {"wo_id": wo_id, "assumption_id": assumption["id"],
             "n": assumption.get("n"), "status": status, "pending": len(pending),
-            "settled": not pending}
+            "settled": settled}
 
 
 #: The one transport that ships
@@ -7093,13 +7110,20 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
     if park is not None:
         out["pr_pending"] = {k: park.get(k) or ""
                              for k in ("branch", "base", "compare_url")}
-    if not feedback:
+    # No review status will prompt the user for guidance on a manager: it hears either way (io-d5e62d4d)
+    if not feedback and not accept and pending and settles_idle(wo):
+        feedback_to_send = ("The user rejected assumption(s) "
+                            f"{', '.join('#' + str(a.get('n')) for a in pending)}: "
+                            "reconsider those calls and act on it.")
+    else:
+        feedback_to_send = feedback
+    if not feedback_to_send:
         return out
 
     # A rejection without guidance reaching the worker just strands it
     if not accept and wo["status"] in OPEN_STATUSES:
         try:
-            out["delivered"] = send_message(wo_id, feedback, source="jarvis",
+            out["delivered"] = send_message(wo_id, feedback_to_send, source="jarvis",
                                             project_name=name)
         except OpsError as e:
             out["delivery_error"] = str(e)
@@ -8833,7 +8857,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                base_red_until: float = 0.0,
                stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
     """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)"""
-    from . import background, budget, bus, holds, stuck, worker_session
+    from . import background, budget, bus, holds, inspection, stuck, worker_session
     from .central_store import base_red_hold_spans
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
@@ -8933,17 +8957,22 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # Issue 1451: a stalled turn lapses the exclusion and is judged stuck outright
         stalled = worker_session.is_stalled(turn, now)
         turn_in_flight = bool(turn) and not stalled
-        # Issue 1562: read the transcript only once the silence would convict; a stalled turn gets no pass
+        silence = now - (durations.last_activity_ts or since)
+        # Issues 1556, 1562: the transcript is read only once the silence would be judged
+        silent_turn = (turn_in_flight and silence
+                       >= thresholds.get("running", cfg.fallback_minutes * 60.0))
+        path = _worker_transcript(pstore, wo) if silent_turn else None
+        tool_executing = bool(path) and inspection.tool_call_open(
+            path, float(turn["started_at"]))
         awaits_task = False
-        if (turn_in_flight and now - (durations.last_activity_ts or since)
-                >= thresholds.get("running", cfg.fallback_minutes * 60.0)):
+        if silent_turn:
             try:
                 awaits_task = bool(background.live_tasks(
                     str(wo.get("session_id") or ""), since=float(turn["started_at"])))
             except OSError:
                 pass  # an unreadable transcript is no evidence of a wait: judged as silent
         verdict = stuck.assess(
-            str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
+            str(wo["status"]), now - since, silence,
             discounted, thresholds, cfg.fallback_minutes * 60.0,
             # CI and base-red cannot collide: `validating` and `waiting_pr_merge` (§1 of the 2026-10-15 spec)
             excluded_cause=(PAUSE_USAGE_LIMIT
@@ -8967,6 +8996,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,
             turn_in_flight=turn_in_flight,
+            tool_executing=tool_executing,
             stalled_turn_seconds=(now - float(turn["started_at"])) if stalled else 0.0)
         if stuck_only and not verdict.stuck:
             continue
@@ -9530,6 +9560,11 @@ def show_feature_order(fo_id: str, project_name: str | None = None, *,
         mgr = store.manager_work_order(fo_id)
         manager = ({k: mgr[k] for k in ("id", "title", "status", "result_summary")}
                    if mgr else None)
+        if mgr:
+            # What the strip's "assumptions pending" points at (io-d5e62d4d)
+            manager["pending_assumptions"] = [
+                {k: a[k] for k in ("n", "content")}
+                for a in store.all_assumptions(mgr["id"]) if a["status"] == "pending"]
         return {
             "project": name, **fo,
             "plan": plan,
@@ -10871,6 +10906,9 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
         q = neo.get(question_id)
         if q is None:
             raise OpsError(f"neo question {question_id} not found")
+        if q["status"] == "lapsed":
+            raise OpsError(f"neo question {question_id} has lapsed, so it takes no answer "
+                           f"and nothing was sent: {q['lapsed_reason']}")
         if q["status"] not in ("escalated", "failed", "queued"):
             raise OpsError(f"neo question {question_id} is {q['status']} — "
                            "only escalated/failed/queued questions take a user answer")
@@ -16440,7 +16478,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     scope = {project: paths[project]} if project else paths
 
     questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
-                 "superseded": 0, "refined": 0, "escalation_rate": None,
+                 "superseded": 0, "refined": 0, "lapsed": 0, "escalation_rate": None,
                  "unreachable_rate": None}
     by_kind: dict[str, dict[str, Any]] = {}
     by_project: dict[str, dict[str, Any]] = {}
@@ -16473,6 +16511,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         elif row["status"] == "refined":
             # Bounced to the asker to split: not an escalation (wo-ea3c6f0c)
             questions["refined"] += n
+        elif row["status"] == "lapsed":
+            # Its order ended first: nobody ruled (io-d5e62d4d)
+            questions["lapsed"] += n
         elif row["status"] in ("escalated", "failed"):
             for bucket in buckets:
                 bucket[row["status"]] += n
