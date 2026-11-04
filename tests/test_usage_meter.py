@@ -17,6 +17,7 @@ from jarvis.claude_cli import CREDENTIALS_ENV
 TOKEN = "sk-ant-oat01-SANDBOX-TOKEN-VALUE"
 MINUTE = 60.0
 T0 = 1_760_000_000.0
+WEEK_SECONDS = 7 * 86_400.0
 
 
 # -- fixtures
@@ -274,8 +275,44 @@ def test_gap_rows_are_excluded_from_segments_and_counted_in_coverage():
     assert found.delta_points == pytest.approx(7.0)
     assert found.coverage.gap_rows == 3
     assert found.coverage.samples == 2
-    assert found.coverage.share == pytest.approx(2 / 5)
+    # The 4-period hole is unmeasured; only the one period after the last reading is covered
+    assert found.coverage.share == pytest.approx(1 / 5)
     assert found.coverage.longest_gap_seconds == pytest.approx(4 * period)
+
+
+def _gapless(step: float, span: float) -> list[usage_meter.Sample]:
+    return series(T0, [10.0] * (int(span // step) + 1), T0 + WEEK_SECONDS, step=step)
+
+
+def test_a_window_ending_ahead_of_now_is_judged_only_up_to_now():
+    """Issue io-82bcb830: same readings, same answer, whatever the window's future end"""
+    rows_ = _gapless(150.0, 3600.0)
+    ended = usage_meter.segments(rows_, since=T0, until=T0 + 3600, key="five_hour",
+                                 now=T0 + 3600)
+    ahead = usage_meter.segments(rows_, since=T0, until=T0 + 7 * 86_400, key="five_hour",
+                                 now=T0 + 3600)
+
+    assert ended.coverage.share == pytest.approx(1.0)
+    assert ahead.coverage.share == pytest.approx(1.0)
+    assert ahead.max_resets == ended.max_resets == 1
+
+
+def test_the_sampler_real_cadence_covers_the_whole_span():
+    """A gapless span at the measured 222s mean and 345s longest gap is not 'incomplete'"""
+    assert usage_meter.segments(_gapless(222.0, 6 * 3600), since=T0, until=T0 + 6 * 3600,
+                                key="five_hour").coverage.share > 0.98
+    assert usage_meter.segments(_gapless(345.0, 6 * 3600), since=T0, until=T0 + 6 * 3600,
+                                key="five_hour").coverage.share > 0.98
+
+
+def test_a_real_hole_still_lowers_coverage_below_the_reliable_share():
+    """Five hours measured, then seven dark and up to now: the refusal stands"""
+    rows_ = _gapless(222.0, 5 * 3600)
+    found = usage_meter.segments(rows_, since=T0, until=T0 + 24 * 3600, key="five_hour",
+                                 now=T0 + 12 * 3600)
+
+    assert found.coverage.share == pytest.approx(5 / 12, abs=0.02)
+    assert found.coverage.share < usage_meter.MIN_RELIABLE_COVERAGE_SHARE
 
 
 # -- the reset tolerance and the segment bound

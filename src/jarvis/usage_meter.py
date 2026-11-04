@@ -44,6 +44,9 @@ WINDOW_SECONDS = {"five_hour": 5 * 3600.0, "seven_day": 7 * 86_400.0}
 #: More of the span unmeasured than measured: nothing about the rise or the reset count is bounded
 MIN_RELIABLE_COVERAGE_SHARE = 0.5
 
+#: Longer than this between readings is unmeasured: daemon ticks stretch the period (222s mean, 345s longest seen, io-82bcb830), and one missed reading stays inside it
+COVERED_GAP_SECONDS = 3 * SAMPLE_SECONDS
+
 NOTICE_STREAK_KEY = "usage_meter_notice_streak"
 
 
@@ -379,7 +382,6 @@ class Segment:
 class Coverage:
     samples: int = 0
     gap_rows: int = 0
-    expected: int = 0
     share: float = 0.0
     longest_gap_seconds: float = 0.0
     head_uncovered_seconds: float = 0.0
@@ -416,9 +418,20 @@ def _retreat(a: Sample, b: Sample, key: str) -> bool:
             and before - after > RESET_TOLERANCE_SECONDS)
 
 
+def _covered_share(inside: Sequence[Sample], *, since: float, end: float) -> float:
+    """Share of since..end lying between readings no further apart than `COVERED_GAP_SECONDS`"""
+    if end <= since or not inside:
+        return 0.0
+    marks = [since, *(s.ts for s in inside if s.ts < end), end]
+    covered = sum(b - a for a, b in zip(marks, marks[1:]) if b - a <= COVERED_GAP_SECONDS)
+    return min(1.0, covered / (end - since))
+
+
 def segments(samples: Sequence[Sample], *, since: float, until: float, key: str,
-             nearest_seconds: float | None = None) -> SegmentSum:
+             nearest_seconds: float | None = None,
+             now: float | None = None) -> SegmentSum:
     """Per-segment delta, because utilisation drops to ~0 at `resets_at` (§4)"""
+    end = min(until, db.now() if now is None else now)   # a window ending ahead of now is judged on what has happened
     if nearest_seconds is None:
         from .catalog import DEFAULT_COST_METER_NEAREST_SECONDS
 
@@ -427,9 +440,8 @@ def segments(samples: Sequence[Sample], *, since: float, until: float, key: str,
     inside = [s for s in ordered
               if s.ok and since <= s.ts < until and s.pct(key) is not None]
     gaps = [s for s in ordered if not s.ok and since <= s.ts < until]
-    expected = max(1, int(round((until - since) / SAMPLE_SECONDS)))
-    coverage = Coverage(samples=len(inside), gap_rows=len(gaps), expected=expected,
-                        share=min(1.0, len(inside) / expected))
+    coverage = Coverage(samples=len(inside), gap_rows=len(gaps),
+                        share=_covered_share(inside, since=since, end=end))
     if not inside:
         return SegmentSum(coverage=coverage)
     coverage.longest_gap_seconds = max(
@@ -474,7 +486,7 @@ def segments(samples: Sequence[Sample], *, since: float, until: float, key: str,
         found.reliable = False
         found.unreliable.append("window_length_unknown")
     else:
-        found.max_resets = int((until - since) // window) + 1
+        found.max_resets = int(max(0.0, end - since) // window) + 1
         if found.reset_count > found.max_resets:
             found.reliable = False
             found.unreliable.append("reset_count_above_span")
@@ -1045,7 +1057,7 @@ def _window_dict(sum_: SegmentSum) -> dict[str, Any]:
 
 def _coverage_dict(cov: Coverage, rows: Sequence[Sample]) -> dict[str, Any]:
     ok = [s for s in rows if s.ok]
-    return {"samples": cov.samples, "expected": cov.expected,
+    return {"samples": cov.samples,
             "share": round(cov.share, 4), "gap_rows": cov.gap_rows,
             "longest_gap_seconds": cov.longest_gap_seconds,
             "head_uncovered_seconds": cov.head_uncovered_seconds,
@@ -1069,9 +1081,9 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
     rows = samples_between(root, since=since - cfg.meter_nearest_seconds, until=until)
     in_span = [s for s in rows if since <= s.ts < until]
     five = segments(rows, since=since, until=until, key="five_hour",
-                    nearest_seconds=cfg.meter_nearest_seconds)
+                    nearest_seconds=cfg.meter_nearest_seconds, now=now)
     seven = segments(rows, since=since, until=until, key="seven_day",
-                     nearest_seconds=cfg.meter_nearest_seconds)
+                     nearest_seconds=cfg.meter_nearest_seconds, now=now)
     dollars = dollars_per_point(now=now, cfg=cfg, home=root)
     seven_rate = dollars_per_point(now=now, cfg=cfg, home=root, key="seven_day")["value"]
     covered = five.coverage.samples > 0
