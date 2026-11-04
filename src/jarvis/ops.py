@@ -789,6 +789,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             finally:
                 store.close()
         attention.extend(gate_items)
+        backlog_escalated, _ = split_quarantined(central.list_backlog(status="quarantined"))
+        attention.extend(_backlog_escalated_attention(backlog_escalated))
         # The dashboard is part of the OS, so its failures belong in the OS's pulse
         ui = ui_health()
         if ui["errors"]:
@@ -821,6 +823,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "items": inbox[:10],
             },
             "backlog": {"open": len(backlog_open)},
+            "backlog_escalated": len(backlog_escalated),
             # Reported bugs and panel follow-ups counted apart (wo-5b96c9da)
             "steward": steward_track_counts(central),
             "investigations": {"fixes_parked": fixes_parked},
@@ -13624,6 +13627,81 @@ def show_backlog(item_id: str) -> dict[str, Any]:
         central.close()
     item["origins"] = backlog_origins(item)
     return item
+
+
+#: What the user is told about a proposal they now hold; only `escalated` was a ruling (kn-40db1828)
+QUARANTINE_NOTES = {
+    "escalated": "Neo left the decision to you",
+    "unreachable": "Neo could not be reached; nobody has judged this",
+    "unjudged": "no usable decision from Neo; nobody has judged this",
+}
+
+
+def _quarantine_state(item: dict[str, Any], q: dict[str, Any] | None) -> str | None:
+    """Why the user holds this proposal; None while Neo will still answer it"""
+    from .neo_store import MAX_REVIVALS, NEO_HELD_Q_STATUSES
+
+    if not item.get("neo_question_id"):
+        return None  # `ask_quarantined` asks on the next tick
+    if q is None:
+        return "unjudged"  # nothing re-asks an item that already names a question
+    if q["status"] in NEO_HELD_Q_STATUSES:
+        return None
+    if q["status"] == "escalated":
+        return "escalated"
+    if q["status"] == "failed" and q.get("escalation_cause") == "transport-unreachable":
+        # `revive_unreachable` re-asks it until its revivals are spent
+        return "unreachable" if (q.get("revivals") or 0) >= MAX_REVIVALS else None
+    return "unjudged"
+
+
+def split_quarantined(items: list[dict[str, Any]]
+                      ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """`(the user's, Neo's)` among quarantined rows (backlog-operability §8)"""
+    from .neo_store import NeoStore
+
+    mine: list[dict[str, Any]] = []
+    neos: list[dict[str, Any]] = []
+    quarantined = [i for i in items if i["status"] == "quarantined"]
+    if not quarantined:
+        return mine, neos
+    neo = NeoStore()
+    try:
+        for item in quarantined:
+            qid = item.get("neo_question_id")
+            q = neo.get(int(qid)) if qid else None
+            state = _quarantine_state(item, q)
+            row = {**item, "neo_state": state, "neo_reason": (q or {}).get("answer_reason") or ""}
+            if state:
+                mine.append({**row, "neo_note": QUARANTINE_NOTES[state]})
+            else:
+                neos.append(row)
+    finally:
+        neo.close()
+    return mine, neos
+
+
+def _backlog_escalated_attention(escalated: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One line per project; `backlog_neo.REVIEW_HINT` is the command"""
+    from .backlog_neo import REVIEW_HINT
+
+    by_project: dict[str, list[dict[str, Any]]] = {}
+    for item in escalated:
+        by_project.setdefault(item["project"], []).append(item)
+    rows = []
+    for project, items in by_project.items():
+        by_note: dict[str, list[str]] = {}
+        for item in items:
+            by_note.setdefault(item["neo_note"], []).append(item["id"])
+        rows.append({
+            "project": project, "wo_id": None,
+            "title": (f"{len(items)} quarantined backlog proposal"
+                      f"{'s' if len(items) != 1 else ''} waiting on you"),
+            "status": "backlog_escalated",
+            "reason": "; ".join(f"{note}: {', '.join(ids)}" for note, ids in by_note.items()),
+            "decide": REVIEW_HINT.format(id=items[0]["id"] if len(items) == 1 else "<bl-id>"),
+        })
+    return rows
 
 
 def _backlog_item_of_question(question_id: int) -> dict[str, Any] | None:

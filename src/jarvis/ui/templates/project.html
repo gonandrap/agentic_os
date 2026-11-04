@@ -117,8 +117,9 @@
   </p>
 </div>
 
-{% if backlog %}
+{% if backlog or backlog_counts.proposed or backlog_counts.quarantined %}
 <h2>Open backlog for this project</h2>
+<p class="sub"><a href="/backlog?project={{ project_name }}">{{ backlog_counts.open }} open · {{ backlog_counts.proposed }} proposed · {{ backlog_counts.quarantined }} quarantined</a></p>
 <div class="panel">
   {% for item in backlog %}
   <div class="row">

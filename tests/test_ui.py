@@ -3903,3 +3903,126 @@ def test_a_finding_owed_a_decision_sorts_above_a_decided_one(improvement):
     ops.review_findings(io["id"], accept=(first,), project_name="proj_a")
     page = client.get(f"/io/proj_a/{io['id']}").text
     assert page.index(f'id="finding-{second}"') < page.index(f'id="finding-{first}"')
+
+
+# -- quarantine on /backlog and the project page (2026-11-03-backlog-operability §8)
+
+
+def _quarantine(title, *, neo_status="queued", project="proj_a"):
+    from jarvis.neo_store import NeoStore
+
+    central, neo = CentralStore(), NeoStore()
+    try:
+        item = central.propose_backlog(project, title, item_type="bug", severity="critical",
+                                       suggested_kind="wo", origin_refs=[])
+        central.review_backlog(item["id"], "quarantined", rule="severity-claim",
+                               note="claims critical")
+        q = neo.ask(project, "", f"decide {item['id']}", kind="backlog")
+        if neo_status != "queued":
+            neo.mark(q["id"], neo_status, reason="too close to call")
+        assert central.set_backlog_question(item["id"], q["id"])
+        return item["id"], q["id"]
+    finally:
+        central.close()
+        neo.close()
+
+
+def test_backlog_page_splits_escalated_from_what_neo_still_decides(client, project):
+    mine, _ = _quarantine("exporter drops rows", neo_status="escalated")
+    neos, _ = _quarantine("uploader retry storm")
+    page = client.get("/backlog").text
+
+    head, _, rest = page.partition("Neo is still deciding")
+    assert "quarantined — waiting on you" in head and "too close to call" in head
+    assert "Neo left the decision to you" in head
+    assert f'action="/backlog/review/{mine}"' in head
+    assert 'value="accept"' in head and 'value="reject"' in head
+    assert "<details" in head and "<details open" not in head
+    deciding = rest.partition("</details>")[0]
+    assert neos in deciding and mine not in deciding
+    # no buttons on what is still Neo's
+    assert f'action="/backlog/review/{neos}"' not in page
+
+
+def test_backlog_page_says_neo_was_unreachable_once_revivals_are_spent(client, project):
+    from jarvis.neo_store import MAX_REVIVALS, NeoStore
+
+    item, qid = _quarantine("exporter drops rows")
+    neo = NeoStore()
+    try:
+        for _ in range(MAX_REVIVALS):
+            neo.mark(qid, "failed", reason="neo could not be reached: x",
+                     cause="transport-unreachable")
+            page = client.get("/backlog").text
+            assert "Neo is still deciding" in page and "waiting on you" not in page
+            neo.revive_unreachable()
+        neo.mark(qid, "failed", reason="neo could not be reached: x",
+                 cause="transport-unreachable")
+    finally:
+        neo.close()
+    page = client.get("/backlog").text
+    assert "Neo could not be reached; nobody has judged this" in page
+    assert "Neo left the decision to you" not in page and "Neo left these" not in page
+    assert "Neo is still deciding" not in page
+    assert f'action="/backlog/review/{item}"' in page and 'value="reject"' in page
+
+
+def test_backlog_page_without_quarantine_renders_neither_block(client, project):
+    CentralStore().add_backlog("proj_a", "just an idea")
+    page = client.get("/backlog").text
+    assert "just an idea" in page
+    assert "quarantined — waiting on you" not in page and "Neo is still deciding" not in page
+    assert "/backlog/review/" not in page
+
+
+@pytest.mark.parametrize("decision, status", [("accept", "open"), ("reject", "dropped")])
+def test_backlog_review_post_decides_and_closes_the_question(client, project, decision, status):
+    from jarvis.neo_store import NeoStore
+
+    item, qid = _quarantine("exporter drops rows", neo_status="escalated")
+    r = client.post(f"/backlog/review/{item}", data={"decision": decision},
+                    follow_redirects=False)
+    assert (r.status_code, r.headers["location"]) == (303, "/backlog")
+    got = CentralStore().get_backlog(item)
+    assert (got["status"], got["review_rule"]) == (status, "user")
+    q = NeoStore().get(qid)
+    assert (q["status"], q["answered_by"]) == ("answered", "user")
+    assert "quarantined — waiting on you" not in client.get("/backlog").text
+
+
+@pytest.mark.parametrize("decision", ["", "maybe", "duplicate"])
+def test_backlog_review_post_refuses_a_non_decision_and_changes_nothing(
+        client, project, decision):
+    item, _ = _quarantine("exporter drops rows", neo_status="escalated")
+    r = client.post(f"/backlog/review/{item}", data={"decision": decision},
+                    follow_redirects=False)
+    assert r.headers["location"].startswith("/backlog?error=")
+    assert CentralStore().get_backlog(item)["status"] == "quarantined"
+
+
+def test_backlog_review_post_refuses_an_item_not_in_quarantine(client, project):
+    item = CentralStore().add_backlog("proj_a", "already open")["id"]
+    r = client.post(f"/backlog/review/{item}", data={"decision": "reject"},
+                    follow_redirects=False)
+    assert "not%20quarantined" in r.headers["location"]
+    assert CentralStore().get_backlog(item)["status"] == "open"
+
+
+def test_dashboard_links_an_escalated_proposal_to_the_backlog_page(client, project):
+    assert "/backlog?project=proj_a" not in client.get("/").text
+    _quarantine("exporter drops rows", neo_status="escalated")
+    page = client.get("/").text
+    assert "waiting on you" in page and "/backlog?project=proj_a" in page
+
+
+def test_project_page_counts_proposed_and_quarantined_beside_open(client, project):
+    assert " quarantined</a>" not in client.get("/project/proj_a").text
+    central = CentralStore()
+    central.propose_backlog("proj_a", "new idea", item_type="task", severity="medium",
+                            suggested_kind="wo", origin_refs=[])
+    _quarantine("exporter drops rows")
+    # With no open item the section still has to appear
+    page = client.get("/project/proj_a").text
+    assert "0 open · 1 proposed · 1 quarantined" in page
+    central.add_backlog("proj_a", "an open idea")
+    assert "1 open · 1 proposed · 1 quarantined" in client.get("/project/proj_a").text

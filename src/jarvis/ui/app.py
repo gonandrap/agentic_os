@@ -257,6 +257,11 @@ def filter_options(rows: Iterable[dict], key: str) -> list[str]:
     return sorted({str(r[key]) for r in rows if r.get(key)})
 
 
+def _backlog_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    return {s: sum(1 for r in rows if r["status"] == s)
+            for s in ("open", "proposed", "quarantined")}
+
+
 def orders_cap(limit: str, total: int) -> int:
     """How many rows the project page draws: a page, or what `limit` asked, never past `total`"""
     try:
@@ -1426,9 +1431,10 @@ def create_app() -> FastAPI:
             store.close()
         central = CentralStore()
         try:
-            backlog = central.list_backlog(project=name, status="open")
+            every_backlog = central.list_backlog(project=name, status=None)
         finally:
             central.close()
+        backlog = [i for i in every_backlog if i["status"] == "open"]
         featured, rest = group_open([{**wo, "type": "work"} for wo in wos], "all")
         every = families + featured + rest
         past = sorted((r for r in every if r["status"] in TERMINAL_STATUSES),
@@ -1450,7 +1456,8 @@ def create_app() -> FastAPI:
         return render(request, "project.html", project_name=name, path=paths[name],
                       rows=rows, total=total, matched=matched,
                       next_limit=cap + ORDERS_PAGE, filters=filters, options=options,
-                      backlog=backlog, show_hidden=show_hidden, blocked=blocked,
+                      backlog=backlog, backlog_counts=_backlog_counts(every_backlog),
+                      show_hidden=show_hidden, blocked=blocked,
                       pauses=pauses, hidden_count=hidden_count,
                       issue_board=issue_board)
 
@@ -1914,10 +1921,11 @@ def create_app() -> FastAPI:
         if "status" not in filters:
             rows = [r for r in rows if r["status"] not in SETTLED_BACKLOG_STATUSES]
         rows = attention_first(rows, lambda i: bool(i["blockers"]))
-        counts = {s: sum(1 for r in every if r["status"] == s)
-                  for s in ("open", "proposed", "quarantined")}
+        escalated, deciding = ops.split_quarantined(rows)
         return render(request, "backlog.html", active="backlog", rows=rows,
-                      attention=[i for i in rows if i["blockers"]], counts=counts,
+                      attention=[i for i in rows if i["blockers"]],
+                      counts=_backlog_counts(every),
+                      escalated=escalated, deciding=deciding,
                       filters=filters, options=options, total=len(every))
 
     @app.get("/backlog/{item_id}", response_class=HTMLResponse)
@@ -2957,6 +2965,15 @@ def create_app() -> FastAPI:
         else:
             ops.ack_inbox(int(inbox_id) if inbox_id else None)
         return RedirectResponse(_same_site_back(next, "/inbox"), status_code=303)
+
+    @app.post("/backlog/review/{item_id}")
+    def backlog_review(item_id: str, decision: str = Form("")):
+        """Accept or reject an escalated proposal (2026-11-03-backlog-operability §8)"""
+        try:
+            ops.review_backlog_item(item_id, decision)
+        except ops.OpsError as e:
+            return RedirectResponse(f"/backlog?error={quote(str(e))}", status_code=303)
+        return RedirectResponse("/backlog", status_code=303)
 
     @app.get("/backlog/{item_id}/promote-plan")
     def promote_plan(item_id: str):

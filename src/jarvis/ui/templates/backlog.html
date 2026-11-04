@@ -13,6 +13,29 @@
     {% for b in it.blockers %}{{ b.id }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}</span>
 {% endcall %}
 
+{# 2026-11-03-backlog-operability.md §8 #}
+{% call(it) ui.needs_you(escalated, "quarantined — waiting on you") %}
+  {{ ui.row_id(it.id, "/backlog/" ~ it.id) }} {{ it.title }}
+  <div class="sub">{{ it.review_rule }}: {{ it.review_note }}</div>
+  <div class="sub {{ 'tone-warn' if it.neo_state != 'escalated' }}">{{ it.neo_note }}
+    {%- if it.neo_reason %} · {{ it.neo_reason }}{% endif %}</div>
+  <form class="inline" method="post" action="/backlog/review/{{ it.id }}">
+    <button name="decision" value="accept" class="primary">Accept</button>
+    <button name="decision" value="reject">Reject</button>
+  </form>
+{% endcall %}
+
+{% if deciding %}
+<details class="panel quarantine-deciding">
+  <summary>{{ deciding | length }} quarantined — Neo is still deciding</summary>
+  {% for it in deciding %}
+  <div class="row">{{ ui.row_id(it.id, "/backlog/" ~ it.id) }}
+    <span class="grow">{{ it.title }}
+      <span class="sub">{{ it.review_rule }}: {{ it.review_note }}</span></span></div>
+  {% endfor %}
+</details>
+{% endif %}
+
 {{ ui.filter_bar("/backlog", filters, options, rows | length, total,
                  labels={"status": "unsettled (not done/dropped)", "item_type": "every type",
                          "suggested_kind": "every kind"}) }}
