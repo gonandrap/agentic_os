@@ -857,7 +857,7 @@ def test_a_promotion_plan_is_dependency_ordered_and_creates_nothing(started, pro
     assert len(plan) == 4, "a diamond's shared dependency appears once"
     assert plan[-1]["waits_on"] == [b["id"], c["id"]]
     assert plan[-1] == {"id": d["id"], "title": "d", "project": "proj_a", "kind": "wo",
-                        "waits_on": [b["id"], c["id"]]}
+                        "waits_on": [b["id"], c["id"]], "dead_deps": []}
     assert central.get_backlog(a["id"])["status"] == "open"
     assert ProjectStore(project).list_work_orders() == []
 
@@ -878,7 +878,7 @@ def test_a_promoted_dependency_holds_but_is_not_promoted_again(started, project)
     assert [r["ref"] for r in store.open_preconditions(result["wo_id"])] == [a["id"]]
 
 
-@pytest.mark.parametrize("status", ["dropped", "proposed", "quarantined"])
+@pytest.mark.parametrize("status", ["proposed", "quarantined"])
 def test_a_dependency_that_cannot_be_promoted_refuses_the_whole_closure(started, project, status):
     central = CentralStore()
     bad = central.add_backlog("proj_a", "bad", status=status)
@@ -894,14 +894,133 @@ def test_a_dependency_that_cannot_be_promoted_refuses_the_whole_closure(started,
     assert ProjectStore(project).list_work_orders() == []
 
 
+def test_a_missing_dependency_refuses_with_nothing_created(started, project):
+    central = CentralStore()
+    a = central.add_backlog("proj_a", "a")
+    b = central.add_backlog("proj_a", "b", depends_on=[a["id"]])
+    central.conn.execute("DELETE FROM backlog WHERE id=?", (a["id"],))
+
+    with pytest.raises(ops.OpsError, match=f"{a['id']} \\(missing\\)"):
+        ops.promote_backlog(b["id"])
+    assert central.get_backlog(b["id"])["status"] == "open"
+    assert ProjectStore(project).list_work_orders() == []
+
+
+def test_a_dropped_dependency_is_a_dead_edge_the_plan_names(started, project):
+    central = CentralStore()
+    gone = central.add_backlog("proj_a", "gone")
+    central.mark_backlog(gone["id"], "dropped")
+    live = central.add_backlog("proj_a", "live")
+    b = central.add_backlog("proj_a", "b", depends_on=[gone["id"], live["id"]])
+
+    plan = ops.promote_backlog(b["id"], dry_run=True)
+    assert plan[-1]["waits_on"] == [live["id"]]
+    assert plan[-1]["dead_deps"] == [gone["id"]]
+
+    result = ops.promote_backlog(b["id"])
+    assert [m["id"] for m in result["members"]] == [live["id"], b["id"]]
+    assert result["members"][-1]["dead_deps"] == [gone["id"]]
+    store = ProjectStore(project)
+    assert [r["ref"] for r in store.open_preconditions(result["wo_id"])] == [live["id"]]
+    assert central.get_backlog(gone["id"])["status"] == "dropped", "a dead edge is not revived"
+
+
+def test_a_feature_may_promote_past_a_dropped_dependency(started, project):
+    central = CentralStore()
+    gone = central.add_backlog("proj_a", "gone")
+    central.mark_backlog(gone["id"], "dropped")
+    b = central.add_backlog("proj_a", "b", description="the ask", depends_on=[gone["id"]])
+
+    assert "fo_id" in ops.promote_backlog(b["id"], as_feature=True)
+
+
+def _drop_as_duplicate(central, kept_id):
+    item = central.add_backlog("proj_a", f"copy of {kept_id}", status="proposed")
+    return central.review_backlog(item["id"], "dropped", rule="test", note="test",
+                                  duplicate_of=kept_id)
+
+
+def test_a_dropped_duplicate_waits_on_the_kept_item_through_a_chain(started, project):
+    central = CentralStore()
+    kept = central.add_backlog("proj_a", "kept")
+    middle = _drop_as_duplicate(central, kept["id"])
+    first = _drop_as_duplicate(central, middle["id"])
+    # both edges land on the kept item: it is waited on, and promoted, once
+    b = central.add_backlog("proj_a", "b", depends_on=[first["id"], kept["id"]])
+
+    result = ops.promote_backlog(b["id"])
+
+    assert [m["id"] for m in result["members"]] == [kept["id"], b["id"]]
+    assert result["members"][-1]["waits_on"] == [kept["id"]]
+    assert result["members"][-1]["dead_deps"] == [first["id"], middle["id"]]
+    assert central.get_backlog(kept["id"])["status"] == "promoted"
+    store = ProjectStore(project)
+    assert [r["ref"] for r in store.open_preconditions(result["wo_id"])] == [kept["id"]]
+
+
+@pytest.mark.parametrize("kept_status", ["done", "promoted"])
+def test_a_dropped_duplicate_takes_the_kept_items_state(started, project, kept_status):
+    central = CentralStore()
+    kept = central.add_backlog("proj_a", "kept")
+    central.mark_backlog(kept["id"], kept_status)
+    copy = _drop_as_duplicate(central, kept["id"])
+    b = central.add_backlog("proj_a", "b", depends_on=[copy["id"]])
+
+    plan = ops.promote_backlog(b["id"], dry_run=True)
+
+    assert [m["id"] for m in plan] == [b["id"]]
+    assert plan[-1]["waits_on"] == ([kept["id"]] if kept_status == "promoted" else [])
+    assert plan[-1]["dead_deps"] == [copy["id"]]
+
+
+def test_a_dropped_duplicate_of_an_unpromotable_item_still_refuses(started, project):
+    central = CentralStore()
+    kept = central.add_backlog("proj_a", "kept", status="quarantined")
+    copy = _drop_as_duplicate(central, kept["id"])
+    b = central.add_backlog("proj_a", "b", depends_on=[copy["id"]])
+
+    with pytest.raises(ops.OpsError, match=f"{kept['id']} \\(quarantined\\)"):
+        ops.promote_backlog(b["id"])
+    assert ProjectStore(project).list_work_orders() == []
+
+
+def test_a_duplicate_chain_that_loops_ends_as_dead_edges(started, project):
+    central = CentralStore()
+    x = central.add_backlog("proj_a", "x", status="proposed")
+    y = _drop_as_duplicate(central, x["id"])
+    central.review_backlog(x["id"], "dropped", rule="test", note="test", duplicate_of=y["id"])
+    b = central.add_backlog("proj_a", "b", depends_on=[y["id"]])
+
+    plan = ops.promote_backlog(b["id"], dry_run=True)
+
+    assert [m["id"] for m in plan] == [b["id"]]
+    assert plan[-1]["waits_on"] == [] and plan[-1]["dead_deps"] == [y["id"], x["id"]]
+
+
+def test_a_dropped_duplicate_of_the_item_itself_is_a_cycle(started, project):
+    central = CentralStore()
+    b = central.add_backlog("proj_a", "b", status="proposed")
+    copy = _drop_as_duplicate(central, b["id"])
+    central.review_backlog(b["id"], "open", rule="test", note="test", depends_on=[copy["id"]])
+
+    with pytest.raises(ops.OpsError, match="dependency cycle"):
+        ops.promote_backlog(b["id"])
+
+
 def test_a_feature_with_unsettled_dependencies_is_refused_up_front(started, project):
     central = CentralStore()
     a = central.add_backlog("proj_a", "a")
     b = central.add_backlog("proj_a", "b", description="the ask", depends_on=[a["id"]])
 
-    with pytest.raises(ops.OpsError, match="promote its dependencies first"):
+    with pytest.raises(ops.OpsError, match="must reach done or dropped") as refusal:
         ops.promote_backlog(b["id"], as_feature=True)
+    assert "promote its dependencies first" not in str(refusal.value)
     assert central.get_backlog(a["id"])["status"] == "open", "nothing created"
+
+    # why the old advice was wrong: a promoted dependency alone does not clear the refusal
+    ops.promote_backlog(a["id"])
+    with pytest.raises(ops.OpsError, match="must reach done or dropped"):
+        ops.promote_backlog(b["id"], as_feature=True)
 
     # the positive: the same override with its dependency settled goes through
     central.mark_backlog(a["id"], "done")
@@ -962,6 +1081,24 @@ def test_cli_promote_needs_yes_for_more_than_one_member(started, project, capsys
 
     solo = central.add_backlog("proj_a", "solo")
     assert cli.main(["backlog", "promote", solo["id"]]) == 0, "one member needs no --yes"
+
+
+def test_cli_promote_names_a_dead_dependency_on_one_line(started, project, capsys):
+    from jarvis import cli
+    central = CentralStore()
+    live = central.add_backlog("proj_a", "live")
+    b = central.add_backlog("proj_a", "b", depends_on=[live["id"]])
+
+    assert cli.main(["backlog", "promote", b["id"]]) == 1
+    assert "dropped dependencies" not in capsys.readouterr().out, "no dead edge, no line"
+
+    gone = central.add_backlog("proj_a", "gone")
+    central.mark_backlog(gone["id"], "dropped")
+    c = central.add_backlog("proj_a", "c", depends_on=[gone["id"]])
+    assert cli.main(["backlog", "promote", c["id"]]) == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines()
+             if "dropped dependencies" in ln]
+    assert len(lines) == 1 and gone["id"] in lines[0]
 
 
 def test_wo_not_found(started):
