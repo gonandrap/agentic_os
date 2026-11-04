@@ -101,6 +101,20 @@ def test_a_filed_sibling_finding_becomes_the_edge(store, io_id):
     assert store.dependencies(store.get_work_order(out["created"][0]["id"])) == [first]
 
 
+def test_a_sibling_accepted_in_the_same_call_files_first(store, io_id):
+    report = db.from_json(store.get_feature_order(io_id)["plan"], None)
+    report["findings"][1]["proposed_orders"] = [
+        {"type": "work", "project": "proj_a", "title": "the prerequisite", "description": BRIEF}]
+    store.update_feature_order(io_id, plan=db.to_json(report))
+    _say(store, io_id, "Sequence after stale-code-map.")
+
+    out = ops.review_findings(io_id, accept=["first-turn-reads", "stale-code-map"])
+
+    assert out["errors"] == []
+    prerequisite, waiter = out["created"][0]["id"], out["created"][1]["id"]
+    assert store.dependencies(store.get_work_order(waiter)) == [prerequisite]
+
+
 def test_the_detector_covers_an_unwired_os_filing_only(store):
     typed = store.create_work_order("typed", description="Start after PR 1548 merges.")
     filed = store.create_work_order("filed", description="Start after PR 1548 merges.",

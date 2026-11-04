@@ -7967,6 +7967,19 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
         if f.get("status") != "accepted":
             f.update(status="accepted", decided_by=decided_by, decided_at=db.now(),
                      feedback=feedback)
+    # A finding may name a sibling this same call files after it (issue 1567)
+    progress = bool(errors)
+    while progress:
+        progress = False
+        for failed in list(errors):
+            made, error = _file_finding_orders(name, io_id, by_key[failed["key"]],
+                                               steward_decision, report)
+            created += made
+            progress = progress or bool(made)
+            if error:
+                failed["error"] = error
+            else:
+                errors.remove(failed)
 
     for key, reason in rejections.items():
         by_key[key].update(status="rejected", decided_by=decided_by, decided_at=db.now(),
