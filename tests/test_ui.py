@@ -3976,9 +3976,11 @@ def test_backlog_page_without_quarantine_renders_neither_block(client, project):
 
 
 @pytest.mark.parametrize("decision, status", [("accept", "open"), ("reject", "dropped")])
-def test_backlog_review_post_decides_and_closes_the_question(client, project, decision, status):
+def test_backlog_review_post_decides_and_closes_the_question(client, project, decision, status,
+                                                             monkeypatch):
     from jarvis.neo_store import NeoStore
 
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
     item, qid = _quarantine("exporter drops rows", neo_status="escalated")
     r = client.post(f"/backlog/review/{item}", data={"decision": decision},
                     follow_redirects=False)
@@ -3992,15 +3994,29 @@ def test_backlog_review_post_decides_and_closes_the_question(client, project, de
 
 @pytest.mark.parametrize("decision", ["", "maybe", "duplicate"])
 def test_backlog_review_post_refuses_a_non_decision_and_changes_nothing(
-        client, project, decision):
+        client, project, decision, monkeypatch):
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
     item, _ = _quarantine("exporter drops rows", neo_status="escalated")
     r = client.post(f"/backlog/review/{item}", data={"decision": decision},
                     follow_redirects=False)
-    assert r.headers["location"].startswith("/backlog?error=")
+    assert "not%20a%20backlog%20decision" in r.headers["location"]
     assert CentralStore().get_backlog(item)["status"] == "quarantined"
 
 
-def test_backlog_review_post_refuses_an_item_not_in_quarantine(client, project):
+def test_backlog_review_post_shows_the_worker_refusal_instead_of_a_500(
+        client, project, monkeypatch):
+    item, _ = _quarantine("exporter drops rows", neo_status="escalated")
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-deadbeef")
+    r = client.post(f"/backlog/review/{item}", data={"decision": "accept"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    assert "worker%20session" in r.headers["location"]
+    assert CentralStore().get_backlog(item)["status"] == "quarantined"
+    assert "is a worker session" in client.get(r.headers["location"]).text
+
+
+def test_backlog_review_post_refuses_an_item_not_in_quarantine(client, project, monkeypatch):
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
     item = CentralStore().add_backlog("proj_a", "already open")["id"]
     r = client.post(f"/backlog/review/{item}", data={"decision": "reject"},
                     follow_redirects=False)
