@@ -58,6 +58,7 @@ from .daemon import (
     polls_and_can_act_on_pull_request,
     polls_pull_request,
     retries_turn,
+    reviews_assumptions,
     reviews_gate,
     settles_turn,
     validation_round,
@@ -17172,10 +17173,15 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "daemon.polls_pull_request", polls_pull_request),
         REVIEWS_GATE,
     )),
-    # The USER is the actor: `true_blockers`' four-way triage always yields a line for a governed order
-    "needs_review": ActorPasses((JUDGES_ROUND, REVIEWS_GATE), none_because=(
-        "no daemon pass of its own — the user reviews it, and "
-        "`invariants.true_blockers` is what puts it in front of them")),
+    # With no pass selecting it the USER is the actor: `true_blockers`' triage gives them the line
+    "needs_review": ActorPasses((
+        JUDGES_ROUND,
+        _Pass("Daemon.auto_review",
+              "Neo holds or is about to be asked a pending assumption of this order: "
+              "a row `invariants.assumptions_owed_to_user` does not yet give the user",
+              "daemon.reviews_assumptions", reviews_assumptions),
+        REVIEWS_GATE,
+    )),
     "waiting_pr_merge": ActorPasses((
         # wo-d3a70c29: the poll still SELECTS a stalled row (`polls_pull_request` is untouched)
         _Pass("Daemon.poll_pull_requests", _pr_poll_why,

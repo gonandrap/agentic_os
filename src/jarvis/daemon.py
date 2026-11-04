@@ -420,6 +420,17 @@ def reviews_gate(store: ProjectStore, wo: dict[str, Any],
     return invariants.waiting_on_neo_gate(store, wo)
 
 
+def reviews_assumptions(store: ProjectStore, wo: dict[str, Any],
+                        now: float | None = None) -> bool:
+    """True when a pending row is not yet the user's, so `Daemon.auto_review` holds it (io-ed253c2b)"""
+    from . import invariants
+    # `Daemon.auto_review` lists rows with the hidden-excluding default
+    if wo.get("hidden"):
+        return False
+    return (len(invariants.reviewable_assumptions(store, wo))
+            > len(invariants.assumptions_owed_to_user(store, wo)))
+
+
 #: Walk the transcript tree for one-hour cache writes every N ticks
 CACHE_TTL_EVERY_TICKS = 4320
 
