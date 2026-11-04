@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from jarvis import background, db, ops
 from jarvis.project_store import ProjectStore
+from jarvis.testing import a_report
 
 
 def test_dashboard_quiet_state(page, server):
@@ -1473,6 +1474,46 @@ def test_clicking_a_morpheus_row_id_opens_its_detail(page, server):
     assert "confirm failed" in page.locator("main").inner_text()
     page.goto(f"{server}/go/{failed}")
     page.wait_for_url(f"**/mo/{failed}")
+
+
+# §1.3 of docs/superpowers/specs/2026-11-03-backlog-operability.md
+def test_an_origin_link_survives_go_and_opens_the_folded_finding(page, server, project):
+    store = ProjectStore(project)
+    try:
+        io = store.create_feature_order("root cause", description="d", kind="improvement")
+        analyst = store.create_work_order("analyse it", kind="planner", status="running")
+        store.update_feature_order(io["id"], plan_wo_id=analyst["id"], status="planning")
+    finally:
+        store.close()
+    ops.submit_findings(io["id"], a_report())
+    key = ops.show_improvement_order(io["id"])["report"]["findings"][0]["key"]
+    ops.review_findings(io["id"], accept=(key,), project_name="proj_a")
+    card = f"details#finding-{key}"
+
+    page.goto(f"{server}/io/proj_a/{io['id']}")
+    assert page.locator(card).get_attribute("open") is None  # folded unless targeted
+
+    href, _ = ops.origin_url({"kind": "finding", "order_id": io["id"], "key": key})
+    page.goto(f"{server}{href}")
+    page.wait_for_url(f"**/io/proj_a/{io['id']}#finding-{key}")
+    assert page.locator(card).get_attribute("open") is not None
+
+
+def test_an_envelope_link_opens_the_timeline_tab(page, server, project):
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("found something")
+        env = store.post_envelope(from_role="implementor", to_role="manager",
+                                  kind="deferral_request", subject_wo_id=wo["id"],
+                                  payload={"title": "tidy the parser", "why": "out of scope"})
+    finally:
+        store.close()
+    page.goto(f"{server}/wo/proj_a/{wo['id']}")
+    assert not page.locator(f"#envelope-{env}").is_visible()
+    href, _ = ops.origin_url({"kind": "envelope", "project": "proj_a", "id": env,
+                              "subject_wo_id": wo["id"]})
+    page.goto(f"{server}{href}")
+    assert page.locator(f"#envelope-{env}").is_visible()
 
 
 # §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md

@@ -1672,6 +1672,7 @@ def create_app() -> FastAPI:
             # How this status should READ — derived once, in the one function every other surface derives it from
             label = invariants.status_label(store, wo, account)
             validation = ops.validation_detail(store, wo_id=wo_id)
+            deferrals = ops.deferrals_of(store, wo_id)
             # THE WHOLE ORDER'S LIST, not one round's
             issue_index = ops.issue_index(store, wo_id)
             # None for every order the automatic merge has never touched
@@ -1720,7 +1721,7 @@ def create_app() -> FastAPI:
                       seen=invariants.acknowledged(wo),
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
-                      validation=validation, spec=spec, spec_link=spec_link,
+                      validation=validation, deferrals=deferrals, spec=spec, spec_link=spec_link,
                       # An analyst's sibling fix orders (issue 1323)
                       siblings=ops.analyst_dispatched(wo),
                       auto_merge=auto_merge,
