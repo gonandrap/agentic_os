@@ -86,11 +86,23 @@ GAP_CLASSES: dict[str, GapClass] = {
         issue_url="https://github.com/gonandrap/agentic_os/issues/1089",
         since="",
     ),
+    "background-task-silence": GapClass(
+        id="background-task-silence",
+        headline="a worker waiting for a background task's result writes nothing while it "
+                 "waits, so the sweep reads an open turn with no activity as wedged",
+        symptom="an investigation opened on a `running` order whose transcript ends on a "
+                "background launch and whose worker later resumes on the task notification",
+        detector="background.live_tasks",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
+        since="",
+    ),
 }
 
 #: Asserted equal to `tuple(GAP_CLASSES)`, on `remedies.SHIPPED_REMEDIES`' precedent
 SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
-                                        "oversized-input", "unwired-precondition")
+                                        "oversized-input", "unwired-precondition",
+                                        "background-task-silence")
 
 
 def checked_slug(raw: str) -> str:

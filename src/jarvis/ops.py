@@ -8833,7 +8833,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                base_red_until: float = 0.0,
                stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
     """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)"""
-    from . import budget, bus, holds, stuck, worker_session
+    from . import background, budget, bus, holds, stuck, worker_session
     from .central_store import base_red_hold_spans
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
@@ -8933,6 +8933,15 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # Issue 1451: a stalled turn lapses the exclusion and is judged stuck outright
         stalled = worker_session.is_stalled(turn, now)
         turn_in_flight = bool(turn) and not stalled
+        # Issue 1562: read the transcript only once the silence would convict; a stalled turn gets no pass
+        awaits_task = False
+        if (turn_in_flight and now - (durations.last_activity_ts or since)
+                >= thresholds.get("running", cfg.fallback_minutes * 60.0)):
+            try:
+                awaits_task = bool(background.live_tasks(
+                    str(wo.get("session_id") or ""), since=float(turn["started_at"])))
+            except OSError:
+                pass  # an unreadable transcript is no evidence of a wait: judged as silent
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
@@ -8951,7 +8960,9 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else stuck.PRECONDITION_CAUSE if pre_held
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact about one feature's plan
-                            else stuck.PLAN_ASSUMPTION_CAUSE if plan_held else ""),
+                            else stuck.PLAN_ASSUMPTION_CAUSE if plan_held
+                            # `running`-only, so it collides with nothing but the usage window above
+                            else stuck.BACKGROUND_TASK_CAUSE if awaits_task else ""),
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,
