@@ -13847,7 +13847,7 @@ def propose_backlog(project: str, title: str, description: str = "", *,
 
 def _promotion_plan(central: CentralStore, item_id: str,
                     as_feature: bool | None) -> list[dict[str, Any]]:
-    """Open closure, dependencies first (docs/superpowers/specs/2026-11-03-backlog-operability.md §7.1, §7.2)"""
+    """Open closure, dependencies first (docs/superpowers/specs/2026-11-03-backlog-operability.md §7.1)"""
     root = central.get_backlog(item_id)
     if not root:
         raise OpsError(f"backlog item {item_id!r} not found")
@@ -13911,7 +13911,7 @@ def _promotion_plan(central: CentralStore, item_id: str,
 
 def promote_backlog(item_id: str, *, as_feature: bool | None = None, dry_run: bool = False,
                     max_parallel: int | None = None) -> dict[str, Any] | list[dict[str, Any]]:
-    """Turn an intake item and its open dependencies into committed work (2026-11-03-backlog-operability §7)"""
+    """Turn an intake item and its open dependencies into orders (docs/superpowers/specs/2026-11-03-backlog-operability.md §7)"""
     from . import preconditions
 
     central = CentralStore()
