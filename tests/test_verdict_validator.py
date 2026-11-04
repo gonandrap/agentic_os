@@ -165,6 +165,27 @@ def test_a_proposed_fix_without_a_detector_or_a_remedy_is_refused():
     assert doc["proposed_fix"]["detector"] and doc["proposed_fix"]["remedy"]
 
 
+def test_a_gap_needs_an_owner_and_only_an_os_gap_owes_detector_and_remedy():
+    """io-ab244036: the owner picks the tracker"""
+    for owner in (None, "", "neo"):
+        doc = a_verdict("GAP")
+        doc.pop("owner")
+        if owner is not None:
+            doc["owner"] = owner
+        with pytest.raises(verdicts.VerdictError) as e:
+            verdicts.parse_verdict(doc)
+        assert any("`owner`" in p for p in e.value.problems)
+    fix = dict(a_verdict("GAP")["proposed_fix"])
+    fix.pop("detector")
+    fix.pop("remedy")
+    with pytest.raises(verdicts.VerdictError):
+        verdicts.parse_verdict(a_verdict("GAP", proposed_fix=fix))   # os still owes both
+    doc = verdicts.parse_verdict(a_verdict("GAP", owner="project", proposed_fix=fix))
+    assert doc["owner"] == "project" and "detector" not in doc["proposed_fix"]
+    with pytest.raises(verdicts.VerdictError, match="owner"):
+        verdicts.parse_verdict(a_verdict("TRANSIENT", owner="os"))
+
+
 def test_the_rendered_verdict_leads_with_the_class_and_shows_the_deliverables():
     text = "\n".join(verdicts.render_verdict(verdicts.parse_verdict(a_verdict("GAP"))))
     assert "stale-hold" in text.splitlines()[0]

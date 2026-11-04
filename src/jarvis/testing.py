@@ -2811,6 +2811,7 @@ def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
         ],
     }
     if classification == "GAP":
+        doc["owner"] = "os"
         doc["proposed_fix"] = {
             "title": "a stale panel hold parks an order after its cause has cleared",
             "description": ("The hold the panel writes when it gives up is never "
