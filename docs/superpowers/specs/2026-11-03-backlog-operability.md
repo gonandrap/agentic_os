@@ -65,12 +65,12 @@ are what older rows have.
 | `turn` | `project, wo_id, ts, seq?` | the first `agent_to_user` message of that WO with `ts >=` ref ts: `/wo/<p>/<wo>#msg-<id>`; while none exists yet, `/wo/<p>/<wo>` |
 | `message` | `project, wo_id, id` | `/wo/<p>/<wo>#msg-<id>` |
 | `neo_question` | `id` | `/neo/question/<id>` |
-| `envelope` | `project, id, subject_wo_id` | the subject WO page (the deferral) |
-| `decision` | `do_id, key?` | `/go/<do_id>` (proposal key shown as label) |
+| `envelope` | `project, id, subject_wo_id` | `/wo/<p>/<subject_wo_id>#envelope-<id>` (the deferral, in the Timeline tab) |
+| `decision` | `do_id, key?` | `/go/<do_id>#proposal-<key>`; without a key, `/go/<do_id>` |
 | `monitoring_order` | `id` (`mo-`/`mv-`) | `/mo/<id>` |
 | `alarm` | `project, id` | `/alarms/<p>/<id>` |
-| `validation` | `project, wo_id, round?` | the WO page's validation panel |
-| `finding` | `order_id` (`io-`/`inv-`/`do-`), `key` | `/go/<order_id>` |
+| `validation` | `project, wo_id, round?` | `/wo/<p>/<wo>#round-<round>`; without a round, `/wo/<p>/<wo>#validation` |
+| `finding` | `order_id` (`io-`/`inv-`/`do-`), `key` | `/go/<order_id>#finding-<key>`; an `inv-` order has no keyed findings, so `/go/<order_id>#verdict` |
 | `gate` | `project, id` | `/gates/<id>?project=<p>` |
 | `order` | `id` (any `wo-`/`fo-`) | `/go/<id>` — the weakest ref, used only when nothing finer is known |
 

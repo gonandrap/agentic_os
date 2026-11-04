@@ -702,6 +702,21 @@ the latest release tag plus its one commit cherry-picked, not whatever else is o
       ({{ debug_count }})</a>
   {% endif %}
 </div>
+{# `#envelope-<id>`: where a backlog item filed from a deferral points back to #}
+{% if deferrals %}
+<h3>Deferred work</h3>
+<div class="panel">
+  {% for d in deferrals %}
+  <div class="row" id="envelope-{{ d.id }}">
+    <div class="grow">
+      <strong>{{ d.title }}</strong> <span class="sub">{{ d.state }}</span>
+      <div class="sub">{{ d.why }}</div>
+      {% if d.note %}<div class="sub">{{ d.note }}</div>{% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
 </section>
 
 <section class="tabpanel" id="tab-states" role="tabpanel">

@@ -46,7 +46,7 @@
 <h3>Findings</h3>
 <div class="panel">
   {% for f in r.findings or [] %}
-  <div class="row">
+  <div class="row" id="finding-{{ f.key }}">
     <div class="grow">
       <strong>{{ f.title }}</strong> <span class="sub mono">{{ f.key }}</span>
       <div style="white-space: pre-wrap;">{{ f.detail }}</div>
@@ -83,7 +83,7 @@
 <h3>Proposed orders</h3>
 <div class="panel">
   {% for p in r.proposed_orders %}
-  <div class="row">
+  <div class="row" id="proposal-{{ p.key }}">
     <div class="grow">
       <strong>{{ p.title }}</strong> <span class="sub mono">{{ p.key }} · {{ p.as }}{% if p.project %} · {{ p.project }}{% endif %}</span>
       <div class="sub" style="white-space: pre-wrap;">{{ p.description }}</div>
