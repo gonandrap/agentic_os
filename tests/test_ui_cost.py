@@ -291,6 +291,28 @@ def test_a_work_order_with_no_transcript_shows_no_cost_line_at_all(client, proje
     assert "details →" not in page.text
 
 
+def test_calls_no_work_order_caused_get_a_row_and_a_true_sentence(client, project):
+    """io-82bcb830: rows sum to the headline, and the by-kind line states its price basis"""
+    from jarvis import agent_usage
+
+    agent_usage.record("digest", project="proj_a", wo_id="", label="d",
+                       model="claude-opus-5",
+                       usage={"total_cost_usd": 1.0, "input": 10, "cache_write": 0,
+                              "cache_read": 0, "output": 1_000_000})
+    report = ops.cost_report(project="proj_a", window=ops.cost_window(project="proj_a"))
+    un = report["os_unattributed"]["os_cost_usd"]
+    assert report["totals"]["total_cost_usd"] == pytest.approx(un, abs=0.01)
+
+    page = cost_page(client, "/cost?project=proj_a").text
+
+    assert f"~${report['totals']['total_cost_usd']:.2f}</p>" in page
+    assert 'class="no-work-order"' in page
+    assert f"${un:.2f}</td>" in page
+    assert "of those calls" in page and "of them" not in page
+    assert "counted in the total" in page
+    assert "recorded cost, as each call reported it" in page
+
+
 def test_a_broken_transcript_read_never_takes_the_work_order_page_down(
         client, project, monkeypatch):
     """The work order page carries the gate decision and the assumption review"""

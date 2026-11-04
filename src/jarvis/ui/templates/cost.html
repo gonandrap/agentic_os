@@ -128,8 +128,9 @@
     they happen ({{ fmt_tok(totals.os_billed_input) }} in ·
     {{ fmt_tok(totals.os_output) }} out) and survive transcript pruning.
     {%- if report.os_unattributed and report.os_unattributed.os_calls %}
-      {{ report.os_unattributed.os_calls }} of them
-      (~${{ '%.2f'|format(report.os_unattributed.os_cost_usd) }}) belong to no work order.
+      {{ report.os_unattributed.os_calls }} of those calls
+      (~${{ '%.2f'|format(report.os_unattributed.os_cost_usd) }}) belong to no work order:
+      counted in the total, and listed as their own row below.
     {%- endif %}
   </p>
   {% endif %}
@@ -209,6 +210,22 @@
   {% else %}
   <tr><td colspan="4" class="empty">no work orders to measure</td></tr>
   {% endfor %}
+  {# Not an order, so no link and no state; here so the rows sum to the headline (io-82bcb830). #}
+  {% if report.os_unattributed and report.os_unattributed.os_calls %}
+  {% set un = report.os_unattributed %}
+  <tr class="no-work-order">
+    <td class="mono">—</td>
+    <td class="mono num" style="text-align: right; color: var(--ink);">${{ '%.2f'|format(un.os_cost_usd) }}</td>
+    <td class="prose">
+      no work order
+      <div class="sub mono">jarvis ~${{ '%.2f'|format(un.os_cost_usd) }}
+        ({{ un.os_calls }} call{{ 's' if un.os_calls != 1 }}
+        {%- for k in un.os_by_kind %}{{ ', ' if not loop.first else ': ' }}{{ k.calls }} {{ k.label }}{% endfor %})
+      </div>
+    </td>
+    <td class="when"></td>
+  </tr>
+  {% endif %}
   </table>
 </div>
 
