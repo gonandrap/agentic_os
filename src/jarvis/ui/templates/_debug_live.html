@@ -14,6 +14,7 @@
     <span class="kv" style="width: 120px;">state</span>
     <span class="grow mono" id="live-state">{{ f.state }}</span>
     <span class="kv">silent <span class="mono" id="live-stale">{{ fmt_dur(f.stale_seconds) }}</span></span>
+    <button type="button" id="pty-open">open the terminal</button>
   </div>
   <div class="row"><span class="sub" id="live-note">{{ f.note }}</span></div>
   {% if f.turn %}
@@ -64,4 +65,124 @@
     {{ f.params_cap }} characters and credentials are replaced before they are cut.</div>
 </div>
 {% endif %}
+{# THE TERMINAL: the same transcript, event by event instead of as one frame
+   (`ops.live_stream`). READ-ONLY — a worker is a `claude --bg` session with no tty to
+   attach to, and feedback still goes through `jarvis wo send`. ON DEMAND like any
+   other data provider: it opens on the tail and asks for one older page per click.
+   It composes nothing: every line is a payload key, redacted by `live.redact_params`. #}
+<dialog id="pty-modal" style="width: min(1100px, 95vw); max-height: 90vh; background: var(--surface);
+  color: var(--ink); border: 1px solid var(--line);">
+  <div class="row">
+    <span class="grow mono" id="pty-modal-title">the worker conversation</span>
+    <button type="button" id="pty-modal-close">close</button>
+  </div>
+  <div class="sub" id="pty-modal-note"></div>
+  <div class="row"><button type="button" id="pty-more" hidden>load the page before this</button></div>
+  <pre id="pty-log" style="white-space: pre-wrap; overflow: auto; max-height: 70vh;"></pre>
+  <div class="sub" style="padding: 8px 16px;">Read-only: this is the worker's transcript,
+    not a prompt. Send it feedback with <code>jarvis wo send {{ wo.id }} "…"</code>.</div>
+</dialog>
+<script id="pty-modal-js">
+(function () {
+  var modal = document.getElementById("pty-modal");
+  var opener = document.getElementById("pty-open");
+  var log = document.getElementById("pty-log");
+  var more = document.getElementById("pty-more");
+  if (!opener) { return; }  // no live payload, nothing to tail
+  var url = "/api/wo/{{ project }}/{{ wo.id }}/stream";
+  var first = 0, cursor = 0, total = 0, timer = null;
+  var put = function (id, text) { document.getElementById(id).textContent = text; };
+  // textContent on every node: each line is text a worker (or whatever it read) wrote
+  var nodes = function (line) {
+    var made = [];
+    var row = document.createElement("div");
+    var label = line.kind === "prompt" ? "turn " + line.turn : line.kind;
+    var head = line.clock + "  " + label + "  " + line.text;
+    row.textContent = line.detail ? head + "  " + line.detail : head;
+    made.push(row);
+    Object.keys(line.params).forEach(function (key) {
+      var param = document.createElement("div");
+      param.textContent = "        " + key + ": " + line.params[key];
+      made.push(param);
+    });
+    return made;
+  };
+  var page = function (lines) {
+    var block = document.createDocumentFragment();
+    lines.forEach(function (line) {
+      nodes(line).forEach(function (node) { block.appendChild(node); });
+    });
+    return block;
+  };
+  // `first` is the VIEW's oldest line, not the payload's: an `after` window always
+  // has lines before it, and the view it appends to may already reach line 1.
+  var said = function (d) {
+    put("pty-modal-title", d.turn
+      ? "turn " + d.turn.seq + " · " + d.total + " lines in this conversation"
+      : "nothing has been written to this conversation yet");
+    put("pty-modal-note", d.note || (first > 1
+      ? (first - 1) + " earlier line(s) are not on screen — load them a page at a time"
+      : ""));
+    more.hidden = !(first > 1);
+  };
+  var ask = function (query) {
+    return fetch(url + query).then(function (r) {
+      return r.ok ? r.json() : null;
+    });
+  };
+  var reset = function () {
+    log.textContent = "";
+    first = cursor = total = 0;
+    ask("").then(function (d) {
+      if (!d) { return; }
+      log.appendChild(page(d.lines));
+      first = d.first || 0;
+      cursor = d.cursor || 0;
+      total = d.total;
+      said(d);
+      log.scrollTop = log.scrollHeight;
+    }).catch(function () {});
+  };
+  var poll = function () {
+    ask("?after=" + cursor).then(function (d) {
+      if (!d) { return; }
+      // A compaction rewrites the transcript from the start, so the numbering it was
+      // read at is gone: start the window again rather than append across the seam.
+      if (d.total < total) { reset(); return; }
+      var atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+      log.appendChild(page(d.lines));
+      if (d.lines.length) { cursor = d.cursor; }
+      if (!first) { first = d.first || 0; }
+      total = d.total;
+      said(d);
+      if (atEnd) { log.scrollTop = log.scrollHeight; }
+    }).catch(function () {});
+  };
+  more.onclick = function () {
+    if (!first) { return; }
+    more.disabled = true;
+    ask("?before=" + first).then(function (d) {
+      more.disabled = false;
+      if (!d || !d.lines.length) { more.hidden = true; return; }
+      var was = log.scrollHeight;
+      log.insertBefore(page(d.lines), log.firstChild);
+      first = d.first;
+      more.hidden = !(first > 1);
+      // Hold the reader's place: the lines just prepended pushed everything down
+      log.scrollTop += log.scrollHeight - was;
+    }).catch(function () { more.disabled = false; });
+  };
+  opener.onclick = function () {
+    modal.showModal();
+    reset();
+    timer = setInterval(poll, 2000);
+  };
+  document.getElementById("pty-modal-close").onclick = function () { modal.close(); };
+  // On `close`, not on the button: Esc closes a `<dialog>` and would leak the interval
+  modal.addEventListener("close", function () {
+    clearInterval(timer);
+    timer = null;
+  });
+})();
+</script>
 </section>

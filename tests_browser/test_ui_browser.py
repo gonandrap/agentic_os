@@ -1255,6 +1255,190 @@ def test_debug_prompt_spec_and_sessions_pages_read_at_desktop_and_phone_width(
             _shot(page, f"{name}-{size['width']}")
 
 
+def _talkative_order(project, root, lines):
+    """An order with a real session transcript of `lines` assistant messages"""
+    import json
+    import time as _time
+
+    wo = ops.create_work_order("proj_a", "an order whose turn is running right now")
+    store = ProjectStore(project)
+    try:
+        store.create_turn(wo["id"], "dispatch", "go")
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+    finally:
+        store.close()
+
+    at = _time.time() - 600
+
+    def stamp(t):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(t))
+
+    def said(n, text, block=None):
+        return {"type": "assistant", "timestamp": stamp(at + n),
+                "message": {"id": f"m{n}", "model": "claude-opus-5",
+                            "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                                      "cache_read_input_tokens": 0, "output_tokens": 1},
+                            "content": [block or {"type": "text", "text": text}]}}
+
+    rows = [{"type": "user", "timestamp": stamp(at), "promptSource": "sdk",
+             "message": {"content": "You are the worker agent for " + wo["id"]}}]
+    rows += [said(n, f"step {n} of the plan") for n in range(lines)]
+    rows += [
+        said(lines + 1, "", {"type": "tool_use", "id": "t1", "name": "Bash",
+                             "input": {"command": "uv run pytest tests/test_live.py -q"}}),
+        {"type": "user", "timestamp": stamp(at + lines + 2),
+         "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                  "content": "28 passed in 1.69s"}]}},
+    ]
+    (root / "-proj" / f"{wo['id']}.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows))
+    return wo
+
+
+def test_the_terminal_modal_tails_the_worker_conversation(
+        page, server, project, monkeypatch, tmp_path):
+    """The debugging page's terminal: one click, the end of the conversation, nothing to type into"""
+    from jarvis import usage
+
+    root = tmp_path / "pty-transcripts"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    wo = _talkative_order(project, root, 6)
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}/debug")
+    assert not page.locator("#pty-modal").is_visible()
+
+    page.click("#pty-open")
+    page.wait_for_selector("#pty-log div")
+    terminal = page.locator("#pty-log").inner_text()
+
+    assert "lines in this conversation" in page.locator("#pty-modal-title").inner_text()
+    assert "step 5 of the plan" in terminal
+    assert "uv run pytest tests/test_live.py -q" in terminal
+    assert "28 passed in 1.69s" in terminal
+    # The whole conversation fits in one page, so there is nothing older to ask for
+    assert page.locator("#pty-more").is_hidden()
+    # Read-only: the modal offers no way to speak to the session
+    assert not page.locator("#pty-modal input, #pty-modal textarea").count()
+    assert "jarvis wo send" in page.locator("#pty-modal").inner_text()
+    _shot(page, "debug-terminal-modal")
+
+
+def test_the_terminal_modal_loads_one_older_page_per_click(
+        page, server, project, monkeypatch, tmp_path):
+    """On demand: the modal opens on the tail and never fetches the whole conversation"""
+    from jarvis import ops as _ops
+    from jarvis import usage
+
+    root = tmp_path / "pty-paging"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    _ops.set_config("inspect.stream_lines", 5, "proj_a", reason="a small page")
+    wo = _talkative_order(project, root, 20)
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}/debug")
+    page.click("#pty-open")
+    page.wait_for_selector("#pty-log div")
+
+    opened = page.locator("#pty-log").inner_text()
+    assert "step 19 of the plan" in opened, "the tail is what it opens on"
+    assert "step 0 of the plan" not in opened
+    assert page.locator("#pty-more").is_visible()
+    assert "earlier line(s) are not on screen" in page.locator("#pty-modal-note").inner_text()
+    _shot(page, "debug-terminal-modal-paged")
+
+    page.click("#pty-more")
+    page.wait_for_function(
+        "() => document.getElementById('pty-log').innerText.includes('step 14')")
+    after_one_click = page.locator("#pty-log").inner_text()
+
+    assert "step 19 of the plan" in after_one_click, "the page is prepended, not replaced"
+    assert "step 12 of the plan" in after_one_click
+    assert "step 11 of the plan" not in after_one_click, "ONE page per click, not all of them"
+
+
+def test_closing_the_terminal_with_escape_stops_the_poll(
+        page, server, project, monkeypatch, tmp_path):
+    """A `<dialog>` closes on Esc without the close button, and the interval must go with it"""
+    from jarvis import usage
+
+    root = tmp_path / "pty-escape"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    wo = _talkative_order(project, root, 4)
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}/debug")
+    page.click("#pty-open")
+    page.wait_for_selector("#pty-log div")
+
+    polls = []
+    page.on("request", lambda r: polls.append(r.url) if "/stream" in r.url else None)
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(4500)
+
+    assert not page.locator("#pty-modal").is_visible()
+    assert polls == [], f"the poll outlived the modal: {polls}"
+
+
+def test_the_terminal_restarts_its_window_when_the_transcript_is_rewritten(
+        page, server, project, monkeypatch, tmp_path):
+    """A compaction renumbers from line 1, so appending across the seam would interleave"""
+    import json
+
+    from jarvis import usage
+
+    root = tmp_path / "pty-compaction"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    wo = _talkative_order(project, root, 8)
+    transcript = root / "-proj" / f"{wo['id']}.jsonl"
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}/debug")
+    page.click("#pty-open")
+    page.wait_for_selector("#pty-log div")
+    assert "step 7 of the plan" in page.locator("#pty-log").inner_text()
+
+    kept = [json.loads(line) for line in transcript.read_text().splitlines()][:2]
+    kept[1]["message"]["content"] = [{"type": "text", "text": "a summary of what came before"}]
+    transcript.write_text("".join(json.dumps(r) + "\n" for r in kept))
+    page.wait_for_function(
+        "() => document.getElementById('pty-log').innerText.includes('a summary of what')",
+        timeout=10000)
+
+    after = page.locator("#pty-log").inner_text()
+    assert "step 7 of the plan" not in after, "the pre-compaction lines were not dropped"
+
+
+def test_loading_an_older_page_keeps_the_reader_where_they_were(
+        page, server, project, monkeypatch, tmp_path):
+    """Prepending pushes everything down; the line under the eye must not move with it"""
+    from jarvis import ops as _ops
+    from jarvis import usage
+
+    root = tmp_path / "pty-scroll"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    _ops.set_config("inspect.stream_lines", 30, "proj_a", reason="a page taller than the log")
+    wo = _talkative_order(project, root, 90)
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}/debug")
+    page.click("#pty-open")
+    page.wait_for_selector("#pty-log div")
+    page.evaluate("() => { document.getElementById('pty-log').scrollTop = 0; }")
+
+    page.click("#pty-more")
+    page.wait_for_function(
+        "() => document.getElementById('pty-log').innerText.includes('step 32 of the plan')")
+
+    held = page.evaluate("""() => {
+      var log = document.getElementById('pty-log');
+      return {top: log.scrollTop, height: log.scrollHeight};
+    }""")
+    assert held["top"] > 0, "the view snapped back to the top of the newly loaded page"
+
+
 def test_the_operation_jump_opens_its_tab_on_the_worker_prompt_page(page, server):
     page.goto(f"{server}/project/proj_a/prompt#operation")
     assert page.locator("#operation").is_visible()
