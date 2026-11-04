@@ -59,7 +59,9 @@
   {# Not an error, and worth saying which kind of "not yet" this is: a worker is parked
      on it either way, and only one of the two is waiting on the user. #}
   <div class="empty">
-    {%- if q.status in ('escalated', 'failed') -%}
+    {%- if q.status == 'lapsed' -%}
+      never answered — {{ q.lapsed_reason }}.
+    {%- elif q.status in ('escalated', 'failed') -%}
       not answered yet — Neo escalated this to you.
     {%- else -%}
       not answered yet — still with Neo.

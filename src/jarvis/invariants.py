@@ -2134,6 +2134,39 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
         neo.close()
 
 
+def check_open_questions_lapse(store: ProjectStore) -> Iterator[Violation]:
+    """INV-NEO-QUESTION-LAPSED — an ended order's worker question must not stay open (io-d5e62d4d)"""
+    from .neo_store import LAPSABLE_Q_STATUSES, NeoStore
+    from .project_store import QUESTION_LAPSING_STATUSES
+
+    readonly = getattr(store, "readonly", False)
+    neo = NeoStore()
+    try:
+        # An empty `wo_id` has a subject of its own, and no order to end
+        rows = [q for q in neo.list_questions(statuses=LAPSABLE_Q_STATUSES, limit=-1)
+                if q["kind"] == "question" and q["wo_id"]]
+    finally:
+        neo.close()
+    for q in rows:
+        try:
+            wo = store.get_work_order(q["wo_id"])
+        except KeyError:
+            continue  # another project's order: Neo's store is OS-wide
+        if wo["status"] not in QUESTION_LAPSING_STATUSES:
+            continue
+        # `_ReadOnly` swallows this write
+        store.lapse_open_questions(wo["id"], str(wo["status"]))
+        yield Violation(
+            invariant="INV-NEO-QUESTION-LAPSED",
+            wo_id=wo["id"],
+            detail=(f"Neo question {q['id']} was still {q['status']}, but its work order "
+                    f"is {wo['status']}"),
+            repaired=True,
+            repair="would lapse it" if readonly else "lapsed",
+            context={"question_id": q["id"], "was": q["status"]},
+        )
+
+
 def _is_work_order(store: ProjectStore, wo_id: str) -> bool:
     try:
         store.get_work_order(wo_id)
@@ -4489,6 +4522,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # settled; it reads child flags and writes only the parent's
     check_decisions_closed_by_user,  # order-free: a pure read that repairs nothing
     check_awaiting_decisions_flagged,  # after the orphan check: it raises only where no flag is up
+    check_open_questions_lapse,    # before the next check: it would write an answer on these rows
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
                                    # touches no flag any other check reads
     check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one
@@ -4537,6 +4571,8 @@ class _ReadOnly:
                 "clear_attention",
                 "add_assumption", "add_event",
                 "set_status", "update_work_order", "supersede_approval",
+                # INV-NEO-QUESTION-LAPSED's repair
+                "lapse_open_questions",
                 # INV-GATE-UNJUDGED's repair
                 "mark_approval_escalated",
                 # The bus
