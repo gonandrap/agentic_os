@@ -1,9 +1,8 @@
-"""A manager's turn end is its delivery: its assumptions get ruled while its feature lives (io-d5e62d4d)"""
+"""A manager's turn end is its delivery (io-d5e62d4d)"""
 
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
@@ -155,7 +154,7 @@ def test_the_managers_next_turn_answers_a_refusal(started, monkeypatch):
     # A hold that lifts by itself is not the user's
     assert not invariants.true_blockers(store, store.get_work_order(wo["id"]))
 
-    monkeypatch.setattr(store, "latest_turn", lambda _: {"state": "done", "ended_at": time.time() + 60})
+    monkeypatch.setattr(store, "latest_turn", lambda _: {"state": "done", "ended_at": float("inf")})
     assert ops.refusal_answered(store, wo["id"])
     before = len(questions())
     ask(started, store)
