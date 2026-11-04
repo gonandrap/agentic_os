@@ -741,10 +741,15 @@ def remove_closed_sessions(store: ProjectStore) -> list[str]:
 
 
 def os_ordered_paths(store: ProjectStore, wo: dict[str, Any], tree: Path) -> tuple[str, ...]:
-    """Every file in `tree` the OS's contract, submits and hooks had this order write (#1538)"""
+    """Every file in `tree` the OS's contract, submits and hooks had this order write and may now discard (#1538)"""
     root = tree.resolve()
-    out = [*submission_artifacts(wo), pr_body_file(wo["id"])]
-    for kind in (SUBMITTED_ARTIFACT_EVENT, REFUSED_ARTIFACT_EVENT):
+    out = [pr_body_file(wo["id"])]
+    kinds = [SUBMITTED_ARTIFACT_EVENT]
+    # Completed means its contract command read the file; a cancelled one's may be the only copy
+    if wo["status"] == "completed":
+        out.extend(submission_artifacts(wo))
+        kinds.append(REFUSED_ARTIFACT_EVENT)
+    for kind in kinds:
         for event in store.events_of_kind(wo["id"], kind):
             recorded = (db.from_json(event.get("payload"), None) or {}).get("path")
             if recorded and Path(recorded).is_relative_to(root):
@@ -761,9 +766,7 @@ def _prune_worktree_caches(store: ProjectStore, wo: dict[str, Any]) -> None:
     tree = Path(store.project_path) / ".claude" / "worktrees" / str(wo["worktree"])
     if not tree.is_dir():
         return
-    # Completed means its contract command already read the file; a cancelled one may not have
-    consumed = os_ordered_paths(store, wo, tree) if wo["status"] == "completed" else ()
-    pruned = disk.prune_build_caches(tree, consumed)
+    pruned = disk.prune_build_caches(tree, os_ordered_paths(store, wo, tree))
     kept = store.last_event_of_kind(wo["id"], SESSION_KEPT_EVENT)
     # Walk once, and again only after an EACCES refusal — not every poll of a kept tree
     if kept is None or "EACCES" in str(kept.get("payload") or ""):

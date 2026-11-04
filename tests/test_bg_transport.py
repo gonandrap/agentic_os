@@ -611,7 +611,8 @@ def test_a_real_uncommitted_file_beside_os_ordered_ones_still_keeps_the_session(
     assert (tree / "notes.md").exists()
 
 
-def test_a_cancelled_order_keeps_what_the_os_ordered(bg_fleet, fake_claude, settle_turns):
+def test_a_cancelled_order_keeps_its_refused_plan_but_not_its_pr_body(
+        bg_fleet, fake_claude, settle_turns):
     """A cancelled order's refused plan was never read; it may be the only copy (#1538)"""
     store, wo, tree, body = _order_with_refused_plan_and_pr_body(bg_fleet, settle_turns)
     store.set_status(wo["id"], "cancelled")
@@ -619,7 +620,30 @@ def test_a_cancelled_order_keeps_what_the_os_ordered(bg_fleet, fake_claude, sett
     worker_session.poll(store)
 
     assert (tree / ".jarvis-plan.json").exists()
-    assert (tree / body).exists()
+    assert not (tree / body).exists()
+    assert store.get_work_order(wo["id"])["bg_id"] == wo["bg_id"]
+    assert [v.invariant for v in invariants.check_closed_session_removed(store)] == [
+        "INV-SESSION-KEPT"]
+
+
+def test_a_cancelled_order_with_only_read_or_regenerable_files_is_removed(
+        bg_fleet, fake_claude, settle_turns):
+    """Its submission was read and its PR body regenerable: neither keeps the session (#1538)"""
+    from jarvis.project_store import SUBMITTED_ARTIFACT_EVENT, pr_body_file
+
+    store = bg_fleet["store"]
+    wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {"my-plan.json": "{}"})
+    (tree / pr_body_file(wo["id"])).write_text("body\n")
+    store.add_event(wo["id"], SUBMITTED_ARTIFACT_EVENT,
+                    {"path": str((tree / "my-plan.json").resolve())})
+    store.set_status(wo["id"], "cancelled")
+
+    worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] is None
+    assert not (tree / "my-plan.json").exists()
+    assert not (tree / pr_body_file(wo["id"])).exists()
+    assert list(invariants.check_closed_session_removed(store)) == []
 
 
 def test_a_pr_body_tracked_on_the_branch_is_restored_to_head(
