@@ -709,13 +709,13 @@ def _confirmation_is_open(question_id: int) -> bool:
     return bool(q) and str(q["status"] or "") in NEO_HELD_Q_STATUSES
 
 
-def _os_is_confirming(a: dict[str, Any]) -> bool:
-    """Is the OS's own confirmation pass (§7) holding this assumption, not the user? (#833)"""
+def _neo_still_rules(a: dict[str, Any]) -> bool:
+    """Is Neo holding this assumption or about to be asked, not done with a closed question? (#833)"""
     verdict = str(a.get("provisional_verdict") or "")
-    if verdict == "accept":
-        qid = int(a.get("confirm_question_id") or 0)
-        return not qid or _confirmation_is_open(qid)
-    return verdict == "object" and bool(a.get("objection_delivered_ts"))
+    if verdict == "object":
+        return bool(a.get("objection_delivered_ts"))
+    qid = int(a.get("confirm_question_id" if verdict else "neo_question_id") or 0)
+    return not qid or _confirmation_is_open(qid)
 
 
 def drift_review_failed(store: ProjectStore, wo: dict[str, Any]) -> str:
@@ -754,6 +754,23 @@ def assumptions_left_with_user(store: ProjectStore, wo: dict[str, Any],
     return [a for a in pending if int(a["id"]) in left]
 
 
+def assumptions_owed_to_user(store: ProjectStore,
+                             wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """The rows that are the user's now: the ONE answer flag, ping and blockers ask (io-ed253c2b)"""
+    pending = reviewable_assumptions(store, wo)
+    if not pending or neo_reviews_later(store, wo):
+        return []
+    from .ops import assumptions_held_final, auto_review_at
+
+    if wo["status"] != "needs_review" and turn_end_is_delivery(wo):
+        return assumptions_left_with_user(store, wo, pending)
+    # Only a `needs_review` order is in Neo's delivered pass; no pass reaches any other status
+    if wo["status"] != "needs_review" or not auto_review_at(store.project_path):
+        return pending
+    final = assumptions_held_final(store, wo)
+    return [a for a in pending if int(a["id"]) in final or not _neo_still_rules(a)]
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone"""
@@ -762,17 +779,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # §9: FIRST, because it is the more specific fact about the same assumption
     if any(objection_undeliverable(store, a) for a in pending):
         blockers.append(OBJECTION_UNDELIVERABLE_BLOCKER)
-    owed = pending
-    if pending and wo["status"] == "needs_review":
-        # `neo_reviews_later` covers the PRE-DELIVERY statuses (#711) and is False here
-        from .ops import auto_review_at
-        if auto_review_at(store.project_path):
-            owed = [a for a in pending if not _os_is_confirming(a)]
-    elif pending and turn_end_is_delivery(wo):
-        owed = assumptions_left_with_user(store, wo, pending)
+    owed = assumptions_owed_to_user(store, wo)
     # ONE COMPOUND LINE when the order is also out of money
     compound = False
-    if owed and not neo_reviews_later(store, wo):
+    if owed:
         n = len(owed)
         compound = wo["status"] == budget.EXHAUSTED
         clause = (f"{n} assumption{'s' if n != 1 else ''} "

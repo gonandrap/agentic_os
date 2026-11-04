@@ -5536,6 +5536,9 @@ def cmd_backlog(args: argparse.Namespace) -> int:
                 for m in plan:
                     waits = f" (waits on {', '.join(m['waits_on'])})" if m["waits_on"] else ""
                     print(f"• {m['id']} [{m['project']}] {m['kind']}: {m['title']}{waits}")
+                dead = sorted({d for m in plan for d in m["dead_deps"]})
+                if dead:
+                    print(f"not waiting on dropped dependencies: {', '.join(dead)}")
             if not confirmed:
                 if not args.json:
                     print(f"this creates {len(plan)} orders; re-run with --yes")

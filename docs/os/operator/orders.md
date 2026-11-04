@@ -91,7 +91,7 @@ show renders the report and the orders already filed from it. send asks the rese
 
 ## `jarvis backlog promote <id> [--as feature] [--yes]`
 
-Intake -> orders: the item and every open dependency, each of its `suggested_kind`; `--as` overrides the item's own. More than one member needs `--yes`. A work order waits on its dependencies through `bl-` holds; a feature order cannot wait, so one with unsettled dependencies is refused. A dropped, missing, proposed or quarantined dependency refuses the whole promotion.
+Intake -> orders: the item and every open dependency, each of its `suggested_kind`; `--as` overrides the item's own. More than one member needs `--yes`. A work order waits on its dependencies through `bl-` holds; a feature order cannot wait, so one with unsettled dependencies is refused. A dropped dependency is not waited on, and the confirmation names it; dropped as a duplicate, the kept item stands in for it. A missing, proposed or quarantined dependency refuses the whole promotion.
 
 ## `jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>`
 
