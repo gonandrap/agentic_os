@@ -348,4 +348,6 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
             lines.append(f"    {filed['dispatch']}")
     elif verdict.get("filing_error"):
         lines.append(f"  NOT filed: {verdict['filing_error']}")
+    for miss in verdict.get("coverage_miss") or []:
+        lines.append(f"  named with no entry: {miss.get('gap', '')} ({miss.get('quote', '')!r})")
     return lines

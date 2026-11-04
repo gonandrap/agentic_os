@@ -1064,6 +1064,9 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"whole document is refused.",
         "- One subject, one root cause, one classification. A symptom with two independent "
         "causes is an improvement order, and belongs in the verdict as that recommendation.",
+        "- A GAP verdict passes one model check before it settles, so the verdict command "
+        "can take 90 seconds. If it returns naming gaps with no entry, cover them and "
+        "resubmit: it returns once.",
         "",
         "# What you may run",
         "Reads: `git log|show|diff|status|blame`, `gh pr view|diff|checks`, "
