@@ -360,6 +360,8 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "question_asked":
         # Never the text, with or without an id: the conversation renders the ask from this same payload
         return "Worker asked a question", ""
+    if kind == "question_lapsed":
+        return f"Neo question {p.get('question_id')} lapsed", p.get("reason") or ""
     # Debug (see DEBUG_KINDS); they still render, with no detail, when asked for
     if kind == "neo_answered":
         return "Neo answered the worker", ""
@@ -372,6 +374,9 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         verb = "accepted" if p.get("accepted") else "rejected"
         count = p.get("count")
         return f"Assumptions {verb}", f"{count} assumption(s)" if count else ""
+    if kind == "assumptions_lapsed":
+        return "Assumptions lapsed", (f"{p.get('count')} unruled when the order reached "
+                                      f"{p.get('status')}; no verdict recorded")
     # Auto-review's (`ops.AUTOREVIEW_EVENTS`
     if kind == "autoreview_asked":
         return (f"Asked Neo to rule on assumption #{p.get('n')}",

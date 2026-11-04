@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -604,6 +605,94 @@ def test_the_cost_page_shows_the_fleet_distribution(client, project):
     assert "usage week" in page.text, "the window says where it came from"
 
 
+def _wrap(monkeypatch, name: str, change) -> None:
+    """Run the real `ops.<name>`, then edit its payload"""
+    real = getattr(ops, name)
+
+    def wrapped(**kwargs):
+        out = real(**kwargs)
+        change(out)
+        return out
+
+    monkeypatch.setattr(ops, name, wrapped)
+
+
+def _listed_cents(html: str) -> float:
+    """What a reader adding up the cost column gets"""
+    table = html.split('class="cost-list"', 1)[1].split("</table>", 1)[0]
+    cells = re.findall(r'<td class="mono num"[^>]*>\s*\$([0-9.]+)', table)
+    return round(sum(float(c) for c in cells), 2)
+
+
+def test_the_order_list_comes_first_and_its_tally_adds_to_the_headline(client, project):
+    """The headline's dollars are all in rows, including a row whose transcript is gone"""
+    worker = ops.create_work_order("proj_a", "the dear one")
+    add_recorded_turn(project, worker["id"], 0.05, 48_000)
+    add_os_calls(worker["id"], neo_calls=2)
+    add_os_calls(ops.create_work_order("proj_a", "jarvis half only")["id"], neo_calls=1)
+
+    html = cost_page(client, "/cost").text
+
+    headline = float(re.search(r'font-size: 22px;" class="mono">\s*~\$([0-9.]+)', html)[1])
+    assert headline > 0 and _listed_cents(html) == headline
+    assert f"2 orders below add to\n      ${headline:.2f}" in html
+    assert f"= ~${headline:.2f}, the headline above." in html
+    assert "from rounding" not in html
+    assert html.index("the headline above") < html.index("What a typical order costs")
+
+
+def test_the_tally_names_the_rounding_between_rows_and_headline(client, project, monkeypatch):
+    def change(report):
+        report["totals"]["total_cost_usd"] = 2.01
+        for unit, cost in zip(report["units"], (1.004, 1.003), strict=True):
+            unit.update(total_cost_usd=cost, found=True)
+
+    for title in ("one", "two"):
+        add_recorded_turn(project, ops.create_work_order("proj_a", title)["id"], 0.05, 48_000)
+    _wrap(monkeypatch, "cost_report", change)
+
+    html = cost_page(client, "/cost").text
+
+    assert "add to\n      $2.00" in html
+    assert "+ $0.01 from rounding" in html and "= ~$2.01, the headline" in html
+
+
+def test_what_the_headline_leaves_out_is_named_and_the_outside_table_is_headed(
+        client, project, monkeypatch):
+    """The unheaded $5.76 table was read as the window's orders (io-82bcb830)"""
+    def change(payload):
+        payload["meter"]["outside"] = {
+            "n": 1, "total_usd": 5.76,
+            "sessions": [{"session_id": "abcdef012345", "project": "proj_a",
+                          "project_dir": "/p", "usd": 5.76, "title": "by hand"}]}
+
+    add_recorded_turn(project, ops.create_work_order("proj_a", "an order")["id"], 0.05, 48_000)
+    add_os_calls("", neo_calls=1)
+    meter_samples_in_the_current_5h_window()
+    _wrap(monkeypatch, "cost_meter", change)
+
+    html = cost_page(client, "/cost?window=5h").text
+
+    tally = html.split("Not in that total:", 1)[1].split("</p>", 1)[0]
+    assert "1 Jarvis call that" in tally and "belong to no work order" in tally
+    assert "1 session Jarvis did not dispatch" in tally and "$5.76" in tally
+    heading = html.index("<strong>Sessions Jarvis did not dispatch</strong>")
+    assert html.index("the headline above") < heading < html.index("abcdef01")
+    assert "of them" not in html
+
+
+@pytest.mark.parametrize("envelope,labelled", [(0, True), (1, False)])
+def test_a_cost_per_order_with_no_envelope_turns_is_named_the_jarvis_half(
+        client, project, monkeypatch, envelope, labelled):
+    def change(payload):
+        payload["fleet"]["metrics"]["cost_per_order_usd"]["cost_basis"]["envelope"] = envelope
+
+    add_recorded_turn(project, ops.create_work_order("proj_a", "an order")["id"], 0.05, 48_000)
+    _wrap(monkeypatch, "fleet_cost", change)
+
+    assert ("Jarvis half only" in cost_page(client, "/cost").text) is labelled
+
+
 def test_the_cost_page_survives_a_fleet_section_that_cannot_be_built(client, project,
                                                                      monkeypatch):
     """The distribution is a SECTION"""
@@ -868,7 +957,7 @@ def test_the_feature_bill_grows_no_own_row_when_there_is_no_own_spend(
     assert OWN_LABEL not in page.text
 
 
-# -- the usage meter, above the listing (tests 36 and 44)
+# -- the usage meter, below the listing (tests 36 and 44)
 
 
 def meter_samples_in_the_current_5h_window(n: int = 240) -> None:
@@ -889,7 +978,7 @@ def meter_samples_in_the_current_5h_window(n: int = 240) -> None:
         central.close()
 
 
-def test_the_meter_sentence_and_the_sparkline_are_above_the_listing(client, project):
+def test_the_meter_sentence_and_the_sparkline_are_below_the_listing(client, project):
     """One sentence, built once in `usage_meter.sentence` and rendered VERBATIM: two wordings of the same..."""
     wo = ops.create_work_order("proj_a", "an order in this window")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
@@ -901,7 +990,7 @@ def test_the_meter_sentence_and_the_sparkline_are_above_the_listing(client, proj
     assert page.status_code == 200
     assert said in page.text, "re-worded in the template"
     assert "the 5h meter rose" in said
-    assert page.text.index(said) < page.text.index("an order in this window")
+    assert page.text.index("an order in this window") < page.text.index(said)
     assert "<svg" in page.text and "<polyline" in page.text
 
 
@@ -929,6 +1018,9 @@ def test_the_meter_chart_endpoint_serves_any_span_and_refuses_a_bad_one(client, 
     # The wheel refuses a span past the endpoint's cap rather than blanking the chart on a 400
     assert embedded["max_span"] == cap
     assert 'data-shift="span"' in page.text and 'data-series="seven_day_pct"' in page.text
+    assert 'data-calc="five_hour" checked' in page.text
+    assert 'data-calc="seven_day" checked' in page.text
+    assert "five_hour_calc_jarvis" in embedded["timeline"][0]
 
 
 def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, project):

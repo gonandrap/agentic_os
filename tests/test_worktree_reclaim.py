@@ -147,6 +147,79 @@ def test_a_checkout_already_gone_is_recorded_and_not_looked_at_again(store, proj
     assert disk.sweep(store, spec(project)) == ([], [])
 
 
+@pytest.fixture()
+def temp_roots(tmp_path, monkeypatch):
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+
+
+def populated_root(wo_id: str) -> Path:
+    root = disk.pytest_temproot(wo_id)
+    (root / "pytest-of-u" / "pytest-0").mkdir(parents=True)
+    return root
+
+
+def remove_checkout(project: Path, path: Path) -> None:
+    subprocess.run(["git", "-C", str(project), "worktree", "remove", "--force",
+                    str(path)], check=True)
+
+
+def test_a_checkout_already_gone_still_loses_its_temp_root(store, project, temp_roots):
+    """#1574: the early return on the already-gone path skipped the removal"""
+    wo_id, path = settled(store, project)
+    root = populated_root(wo_id)
+    remove_checkout(project, path)
+
+    assert disk.sweep(store, spec(project))[0] == [wo_id]
+    assert not root.exists()
+
+
+def test_an_order_already_marked_reclaimed_still_loses_its_temp_root(store, project,
+                                                                     temp_roots):
+    """The roots stranded before #1574: the event keeps these out of `settled_worktrees`"""
+    wo_id, path = settled(store, project)
+    remove_checkout(project, path)
+    store.add_event(wo_id, disk.EVENT, {"worktree": wo_id, "removed": False,
+                                        "why": "already gone"})
+    root = populated_root(wo_id)
+
+    assert disk.sweep(store, spec(project)) == ([], [])
+    assert not root.exists()
+
+
+def test_a_harness_opened_order_loses_its_temp_root(store, project, temp_roots):
+    wo_id, _ = settled(store, project)
+    store.update_work_order(wo_id, worktree=str(project / "elsewhere"))
+    store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
+                       (db.now() - 48 * HOUR, wo_id))
+    store.conn.commit()
+    root = populated_root(wo_id)
+
+    assert disk.sweep(store, spec(project)) == ([], [wo_id])
+    assert not root.exists()
+
+
+def test_a_read_only_temp_root_is_still_removed(store, project, temp_roots):
+    wo_id, _ = settled(store, project)
+    root = populated_root(wo_id)
+    (root / "pytest-of-u" / "pytest-0" / "f").write_text("x")
+    (root / "pytest-of-u" / "pytest-0").chmod(0o500)
+
+    disk.sweep(store, spec(project))
+    assert not root.exists()
+
+
+def test_a_temp_root_nobody_may_reclaim_stays(store, project, temp_roots):
+    """Inside the grace period, retryable, or not this project's order"""
+    young, _ = settled(store, project, ago=HOUR)
+    failed, _ = settled(store, project, status="failed")
+    roots = [populated_root(wo_id) for wo_id in (young, failed, "wo-another-project")]
+
+    disk.sweep(store, spec(project))
+    assert all(root.is_dir() for root in roots)
+
+
 def test_the_sweep_is_bounded_per_pass(store, project):
     ids = [settled(store, project)[0] for _ in range(3)]
 

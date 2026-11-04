@@ -23,6 +23,8 @@
                                              align-items: center; margin-bottom: 6px;">
     <label><input type="checkbox" data-series="five_hour_pct" checked> 5h</label>
     <label><input type="checkbox" data-series="seven_day_pct" checked> 7d</label>
+    <label><input type="checkbox" data-calc="five_hour" checked> 5h calculated</label>
+    <label><input type="checkbox" data-calc="seven_day" checked> 7d calculated</label>
     <span class="sub">compare with:</span>
     <label><input type="checkbox" data-shift="span"> previous window</label>
     <label><input type="checkbox" data-shift="span2"> 2 windows back</label>
@@ -44,7 +46,9 @@
     5h solid · 7d dashed · 0-100% of the window ·
     {{ tl|length }} point{{ 's' if tl|length != 1 }} ·
     {{ '%.0f'|format(100 * meter.coverage.share) }}% covered
-    <span class="meter-hint" style="display: none;"> · wheel zooms · drag selects a
+    <span class="meter-hint" style="display: none;"> · shaded: calculated from
+      recorded spend, <span style="color: var(--cyan);">Jarvis</span> under
+      <span style="color: #f2a33c;">outside Jarvis</span> · wheel zooms · drag selects a
       range and opens it · overlays are aligned to this window</span>
   </p>
   <script type="application/json" id="meter-data">{{ {
@@ -62,6 +66,9 @@
     var SERIES = { five_hour_pct: { label: '5h', dash: '' },
                    seven_day_pct: { label: '7d', dash: '5 4' } };
     var OVERLAY_COLORS = ['#f2a33c', '#56c8e8', '#46d69a', '#e85d5d'];
+    var CALC = { five_hour: { label: '5h', meter: 'five_hour_pct', opacity: 0.3 },
+                 seven_day: { label: '7d', meter: 'seven_day_pct', opacity: 0.18 } };
+    var calcShown = { five_hour: true, seven_day: true };
     var span = data.until - data.since, MAX_SPAN = data.max_span;
     var view = { a: data.since, b: data.until };
     var main = data.timeline;
@@ -152,6 +159,44 @@
         'data-series': key, 'data-overlay': overlay || '' }, parent);
     }
 
+    // Calculated usage as a stack: Jarvis from 0, outside on top; a null breaks the band.
+    function stack(parent, tl, key) {
+      var runs = [], cur = [];
+      tl.forEach(function (p) {
+        var j = p[key + '_calc_jarvis'], o = p[key + '_calc_outside'];
+        if (j == null || o == null) { if (cur.length) runs.push(cur); cur = []; return; }
+        cur.push({ x: x(p.ts), j: j, o: o });
+      });
+      if (cur.length) runs.push(cur);
+      runs.forEach(function (r) {
+        function band(lo, hi, color) {
+          var top = r.map(function (q) { return q.x.toFixed(1) + ',' + y(hi(q)).toFixed(1); });
+          var bottom = r.slice().reverse().map(function (q) {
+            return q.x.toFixed(1) + ',' + y(lo(q)).toFixed(1);
+          });
+          el('polygon', { points: top.concat(bottom).join(' '), fill: color, stroke: 'none',
+                          opacity: CALC[key].opacity, 'data-calc': key }, parent);
+        }
+        band(function () { return 0; }, function (q) { return q.j; }, 'var(--cyan)');
+        band(function (q) { return q.j; }, function (q) { return q.j + q.o; }, '#f2a33c');
+      });
+    }
+
+    function calcRow(p) {
+      return Object.keys(CALC).filter(function (k) { return calcShown[k]; })
+        .map(function (k) {
+          var j = p[k + '_calc_jarvis'], o = p[k + '_calc_outside'], m = p[CALC[k].meter];
+          if (j == null || o == null) return CALC[k].label + ' calc —';
+          var said = CALC[k].label + ' calc ' + (j + o).toFixed(1) + '% (Jarvis ' +
+                     j.toFixed(1) + ' + outside ' + o.toFixed(1) + ')';
+          if (m != null) {
+            var d = m - j - o;
+            said += ' · meter−calc ' + (d >= 0 ? '+' : '') + d.toFixed(1);
+          }
+          return said;
+        });
+    }
+
     function nearest(tl, t) {
       var best = null;
       tl.forEach(function (p) {
@@ -196,6 +241,7 @@
       var clip = el('clipPath', { id: 'meter-clip' }, el('defs', {}, svg));
       el('rect', { x: PL, y: PT, width: w - PL - PR, height: H - PT - PB }, clip);
       var plot = el('g', { 'clip-path': 'url(#meter-clip)' }, svg);
+      Object.keys(CALC).forEach(function (k) { if (calcShown[k]) stack(plot, main, k); });
       overlays.forEach(function (o) {
         Object.keys(SERIES).forEach(function (k) {
           if (shown[k] && o.tl) line(plot, o.tl, k, o.shift, o.color, 1.2, 0.8, o.key);
@@ -234,6 +280,8 @@
                   fmtFull.format(new Date(p.ts * 1000)) + ' · ' + vals.join(' · '));
       }
       add(main, 0, 'this', 'var(--ink)');
+      var here = nearest(main, t);
+      if (here) rows = rows.concat(calcRow(here));
       overlays.forEach(function (o) { add(o.tl, o.shift, o.name, o.color); });
       tip.innerHTML = rows.join('<br>');
       tip.style.display = rows.length ? 'block' : 'none';
@@ -331,6 +379,10 @@
 
     controls.addEventListener('change', function (e) {
       var box = e.target;
+      if (box.dataset.calc) {
+        calcShown[box.dataset.calc] = box.checked;
+        return draw();
+      }
       if (box.dataset.series) {
         shown[box.dataset.series] = box.checked;
         return draw();
@@ -390,8 +442,12 @@
   {% if meter.outside.sessions %}
   {# Session ids link NOWHERE: these are not Jarvis records, and a link would imply the
      OS knows something about them it does not. #}
+  <p class="kv" style="margin: 12px 0 0;">
+    <strong>Sessions Jarvis did not dispatch</strong> — not work orders, so not in the
+    order list or its headline.
+  </p>
   <table class="mono" style="width: 100%; border-collapse: collapse; font-size: 13px;
-                             margin-top: 10px;">
+                             margin-top: 4px;">
     <tr class="sub">
       <th style="text-align: left;">session</th>
       <th style="text-align: left;">where</th>

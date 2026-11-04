@@ -68,6 +68,77 @@ def root(tmp_path, monkeypatch) -> Path:
 # -- 1. the detector
 
 
+def _result(when: float, **outcome) -> dict:
+    return {"type": "user", "timestamp": _stamp(when),
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_x", "content": "ok"}]},
+            "toolUseResult": outcome}
+
+
+def _call(when: float, name: str, **params) -> dict:
+    return {"type": "assistant", "timestamp": _stamp(when),
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_y", "name": name, "input": params}]}}
+
+
+def test_live_tasks_names_every_tool_that_starts_one(root):
+    """Issue 1562, each shape as a real transcript has it; TaskUpdate also returns a `taskId`"""
+    now = db.now()
+    _transcript(root, "sess-1", [
+        *_launch(now, "bash1"),
+        _result(now, backgroundTaskId="bash2", timedOutAfterMs=600000, stdout="so far"),
+        _result(now, isAsync=True, status="async_launched", agentId="agent1"),
+        _result(now, taskId="monitor1", timeoutMs=1800000, persistent=False),
+        _result(now, success=True, taskId="1", updatedFields=["status"]),
+    ])
+
+    assert background.live_tasks("sess-1", since=now - 1) == [
+        "bash1", "bash2", "agent1", "monitor1"]
+
+
+def test_a_task_stops_being_live_once_it_reports_or_is_stopped(root):
+    """No notification follows TaskStop, in real transcripts"""
+    now = db.now()
+    _transcript(root, "sess-1", [
+        *_launch(now, "done"), _notification(now + 1, "done"),
+        *_launch(now, "failed"), _notification(now + 1, "failed", "failed"),
+        *_launch(now, "stopped"), _call(now + 1, "TaskStop", task_id="stopped"),
+        *_launch(now, "still-going"),
+    ])
+
+    assert background.live_tasks("sess-1", since=now - 1) == ["still-going"]
+
+
+def test_a_monitor_event_does_not_finish_the_monitor(root):
+    """An event has no `<status>`; a finished monitor has one"""
+    now = db.now()
+    event = {"type": "queue-operation", "timestamp": _stamp(now + 1),
+             "content": ("<task-notification>\n<task-id>m1</task-id>\n"
+                         "<summary>Monitor event</summary>\n</task-notification>")}
+    rows = [_result(now, taskId="m1", timeoutMs=1800000), event]
+    _transcript(root, "sess-1", rows)
+    assert background.live_tasks("sess-1", since=now - 1) == ["m1"]
+
+    _transcript(root, "sess-1", [*rows, _notification(now + 2, "m1")])
+    assert background.live_tasks("sess-1", since=now - 1) == []
+
+
+def test_a_task_from_before_this_turn_is_not_live(root):
+    """A turn reaped over a running task killed it, and nothing ever reports that one"""
+    now = db.now()
+    _transcript(root, "sess-1", _launch(now - 100))
+
+    assert background.live_tasks("sess-1", since=now - 1) == []
+    assert background.live_tasks("nobody", since=0) == []
+
+
+def test_jobs_left_running_honours_task_stop(root):
+    now = db.now()
+    _transcript(root, "sess-1", [*_launch(now), _call(now + 1, "TaskStop", task_id="b51fl7bhe")])
+
+    assert background.jobs_left_running("sess-1", since=now - 1, until=now + 60) == []
+
+
 def test_a_job_the_turn_never_collected_is_orphaned(root):
     """The reproduction case, row for row: launched, id recorded, turn over"""
     now = db.now()

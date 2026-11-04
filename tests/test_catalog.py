@@ -1293,27 +1293,28 @@ def test_ui_health_ships_the_measured_defaults_fleet_wide_and_per_project():
     assert cat.projects[0].ui_health.boot_grace_seconds == 60
 
 
-def test_a_project_naming_one_ui_health_key_inherits_the_rest():
-    """`_parse_inspect`'s field-level inheritance (kn-6ca2bcd9): the project object is the ANSWER"""
+def test_a_project_naming_a_ui_health_key_is_refused():
+    """Issue #1553: one dashboard per machine, so a project's value could only be silently inert"""
     from jarvis import config_version
 
-    cat = parse_catalog({
-        "os": {"ui_health": {"trip_threshold": 5}},
-        "projects": [
-            {"name": "a", "path": "/tmp/a"},
-            {"name": "b", "path": "/tmp/b", "ui_health": {"probe_interval_seconds": 30}},
-        ],
-    })
+    with pytest.raises(CatalogError, match=r"os\.ui_health\.probe_interval_seconds"):
+        parse_catalog({"projects": [{"name": "b", "path": "/tmp/b",
+                                     "ui_health": {"probe_interval_seconds": 30}}]})
 
-    assert cat.os.ui_health.trip_threshold == 5
+    cat = parse_catalog({"os": {"ui_health": {"trip_threshold": 5}},
+                         "projects": [{"name": "a", "path": "/tmp/a"}]})
     assert cat.projects[0].ui_health.trip_threshold == 5         # inherited from os
-    assert cat.projects[1].ui_health.probe_interval_seconds == 30    # its own
-    assert cat.projects[1].ui_health.trip_threshold == 5         # inherited from os
-    assert cat.projects[1].ui_health.max_restarts_per_day == 3   # from the default
     resolved = config_version.resolve(cat)
     assert resolved["os.ui_health.trip_threshold"] == 5
-    assert resolved["projects.b.ui_health.probe_interval_seconds"] == 30
     assert resolved["projects.a.ui_health.enabled"] is True
+
+
+@pytest.mark.parametrize("key", jarvis.catalog.COST_FLEET_ONLY_KEYS)
+def test_a_project_naming_an_account_meter_key_is_refused(key):
+    """Issue #1553: read off the one account meter, with no project in hand"""
+    with pytest.raises(CatalogError, match=rf"is a FLEET number — set os\.cost\.{key}"):
+        parse_catalog({"projects": [{"name": "a", "path": "/tmp/a", "cost": {key: 5}}]})
+    assert getattr(parse_catalog({"os": {"cost": {key: 5}}, "projects": []}).os.cost, key) == 5
 
 
 def test_an_absurd_ui_health_value_is_refused_naming_the_key():

@@ -241,6 +241,55 @@ def test_enforce_never_dispatches_with_self_dispatch_off(fleet):
     assert (d.outcome, d.allowed) == ("dispatch", False)
 
 
+def _own_block(project, fleet_block, own_block):
+    return parse_catalog({
+        "os": {"evolution": fleet_block, "autonomy": {"self_dispatch": True}},
+        "projects": [{"name": "proj_a", "path": str(project), "evolution": own_block}]})
+
+
+def test_a_projects_bug_cap_beats_the_fleets_in_both_directions(fleet, project):
+    """Issue #1553: `config set` recorded the raise and the steward went on holding bugs"""
+    _, store = fleet
+    bug = cand(origin_kind="morpheus", severity="critical", parent_wo_id="wo-p1",
+               payload={"morpheus_item": "mv-1"})
+    raised = _own_block(project, {"mode": "enforce", "bug_weekly_usd": 0},
+                        {"bug_weekly_usd": 500})
+    d = steward.gate(bug, catalog=raised, store=store)
+    assert (d.outcome, d.rule, d.allowed) == ("dispatch", "reported-bug", True)
+    lowered = _own_block(project, {"mode": "enforce", "bug_weekly_usd": 500},
+                         {"bug_weekly_usd": 0})
+    d = steward.gate(cand(origin_kind="morpheus", severity="critical", subject="another",
+                          file="b.py"), catalog=lowered, store=store)
+    assert (d.outcome, d.rule) == ("ask", "bug-budget")
+    assert "of $0.00" in d.reason
+
+
+def test_a_projects_mode_beats_the_fleets(fleet, project):
+    _, store = fleet
+    cat = _own_block(project, {"mode": "shadow"}, {"mode": "enforce"})
+    d = steward.gate(cand(severity="minor"), catalog=cat, store=store)
+    assert (d.mode, d.allowed) == ("enforce", False)
+
+
+def test_a_candidate_with_no_catalogued_project_is_held_to_the_fleets_caps(project):
+    cat = _own_block(project, {"weekly_usd": 7}, {"weekly_usd": 9})
+    assert steward.evolution_for(cat, "proj_a").weekly_usd == 9
+    assert steward.evolution_for(cat, "").weekly_usd == 7
+
+
+def test_the_digest_names_only_a_project_that_differs_from_the_fleet(project):
+    def text(own_block):
+        d = {"mode": "shadow", "ledger": steward.Ledger(), "weekly_usd": 7.0,
+             "bug_weekly_usd": 8.0, "critical_weekly_usd": 60.0, "yield_above_usd": 900.0,
+             "by_kind": {}, "held": [], "queue": {}, "precision": {}, "throttled": [],
+             "projects": steward.project_caps(_own_block(
+                 project, {"weekly_usd": 7, "bug_weekly_usd": 8, "critical_weekly_usd": 60,
+                           "yield_above_usd": 900}, own_block))}
+        return steward.render_digest(d)
+    assert "proj_a" not in text({})
+    assert "reported bugs $1500.00" in text({"bug_weekly_usd": 1500})
+
+
 def test_an_ask_reaches_the_inbox_with_a_link_and_the_command_that_acts(fleet):
     make, store = fleet
     cat = make(mode="enforce", bug_weekly_usd=0)
@@ -257,6 +306,7 @@ def test_an_ask_reaches_the_inbox_with_a_link_and_the_command_that_acts(fleet):
     assert "jarvis morpheus confirm mv-1 --fix" in item["body"]
     assert f"/steward#decision-{d.decision_id}" in item["body"]
     assert "does not re-run this one" in item["body"]
+    assert "Raising projects.proj_a.evolution.bug_weekly_usd" in item["body"]
 
 
 def test_the_ledger_counts_stamped_spend_and_what_is_still_reserved(fleet):

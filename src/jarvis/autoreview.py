@@ -16,6 +16,7 @@ from .catalog import (
     DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
     DEFAULT_VALIDATION_DECISION_RECORD_CHARS,
 )
+from .project_store import ASSUMPTION_LAPSED, turn_end_is_delivery
 from .stakes import Stakes
 
 log = logging.getLogger(__name__)
@@ -83,6 +84,9 @@ HELD_CONFIRM_SPENT = "confirm_spent"
 #: WHICH DROPPED CONFIRMATION MAY BE ASKED AGAIN — the settle site's allowlist (§4.1)
 TRANSIENT_DROPS = frozenset({HELD_STATUS, HELD_REFUSAL_UNANSWERED,
                              HELD_OBJECTION_IN_FLIGHT})
+
+#: Holds a later pass re-decides, so the row is not yet the user's; others are final (io-ed253c2b)
+TRANSIENT_HOLDS = TRANSIENT_DROPS | {HELD_ASKED, HELD_CONFIRMING, HELD_ROUND_OPEN}
 
 #: A round's outcome that means the panel has NOT finished with it
 _UNRESOLVED_OUTCOMES = ("", "pending")
@@ -538,7 +542,7 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      "this project has not given the OS permission to decide its "
                      "assumptions (`validation.auto_review`)")
     status = str(wo.get("status") or "")
-    if status != REVIEW_PASS_STATUS:
+    if status != REVIEW_PASS_STATUS and not turn_end_is_delivery(wo):
         return _held(HELD_STATUS,
                      f"the work order is {status or 'in no status'}, not waiting on a "
                      f"review")
@@ -1022,7 +1026,8 @@ def _message_item(m: dict[str, Any]) -> str:
 def _user_ruling_item(s: dict[str, Any]) -> str:
     """A sibling assumption the USER settled, with the reasoning they gave, or `''`"""
     status = str(s.get("status") or "")
-    if status in ("", "pending") or str(s.get("decided_by") or "") == DECIDER:
+    if (status in ("", "pending", ASSUMPTION_LAPSED)
+            or str(s.get("decided_by") or "") == DECIDER):
         return ""
     raw = str(s.get("decided_reason") or "")
     reason = " ".join(raw.split())[:400]
@@ -1143,6 +1148,12 @@ def _share(a: int, b: int, chars: int) -> tuple[int, int]:
     return floor, floor
 
 
+def _no_summary(wo: dict[str, Any]) -> str:
+    """Why a question shows no result: a feature's manager never writes one (io-d5e62d4d)"""
+    return ("(a feature's manager delivers no result: judge the call as recorded)"
+            if wo.get("kind") == "manager" else "(nothing recorded)")
+
+
 def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
                      siblings: list[dict[str, Any]], *, early: bool = False,
                      record: str = "", spec: dict[str, str] | None = None,
@@ -1160,7 +1171,7 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         "provisionally."
         if early else
         f"# What the worker says it delivered\n"
-        f"{(wo.get('result_summary') or '(nothing recorded)')[:1500]}")
+        f"{(wo.get('result_summary') or _no_summary(wo))[:1500]}")
     answers = (
         "Answer with `escalate`, `verdict` (`approve`; `deny` OBJECTS, `reason` reaches "
         "the worker), `stakes` (`routine`|`high`), one-line `reason`."
@@ -1216,7 +1227,7 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"{(wo.get('description') or '')[:CONFIRM_DESCRIPTION_CHARS]}",
         *_spec_blocks(assumption, spec, spec_chars),
         f"# What the worker says it delivered\n"
-        f"{(wo.get('result_summary') or '(nothing recorded)')[:CONFIRM_SUMMARY_CHARS]}",
+        f"{(wo.get('result_summary') or _no_summary(wo))[:CONFIRM_SUMMARY_CHARS]}",
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
         _record_block(record),

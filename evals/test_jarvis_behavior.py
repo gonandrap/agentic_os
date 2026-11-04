@@ -269,9 +269,8 @@ def test_feedback_unknown_wo(fleet):
 def test_backlog_dependency_rail(fleet):
     central = CentralStore()
     try:
-        dep = central.add_backlog("proj_a", "foundation")
+        dep = central.add_backlog("proj_a", "foundation", status="quarantined")
         item = central.add_backlog("proj_a", "tower", depends_on=[dep["id"]])
-        central.mark_backlog(dep["id"], "dropped")
     finally:
         central.close()
     with pytest.raises(ops.OpsError, match=dep["id"]):

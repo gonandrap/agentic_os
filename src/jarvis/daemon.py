@@ -49,6 +49,7 @@ from .project_store import (
     ProjectStore,
     kind_contract,
     resume_spends_slot,
+    turn_end_is_delivery,
     validation_hold_until,
 )
 
@@ -428,6 +429,12 @@ CACHE_TTL_TICK_OFFSET = 60
 #: Reconcile the meter against measured spend every N ticks — 30 minutes at the default 5s interval (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)
 METER_RECONCILE_EVERY_TICKS = 360
 
+#: Same-kind meter alarms under this far apart are one standing condition (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)
+METER_STANDING_GAP_SECONDS = 7 * 86_400
+
+#: The occurrence that stops the supervisor's review and, for the residual, files the diagnostic
+METER_STANDING_OCCURRENCES = 3
+
 #: The two kinds `check_meter_residual` raises, and the inbox title of each
 METER_OUTSIDE_ALARM = "cost_outside_spend_high"
 METER_RESIDUAL_ALARM = "cost_residual_high"
@@ -435,6 +442,31 @@ METER_INBOX_TITLE = {
     METER_OUTSIDE_ALARM: "sessions Jarvis did not dispatch are spending the window",
     METER_RESIDUAL_ALARM: "the usage meter and the measured spend do not reconcile",
 }
+
+#: Records the filing: one inside the chain means do not file again
+METER_DIAGNOSED_ALARM = "cost_residual_diagnosed"
+#: Who the filing is from: not a work order, so the steward counts no lineage from a carrier
+METER_FILED_BY = "the meter reconciliation"
+#: How many occurrences the diagnostic's brief lists
+METER_DIAGNOSTIC_ROWS = 10
+
+
+def _utc(ts: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def meter_diagnostic_brief(chain: list[dict[str, Any]]) -> str:
+    """The filed issue's description: the evidence, and where the defect is looked for"""
+    rows = "\n".join(f"- {_utc(float(row['ts']))}: {row['reason']}"
+                     for row in chain[-METER_DIAGNOSTIC_ROWS:])
+    return (f"`{METER_RESIDUAL_ALARM}` has recurred {len(chain)} times since "
+            f"{_utc(float(chain[0]['ts']))} as one standing, machine-wide condition. The work "
+            f"orders those alarms sit on only carry the row; they are not the cause.\n\n"
+            f"Diagnose the meter accounting, `src/jarvis/usage_meter.py` and "
+            f"`src/jarvis/fleetcost.py`. A residual that changes sign points at the "
+            f"arithmetic, not at invisible usage.\n\n{rows}")
 
 #: How many outside sessions the outside alarm NAMES
 METER_ALARM_SESSIONS = 3
@@ -1903,7 +1935,7 @@ class Daemon:
                   f"every SQLite write fails and each invariant reports itself as "
                   f"`database or disk is full`.\n\n"
                   f"The OS reclaims the checkout of a settled work order itself "
-                  f"({self.catalog.os.worktree.reclaim_after_hours}h after it settles); "
+                  f"(`worktree.reclaim_after_hours` after it settles); "
                   f"what is left is the checkouts of open and failed orders, the logs "
                   f"under {logs_dir()} and Claude Code's transcripts."),
         )
@@ -3483,6 +3515,17 @@ class Daemon:
             # No work order to flag; revival re-asks it once Neo answers again
             self._backlog_question_unanswered(central, q, f"Neo could not be reached: {detail}")
             return
+        ppath = {p.name: p.path for p in self.catalog.projects}.get(q["project"])
+        if q.get("kind") == "assumption" and ppath and ppath.is_dir():
+            # The row's ping, once: the pass re-asks a dead question (io-ed253c2b)
+            from . import ops
+
+            pstore = ProjectStore(ppath)
+            try:
+                ops.flag_assumptions_pending(pstore, q["wo_id"])
+            finally:
+                pstore.close()
+            return
         head = q["question"].strip().splitlines()[0][:200]
         central.add_inbox(
             project=q["project"], level="warning",
@@ -3495,7 +3538,6 @@ class Daemon:
                  f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
             wo_id=q["wo_id"],
         )
-        ppath = {p.name: p.path for p in self.catalog.projects}.get(q["project"])
         if ppath and ppath.is_dir():
             pstore = ProjectStore(ppath)
             try:
@@ -3950,7 +3992,7 @@ class Daemon:
             project=q["project"], level="info",
             title=supervisor.ADVICE_INBOX_TITLE.format(wo_id=q["wo_id"]),
             body=f"{note}\n{supervisor.ALARM_PATH.format(project=q['project'], alarm_id=alarm['id'])}",
-            wo_id=q["wo_id"])
+            wo_id=q["wo_id"], push=False)
         log.info("neo answered alarm %s", alarm["id"])
 
     def _supervisor_config(self, project: str) -> Any:
@@ -4034,6 +4076,9 @@ class Daemon:
                       f"Command: {approval['command']}\n"
                       f"Review Neo's call with: jarvis neo review {q['id']}"),
                 wo_id=q["wo_id"],
+                # A settled merge or release asks nothing of the user (io-ed253c2b)
+                push=not (ruling == "approved" and not decided["contested"]
+                          and approval["kind"] in ("auto_merge", "release")),
             )
         log.info("gate %s %s by neo for %s", approval["id"], ruling, q["wo_id"])
 
@@ -4476,7 +4521,7 @@ class Daemon:
         last = ops.last_stuck_investigation(project, wo_id)
         if last is None:
             return False
-        cooldown = self.catalog.os.fleet_health.cooldown_minutes * 60.0
+        cooldown = self.catalog.project(project).fleet_health.cooldown_minutes * 60.0
         return (now - float(last.get("updated_at") or 0.0) < cooldown
                 or last[ops.STUCK_FINGERPRINT_KEY] == fingerprint)
 
@@ -5108,22 +5153,62 @@ class Daemon:
                      "the alarm yet", project.name)
             return
         for kind in raised:
-            last = store.last_alarm_of_kind(kind)
-            if last is not None and float(last["ts"] or 0.0) >= resolved["since"]:
-                continue
-            reason = meter_alarm_reason(kind, meter)
-            row = store.add_finding(carrier["id"], kind=kind, reason=reason,
-                                    seq=NO_TURN, source="cost")
-            store.add_event(carrier["id"], "cost_alarm",
-                            {"kind": kind, "seq": NO_TURN, "reason": reason,
-                             "alarm_id": row["id"]})
-            self.central.add_inbox(
-                project=project.name, level="warning", title=METER_INBOX_TITLE[kind],
-                body=f"{reason}\n"
-                     f"The supervisor will look before you have to. "
-                     f"Read it with: jarvis alarms show {row['id']}",
-                wo_id=carrier["id"])
-            log.info("[%s] %s: %s", project.name, kind, reason)
+            chain = store.standing_alarms(kind, METER_STANDING_GAP_SECONDS)
+            if not chain or float(chain[-1]["ts"] or 0.0) < resolved["since"]:
+                occurrence = len(chain) + 1
+                first_seen = float(chain[0]["ts"]) if chain else db.now()
+                reason = meter_alarm_reason(kind, meter)
+                if chain:
+                    reason += (f" Occurrence {occurrence} of this standing condition, "
+                               f"first seen {_utc(first_seen)}.")
+                row = store.add_finding(
+                    carrier["id"], kind=kind, reason=reason, seq=NO_TURN, source="cost",
+                    status=("raised" if occurrence < METER_STANDING_OCCURRENCES
+                            else "informational"))
+                store.add_event(carrier["id"], "cost_alarm",
+                                {"kind": kind, "seq": NO_TURN, "reason": reason,
+                                 "alarm_id": row["id"], "occurrence": occurrence,
+                                 "first_seen": first_seen})
+                if not chain:
+                    self.central.add_inbox(
+                        project=project.name, level="warning", title=METER_INBOX_TITLE[kind],
+                        body=f"{reason}\n"
+                             f"The supervisor will look before you have to, and repeats are "
+                             f"counted, not sent here. "
+                             f"Read it with: jarvis alarms show {row['id']}",
+                        wo_id=carrier["id"])
+                log.info("[%s] %s: %s", project.name, kind, reason)
+                chain.append(row)
+            if kind == METER_RESIDUAL_ALARM and len(chain) >= METER_STANDING_OCCURRENCES:
+                self._file_meter_diagnostic(project, store, carrier["id"], chain)
+
+    def _file_meter_diagnostic(self, project: ProjectSpec, store: ProjectStore,
+                               carrier_id: str, chain: list[dict[str, Any]]) -> None:
+        """A standing residual becomes one filed bug, and never a second inbox line"""
+        from . import bugreport
+        from .project_store import NO_TURN
+
+        done = store.last_alarm_of_kind(METER_DIAGNOSED_ALARM)
+        if done is not None and float(done["ts"] or 0.0) >= float(chain[0]["ts"] or 0.0):
+            return
+        try:
+            filed = bugreport.report_bug(
+                title="The usage meter and the measured spend do not reconcile",
+                description=meter_diagnostic_brief(chain),
+                expected="The meter's implied spend reconciles with measured spend",
+                actual=f"{METER_RESIDUAL_ALARM} recurred {len(chain)} times since "
+                       f"{_utc(float(chain[0]['ts']))}",
+                priority="high", project=project.name,
+                filed_by=METER_FILED_BY, notify=False)
+        except Exception:  # noqa: BLE001 — nothing recorded, so the next pass files it
+            log.exception("[%s] could not file the meter diagnostic", project.name)
+            return
+        store.add_finding(
+            carrier_id, kind=METER_DIAGNOSED_ALARM, seq=NO_TURN, source="cost",
+            status="informational",
+            reason=f"{METER_RESIDUAL_ALARM} recurred {len(chain)} times: filed as "
+                   f"{filed.get('url')}")
+        log.info("[%s] meter diagnostic filed: %s", project.name, filed.get("url"))
 
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is"""
@@ -6188,10 +6273,12 @@ class Daemon:
 
         # Hidden orders are excluded by the default
         candidates: list[tuple[dict, list[dict], bool]] = []
-        for early, status in ((False, "needs_review"), (True, "running")):
+        for early, status in ((False, "needs_review"), (False, "idle"), (True, "running")):
             for wo in store.list_work_orders(statuses=(status,)):
                 if wo.get("kind") == "investigator":
                     # A diagnosis is not a submission and nothing is gated on it: §2.3 of...
+                    continue
+                if status == "idle" and not turn_end_is_delivery(wo):
                     continue
                 rows = store.all_assumptions(wo["id"])
                 if any(a["status"] == "pending"
@@ -6354,6 +6441,7 @@ class Daemon:
         dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
+        holds_before = len(store.events_of_kind(wo["id"], "autoreview_held"))
         for a in assumptions:
             # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.1
             if str(a.get("status") or "") != "pending":
@@ -6419,6 +6507,9 @@ class Daemon:
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
                                early=early, cfg=cfg)
+        # After the loop: one pass's holds are one ping
+        if len(store.events_of_kind(wo["id"], "autoreview_held")) > holds_before:
+            ops.flag_assumptions_pending(store, wo["id"])
 
     def _stakes_reviewed(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                          cfg: Any, a: dict, decision: Any,
@@ -6588,6 +6679,7 @@ class Daemon:
                 {**payload, **prior} if confirming else payload)
             log.info("auto-review left assumption #%s of %s with the user: %s",
                      numbered.get("n"), wo["id"], ruling.reason)
+            ops.flag_assumptions_pending(pstore, wo["id"])
             return
 
         project = next((p for p in self.catalog.projects if p.name == q["project"]), None)
@@ -6635,6 +6727,8 @@ class Daemon:
                     pstore.clear_assumption_confirmation(assumption["id"])
                 else:
                     pstore.clear_assumption_question(assumption["id"])
+            else:
+                ops.flag_assumptions_pending(pstore, wo["id"])
             log.info("auto-review dropped its ruling on assumption #%s of %s: %s",
                      numbered.get("n"), wo["id"], still.reason)
             return
@@ -6667,7 +6761,7 @@ class Daemon:
                  f"What it accepted, and why: jarvis wo show {wo['id']}\n"
                  f"If any of it was wrong: jarvis neo review {q['id']} "
                  f"--correct \"…\" teaches Neo not to do it again.",
-            wo_id=wo["id"])
+            wo_id=wo["id"], push=False)
 
     def _asked_early(self, pstore: ProjectStore, wo_id: str, question_id: int) -> bool:
         """Was this assumption question filed by the EARLY pass?"""

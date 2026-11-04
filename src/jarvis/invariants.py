@@ -22,7 +22,7 @@ from .automerge import (
     HELD_SHA_UNRECORDED,
 )
 # Same leaf argument: `autoreview` imports only `navigation`
-from .autoreview import REFUSAL_UNANSWERED_REASON
+from .autoreview import REFUSAL_UNANSWERED_REASON, TRANSIENT_DROPS
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
@@ -40,6 +40,7 @@ from .project_store import (
     VALIDATION_HELD_CAUSE,
     WORKER_CHILDREN,
     kind_contract,
+    turn_end_is_delivery,
     validation_hold,
 )
 
@@ -667,7 +668,7 @@ def parked_on_a_give_up(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Are this order's pending assumptions Neo's to decide on delivery, not the user's? (#711)"""
-    if wo["status"] not in PRE_DELIVERY_STATUSES:
+    if wo["status"] not in PRE_DELIVERY_STATUSES or turn_end_is_delivery(wo):
         return False
     from .ops import auto_review_at
 
@@ -708,13 +709,13 @@ def _confirmation_is_open(question_id: int) -> bool:
     return bool(q) and str(q["status"] or "") in NEO_HELD_Q_STATUSES
 
 
-def _os_is_confirming(a: dict[str, Any]) -> bool:
-    """Is the OS's own confirmation pass (§7) holding this assumption, not the user? (#833)"""
+def _neo_still_rules(a: dict[str, Any]) -> bool:
+    """Is Neo holding this assumption or about to be asked, not done with a closed question? (#833)"""
     verdict = str(a.get("provisional_verdict") or "")
-    if verdict == "accept":
-        qid = int(a.get("confirm_question_id") or 0)
-        return not qid or _confirmation_is_open(qid)
-    return verdict == "object" and bool(a.get("objection_delivered_ts"))
+    if verdict == "object":
+        return bool(a.get("objection_delivered_ts"))
+    qid = int(a.get("confirm_question_id" if verdict else "neo_question_id") or 0)
+    return not qid or _confirmation_is_open(qid)
 
 
 def drift_review_failed(store: ProjectStore, wo: dict[str, Any]) -> str:
@@ -735,6 +736,41 @@ def reviewable_assumptions(store: ProjectStore,
     return store.pending_assumptions(wo["id"])
 
 
+def assumptions_left_with_user(store: ProjectStore, wo: dict[str, Any],
+                               pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Which of an idle manager's rows the OS has let go of: it has no review list to sit on (io-d5e62d4d)"""
+    from .ops import auto_review_at
+
+    if not auto_review_at(store.project_path):
+        return pending
+    left: set[int] = set()
+    for kind in ("autoreview_held", "autoreview_escalated", "autoreview_unconfirmed"):
+        for event in store.events_of_kind(wo["id"], kind):
+            payload = db.from_json(event["payload"], {})
+            if (payload.get("re_asked") or payload.get("code") in TRANSIENT_DROPS
+                    or (kind == "autoreview_held" and payload.get("early"))):
+                continue
+            left.add(int(payload.get("assumption_id") or 0))
+    return [a for a in pending if int(a["id"]) in left]
+
+
+def assumptions_owed_to_user(store: ProjectStore,
+                             wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """The rows that are the user's now: the ONE answer flag, ping and blockers ask (io-ed253c2b)"""
+    pending = reviewable_assumptions(store, wo)
+    if not pending or neo_reviews_later(store, wo):
+        return []
+    from .ops import assumptions_held_final, auto_review_at
+
+    if wo["status"] != "needs_review" and turn_end_is_delivery(wo):
+        return assumptions_left_with_user(store, wo, pending)
+    # Only a `needs_review` order is in Neo's delivered pass; no pass reaches any other status
+    if wo["status"] != "needs_review" or not auto_review_at(store.project_path):
+        return pending
+    final = assumptions_held_final(store, wo)
+    return [a for a in pending if int(a["id"]) in final or not _neo_still_rules(a)]
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone"""
@@ -743,15 +779,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # §9: FIRST, because it is the more specific fact about the same assumption
     if any(objection_undeliverable(store, a) for a in pending):
         blockers.append(OBJECTION_UNDELIVERABLE_BLOCKER)
-    owed = pending
-    if pending and wo["status"] == "needs_review":
-        # `neo_reviews_later` covers the PRE-DELIVERY statuses (#711) and is False here
-        from .ops import auto_review_at
-        if auto_review_at(store.project_path):
-            owed = [a for a in pending if not _os_is_confirming(a)]
+    owed = assumptions_owed_to_user(store, wo)
     # ONE COMPOUND LINE when the order is also out of money
     compound = False
-    if owed and not neo_reviews_later(store, wo):
+    if owed:
         n = len(owed)
         compound = wo["status"] == budget.EXHAUSTED
         clause = (f"{n} assumption{'s' if n != 1 else ''} "
@@ -1901,7 +1932,9 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
             continue
         if not _mentions_assumptions(wo.get("attention_reason")):
             continue
-        if not (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo)):
+        # An idle manager has no landing to clear its flag once its rows are settled (io-d5e62d4d)
+        if not (turn_end_is_delivery(wo)
+                or (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo))):
             continue
         # An undeliverable objection raises a real blocker on a RUNNING order
         if any(_mentions_assumptions(b) for b in true_blockers(store, wo)):
@@ -2002,6 +2035,68 @@ def check_assumptions_persisted(store: ProjectStore) -> Iterator[Violation]:
                 repair="row reconstructed from the event payload",
                 context={"content": content[:200]},
             )
+
+
+def _moot_assumption_reason(wo: dict[str, Any], parent: dict[str, Any]) -> str:
+    """Why this child's rows ask for a decision nobody can take any more, or '' (issue 1572)"""
+    if parent.get("kind") == "improvement" and parent.get("plan_wo_id") == wo["id"]:
+        report = db.from_json(parent.get("plan"), None)
+        found = report.get("findings") if isinstance(report, dict) else None
+        accepted = [str(f.get("key")) for f in found or []
+                    if isinstance(f, dict) and f.get("status") == "accepted"]
+        if accepted:
+            return (f"finding {', '.join(accepted)} on {parent['id']} was accepted; "
+                    f"the decision was taken there, and nobody ruled on this row")
+    if parent["status"] in TERMINAL_STATUSES:
+        return (f"its parent {parent['id']} is {parent['status']} and nothing re-derives "
+                f"a settled parent; nobody ruled on this row")
+    return ""
+
+
+def _held_only_by_assumptions(store: ProjectStore, wo: dict[str, Any],
+                              parent: dict[str, Any]) -> bool:
+    """Is a pending row all that holds it, the settled parent's own line aside?"""
+    settled = SETTLED_FEATURE_BLOCKER.format(fo_id=parent["id"], status=parent["status"],
+                                             remedy="")
+    blockers = [b for b in true_blockers(store, wo) if not b.startswith(settled)]
+    return bool(blockers) and all(b.endswith(" pending your review") for b in blockers)
+
+
+def check_ended_orders_hold_no_pending_assumption(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ASSUMPTION-LAPSED — nobody can rule on a row whose order ended or decision went (issue 1572)"""
+    from .ops import lapse_moot_assumptions
+
+    for wo in store.live_children_with_pending_assumptions():
+        parent = store.get_feature_order(wo["parent_id"])
+        reason = _moot_assumption_reason(wo, parent)
+        if not reason or not _held_only_by_assumptions(store, wo, parent):
+            continue
+        n = len(store.pending_assumptions(wo["id"]))
+        if not getattr(store, "readonly", False) and not lapse_moot_assumptions(
+                store, wo, reason):
+            continue  # it moved under the sweep: the row is ruleable again
+        yield Violation(
+            invariant="INV-ASSUMPTION-LAPSED",
+            wo_id=wo["id"],
+            detail=f"{wo['status']} work order held {n} assumption(s) nobody can answer: "
+                   f"{reason}",
+            repaired=True,
+            repair=f"{n} assumption(s) and their Neo questions lapsed, no verdict recorded",
+        )
+    for wo in store.ended_orders_with_pending_assumptions():
+        status = str(wo["status"])
+        n = len(store.pending_assumptions(wo["id"]))
+        if not getattr(store, "readonly", False) and not store.repair_while(
+                wo["id"], status,
+                lambda w=wo["id"], s=status: store.lapse_pending_assumptions(w, s)):
+            continue  # it moved under the sweep: the row is ruleable again
+        yield Violation(
+            invariant="INV-ASSUMPTION-LAPSED",
+            wo_id=wo["id"],
+            detail=f"{status} work order still held {n} pending assumption(s)",
+            repaired=True,
+            repair=f"{n} assumption(s) lapsed, no verdict recorded",
+        )
 
 
 def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
@@ -2109,6 +2204,39 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
             )
     finally:
         neo.close()
+
+
+def check_open_questions_lapse(store: ProjectStore) -> Iterator[Violation]:
+    """INV-NEO-QUESTION-LAPSED — an ended order's worker question must not stay open (io-d5e62d4d)"""
+    from .neo_store import LAPSABLE_Q_STATUSES, NeoStore
+    from .project_store import QUESTION_LAPSING_STATUSES
+
+    readonly = getattr(store, "readonly", False)
+    neo = NeoStore()
+    try:
+        # An empty `wo_id` has a subject of its own, and no order to end
+        rows = [q for q in neo.list_questions(statuses=LAPSABLE_Q_STATUSES, limit=-1)
+                if q["kind"] == "question" and q["wo_id"]]
+    finally:
+        neo.close()
+    for q in rows:
+        try:
+            wo = store.get_work_order(q["wo_id"])
+        except KeyError:
+            continue  # another project's order: Neo's store is OS-wide
+        if wo["status"] not in QUESTION_LAPSING_STATUSES:
+            continue
+        # `_ReadOnly` swallows this write
+        store.lapse_open_questions(wo["id"], str(wo["status"]))
+        yield Violation(
+            invariant="INV-NEO-QUESTION-LAPSED",
+            wo_id=wo["id"],
+            detail=(f"Neo question {q['id']} was still {q['status']}, but its work order "
+                    f"is {wo['status']}"),
+            repaired=True,
+            repair="would lapse it" if readonly else "lapsed",
+            context={"question_id": q["id"], "was": q["status"]},
+        )
 
 
 def _is_work_order(store: ProjectStore, wo_id: str) -> bool:
@@ -2466,7 +2594,7 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
 
 def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
     """INV-VALIDATION-STRANDED — a unit under review must not sit on an open round for ever (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §3)"""
-    per_round = _validation_timeout()
+    per_round = _validation_timeout(store.project_path)
     threshold = 2 * per_round
     now = time.time()
     cutoff = now - threshold
@@ -2853,11 +2981,13 @@ def check_awaiting_decisions_flagged(store: ProjectStore) -> Iterator[Violation]
         )
 
 
-def _validation_timeout() -> int:
-    """How long one validation round is allowed to take, per the LIVE catalog"""
-    from .ops import validation_config
+def _validation_timeout(project_path: Any = None) -> int:
+    """How long one of this project's validation rounds may take, per the LIVE catalog"""
+    from . import ops
 
-    timeout = getattr(validation_config(), "timeout", None)
+    cfg = (ops.validation_config() if project_path is None
+           else ops.validation_config_at(project_path))
+    timeout = getattr(cfg, "timeout", None)
     return int(timeout) if timeout else DEFAULT_VALIDATION_TIMEOUT
 
 
@@ -4384,10 +4514,38 @@ def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+INV_FIX_GAP_UNREGISTERED = "INV-FIX-GAP-UNREGISTERED"
+
+
+def check_fix_registered_its_gap(store: ProjectStore) -> Iterator[Violation]:
+    """INV-FIX-GAP-UNREGISTERED — a completed GAP fix left its class out of `gaps.py` (io-38a4354f)"""
+    from . import gaps
+    from .bugreport import VERDICT_GAP_CLASS_KEY
+
+    rows = store.conn.execute(
+        "SELECT id, metadata FROM work_orders WHERE status='completed' "
+        "AND instr(metadata, ?) > 0", (VERDICT_GAP_CLASS_KEY,)).fetchall()
+    for row in rows:
+        metadata = db.from_json(row["metadata"], {}) or {}
+        gap_class = str(metadata.get(VERDICT_GAP_CLASS_KEY) or "")
+        if not gap_class or gaps.registered(gap_class) or store.work_abandoned(row["id"]):
+            continue
+        yield Violation(
+            invariant=INV_FIX_GAP_UNREGISTERED,
+            wo_id=row["id"],
+            detail=(f"completed, but gap class `{gap_class}` its verdict named is not "
+                    f"registered in src/jarvis/gaps.py, so the detector and remedy it owed "
+                    f"are unproven: register them or file the follow-up"),
+            context={"gap_class": gap_class},
+        )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
                                    # reading, repairing nothing and touching no flag any other check derives
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
+    check_ended_orders_hold_no_pending_assumption,  # ...and after it, whose rebuilt row may
+                                   # be on an ended order; before the phantom check clears its flag
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
                                     # request is a blocker they would otherwise believe
     check_gate_requests_have_a_reviewer,  # ...and beside it, for the mirror reason: it
@@ -4438,6 +4596,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # settled; it reads child flags and writes only the parent's
     check_decisions_closed_by_user,  # order-free: a pure read that repairs nothing
     check_awaiting_decisions_flagged,  # after the orphan check: it raises only where no flag is up
+    check_open_questions_lapse,    # before the next check: it would write an answer on these rows
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
                                    # touches no flag any other check reads
     check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one
@@ -4457,6 +4616,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 #: Invariants whose cost scales with the SETTLED BACKLOG rather than with live work
 SLOW_INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_work_lands,
+    check_fix_registered_its_gap,  # population: every completed order, like the one above
     check_spec_pointer_resolves,  # both properties of this class and neither of the fast
                                   # one: its population is every feature order a project has ever had
 )
@@ -4485,6 +4645,8 @@ class _ReadOnly:
                 "clear_attention",
                 "add_assumption", "add_event",
                 "set_status", "update_work_order", "supersede_approval",
+                # INV-NEO-QUESTION-LAPSED's repair
+                "lapse_open_questions",
                 # INV-GATE-UNJUDGED's repair
                 "mark_approval_escalated",
                 # The bus
