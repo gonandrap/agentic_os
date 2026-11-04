@@ -1,4 +1,4 @@
-"""A local clone is a cache of origin: the one layer that refreshes it before a ref is read (io-c1bbfff4)"""
+"""A clone is a cache of origin — the one layer that refreshes it (io-c1bbfff4)"""
 
 from __future__ import annotations
 
