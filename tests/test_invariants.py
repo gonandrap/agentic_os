@@ -863,14 +863,28 @@ def test_the_threshold_follows_the_configured_timeout(project, monkeypatch):
     _, rnd = _stranded(store, age=2 * DEFAULT_VALIDATION_TIMEOUT + 60)
 
     # `_validation_timeout` imports it inside the call
-    monkeypatch.setattr(ops, "validation_config",
-                        lambda: SimpleNamespace(timeout=3600))
+    monkeypatch.setattr(ops, "validation_config_at",
+                        lambda _path: SimpleNamespace(timeout=3600))
     assert _stranded_violations(store) == []
     assert _round(store, rnd)["outcome"] == "pending"
 
     monkeypatch.undo()
     assert len(_stranded_violations(store)) == 1
     assert _round(store, rnd)["outcome"] == "failed"
+
+
+def test_the_threshold_is_the_projects_own_timeout(tmp_path, monkeypatch):
+    """Issue #1553: a round the project allows an hour was closed on the fleet's number"""
+    from jarvis.catalog import parse_catalog
+    from jarvis.invariants import _validation_timeout
+
+    cat = parse_catalog({"os": {"validation": {"timeout": 600}},
+                         "projects": [{"name": "a", "path": str(tmp_path),
+                                       "validation": {"timeout": 3600}}]})
+    monkeypatch.setattr(ops, "resolve_catalog", lambda *a, **k: cat)
+
+    assert _validation_timeout(tmp_path) == 3600
+    assert _validation_timeout(tmp_path / "not-catalogued") == 600
 
 
 def test_an_unreadable_catalog_falls_back_to_the_shipped_timeout(monkeypatch):

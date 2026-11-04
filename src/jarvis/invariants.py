@@ -2540,7 +2540,7 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
 
 def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
     """INV-VALIDATION-STRANDED — a unit under review must not sit on an open round for ever (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §3)"""
-    per_round = _validation_timeout()
+    per_round = _validation_timeout(store.project_path)
     threshold = 2 * per_round
     now = time.time()
     cutoff = now - threshold
@@ -2927,11 +2927,13 @@ def check_awaiting_decisions_flagged(store: ProjectStore) -> Iterator[Violation]
         )
 
 
-def _validation_timeout() -> int:
-    """How long one validation round is allowed to take, per the LIVE catalog"""
-    from .ops import validation_config
+def _validation_timeout(project_path: Any = None) -> int:
+    """How long one of this project's validation rounds may take, per the LIVE catalog"""
+    from . import ops
 
-    timeout = getattr(validation_config(), "timeout", None)
+    cfg = (ops.validation_config() if project_path is None
+           else ops.validation_config_at(project_path))
+    timeout = getattr(cfg, "timeout", None)
     return int(timeout) if timeout else DEFAULT_VALIDATION_TIMEOUT
 
 

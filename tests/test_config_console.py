@@ -295,18 +295,29 @@ def test_every_class_in_the_design_table(path, cls):
     assert ops.apply_class(path) == cls
 
 
-def test_a_ui_health_key_can_be_set_fleet_wide_and_per_project(catalog):
-    """Every new key must reach the console and the file: a threshold nobody can change without a release..."""
+def test_a_ui_health_key_is_set_fleet_wide_and_refused_on_a_project(catalog):
+    """Issue #1553: `config set` must not accept a value nothing will read"""
     fleet = ops.set_config("os.ui_health.trip_threshold", 5)
-    mine = ops.set_config("ui_health.probe_interval_seconds", 30, project="proj_a")
 
     assert document_of(catalog)["os"]["ui_health"]["trip_threshold"] == 5
-    assert mine["path"] == "projects.proj_a.ui_health.probe_interval_seconds"
-    assert fleet["apply"] == mine["apply"] == "hot"
+    assert fleet["apply"] == "hot"
     assert ops.config_show()["resolved"]["os.ui_health.trip_threshold"] == 5
-    # Field-level inheritance, through the console: the project's own key is set and the fleet's answer...
+    with pytest.raises(ops.OpsError, match="is a FLEET setting"):
+        ops.set_config("ui_health.probe_interval_seconds", 30, project="proj_a")
+    assert "ui_health" not in next(p for p in document_of(catalog)["projects"]
+                                   if p["name"] == "proj_a")
+    # Inherited, and readable: only the writing is refused
     assert ops.config_show()[
         "resolved"]["projects.proj_a.ui_health.trip_threshold"] == 5
+
+
+def test_a_projects_steward_cap_demands_a_reason_like_the_fleets(catalog):
+    """Issue #1553: the project's value now moves real money, so it is the same safety key"""
+    with pytest.raises(ops.OpsError, match="reason"):
+        ops.set_config("evolution.bug_weekly_usd", 1500, project="proj_a")
+    ops.set_config("evolution.bug_weekly_usd", 1500, project="proj_a", reason="raise it")
+    got = ops.config_get("evolution.bug_weekly_usd", project="proj_a")
+    assert (got["value"], got["safety"]) == (1500.0, True)
 
 
 def test_settings_overrides_says_why_it_is_inert_rather_than_accepting_it_silently(

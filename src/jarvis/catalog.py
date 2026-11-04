@@ -42,12 +42,12 @@ SAFETY_KEYS = (
     # Files work nobody typed: same class of act as the scheduler
     "os.autonomy.*",
     # How much of that the steward may spend, and how deep it may go (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
-    "os.evolution.weekly_usd", "os.evolution.bug_weekly_usd",
-    "os.evolution.critical_weekly_usd",
-    "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
-    "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_refs_by_kind",
-    "os.evolution.min_precision",
-    "os.evolution.mode",
+    "*.evolution.weekly_usd", "*.evolution.bug_weekly_usd",
+    "*.evolution.critical_weekly_usd",
+    "*.evolution.yield_above_usd", "*.evolution.order_budget_usd",
+    "*.evolution.max_depth", "*.evolution.*_min_refs", "*.evolution.min_refs_by_kind",
+    "*.evolution.min_precision",
+    "*.evolution.mode",
     # What the OS is permitted to WATCH (docs/superpowers/specs/2026-09-27-self-evolution.md)
     "*.rules.*",
 )
@@ -552,6 +552,10 @@ DEFAULT_FLEET_HEALTH_EXEMPT_KINDS: tuple[str, ...] = ("investigator",)
 
 #: `FleetHealthConfig` fields that are a LIST, not a count
 FLEET_HEALTH_LIST_KEYS = ("exempt_kinds",)
+
+#: `CostConfig` fields read off the ONE account meter, with no project in hand: REFUSED on a project
+COST_FLEET_ONLY_KEYS = ("meter_stale_minutes", "meter_gap_notice_samples",
+                        "meter_burn_warn_lead_minutes")
 
 #: `FleetHealthConfig` fields that are a FLEET number and are REFUSED on a project
 FLEET_HEALTH_FLEET_ONLY_KEYS: dict[str, str] = {
@@ -1569,6 +1573,10 @@ def _parse_ui_health(raw: Any, base: UiHealthConfig | None = None,
     base = base or UiHealthConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
+    if where != "os.ui_health":
+        for key in raw:
+            raise _err(f"{where}.{key} is a FLEET setting — set os.ui_health.{key}. One "
+                       f"dashboard serves the whole machine, so no project can have its own.")
     cfg = UiHealthConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
         probe_interval_seconds=int(raw.get("probe_interval_seconds",
@@ -1701,6 +1709,11 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
     base = base or CostConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
+    if where != "os.cost":
+        for key in COST_FLEET_ONLY_KEYS:
+            if key in raw:
+                raise _err(f"{where}.{key} is a FLEET number — set os.cost.{key}. There is "
+                           f"one account meter, and no project in hand where it is read.")
     cfg = CostConfig(
         week_reset_weekday=int(raw.get("week_reset_weekday", base.week_reset_weekday)),
         week_reset_hour=int(raw.get("week_reset_hour", base.week_reset_hour)),

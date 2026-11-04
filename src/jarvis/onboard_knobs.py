@@ -126,7 +126,7 @@ AREA_SCOPE: dict[str, str] = {
     "compaction": "both",
     "model": "both",
     "fleet_health": "both",
-    "ui_health": "both",
+    "ui_health": "os",
     "schedule": "both",
     "navigation": "both",
     "concision": "both",
