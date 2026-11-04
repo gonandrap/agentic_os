@@ -15087,6 +15087,19 @@ def schedule_config_at(project_path: Path, catalog: Catalog | None = None) -> An
     return ScheduleConfig()
 
 
+def validation_config_at(project_path: Path) -> Any:
+    """`validation` for the project rooted at `project_path`, or the OS's, or None"""
+    try:
+        catalog = resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in catalog.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.validation
+        return catalog.os.validation
+    except (OpsError, CatalogError, OSError, ValueError):
+        return None
+
+
 def messaging_config_at(project_path: Path) -> Any:
     """`os.messaging` for the project rooted at `project_path`"""
     from .catalog import MessagingConfig
