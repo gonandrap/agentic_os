@@ -470,7 +470,8 @@ def _utc(ts: float) -> str:
 
 def meter_diagnostic_brief(chain: list[dict[str, Any]]) -> str:
     """The filed issue's description: the evidence, and where the defect is looked for"""
-    rows = "\n".join(f"- {_utc(float(row['ts']))}: {row['reason']}"
+    # Ids, never reasons: a reason states spend and the tracker is public
+    rows = "\n".join(f"- {_utc(float(row['ts']))}: `jarvis alarms show {row['id']}`"
                      for row in chain[-METER_DIAGNOSTIC_ROWS:])
     return (f"`{METER_RESIDUAL_ALARM}` has recurred {len(chain)} times since "
             f"{_utc(float(chain[0]['ts']))} as one standing, machine-wide condition. The work "
