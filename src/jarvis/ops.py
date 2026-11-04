@@ -9178,16 +9178,17 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
                             f"{name} bugs.repo <owner/name> --reason …`")
     if verdict["classification"] == "GAP" and not filing_error:
         try:
-            duplicate = _verdict_duplicate(name, subject, verdict, fo, tracker)
+            duplicate, link = _verdict_duplicate(path, subject, verdict, fo, tracker)
         except Exception as e:  # noqa: BLE001 — an unreadable tracker is the §2.5 case
             filing_error = f"the duplicate check could not read the tracker: {e}"
-            duplicate = ""
+            duplicate, link = "", ""
         if not filing_error and duplicate:
             # RECORDED AS `ops`' DECISION, and the submitted classification is kept: the record must never read...
             verdict["submitted_classification"] = "GAP"
             verdict["classification"] = "ALREADY_TRACKED"
             verdict["classified_by"] = "ops"
             verdict["duplicate_of"] = duplicate
+            verdict["duplicate_link"] = link
         elif not filing_error and verdict.get("owner") == "project":
             # OFF THE OS BUG RAILS: no steward, no OS pickup — the project's own tracker
             fix = verdict["proposed_fix"]
@@ -9260,6 +9261,10 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
                 })
             except (KeyError, sqlite3.IntegrityError):
                 pass  # not this project's work order any more
+        if verdict.get("duplicate_link") in LIVE_ORDER_LINKS:
+            store.add_event(verdict["duplicate_of"], "verdict_duplicate_linked", {
+                "investigation": inv_id, "gap_class": verdict.get("gap_class"),
+                "link": verdict["duplicate_link"]})
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {
                 "investigation": inv_id, "classification": classification,
@@ -9344,23 +9349,116 @@ def submitter_unsettled(what: str, order_id: str, wo_id: str, error: Exception) 
             f"is the OS's to clear, not yours: {error}")
 
 
-def _verdict_duplicate(project: str, subject: str, verdict: dict[str, Any],
-                       fo: dict[str, Any], repo: str = "") -> str:
-    """What already covers this GAP — an issue url on `repo` (else the OS's) or a live order id — or `""`"""
-    from . import bugreport, issues, search as search_mod
+#: How a live order can cover a GAP's cause; a text mention of the subject is NOT one (spec §2.5)
+LIVE_ORDER_LINKS = ("gap_class", "issue_url")
+
+
+def _verdict_duplicate(path: Path, subject: str, verdict: dict[str, Any],
+                       fo: dict[str, Any], repo: str = "") -> tuple[str, str]:
+    """(what already covers this GAP, how it is linked) or `("", "")` (spec §2.5)"""
+    from . import bugreport, issues
 
     title = (verdict.get("proposed_fix") or {}).get("title") or ""
     repo = repo or bugreport.bug_repo()
     if title:
         for row in issues.issues_mentioning(repo, title):
-            return str(row["url"])
+            return str(row["url"]), "tracker"
+    gap_class = str(verdict.get("gap_class") or "")
     ours = {subject, fo["id"], fo.get("plan_wo_id") or ""}
-    for hit in search_mod.search(subject, project=project,
-                                 kinds=("work_order", "feature_order")):
-        if hit["id"] in ours or hit.get("status") in TERMINAL_STATUSES:
-            continue
-        return str(hit["id"])
-    return ""
+    store = ProjectStore(path)
+    try:
+        filed_urls = set()
+        for row in store.list_feature_orders(statuses=("completed",), kind="investigation",
+                                             limit=VERDICT_SCAN_LIMIT):
+            earlier = db.from_json(row.get("plan"), {}) or {}
+            url = (earlier.get("filed") or {}).get("issue_url")
+            if url and earlier.get("gap_class") == gap_class:
+                filed_urls.add(str(url))
+        for wo in store.live_orders_on_cause(gap_class, filed_urls):
+            if wo["id"] not in ours:
+                link = "gap_class" if wo.get("gap_class") == gap_class else "issue_url"
+                return str(wo["id"]), link
+    finally:
+        store.close()
+    return "", ""
+
+
+#: How many of a project's investigations one scan reads; `list_feature_orders` defaults to 200
+VERDICT_SCAN_LIMIT = 1000
+
+
+def raise_settled_duplicates(project: str, path: Path) -> list[str]:
+    """GAP verdicts whose order target settled with no issue become backlog proposals (spec §2.5)"""
+    from . import bugreport, issues
+
+    store = ProjectStore(path)
+    central = CentralStore()
+    raised: list[str] = []
+    try:
+        groups: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+        for fo in store.list_feature_orders(statuses=("completed",), kind="investigation",
+                                            limit=VERDICT_SCAN_LIMIT):
+            plan = db.from_json(fo.get("plan"), {}) or {}
+            target = str(plan.get("duplicate_of") or "")
+            if (plan.get("submitted_classification") != "GAP" or not target
+                    or plan.get("duplicate_link") == "tracker" or target.startswith("http")
+                    or plan.get("duplicate_settled")
+                    or not _order_settled(store, target)):
+                continue
+            title = str((plan.get("proposed_fix") or {}).get("title") or "")
+            repo = bugreport.bug_repo()
+            if plan.get("owner") == "project":
+                spec = _spec_or_none(project)
+                repo = follow_up_repo(spec.path if spec is not None else path,
+                                      spec.bugs.repo if spec is not None else "")
+            try:
+                found = issues.issues_mentioning(repo, title) if repo and title else []
+            except Exception:  # noqa: BLE001 — stays unmarked, so the next pass retries it
+                log.exception("[%s] %s: could not read the tracker", project, fo["id"])
+                continue
+            if found:
+                plan["duplicate_settled"] = {"issue_url": str(found[0]["url"])}
+                store.update_feature_order(fo["id"], plan=db.to_json(plan))
+                continue
+            groups.setdefault(str(plan.get("gap_class") or "unclassified"), []).append((fo, plan))
+
+        for gap_class, members in groups.items():
+            first = members[0][1]
+            title = (str((first.get("proposed_fix") or {}).get("title") or gap_class)
+                     if len(members) == 1
+                     else f"{gap_class}: {len(members)} GAP verdicts were never filed")
+            lines = [f"GAP verdicts downgraded to ALREADY_TRACKED on an order that settled "
+                     f"with no issue for the cause. Gap class: {gap_class}."]
+            lines += [f"- {fo['id']} (subject {plan.get('subject')}, was duplicate of "
+                      f"{plan.get('duplicate_of')}): "
+                      f"{(plan.get('proposed_fix') or {}).get('title')}. "
+                      f"Full fix: `jarvis investigate show {fo['id']}`"
+                      for fo, plan in members]
+            item = central.propose_backlog(
+                project, title, "\n".join(lines),
+                item_type="bug", severity="major", suggested_kind="wo",
+                origin_refs=[{"kind": "finding", "order_id": fo["id"], "key": gap_class}
+                             for fo, _ in members],
+                origin_fo_id=members[0][0]["id"],
+                origin_note=f"settled duplicate target, gap class {gap_class}")
+            raised.append(item["id"])
+            for fo, plan in members:
+                plan["duplicate_settled"] = {"backlog": item["id"]}
+                store.update_feature_order(fo["id"], plan=db.to_json(plan))
+    finally:
+        central.close()
+        store.close()
+    return raised
+
+
+def _order_settled(store: ProjectStore, order_id: str) -> bool:
+    """Terminal, or gone: either way nothing is left to carry the cause"""
+    try:
+        row = (store.get_feature_order(order_id) if is_feature_order_id(order_id)
+               else store.get_work_order(order_id))
+    except KeyError:
+        return True
+    return row.get("status") in TERMINAL_STATUSES
 
 
 def _verdict_filing_failed(name: str, path: Path, fo: dict[str, Any], inv_id: str,

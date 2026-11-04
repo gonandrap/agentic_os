@@ -1714,6 +1714,17 @@ class ProjectStore:
 
     # -- the issue <-> work order relation
 
+    def live_orders_on_cause(self, gap_class: str,
+                             issue_urls: Iterable[str] = ()) -> list[dict[str, Any]]:
+        """Unsettled work orders carrying this gap class or working one of these issues"""
+        urls = list(issue_urls)
+        held = ",".join("?" for _ in TERMINAL_STATUSES)
+        rows = self.conn.execute(
+            f"SELECT * FROM work_orders WHERE status NOT IN ({held}) AND (gap_class=? "
+            f"OR issue_url IN ({','.join('?' for _ in urls)})) ORDER BY created_at DESC",
+            (*TERMINAL_STATUSES, gap_class, *urls)).fetchall()
+        return db.rows_to_dicts(rows)
+
     def link_issue(self, issue_url: str, unit_id: str, kind: str, *,
                    round_no: int = 0, seat: str = "", announced: bool = False) -> bool:
         """Record that `unit_id` raised, was assigned, or cites `issue_url`"""
