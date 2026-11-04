@@ -2181,13 +2181,12 @@ def test_clicking_a_dashboard_row_id_opens_its_order(page, server, project):
 
 def test_the_project_page_reads_at_desktop_and_phone_width(page, server, project, readable):
     _open_orders(project)
-    ops.create_feature_order("proj_a", "a feature in the tabs", description=_LONG)
+    ops.create_feature_order("proj_a", "a feature in the list", description=_LONG)
     for size in _WIDTHS:
         page.set_viewport_size(size)
         page.goto(f"{server}/project/proj_a")
         assert page.locator(".proj-orders").is_visible()
-        assert "a feature in the tabs" in page.locator("#tab-features").inner_text()
-        assert not page.locator("#tab-improvements").is_visible()
+        assert "a feature in the list" in page.locator(".proj-orders").inner_text()
         readable(page, _ROWS)
         _shot(page, f"project-{size['width']}")
 
@@ -2209,13 +2208,13 @@ def test_a_project_row_needing_you_sits_above_the_others(page, server, project):
 
 
 def test_clicking_a_project_row_id_opens_its_order(page, server, project):
-    fo = ops.create_feature_order("proj_a", "a feature in the tabs", description=_LONG)
+    fo = ops.create_feature_order("proj_a", "a feature in the list", description=_LONG)
     wo = _open_orders(project)["waiting_pr_merge"]
     page.goto(f"{server}/project/proj_a")
     page.click(f".proj-orders a.rowid:has-text('{wo['id']}')")
     page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
     page.goto(f"{server}/project/proj_a")
-    page.click(f"#tab-features a.rowid:has-text('{fo['id']}')")
+    page.click(f".proj-orders a.rowid:has-text('{fo['id']}')")
     page.wait_for_url(f"**/fo/proj_a/{fo['id']}")
 
 

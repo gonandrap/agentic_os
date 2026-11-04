@@ -45,6 +45,7 @@ from ..inspection import ALARM_KINDS, PARTS
 from ..paths import PRODUCTION, deployment_env
 from ..project_store import (
     ACTIVE_STATUSES,
+    FO_KINDS,
     FO_OPEN_STATUSES,
     FO_STATUSES,
     FO_TERMINAL_STATUSES,
@@ -170,6 +171,7 @@ def gate_display(g: dict) -> str:
 REFRESH_SECONDS = 15
 
 # The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
+ORDERS_PAGE = 200  # rows of the project page's order list before "show more"
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
                      "validating", "waiting_pr_merge")
 # The work-order statuses that sort to the top of a list: each waits on the user
@@ -258,6 +260,15 @@ def filter_options(rows: Iterable[dict], key: str) -> list[str]:
 def _backlog_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return {s: sum(1 for r in rows if r["status"] == s)
             for s in ("open", "proposed", "quarantined")}
+
+
+def orders_cap(limit: str, total: int) -> int:
+    """How many rows the project page draws: a page, or what `limit` asked, never past `total`"""
+    try:
+        asked = int(limit)
+    except ValueError:
+        asked = 0
+    return min(max(asked, ORDERS_PAGE), total)
 
 
 def attention_first(rows: Iterable[dict], needs_you: Callable[[dict], bool]) -> list[dict]:
@@ -1362,71 +1373,60 @@ def create_app() -> FastAPI:
                       filters=filters, options=options, total=len(every))
 
     @app.get("/project/{name}", response_class=HTMLResponse)
-    def project(request: Request, name: str, hidden: str = "", show: str = "",
-                fo: str = ""):
-        """A project's work orders — the ones that want the user, by default"""
+    def project(request: Request, name: str, hidden: str = "", limit: str = ""):
+        """A project's orders of every kind: open ones by default, filter for the past ones"""
         paths = ops.registered_project_paths(include_archived=True)
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
         show_hidden = hidden not in ("", "0", "false")
-        options = {"status": list(WO_STATUSES)}
-        filters = query_filters(request, options)
-        status = filters.get("status", "")
-        # A status filter reveals that status; an unknown one matches nothing (Q2361)
-        show = status or show
-        revealed = show if show in WO_STATUSES else ("all" if show == "all" else "")
-        if status:
-            statuses = (status,)
-        elif revealed == "all":
-            statuses = None
+        filters = query_filters(request, {"type": (), "status": ()})
+        kind, status = filters.get("type", ""), filters.get("status", "")
+        # No status filter means open; an unknown one matches nothing (Q2361)
+        if status == "all":
+            wo_statuses, fo_statuses = None, None
+        elif status == "past":
+            wo_statuses, fo_statuses = TERMINAL_STATUSES, FO_TERMINAL_STATUSES
+        elif status:
+            wo_statuses, fo_statuses = (status,), (status,)
         else:
-            statuses = OPEN_STATUSES + ((revealed,) if revealed else ())
-        fo_revealed = fo if fo in FO_STATUSES else ("all" if fo == "all" else "")
-        if fo_revealed == "all":
-            fo_statuses = None
-        else:
-            fo_statuses = FO_OPEN_STATUSES + ((fo_revealed,) if fo_revealed else ())
+            wo_statuses, fo_statuses = OPEN_STATUSES, FO_OPEN_STATUSES
         store = ProjectStore(paths[name])
         try:
-            # Open feature orders get their own short list above the work orders
-            features = [{**row, "progress": ops.feature_progress(store, row)}
-                        for row in store.list_feature_orders(statuses=fo_statuses)]
-            # Beside the features and never merged into them: `list_feature_orders` defaults to kind='feature'
-            improvements = [
-                {**row,
-                 "status_label": feature_status_label("improvement", row["status"])}
-                for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
-                                                     kind="improvement")]
-            # A third kind beside them, on the same rule and for the same reason (§2.9 of... (docs/superpowers/specs/2026-09-27-investigation-orders.md)
-            investigations = [
-                {**row,
-                 "status_label": feature_status_label("investigation", row["status"])}
-                for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
-                                                     kind="investigation")]
-            # A fourth, same rule (docs/superpowers/specs/2026-10-31-decision-orders.md §7)
-            decisions = [
-                {**row, "status_label": feature_status_label("decision", row["status"])}
-                for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
-                                                     kind="decision")]
-            fo_counts = store.feature_status_counts()
-            wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
+            visible_counts = store.status_counts()
+            all_counts = store.status_counts(include_hidden=True)
+            hidden_count = sum(all_counts.values()) - sum(visible_counts.values())
+            counts = {"work": all_counts if show_hidden else visible_counts,
+                      **{k: store.feature_status_counts(kind=k) for k in FO_KINDS}}
+            total = sum(n for by_status in counts.values() for n in by_status.values())
+            cap = orders_cap(limit, total)
+            wos = (store.list_work_orders(statuses=wo_statuses, limit=cap,
+                                          include_hidden=show_hidden)
+                   if kind in ("", "work") else [])
+            fos = (store.list_feature_orders(statuses=fo_statuses, limit=cap,
+                                             kind=kind or None)
+                   if kind != "work" else [])
+            families = [
+                {**fo, "type": fo["kind"],
+                 # A feature prints its status word; the other kinds relabel theirs
+                 **({"progress": ops.feature_progress(store, fo)}
+                    if fo["kind"] == "feature" else
+                    {"status_label": feature_status_label(fo["kind"], fo["status"])})}
+                for fo in fos]
+            # Open rows only: these notes read each order's own turns and dependencies
+            live_wos = [wo for wo in wos if wo["status"] in OPEN_STATUSES]
             # Inside the store's lifetime: the label reads the dependencies' own rows
-            blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in wos}
+            blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in live_wos}
             blocked = {k: v for k, v in blocked.items() if v}
             # Same lifetime, same reason: the note reads this work order's last turn
-            pauses = {wo["id"]: invariants.pause_note(store, wo) for wo in wos}
+            pauses = {wo["id"]: invariants.pause_note(store, wo) for wo in live_wos}
             # ...and the account-wide one, for the orders that own no refusal of their own (#714)
-            account = _fleet_if_held(wos)
-            for wo in wos:
+            account = _fleet_if_held(live_wos)
+            for wo in live_wos:
                 if not pauses.get(wo["id"]):
                     pauses[wo["id"]] = invariants.fleet_hold_note(wo, account)
             pauses = {k: v for k, v in pauses.items() if v}
             # Inside the store's lifetime like every other read on this page
             issue_board = ops.issue_board(store)
-            visible_counts = store.status_counts()
-            all_counts = store.status_counts(include_hidden=True)
-            counts = all_counts if show_hidden else visible_counts
-            hidden_count = sum(all_counts.values()) - sum(visible_counts.values())
         finally:
             store.close()
         central = CentralStore()
@@ -1435,40 +1435,31 @@ def create_app() -> FastAPI:
         finally:
             central.close()
         backlog = [i for i in every_backlog if i["status"] == "open"]
-        settled = [(s, counts[s]) for s in TERMINAL_STATUSES if counts.get(s)]
-        featured, rest = group_open(wos, revealed)
-        rows = attention_first(featured + rest,
-                               lambda wo: wo["status"] in NEEDS_YOU_STATUSES
-                               or bool(wo.get("needs_attention")))
-        # Counted in SQL rather than from `wos`
-        other_open = [s for s in OPEN_STATUSES if s not in FEATURED_STATUSES]
-        open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
-        fo_settled = [(s, fo_counts[s]) for s in FO_TERMINAL_STATUSES
-                      if fo_counts.get(s)]
-        flagged = lambda r: bool(r.get("needs_attention"))  # noqa: E731
-        features = attention_first(features, flagged)
-        improvements = attention_first(improvements, flagged)
-        investigations = attention_first(investigations, flagged)
-        decisions = attention_first(decisions, flagged)
+        featured, rest = group_open([{**wo, "type": "work"} for wo in wos], "all")
+        every = families + featured + rest
+        past = sorted((r for r in every if r["status"] in TERMINAL_STATUSES),
+                      key=lambda r: r["created_at"], reverse=True)
+        rows = attention_first([r for r in every if r["status"] not in TERMINAL_STATUSES]
+                               + past,
+                               lambda r: r["status"] in NEEDS_YOU_STATUSES
+                               or bool(r.get("needs_attention")))[:cap]
+        in_scope = {t: by_status for t, by_status in counts.items() if kind in ("", t)}
+        wanted = {t: wo_statuses if t == "work" else fo_statuses for t in in_scope}
+        matched = sum(n for t, by_status in in_scope.items()
+                      for s, n in by_status.items()
+                      if wanted[t] is None or s in wanted[t])
+        # Parsed against everything, offered only where a row has it
+        options = {"type": [t for t in ("work", *FO_KINDS) if counts[t]],
+                   "status": ["past", "all"]
+                   + [s for s in dict.fromkeys(WO_STATUSES + FO_STATUSES)
+                      if any(by_status.get(s) for by_status in in_scope.values())]}
         return render(request, "project.html", project_name=name, path=paths[name],
-                      # "of M": the open orders plus whatever the URL revealed, never every settled one
-                      total=sum(n for s, n in counts.items()
-                                if revealed == "all" or s in OPEN_STATUSES
-                                or s in (status, revealed)),
-                      rows=rows, filters=filters,
-                      # Parsed against every status, offered only where a row has it
-                      options={"status": [s for s in WO_STATUSES if counts.get(s)]},
-                      open_counts=open_counts,
+                      rows=rows, total=total, matched=matched,
+                      next_limit=cap + ORDERS_PAGE, filters=filters, options=options,
                       backlog=backlog, backlog_counts=_backlog_counts(every_backlog),
                       show_hidden=show_hidden, blocked=blocked,
-                      pauses=pauses,
-                      hidden_count=hidden_count, settled=settled, revealed=revealed,
-                      features=features, fo_settled=fo_settled,
-                      improvements=improvements,
-                      investigations=investigations,
-                      decisions=decisions,
-                      issue_board=issue_board,
-                      fo_revealed=fo_revealed)
+                      pauses=pauses, hidden_count=hidden_count,
+                      issue_board=issue_board)
 
     @app.get("/fo/{name}/{fo_id}", response_class=HTMLResponse)
     def feature_order(request: Request, name: str, fo_id: str, error: str = ""):
