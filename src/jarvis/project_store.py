@@ -1901,6 +1901,20 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    def settled_among(self, wo_ids: list[str], statuses: tuple[str, ...],
+                      settled_before: float) -> list[str]:
+        """Which of `wo_ids` are this project's orders, settled before the cutoff (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §1)"""
+        if not wo_ids:
+            return []
+        rows = self.conn.execute(
+            f"""SELECT id FROM work_orders
+                 WHERE id IN ({','.join('?' for _ in wo_ids)})
+                   AND status IN ({','.join('?' for _ in statuses)})
+                   AND updated_at < ?""",
+            (*wo_ids, *statuses, settled_before),
+        ).fetchall()
+        return [row["id"] for row in rows]
+
     def list_work_orders(
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,
         include_hidden: bool = False,
