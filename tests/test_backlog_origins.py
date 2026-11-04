@@ -26,12 +26,13 @@ def test_every_kind_resolves_to_its_page():
     cases = {
         "message": ({"project": "p", "wo_id": "wo-1", "id": 7}, "/wo/p/wo-1#msg-7"),
         "neo_question": ({"id": 12}, "/neo/question/12"),
-        "envelope": ({"project": "p", "id": 3, "subject_wo_id": "wo-2"}, "/wo/p/wo-2"),
-        "decision": ({"do_id": "do-1", "key": "k1"}, "/go/do-1"),
+        "envelope": ({"project": "p", "id": 3, "subject_wo_id": "wo-2"},
+                     "/wo/p/wo-2#envelope-3"),
+        "decision": ({"do_id": "do-1", "key": "k1"}, "/go/do-1#proposal-k1"),
         "monitoring_order": ({"id": "mo-1"}, "/mo/mo-1"),
         "alarm": ({"project": "p", "id": "al-1"}, "/alarms/p/al-1"),
-        "validation": ({"project": "p", "wo_id": "wo-1", "round": 2}, "/wo/p/wo-1#validation"),
-        "finding": ({"order_id": "io-1", "key": "f2"}, "/go/io-1"),
+        "validation": ({"project": "p", "wo_id": "wo-1", "round": 2}, "/wo/p/wo-1#round-2"),
+        "finding": ({"order_id": "io-1", "key": "f2"}, "/go/io-1#finding-f2"),
         "gate": ({"project": "p", "id": 9}, "/gates/9?project=p"),
         "order": ({"id": "fo-1"}, "/go/fo-1"),
     }
