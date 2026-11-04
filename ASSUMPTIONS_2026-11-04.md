@@ -1,0 +1,27 @@
+# Assumptions — wo-5515ff6b (investigate multi-machine OS)
+
+1. **Deliverable is a spec document, not code.** The order says its output feeds a
+   feature order, so it lands as
+   `docs/superpowers/specs/2026-11-04-one-fleet-across-many-machines.md`, the path
+   CLAUDE.md names for design docs. Rejected: a knowledge-base entry only (too small
+   to carry an architecture) and an implementation (explicitly out of scope).
+
+2. **Recommendation is OS-level RPC, not storage replication.** Rejected:
+   LiteFS (unsupported by Fly.io, Linux/FUSE only, no macOS), Litestream (backup, not
+   live replication), libSQL embedded replicas (works, but costs the `sqlite3`
+   driver, a self-hosted `sqld` and interactive transactions) and rqlite (rewrites
+   every query, deterministic-SQL constraint). Reason: none addresses the actual
+   blocker, which is that two daemons over one table both claim the same work order
+   and run it in two different checkouts.
+
+3. **The per-project database is split rather than moved.** The ledger goes to the
+   master; `wo_events`/`wo_turns` and hook preflight stay on the runner, because
+   `hooks.handle_hook` runs on every tool call and a round trip there would block
+   workers on master latency. Rejected: routing every hook write to the master.
+
+4. **Gates fail closed.** A gate preflight that cannot reach the master denies rather
+   than allowing locally. Rejected: a local fallback grant, which is a security hole.
+
+5. **Phasing is three steps, read-only first.** Rejected: one big change, because
+   phases 1 and 2 give a second operator console with no scheduler change and roll
+   back by unsetting an environment variable.
