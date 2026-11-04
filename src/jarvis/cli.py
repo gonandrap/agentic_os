@@ -60,6 +60,7 @@ def _read_submission(from_file: str, kind: str, noun: str) -> tuple[Any, Path]:
         raise ops.OpsError(f"no such {noun} file: {path}")
     artifact = WO_KIND_CONTRACTS[kind].artifact
     if path.name != artifact:
+        ops.record_refused_artifact(kind, path.resolve())
         raise ops.OpsError(
             f"{path} is not named `{artifact}`, and nothing was submitted: the {noun} "
             f"must be written to `{artifact}` in your worktree root and submitted with "

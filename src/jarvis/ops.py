@@ -90,6 +90,7 @@ from .project_store import (
     PR_PENDING_EVENT,
     SETTLE_BY_FINISH,
     SETTLE_IN_SESSION,
+    REFUSED_ARTIFACT_EVENT,
     SUBMITTED_ARTIFACT_EVENT,
     TERMINAL_STATUSES,
     WORKER_CHILDREN,
@@ -9294,6 +9295,24 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
             if settled is not None:
                 out["investigator"] = settled
     return out
+
+
+def record_refused_artifact(kind: str, source: Path) -> None:
+    """The submitting session's own refused file is OS-ordered, so the prune can find it (#1538)"""
+    wo_id = os.environ.get(WORKER_SESSION_ENV)
+    if not wo_id:
+        return
+    try:
+        _, path, wo = find_work_order(wo_id)
+    except OpsError:
+        return  # the refusal itself must still reach the caller
+    if str(wo.get("kind") or "worker") != kind:
+        return  # only this kind was told to submit; any other's file may be real work
+    store = ProjectStore(path)
+    try:
+        store.add_event(wo_id, REFUSED_ARTIFACT_EVENT, {"path": str(source)})
+    finally:
+        store.close()
 
 
 def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
