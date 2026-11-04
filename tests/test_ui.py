@@ -3916,7 +3916,8 @@ def test_backlog_page_splits_escalated_from_what_neo_still_decides(client, proje
     page = client.get("/backlog").text
 
     head, _, rest = page.partition("Neo is still deciding")
-    assert "Neo left these to you" in head and "too close to call" in head
+    assert "quarantined — waiting on you" in head and "too close to call" in head
+    assert "Neo left the decision to you" in head
     assert f'action="/backlog/review/{mine}"' in head
     assert 'value="accept"' in head and 'value="reject"' in head
     assert "<details" in head and "<details open" not in head
@@ -3926,11 +3927,34 @@ def test_backlog_page_splits_escalated_from_what_neo_still_decides(client, proje
     assert f'action="/backlog/review/{neos}"' not in page
 
 
+def test_backlog_page_says_neo_was_unreachable_once_revivals_are_spent(client, project):
+    from jarvis.neo_store import MAX_REVIVALS, NeoStore
+
+    item, qid = _quarantine("exporter drops rows")
+    neo = NeoStore()
+    try:
+        for _ in range(MAX_REVIVALS):
+            neo.mark(qid, "failed", reason="neo could not be reached: x",
+                     cause="transport-unreachable")
+            page = client.get("/backlog").text
+            assert "Neo is still deciding" in page and "waiting on you" not in page
+            neo.revive_unreachable()
+        neo.mark(qid, "failed", reason="neo could not be reached: x",
+                 cause="transport-unreachable")
+    finally:
+        neo.close()
+    page = client.get("/backlog").text
+    assert "Neo could not be reached; nobody has judged this" in page
+    assert "Neo left the decision to you" not in page and "Neo left these" not in page
+    assert "Neo is still deciding" not in page
+    assert f'action="/backlog/review/{item}"' in page and 'value="reject"' in page
+
+
 def test_backlog_page_without_quarantine_renders_neither_block(client, project):
     CentralStore().add_backlog("proj_a", "just an idea")
     page = client.get("/backlog").text
     assert "just an idea" in page
-    assert "Neo left these to you" not in page and "Neo is still deciding" not in page
+    assert "quarantined — waiting on you" not in page and "Neo is still deciding" not in page
     assert "/backlog/review/" not in page
 
 
@@ -3946,7 +3970,7 @@ def test_backlog_review_post_decides_and_closes_the_question(client, project, de
     assert (got["status"], got["review_rule"]) == (status, "user")
     q = NeoStore().get(qid)
     assert (q["status"], q["answered_by"]) == ("answered", "user")
-    assert "Neo left these to you" not in client.get("/backlog").text
+    assert "quarantined — waiting on you" not in client.get("/backlog").text
 
 
 @pytest.mark.parametrize("decision", ["", "maybe", "duplicate"])

@@ -1353,6 +1353,7 @@ def test_the_pulse_carries_a_proposal_only_once_neo_left_it_to_the_user(started,
     assert st["backlog_escalated"] == 1
     row, = _escalated_rows(st)
     assert row["project"] == "proj_a" and item["id"] in row["reason"]
+    assert "Neo left the decision to you" in row["reason"]
     assert row["decide"].startswith(f"jarvis backlog review {item['id']} ")
     assert not st["healthy"]
 
@@ -1396,7 +1397,11 @@ def test_an_outage_is_not_an_escalation_until_its_revivals_are_spent(started):
         assert neo.revive_unreachable() == []
     finally:
         neo.close()
-    assert ops.os_status()["backlog_escalated"] == 1
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 1
+    row, = _escalated_rows(st)
+    assert "Neo could not be reached" in row["reason"] and item["id"] in row["reason"]
+    assert "Neo left the decision to you" not in row["reason"]
 
 
 def test_an_unusable_answer_that_spent_its_attempts_is_the_users(started):
@@ -1407,4 +1412,42 @@ def test_an_unusable_answer_that_spent_its_attempts_is_the_users(started):
                  cause="unparseable-reply")
     finally:
         neo.close()
-    assert ops.os_status()["backlog_escalated"] == 1
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 1
+    row, = _escalated_rows(st)
+    assert "nobody has judged this" in row["reason"]
+    assert "Neo left the decision to you" not in row["reason"]
+
+
+def test_a_proposal_whose_question_is_gone_is_the_users_and_an_unasked_one_is_not(started):
+    """Only an item naming no question gets asked, so a lost question would wait forever"""
+    central = CentralStore()
+    try:
+        item = central.propose_backlog("proj_a", "Exporter drops rows on retry",
+                                       item_type="bug", severity="critical",
+                                       suggested_kind="wo", origin_refs=[])
+        central.review_backlog(item["id"], "quarantined", rule="severity-claim", note="claims")
+        assert ops.os_status()["backlog_escalated"] == 0
+        assert central.set_backlog_question(item["id"], 999999)
+    finally:
+        central.close()
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 1
+    row, = _escalated_rows(st)
+    assert "nobody has judged this" in row["reason"]
+    assert "Neo left the decision to you" not in row["reason"]
+
+
+def test_mixed_causes_each_keep_their_own_words_on_the_one_line(started):
+    left, lost = _quarantined(started), _quarantined(started, "Uploader retry storm melts disks")
+    neo = NeoStore()
+    try:
+        neo.mark(left["neo_question_id"], "escalated", reason="the user's call")
+        neo.mark(lost["neo_question_id"], "failed", reason="backlog: nobody has judged this",
+                 cause="unparseable-reply")
+    finally:
+        neo.close()
+    row, = _escalated_rows(ops.os_status())
+    told_left, told_lost = row["reason"].split("; ", 1)
+    assert told_left.startswith("Neo left the decision to you") and left["id"] in told_left
+    assert lost["id"] in told_lost and left["id"] not in told_lost
