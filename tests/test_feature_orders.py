@@ -607,6 +607,28 @@ def test_the_cli_refuses_a_plan_not_named_plan_json(planning, store, tmp_path, c
     assert store.get_feature_order(fo["id"])["plan"] is None
 
 
+@pytest.mark.parametrize("kind,recorded", [("planner", True), ("worker", False)])
+def test_a_refused_plan_is_recorded_only_on_a_submitter_of_that_kind(
+        planning, store, tmp_path, monkeypatch, kind, recorded):
+    """The refusal is the only place that knows this path, and only a planner was told to write it (#1538)"""
+    from jarvis import cli
+    from jarvis.project_store import REFUSED_ARTIFACT_EVENT
+
+    _, fo = planning
+    planner = store.get_feature_order(fo["id"])["plan_wo_id"]
+    store.conn.execute("UPDATE work_orders SET kind=? WHERE id=?", (kind, planner))
+    store.conn.commit()
+    path = tmp_path / ".jarvis-plan.json"
+    path.write_text("{}")
+    monkeypatch.setenv("JARVIS_WO_ID", planner)
+
+    assert cli.main(["fo", "plan", fo["id"], "--from-file", str(path)]) == 1
+
+    events = store.events_of_kind(planner, REFUSED_ARTIFACT_EVENT)
+    assert [json.loads(e["payload"])["path"] for e in events] == (
+        [str(path.resolve())] if recorded else [])
+
+
 def test_a_submitted_plan_records_the_path_it_was_read_from(planning, store, tmp_path):
     from jarvis import cli
     from jarvis.project_store import SUBMITTED_ARTIFACT_EVENT

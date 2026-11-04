@@ -277,6 +277,11 @@ def submission_artifacts(wo: Mapping[str, Any]) -> tuple[str, ...]:
     artifact = kind_contract(wo).artifact
     return (artifact,) if artifact else ()
 
+
+def pr_body_file(wo_id: str) -> str:
+    """The worktree file `hooks.pr_body_decision` orders a PR body written to (#1538)"""
+    return f"pr-body-{wo_id}.md"
+
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on somebody else (#134)
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 
@@ -491,6 +496,8 @@ WORKTREE_RECLAIMED_EVENT = "worktree_reclaimed"
 SESSION_KEPT_EVENT = "background_session_kept"
 #: The resolved path a `--from-file` submission was read from (#1528)
 SUBMITTED_ARTIFACT_EVENT = "submitted_artifact"
+#: The resolved path a `--from-file` submit refused for its name (#1538)
+REFUSED_ARTIFACT_EVENT = "refused_artifact"
 
 #: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
 MAX_PER_SWEEP_ROWS = 50
