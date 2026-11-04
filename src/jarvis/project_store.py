@@ -278,10 +278,25 @@ def kind_contract(wo: Mapping[str, Any]) -> KindContract:
     return WO_KIND_CONTRACTS[str(wo.get("kind") or "worker")]
 
 
+def settles_idle(wo: Mapping[str, Any]) -> bool:
+    """Does this kind idle between messages, never finishing?"""
+    return kind_contract(wo).route == SETTLE_IDLE
+
+
+def turn_end_is_delivery(wo: Mapping[str, Any]) -> bool:
+    """An idle manager has delivered: it never reaches `needs_review` (io-d5e62d4d)"""
+    return settles_idle(wo) and wo.get("status") == "idle"
+
+
 def submission_artifacts(wo: Mapping[str, Any]) -> tuple[str, ...]:
     """The file this kind's contract command consumes, as `landing.authored` excludes it"""
     artifact = kind_contract(wo).artifact
     return (artifact,) if artifact else ()
+
+
+def pr_body_file(wo_id: str) -> str:
+    """The worktree file `hooks.pr_body_decision` orders a PR body written to (#1538)"""
+    return f"pr-body-{wo_id}.md"
 
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on somebody else (#134)
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
@@ -497,6 +512,8 @@ WORKTREE_RECLAIMED_EVENT = "worktree_reclaimed"
 SESSION_KEPT_EVENT = "background_session_kept"
 #: The resolved path a `--from-file` submission was read from (#1528)
 SUBMITTED_ARTIFACT_EVENT = "submitted_artifact"
+#: The resolved path a `--from-file` submit refused for its name (#1538)
+REFUSED_ARTIFACT_EVENT = "refused_artifact"
 
 #: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
 MAX_PER_SWEEP_ROWS = 50
@@ -2294,6 +2311,20 @@ class ProjectStore:
             "SELECT * FROM wo_alarms WHERE kind=? ORDER BY ts DESC LIMIT 1",
             (kind,)).fetchone()
         return dict(row) if row else None
+
+    def standing_alarms(self, kind: str, gap_seconds: float) -> list[dict[str, Any]]:
+        """One kind's rows still chained to now, OLDEST first (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)"""
+        rows = self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE kind=? ORDER BY ts DESC", (kind,)).fetchall()
+        chain: list[dict[str, Any]] = []
+        later = db.now()
+        for row in rows:
+            if later - float(row["ts"] or 0.0) >= gap_seconds:
+                break
+            chain.append(dict(row))
+            later = float(row["ts"] or 0.0)
+        chain.reverse()
+        return chain
 
     def latest_settled_order(self) -> dict[str, Any] | None:
         """The most recently settled work order, as a CARRIER and nothing more"""

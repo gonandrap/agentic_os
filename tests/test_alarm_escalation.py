@@ -234,6 +234,7 @@ def test_the_advice_reaches_the_user_as_an_inbox_row_pointing_at_the_alarm(escal
     alarm = _alarm(wo_id)
     (row,) = _inbox(wo_id)
     assert row["level"] == "info"
+    assert row["push"] == 0
     assert row["title"] == supervisor.ADVICE_INBOX_TITLE.format(wo_id=wo_id)
     assert alarm["note"] in row["body"]
     assert f"/alarms/proj_a/{alarm['id']}" in row["body"]
