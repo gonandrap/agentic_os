@@ -12,7 +12,7 @@
 {# Everything about this project that lives on another page, one click each —
    docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md §1. #}
 <div class="jumps" style="margin-bottom: 10px;">
-  <a href="#proj-orders">work orders</a>
+  <a href="#proj-orders">orders</a>
   <a href="/config?scope={{ ('projects.' ~ project_name)|urlencode }}">its config</a>
   <a href="/project/{{ project_name }}/prompt">its worker prompt</a>
   <a href="/project/{{ project_name }}/contract">its contract</a>
@@ -27,210 +27,64 @@
   <input type="text" name="q" placeholder="search {{ project_name }} — work orders, features, questions, alarms, gates">
   <button>Search</button>
 </form>
-{# Everything open that the user can act on gets a row: a decision they owe (needs
-   review, waiting on them), a running worker, a pull request waiting to be merged.
-   Only work the OS has not started yet — pending, dispatching — collapses to a count,
-   along with the settled orders that are the bulk of any project with history. Every
-   link carries the OTHER two flags through, so expanding one group does not silently
-   undo "show hidden too" or a revealed group of feature orders. #}
-{% set p_show = 'show=' + revealed if revealed else '' %}
-{% set p_fo = 'fo=' + fo_revealed if fo_revealed else '' %}
-{% macro purl(a='', b='', hidden=show_hidden) -%}
-  {%- set parts = [('hidden=1' if hidden else ''), a, b]|select|list -%}
+{# Every order of every kind in one list, narrowed by the filter bar: open by default,
+   past or all on request. Each link carries the filters, so no control undoes another. #}
+{% macro purl(hidden=show_hidden, limit=none) -%}
+  {%- set parts = [('hidden=1' if hidden else ''), filters|urlencode, ('limit=' ~ limit if limit else '')]|select|list -%}
   /project/{{ project_name }}{{ '?' ~ parts|join('&') if parts }}
 {%- endmacro %}
-{# One macro for both lines: the work orders' and the feature orders' reveals are the
-   same control on different rows, and a copy is how two of them drift apart. #}
-{% macro count_line(groups, meta=status_meta, active=revealed, param='show',
-                    carry=p_fo, noun='work') %}
-  {% for status, n in groups %}
-    {%- set word = meta.get(status, {}).get('word', status) -%}
-    {%- if active == status -%}
-      <strong>{{ n }} {{ word }}</strong> (<a href="{{ purl(carry) }}">collapse</a>)
-    {%- else -%}
-      <a href="{{ purl(carry, param + '=' + status) }}"
-         title="Show the {{ n }} {{ word }} {{ noun }} order(s) as well">{{ n }} {{ word }}</a>
-    {%- endif -%}
-    {{ ' · ' if not loop.last }}
-  {% endfor %}
-{% endmacro %}
-{% if open_counts or settled %}
-<p class="sub">
-  {{ count_line(open_counts + settled) }}
-  ·
-  {% if revealed == 'all' %}
-    <a href="{{ purl(p_fo) }}">collapse them again</a>
-  {% else %}
-    <a href="{{ purl(p_fo, 'show=all') }}">show all</a>
-  {% endif %}
-</p>
-{% endif %}
+<h2 id="proj-orders">Orders</h2>
+{{ ui.filter_bar("/project/" ~ project_name, filters, options, rows | length, total,
+                 labels={"type": "every type", "status": "open"},
+                 hidden={"hidden": "1"} if show_hidden else {}) }}
 <p class="sub">
   {% if show_hidden %}
     Showing hidden work orders too ·
-    <a href="{{ purl(p_show, p_fo, hidden=false) }}">hide them again</a>
+    <a href="{{ purl(hidden=false) }}">hide them again</a>
   {% elif hidden_count %}
     {{ hidden_count }} hidden ·
-    <a href="{{ purl(p_show, p_fo, hidden=true) }}">show</a>
+    <a href="{{ purl(hidden=true) }}">show</a>
   {% endif %}
 </p>
-{# §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md:
-   work orders full width and attention first; the planned units sit in tabs below. #}
-<h2 id="proj-orders">Work orders</h2>
-{{ ui.filter_bar("/project/" ~ project_name, filters, options, rows | length, total,
-                 labels={"status": "open work"}) }}
 <div class="panel proj-orders">
-  {% for wo in rows %}
-    {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
-    <div class="row" data-status="{{ wo.status }}">
-      <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
+  {% for o in rows %}
+    {% set work = o.type == 'work' %}
+    {% set m = (status_meta if work else fo_status_meta).get(o.status, {'word': o.status, 'icon': '•', 'tone': 'muted'}) %}
+    <div class="row" data-status="{{ o.status }}" data-type="{{ o.type }}">
+      <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ o.status_label or m.word }}</span>
       <div class="grow">
-        {{ ui.row_id(wo.id, '/wo/' ~ project_name ~ '/' ~ wo.id) }} {{ wo.title }}
-        {% if wo.hidden %}<span class="badge outside" title="hidden">🙈 hidden</span>{% endif %}
-        {% if wo.status == 'waiting_pr_merge' and wo.pr_url %}
-          <div class="sub">⑃ <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a></div>
+        {{ ui.row_id(o.id, ('/wo/' ~ project_name ~ '/' ~ o.id) if work else order_path(project_name, o.id)) }} {{ o.title }}
+        {% if o.hidden %}<span class="badge outside" title="hidden">🙈 hidden</span>{% endif %}
+        {% if o.progress %}<span class="sub">{{ o.progress.label }}</span>{% endif %}
+        {% if o.status == 'waiting_pr_merge' and o.pr_url %}
+          <div class="sub">⑃ <a href="{{ o.pr_url }}" rel="noopener">{{ o.pr_url }}</a></div>
         {% endif %}
-        {% if blocked.get(wo.id) %}
+        {% if blocked.get(o.id) %}
           <div class="sub">⊘ blocked by:
-            {% for b in blocked[wo.id] %}{{ ui.row_id(b.id, '/wo/' ~ project_name ~ '/' ~ b.id) }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
+            {% for b in blocked[o.id] %}{{ ui.row_id(b.id, '/wo/' ~ project_name ~ '/' ~ b.id) }} ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
           </div>
         {% endif %}
-        {{ brake_ui.let_through(brake, wo, '/project/' ~ project_name) }}
+        {% if work %}{{ brake_ui.let_through(brake, o, '/project/' ~ project_name) }}{% endif %}
         {# Not an attention item on purpose: the OS resumes this one itself. #}
-        {% if pauses.get(wo.id) %}
-          <div class="sub">⏳ {{ pauses[wo.id] }}</div>
+        {% if pauses.get(o.id) %}
+          <div class="sub">⏳ {{ pauses[o.id] }}</div>
         {% endif %}
-        {% if wo.needs_attention %}<div class="sub tone-warn">◭ {{ wo.attention_reason }}</div>{% endif %}
+        {% if o.needs_attention %}<div class="sub tone-warn">◭ {{ o.attention_reason }}</div>{% endif %}
       </div>
-      <span>{{ ui.wo_tags(wo_tags(wo, project_name)) }}</span>
-      <span class="sub mono">{{ fmt_age(wo.created_at) }}</span>
+      <span><span class="badge">{{ o.type }}</span>{% if work %} {{ ui.wo_tags(wo_tags(o, project_name)) }}{% endif %}</span>
+      <span class="sub mono">{{ fmt_age(o.created_at) }}</span>
     </div>
   {% else %}
     <div class="empty">
       {% if filters %}nothing matches these filters
-      {% elif open_counts or settled %}nothing running and nothing waiting on you — the rest is counted above
-      {% else %}no work orders yet{% endif %}
+      {% elif total %}nothing running and nothing waiting on you — set status to past or all for the rest
+      {% else %}no orders yet{% endif %}
     </div>
   {% endfor %}
 </div>
-
-{% macro tab(id, label, items) -%}
-<button role="tab" data-panel="{{ id }}" aria-selected="{{ 'true' if id == 'tab-features' else 'false' }}"
-        aria-controls="{{ id }}">{{ label }}
-  {%- if items %}<span class="n {{ 'hot' if items | selectattr('needs_attention') | list }}">{{ items | length }}</span>{% endif %}</button>
-{%- endmacro %}
-<div class="tabbed" id="proj-tabs">
-  <div class="tabs" role="tablist">
-    {{ tab('tab-features', 'Feature orders', features) }}
-    {{ tab('tab-improvements', 'Improvement orders', improvements) }}
-    {{ tab('tab-investigations', 'Investigations', investigations) }}
-    {{ tab('tab-decisions', 'Decision orders', decisions) }}
-  </div>
-
-{# Improvements: "counts, not trees" (§6.1 of the improvement-orders spec); the label is
-   kind-aware because `plan_review` here means a decision is owed. #}
-<div class="tabpanel" id="tab-improvements">
-<h2>Improvement orders</h2>
-{% if improvements %}
-<div class="panel">
-  {% for io in improvements %}
-    {% set im = fo_status_meta.get(io.status, {'word': io.status, 'icon': '•', 'tone': 'muted'}) %}
-    <div class="row">
-      <span class="st tone-{{ im.tone }}"><span class="i">{{ im.icon }}</span>{{ io.status_label }}</span>
-      <div class="grow">
-        {{ ui.row_id(io.id, '/io/' ~ project_name ~ '/' ~ io.id) }} {{ io.title }}
-        {% if io.needs_attention %}<div class="sub tone-warn">◭ {{ io.attention_reason }}</div>{% endif %}
-      </div>
-      <span class="sub mono">{{ fmt_age(io.created_at) }}</span>
-    </div>
-  {% endfor %}
-</div>
-{% else %}
-<p class="empty">no open improvement orders</p>
+{% if matched > rows | length %}
+<p class="sub"><a href="{{ purl(limit=next_limit) }}">show more</a> ({{ matched - rows | length }} not drawn)</p>
 {% endif %}
-</div>
-
-{# Investigations, on the same "counts, not trees" rule (§2.9 of
-   docs/superpowers/specs/2026-09-27-investigation-orders.md): the verdict is on its page. #}
-<div class="tabpanel" id="tab-investigations">
-<h2>Investigations</h2>
-{% if investigations %}
-<div class="panel">
-  {% for inv in investigations %}
-    {% set vm = fo_status_meta.get(inv.status, {'word': inv.status, 'icon': '•', 'tone': 'muted'}) %}
-    <div class="row">
-      <span class="st tone-{{ vm.tone }}"><span class="i">{{ vm.icon }}</span>{{ inv.status_label }}</span>
-      <div class="grow">
-        {{ ui.row_id(inv.id, '/inv/' ~ project_name ~ '/' ~ inv.id) }} {{ inv.title }}
-        {% if inv.needs_attention %}<div class="sub tone-warn">◭ {{ inv.attention_reason }}</div>{% endif %}
-      </div>
-      <span class="sub mono">{{ fmt_age(inv.created_at) }}</span>
-    </div>
-  {% endfor %}
-</div>
-{% else %}
-<p class="empty">no open investigations</p>
-{% endif %}
-</div>
-
-{# Decision orders, same rule (§7 of docs/superpowers/specs/2026-10-31-decision-orders.md): the report is on its page. #}
-<div class="tabpanel" id="tab-decisions">
-<h2>Decision orders</h2>
-{% if decisions %}
-<div class="panel">
-  {% for d in decisions %}
-    {% set dm = fo_status_meta.get(d.status, {'word': d.status, 'icon': '•', 'tone': 'muted'}) %}
-    <div class="row">
-      <span class="st tone-{{ dm.tone }}"><span class="i">{{ dm.icon }}</span>{{ d.status_label }}</span>
-      <div class="grow">
-        {{ ui.row_id(d.id, order_path(project_name, d.id)) }} {{ d.title }}
-        {% if d.needs_attention %}<div class="sub tone-warn">◭ {{ d.attention_reason }}</div>{% endif %}
-      </div>
-      <span class="sub mono">{{ fmt_age(d.created_at) }}</span>
-    </div>
-  {% endfor %}
-</div>
-{% else %}
-<p class="empty">no open decision orders</p>
-{% endif %}
-</div>
-
-{# Feature orders do not expand into their children here: the children are already in
-   the work orders above, and the tree is on the feature's own page. Settled ones collapse
-   to a count of their own, on the `fo` param rather than `show` — see the project route. #}
-<div class="tabpanel on" id="tab-features">
-<h2>Feature orders</h2>
-{% if features or fo_settled %}
-{% if fo_settled %}
-<p class="sub">
-  {{ count_line(fo_settled, fo_status_meta, fo_revealed, 'fo', p_show, 'feature') }}
-  ·
-  {% if fo_revealed == 'all' %}
-    <a href="{{ purl(p_show) }}">collapse them again</a>
-  {% else %}
-    <a href="{{ purl(p_show, 'fo=all') }}">show all</a>
-  {% endif %}
-</p>
-{% endif %}
-<div class="panel">
-  {% for fo in features %}
-    {% set fm = fo_status_meta.get(fo.status, {'word': fo.status, 'icon': '•', 'tone': 'muted'}) %}
-    <div class="row">
-      <span class="st tone-{{ fm.tone }}"><span class="i">{{ fm.icon }}</span>{{ fm.word }}</span>
-      <div class="grow">
-        {{ ui.row_id(fo.id, '/fo/' ~ project_name ~ '/' ~ fo.id) }} {{ fo.title }}
-        <span class="sub">{{ fo.progress.label }}</span>
-        {% if fo.needs_attention %}<div class="sub tone-warn">◭ {{ fo.attention_reason }}</div>{% endif %}
-      </div>
-      <span class="sub mono">{{ fmt_age(fo.created_at) }}</span>
-    </div>
-  {% endfor %}
-</div>
-{% else %}
-<p class="empty">no open feature orders</p>
-{% endif %}
-</div>
-</div>
 
 {# Your own Claude sessions, fetched after this page has rendered: listing them shells
    out to the Claude CLI, and a slow or missing CLI must not hold up the work orders
@@ -263,8 +117,9 @@
   </p>
 </div>
 
-{% if backlog %}
+{% if backlog or backlog_counts.proposed or backlog_counts.quarantined %}
 <h2>Open backlog for this project</h2>
+<p class="sub"><a href="/backlog?project={{ project_name }}">{{ backlog_counts.open }} open · {{ backlog_counts.proposed }} proposed · {{ backlog_counts.quarantined }} quarantined</a></p>
 <div class="panel">
   {% for item in backlog %}
   <div class="row">

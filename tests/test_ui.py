@@ -1699,7 +1699,7 @@ def test_mark_done_is_not_offered_while_assumptions_are_pending(client, project)
     assert "Mark done" in client.get(f"/wo/proj_a/{wo['id']}").text
 
 
-def test_settled_work_orders_collapse_into_a_count(client, project):
+def test_past_work_orders_leave_the_default_list_for_the_status_filter(client, project):
     """The complaint: a project page that lists every work order ever created is unreadable"""
     open_wo = ops.create_work_order("proj_a", "still going")
     done = ops.create_work_order("proj_a", "old and finished")
@@ -1710,21 +1710,23 @@ def test_settled_work_orders_collapse_into_a_count(client, project):
     store.set_status(open_wo["id"], "running")
     store.close()
 
-    page = client.get("/project/proj_a")
-    assert "still going" in page.text
-    assert "old and finished" not in page.text
-    assert "old and cancelled" not in page.text
-    assert "1 completed" in page.text and "1 cancelled" in page.text
-    assert "failed" not in page.text  # zero of them: no count, no link
+    page = client.get("/project/proj_a").text
+    assert "still going" in page
+    assert "old and finished" not in page and "old and cancelled" not in page
+    assert '<option value="completed"' in page
+    assert '<option value="failed"' not in page  # zero of them: not offered
 
-    just_completed = client.get("/project/proj_a?show=completed")
-    assert "old and finished" in just_completed.text
-    assert "old and cancelled" not in just_completed.text  # just that group
-    assert "still going" in just_completed.text  # the open ones never leave
+    just_completed = client.get("/project/proj_a?status=completed").text
+    assert "old and finished" in just_completed
+    assert "old and cancelled" not in just_completed and "still going" not in just_completed
 
-    everything = client.get("/project/proj_a?show=all")
+    past = client.get("/project/proj_a?status=past").text
+    assert "old and finished" in past and "old and cancelled" in past
+    assert "still going" not in past
+
+    everything = client.get("/project/proj_a?status=all").text
     for title in ("still going", "old and finished", "old and cancelled"):
-        assert title in everything.text
+        assert title in everything
 
 
 def test_pr_merges_and_running_work_get_the_rows(client, project):
@@ -1742,13 +1744,14 @@ def test_pr_merges_and_running_work_get_the_rows(client, project):
         assert "still going" in page.text, url
         assert "waiting on a merge" in page.text, url
         assert "https://github.com/a/b/pull/9" in page.text, url  # one click to merge
-        assert "not started yet" not in page.text, url
-        assert "1 pending" in page.text, url
         # running is listed before the merge queue, and both before anything else
         assert page.text.index("still going") < page.text.index("waiting on a merge")
 
-    for url in ("/?show=pending", "/project/proj_a?show=pending"):
-        assert "not started yet" in client.get(url).text, url
+    dashboard = client.get("/").text
+    assert "not started yet" not in dashboard and "1 pending" in dashboard
+    assert "not started yet" in client.get("/?show=pending").text
+    project_page = client.get("/project/proj_a").text
+    assert project_page.index("waiting on a merge") < project_page.index("not started yet")
 
 
 def test_a_decision_you_owe_gets_a_row_not_a_count(client, daemon, project):
@@ -1768,14 +1771,16 @@ def test_a_decision_you_owe_gets_a_row_not_a_count(client, daemon, project):
         page = client.get(url).text
         assert "decide this please" in page, url
         assert "worker is stuck" in page, url
-        assert "not started yet" not in page, url  # started by nobody, needs nobody
-        assert "show=pending" in page, url  # a count line, expandable
         assert "show=needs_review" not in page, url  # a row, so never a count line
         # a review the user owes comes before a worker merely blocked on them
         assert page.index("decide this please") < page.index("worker is stuck"), url
 
-    for url in ("/?show=pending", "/project/proj_a?show=pending"):
-        assert "not started yet" in client.get(url).text, url
+    dashboard = client.get("/").text
+    assert "not started yet" not in dashboard  # started by nobody, needs nobody
+    assert "show=pending" in dashboard  # a count line, expandable
+    assert "not started yet" in client.get("/?show=pending").text
+    project_page = client.get("/project/proj_a").text
+    assert project_page.index("worker is stuck") < project_page.index("not started yet")
 
 
 def test_a_project_whose_only_open_work_needs_review_is_not_an_empty_panel(client,
@@ -1801,8 +1806,8 @@ def test_a_blocked_work_order_says_what_it_is_waiting_for(client, project):
     dep = ops.create_work_order("proj_a", "the schema change")
     ops.create_work_order("proj_a", "needs the schema", depends_on=[dep["id"]])
 
-    # Pending work still collapses by default
-    for url in ("/?show=pending", "/project/proj_a?show=pending"):
+    # Pending work still collapses by default on the dashboard
+    for url in ("/?show=pending", "/project/proj_a"):
         page = client.get(url)
         assert "blocked by" in page.text, url
         assert dep["id"] in page.text, url
@@ -1832,30 +1837,31 @@ def test_a_pr_waiting_to_be_merged_never_enters_the_attention_strip(client, proj
     assert "NEEDS YOU" not in page.text
 
 
-def test_expanding_a_settled_group_keeps_hidden_work_orders_showing(client, project):
-    """Two independent toggles: expanding one must not silently undo the other"""
+def test_the_status_filter_and_the_hidden_toggle_keep_each_other(client, project):
+    """Two independent controls: using one must not silently undo the other"""
     shy = ops.create_work_order("proj_a", "hidden and finished")
     ops.mark_done(shy["id"])
     ops.hide_work_order(shy["id"], hidden=True)
 
-    assert "hidden and finished" not in client.get("/project/proj_a?show=completed").text
-    both = client.get("/project/proj_a?show=completed&hidden=1")
-    assert "hidden and finished" in both.text
-    assert "show=completed" in both.text  # the "hide them again" link keeps the group
+    alone = client.get("/project/proj_a?status=completed").text
+    assert "hidden and finished" not in alone
+    assert "?hidden=1&amp;status=completed" in alone  # "show" keeps the filter
+    both = client.get("/project/proj_a?status=completed&hidden=1").text
+    assert "hidden and finished" in both
+    assert 'href="/project/proj_a?status=completed"' in both  # "hide them again" too
+    assert '<input type="hidden" name="hidden" value="1">' in both  # and the form keeps hidden
 
 
-def test_a_bogus_show_value_falls_back_to_the_open_list(client, project):
-    live = ops.create_work_order("proj_a", "still going")
-    done = ops.create_work_order("proj_a", "old and finished")
-    ops.mark_done(done["id"])
-    store = ProjectStore(project)
-    store.set_status(live["id"], "running")
-    store.close()
+def test_a_bogus_filter_value_matches_nothing(client, project):
+    ops.create_work_order("proj_a", "still going")
 
-    page = client.get("/project/proj_a?show=../../etc/passwd")
-    assert page.status_code == 200
-    assert "still going" in page.text
-    assert "old and finished" not in page.text
+    for query in ("status=../../etc/passwd", "type=../../etc/passwd"):
+        page = client.get(f"/project/proj_a?{query}")
+        assert page.status_code == 200
+        assert "still going" not in page.text
+        assert "nothing matches these filters" in page.text
+    for limit in ("nonsense", "-1", "9" * 30):
+        assert "still going" in client.get(f"/project/proj_a?limit={limit}").text
 
 
 def test_got_it_button_puts_the_flag_down(client, project):
@@ -2026,7 +2032,7 @@ def test_the_project_page_lists_feature_orders_without_repeating_the_tree(featur
     page = client.get("/project/proj_a").text
 
     assert f"/fo/proj_a/{fo['id']}" in page
-    assert "Feature orders" in page
+    assert 'data-type="feature"' in page
     # The children belong to the listing below as ordinary work orders
     assert page.count(f"/fo/proj_a/{fo['id']}") == 1
 
@@ -2286,7 +2292,7 @@ def test_the_project_page_lists_improvement_orders_without_expanding_findings(im
     page = client.get("/project/proj_a").text
 
     assert page.count(f"/io/proj_a/{io['id']}") == 1
-    assert "Improvement orders" in page
+    assert 'data-type="improvement"' in page
     assert "findings awaiting you" in page   # the kind-aware label, not `plan_review`
     # Counts, not trees: the findings are what the order's own page is for
     assert "before touching the dispatch path" not in page
@@ -2381,7 +2387,7 @@ def test_the_project_page_lists_live_investigations_beside_the_other_kinds(clien
     page = client.get("/project/proj_a").text
 
     assert page.count(f"/inv/proj_a/{inv['id']}") == 1
-    assert "Investigations" in page
+    assert 'data-type="investigation"' in page
     assert subject in page   # the subject is what the line is about
 
 
@@ -2449,7 +2455,7 @@ def test_the_decision_buttons_go_through_ops(decision):
 def test_the_project_page_and_api_status_list_decision_orders(decision):
     client, do = decision
     page = client.get("/project/proj_a").text
-    assert "Decision orders" in page and page.count(f"/do/proj_a/{do['id']}") == 1
+    assert 'data-type="decision"' in page and page.count(f"/do/proj_a/{do['id']}") == 1
 
 
 def _settle_feature(project, title, status):
@@ -2464,52 +2470,63 @@ def _settle_feature(project, title, status):
     return fo
 
 
-def test_settled_feature_orders_collapse_into_a_count(client, project):
-    """The complaint: a completed feature order left the project page and there was no way back to it"""
+def test_past_orders_of_every_kind_are_one_filter_away(client, project):
+    """The reported gap: a settled feature, improvement or investigation had no way back"""
+    live = ops.create_feature_order("proj_a", "XLS export",
+                                    description="the whole ask, at length, "
+                                                "with enough detail to plan it")
     done = _settle_feature(project, "CSV export", "completed")
-    killed = _settle_feature(project, "PDF export", "cancelled")
-    still_going = ops.create_feature_order("proj_a", "XLS export",
-                                           description="the whole ask, at length, "
-                                                       "with enough detail to plan it")
+    finished = ops.create_work_order("proj_a", "old and finished")
+    ops.mark_done(finished["id"])
+    investigated = ops.create_investigation_order("proj_a", finished["id"], "why so slow")
+    improved = ops.create_improvement_order("proj_a", "root cause it", description="x" * 40,
+                                         refs=[finished["id"]])
+    store = ProjectStore(project)
+    try:
+        for order in (investigated, improved):
+            store.update_feature_order(order["id"], status="completed")
+    finally:
+        store.close()
+    links = {"work": f"/wo/proj_a/{finished['id']}", "feature": f"/fo/proj_a/{done['id']}",
+             "investigation": f"/inv/proj_a/{investigated['id']}",
+             "improvement": f"/io/proj_a/{improved['id']}"}
 
     page = client.get("/project/proj_a").text
-    assert "XLS export" in page
-    assert "CSV export" not in page and "PDF export" not in page
-    # The gap was discoverability, not just filtering: the count says they exist
-    assert "1 completed" in page and "1 cancelled" in page
-    assert "fo=completed" in page
-    assert "fo=failed" not in page  # zero of them: no count, no link
+    assert f"/fo/proj_a/{live['id']}" in page
+    assert not any(link in page for link in links.values())
+    assert "1 of 5 shown" in page  # the rest exist, and the filter is how to reach them
 
-    just_completed = client.get("/project/proj_a?fo=completed").text
-    assert "CSV export" in just_completed
-    assert "PDF export" not in just_completed  # just that group
-    assert "XLS export" in just_completed  # the open ones never leave
+    past = client.get("/project/proj_a?status=past").text
+    assert all(link in past for link in links.values())
+    assert f"/fo/proj_a/{live['id']}" not in past
 
-    everything = client.get("/project/proj_a?fo=all").text
-    for fo in (done, killed, still_going):
-        assert f"/fo/proj_a/{fo['id']}" in everything
+    for kind, link in links.items():
+        only = client.get(f"/project/proj_a?status=past&type={kind}").text
+        assert link in only, kind
+        assert not any(other in only for other in links.values() if other != link), kind
 
 
 def test_a_settled_feature_is_still_told_apart_from_an_open_one(client, project):
     """Revealed, it is a row like any other — wearing its own status, not an open one's"""
     _settle_feature(project, "CSV export", "failed")
 
-    page = client.get("/project/proj_a?fo=all").text
-    assert "Feature orders" in page
+    page = client.get("/project/proj_a?status=all").text
+    assert 'data-type="feature"' in page
     assert "tone-bad" in page and "✗" in page
 
 
-def test_the_work_order_reveal_and_the_feature_reveal_do_not_undo_each_other(client,
-                                                                            project):
-    """Two independent reveals on one page: every link must carry the other"""
-    _settle_feature(project, "CSV export", "completed")
-    finished = ops.create_work_order("proj_a", "old and finished")
-    ops.mark_done(finished["id"])
+def test_show_more_reaches_orders_past_the_first_page(client, project, monkeypatch):
+    """A project's history is longer than one page; the oldest order must still be reachable"""
+    monkeypatch.setattr("jarvis.ui.app.ORDERS_PAGE", 2)
+    for n in range(3):
+        wo = ops.create_work_order("proj_a", f"finished {n}")
+        ops.mark_done(wo["id"])
 
-    both = client.get("/project/proj_a?fo=all&show=all").text
-    assert "CSV export" in both and "old and finished" in both
-    assert "?fo=all&amp;show=completed" in both  # the work-order reveal keeps `fo`
-    assert "?show=all&amp;fo=completed" in both  # and the feature reveal keeps `show`
+    first = client.get("/project/proj_a?status=past").text
+    assert "2 of 3 shown" in first and "(1 not drawn)" in first
+    assert "?status=past&amp;limit=4" in first
+    second = client.get("/project/proj_a?status=past&limit=4").text
+    assert "3 of 3 shown" in second and "not drawn" not in second
 
 
 def test_the_dashboard_takes_a_feature_order(client):
@@ -3865,7 +3882,7 @@ def test_the_dashboard_lists_every_kind_of_open_order_and_filters_by_type(client
     assert "plain work" not in only and fo["id"] not in only
 
 
-def test_the_project_filter_counts_only_what_the_view_draws_from(client, project):
+def test_the_project_filter_counts_every_order_as_its_total(client, project):
     open_wo = ops.create_work_order("proj_a", "still going")
     done = ops.create_work_order("proj_a", "old and finished")
     ops.mark_done(done["id"])
@@ -3874,7 +3891,7 @@ def test_the_project_filter_counts_only_what_the_view_draws_from(client, project
         store.set_status(open_wo["id"], "running")
     finally:
         store.close()
-    assert "1 of 1 shown" in client.get("/project/proj_a").text  # the settled one is not in M
+    assert "1 of 2 shown" in client.get("/project/proj_a").text  # M says the settled one exists
     assert "1 of 2 shown" in client.get("/project/proj_a?status=completed").text
 
 
@@ -3886,3 +3903,142 @@ def test_a_finding_owed_a_decision_sorts_above_a_decided_one(improvement):
     ops.review_findings(io["id"], accept=(first,), project_name="proj_a")
     page = client.get(f"/io/proj_a/{io['id']}").text
     assert page.index(f'id="finding-{second}"') < page.index(f'id="finding-{first}"')
+
+
+# -- quarantine on /backlog and the project page (2026-11-03-backlog-operability §8)
+
+
+def _quarantine(title, *, neo_status="queued", project="proj_a"):
+    from jarvis.neo_store import NeoStore
+
+    central, neo = CentralStore(), NeoStore()
+    try:
+        item = central.propose_backlog(project, title, item_type="bug", severity="critical",
+                                       suggested_kind="wo", origin_refs=[])
+        central.review_backlog(item["id"], "quarantined", rule="severity-claim",
+                               note="claims critical")
+        q = neo.ask(project, "", f"decide {item['id']}", kind="backlog")
+        if neo_status != "queued":
+            neo.mark(q["id"], neo_status, reason="too close to call")
+        assert central.set_backlog_question(item["id"], q["id"])
+        return item["id"], q["id"]
+    finally:
+        central.close()
+        neo.close()
+
+
+def test_backlog_page_splits_escalated_from_what_neo_still_decides(client, project):
+    mine, _ = _quarantine("exporter drops rows", neo_status="escalated")
+    neos, _ = _quarantine("uploader retry storm")
+    page = client.get("/backlog").text
+
+    head, _, rest = page.partition("Neo is still deciding")
+    assert "quarantined — waiting on you" in head and "too close to call" in head
+    assert "Neo left the decision to you" in head
+    assert f'action="/backlog/review/{mine}"' in head
+    assert 'value="accept"' in head and 'value="reject"' in head
+    assert "<details" in head and "<details open" not in head
+    deciding = rest.partition("</details>")[0]
+    assert neos in deciding and mine not in deciding
+    # no buttons on what is still Neo's
+    assert f'action="/backlog/review/{neos}"' not in page
+
+
+def test_backlog_page_says_neo_was_unreachable_once_revivals_are_spent(client, project):
+    from jarvis.neo_store import MAX_REVIVALS, NeoStore
+
+    item, qid = _quarantine("exporter drops rows")
+    neo = NeoStore()
+    try:
+        for _ in range(MAX_REVIVALS):
+            neo.mark(qid, "failed", reason="neo could not be reached: x",
+                     cause="transport-unreachable")
+            page = client.get("/backlog").text
+            assert "Neo is still deciding" in page and "waiting on you" not in page
+            neo.revive_unreachable()
+        neo.mark(qid, "failed", reason="neo could not be reached: x",
+                 cause="transport-unreachable")
+    finally:
+        neo.close()
+    page = client.get("/backlog").text
+    assert "Neo could not be reached; nobody has judged this" in page
+    assert "Neo left the decision to you" not in page and "Neo left these" not in page
+    assert "Neo is still deciding" not in page
+    assert f'action="/backlog/review/{item}"' in page and 'value="reject"' in page
+
+
+def test_backlog_page_without_quarantine_renders_neither_block(client, project):
+    CentralStore().add_backlog("proj_a", "just an idea")
+    page = client.get("/backlog").text
+    assert "just an idea" in page
+    assert "quarantined — waiting on you" not in page and "Neo is still deciding" not in page
+    assert "/backlog/review/" not in page
+
+
+@pytest.mark.parametrize("decision, status", [("accept", "open"), ("reject", "dropped")])
+def test_backlog_review_post_decides_and_closes_the_question(client, project, decision, status,
+                                                             monkeypatch):
+    from jarvis.neo_store import NeoStore
+
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    item, qid = _quarantine("exporter drops rows", neo_status="escalated")
+    r = client.post(f"/backlog/review/{item}", data={"decision": decision},
+                    follow_redirects=False)
+    assert (r.status_code, r.headers["location"]) == (303, "/backlog")
+    got = CentralStore().get_backlog(item)
+    assert (got["status"], got["review_rule"]) == (status, "user")
+    q = NeoStore().get(qid)
+    assert (q["status"], q["answered_by"]) == ("answered", "user")
+    assert "quarantined — waiting on you" not in client.get("/backlog").text
+
+
+@pytest.mark.parametrize("decision", ["", "maybe", "duplicate"])
+def test_backlog_review_post_refuses_a_non_decision_and_changes_nothing(
+        client, project, decision, monkeypatch):
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    item, _ = _quarantine("exporter drops rows", neo_status="escalated")
+    r = client.post(f"/backlog/review/{item}", data={"decision": decision},
+                    follow_redirects=False)
+    assert "not%20a%20backlog%20decision" in r.headers["location"]
+    assert CentralStore().get_backlog(item)["status"] == "quarantined"
+
+
+def test_backlog_review_post_shows_the_worker_refusal_instead_of_a_500(
+        client, project, monkeypatch):
+    item, _ = _quarantine("exporter drops rows", neo_status="escalated")
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-deadbeef")
+    r = client.post(f"/backlog/review/{item}", data={"decision": "accept"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    assert "worker%20session" in r.headers["location"]
+    assert CentralStore().get_backlog(item)["status"] == "quarantined"
+    assert "is a worker session" in client.get(r.headers["location"]).text
+
+
+def test_backlog_review_post_refuses_an_item_not_in_quarantine(client, project, monkeypatch):
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    item = CentralStore().add_backlog("proj_a", "already open")["id"]
+    r = client.post(f"/backlog/review/{item}", data={"decision": "reject"},
+                    follow_redirects=False)
+    assert "not%20quarantined" in r.headers["location"]
+    assert CentralStore().get_backlog(item)["status"] == "open"
+
+
+def test_dashboard_links_an_escalated_proposal_to_the_backlog_page(client, project):
+    assert "/backlog?project=proj_a" not in client.get("/").text
+    _quarantine("exporter drops rows", neo_status="escalated")
+    page = client.get("/").text
+    assert "waiting on you" in page and "/backlog?project=proj_a" in page
+
+
+def test_project_page_counts_proposed_and_quarantined_beside_open(client, project):
+    assert " quarantined</a>" not in client.get("/project/proj_a").text
+    central = CentralStore()
+    central.propose_backlog("proj_a", "new idea", item_type="task", severity="medium",
+                            suggested_kind="wo", origin_refs=[])
+    _quarantine("exporter drops rows")
+    # With no open item the section still has to appear
+    page = client.get("/project/proj_a").text
+    assert "0 open · 1 proposed · 1 quarantined" in page
+    central.add_backlog("proj_a", "an open idea")
+    assert "1 open · 1 proposed · 1 quarantined" in client.get("/project/proj_a").text

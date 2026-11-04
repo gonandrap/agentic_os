@@ -51,7 +51,7 @@
 {% endif %}
 
 {% if v %}
-<h3>{{ v.classification }} — root cause</h3>
+<h3 id="verdict">{{ v.classification }} — root cause</h3>
 <div class="panel">
   <div class="row"><div class="grow">{{ v.root_cause }}</div></div>
   {% if v.submitted_classification %}

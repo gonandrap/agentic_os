@@ -790,6 +790,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             finally:
                 store.close()
         attention.extend(gate_items)
+        backlog_escalated, _ = split_quarantined(central.list_backlog(status="quarantined"))
+        attention.extend(_backlog_escalated_attention(backlog_escalated))
         # The dashboard is part of the OS, so its failures belong in the OS's pulse
         ui = ui_health()
         if ui["errors"]:
@@ -822,6 +824,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "items": inbox[:10],
             },
             "backlog": {"open": len(backlog_open)},
+            "backlog_escalated": len(backlog_escalated),
             # Reported bugs and panel follow-ups counted apart (wo-5b96c9da)
             "steward": steward_track_counts(central),
             "investigations": {"fixes_parked": fixes_parked},
@@ -7200,7 +7203,7 @@ def find_feature_order(fo_id: str, project_name: str | None = None, *,
 
 
 #: Every id the OS mints that has a page, and the shapes a reader types for the rest
-_REF_ID = re.compile(r"^(wo|fo|io|inv|kn|al|mv|mo|bl)-[0-9a-f]{8}$")
+_REF_ID = re.compile(r"^(wo|fo|io|inv|do|kn|al|mv|mo|bl)-[0-9a-f]{8}$")
 _REF_NUMBERED = re.compile(r"^(q|gate-|issue-|#)?(\d+)$")
 
 
@@ -7225,7 +7228,7 @@ def resolve_ref(ref: str) -> str:
         if prefix == "wo":
             name, _, _ = find_work_order(rid)
             return order_path(name, rid)
-        if prefix in ("fo", "io", "inv"):
+        if prefix in ("fo", "io", "inv", "do"):
             name, _, _ = find_feature_order(rid)
             return order_path(name, rid)
         if prefix == "al":
@@ -13645,6 +13648,81 @@ def show_backlog(item_id: str) -> dict[str, Any]:
     return item
 
 
+#: What the user is told about a proposal they now hold; only `escalated` was a ruling (kn-40db1828)
+QUARANTINE_NOTES = {
+    "escalated": "Neo left the decision to you",
+    "unreachable": "Neo could not be reached; nobody has judged this",
+    "unjudged": "no usable decision from Neo; nobody has judged this",
+}
+
+
+def _quarantine_state(item: dict[str, Any], q: dict[str, Any] | None) -> str | None:
+    """Why the user holds this proposal; None while Neo will still answer it"""
+    from .neo_store import MAX_REVIVALS, NEO_HELD_Q_STATUSES
+
+    if not item.get("neo_question_id"):
+        return None  # `ask_quarantined` asks on the next tick
+    if q is None:
+        return "unjudged"  # nothing re-asks an item that already names a question
+    if q["status"] in NEO_HELD_Q_STATUSES:
+        return None
+    if q["status"] == "escalated":
+        return "escalated"
+    if q["status"] == "failed" and q.get("escalation_cause") == "transport-unreachable":
+        # `revive_unreachable` re-asks it until its revivals are spent
+        return "unreachable" if (q.get("revivals") or 0) >= MAX_REVIVALS else None
+    return "unjudged"
+
+
+def split_quarantined(items: list[dict[str, Any]]
+                      ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """`(the user's, Neo's)` among quarantined rows (backlog-operability §8)"""
+    from .neo_store import NeoStore
+
+    mine: list[dict[str, Any]] = []
+    neos: list[dict[str, Any]] = []
+    quarantined = [i for i in items if i["status"] == "quarantined"]
+    if not quarantined:
+        return mine, neos
+    neo = NeoStore()
+    try:
+        for item in quarantined:
+            qid = item.get("neo_question_id")
+            q = neo.get(int(qid)) if qid else None
+            state = _quarantine_state(item, q)
+            row = {**item, "neo_state": state, "neo_reason": (q or {}).get("answer_reason") or ""}
+            if state:
+                mine.append({**row, "neo_note": QUARANTINE_NOTES[state]})
+            else:
+                neos.append(row)
+    finally:
+        neo.close()
+    return mine, neos
+
+
+def _backlog_escalated_attention(escalated: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One line per project; `backlog_neo.REVIEW_HINT` is the command"""
+    from .backlog_neo import REVIEW_HINT
+
+    by_project: dict[str, list[dict[str, Any]]] = {}
+    for item in escalated:
+        by_project.setdefault(item["project"], []).append(item)
+    rows = []
+    for project, items in by_project.items():
+        by_note: dict[str, list[str]] = {}
+        for item in items:
+            by_note.setdefault(item["neo_note"], []).append(item["id"])
+        rows.append({
+            "project": project, "wo_id": None,
+            "title": (f"{len(items)} quarantined backlog proposal"
+                      f"{'s' if len(items) != 1 else ''} waiting on you"),
+            "status": "backlog_escalated",
+            "reason": "; ".join(f"{note}: {', '.join(ids)}" for note, ids in by_note.items()),
+            "decide": REVIEW_HINT.format(id=items[0]["id"] if len(items) == 1 else "<bl-id>"),
+        })
+    return rows
+
+
 def _backlog_item_of_question(question_id: int) -> dict[str, Any] | None:
     central = CentralStore()
     try:
@@ -13656,6 +13734,12 @@ def _backlog_item_of_question(question_id: int) -> dict[str, Any] | None:
 def review_backlog_item(item_id: str, decision: str, *, duplicate_of: str | None = None,
                         kind: str | None = None, feedback: str = "") -> dict[str, Any]:
     """The user decides a quarantined proposal and closes its Neo question (backlog-operability §5.4)"""
+    wo_id = os.environ.get("JARVIS_WO_ID")
+    if wo_id:
+        raise OpsError(
+            f"{wo_id} is a worker session — a worker may not review a backlog proposal. "
+            "The user decides a quarantined proposal; a worker's proposal goes to the "
+            "steward and Neo.")
     from . import backlog_neo
     from .neo_store import OPEN_Q_STATUSES, NeoStore
 
@@ -13730,6 +13814,17 @@ def _turn_href(project: str, wo_id: str, ts: float) -> str | None:
     return f"{base}#msg-{int(m['id'])}" if m else base
 
 
+def deferrals_of(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """Deferrals about this order: what an `envelope` origin ref lands on (backlog-operability §1.3)"""
+    out = []
+    for e in store.envelopes(subject_wo_id=wo_id):
+        if e["kind"] == "deferral_request":
+            p = db.from_json(e["payload"], {}) or {}
+            out.append({"id": e["id"], "title": p.get("title") or "", "why": p.get("why") or "",
+                        "state": e["state"], "note": e["note"] or ""})
+    return out
+
+
 def origin_url(ref: Mapping[str, Any]) -> tuple[str, str]:
     """(href, label) of one origin ref; never raises (2026-11-03-backlog-operability §1.3)"""
     kind = str(ref.get("kind") or "") if isinstance(ref, Mapping) else ""
@@ -13746,19 +13841,27 @@ def origin_url(ref: Mapping[str, Any]) -> tuple[str, str]:
         elif kind == "neo_question":
             return f"/neo/question/{int(r['id'])}", f"Neo question q{r['id']}"
         elif kind == "envelope":
-            return f"/wo/{p}/{r['subject_wo_id']}", f"deferral {r['id']} on {r['subject_wo_id']}"
+            return (f"/wo/{p}/{r['subject_wo_id']}#envelope-{int(r['id'])}",
+                    f"deferral {r['id']} on {r['subject_wo_id']}")
         elif kind == "decision":
-            label = f"{r['do_id']} {r['key']}" if r.get("key") else str(r["do_id"])
-            return f"/go/{r['do_id']}", label
+            if r.get("key"):
+                return (f"/go/{r['do_id']}#proposal-{quote(str(r['key']), safe='')}",
+                        f"{r['do_id']} {r['key']}")
+            return f"/go/{r['do_id']}", str(r["do_id"])
         elif kind == "monitoring_order":
             return f"/mo/{r['id']}", str(r["id"])
         elif kind == "alarm":
             return f"/alarms/{p}/{r['id']}", f"alarm {r['id']}"
         elif kind == "validation":
-            rnd = f" round {r['round']}" if r.get("round") not in (None, "") else ""
-            return f"/wo/{p}/{r['wo_id']}#validation", f"validation of {r['wo_id']}{rnd}"
+            if r.get("round") in (None, ""):
+                return f"/wo/{p}/{r['wo_id']}#validation", f"validation of {r['wo_id']}"
+            return (f"/wo/{p}/{r['wo_id']}#round-{quote(str(r['round']), safe='')}",
+                    f"validation of {r['wo_id']} round {r['round']}")
         elif kind == "finding":
-            return f"/go/{r['order_id']}", f"{r['order_id']} finding {r['key']}"
+            # An investigation has one verdict, no keyed findings
+            target = ("verdict" if str(r["order_id"]).startswith("inv-")
+                      else f"finding-{quote(str(r['key']), safe='')}")
+            return f"/go/{r['order_id']}#{target}", f"{r['order_id']} finding {r['key']}"
         elif kind == "gate":
             return f"/gates/{int(r['id'])}?project={quote(str(p))}", f"gate {r['id']}"
         elif kind == "order":

@@ -11,10 +11,16 @@ from jarvis import ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
-from jarvis.neo_store import SEATS, NeoStore
+from jarvis.neo_store import MAX_REVIVALS, SEATS, NeoStore
 from jarvis.project_store import ProjectStore
 
 pytestmark = pytest.mark.usefixtures("neo_projects")
+
+
+@pytest.fixture(autouse=True)
+def not_a_worker(monkeypatch):
+    """The suite is routinely run BY a worker, which inherits `JARVIS_WO_ID`"""
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
 
 
 @pytest.fixture()
@@ -1330,3 +1336,167 @@ def test_the_user_may_decide_before_neo_answers_and_that_closes_the_question(sta
 
     q = _question(item["neo_question_id"])
     assert (q["status"], q["answered_by"]) == ("answered", "user")
+
+
+def _learning_count():
+    neo = NeoStore()
+    try:
+        return len(neo.learnings("proj_a", limit=500))
+    finally:
+        neo.close()
+
+
+def test_a_worker_session_may_not_decide_a_quarantined_proposal(started, monkeypatch, capsys):
+    """Paired with the same call outside a worker: the refusal is what stops it"""
+    from jarvis import cli
+
+    item = _quarantined(started)
+    review = ["backlog", "review", item["id"], "--accept", "--feedback", "ship it, trust me"]
+    before = _learning_count()
+
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-deadbeef")
+    assert cli.main(review) != 0
+    assert "wo-deadbeef is a worker session" in capsys.readouterr().err
+    with pytest.raises(ops.OpsError, match="goes to the steward and Neo"):
+        ops.review_backlog_item(item["id"], "accept", feedback="ship it, trust me")
+
+    assert _item(item["id"])["status"] == "quarantined"
+    q = _question(item["neo_question_id"])
+    assert (q["status"], q["answered_by"]) == ("queued", None)
+    assert _learning_count() == before
+
+    monkeypatch.delenv("JARVIS_WO_ID")
+    assert cli.main(review) == 0
+    assert _item(item["id"])["status"] == "open"
+    assert _question(item["neo_question_id"])["answered_by"] == "user"
+    assert _learning_count() == before + 1
+
+
+def test_a_worker_session_does_not_stop_neo_deciding_a_quarantined_proposal(started,
+                                                                            monkeypatch):
+    item = _quarantined(started)
+    _neo_says(monkeypatch, answer=json.dumps({"decision": "reject"}))
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-deadbeef")
+    drain(started)
+    assert _item(item["id"])["status"] == "dropped"
+
+
+# -- the pulse (backlog-operability §8)
+
+
+def _escalated_rows(st):
+    return [a for a in st["attention"] if a["status"] == "backlog_escalated"]
+
+
+def test_the_pulse_carries_a_proposal_only_once_neo_left_it_to_the_user(started, capsys):
+    item = _quarantined(started)
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 0 and _escalated_rows(st) == []
+
+    neo = NeoStore()
+    try:
+        neo.mark(item["neo_question_id"], "escalated", reason="the user's call")
+    finally:
+        neo.close()
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 1
+    row, = _escalated_rows(st)
+    assert row["project"] == "proj_a" and item["id"] in row["reason"]
+    assert "Neo left the decision to you" in row["reason"]
+    assert row["decide"].startswith(f"jarvis backlog review {item['id']} ")
+    assert not st["healthy"]
+
+    from jarvis import cli
+    assert cli.main(["status", "--attention"]) == 0
+    assert f"jarvis backlog review {item['id']} " in capsys.readouterr().out
+
+    ops.review_backlog_item(item["id"], "accept")
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 0 and _escalated_rows(st) == []
+
+
+def test_two_escalated_proposals_of_one_project_fold_into_one_line(started):
+    items = [_quarantined(started), _quarantined(started, "Uploader retry storm melts disks")]
+    neo = NeoStore()
+    try:
+        for item in items:
+            neo.mark(item["neo_question_id"], "escalated", reason="the user's call")
+    finally:
+        neo.close()
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 2
+    row, = _escalated_rows(st)
+    assert row["title"].startswith("2 ") and "<bl-id>" in row["decide"]
+    assert all(i["id"] in row["reason"] for i in items)
+
+
+def test_an_outage_is_not_an_escalation_until_its_revivals_are_spent(started):
+    """kn-40db1828: `revive_unreachable` re-asks it, so it is not yet the user's"""
+    item = _quarantined(started)
+    qid = item["neo_question_id"]
+    neo = NeoStore()
+    try:
+        for _ in range(MAX_REVIVALS):
+            neo.mark(qid, "failed", reason="neo could not be reached: x",
+                     cause="transport-unreachable")
+            assert ops.os_status()["backlog_escalated"] == 0
+            assert neo.revive_unreachable() == [qid]
+        neo.mark(qid, "failed", reason="neo could not be reached: x",
+                 cause="transport-unreachable")
+        assert neo.revive_unreachable() == []
+    finally:
+        neo.close()
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 1
+    row, = _escalated_rows(st)
+    assert "Neo could not be reached" in row["reason"] and item["id"] in row["reason"]
+    assert "Neo left the decision to you" not in row["reason"]
+
+
+def test_an_unusable_answer_that_spent_its_attempts_is_the_users(started):
+    item = _quarantined(started)
+    neo = NeoStore()
+    try:
+        neo.mark(item["neo_question_id"], "failed", reason="backlog: nobody has judged this",
+                 cause="unparseable-reply")
+    finally:
+        neo.close()
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 1
+    row, = _escalated_rows(st)
+    assert "nobody has judged this" in row["reason"]
+    assert "Neo left the decision to you" not in row["reason"]
+
+
+def test_a_proposal_whose_question_is_gone_is_the_users_and_an_unasked_one_is_not(started):
+    """Only an item naming no question gets asked, so a lost question would wait forever"""
+    central = CentralStore()
+    try:
+        item = central.propose_backlog("proj_a", "Exporter drops rows on retry",
+                                       item_type="bug", severity="critical",
+                                       suggested_kind="wo", origin_refs=[])
+        central.review_backlog(item["id"], "quarantined", rule="severity-claim", note="claims")
+        assert ops.os_status()["backlog_escalated"] == 0
+        assert central.set_backlog_question(item["id"], 999999)
+    finally:
+        central.close()
+    st = ops.os_status()
+    assert st["backlog_escalated"] == 1
+    row, = _escalated_rows(st)
+    assert "nobody has judged this" in row["reason"]
+    assert "Neo left the decision to you" not in row["reason"]
+
+
+def test_mixed_causes_each_keep_their_own_words_on_the_one_line(started):
+    left, lost = _quarantined(started), _quarantined(started, "Uploader retry storm melts disks")
+    neo = NeoStore()
+    try:
+        neo.mark(left["neo_question_id"], "escalated", reason="the user's call")
+        neo.mark(lost["neo_question_id"], "failed", reason="backlog: nobody has judged this",
+                 cause="unparseable-reply")
+    finally:
+        neo.close()
+    row, = _escalated_rows(ops.os_status())
+    told_left, told_lost = row["reason"].split("; ", 1)
+    assert told_left.startswith("Neo left the decision to you") and left["id"] in told_left
+    assert lost["id"] in told_lost and left["id"] not in told_lost
