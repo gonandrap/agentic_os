@@ -991,8 +991,9 @@ def test_a_duplicate_chain_that_loops_ends_as_dead_edges(started, project):
     x = central.add_backlog("proj_a", "x", status="proposed")
     y = _drop_as_duplicate(central, x["id"])
     central.review_backlog(x["id"], "dropped", rule="test", note="test")
-    # review_backlog refuses a settled target now; rows from before that refusal can still loop
+    # review_backlog now refuses a settled target (#1544): only a row older than that can loop
     central.conn.execute("UPDATE backlog SET duplicate_of=? WHERE id=?", (y["id"], x["id"]))
+    central.conn.commit()
     b = central.add_backlog("proj_a", "b", depends_on=[y["id"]])
 
     plan = ops.promote_backlog(b["id"], dry_run=True)
