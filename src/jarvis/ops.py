@@ -6783,13 +6783,13 @@ def select_inbox(items: list[dict[str, Any]], *, level: str = "", project: str =
 
 def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Put down an attention flag the OS raised for ITSELF, acknowledging nothing"""
-    from .invariants import true_blockers
+    from .invariants import surfaced_blockers
 
     name, path, _ = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
     try:
         wo = store.get_work_order(wo_id)
-        blockers = true_blockers(store, wo)
+        blockers = surfaced_blockers(store, wo)
         if blockers:
             # Only when it would actually change: `flag_attention` writes a timeline row every call
             if not wo["needs_attention"] or wo.get("attention_reason") != blockers[0]:
@@ -15861,18 +15861,9 @@ def _settle_alarm_attention(name: str, path: Path, wo_id: str, alarm_id: str) ->
             return
         if wo.get("attention_reason") != ALARM_BLOCKER.format(alarm_id=alarm_id):
             return  # the flag names something else: not this review's to touch
-        owed = [a for a in store.alarms_of(wo_id)
-                if a["id"] != alarm_id and a["status"] in ("escalated", "failed")
-                and a["review_status"] == "unreviewed"]
     finally:
         store.close()
-    settled = ack_os_flag(wo_id, name)
-    if not settled["blockers"] and owed:
-        store = ProjectStore(path)
-        try:
-            store.flag_attention(wo_id, ALARM_BLOCKER.format(alarm_id=owed[0]["id"]))
-        finally:
-            store.close()
+    ack_os_flag(wo_id, name)  # re-derives, so another owed alarm takes the flag over
 
 
 def approve_alarm_queue(project_name: str | None = None,
