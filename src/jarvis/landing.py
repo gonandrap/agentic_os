@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import worker_session
+from . import gitrefs, worker_session
 from .evidence import ProjectRef, base_ref, default_branch_head
 
 log = logging.getLogger("jarvis.landing")
@@ -249,18 +249,7 @@ def _object_exists(repo: Path, ref: str, repo_path: str) -> bool | None:
 
 def _fetch_ref(repo: Path, ref: str) -> None:
     """Refresh the default branch before reading it, best-effort. §8"""
-    branch = ref.split("/", 1)[1] if ref.startswith("origin/") else ref
-    try:
-        proc = subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "origin",
-                               branch], capture_output=True, text=True,
-                              errors="replace", timeout=20, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log.warning("git fetch origin %s in %s could not run: %s", branch, repo,
-                    _scrub(str(exc)))
-        return
-    if proc.returncode != 0:
-        log.debug("git fetch origin %s in %s exited %d: %s", branch, repo,
-                  proc.returncode, _scrub(proc.stderr.strip())[:200])
+    gitrefs.fetch_ref(repo, ref)
 
 
 @dataclass(frozen=True)

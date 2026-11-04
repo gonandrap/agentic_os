@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Union
 
-from . import db
+from . import db, gitrefs
 
 if TYPE_CHECKING:  # pragma: no cover
     from .catalog import Catalog, MorpheusConfig
@@ -166,9 +166,12 @@ def parse_pr_url(url: str) -> tuple[str, int] | None:
     return (m.group(1), int(m.group(2))) if m else None
 
 
+class UnknownTag(LookupError):
+    """A tag the clone does not have, even after a refresh — never a neighbour of it"""
+
+
 def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
-                          check=True, timeout=60).stdout
+    return gitrefs.read(repo, *args)
 
 
 def range_subjects(repo: Path, from_ref: str, to_ref: str) -> list[str]:
@@ -179,11 +182,11 @@ def range_subjects(repo: Path, from_ref: str, to_ref: str) -> list[str]:
 
 
 def previous_tag(repo: Path, tag: str) -> str:
-    """The `jarvis-*` tag released before `tag`, by version order, or ''"""
+    """The `jarvis-*` tag released before `tag`, by version order, or '' for the first one"""
     tags = [t for t in _git(repo, "tag", "--list", "jarvis-*", "--sort=v:refname").split()
             if t]
     if tag not in tags:
-        return tags[-1] if tags else ""
+        raise UnknownTag(f"{tag} is not a tag of {repo} — refreshed, {len(tags)} known")
     i = tags.index(tag)
     return tags[i - 1] if i else ""
 
