@@ -262,9 +262,11 @@ def coverage(resolved: dict[str, Any]) -> list[str]  # every path it cannot clas
 the test file, `catalog.parse_catalog` it, `config_version.resolve` it, and then:
 
 1. **Pin the fixture to the real schema** before asserting anything about coverage:
-   `len(resolved) == 374`, 202 paths under `os.`, 172 under `projects.`. Without this,
-   an empty `coverage()` proves nothing — and the counts are also the guard that stops a
-   worker making coverage easier by editing the resolver, which is read-only here.
+   `len(resolved) >= 394`, at least 212 paths under `os.`, at least 182 under `projects.`.
+   Without this, an empty `coverage()` proves nothing — and the floors are also the guard
+   that stops a worker making coverage easier by editing the resolver, which is read-only
+   here. Floors, not exact counts: two knob additions bumping one exact count merge
+   silently and turn `main` red (issue 1534). Removing a knob on purpose lowers the floor.
 2. `coverage(resolved)` is empty: a knob added to `catalog.py` without a registry entry
    fails here, which is the point.
 3. **The classification is not one bucket.** `len(AREA_KEYS) >= 25`; every key in
