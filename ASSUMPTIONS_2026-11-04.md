@@ -33,6 +33,17 @@
    is the fallback in §5.2, not the design, since remote operation is the point of the
    order).
 
-6. **Phasing is three steps, read-only first.** Rejected: one big change, because
+6. **Decisions are authorised by a user-presence key, not by a stored secret (review
+   round 2).** A worker runs as the same OS user as its runner, so a 0600
+   `credentials.json` is readable by it and is not a barrier. Every operator-only call
+   is signed with a macOS Keychain key created with `kSecAccessControlUserPresence`
+   (Touch ID / password), over a fresh master-issued nonce bound to that exact call;
+   the master refuses the call without that signature. Rejected: a tty prompt alone (a
+   worker can skip the CLI and call the API with the stored token); a cached presence
+   session (a token at rest again). Portable variant where there is no Keychain: hold
+   the key as a different OS user reachable over a unix socket. Accepted residual risk:
+   the session bearer token for reads and recording writes IS worker-readable.
+
+7. **Phasing is three steps, read-only first.** Rejected: one big change, because
    phases 1 and 2 give a second operator console with no scheduler change and roll
    back by unsetting an environment variable.

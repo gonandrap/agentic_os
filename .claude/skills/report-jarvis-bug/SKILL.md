@@ -21,9 +21,7 @@ Report when the fault is in Jarvis OS:
 - state looks corrupt or lost
 
 **Do not** use this for bugs in the project you are working on. Those are that
-project's business — use its issue tracker, or `jarvis backlog propose <project> "…"
--d "…" --type bug --severity … [--ref …]`. The steward reviews it; name the Neo
-question or message that led to it with `--ref`.
+project's business — use its issue tracker, or `jarvis backlog add`.
 
 Do not report the same bug twice in one session.
 
