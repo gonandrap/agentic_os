@@ -353,6 +353,28 @@ def throttled(cfg: EvolutionConfig, counts: Mapping[str, tuple[int, int]]) -> se
             if total >= PRECISION_MIN_SAMPLES and hit / total < cfg.min_precision}
 
 
+def evolution_for(catalog: Catalog, project: str) -> EvolutionConfig:
+    """The settings in force for `project`, against the one fleet-wide ledger; the fleet's if it is not catalogued"""
+    for spec in getattr(catalog, "projects", []) or []:
+        if spec.name == project:
+            return spec.evolution
+    return catalog.os.evolution
+
+
+def project_caps(catalog: Catalog) -> dict[str, dict[str, Any]]:
+    """{project: the mode and caps in force for it}: what `decide` holds its candidates to"""
+    return {spec.name: {key: getattr(spec.evolution, key) for key in
+                        ("mode", "weekly_usd", "bug_weekly_usd", "critical_weekly_usd",
+                         "yield_above_usd")}
+            for spec in getattr(catalog, "projects", []) or []}
+
+
+def cap_line(project: str, caps: Mapping[str, Any]) -> str:
+    return (f"  {project:<18} {caps['mode']}: reported bugs ${caps['bug_weekly_usd']:.2f}, "
+            f"follow-ups ${caps['weekly_usd']:.2f}, critical "
+            f"${caps['critical_weekly_usd']:.2f}, yield ${caps['yield_above_usd']:.2f}")
+
+
 # ---------------------------------------------------------------- the gate
 
 
@@ -362,7 +384,7 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
     """Decide, record, and say whether the caller may dispatch now"""
     from .central_store import CentralStore
 
-    cfg = catalog.os.evolution
+    cfg = evolution_for(catalog, c.project)
     mode = cfg.mode
     if self_dispatch is None:
         self_dispatch = bool(catalog.os.autonomy.self_dispatch)
@@ -480,15 +502,15 @@ def ask_body(c: Candidate, reason: str, decision_id: int, catalog: Catalog) -> s
     if c.origin_kind == "morpheus" and item:
         act += f" {ui_base_url(catalog)}/morpheus#{item}"
     # An `ask` is never re-offered (`_queue_fields`), so the cap is no answer for THIS one
-    return (f"{reason}. Act: {act}. Raising {ceiling_key(c.origin_kind)} lets later "
+    return (f"{reason}. Act: {act}. Raising {ceiling_key(c.origin_kind, c.project)} lets later "
             f"ones through; it does not re-run this one.\n"
             f"{ui_base_url(catalog)}/steward#decision-{decision_id}")
 
 
-def ceiling_key(origin_kind: str) -> str:
-    """The config key whose spent ceiling made an `ask` of this kind"""
-    return ("os.evolution.bug_weekly_usd" if track_of(origin_kind) == "bug"
-            else "os.evolution.critical_weekly_usd")
+def ceiling_key(origin_kind: str, project: str = "") -> str:
+    """The config key that lifts the spent ceiling behind an `ask` of this kind: a project's own wins"""
+    leaf = "bug_weekly_usd" if track_of(origin_kind) == "bug" else "critical_weekly_usd"
+    return f"projects.{project}.evolution.{leaf}" if project else f"os.evolution.{leaf}"
 
 
 def act_on(origin_kind: str, morpheus_item: str, parent_wo_id: str, project: str,
@@ -525,7 +547,7 @@ def next_step(row: Mapping[str, Any], now: float | None = None) -> dict[str, Any
                 f"Needs you: the OS held this {row.get('severity')} fix because its weekly "
                 f"{'bug ledger' if track_of(kind) == 'bug' else 'critical ceiling'} is spent, "
                 f"and it never retries it. Act: {act} Or leave it if it no longer matters. "
-                f"Raising {ceiling_key(kind)} lets later ones through; it does not re-run "
+                f"Raising {ceiling_key(kind, row.get('project') or '')} lets later ones through; it does not re-run "
                 "this one.")}
         return {"yours": False, "text": f"No longer waiting on you (asked over "
                 f"{WINDOW_SECONDS // 86400} days ago). Only if it still matters: {act}"}
@@ -846,15 +868,10 @@ def drain(catalog: Catalog, central: CentralStore, *, now: float | None = None,
           limit: int = DRAIN_PER_PASS) -> dict[str, int]:
     """Re-offer the queued decisions the ledger now has room for, severest then oldest first"""
     now = now if now is not None else db.now()
-    cfg = catalog.os.evolution
     out = {"waiting": 0, "dispatched": 0, "expired": settle_unrecoverable(central, now=now),
            "failed": 0}
     rows = central.steward_queue()
     if not rows:
-        return out
-    if cfg.mode != "enforce":
-        # Shadow dispatches by today's rules, which never held these back
-        out["waiting"] = len(rows)
         return out
     self_dispatch = bool(catalog.os.autonomy.self_dispatch)
     if dispatchers is None:
@@ -862,11 +879,16 @@ def drain(catalog: Catalog, central: CentralStore, *, now: float | None = None,
 
         dispatchers = ops.steward_dispatchers()
     book: Ledger | None = None
-    slow: set[str] = set()
+    counts: Mapping[str, tuple[int, int]] = {}
     # Reported bugs first, and uncapped: panel noise never delays them (Neo Q2941)
     capped = 0
     for row in sorted(rows, key=lambda r: (track_of(str(r["origin_kind"])) != "bug",
                                            -severity_rank(r["severity"]), r["ts"], r["id"])):
+        cfg = evolution_for(catalog, str(row["project"]))
+        if cfg.mode != "enforce":
+            # Shadow dispatches by today's rules, which never held these back
+            out["waiting"] += 1
+            continue
         bug = track_of(str(row["origin_kind"])) == "bug"
         store = _store_for(central, str(row["project"]))
         try:
@@ -885,13 +907,14 @@ def drain(catalog: Catalog, central: CentralStore, *, now: float | None = None,
             if book is None:
                 try:
                     book = ledger(catalog, central, now=now)
-                    slow = throttled(cfg, precision(catalog, now=now))
+                    counts = precision(catalog, now=now)
                 except Exception:  # noqa: BLE001 — a failure is never a verdict
                     log.exception("steward: ledger unreadable; nothing re-offered")
                     out["waiting"] = (len(rows) - out["expired"] - out["dispatched"]
                                       - out["failed"])
                     return out
-            landed = _reoffer(central, cfg, book, slow, row, store, dispatch, now)
+            landed = _reoffer(central, cfg, book, throttled(cfg, counts), row, store, dispatch,
+                              now)
             out[landed] += 1
             if landed == "dispatched":
                 capped += not bug
@@ -963,6 +986,7 @@ def digest(catalog: Catalog, central: CentralStore, *, now: float | None = None
             "bug_weekly_usd": cfg.bug_weekly_usd,
             "critical_weekly_usd": cfg.critical_weekly_usd,
             "yield_above_usd": cfg.yield_above_usd, "by_kind": by_kind,
+            "projects": project_caps(catalog),
             "held": [r for r in rows if r["outcome"] in ("queue", "ask")][:10],
             "queue": central.steward_queue_counts(),
             "precision": counts, "throttled": sorted(throttled(cfg, counts))}
@@ -975,6 +999,11 @@ def render_digest(d: Mapping[str, Any]) -> str:
              f"${book.evolution_usd:.2f} of ${d['weekly_usd']:.2f}, critical "
              f"${book.critical_usd:.2f} of ${d['critical_weekly_usd']:.2f}; fleet "
              f"${book.fleet_usd:.2f} (new follow-ups yield above ${d['yield_above_usd']:.2f})"]
+    own = {name: caps for name, caps in (d.get("projects") or {}).items()
+           if any(caps[key] != d.get(key) for key in caps)}
+    if own:
+        lines.append("projects with their own caps, against the same spend:")
+        lines += [cap_line(name, caps) for name, caps in own.items()]
     for kind, counts in sorted(d["by_kind"].items(),
                                key=lambda kv: (list(TRACKS).index(track_of(kv[0])), kv[0])):
         lines.append(f"  {TRACK_LABELS[track_of(kind)]:<15} {kind:<14} "

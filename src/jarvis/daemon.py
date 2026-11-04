@@ -1901,7 +1901,7 @@ class Daemon:
                   f"every SQLite write fails and each invariant reports itself as "
                   f"`database or disk is full`.\n\n"
                   f"The OS reclaims the checkout of a settled work order itself "
-                  f"({self.catalog.os.worktree.reclaim_after_hours}h after it settles); "
+                  f"(`worktree.reclaim_after_hours` after it settles); "
                   f"what is left is the checkouts of open and failed orders, the logs "
                   f"under {logs_dir()} and Claude Code's transcripts."),
         )
@@ -4474,7 +4474,7 @@ class Daemon:
         last = ops.last_stuck_investigation(project, wo_id)
         if last is None:
             return False
-        cooldown = self.catalog.os.fleet_health.cooldown_minutes * 60.0
+        cooldown = self.catalog.project(project).fleet_health.cooldown_minutes * 60.0
         return (now - float(last.get("updated_at") or 0.0) < cooldown
                 or last[ops.STUCK_FINGERPRINT_KEY] == fingerprint)
 
