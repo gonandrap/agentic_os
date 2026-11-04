@@ -1090,7 +1090,7 @@ def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: 
 
 
 def tool_call_open(path: Path | str, since: float) -> bool:
-    """Is a tool call asked for at or after `since` still without its result? Any of them: parallel calls return out of order (issue 1556)"""
+    """Is any tool call from `since` on still without its result? (issue 1556)"""
     asked: dict[str, float] = {}
     for row in usage_mod.rows(path, '"tool_'):
         ts = usage_mod.parse_stamp(row.get("timestamp"))
