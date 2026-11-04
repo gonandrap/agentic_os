@@ -7954,7 +7954,7 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
             f["knowledge_id"] = entry["id"]
             learnings.append(entry["id"])
         if file_orders:
-            made, error = _file_finding_orders(name, io_id, f, steward_decision)
+            made, error = _file_finding_orders(name, io_id, f, steward_decision, report)
             created += made
             if error:
                 errors.append({"key": key, "error": error})
@@ -8042,8 +8042,98 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
             "learnings": learnings, "rejected": sorted(rejections), "errors": errors}
 
 
+def _filed_work(finding: Mapping[str, Any], target: str) -> list[str]:
+    """The work orders this finding has already filed in `target`"""
+    return [str(o["id"]) for o in finding.get("created_orders") or []
+            if o.get("type") == "work" and o.get("project") == target]
+
+
+def _sequence_holds(target: str, io_id: str, f: Mapping[str, Any],
+                    report: Mapping[str, Any], order: Mapping[str, Any]
+                    ) -> tuple[list[str], list[str]]:
+    """The edges and rows expressing the sequence an order's text states, or OpsError (issue 1567)"""
+    import re
+
+    from . import preconditions
+    from .project_store import DEPENDENCY_DEAD_STATUSES
+
+    clauses = preconditions.states_sequence(order.get("title", ""),
+                                            order.get("description", ""),
+                                            f.get("recommendation", ""))
+    if not clauses:
+        return [], []
+
+    def refused(clause: str, why: str) -> OpsError:
+        return OpsError(
+            f"cannot file this order: \"{clause}\" states a sequence and {why}, so nothing "
+            f"would hold it back and jarvisd would dispatch it (wo-87e007eb cost 0.78 USD "
+            f"this way). File the prerequisite, then retry `jarvis io review {io_id} "
+            f"--accept {f.get('key', '<key>')}`, or reject the finding and file the order "
+            f"by hand with `--depends-on`/`--blocked-by`.")
+
+    if (order.get("type") or "work") == "feature":
+        raise refused(clauses[0], "a feature order takes no dependency edge")
+    path = registered_project_paths().get(target)
+    if path is None:
+        return [], []  # create_work_order names the unregistered project
+    siblings = [x for x in report.get("findings") or []
+                if isinstance(x, dict) and x.get("key") != f.get("key")]
+    depends: list[str] = []
+    holds: list[str] = []
+    store = ProjectStore(path)
+    try:
+        for clause in clauses:
+            named = [x for x in siblings if re.search(
+                rf"(?<![\w-]){re.escape(str(x.get('key')))}(?![\w-])", clause)]
+            refs = [r for r in preconditions.sequence_refs(clause) if r != ("io", io_id)]
+            if not refs and not named:
+                raise refused(clause, "names no order, pull request or finding")
+            for finding in named:
+                filed = _filed_work(finding, target)
+                if not filed:
+                    raise refused(clause, f"finding {finding.get('key')} has no order filed "
+                                          f"in {target}")
+                depends += filed
+            for kind, value in refs:
+                if kind == "bl":
+                    holds.append(value)
+                    continue
+                if kind == "pr":
+                    owners = store.work_orders_for_pr_number(int(value))
+                    if not owners:
+                        raise refused(clause, f"no order in {target} owns PR {value}")
+                    found = [str(owners[0]["id"])]
+                elif kind == "io":
+                    try:
+                        other = db.from_json(store.get_feature_order(value).get("plan"),
+                                             None) or {}
+                    except KeyError:
+                        raise refused(clause, f"{value} is not in {target}") from None
+                    entries = [x for x in other.get("findings") or [] if isinstance(x, dict)]
+                    keyed = [x for x in entries if str(x.get("key")) in clause]
+                    found = [i for x in (keyed or entries) for i in _filed_work(x, target)]
+                    if not found:
+                        raise refused(clause, f"{value} has no order filed in {target}")
+                else:
+                    found = [value]
+                for wo_id in found:
+                    try:
+                        holder = store.get_work_order(wo_id)
+                    except KeyError:
+                        raise refused(clause, f"{wo_id} is not in {target}") from None
+                    if holder["status"] in DEPENDENCY_DEAD_STATUSES:
+                        raise refused(clause, f"{wo_id} is {holder['status']} and can never "
+                                              f"complete")
+                    depends.append(wo_id)
+    finally:
+        store.close()
+    return list(dict.fromkeys(depends)), list(dict.fromkeys(holds))
+
+
 def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
-                         decision: Any = None) -> tuple[list[dict[str, Any]], str]:
+                         decision: Any = None,
+                         report: Mapping[str, Any] | None = None
+                         ) -> tuple[list[dict[str, Any]], str]:
     """File the finding's proposed orders not filed yet: (created, error), stopping at the first failure"""
     from . import steward
 
@@ -8068,6 +8158,7 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             metadata = steward.stamped(metadata, decision)
             budget_usd = decision.budget_usd
         try:
+            depends, holds = _sequence_holds(target, io_id, f, report or {}, order)
             if order_type == "feature":
                 row = create_feature_order(target, order.get("title", ""),
                                            description=description,
@@ -8075,6 +8166,8 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             else:
                 row = create_work_order(target, order.get("title", ""),
                                         description=description, parent_id=None,
+                                        depends_on=depends or None,
+                                        blocked_by=holds or None,
                                         metadata=metadata, budget_usd=budget_usd)
         except OpsError as e:
             error = str(e)
@@ -8441,7 +8534,7 @@ def reoffer_io_finding(row: Mapping[str, Any], candidate: Any, decision: Any) ->
               if isinstance(x, dict) and x.get("key") == key), None)
     if f is None or f.get("status") != "accepted" or not f.get("orders_held"):
         return ""  # decided or filed some other way meanwhile: nothing left to file
-    created, error = _file_finding_orders(name, io_id, f, decision)
+    created, error = _file_finding_orders(name, io_id, f, decision, report)
     if not error:
         f.pop("orders_held", None)
     store = ProjectStore(path)
