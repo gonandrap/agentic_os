@@ -5646,6 +5646,7 @@ def _print_assumption_rows(a: dict[str, Any]) -> None:
            f", median age {u['median_age_days']}d, oldest {u['max_age_days']}d")
     print(f"  still unsettled     {u['count']:>4}  ({u['reached_neo']} reached Neo, "
           f"{u['never_reached_neo']} never did{age}) — out of the rates")
+    print(f"  lapsed unruled      {a['lapsed']:>4}  (its order ended first) — out of the rates")
     d, net = a["dropped_rulings"], a["stakes_net"]
     print(f"  dropped rulings     {d['total']:>4}  ({d['re_asked']} re-asked; the rest "
           f"came to you)")

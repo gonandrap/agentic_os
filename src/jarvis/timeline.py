@@ -372,6 +372,9 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         verb = "accepted" if p.get("accepted") else "rejected"
         count = p.get("count")
         return f"Assumptions {verb}", f"{count} assumption(s)" if count else ""
+    if kind == "assumptions_lapsed":
+        return "Assumptions lapsed", (f"{p.get('count')} unruled when the order reached "
+                                      f"{p.get('status')}; no verdict recorded")
     # Auto-review's (`ops.AUTOREVIEW_EVENTS`
     if kind == "autoreview_asked":
         return (f"Asked Neo to rule on assumption #{p.get('n')}",
