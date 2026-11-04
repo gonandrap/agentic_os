@@ -15,7 +15,8 @@ from . import (background, budget, claude_cli, context, db, session_dispatch,
                systemd_units, usage)
 from .catalog import ProjectSpec
 from .project_store import (COMPACT_TURN, COST_FROM_TRANSCRIPT, SESSION_KEPT_EVENT,
-                            SUBMITTED_ARTIFACT_EVENT, TERMINAL_STATUSES, ProjectStore,
+                            REFUSED_ARTIFACT_EVENT, SUBMITTED_ARTIFACT_EVENT,
+                            TERMINAL_STATUSES, ProjectStore, pr_body_file,
                             submission_artifacts)
 
 log = logging.getLogger("jarvisd")
@@ -739,14 +740,15 @@ def remove_closed_sessions(store: ProjectStore) -> list[str]:
     return removed
 
 
-def _submitted_paths(store: ProjectStore, wo_id: str, tree: Path) -> tuple[str, ...]:
-    """Each file a `--from-file` submission read, relative to `tree` when inside it (#1528)"""
+def os_ordered_paths(store: ProjectStore, wo: dict[str, Any], tree: Path) -> tuple[str, ...]:
+    """Every file in `tree` the OS's contract, submits and hooks had this order write (#1538)"""
     root = tree.resolve()
-    out = []
-    for event in store.events_of_kind(wo_id, SUBMITTED_ARTIFACT_EVENT):
-        recorded = (db.from_json(event.get("payload"), None) or {}).get("path")
-        if recorded and Path(recorded).is_relative_to(root):
-            out.append(Path(recorded).relative_to(root).as_posix())
+    out = [*submission_artifacts(wo), pr_body_file(wo["id"])]
+    for kind in (SUBMITTED_ARTIFACT_EVENT, REFUSED_ARTIFACT_EVENT):
+        for event in store.events_of_kind(wo["id"], kind):
+            recorded = (db.from_json(event.get("payload"), None) or {}).get("path")
+            if recorded and Path(recorded).is_relative_to(root):
+                out.append(Path(recorded).relative_to(root).as_posix())
     return tuple(out)
 
 
@@ -760,8 +762,7 @@ def _prune_worktree_caches(store: ProjectStore, wo: dict[str, Any]) -> None:
     if not tree.is_dir():
         return
     # Completed means its contract command already read the file; a cancelled one may not have
-    consumed = (submission_artifacts(wo) + _submitted_paths(store, wo["id"], tree)
-                if wo["status"] == "completed" else ())
+    consumed = os_ordered_paths(store, wo, tree) if wo["status"] == "completed" else ()
     pruned = disk.prune_build_caches(tree, consumed)
     kept = store.last_event_of_kind(wo["id"], SESSION_KEPT_EVENT)
     # Walk once, and again only after an EACCES refusal — not every poll of a kept tree

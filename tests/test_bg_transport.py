@@ -569,6 +569,80 @@ def test_the_path_a_submission_was_read_from_is_pruned_whatever_its_name(
     assert not (tree / "sub/.jarvis-plan.json").exists()
 
 
+def _order_with_refused_plan_and_pr_body(bg_fleet, settle_turns):
+    from jarvis.project_store import REFUSED_ARTIFACT_EVENT, pr_body_file
+
+    store = bg_fleet["store"]
+    wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {".jarvis-plan.json": "{}"})
+    body = pr_body_file(wo["id"])
+    (tree / body).write_text("body\n")
+    store.conn.execute("UPDATE work_orders SET kind='planner' WHERE id=?", (wo["id"],))
+    store.add_event(wo["id"], REFUSED_ARTIFACT_EVENT,
+                    {"path": str((tree / ".jarvis-plan.json").resolve())})
+    store.conn.commit()
+    return store, wo, tree, body
+
+
+def test_every_os_ordered_file_is_pruned_for_a_completed_order(
+        bg_fleet, fake_claude, settle_turns):
+    """wo-34efa31b kept on a refused plan, wo-fa084878 on its PR body (#1538)"""
+    store, wo, tree, body = _order_with_refused_plan_and_pr_body(bg_fleet, settle_turns)
+    store.set_status(wo["id"], "completed")
+
+    worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] is None
+    assert not (tree / ".jarvis-plan.json").exists()
+    assert not (tree / body).exists()
+    assert [e["kind"] for e in store.list_events(wo["id"])
+            if e["kind"] == "background_session_removed"] == ["background_session_removed"]
+    assert list(invariants.check_closed_session_removed(store)) == []
+
+
+def test_a_real_uncommitted_file_beside_os_ordered_ones_still_keeps_the_session(
+        bg_fleet, fake_claude, settle_turns):
+    store, wo, tree, _ = _order_with_refused_plan_and_pr_body(bg_fleet, settle_turns)
+    (tree / "notes.md").write_text("unsaved work\n")
+    store.set_status(wo["id"], "completed")
+
+    worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] == wo["bg_id"]
+    assert (tree / "notes.md").exists()
+
+
+def test_a_cancelled_order_keeps_what_the_os_ordered(bg_fleet, fake_claude, settle_turns):
+    """A cancelled order's refused plan was never read; it may be the only copy (#1538)"""
+    store, wo, tree, body = _order_with_refused_plan_and_pr_body(bg_fleet, settle_turns)
+    store.set_status(wo["id"], "cancelled")
+
+    worker_session.poll(store)
+
+    assert (tree / ".jarvis-plan.json").exists()
+    assert (tree / body).exists()
+
+
+def test_a_pr_body_tracked_on_the_branch_is_restored_to_head(
+        bg_fleet, fake_claude, settle_turns):
+    """Restore, never delete: a tracked file reads as modified (#1538, #1292)"""
+    from jarvis.project_store import pr_body_file
+
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    wo, tree = _worktree_bg_wo(bg_fleet, settle_turns, {})
+    body = tree / pr_body_file(wo["id"])
+    body.write_text("committed\n")
+    subprocess.run(["git", "add", body.name], cwd=tree, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm",
+                    "body"], cwd=tree, check=True)
+    body.write_text("edited\n")
+    store.set_status(wo["id"], "completed")
+
+    worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] is None
+    assert body.read_text() == "committed\n"
+
+
 def test_read_only_directories_are_made_removable(tmp_path):
     """A read-only __pycache__ failed the removal half-way with EACCES (wo-b6e2ddda)"""
     from jarvis import disk
