@@ -7202,7 +7202,7 @@ def find_feature_order(fo_id: str, project_name: str | None = None, *,
 
 
 #: Every id the OS mints that has a page, and the shapes a reader types for the rest
-_REF_ID = re.compile(r"^(wo|fo|io|inv|kn|al|mv|mo|bl)-[0-9a-f]{8}$")
+_REF_ID = re.compile(r"^(wo|fo|io|inv|do|kn|al|mv|mo|bl)-[0-9a-f]{8}$")
 _REF_NUMBERED = re.compile(r"^(q|gate-|issue-|#)?(\d+)$")
 
 
@@ -7227,7 +7227,7 @@ def resolve_ref(ref: str) -> str:
         if prefix == "wo":
             name, _, _ = find_work_order(rid)
             return order_path(name, rid)
-        if prefix in ("fo", "io", "inv"):
+        if prefix in ("fo", "io", "inv", "do"):
             name, _, _ = find_feature_order(rid)
             return order_path(name, rid)
         if prefix == "al":
@@ -13795,6 +13795,17 @@ def _turn_href(project: str, wo_id: str, ts: float) -> str | None:
     return f"{base}#msg-{int(m['id'])}" if m else base
 
 
+def deferrals_of(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """Deferrals about this order: what an `envelope` origin ref lands on (backlog-operability §1.3)"""
+    out = []
+    for e in store.envelopes(subject_wo_id=wo_id):
+        if e["kind"] == "deferral_request":
+            p = db.from_json(e["payload"], {}) or {}
+            out.append({"id": e["id"], "title": p.get("title") or "", "why": p.get("why") or "",
+                        "state": e["state"], "note": e["note"] or ""})
+    return out
+
+
 def origin_url(ref: Mapping[str, Any]) -> tuple[str, str]:
     """(href, label) of one origin ref; never raises (2026-11-03-backlog-operability §1.3)"""
     kind = str(ref.get("kind") or "") if isinstance(ref, Mapping) else ""
@@ -13811,19 +13822,27 @@ def origin_url(ref: Mapping[str, Any]) -> tuple[str, str]:
         elif kind == "neo_question":
             return f"/neo/question/{int(r['id'])}", f"Neo question q{r['id']}"
         elif kind == "envelope":
-            return f"/wo/{p}/{r['subject_wo_id']}", f"deferral {r['id']} on {r['subject_wo_id']}"
+            return (f"/wo/{p}/{r['subject_wo_id']}#envelope-{int(r['id'])}",
+                    f"deferral {r['id']} on {r['subject_wo_id']}")
         elif kind == "decision":
-            label = f"{r['do_id']} {r['key']}" if r.get("key") else str(r["do_id"])
-            return f"/go/{r['do_id']}", label
+            if r.get("key"):
+                return (f"/go/{r['do_id']}#proposal-{quote(str(r['key']), safe='')}",
+                        f"{r['do_id']} {r['key']}")
+            return f"/go/{r['do_id']}", str(r["do_id"])
         elif kind == "monitoring_order":
             return f"/mo/{r['id']}", str(r["id"])
         elif kind == "alarm":
             return f"/alarms/{p}/{r['id']}", f"alarm {r['id']}"
         elif kind == "validation":
-            rnd = f" round {r['round']}" if r.get("round") not in (None, "") else ""
-            return f"/wo/{p}/{r['wo_id']}#validation", f"validation of {r['wo_id']}{rnd}"
+            if r.get("round") in (None, ""):
+                return f"/wo/{p}/{r['wo_id']}#validation", f"validation of {r['wo_id']}"
+            return (f"/wo/{p}/{r['wo_id']}#round-{quote(str(r['round']), safe='')}",
+                    f"validation of {r['wo_id']} round {r['round']}")
         elif kind == "finding":
-            return f"/go/{r['order_id']}", f"{r['order_id']} finding {r['key']}"
+            # An investigation has one verdict, no keyed findings
+            target = ("verdict" if str(r["order_id"]).startswith("inv-")
+                      else f"finding-{quote(str(r['key']), safe='')}")
+            return f"/go/{r['order_id']}#{target}", f"{r['order_id']} finding {r['key']}"
         elif kind == "gate":
             return f"/gates/{int(r['id'])}?project={quote(str(p))}", f"gate {r['id']}"
         elif kind == "order":
