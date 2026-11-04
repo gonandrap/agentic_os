@@ -1263,10 +1263,10 @@ ASSUMPTION_DECIDER_USER = "user"
 #: `assumptions.decided_by` when the OS did — `autoreview`
 ASSUMPTION_DECIDER_OS = "neo"
 
-#: `assumptions.status` for a row whose order ended unruled: NOT a verdict, `decided_by` stays '' (io-d5e62d4d)
+#: `assumptions.status` when its order ended unruled: NOT a verdict (io-d5e62d4d)
 ASSUMPTION_LAPSED = "lapsed"
 
-#: The order statuses that lapse a pending row; `failed` is absent because `wo retry` can resume it
+#: Order statuses that lapse a pending row; never `failed`: `wo retry` can resume it
 ASSUMPTION_LAPSE_STATUSES = ("completed", "cancelled")
 
 #: What an early verdict may say
@@ -3715,7 +3715,7 @@ class ProjectStore:
         return len(ids)
 
     def ended_orders_with_pending_assumptions(self) -> list[dict[str, Any]]:
-        """Orders holding rows `set_status` did not lapse: older than it, or recorded after the end"""
+        """Ended orders holding rows `set_status` did not lapse (io-d5e62d4d)"""
         marks = ",".join("?" for _ in ASSUMPTION_LAPSE_STATUSES)
         return db.rows_to_dicts(self.conn.execute(
             "SELECT DISTINCT w.id, w.status FROM assumptions a "
