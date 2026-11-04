@@ -77,6 +77,38 @@ def test_a_different_title_is_not_an_exact_duplicate(central):
     assert other["status"] == "open" and other["duplicate_of"] is None
 
 
+@pytest.mark.parametrize("settled", ["done", "dropped"])
+def test_folding_into_a_settled_item_is_refused_and_changes_nothing(central, settled):
+    target = central.add_backlog("proj_a", "the settled one",
+                                 origin_refs=[{"kind": "order", "id": "wo-11111111"}])
+    central.mark_backlog(target["id"], settled)
+    item = propose(central, "a restatement", refs=[REF])
+    central.review_backlog(item["id"], "quarantined", rule="r", note="n")
+    item = central.get_backlog(item["id"])
+    before = central.get_backlog(target["id"])
+    assert before["status"] == settled
+
+    with pytest.raises(ValueError, match=rf"{target['id']}.*{settled}"):
+        steward.fold_duplicate(central, item, target["id"], rule="neo", note="same")
+
+    after = central.get_backlog(item["id"])
+    assert (after["status"], after["duplicate_of"]) == ("quarantined", None)
+    assert central.get_backlog(target["id"])["origin_refs"] == before["origin_refs"]
+
+
+def test_folding_into_an_open_item_still_works(central):
+    target = central.add_backlog("proj_a", "the live one")
+    item = propose(central, "a restatement", refs=[REF])
+    central.review_backlog(item["id"], "quarantined", rule="r", note="n")
+
+    steward.fold_duplicate(central, central.get_backlog(item["id"]), target["id"],
+                           rule="neo", note="same")
+
+    after = central.get_backlog(item["id"])
+    assert (after["status"], after["duplicate_of"]) == ("dropped", target["id"])
+    assert central.get_backlog(target["id"])["origin_refs"] == [REF]
+
+
 def test_a_duplicate_of_a_promoted_item_names_its_order(central):
     kept = central.add_backlog("proj_a", "fix the login bug")
     central.mark_backlog(kept["id"], "promoted", promoted_wo_id="wo-22222222")
