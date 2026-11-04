@@ -88,10 +88,10 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "background-task-silence": GapClass(
         id="background-task-silence",
-        headline="a worker waiting for a background task's result writes nothing while it "
-                 "waits, so the sweep reads an open turn with no activity as wedged",
-        symptom="an investigation opened on a `running` order whose transcript ends on a "
-                "background launch and whose worker later resumes on the task notification",
+        headline="a worker awaiting a background task's result writes nothing, so the "
+                 "sweep reads its open turn as wedged",
+        symptom="a `running` order investigated while its transcript ends on a background "
+                "launch",
         detector="background.live_tasks",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
@@ -143,8 +143,8 @@ def render_registry() -> str:
         lines += [
             f"- `{cls.id}` — {cls.headline}",
             f"  Looks like: {cls.symptom}",
-            f"  Detector: {cls.detector or 'NONE YET — no state check recognises this'}"
-            f"; remedy: {cls.remedy}"
-            + (f" ({cls.issue_url})" if cls.issue_url else ""),
+            f"  Detector: {cls.detector or 'NONE YET'}; remedy: {cls.remedy}"
+            # The number alone: this list is inside a worker's 10K start budget
+            + (f" (issue {cls.issue_url.rsplit('/', 1)[-1]})" if cls.issue_url else ""),
         ]
     return "\n".join(lines)

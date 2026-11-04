@@ -2080,7 +2080,7 @@ def test_a_live_turn_buys_no_investigation(stuck_os):
 
 
 def _waiting_on(store, root, wo, *rows_after, task="blh1dirur", started):
-    """Issue 1562: a turn that launched a task and ended; `started` back-dates the row, or the test passes without the fix"""
+    """Issue 1562: a turn that launched a task and ended; back-dated, or no fix is needed to pass"""
     session = f"sess-{wo['id']}"
     store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?", (session, wo["id"]))
     store.conn.commit()
