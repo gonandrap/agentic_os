@@ -714,9 +714,8 @@ def _other_gap(n: int) -> dict[str, str]:
 
 @pytest.mark.parametrize("classification", ["TRANSIENT", "GAP"])
 def test_each_other_gap_becomes_one_origin_linked_backlog_proposal(started, store, catalog_file,
-                                                                  monkeypatch, classification):
+                                                                  classification):
     """io-38a4354f one-fix-slot: the `done` line, end to end through the router"""
-    monkeypatch.setattr(ops, "_verdict_duplicate", lambda *a, **k: "#790")  # no tracker call
     inv_id, investigator, out = _submitted(started, store, classification,
                                            other_gaps=[_other_gap(1), _other_gap(2)])
     assert out["other_gaps_proposed"] == 2
