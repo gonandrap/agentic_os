@@ -3757,20 +3757,50 @@ class ProjectStore:
                    decided_model=?, decided_config_version=? WHERE id=?""",
             (status, decided_by, reason, model, config_version, assumption_id))
 
-    def lapse_pending_assumptions(self, wo_id: str, status: str) -> int:
-        """Retire this order's unruled rows now it ended: no verdict, no decider (io-d5e62d4d)"""
+    def lapse_pending_assumptions(self, wo_id: str, status: str, reason: str = "") -> int:
+        """Retire this order's unruled rows: no verdict, no decider (io-d5e62d4d)"""
         ids = [int(r["id"]) for r in self.conn.execute(
             "SELECT id FROM assumptions WHERE wo_id=? AND status='pending' ORDER BY id",
             (wo_id,)).fetchall()]
         if not ids:
             return 0
+        why = reason or f"its order reached {status} before anyone ruled"
         self.conn.execute(
             "UPDATE assumptions SET status=?, decided_reason=? "
             "WHERE wo_id=? AND status='pending'",
-            (ASSUMPTION_LAPSED, f"its order reached {status} before anyone ruled", wo_id))
+            (ASSUMPTION_LAPSED, why, wo_id))
         self.add_event(wo_id, "assumptions_lapsed",
-                       {"count": len(ids), "assumption_ids": ids, "status": status})
+                       {"count": len(ids), "assumption_ids": ids, "status": status,
+                        "reason": why})
         return len(ids)
+
+    def lapse_moot_assumptions(self, wo_id: str, status: str, reason: str) -> int:
+        """A LIVE order's rows, and the Neo questions on them, once nobody can answer them (issue 1572)"""
+        from .neo_store import NeoStore
+
+        rows = self.pending_assumptions(wo_id)
+        linked = [int(a[column]) for a in rows
+                  for column in ("neo_question_id", "confirm_question_id") if a[column]]
+        neo = NeoStore()
+        try:
+            # First: a failure here leaves the rows pending, for the next tick to retry
+            lapsed = neo.lapse_questions(linked, reason)
+        finally:
+            neo.close()
+        for question_id in lapsed:
+            self.add_event(wo_id, "question_lapsed",
+                           {"question_id": question_id, "reason": reason})
+        return self.lapse_pending_assumptions(wo_id, status, reason)
+
+    def live_children_with_pending_assumptions(self) -> list[dict[str, Any]]:
+        """Open non-manager orders under a parent, holding unruled rows (issue 1572)"""
+        marks = ",".join("?" for _ in OPEN_STATUSES)
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT DISTINCT w.* FROM assumptions a "
+            "JOIN work_orders w ON w.id = a.wo_id "
+            "JOIN feature_orders f ON f.id = w.parent_id "
+            f"WHERE a.status='pending' AND w.kind != 'manager' AND w.status IN ({marks}) "
+            "ORDER BY w.id", OPEN_STATUSES).fetchall())
 
     def ended_orders_with_pending_assumptions(self) -> list[dict[str, Any]]:
         """Ended orders holding rows `set_status` did not lapse (io-d5e62d4d)"""
