@@ -55,6 +55,13 @@ written again.
 * One `worktree_reclaimed` event per order, with a `timeline._describe` branch and NOT in
   `DEBUG_KINDS` (kn-3f133363): once per order lifetime, and it changes what the user can
   still open.
+* **Pytest temp roots** (#1574): the same sweep lists `<tempdir>/jarvis-pytest/` and removes
+  the root of every order this project's store knows as settled past the grace period,
+  whatever became of its checkout: removed, already gone, harness-opened or kept. A root is
+  scratch, never the uncommitted work the keep rule protects. It walks the directory rather
+  than `settled_worktrees` because the event hides already-reclaimed orders, and the walk
+  retries a failed removal. A root no store here claims is left alone: it may be a sibling
+  project's or another instance's.
 
 ### 2. The warning (`Daemon.check_disk_space`)
 

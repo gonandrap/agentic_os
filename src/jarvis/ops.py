@@ -2525,15 +2525,29 @@ def fix_flag_notice(flag: str) -> str | None:
 ASSUMPTIONS_PENDING_REASON = "assumptions pending review"
 
 
+#: Records which assumptions the user was already pinged about: the flag cannot, validating clears it
+ASSUMPTIONS_PINGED_EVENT = "assumptions_pinged"
+
+
 def flag_assumptions_pending(store: ProjectStore, wo_id: str) -> None:
-    """Flag AND notify: the flag reaches only who already looks (issue #244)"""
-    row = store.get_work_order(wo_id) or {}
+    """Flag AND notify (#244), only for rows that are the user's, each row once (io-ed253c2b)"""
+    row = store.get_work_order(wo_id)
+    owed = invariants.assumptions_owed_to_user(store, row)
+    if not owed:
+        return
     already = (row.get("needs_attention")
                and row.get("attention_reason") == ASSUMPTIONS_PENDING_REASON)
     store.flag_attention(wo_id, ASSUMPTIONS_PENDING_REASON)
-    if already:
+    # Without auto-review every assumption of a raised flag is one ping, as it always was
+    if already and not auto_review_at(store.project_path):
         return
-    n = sum(1 for a in store.all_assumptions(wo_id) if a["status"] == "pending")
+    pinged = {int(aid) for e in store.events_of_kind(wo_id, ASSUMPTIONS_PINGED_EVENT)
+              for aid in db.from_json(e["payload"], {}).get("assumption_ids", [])}
+    fresh = [int(a["id"]) for a in owed if int(a["id"]) not in pinged]
+    if not fresh:
+        return
+    n = len(fresh)
+    store.add_event(wo_id, ASSUMPTIONS_PINGED_EVENT, {"assumption_ids": fresh})
     store.add_notification(
         title=f"{wo_id} is waiting on your review of {n} assumption{'s' if n != 1 else ''}",
         body=f"{row.get('title') or ''}\n"
@@ -3439,6 +3453,28 @@ def _owed_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[int]:
             if (kind == "autoreview_held" or kind in _AUTOREVIEW_OWED_BY_USER)
             and not payload.get("re_asked")]
     return sorted(owed)
+
+
+def assumptions_held_final(store: ProjectStore, wo: dict[str, Any]) -> set[int]:
+    """Ids whose newest live review event is a delivered-pass hold no later pass retries (io-ed253c2b)"""
+    from . import autoreview, db
+
+    wo_id = wo["id"]
+    stale = _stale_ruling(store, wo_id, status=str(wo.get("status") or ""))
+    events = [(float(r["ts"]), kind, db.from_json(r["payload"], {}))
+              for kind in ("autoreview_held", "autoreview_asked")
+              for r in store.events_of_kind(wo_id, kind)]
+    final: set[int] = set()
+    for _, kind, payload in sorted(events, key=lambda e: e[0]):
+        # An early hold is re-decided on delivery, so that pass writes its own
+        if payload.get("early") or stale(kind, payload):
+            continue
+        aid = int(payload.get("assumption_id") or 0)
+        if kind == "autoreview_held" and payload.get("code") not in autoreview.TRANSIENT_HOLDS:
+            final.add(aid)
+        else:
+            final.discard(aid)
+    return final
 
 
 def _held_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[dict[str, Any]]:
@@ -6747,13 +6783,13 @@ def select_inbox(items: list[dict[str, Any]], *, level: str = "", project: str =
 
 def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Put down an attention flag the OS raised for ITSELF, acknowledging nothing"""
-    from .invariants import true_blockers
+    from .invariants import surfaced_blockers
 
     name, path, _ = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
     try:
         wo = store.get_work_order(wo_id)
-        blockers = true_blockers(store, wo)
+        blockers = surfaced_blockers(store, wo)
         if blockers:
             # Only when it would actually change: `flag_attention` writes a timeline row every call
             if not wo["needs_attention"] or wo.get("attention_reason") != blockers[0]:
@@ -14167,6 +14203,21 @@ def propose_backlog(project: str, title: str, description: str = "", *,
         central.close()
 
 
+def _live_dependency(central: CentralStore, dep_id: str,
+                     dead: list[str]) -> tuple[str | None, dict[str, Any] | None]:
+    """What a dependency stands for once dropped ids are in `dead`; id None when nothing does (§7.1)"""
+    while True:
+        dep = central.get_backlog(dep_id)
+        if not dep or dep["status"] != "dropped":
+            return dep_id, dep
+        if dep_id not in dead:
+            dead.append(dep_id)
+        kept = dep["duplicate_of"]
+        if not kept or kept in dead:
+            return None, None
+        dep_id = kept
+
+
 def _promotion_plan(central: CentralStore, item_id: str,
                     as_feature: bool | None) -> list[dict[str, Any]]:
     """Open closure, dependencies first (docs/superpowers/specs/2026-11-03-backlog-operability.md §7.1)"""
@@ -14183,9 +14234,12 @@ def _promotion_plan(central: CentralStore, item_id: str,
     def visit(item: dict[str, Any]) -> None:
         seen.add(item["id"])
         path.append(item["id"])
-        waits_on = []
+        waits_on: list[str] = []
+        dead_deps: list[str] = []
         for dep_id in item["depends_on"]:
-            dep = central.get_backlog(dep_id)
+            dep_id, dep = _live_dependency(central, dep_id, dead_deps)
+            if dep_id is None or dep_id in waits_on:
+                continue
             status = dep["status"] if dep else "missing"
             if status == "done":
                 continue
@@ -14204,7 +14258,7 @@ def _promotion_plan(central: CentralStore, item_id: str,
         if item["id"] == item_id and as_feature is not None:
             kind = "fo" if as_feature else "wo"
         plan.append({"id": item["id"], "title": item["title"], "project": item["project"],
-                     "kind": kind, "waits_on": waits_on})
+                     "kind": kind, "waits_on": waits_on, "dead_deps": dead_deps})
 
     visit(root)
     if refused:
@@ -14216,7 +14270,8 @@ def _promotion_plan(central: CentralStore, item_id: str,
             f"cannot promote {item_id}, nothing was created: a feature order starts planning "
             "at once and cannot wait, so " + "; ".join(
                 f"{m['id']} waits on {', '.join(m['waits_on'])}" for m in waiting_features)
-            + " — promote its dependencies first")
+            + " — those dependencies must reach done or dropped first: they can be promoted "
+            "on their own now, then promote this item once they settle")
     # create_feature_order refuses these; caught here, a late member cannot strand the early ones
     bare = [m["id"] for m in plan if m["kind"] == "fo"
             and not (central.get_backlog(m["id"])["description"] or "").strip()]
@@ -15822,18 +15877,9 @@ def _settle_alarm_attention(name: str, path: Path, wo_id: str, alarm_id: str) ->
             return
         if wo.get("attention_reason") != ALARM_BLOCKER.format(alarm_id=alarm_id):
             return  # the flag names something else: not this review's to touch
-        owed = [a for a in store.alarms_of(wo_id)
-                if a["id"] != alarm_id and a["status"] in ("escalated", "failed")
-                and a["review_status"] == "unreviewed"]
     finally:
         store.close()
-    settled = ack_os_flag(wo_id, name)
-    if not settled["blockers"] and owed:
-        store = ProjectStore(path)
-        try:
-            store.flag_attention(wo_id, ALARM_BLOCKER.format(alarm_id=owed[0]["id"]))
-        finally:
-            store.close()
+    ack_os_flag(wo_id, name)  # re-derives, so another owed alarm takes the flag over
 
 
 def approve_alarm_queue(project_name: str | None = None,

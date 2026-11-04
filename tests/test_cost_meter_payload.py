@@ -626,6 +626,10 @@ def test_a_standing_residual_files_once_and_silently(fleet_fixture, fixed_now, m
     assert filed[0]["notify"] is False and filed[0]["priority"] == "high"
     assert "recurred 3 times" in filed[0]["description"]
     assert "usage_meter" in filed[0]["description"]
+    # The tracker is public: spend stays on the alarm rows it names
+    assert "$" not in filed[0]["description"] and "$" not in filed[0]["actual"]
+    assert all(r["id"] in filed[0]["description"] for r in alarms(fleet_fixture)
+               if r["kind"] == "cost_residual_high")
     kinds = [r["kind"] for r in alarms(fleet_fixture)]
     assert kinds.count("cost_residual_diagnosed") == 1
     central = CentralStore()

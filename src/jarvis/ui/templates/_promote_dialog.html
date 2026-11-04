@@ -1,8 +1,9 @@
 {# docs/superpowers/specs/2026-11-03-backlog-operability.md §7.3. The server refuses an
-   unconfirmed multi-member POST, so a failed plan fetch just submits and gets the flash. #}
+   unconfirmed multi-member or dead-dependency POST, so a failed plan fetch just submits and gets the flash. #}
 <dialog id="promote-dialog" style="width: min(800px, 95vw); max-height: 90vh; background: var(--surface);
   color: var(--ink); border: 1px solid var(--line);">
   <div class="row"><span class="grow" id="promote-dialog-note"></span></div>
+  <div class="row"><span class="grow sub tone-warn" id="promote-dialog-dead"></span></div>
   <div class="table-wrap">
     <table>
       <tr><th>id</th><th>title</th><th>kind</th><th>project</th></tr>
@@ -25,7 +26,11 @@
     if (!form.matches("form[data-promote-plan]")) { return; }
     ev.preventDefault();
     fetch(form.dataset.promotePlan).then(function (r) { return r.json(); }).then(function (out) {
-      if (!out.plan || out.plan.length < 2) { form.submit(); return; }
+      var dead = [];
+      (out.plan || []).forEach(function (m) {
+        m.dead_deps.forEach(function (id) { if (dead.indexOf(id) < 0) { dead.push(id); } });
+      });
+      if (!out.plan || (out.plan.length < 2 && !dead.length)) { form.submit(); return; }
       rows.textContent = "";
       out.plan.forEach(function (m) {
         var tr = rows.insertRow();
@@ -34,7 +39,9 @@
         });
       });
       document.getElementById("promote-dialog-note").textContent =
-        "This creates " + out.plan.length + " orders, dependencies first:";
+        "This creates " + out.plan.length + (out.plan.length === 1 ? " order:" : " orders, dependencies first:");
+      document.getElementById("promote-dialog-dead").textContent = dead.length
+        ? "Not waiting on dropped dependencies: " + dead.join(", ") : "";
       pending = form;
       modal.showModal();
     }).catch(function () { form.submit(); });
