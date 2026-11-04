@@ -253,7 +253,7 @@ def test_a_ref_past_the_quoted_length_still_resolves(store, io_id):
     assert store.dependencies(store.get_work_order(out["created"][0]["id"])) == [holder["id"]]
 
 
-def test_the_user_can_reject_a_refused_finding_and_file_by_hand(store, io_id):
+def test_the_user_can_reject_a_refused_finding(store, io_id):
     _say(store, io_id, "Start after reading the spec.")
     _refused(store, io_id, "Start after reading the spec.")
 

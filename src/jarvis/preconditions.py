@@ -66,7 +66,7 @@ _PR_RE = re.compile(r"(?:\bPR\s*#?|\bpull request\s*#?|/pull/|(?<![\w/])#)(\d+)"
 
 
 def states_sequence(*texts: str) -> list[str]:
-    """Every clause stating work must wait for something, whole (refs may sit past MAX_SENTENCE), quoted text aside"""
+    """Every clause stating work must wait, untruncated, quoted text aside"""
     clauses: list[str] = []
     for text in texts:
         for clause in _CLAUSE_RE.split(_QUOTED_RE.sub(" ", text or "")):
