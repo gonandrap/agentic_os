@@ -54,7 +54,7 @@ NOTES = (
     "the conversation and the transcript carries no window",
 )
 
-#: Both renderers print it beside `os_cost_by_kind`, which the headline's list-priced figure cannot reconcile to
+#: Printed beside `os_cost_by_kind`: its dollars are not the headline's list prices
 OS_COST_BASIS = (
     "recorded cost, as each call reported it; the headline's jarvis figure reprices the same "
     "calls at list prices, so the two differ. No work order is a subset of the kinds, not an "
