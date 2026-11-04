@@ -96,7 +96,9 @@ def test_a_marker_held_row_flags_the_user_and_their_accept_clears_it(started):
     fresh = store.get_work_order(wo["id"])
     assert fresh["status"] == "idle"
     assert fresh["needs_attention"]
-    assert "1 assumption pending your review" in fresh["attention_reason"]
+    # The hold's own ping raised it, so the sweep had nothing to add (io-ed253c2b)
+    assert fresh["attention_reason"] == "assumptions pending review"
+    assert "1 assumption pending your review" in invariants.true_blockers(store, fresh)
     assert ops.waiting_on(store, fresh)["what"] == "assumptions"
     assert ops.show_feature_order(fo_id, "proj_a")["manager"]["pending_assumptions"] == [
         {"n": 1, "content": MARKED}]

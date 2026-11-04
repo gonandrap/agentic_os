@@ -2992,6 +2992,10 @@ def create_app() -> FastAPI:
                 raise ops.OpsError(f"promoting {item_id} creates {len(plan)} orders ("
                                    + ", ".join(m["id"] for m in plan)
                                    + ") — confirm the list first")
+            dead = sorted({d for m in plan for d in m["dead_deps"]})
+            if dead and not confirm:
+                raise ops.OpsError(f"promoting {item_id} will not wait on dropped dependencies "
+                                   f"{', '.join(dead)} — confirm first")
             result = ops.promote_backlog(item_id)
         except ops.OpsError as e:
             return RedirectResponse(f"/backlog?error={quote(str(e))}", status_code=303)

@@ -128,8 +128,9 @@
     they happen ({{ fmt_tok(totals.os_billed_input) }} in ·
     {{ fmt_tok(totals.os_output) }} out) and survive transcript pruning.
     {%- if report.os_unattributed and report.os_unattributed.os_calls %}
-      {{ report.os_unattributed.os_calls }} of them
-      (~${{ '%.2f'|format(report.os_unattributed.os_cost_usd) }}) belong to no work order.
+      A further {{ report.os_unattributed.os_calls }}
+      (~${{ '%.2f'|format(report.os_unattributed.os_cost_usd) }}) belong to no work order
+      and are not in this figure.
     {%- endif %}
   </p>
   {% endif %}
@@ -150,16 +151,41 @@
   {% endif %}
 </div>
 
-{# The METER, FIRST: the sentence is the first thing read, not a row in a table (§10).
-   Absent rather than faked when it could not be built — see `cost_page`. #}
-{% if meter %}{% include "_meter.html" %}{% endif %}
-
-{# The DISTRIBUTION, above the listing: the listing says which order cost the most and
-   cannot say what normal looks like. Absent rather than faked when it could not be
-   built — see `cost_page`. #}
-{% if fleet %}{% include "_fleet_distribution.html" %}{% endif %}
-
+{# The orders FIRST: "where did it go" is this page's first question (io-82bcb830). #}
 <div class="panel table-wrap" style="margin-top: 14px;">
+  {% if units %}
+  {# Sums the cents the rows SHOW, so a reader's own addition lands here. Every headline
+     dollar is in a row, so the only gap possible is rounding. #}
+  {% set listed = units|map(attribute='total_cost_usd')|map('round', 2)|sum %}
+  {% set rounding = totals.total_cost_usd - listed %}
+  <div style="padding: 10px 16px;">
+    <p class="kv mono" style="margin: 0;">
+      <strong>{{ units|length }} order{{ 's' if units|length != 1 }} below add to
+      ${{ '%.2f'|format(listed) }}</strong>
+      {%- if '%.2f'|format(rounding|abs) != '0.00' %}
+        {{ '+' if rounding > 0 else '−' }} ${{ '%.2f'|format(rounding|abs) }} from rounding
+        each row to cents
+      {%- endif %}
+      = ~${{ '%.2f'|format(totals.total_cost_usd) }}, the headline above.
+    </p>
+    {% set unattributed = report.os_unattributed if report.os_unattributed and report.os_unattributed.os_calls %}
+    {% set outside = meter.outside if meter and meter.outside.sessions %}
+    {% if unattributed or outside %}
+    <p class="kv sub" style="margin: 4px 0 0;">
+      Not in that total:
+      {%- if unattributed %}
+        {{ unattributed.os_calls }} Jarvis call{{ 's' if unattributed.os_calls != 1 }} that
+        belong to no work order (~${{ '%.2f'|format(unattributed.os_cost_usd) }})
+      {%- endif %}
+      {{- ' ·' if unattributed and outside }}
+      {%- if outside %}
+        {{ outside.n }} session{{ 's' if outside.n != 1 }} Jarvis did not dispatch
+        (${{ '%.2f'|format(outside.total_usd) }}, listed under the meter)
+      {%- endif %}.
+    </p>
+    {% endif %}
+  </div>
+  {% endif %}
   <table class="cost-list">
   <tr><th>id</th><th>cost</th><th>order</th><th>state</th></tr>
   {% for u in units %}
@@ -168,7 +194,7 @@
     <td class="mono num" style="text-align: right; color: var(--ink);"
           title="Worker plus jarvis. {% if u.os_calls %}~${{ '%.2f'|format(u.os_cost_usd) }} of it is jarvis.{% endif %}">
       {%- if u.found %}${{ '%.2f'|format(u.total_cost_usd) }}
-      {%- elif u.os_calls %}${{ '%.2f'|format(u.os_cost_usd) }}+
+      {%- elif u.total_cost_usd %}${{ '%.2f'|format(u.total_cost_usd) }}+
       {%- else %}—{% endif -%}
     </td>
     {# A title is often a paragraph of user intent: clamped to one line, full text in
@@ -211,6 +237,13 @@
   {% endfor %}
   </table>
 </div>
+
+{# Absent rather than faked when it could not be built — see `cost_page`. #}
+{% if meter %}{% include "_meter.html" %}{% endif %}
+
+{# The listing says which order cost the most and cannot say what normal looks like.
+   Absent rather than faked when it could not be built — see `cost_page`. #}
+{% if fleet %}{% include "_fleet_distribution.html" %}{% endif %}
 
 {# Said on the page, not only in the docs: this figure is the only number on screen and
    a subscription user reading it as an invoice is the likeliest misreading. #}

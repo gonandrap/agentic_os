@@ -990,17 +990,38 @@ def test_the_promote_plan_route_lists_every_member_or_says_why_not(client, proje
     central = CentralStore()
     a = central.add_backlog("proj_a", "foundation")
     b = central.add_backlog("proj_a", "tower", depends_on=[a["id"]])
-    gone = central.add_backlog("proj_a", "gone")
-    central.mark_backlog(gone["id"], "dropped")
-    c = central.add_backlog("proj_a", "shed", depends_on=[gone["id"]])
+    held = central.add_backlog("proj_a", "held", status="quarantined")
+    c = central.add_backlog("proj_a", "shed", depends_on=[held["id"]])
 
     plan = client.get(f"/backlog/{b['id']}/promote-plan").json()["plan"]
     assert [(m["id"], m["title"], m["kind"], m["project"]) for m in plan] == [
         (a["id"], "foundation", "wo", "proj_a"), (b["id"], "tower", "wo", "proj_a")]
 
     r = client.get(f"/backlog/{c['id']}/promote-plan")
-    assert r.status_code == 409 and gone["id"] in r.json()["error"]
+    assert r.status_code == 409 and held["id"] in r.json()["error"]
     assert central.get_backlog(a["id"])["status"] == "open"  # a plan creates nothing
+
+
+def test_a_dead_dependency_is_shown_before_a_lone_promotion_goes_through(client, project):
+    central = CentralStore()
+    gone = central.add_backlog("proj_a", "gone")
+    central.mark_backlog(gone["id"], "dropped")
+    b = central.add_backlog("proj_a", "shed", depends_on=[gone["id"]])
+
+    plan = client.get(f"/backlog/{b['id']}/promote-plan").json()["plan"]
+    assert plan[-1]["dead_deps"] == [gone["id"]] and plan[-1]["waits_on"] == []
+    assert 'id="promote-dialog-dead"' in client.get("/backlog").text
+
+    # a failed plan fetch submits unconfirmed: the skip must still reach the user
+    r = client.post(f"/backlog/promote/{b['id']}", data={}, follow_redirects=False)
+    from urllib.parse import unquote
+    flash = unquote(r.headers["location"])
+    assert flash.startswith("/backlog?error=") and gone["id"] in flash
+    assert central.get_backlog(b["id"])["status"] == "open"
+
+    r = client.post(f"/backlog/promote/{b['id']}", data={"confirm": "1"}, follow_redirects=False)
+    assert r.headers["location"].startswith("/wo/proj_a/")
+    assert central.get_backlog(b["id"])["status"] == "promoted"
 
 
 # -- backlog filters and origins (2026-11-03-backlog-operability §6)
