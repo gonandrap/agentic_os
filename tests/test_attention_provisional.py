@@ -9,6 +9,7 @@ import pytest
 from jarvis import invariants, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
+from jarvis.neo_store import NeoStore
 from jarvis.project_store import ADDED_COLUMNS, ProjectStore
 
 REASON = "the helper is not idempotent on retry, so the second call double-counts"
@@ -71,9 +72,14 @@ def test_a_provisional_approval_at_needs_review_asks_nothing_and_its_control(
 
     assert assumptions_blocker(invariants.true_blockers(store, wo)) == []
 
-    store, plain, _ = order(started, verdict="")
+    store, spent, a = order(started, verdict="accept")
+    neo = NeoStore()
+    q = neo.ask("proj_a", spent["id"], "confirm", kind="assumption")
+    store.link_assumption_confirmation(a["id"], q["id"])
+    neo.mark(q["id"], "escalated", reason="not confirmed")
+    neo.close()
 
-    assert assumptions_blocker(invariants.true_blockers(store, plain)) == [
+    assert assumptions_blocker(invariants.true_blockers(store, spent)) == [
         "1 assumption pending your review"]
 
 

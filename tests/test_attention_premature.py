@@ -76,9 +76,9 @@ def test_neo_switched_off_is_not_an_opt_in(started, catalog_file, monkeypatch):
     assert store.get_work_order(wo["id"])["needs_attention"]
 
 
-@pytest.mark.parametrize("status", ["needs_review", "failed", "budget_exhausted"])
+@pytest.mark.parametrize("status", ["failed", "budget_exhausted"])
 def test_delivery_hands_the_decision_straight_back(started, catalog_file, status):
-    """NOT A SUPPRESSION THAT OUTLIVES THE TURN"""
+    """NOT A SUPPRESSION THAT OUTLIVES THE TURN; `needs_review` waits on Neo's ruling (io-ed253c2b)"""
     opt_in(catalog_file)
     store, wo = running(started)
     ops.assume(wo["id"], ROUTINE)
