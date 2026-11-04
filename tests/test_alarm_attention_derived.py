@@ -1,4 +1,4 @@
-"""An alarm's attention flag is derived: `true_blockers` and the flag agree in every status (io-d5e62d4d)"""
+"""An alarm's attention flag and `true_blockers` agree in every status (io-d5e62d4d)"""
 
 from __future__ import annotations
 

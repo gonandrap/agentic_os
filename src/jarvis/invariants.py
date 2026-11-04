@@ -1964,7 +1964,7 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
 
 
 def _unflagged_blocked_orders(store: ProjectStore) -> Iterator[tuple[dict[str, Any], list[str]]]:
-    """Each unflagged order and what it should say; a completed or cancelled one, its alarms only (io-d5e62d4d, Q3446)"""
+    """Unflagged orders and what each should say, settled ones only for an owed alarm"""
     # Every status `true_blockers` can derive for (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5c)
     statuses = OPEN_STATUSES + ("failed",)
     for wo in store.list_work_orders(statuses=statuses, include_hidden=True):
