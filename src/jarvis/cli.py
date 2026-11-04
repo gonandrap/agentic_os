@@ -4119,6 +4119,8 @@ def cmd_fo(args: argparse.Namespace) -> int:
             if detail["manager"]:
                 m = detail["manager"]
                 print(f"manager: {m['id']} ({m['status']})")
+                for a in m["pending_assumptions"]:
+                    print(f"  assumption #{a['n']} pending: {a['content']}")
             if detail["validation_rounds"]:
                 print("\nvalidation:")
                 for rnd in detail["validation_rounds"]:

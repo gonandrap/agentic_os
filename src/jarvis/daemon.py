@@ -49,6 +49,7 @@ from .project_store import (
     ProjectStore,
     kind_contract,
     resume_spends_slot,
+    turn_end_is_delivery,
     validation_hold_until,
 )
 
@@ -6246,10 +6247,12 @@ class Daemon:
 
         # Hidden orders are excluded by the default
         candidates: list[tuple[dict, list[dict], bool]] = []
-        for early, status in ((False, "needs_review"), (True, "running")):
+        for early, status in ((False, "needs_review"), (False, "idle"), (True, "running")):
             for wo in store.list_work_orders(statuses=(status,)):
                 if wo.get("kind") == "investigator":
                     # A diagnosis is not a submission and nothing is gated on it: §2.3 of...
+                    continue
+                if status == "idle" and not turn_end_is_delivery(wo):
                     continue
                 rows = store.all_assumptions(wo["id"])
                 if any(a["status"] == "pending"

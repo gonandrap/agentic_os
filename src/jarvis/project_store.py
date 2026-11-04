@@ -272,6 +272,16 @@ def kind_contract(wo: Mapping[str, Any]) -> KindContract:
     return WO_KIND_CONTRACTS[str(wo.get("kind") or "worker")]
 
 
+def settles_idle(wo: Mapping[str, Any]) -> bool:
+    """Does this kind idle between messages, never finishing?"""
+    return kind_contract(wo).route == SETTLE_IDLE
+
+
+def turn_end_is_delivery(wo: Mapping[str, Any]) -> bool:
+    """An idle manager has delivered: it never reaches `needs_review` (io-d5e62d4d)"""
+    return settles_idle(wo) and wo.get("status") == "idle"
+
+
 def submission_artifacts(wo: Mapping[str, Any]) -> tuple[str, ...]:
     """The file this kind's contract command consumes, as `landing.authored` excludes it"""
     artifact = kind_contract(wo).artifact
