@@ -9162,9 +9162,19 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
     verdict["classified_by"] = "investigator"
     verdict["filed"] = None
     filing_error = ""
-    if verdict["classification"] == "GAP":
+    tracker = bugreport.bug_repo()
+    if verdict["classification"] == "GAP" and verdict.get("owner") == "project":
+        spec = _spec_or_none(name)
+        tracker = follow_up_repo(spec.path if spec is not None else path,
+                                 spec.bugs.repo if spec is not None else "")
+        if not tracker:
+            # NEVER THE OS REPO: a project bug filed there is #1521
+            filing_error = (f"project {name!r} has no git `origin` and no `bugs.repo`, so "
+                            f"its tracker is unknown — set one with `jarvis config set "
+                            f"{name} bugs.repo <owner/name> --reason …`")
+    if verdict["classification"] == "GAP" and not filing_error:
         try:
-            duplicate = _verdict_duplicate(name, subject, verdict, fo)
+            duplicate = _verdict_duplicate(name, subject, verdict, fo, tracker)
         except Exception as e:  # noqa: BLE001 — an unreadable tracker is the §2.5 case
             filing_error = f"the duplicate check could not read the tracker: {e}"
             duplicate = ""
@@ -9174,6 +9184,24 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
             verdict["classification"] = "ALREADY_TRACKED"
             verdict["classified_by"] = "ops"
             verdict["duplicate_of"] = duplicate
+        elif not filing_error and verdict.get("owner") == "project":
+            # OFF THE OS BUG RAILS: no steward, no OS pickup — the project's own tracker
+            fix = verdict["proposed_fix"]
+            try:
+                url = bugreport.create_issue(fix["title"], bugreport.render_body(
+                    description=fix["description"], expected=fix["expected"],
+                    actual=fix["actual"], version=bugreport.jarvis_version(),
+                    project=name, wo_id=fo.get("plan_wo_id") or "",
+                    priority=fix["priority"]), tracker)
+            except Exception as e:  # noqa: BLE001 — same case as the OS filing below
+                filing_error = f"the bug could not be filed on {tracker}: {e}"
+            else:
+                verdict["filed"] = {
+                    "issue_url": url, "repo": tracker, "wo_id": None, "expedited": False,
+                    "neo_question_id": 0,
+                    "dispatch": f"filed on {name}'s tracker; work it with "
+                                f"`jarvis issues start {url}`",
+                }
         elif not filing_error:
             try:
                 filed = bugreport.report_bug(
@@ -9295,12 +9323,12 @@ def submitter_unsettled(what: str, order_id: str, wo_id: str, error: Exception) 
 
 
 def _verdict_duplicate(project: str, subject: str, verdict: dict[str, Any],
-                       fo: dict[str, Any]) -> str:
-    """What already covers this GAP — a tracker issue url or a live order id — or `""`"""
+                       fo: dict[str, Any], repo: str = "") -> str:
+    """What already covers this GAP — an issue url on `repo` (else the OS's) or a live order id — or `""`"""
     from . import bugreport, issues, search as search_mod
 
     title = (verdict.get("proposed_fix") or {}).get("title") or ""
-    repo = bugreport.bug_repo()
+    repo = repo or bugreport.bug_repo()
     if title:
         for row in issues.issues_mentioning(repo, title):
             return str(row["url"])

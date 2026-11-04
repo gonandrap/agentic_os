@@ -46,6 +46,12 @@ FORBIDDEN_FIELDS: dict[str, tuple[str, ...]] = {
 PROPOSED_FIX_FIELDS = ("title", "description", "expected", "actual", "priority",
                        "detector", "remedy")
 
+#: Whose defect a GAP is: the OS's (OS tracker, OS bug rails) or the subject project's own
+OWNERS = ("os", "project")
+
+#: `proposed_fix` fields only an OS-owned GAP owes: a project's bug is not an OS mechanism
+OS_ONLY_FIX_FIELDS = ("detector", "remedy")
+
 #: What `duplicate_of` may name: a tracker issue (`#n` or a URL) or an order id
 _DUPLICATE_RE = re.compile(r"^(?:#\d+|https?://\S+|(?:wo|fo|io|inv)-[0-9a-f]+)$")
 
@@ -146,10 +152,22 @@ def _payload(classification: str, raw: dict[str, Any],
                 f"a {classification} verdict must not carry `{name}` — "
                 f"{_why_forbidden(classification, name)}"
             )
+    if classification == "GAP":
+        owner = str(raw.get("owner") or "").strip()
+        if owner not in OWNERS:
+            problems.append(
+                f"a GAP verdict must carry `owner`, one of {', '.join(OWNERS)}, got "
+                f"{owner!r} — `os` files on the OS tracker, `project` on the subject "
+                f"project's own tracker")
+        out["owner"] = owner
+    elif raw.get("owner"):
+        problems.append(f"a {classification} verdict must not carry `owner` — only a GAP "
+                        f"files anything, so only a GAP has an owner")
     for name in REQUIRED_FIELDS[classification]:
         value = raw.get(name)
         if name == "proposed_fix":
-            out["proposed_fix"] = _parse_fix(value, problems)
+            out["proposed_fix"] = _parse_fix(value, problems,
+                                             os_owned=out.get("owner") != "project")
         elif name == "unsticks":
             out["unsticks"] = _parse_unsticks(value, problems)
         elif name == "duplicate_of":
@@ -197,17 +215,19 @@ def _why_forbidden(classification: str, name: str) -> str:
     return "nothing is owed by the user here, or the classification is WAITING_ON_USER"
 
 
-def _parse_fix(raw: Any, problems: list[str]) -> dict[str, str]:
+def _parse_fix(raw: Any, problems: list[str], *, os_owned: bool = True) -> dict[str, str]:
     """The bug report a GAP verdict names"""
+    fields = PROPOSED_FIX_FIELDS if os_owned else tuple(
+        f for f in PROPOSED_FIX_FIELDS if f not in OS_ONLY_FIX_FIELDS)
     if not isinstance(raw, dict):
         problems.append(
             f"a GAP verdict must carry `proposed_fix`, an object with "
-            f"{', '.join(PROPOSED_FIX_FIELDS)} — ops files it as a bug, and "
+            f"{', '.join(fields)} — ops files it as a bug, and "
             f"nothing else in the verdict says what to file"
         )
         return {}
     out: dict[str, str] = {}
-    for name in PROPOSED_FIX_FIELDS:
+    for name in fields:
         value = str(raw.get(name) or "").strip()
         if not value:
             problems.append(
@@ -284,8 +304,10 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
     """One verdict as lines a human reads: the decision first, then the argument"""
     lines = [
         f"  classification: {verdict.get('classification', '')}"
+        + (f" (owner: {verdict['owner']})" if verdict.get("owner") else "")
         + (f" [{verdict['gap_class']}"
            + ("" if gaps.registered(str(verdict['gap_class']))
+              or verdict.get("owner") == "project"
               else ", not registered — the fix order owes a detector and a remedy")
            + "]" if verdict.get("gap_class") else "")
         + (f" (ops: submitted as {verdict['submitted_classification']})"
@@ -311,9 +333,8 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
         lines += [f"  proposed fix: {fix.get('title', '')}",
                   f"    expected: {fix.get('expected', '')}",
                   f"    actual: {fix.get('actual', '')}",
-                  f"    priority: {fix.get('priority', '')}",
-                  f"    detector: {fix.get('detector', '')}",
-                  f"    remedy: {fix.get('remedy', '')}"]
+                  f"    priority: {fix.get('priority', '')}"]
+        lines += [f"    {name}: {fix[name]}" for name in OS_ONLY_FIX_FIELDS if fix.get(name)]
     evidence = verdict.get("evidence") or []
     if evidence:
         lines.append("  evidence:")
