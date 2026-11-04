@@ -17,6 +17,9 @@ from .paths import project_db_path
 
 log = logging.getLogger(__name__)
 
+#: Not `failed`: `wo retry` can resume that order, and its question with it (io-d5e62d4d)
+QUESTION_LAPSING_STATUSES = ("completed", "cancelled")
+
 # Work order lifecycle
 WO_STATUSES = (
     "pending",       # created, waiting for the project orchestrator to pick it up
@@ -2158,7 +2161,7 @@ class ProjectStore:
                 "order_kind='wo' ORDER BY ts DESC, id DESC LIMIT 1", (wo_id,)).fetchone()
             assert tail is not None and tail["to_status"] == status, (
                 f"{wo_id} moved to {status!r} without a span beside it")
-        if status in ("completed", "cancelled"):
+        if status in QUESTION_LAPSING_STATUSES:
             try:
                 self.lapse_open_questions(wo_id, status)
             except Exception:  # noqa: BLE001 — a close never fails on Neo's DB; INV-NEO-QUESTION-LAPSED repairs it

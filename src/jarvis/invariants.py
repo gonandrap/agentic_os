@@ -2114,6 +2114,7 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
 def check_open_questions_lapse(store: ProjectStore) -> Iterator[Violation]:
     """INV-NEO-QUESTION-LAPSED — an ended order's worker question must not stay open (io-d5e62d4d)"""
     from .neo_store import LAPSABLE_Q_STATUSES, NeoStore
+    from .project_store import QUESTION_LAPSING_STATUSES
 
     readonly = getattr(store, "readonly", False)
     neo = NeoStore()
@@ -2128,7 +2129,7 @@ def check_open_questions_lapse(store: ProjectStore) -> Iterator[Violation]:
             wo = store.get_work_order(q["wo_id"])
         except KeyError:
             continue  # another project's order: Neo's store is OS-wide
-        if wo["status"] not in TERMINAL_STATUSES:
+        if wo["status"] not in QUESTION_LAPSING_STATUSES:
             continue
         # `_ReadOnly` swallows this write
         store.lapse_open_questions(wo["id"], str(wo["status"]))

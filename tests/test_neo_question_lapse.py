@@ -58,7 +58,10 @@ def test_a_failed_order_keeps_its_question_open(store, neo):
 
     store.set_status(wo["id"], "failed")
 
+    violations = check_project(store, repair=True)
+
     assert neo.get(qid)["status"] == "escalated"
+    assert [v for v in violations if v.invariant == "INV-NEO-QUESTION-LAPSED"] == []
 
 
 def test_a_late_answer_is_refused_plainly_and_teaches_nothing(store, neo):
