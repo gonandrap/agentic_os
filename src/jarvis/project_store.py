@@ -2257,6 +2257,20 @@ class ProjectStore:
             (kind,)).fetchone()
         return dict(row) if row else None
 
+    def standing_alarms(self, kind: str, gap_seconds: float) -> list[dict[str, Any]]:
+        """One kind's rows still chained to now, OLDEST first (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)"""
+        rows = self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE kind=? ORDER BY ts DESC", (kind,)).fetchall()
+        chain: list[dict[str, Any]] = []
+        later = db.now()
+        for row in rows:
+            if later - float(row["ts"] or 0.0) >= gap_seconds:
+                break
+            chain.append(dict(row))
+            later = float(row["ts"] or 0.0)
+        chain.reverse()
+        return chain
+
     def latest_settled_order(self) -> dict[str, Any] | None:
         """The most recently settled work order, as a CARRIER and nothing more"""
         row = self.conn.execute(

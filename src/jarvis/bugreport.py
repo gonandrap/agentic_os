@@ -336,7 +336,8 @@ AGENT_EXPEDITE_NOTE = ("--expedite ignored: filed from a work-order session, so 
 def report_bug(*, title: str, description: str, expected: str, actual: str,
                priority: str = "", steps: str = "", project: str = "",
                wo_id: str = "", expedite: bool = False,
-               investigation: dict[str, str] | None = None) -> dict[str, Any]:
+               investigation: dict[str, str] | None = None,
+               filed_by: str = "", notify: bool = True) -> dict[str, Any]:
     """File a Jarvis OS bug, put it on the OS's rails, and tell the user about it"""
     from .issues import checked_priority
 
@@ -371,7 +372,8 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
             raise BugReportError(
                 f"this break is already filed as {existing}, and the evidence could "
                 f"not be added there ({e}) — retry the report") from e
-        _notify(project, title, existing, version, wo_id, heading="Bug evidence added")
+        if notify:
+            _notify(project, title, existing, version, wo_id, heading="Bug evidence added")
         out = {"url": existing, "duplicate_of": existing, "title": title, "repo": repo,
                "version": version, "project": project, "wo_id": wo_id, "pickup": {}}
         if note:
@@ -381,8 +383,9 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
     # Between creating the issue and telling anyone about it (#240)
     pickup = _route(url, title, body, priority, expedite=expedite,
                     investigation=investigation,
-                    filed_by=os.environ.get("JARVIS_WO_ID", ""))
-    _notify(project, title, url, version, wo_id, pickup)
+                    filed_by=filed_by or os.environ.get("JARVIS_WO_ID", ""))
+    if notify:
+        _notify(project, title, url, version, wo_id, pickup)
     out = {"url": url, "title": title, "repo": repo, "version": version,
            "project": project, "wo_id": wo_id, "pickup": pickup}
     if note:

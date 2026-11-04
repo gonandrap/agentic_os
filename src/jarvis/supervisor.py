@@ -555,6 +555,36 @@ BLOCKED_SENTENCES = {
 }
 
 
+def _machine_wide(alarm: dict[str, Any]) -> bool:
+    """A meter alarm describes the machine; its work order only carries the row"""
+    from .daemon import METER_INBOX_TITLE
+
+    return alarm.get("kind") in METER_INBOX_TITLE
+
+
+def _standing_lines(pstore: Any, alarm: dict[str, Any], cfg: Any) -> list[str]:
+    """Earlier occurrences and their verdicts (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)"""
+    from .daemon import METER_DIAGNOSTIC_ROWS, METER_STANDING_GAP_SECONDS
+
+    if not _machine_wide(alarm):
+        return []
+    now = db.now()
+    chain = pstore.standing_alarms(str(alarm["kind"]), METER_STANDING_GAP_SECONDS)
+    prior = [r for r in chain if float(r["ts"] or 0.0) < float(alarm.get("ts") or 0.0)]
+    lines = ["# This standing condition",
+             "It describes the whole machine: the work order below only carries the row "
+             "and cannot explain it.",
+             f"occurrence {len(prior) + 1}"]
+    if prior:
+        lines[-1] += f", first seen {_for(now - float(prior[0]['ts'] or now))} ago"
+    for row in prior[-METER_DIAGNOSTIC_ROWS:]:
+        verdict = row.get("verdict") or row.get("status")
+        lines.append(f"- {_for(now - float(row['ts'] or now))} ago: "
+                     f"{_clip(str(row.get('reason') or ''), cfg.reason_chars)} — verdict "
+                     f"{verdict}: {_clip(str(row.get('verdict_reason') or ''), cfg.reason_chars)}")
+    return lines
+
+
 def build_evidence(pstore: Any, subject: dict[str, Any],
                    alarm: dict[str, Any] | None,
                    cfg: Any = None, inspect_cfg: Any = None) -> str:
@@ -580,6 +610,9 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
             f"reason: {alarm.get('reason')}",
             f"{raised}, {minutes:.0f} minute(s) ago",
         ])
+        standing = _standing_lines(pstore, alarm, cfg)
+        if standing:
+            sections.append(standing)
 
     row = subject["row"]
     if subject["kind"] == "feature_order":
@@ -1017,6 +1050,16 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
         pstore.update_alarm(alarm_id, status="failed",
                             verdict_reason=verdict["reason"], decided_at=decided)
         log.warning("supervisor review of %s failed: %s", alarm_id, verdict["reason"])
+        return
+
+    if _machine_wide(alarm):
+        # Recorded for the next occurrence's packet: the user heard at the raise, and the carrier is innocent
+        pstore.update_alarm(alarm_id, status="acked", verdict=verdict["decision"],
+                            verdict_reason=verdict["reason"], note=verdict.get("note") or "",
+                            decided_at=decided)
+        pstore.add_event(wo["id"], "alarm_reviewed",
+                         {"alarm_id": alarm_id, "verdict": verdict["decision"],
+                          "reason": verdict["reason"], "note": verdict.get("note") or ""})
         return
 
     if verdict["decision"] == "escalate":
