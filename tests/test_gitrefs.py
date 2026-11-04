@@ -63,8 +63,8 @@ def test_the_refresh_is_cached_per_repo_until_it_is_forced(clone, origin):
 
 def test_a_clone_that_cannot_reach_origin_still_answers_and_reports_the_failure(origin):
     assert [t["tag"] for t in release_view.tags(origin)] == ["jarvis-0.1.0"]
-    last = gitrefs.last_refresh(origin)
-    assert last is not None and not last.ok and last.error
+    failed = gitrefs.refresh(origin)
+    assert not failed.ok and failed.error
 
 
 def test_tags_containing_forces_a_fetch_past_a_cached_refresh(clone, origin):
@@ -73,6 +73,21 @@ def test_tags_containing_forces_a_fetch_past_a_cached_refresh(clone, origin):
     _tag_on_a_release_branch(origin, "jarvis-0.2.0")
     found, detail = release.tags_containing(clone, [sha])
     assert "jarvis-0.2.0" in found, detail
+
+
+def test_a_fetch_failure_names_no_token_the_remote_url_carried(tmp_path):
+    repo = tmp_path / "tokened"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "remote", "add", "origin",
+         "https://x-access-token:SECRET@127.0.0.1:1/o/r.git")
+    error = gitrefs.refresh(repo).error
+    assert error and "SECRET" not in error
+
+
+def test_scrub_redacts_the_userinfo_of_a_url_git_does_print_back():
+    assert gitrefs.scrub("fatal: https://x-access-token:SECRET@github.com/o/r.git gone") == (
+        "fatal: https://<redacted>@github.com/o/r.git gone")
 
 
 def test_fetch_ref_refuses_a_ref_that_is_not_a_ref_name(clone):
@@ -85,7 +100,7 @@ def test_fetch_ref_brings_one_branch_down_and_counts_as_no_tag_refresh(clone, or
     _tag_on_a_release_branch(origin, "jarvis-0.2.0")
     assert gitrefs.fetch_ref(clone, "origin/main")
     assert _git(clone, "log", "-1", "--format=%s", "origin/main").strip() == "second"
-    assert gitrefs.last_refresh(clone) is None
+    assert [t["tag"] for t in release_view.tags(clone)][0] == "jarvis-0.2.0"
 
 
 def test_previous_tag_refuses_to_guess_at_a_tag_the_clone_does_not_have(clone):

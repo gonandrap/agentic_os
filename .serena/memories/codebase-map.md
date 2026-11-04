@@ -150,8 +150,8 @@
   `Daemon.poll_pull_requests` — see `mem:work-order-lifecycle`.
 - `gitrefs.py` — the only place the OS refreshes a clone from origin (io-c1bbfff4).
   `refresh(repo, force=)` fetches `--tags --force origin` at most once per repo per `TTL`
-  (300s, success AND failure cached) and returns `Refresh(ok, ts, error)`; `last_refresh()`
-  is what a page states as provenance; `read(repo, *args)` refreshes, then runs git with
+  (300s, success AND failure cached) and returns `Refresh(ok, ts, error)` — during the TTL a
+  reader gets the refs the clone has, stale, never an error; `read(repo, *args)` refreshes, then runs git with
   `check=True` (`release_view._git`, `morpheus._git` are this); `fetch_ref(repo, *refs)`
   brings named refs only — `REF_RE`-checked, no tags, so it is never the repo's refresh
   (`landing._fetch_ref`, `branchproof.fetch`). `release.tags_containing` passes

@@ -15,6 +15,9 @@ log = logging.getLogger("jarvis.gitrefs")
 #: A ref BECOMES AN ARGUMENT, and one of the callers passes `baseRefName` as GitHub answered it
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
+#: A token sits in the remote URL git prints back, so scrub BEFORE truncating
+_CREDENTIALS_RE = re.compile(r"://[^/\s@]+@")
+
 #: Same ceiling as `branchproof.GIT_TIMEOUT` for one named ref; a tag refresh may walk more
 FETCH_TIMEOUT = 60
 
@@ -33,6 +36,11 @@ class Refresh:
 _LAST: dict[str, Refresh] = {}
 
 
+def scrub(text: str) -> str:
+    """`text` with any URL userinfo replaced"""
+    return _CREDENTIALS_RE.sub("://<redacted>@", text)
+
+
 def env() -> dict[str, str]:
     """`git` with nothing of the user's configuration and NOTHING INTERACTIVE"""
     return {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "true",
@@ -44,13 +52,8 @@ def forget(repo: Path | None = None) -> None:
     _LAST.pop(str(repo), None) if repo is not None else _LAST.clear()
 
 
-def last_refresh(repo: Path) -> Refresh | None:
-    """The last refresh of `repo` in this process, or None if nothing refreshed it yet"""
-    return _LAST.get(str(repo))
-
-
 def refresh(repo: Path, *, force: bool = False) -> Refresh:
-    """Bring `repo`'s branches and tags down from origin, at most once per `TTL` unless forced"""
+    """Branches and tags down from origin, at most once per `TTL` — failure cached too"""
     cached = _LAST.get(str(repo))
     if not force and cached and time.time() - cached.ts < TTL:
         return cached
@@ -89,7 +92,7 @@ def _fetch(repo: Path, *args: str) -> str:
                               capture_output=True, text=True, errors="replace",
                               timeout=FETCH_TIMEOUT, env=env())
     except (OSError, subprocess.SubprocessError) as exc:
-        return f"{type(exc).__name__}: {exc}"[:200]
+        return scrub(f"{type(exc).__name__}: {exc}")[:200]
     return "" if proc.returncode == 0 else (
-        (proc.stderr or proc.stdout).strip().replace("\n", " ")[:200]
+        scrub((proc.stderr or proc.stdout).strip().replace("\n", " "))[:200]
         or f"git fetch exited {proc.returncode}")

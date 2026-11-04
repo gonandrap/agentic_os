@@ -29,9 +29,6 @@ FRESH_FOR_SECONDS = 7 * 24 * 3600
 #: How many work orders one landing sweep may ask GitHub about
 REFRESH_PER_SWEEP = 25
 
-#: URL userinfo — `https://x-access-token:TOKEN@github.com/…`
-_CREDENTIALS_RE = re.compile(r"://[^/\s@]+@")
-
 #: A GitHub pull-request URL sitting in prose (#232)
 PR_URL_RE = re.compile(r"https?://[^\s<>()\[\]\"']*?/pull/\d+")
 
@@ -305,9 +302,8 @@ def judge(wo_id: str, pr_url: str, state: str) -> Landing:
 
 # --------------------------------------------------------------------------- internals
 
-def _scrub(text: str) -> str:
-    """`text` with any URL userinfo replaced"""
-    return _CREDENTIALS_RE.sub("://<redacted>@", text)
+#: The in-module name, unchanged: every existing call site reads `_scrub`
+_scrub = gitrefs.scrub
 
 
 def _git(repo: Path, *args: str) -> str | None:
