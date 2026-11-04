@@ -90,7 +90,7 @@ jarvis gate list [--pending] / show <id>   # privileged-action approvals; Neo de
 jarvis gate approve|deny <id> --reason "…" # decide an escalated gate
 jarvis gate dismiss <id> --reason "…"      # NOT a gated action (classifier false positive); never approve/deny those
 jarvis gate rules / explain "<command>" / rule-retract <id> --reason "…"
-jarvis neo list / review <qid> [--correct "…"] / answer <qid> "…"
+jarvis neo list [--status s] / review <qid> [--correct "…"] / answer <qid> "…"
 jarvis neo learnings [--project p] / stats [--project p] [--days n]
 jarvis neo retract <id> --reason "…"       # retire a ruling the user has reversed
 jarvis inbox / jarvis inbox ack [id]

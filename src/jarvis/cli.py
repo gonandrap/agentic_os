@@ -1841,10 +1841,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="render with this work order's real ids")
 
     # neo
+    from .neo_store import Q_STATUSES
+
     ne = sub.add_parser("neo", help="Neo: the OS answerer agent (answers workers as you)"
                         ).add_subparsers(dest="neo_cmd", required=True)
     n = ne.add_parser("list", help="questions Neo has handled or is handling")
-    n.add_argument("--all", action="store_true", help="include reviewed items")
+    n.add_argument("--all", action="store_true",
+                   help="include reviewed items (newest 200; --status has no cap)")
+    n.add_argument("--status", action="append", choices=Q_STATUSES,
+                   help="only this status, every row; repeatable")
     n = ne.add_parser("show", help="one question with Neo's full answer")
     n.add_argument("question_id", type=int)
     n.add_argument("--panel", action="store_true",
@@ -5674,6 +5679,7 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     print(f"  still open        {q['open']}")
     print(f"  superseded        {q['superseded']}  (decided elsewhere, out of the rate)")
     print(f"  refined           {q['refined']}  (returned to the asker to split, out of the rate)")
+    print(f"  lapsed            {q['lapsed']}  (its order ended first, out of the rate)")
     print(f"  escalation rate   {_pct(q['escalation_rate'])}  "
           f"(over settled questions only)")
     # Its own figure, never blended into the escalation rate: a crash is not a decision
@@ -5917,25 +5923,31 @@ def cmd_brief(args: argparse.Namespace) -> int:
 
 def cmd_neo(args: argparse.Namespace) -> int:
     from . import ops
-    from .neo_store import NeoStore
+    from .neo_store import OPEN_Q_STATUSES, NeoStore
 
     if args.neo_cmd == "list":
         neo = NeoStore()
         try:
-            qs = neo.list_questions()
+            if args.status:
+                qs = neo.list_questions(statuses=tuple(args.status), limit=-1)
+            elif args.all:
+                qs = neo.list_questions()
+            else:
+                # Open rows uncapped: the newest 200 of everything hid older escalations (io-d5e62d4d)
+                # `answered_by == "neo"` matches NeoStore.counts
+                qs = sorted(
+                    [*neo.list_questions(statuses=OPEN_Q_STATUSES, limit=-1),
+                     *(q for q in neo.list_questions(statuses=("answered",),
+                                                     review_status="unreviewed")
+                       if q["answered_by"] == "neo")],
+                    key=lambda q: q["ts"], reverse=True)
         finally:
             neo.close()
-        if not args.all:
-            # `answered_by == "neo"` matches NeoStore.counts
-            qs = [q for q in qs
-                  if q["status"] in ("queued", "answering", "escalated", "failed")
-                  or (q["status"] == "answered" and q["review_status"] == "unreviewed"
-                      and q["answered_by"] == "neo")]
         if args.json:
             _print(qs, True)
         else:
             icon = {"queued": "⏳", "answering": "🤔", "answered": "💬",
-                    "escalated": "🙋", "failed": "❌"}
+                    "escalated": "🙋", "failed": "❌", "lapsed": "⌛"}
             # `failed` RENDERS AS `unreachable`
             label = {"failed": "unreachable — NOT judged"}
             for q in qs:

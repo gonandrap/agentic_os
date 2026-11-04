@@ -360,6 +360,8 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "question_asked":
         # Never the text, with or without an id: the conversation renders the ask from this same payload
         return "Worker asked a question", ""
+    if kind == "question_lapsed":
+        return f"Neo question {p.get('question_id')} lapsed", p.get("reason") or ""
     # Debug (see DEBUG_KINDS); they still render, with no detail, when asked for
     if kind == "neo_answered":
         return "Neo answered the worker", ""
