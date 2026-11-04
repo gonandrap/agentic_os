@@ -16,8 +16,8 @@ EVENT = "background_orphaned"
 #: `wo_messages.source` for the note a resume carries
 SOURCE = "background-orphan"
 
-#: The tool that kills a background job
-KILL_TOOL = "KillShell"
+#: The tools that kill a background job; no notification follows either
+KILL_TOOLS = ("KillShell", "TaskStop")
 
 #: The tools that poll one (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)
 POLL_TOOL = ("BashOutput", "TaskOutput")
@@ -88,21 +88,56 @@ def jobs_left_running(session_id: str, *, since: float, until: float,
                       index: dict[str, list[Path]] | None = None,
                       root: Path | None = None) -> list[Job]:
     """The transcript half, with no store in it — spec §2's table, in order"""
-    if index is None:
-        index = usage.index_sessions(root)
     launched: dict[str, dict[str, Any]] = {}  # tool_use id -> its input
     polls: dict[str, str] = {}                # tool_use id -> the job it polled
     jobs: dict[str, Job] = {}
     collected: set[str] = set()
+    for row in _rows_between(session_id, since, until, index, root):
+        _scan_calls(row, launched, polls, collected)
+        _scan_results(row, launched, polls, jobs, collected)
+        collected |= _notified(row)
+    return [job for job_id, job in jobs.items() if job_id not in collected]
+
+
+def live_tasks(session_id: str, *, since: float,
+               index: dict[str, list[Path]] | None = None,
+               root: Path | None = None) -> list[str]:
+    """Ids of the background tasks started since `since` whose result has not arrived (issue 1562)"""
+    started: list[str] = []
+    polls: dict[str, str] = {}
+    collected: set[str] = set()
+    for row in _rows_between(session_id, since, float("inf"), index, root):
+        _scan_calls(row, {}, polls, collected)
+        _scan_results(row, {}, polls, {}, collected)
+        collected |= _notified(row)
+        task_id = _started_task(row)
+        if task_id:
+            started.append(task_id)
+    return [task_id for task_id in started if task_id not in collected]
+
+
+def _rows_between(session_id: str, since: float, until: float,
+                  index: dict[str, list[Path]] | None,
+                  root: Path | None) -> Iterator[dict[str, Any]]:
+    if index is None:
+        index = usage.index_sessions(root)
     for path in sorted(index.get(session_id) or []):
         for row in usage.rows(path):
             stamp = usage.parse_stamp(row.get("timestamp"))
-            if stamp and not since <= stamp <= until:
-                continue
-            _scan_calls(row, launched, polls, collected)
-            _scan_results(row, launched, polls, jobs, collected)
-            collected |= _notified(row)
-    return [job for job_id, job in jobs.items() if job_id not in collected]
+            if not stamp or since <= stamp <= until:
+                yield row
+
+
+def _started_task(row: dict[str, Any]) -> str:
+    """The task this tool result started, from each tool's own shape: Agent, Bash, Monitor"""
+    outcome = row.get("toolUseResult")
+    if not isinstance(outcome, dict):
+        return ""
+    if outcome.get("isAsync"):
+        return str(outcome.get("agentId") or "")
+    # `taskId` alone is not enough: TaskUpdate's result has one too
+    return str(outcome.get("backgroundTaskId")
+               or (outcome.get("taskId") if "timeoutMs" in outcome else "") or "")
 
 
 def _scan_calls(row: dict[str, Any], launched: dict[str, dict[str, Any]],
@@ -118,7 +153,7 @@ def _scan_calls(row: dict[str, Any], launched: dict[str, dict[str, Any]],
         job_id = next((str(params[key]) for key in JOB_ID_PARAMS if params.get(key)), "")
         if not job_id:
             continue
-        if name == KILL_TOOL:
+        if name in KILL_TOOLS:
             collected.add(job_id)
         elif name in POLL_TOOL:
             polls[call_id] = job_id
@@ -168,7 +203,8 @@ def _notified(row: dict[str, Any]) -> set[str]:
         if "<task-notification>" not in text:
             continue
         status = _STATUS.search(text)
-        if status and status.group(1).lower() == RUNNING:
+        # No status is a Monitor event: the monitor is still going
+        if not status or status.group(1).lower() == RUNNING:
             continue
         done |= {found.group(1) for found in _TASK_ID.finditer(text)}
     return done

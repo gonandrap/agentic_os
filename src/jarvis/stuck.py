@@ -22,6 +22,9 @@ IDLE_MANAGER_CAUSE = "its feature's next message"
 #: §1 of docs/superpowers/specs/2026-10-14-a-worker-turn-in-flight-is-not-stuck.md
 TURN_IN_FLIGHT_CAUSE = "a worker turn is in flight"
 
+#: Issue 1562
+BACKGROUND_TASK_CAUSE = "a background task its worker launched"
+
 #: Issue 1556
 TOOL_CALL_CAUSE = "a tool call in flight"
 
@@ -52,6 +55,10 @@ EXCLUSION_REASON: Mapping[str, str] = {
                            "timeline while its tools run — its transcript is still "
                            "moving, so nothing is judged until it falls silent past the "
                            "threshold"),
+    BACKGROUND_TASK_CAUSE: ("the worker is waiting for a background task it launched, whose "
+                            "result wakes it, and that wait writes nothing to the record — "
+                            "nothing is judged until the result lands; a task that crashed "
+                            "reads as live until the turn's own stall limit"),
     TOOL_CALL_CAUSE: ("a worker turn is executing a tool call and nothing is written "
                       "until that call returns, so silence says nothing about it — "
                       "nothing is judged until it returns or the turn reaches the "

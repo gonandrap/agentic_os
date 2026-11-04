@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -2076,6 +2077,82 @@ def test_a_live_turn_buys_no_investigation(stuck_os):
     assert row["verdict"].excluded == stuck.TURN_IN_FLIGHT_CAUSE
     assert row["verdict"].stuck is False
     assert abs(row["verdict"].active_seconds - 60) < 60
+
+
+def _waiting_on(store, root, wo, *rows_after, task="blh1dirur", started):
+    """Issue 1562: a turn that launched a task and ended; back-dated, or no fix is needed to pass"""
+    session = f"sess-{wo['id']}"
+    store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?", (session, wo["id"]))
+    store.conn.commit()
+    running_turn(store, wo["id"], started=started)
+    stamp = datetime.fromtimestamp(started + 1, timezone.utc).isoformat()
+    launch = {"type": "user", "timestamp": stamp,
+              "toolUseResult": {"stdout": "", "backgroundTaskId": task}}
+    directory = root / "-elsewhere"
+    directory.mkdir(exist_ok=True)
+    (directory / f"{session}.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in (launch, *rows_after)))
+
+
+def _reported(when, task="blh1dirur"):
+    return {"type": "queue-operation",
+            "timestamp": datetime.fromtimestamp(when, timezone.utc).isoformat(),
+            "content": (f"<task-notification>\n<task-id>{task}</task-id>\n"
+                        "<status>completed</status>\n</task-notification>")}
+
+
+@pytest.fixture()
+def transcripts(tmp_path, monkeypatch):
+    from jarvis import usage
+
+    where = tmp_path / "transcripts"
+    where.mkdir()
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(where))
+    return where
+
+
+def test_a_worker_waiting_on_a_background_task_buys_no_investigation(stuck_os, transcripts):
+    """Issue 1562: wo-b7cffb11, 8m03s silent on a test run it launched"""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    now = db.now()
+    waiting = ops.create_work_order("proj_a", "waiting on its test run")
+    at = park_order(store, waiting["id"], "running", hours=0.2)
+    _waiting_on(store, transcripts, waiting, started=at)
+    # The negative control: parked the same, a turn row, and no live task
+    wedged = ops.create_work_order("proj_a", "the task reported and nothing happened")
+    at = park_order(store, wedged["id"], "running", hours=0.2)
+    _waiting_on(store, transcripts, wedged, _reported(at + 2), started=at)
+
+    stuck_os["daemon"].stuck_tick(None)
+
+    assert not ops.live_investigation("proj_a", waiting["id"])
+    assert ops.live_investigation("proj_a", wedged["id"])
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == waiting["id"]][0]
+    assert row["verdict"].stuck is False
+    assert row["verdict"].excluded == stuck.BACKGROUND_TASK_CAUSE
+    assert row["verdict"].reason == stuck.EXCLUSION_REASON[stuck.BACKGROUND_TASK_CAUSE]
+
+
+def test_a_background_task_excuses_only_a_running_order_inside_the_stall_limit(
+        stuck_os, transcripts):
+    """Issue 1562: `needs_review` is the user's wait; TURN_STALL_SECONDS stays the backstop"""
+    store = stuck_os["store"]
+    now = db.now()
+    review = ops.create_work_order("proj_a", "a turn row while in review")
+    at = park_order(store, review["id"], "needs_review", hours=5)
+    _waiting_on(store, transcripts, review, started=at)
+    stalled = ops.create_work_order("proj_a", "13 hours on one task")
+    at = park_order(store, stalled["id"], "running", hours=13)
+    _waiting_on(store, transcripts, stalled, started=at)
+
+    rows = {r["wo"]["id"]: r["verdict"] for r in _judged(store, now)}
+
+    for wo in (review, stalled):
+        assert rows[wo["id"]].excluded == ""
+        assert rows[wo["id"]].stuck is True
+    assert "past the point the OS" in rows[stalled["id"]].reason
 
 
 def test_a_tool_call_in_flight_past_the_threshold_is_not_stuck():
