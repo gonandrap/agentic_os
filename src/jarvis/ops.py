@@ -1409,7 +1409,9 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
     wo_id = wo["id"]
     round_note = invariants.parallel_round_note(store, wo_id)
     pending = store.pending_assumptions(wo_id)
-    if turn_end_is_delivery(wo):
+    if wo["status"] == "needs_review":
+        pending = invariants.assumptions_owed_to_user(store, wo)
+    elif turn_end_is_delivery(wo):
         pending = invariants.assumptions_left_with_user(store, wo, pending)
     turn = store.latest_turn(wo_id)
     working = (turn is not None and turn["state"] == "running"
@@ -1444,10 +1446,12 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
                           f"`gates.case_ttl_seconds` timer"}
     question = awaiting_neo(wo_id)
     # The worker's own escalated question on an order parked for review falls through to the status arm:... (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
+    # A Neo-held assumption question is no worker's next turn: the assumptions_with_neo arm says it
     outranked = (question is not None
-                 and question["status"] in USER_HELD_Q_STATUSES
-                 and question["kind"] == "question"
-                 and wo["status"] == "needs_review")
+                 and wo["status"] == "needs_review"
+                 and question["kind"] == ("question"
+                                          if question["status"] in USER_HELD_Q_STATUSES
+                                          else "assumption"))
     if question is not None and not outranked:
         if question["status"] in USER_HELD_Q_STATUSES:
             return {"what": "neo_escalated", "stalled": False,
@@ -1511,6 +1515,10 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
         return {"what": "failed", "stalled": False,
                 "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
                           f"relaunches it in the same session; nothing is running to nudge"}
+    if wo["status"] == "needs_review" and reviews_assumptions(store, wo):
+        return {"what": "assumptions_with_neo", "stalled": False,
+                "detail": "Neo is reviewing its assumptions — each is settled by itself "
+                          "or comes to you once Neo has ruled"}
     if wo["status"] in ("completed", "cancelled", "waiting_pr_merge",
                         "needs_review"):
         return {"what": wo["status"], "stalled": False,
@@ -2237,7 +2245,7 @@ def _disagreements(blocker: dict[str, Any], needs_you: list[str]) -> list[str]:
 FIX_NOTHING_TO_CLEAR: tuple[str, ...] = (
     "turn_running", "validating", "retry_pending", "neo_question", "gate_with_neo",
     "queued_message", "pending", "manager_idle", "completed", "cancelled", "failed",
-    "waiting_pr_merge", "needs_review",
+    "waiting_pr_merge", "needs_review", "assumptions_with_neo",
 )
 
 #: Said of a blocker no shipped remedy covers AND whose way through somebody can type

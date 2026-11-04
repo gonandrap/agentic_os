@@ -333,7 +333,7 @@ MESSAGE_STUCK_STATUSES = ("dispatching", "running", "idle", "waiting_input",
 
 #: The `ops.waiting_on` answers that mean the OS itself will do the next thing, with nobody typing
 IN_FLIGHT_WAITS = ("turn_running", "queued_message", "neo_question", "gate_with_neo",
-                   "retry_pending", "signin", "pending")
+                   "retry_pending", "signin", "pending", "assumptions_with_neo")
 
 #: What `parked_reason` stays silent about
 SPOKEN_FOR_WAITS = IN_FLIGHT_WAITS + ("message_stuck",)

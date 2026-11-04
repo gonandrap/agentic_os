@@ -528,6 +528,33 @@ def test_nothing_pending_names_nobody(jarvis_home, project, _os_reviews_assumpti
     assert true_blockers_of(store, wo) == [invariants.IDLE_NO_FINISH_BLOCKER]
 
 
+@pytest.mark.parametrize("asked", [False, True], ids=["first-ask", "question-held"])
+def test_waiting_on_agrees_while_neo_holds_the_row(jarvis_home, project, asked,
+                                                   _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo, aid = _delivered_with_an_assumption(store)
+    if asked:
+        store.link_assumption_question(aid, _ask_neo(wo["id"], "queued"))
+
+    wait = ops.waiting_on(store, wo)
+
+    assert wait["what"] == "assumptions_with_neo"
+    assert ops._disagreements(wait, true_blockers_of(store, wo)) == []
+
+
+def test_waiting_on_sends_the_user_only_their_rows(jarvis_home, project,
+                                                   _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo, aid = _delivered_with_an_assumption(store)
+    store.link_assumption_question(aid, _ask_neo(wo["id"], "failed"))
+    store.add_assumption(wo["id"], "a second call, not asked yet")
+
+    wait = ops.waiting_on(store, wo)
+
+    assert wait["what"] == "assumptions" and wait["detail"].startswith("1 assumption(s)")
+    assert ops._disagreements(wait, true_blockers_of(store, wo)) == []
+
+
 def test_a_hidden_order_is_outside_the_pass_so_the_hole_is_named(jarvis_home, project,
                                                                  _os_reviews_assumptions):
     store = ProjectStore(project)
