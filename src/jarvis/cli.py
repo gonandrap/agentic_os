@@ -3133,7 +3133,7 @@ def cmd_alarms(args: argparse.Namespace) -> int:
         mark = "!" if row["live"] else " "
         # The id only on the reads that asked for one subject: §1 of... (docs/superpowers/specs/2026-08-31-the-supervisor.md)
         who = (f"{row['id']}  " if (args.wo or args.fo)
-               else f"{row['subject_id']}  {row['project']}  ")
+               else f"{row['subject_id'] or 'machine-wide'}  {row['project']}  ")
         print(f"{mark} {who}{row['kind_label']}  "
               f"{ops.turn_label(row['seq'])}  {_age(row['ts'])} ago")
         print(f"    {row['reason']}")
@@ -3194,7 +3194,7 @@ def cmd_alarms_show(args: argparse.Namespace) -> int:
     if args.json:
         _print(a, True)
         return 0
-    print(f"{a['id']}  {a['project']}  {a['subject_id']}  {a['title']}")
+    print(f"{a['id']}  {a['project']}  {a['subject_id'] or 'machine-wide'}  {a['title']}")
     print(f"  {a['kind_label']}  {ops.turn_label(a['seq'])}  {_age(a['ts'])} ago"
           f"{'  ! still asking' if a['live'] else ''}")
     print(f"  what fired: {a['reason']}")
