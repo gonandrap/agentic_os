@@ -160,12 +160,14 @@ HIGH_STAKES_SENSE_CARVE_OUTS = (
 # -- the tightened net (`validation.stakes_classifier: regex-tightened`)
 
 #: THE TIGHTENED NET, and every row of it was derived from a MEASURED false positive (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md §6-)
-_HST_DESTRUCTIVE_VERBS = (r"delet(?:e|es|ed|ing)|destroy(?:s|ed|ing)?|"
-                          r"truncat(?:e|es|ed|ing)|drop(?:s|ped|ping)?|"
-                          r"wip(?:e|es|ed|ing)")
-#: 19 false positives, every one deleting CODE or a record about code
-_HST_DESTRUCTIVE = (rf"\b(?:{_HST_DESTRUCTIVE_VERBS})\s+"
-                    r"(?:(?:the|a|an|all|this|these|its|four|every|six)\s+)?"
+_HST_DESTRUCTIVE_VERBS = (r"delet(?:e|es|ing)|destroy(?:s|ing)?|"
+                          r"truncat(?:e|es|ing)|drop(?:s|ping)?|"
+                          r"wip(?:e|es|ing)")
+_HST_DESTRUCTIVE_PARTICIPLES = r"deleted|destroyed|truncated|dropped|wiped"
+_HST_DETERMINER = r"(?:the|a|an|all|this|these|its|four|every|six)\s+"
+#: 19 false positives deleted CODE; a bare participle ('dropped rows') is a record STATE (issue 1532)
+_HST_DESTRUCTIVE = (rf"\b(?:(?:{_HST_DESTRUCTIVE_VERBS})\s+(?:{_HST_DETERMINER})?"
+                    rf"|(?:{_HST_DESTRUCTIVE_PARTICIPLES})\s+{_HST_DETERMINER})"
                     + _NOT_A_PREPOSITION
                     + rf"(?:{_DATA_OBJECTS}|(?:live|production|prod)\s+\w+)\b"
                     r"|\birreversib|\bpurge")
