@@ -17245,8 +17245,8 @@ def _morpheus_cwd(catalog: Catalog, item: dict[str, Any]) -> Path:
     if item.get("project") == os_name and prod.is_dir():
         return prod
     for p in catalog.projects:
-        if p.name == item.get("project") and p.path.is_dir():
-            return p.path
+        if p.name == item.get("project") and p.production_dir.is_dir():
+            return p.production_dir
     return prod if prod.is_dir() else Path.cwd()
 
 

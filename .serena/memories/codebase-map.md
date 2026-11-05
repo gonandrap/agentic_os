@@ -102,7 +102,9 @@
   `claim_morpheus_action`), states `queued|monitoring|validated|failed|timedout`.
   Queued by: `enqueue_release()` for the OS (shipit step 5a3 + `ensure_release_queued`
   daemon backstop) and `queue_merges()` for every other project (`pr_merged` events,
-  per-project cursor, no backfill). PRs give HINTS only; `wake()` = the ONLY LLM, a
+  per-project cursor, no backfill), `queue_deployed()` instead for a catalog
+  `production.ships: tag` (queues when `production.path` HEAD contains the PR; scripts
+  run from `production.path` either way). PRs give HINTS only; `wake()` = the ONLY LLM, a
   long-lived session (`claude_cli.run_session_turn`, state in os_state
   `morpheus.session`) whose subagents write each check, `/compact` once context ≥
   `compact_at`. `sweep()` runs checks mechanically in each project's dir (exit 0/1/other).
