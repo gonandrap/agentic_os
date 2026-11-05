@@ -39,6 +39,8 @@ sequenceDiagram
     I->>O: jarvis investigate verdict {inv} --from-file verdict.json
     O->>O: verdicts.parse_verdict (fields required and forbidden per class)
     alt GAP (proposed_fix)
+        O->>O: verdict_coverage: one seat, is a gap named with no entry?
+        O-->>I: first miss returned, nothing stored
         O->>GH: duplicate check: issues + live orders
         alt duplicate found
             O->>O: rewritten to ALREADY_TRACKED (classified_by ops)
@@ -48,10 +50,13 @@ sequenceDiagram
         end
     else WAITING_ON_USER (user_owes)
         O-->>U: attention on the investigation<br/>(cleared once the subject is clear)
+        Note over O: on a monitoring order, behaviour_correct true settles it unverified, no attention
     else SCRIPT_WRONG (script_fix; Morpheus-opened only)
-        O->>O: morpheus.rewrite under MAX_SCRIPT_REWRITES,<br/>script_fix + root_cause as the brief
-        O-->>U: cap spent: attention + inbox naming jarvis morpheus rewrite
-    else TRANSIENT (unsticks) / ALREADY_TRACKED (duplicate_of)
+        O->>O: morpheus.rewrite within MAX_FIX_CYCLES,<br/>script_fix + root_cause as the brief
+        O-->>U: past the cycles: attention + inbox naming jarvis morpheus rewrite
+    else TRANSIENT (unsticks)
+        O->>O: on a monitoring order: watch once more; a second TRANSIENT settles it unverified
+    else ALREADY_TRACKED (duplicate_of)
         O->>O: nothing further
     end
     O->>D: FO completed, investigation_verdict event on the subject,<br/>investigator closed out
@@ -61,3 +66,10 @@ A GAP is filed **without** expediting, so it does not jump the queue. The user p
 up with `jarvis issues start` unless Neo's triage confirms critical/blocker. If the
 tracker cannot be reached, the investigation raises attention and shows the retry
 command.
+
+Before filing, `verdict_coverage` asks one seat whether the text names a gap with no
+entry in `proposed_fix` or `other_gaps`. The seat runs only once a parsed verdict carries
+`other_gaps`. A first miss returns to the session naming the items. A second submission
+settles with any remaining miss stored as `coverage_miss`. A seat with no usable answer
+takes the same retry path as an unreachable tracker: nothing filed, order still `planning`.
+A quote the verdict does not contain never blocks.

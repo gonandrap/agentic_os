@@ -107,7 +107,7 @@ def _from_project(store: "ProjectStore", name: str, words: list[str], kinds: set
     if "alarm" in kinds:
         for row in store.search_alarms(words, limit=limit):
             out.append(_hit("alarm", id=row["id"], project=name,
-                            title=f"{row['kind']} on {row['wo_title']}",
+                            title=f"{row['kind']} on {row['wo_title'] or 'the machine'}",
                             status=row["status"], ts=row["ts"], score=row["_score"],
                             body=row.get("note") or row["reason"], words=words,
                             url=f"/alarms/{name}/{row['id']}",

@@ -46,7 +46,7 @@ def pr_close(url: str, *, cwd: Path | None = None) -> None:
     """Close the pull request at `url`"""
     url = checked_pr_url(url, cwd)
     _run(["pr", "close", url], url=url, cwd=cwd,
-         missing_hint="so Jarvis cannot make GitHub recompute a stalled pull request")
+         missing_hint="so Jarvis cannot close a pull request")
 
 
 def pr_reopen(url: str, *, cwd: Path | None = None) -> None:

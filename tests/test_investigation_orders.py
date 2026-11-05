@@ -742,17 +742,142 @@ def test_script_wrong_sends_the_script_back_to_morpheus(started, store):
         item = central.morpheus_item(item_id)
     finally:
         central.close()
-    assert (item["state"], item["script"], item["script_rewrites"]) == ("queued", "", 1)
+    assert (item["state"], item["script"], item["script_rewrites"]) == ("queued", "", 0)
     assert "is producing it" in item["rewrite_brief"] and inv_id in item["rewrite_brief"]
     row = store.get_feature_order(inv_id)
     assert row["status"] == "completed" and not row["needs_attention"]
     assert "sent back to Morpheus" in json.loads(row["plan"])["rewrite"]
 
 
-def test_script_wrong_past_its_cap_asks_the_user(started, store):
+def test_script_wrong_rewrites_though_the_judge_spent_its_rewrite(started, store):
+    """io-5cc7a40d: mv-61c7819f's shape, judge and Neo's cap spent, and no user command"""
     from jarvis.central_store import CentralStore
 
     item_id = _failed_item(script_rewrites=1)
+    _script_wrong(store, item_id)
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id)
+    finally:
+        central.close()
+    assert (item["state"], item["script_rewrites"]) == ("queued", 1)
+
+
+def _item(item_id: str) -> dict:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return central.morpheus_item(item_id)
+    finally:
+        central.close()
+
+
+def _verdict_on(store, item_id: str, classification: str, **fields):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY, morpheus_item=item_id)
+    _investigating(store, inv)
+    ops.submit_verdict(inv["id"], a_verdict(classification, subject=subject, **fields))
+    return inv["id"]
+
+
+def _fail_again(item_id: str) -> None:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.update_morpheus_item(item_id, state="failed", action="")
+    finally:
+        central.close()
+
+
+def test_a_transient_verdict_watches_once_then_settles_unverified(started, store):
+    item_id = _failed_item()
+    _verdict_on(store, item_id, "TRANSIENT")
+    item = _item(item_id)
+    # Neo's cap untouched: the count comes from the verdicts
+    assert (item["state"], item["auto_requeues"]) == ("monitoring", 0)
+    _fail_again(item_id)
+    inv_id = _verdict_on(store, item_id, "TRANSIENT")
+    assert _item(item_id)["state"] == "unverified"
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+
+
+def test_waiting_on_user_settles_unverified_only_when_behaviour_is_correct(started, store):
+    item_id = _failed_item()
+    inv_id = _verdict_on(store, item_id, "WAITING_ON_USER", behaviour_correct=False)
+    assert _item(item_id)["state"] == "failed"
+    assert store.get_feature_order(inv_id)["needs_attention"]
+    _fail_again(item_id)
+    inv_id = _verdict_on(store, item_id, "WAITING_ON_USER", behaviour_correct=True)
+    assert _item(item_id)["state"] == "unverified"
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+
+
+def test_waiting_on_user_on_a_monitor_must_say_whether_behaviour_is_correct(started, store):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY, morpheus_item=_failed_item())
+    _investigating(store, inv)
+    with pytest.raises(ops.OpsError, match="behaviour_correct"):
+        ops.submit_verdict(inv["id"], a_verdict("WAITING_ON_USER", subject=subject))
+
+
+def _stored_before_the_change(store, classification: str, item_id: str, **fields) -> str:
+    """A verdict already stored that never moved its row: the row holds its investigation"""
+    from jarvis.central_store import CentralStore
+
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    verdict = {"classification": classification, "subject": subject, "root_cause": "r" * 80,
+               **fields}
+    store.update_feature_order(inv["id"], plan=json.dumps(verdict))
+    store.set_feature_status(inv["id"], "completed")
+    store.flag_feature_attention(inv["id"], "waiting on you")
+    central = CentralStore()
+    try:
+        central.update_morpheus_item(item_id, action=f"investigation:{inv['id']}")
+    finally:
+        central.close()
+    return inv["id"]
+
+
+def test_the_sweep_backfills_each_stored_verdict_once(started, store):
+    wrong = _failed_item(script_rewrites=1)
+    wrong_inv = _stored_before_the_change(
+        store, "SCRIPT_WRONG", wrong, script_fix="f" * 80,
+        rewrite="its one automatic rewrite is spent", rewrite_ask={"item": wrong})
+    assert ops.settle_investigated_monitors() == [wrong]
+    assert _item(wrong)["state"] == "queued"
+    row = store.get_feature_order(wrong_inv)
+    assert not row["needs_attention"] and "rewrite_ask" not in json.loads(row["plan"])
+    assert ops.settle_investigated_monitors() == []
+
+
+def test_the_sweep_leaves_a_stored_verdict_silent_on_behaviour_to_the_user(started, store):
+    item_id = _failed_item()
+    inv_id = _stored_before_the_change(store, "WAITING_ON_USER", item_id, user_owes="u" * 80)
+    assert ops.settle_investigated_monitors() == []
+    assert _item(item_id)["state"] == "failed"
+    assert store.get_feature_order(inv_id)["needs_attention"]
+    out = ops.correct_investigation(inv_id, "read the root cause: PR is correct")
+    assert out["item"] == item_id and _item(item_id)["state"] == "unverified"
+    row = store.get_feature_order(inv_id)
+    assert not row["needs_attention"] and json.loads(row["plan"])["behaviour_correct"] is True
+
+
+def test_an_unverified_row_never_reads_as_a_passed_release():
+    from jarvis import release_view
+
+    assert release_view.validation_of({"state": "unverified"}) == "unverified"
+    assert release_view.summarize([{"validation": "validated"},
+                                   {"validation": "unverified"}]) == "unverified"
+
+
+def test_script_wrong_past_its_cycles_asks_the_user(started, store, monkeypatch):
+    from jarvis.central_store import CentralStore
+
+    item_id = _failed_item()
+    monkeypatch.setattr(ops, "morpheus_investigations", lambda *_: ["a", "b", "c"])
     inv_id, _ = _script_wrong(store, item_id)
     central = CentralStore()
     try:
@@ -1217,6 +1342,134 @@ def test_a_filing_failure_is_never_silent(started, store, monkeypatch):
         assert any(inv["id"] in (i["title"] or "") for i in central.unacked_inbox())
     finally:
         central.close()
+
+
+# -- the coverage seat (io-38a4354f, finding coverage-unchecked)
+
+SIDE_GAP = "the -$80.09 residual is unexplained"
+A_MISS = json.dumps({"uncovered": [{"gap": "negative residual", "quote": SIDE_GAP}]})
+
+
+def _seat(monkeypatch, *replies):
+    """Stand in for the seat, one reply per call, and for `other_gaps` until wo-1bc53eee ships"""
+    from jarvis import agent_usage, seats, verdict_coverage
+
+    parse = verdicts.parse_verdict
+    monkeypatch.setattr(verdicts, "parse_verdict", lambda doc, subject="": {
+        **parse(doc, subject=subject),
+        **({"other_gaps": doc["other_gaps"]} if "other_gaps" in doc else {})})
+    calls = []
+
+    def run_blind(prompts, **kw):
+        calls.append(prompts[verdict_coverage.SEAT])
+        assert kw["kind"] == agent_usage.COVERAGE and kw["tools"] == ""
+        reply = replies[len(calls) - 1]
+        if reply is None:
+            return [seats.Opinion(seat=verdict_coverage.SEAT, raw="rc=1", status="abstained",
+                                  replied=False)]
+        return [seats.Opinion(seat=verdict_coverage.SEAT, raw=reply)]
+
+    monkeypatch.setattr(seats, "run_blind", run_blind)
+    return calls
+
+
+def _side_gap_verdict(subject, other_gaps=()):
+    doc = a_verdict("GAP", subject=subject, other_gaps=list(other_gaps))
+    doc["root_cause"] += f" Separately, {SIDE_GAP}."
+    return doc
+
+
+def _coverage_order(store):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+    return subject, inv["id"]
+
+
+def test_a_side_gap_only_in_root_cause_returns_once_then_settles_with_the_miss(
+        started, store, monkeypatch):
+    calls = _seat(monkeypatch, A_MISS, A_MISS)
+    subject, inv_id = _coverage_order(store)
+
+    with pytest.raises(ops.OpsError, match=r"negative residual") as refusal:
+        ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    assert SIDE_GAP in str(refusal.value)
+    row = store.get_feature_order(inv_id)
+    assert row["status"] == "planning" and not row["plan"], "nothing was stored"
+    assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls)
+
+    out = ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    assert out["status"] == "completed" and out["filed"]["issue_url"]
+    assert len(calls) == 2
+    stored = json.loads(store.get_feature_order(inv_id)["plan"])
+    assert stored["coverage_miss"] == [{"gap": "negative residual", "quote": SIDE_GAP}]
+    assert any(SIDE_GAP in line for line in verdicts.render_verdict(stored))
+    from fastapi.testclient import TestClient
+    from jarvis.ui.app import create_app
+    page = TestClient(create_app()).get(f"/inv/proj_a/{inv_id}").text
+    assert "negative residual" in page and SIDE_GAP in page
+
+
+def test_a_returned_verdict_that_now_covers_its_gap_records_no_miss(
+        started, store, monkeypatch):
+    _seat(monkeypatch, A_MISS, '{"uncovered": []}')
+    subject, inv_id = _coverage_order(store)
+    with pytest.raises(ops.OpsError):
+        ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    assert "coverage_miss" not in json.loads(store.get_feature_order(inv_id)["plan"])
+
+
+def test_a_gap_quoted_from_nowhere_in_the_verdict_does_not_block(started, store, monkeypatch):
+    """kn-fd51ff0b: only a gap the text names may block; the seat's own idea is not one"""
+    _seat(monkeypatch, json.dumps({"uncovered": [
+        {"gap": "the seat's idea", "quote": "words the verdict never said"}]}))
+    subject, inv_id = _coverage_order(store)
+    out = ops.submit_verdict(inv_id, a_verdict("GAP", subject=subject, other_gaps=[]))
+    assert out["status"] == "completed"
+    assert "coverage_miss" not in json.loads(store.get_feature_order(inv_id)["plan"])
+
+
+@pytest.mark.parametrize("reply", [None, "no json here", '{"verdict": "fine"}'])
+def test_a_seat_with_no_usable_answer_stays_pending_and_files_nothing(
+        started, store, monkeypatch, reply):
+    """kn-40db1828: never a pass and never a miss"""
+    calls = _seat(monkeypatch, reply, '{"uncovered": []}')
+    subject, inv_id = _coverage_order(store)
+
+    out = ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    row = store.get_feature_order(inv_id)
+    assert row["status"] == "planning" and row["needs_attention"]
+    assert "UNREACHABLE" in row["attention_reason"]
+    assert "jarvis investigate verdict" in row["attention_reason"]
+    assert out["filed"] is None
+    assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls)
+
+    assert ops.submit_verdict(inv_id, _side_gap_verdict(subject))["status"] == "completed"
+    assert len(calls) == 2
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+
+
+def test_the_seat_is_inert_until_other_gaps_ships_and_never_runs_off_a_gap(
+        started, store, monkeypatch):
+    calls = _seat(monkeypatch)
+    subject, inv_id = _coverage_order(store)
+    assert ops.submit_verdict(inv_id, a_verdict("GAP", subject=subject))["status"] == "completed"
+    subject, inv_id = _coverage_order(store)
+    ops.submit_verdict(inv_id, a_verdict("TRANSIENT", subject=subject, other_gaps=[]))
+    assert calls == []
+
+
+def test_the_seat_sees_every_field_it_judges(started, store, monkeypatch):
+    calls = _seat(monkeypatch, '{"uncovered": []}')
+    subject, inv_id = _coverage_order(store)
+    entry = {"title": "side gap entry", "why": "w", "description": "d"}
+    ops.submit_verdict(inv_id, _side_gap_verdict(subject, other_gaps=[entry]))
+    _system, shown = calls[0]
+    fix = a_verdict("GAP")["proposed_fix"]
+    for text in (WHY, SIDE_GAP, a_verdict("GAP")["evidence"][0]["quote"], fix["title"],
+                 "side gap entry"):
+        assert text in shown
 
 
 def test_cancelling_one_settles_it_and_stops_the_investigator(started, store):

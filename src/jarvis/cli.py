@@ -529,7 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--release", metavar="TAG",
                     help="every monitoring order of that release tag, summed")
     sp.add_argument("--limit", type=int, default=50,
-                    help="work orders per project to measure (default: 50)")
+                    help="work orders to print (default: 50); totals cover them all")
     # The DISTRIBUTION, beside the listing rather than instead of it: what a typical order costs (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)
     sp.add_argument("--fleet", action="store_true",
                     help="what a TYPICAL order costs: n, avg, p90 and max per metric "
@@ -1367,6 +1367,13 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("amount", nargs="?", metavar="USD",
                    help="the new ceiling, in dollars. Omit to just show it")
     v.add_argument("--clear", action="store_true", help="remove the ceiling")
+    v.add_argument("--project")
+
+    v = inv.add_parser("correct", help="record that a WAITING_ON_USER verdict's shipped "
+                                       "behaviour is correct: its monitoring order settles "
+                                       "unverified, never validated")
+    v.add_argument("inv_id")
+    v.add_argument("--reason", required=True, help="how you know the behaviour is correct")
     v.add_argument("--project")
 
     v = inv.add_parser("verdict", help="(investigators) submit the verdict — the "
@@ -2917,7 +2924,7 @@ def _normalise_issues(argv: list[str]) -> list[str]:
 
 
 #: The `investigate` sub-verbs — a CLOSED set
-INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict", "budget")
+INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict", "budget", "correct")
 
 
 def _normalise_investigate(argv: list[str]) -> list[str]:
@@ -3133,7 +3140,7 @@ def cmd_alarms(args: argparse.Namespace) -> int:
         mark = "!" if row["live"] else " "
         # The id only on the reads that asked for one subject: §1 of... (docs/superpowers/specs/2026-08-31-the-supervisor.md)
         who = (f"{row['id']}  " if (args.wo or args.fo)
-               else f"{row['subject_id']}  {row['project']}  ")
+               else f"{row['subject_id'] or 'machine-wide'}  {row['project']}  ")
         print(f"{mark} {who}{row['kind_label']}  "
               f"{ops.turn_label(row['seq'])}  {_age(row['ts'])} ago")
         print(f"    {row['reason']}")
@@ -3194,7 +3201,7 @@ def cmd_alarms_show(args: argparse.Namespace) -> int:
     if args.json:
         _print(a, True)
         return 0
-    print(f"{a['id']}  {a['project']}  {a['subject_id']}  {a['title']}")
+    print(f"{a['id']}  {a['project']}  {a['subject_id'] or 'machine-wide'}  {a['title']}")
     print(f"  {a['kind_label']}  {ops.turn_label(a['seq'])}  {_age(a['ts'])} ago"
           f"{'  ! still asking' if a['live'] else ''}")
     print(f"  what fired: {a['reason']}")
@@ -3357,7 +3364,8 @@ def cmd_cost(args: argparse.Namespace) -> int:
 
     units = res["units"]
     totals = res["totals"]
-    if not units:
+    unattributed = res.get("os_unattributed") or {}
+    if not units and not unattributed.get("os_calls"):
         print(f"no work orders found for {res['scope']}")
         return 0
     header = f"{res['scope']} — {res['measured']} measured"
@@ -3370,7 +3378,7 @@ def cmd_cost(args: argparse.Namespace) -> int:
     # `$` is the whole bill — the worker's conversation
     print(f"{'$':>7} {'jarvis':>7} {'subproc':>8} {'subagent':>9} {'turns':>5} "
           f"{'output':>7} {'re-write':>9}  work order")
-    for u in units:
+    for u in units[:args.limit]:
         os_cost = f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
         sub_cost = f"{u['subproc_cost_usd']:.2f}" if u.get("subproc_calls") else "—"
         agent_cost = (f"{u['subagent_cost_usd']:.2f}"
@@ -3383,6 +3391,12 @@ def cmd_cost(args: argparse.Namespace) -> int:
               f"{agent_cost:>9} {u['turns']:>5} "
               f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
               f"{u['id']}  {u['title'][:44]}")
+    # Not a unit, but in the total: the rows have to sum to it (io-82bcb830)
+    if unattributed.get("os_calls"):
+        un_cost = unattributed["os_cost_usd"]
+        print(f"{un_cost:>7.2f} {un_cost:>7.2f} {'—':>8} {'—':>9} {'—':>5} "
+              f"{'—':>7} {'—':>9}  (no work order)  "
+              f"{unattributed['os_calls']} jarvis calls")
 
     _print_turn_table(res)
     _print_os_calls(res)
@@ -3424,7 +3438,6 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"  {totals['undated_messages']} transcript messages carried no readable "
               f"timestamp and are excluded from this window")
     _print_write_ttl(totals)
-    unattributed = res.get("os_unattributed") or {}
     if unattributed.get("os_calls"):
         print(f"  OS overhead   ~${unattributed['os_cost_usd']:.2f} — "
               f"{unattributed['os_calls']} calls no work order caused "
@@ -3546,6 +3559,7 @@ def _print_fleet(fleet: dict) -> None:
     kinds = fleet["os_cost_by_kind"]
     if kinds:
         print("\nwhat jarvis itself spent, by kind (dearest first, $0 kinds included)")
+        print(f"  {fleet['os_cost_basis']}")
         for row in kinds:
             print(f"  {row['kind']:<22} {row['calls']:>6} "
                   f"call{'s' if row['calls'] != 1 else ' '}  "
@@ -4321,8 +4335,8 @@ def cmd_io(args: argparse.Namespace) -> int:
     return 0
 
 
-MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "failed": "✗",
-                 "timedout": "⌛"}
+MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "unverified": "?",
+                 "failed": "✗", "timedout": "⌛"}
 
 
 def _morpheus_line(item: dict) -> str:
@@ -4437,7 +4451,9 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             print(f"last check {_stamp(item['last_check_ts'])}"
                   f" on {item.get('last_check_version') or 'an unknown version'}")
         print(f"checks {item['checks']} · last exit {item['last_exit']}"
-              f" · deadline {_stamp(item['deadline_ts'])}"
+              + (f" ({item['last_reason']})" if item.get("last_reason") else "")
+              + (f" · trigger {item['trigger_kind']}" if item.get("trigger_kind") else "")
+              + f" · deadline {_stamp(item['deadline_ts'])}"
               + (f" · {item['auto_requeues']} automatic requeue(s)"
                  if item.get("auto_requeues") else ""))
         if item["resolution"]:
@@ -4704,6 +4720,9 @@ def cmd_investigate(args: argparse.Namespace) -> int:
             amount = None if args.clear else _parse_budget_amount(args.amount)
             _print(ops.set_investigation_budget(args.inv_id, amount, args.project),
                    args.json)
+
+    elif args.inv_cmd == "correct":
+        _print(ops.correct_investigation(args.inv_id, args.reason, args.project), args.json)
 
     elif args.inv_cmd == "verdict":
         doc, source = _read_submission(args.from_file, "investigator", "verdict")

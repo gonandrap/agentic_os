@@ -63,8 +63,7 @@ def calibrate(f, start: float) -> None:
     for offset in (-8 * HOUR, -6 * HOUR, -4 * HOUR):
         at = start + offset
         store_samples(series(at, n=40, first=0.0, last=10.0, resets=start + 9 * HOUR))
-        wo = f.order("a calibration order")
-        f.turn(wo, started_at=at + MINUTE, ended_at=at + 2 * MINUTE, cost_usd=8.2)
+        f.spend("a calibration order", 8.2, at=at + MINUTE)
 
 
 def scene(f, *, since: float = SPAN_SINCE, until: float = SPAN_SINCE + HOUR,
@@ -76,11 +75,10 @@ def scene(f, *, since: float = SPAN_SINCE, until: float = SPAN_SINCE + HOUR,
     n = samples if samples is not None else int((until - since)
                                                 / usage_meter.SAMPLE_SECONDS)
     store_samples(series(since, n=n, first=10.0, last=10.0 + points, resets=until))
-    wo = f.order("the order that spent in this span")
-    f.turn(wo, started_at=since + 2 * MINUTE, ended_at=since + 3 * MINUTE,
-           cost_usd=worker_usd)
+    wo = f.spend("the order that spent in this span", worker_usd, at=since + 2 * MINUTE)
     if os_usd:
-        f.os_call("neo_answer", ts=since + 3 * MINUTE, wo_id=wo, cost_usd=os_usd)
+        f.os_call("neo_answer", ts=since + 3 * MINUTE, wo_id=wo, cost_usd=os_usd,
+                  output=f.output_for(os_usd))
     if outside:
         f.transcript("1a9cd19d-0000-4000-8000-000000000001", [
             prompt_row("look at the cost page", at=since + 4 * MINUTE),
@@ -115,7 +113,7 @@ def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
     assert set(meter["seven_day"]) == set(meter["five_hour"])
     assert set(meter["five_hour"]["segments"][0]) == {"since", "until", "start_pct",
                                                       "end_pct", "delta", "cause"}
-    assert set(meter["coverage"]) == {"samples", "expected", "share", "gap_rows",
+    assert set(meter["coverage"]) == {"samples", "share", "gap_rows",
                                       "longest_gap_seconds", "head_uncovered_seconds",
                                       "first_ts", "last_ts", "reliable",
                                       "min_reliable_share"}
@@ -255,9 +253,7 @@ def test_a_scoped_query_keeps_the_residual_fleet_wide(fleet_fixture):
     other = FleetCostFixture(fleet_fixture.home, second, fleet_fixture.transcript_root,
                              fleet_fixture.catalog_path, name="proj_b")
     resolved = scene(fleet_fixture, outside=False)
-    wo_b = other.order("the order proj_b spent on")
-    other.turn(wo_b, started_at=resolved["since"] + 2 * MINUTE,
-               ended_at=resolved["since"] + 3 * MINUTE, cost_usd=3.0)
+    other.spend("the order proj_b spent on", 3.0, at=resolved["since"] + 2 * MINUTE)
 
     meter = meter_of(fleet_fixture, resolved, project="proj_a")
     spend = meter["spend"]
@@ -294,11 +290,11 @@ def test_a_span_the_meter_barely_covers_derives_no_dollar_figure(fleet_fixture):
     said = meter["sentence"]
     spend = meter["spend"]
 
-    assert meter["coverage"]["share"] == pytest.approx(4 / 120, abs=1e-4)
+    assert meter["coverage"]["share"] == pytest.approx(3 * 150 / 18_000, abs=1e-4)
     assert meter["reliable"] is False
     assert "low_coverage" in meter["unreliable"]
     assert usage_meter.UNRELIABLE in said
-    assert "3% covered" in said
+    assert "2% covered" in said
     for forbidden in ("lower bound", usage_meter.RESIDUAL_LABEL, "unexplained"):
         assert forbidden not in said, forbidden
     # The measured halves are measured, not derived, and stay numbers
@@ -314,19 +310,20 @@ def test_between_the_thresholds_the_figure_stands_and_the_coverage_is_incomplete
     meter = meter_of(fleet_fixture, scene(fleet_fixture, until=SPAN_UNTIL, samples=84))
     said = meter["sentence"]
 
-    assert meter["coverage"]["share"] == pytest.approx(0.7)
+    assert meter["coverage"]["share"] == pytest.approx(83 * 150 / 18_000, abs=1e-4)
     assert meter["reliable"] is True and meter["unreliable"] == []
     assert "the 5h meter rose 12 points (~$9.8)" in said
-    assert "70% of this span, so the rise is incomplete" in said
+    assert "69% of this span, so the rise is incomplete" in said
     assert "lower bound" not in said
 
 
 def test_an_unreliable_span_suppresses_both_alarms_and_the_daemon_writes_nothing(
         fleet_fixture, fixed_now):
     fleet_fixture.order("the carrier", status="completed")
-    scene(fleet_fixture, until=SPAN_UNTIL, samples=48)         # 40% covered
+    # `fixed_now` is 2h in: 20 readings measure 47m30s of them, 40% covered, the rest a real hole
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=20)
     meter = meter_of(fleet_fixture, {"since": SPAN_SINCE, "until": SPAN_UNTIL,
-                                     "source": "session-meter"})
+                                     "source": "session-meter"}, now=fixed_now)
 
     assert meter["reliable"] is False
     assert meter["alerts"]["outside"] is False
@@ -344,12 +341,32 @@ def test_an_unreliable_span_suppresses_both_alarms_and_the_daemon_writes_nothing
         assert central.unacked_inbox("warning") == []
     finally:
         central.close()
-    store = ProjectStore(fleet_fixture.project_path)
-    try:
-        carrier = store.latest_settled_order()
-        assert store.events_of_kind(carrier["id"], "cost_alarm") == []
-    finally:
-        store.close()
+
+
+def test_a_window_ending_ahead_of_now_reconciles_like_the_same_span_ending_now(fleet_fixture):
+    """io-82bcb830: the current 5h window ends in the future by design"""
+    resolved = scene(fleet_fixture)
+    now = resolved["until"]
+
+    ended = meter_of(fleet_fixture, resolved)
+    ahead = meter_of(fleet_fixture, {**resolved, "until": SPAN_SINCE + 5 * HOUR}, now=now)
+
+    assert ahead["reliable"] is True and ahead["unreliable"] == []
+    assert ahead["coverage"]["share"] == pytest.approx(1.0)
+    assert ahead["spend"]["implied_usd"] == ended["spend"]["implied_usd"]
+    assert "incomplete" not in ahead["sentence"]
+
+
+def test_a_window_that_just_opened_raises_no_alarm(fleet_fixture):
+    """Coverage no longer holds the current window back; the dollar floor still must"""
+    resolved = scene(fleet_fixture, until=SPAN_SINCE + 15 * MINUTE, samples=6, points=1.0,
+                     worker_usd=0.0, os_usd=0.0, outside=False)
+
+    meter = meter_of(fleet_fixture, {**resolved, "until": SPAN_SINCE + 5 * HOUR},
+                     now=resolved["until"])
+
+    assert meter["reliable"] is True
+    assert meter["alerts"]["outside"] is False and meter["alerts"]["residual"] is False
 
 
 def test_a_gap_longer_than_the_window_derives_nothing(fleet_fixture):
@@ -362,7 +379,7 @@ def test_a_gap_longer_than_the_window_derives_nothing(fleet_fixture):
     meter = meter_of(fleet_fixture, {"since": since, "until": until,
                                      "source": "session-meter"})
 
-    assert meter["coverage"]["share"] == pytest.approx(0.75)
+    assert meter["coverage"]["share"] == pytest.approx(0.75, abs=0.005)
     assert "gap_longer_than_window" in meter["unreliable"]
     assert "low_coverage" not in meter["unreliable"]
     assert meter["spend"]["implied_usd"] is None
@@ -505,7 +522,6 @@ def reconcile(f, daemon, *, name: str = "proj_a"):
 def test_the_outside_alarm_fires_once_per_window_for_the_os_owner(
         fleet_fixture, fixed_now):
     assert METER_RECONCILE_EVERY_TICKS == 360
-    fleet_fixture.order("the carrier", status="completed")
     scene(fleet_fixture, until=SPAN_UNTIL, samples=120)
     daemon = daemon_for(fleet_fixture)
 
@@ -515,15 +531,12 @@ def test_the_outside_alarm_fires_once_per_window_for_the_os_owner(
     assert [r["kind"] for r in raised] == ["cost_outside_spend_high"]
     assert "1a9cd19d" in raised[0]["reason"]
     assert "look at the cost page" in raised[0]["reason"]
-    carrier = ProjectStore(fleet_fixture.project_path)
-    try:
-        assert raised[0]["wo_id"] == carrier.latest_settled_order()["id"]
-    finally:
-        carrier.close()
+    assert raised[0]["wo_id"] is None, "no order settled yet, and none would carry it"
     central = CentralStore()
     try:
-        told = central.unacked_inbox("warning")
-        assert len(told) == 1 and told[0]["wo_id"] == raised[0]["wo_id"]
+        (told,) = central.unacked_inbox("warning")
+        assert told["wo_id"] is None
+        assert "Your action:" in told["body"]
     finally:
         central.close()
 
@@ -535,11 +548,10 @@ def seed_occurrences(f, kind: str, ages_days: list[float]) -> None:
     """Rows of `kind` already on the record, this many days old, with the review's verdict"""
     store = ProjectStore(f.project_path)
     try:
-        carrier = store.latest_settled_order()
         for age in ages_days:
-            row = store.add_finding(carrier["id"], kind=kind, reason=f"seen {age}d ago")
+            row = store.add_finding(None, kind=kind, reason=f"seen {age}d ago")
             store.update_alarm(row["id"], status="acked", verdict="escalate",
-                               verdict_reason=f"carrier cannot explain {age}",
+                               verdict_reason=f"cannot be explained {age}",
                                ts=T0 - age * 86_400)
     finally:
         store.close()
@@ -661,46 +673,82 @@ def test_a_failed_filing_retries_on_the_next_pass(fleet_fixture, fixed_now, monk
     assert len(filed) == 1
 
 
-def test_the_packet_carries_prior_verdicts_and_a_verdict_stays_off_the_carrier(
+def test_the_packet_carries_prior_verdicts_and_a_verdict_stays_on_the_row(
         fleet_fixture, fixed_now):
     from jarvis import supervisor
     from jarvis.catalog import SupervisorConfig
 
-    fleet_fixture.order("the carrier", status="completed")
     seed_occurrences(fleet_fixture, "cost_residual_high", [3.0])
     store = ProjectStore(fleet_fixture.project_path)
     central = CentralStore()
     try:
-        carrier = store.latest_settled_order()
-        alarm = store.add_finding(carrier["id"], kind="cost_residual_high", reason="again")
+        alarm = store.add_finding(None, kind="cost_residual_high", reason="again")
 
-        packet = supervisor.build_evidence(store, {"kind": "work_order", "row": carrier}, alarm)
+        packet = supervisor.build_evidence(store, {"kind": "machine", "row": {}}, alarm)
         assert "# This standing condition" in packet
         assert "occurrence 2" in packet
-        assert "carrier cannot explain 3.0" in packet
+        assert "cannot be explained 3.0" in packet
+        assert "# The work order" not in packet
 
-        supervisor._apply(store, None, central, "proj_a", carrier, alarm,
+        supervisor._apply(store, None, central, "proj_a", None, alarm,
                           {"decision": "escalate", "failed": False, "reason": "unexplained",
                            "note": ""}, packet, SupervisorConfig())
         row = store.get_alarm(alarm["id"])
         assert (row["status"], row["verdict"]) == ("acked", "escalate")
-        assert not store.get_work_order(carrier["id"])["needs_attention"]
         assert central.unacked_inbox("warning") == []
     finally:
         central.close()
         store.close()
 
 
+def test_the_inbox_line_states_what_the_user_owes(fleet_fixture, fixed_now, monkeypatch):
+    daemon = residual_scene(fleet_fixture, monkeypatch)
+    reconcile(fleet_fixture, daemon)
+
+    central = CentralStore()
+    try:
+        (told,) = central.unacked_inbox("warning")
+    finally:
+        central.close()
+    assert told["wo_id"] is None
+    assert "No action is owed from you" in told["body"]
+    assert alarms(fleet_fixture)[0]["id"] in told["body"]
+    assert "wo-" not in told["body"]
+
+
+def test_a_machine_wide_review_runs_with_no_work_order(fleet_fixture, fixed_now, monkeypatch):
+    from jarvis import structured, supervisor
+    from jarvis.catalog import SupervisorConfig
+    from jarvis.neo_store import NeoStore
+
+    seen: list[str] = []
+
+    def judged(evidence, **_):
+        seen.append(evidence)
+        return {"decision": "escalate", "failed": False, "reason": "unexplained", "note": ""}
+
+    monkeypatch.setattr(structured, "request", judged)
+    store = ProjectStore(fleet_fixture.project_path)
+    neo = NeoStore()
+    try:
+        alarm = store.add_finding(None, kind="cost_residual_high", reason="again")
+        supervisor.review(store, neo, "proj_a", None, alarm, SupervisorConfig())
+        assert store.get_alarm(alarm["id"])["verdict"] == "escalate"
+        assert "The whole machine" in seen[0] and "# The work order" not in seen[0]
+    finally:
+        neo.close()
+        store.close()
+
+
 def test_a_work_order_alarm_gets_no_standing_section(fleet_fixture, fixed_now):
     from jarvis import supervisor
 
-    fleet_fixture.order("the carrier", status="completed")
+    order = fleet_fixture.order("an order", status="completed")
     store = ProjectStore(fleet_fixture.project_path)
     try:
-        carrier = store.latest_settled_order()
-        alarm = store.add_finding(carrier["id"], kind="some_cost_kind", reason="x")
+        alarm = store.add_finding(order, kind="some_cost_kind", reason="x")
         assert "# This standing condition" not in supervisor.build_evidence(
-            store, {"kind": "work_order", "row": carrier}, alarm)
+            store, {"kind": "work_order", "row": store.get_work_order(order)}, alarm)
     finally:
         store.close()
 

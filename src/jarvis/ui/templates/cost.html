@@ -128,9 +128,9 @@
     they happen ({{ fmt_tok(totals.os_billed_input) }} in ·
     {{ fmt_tok(totals.os_output) }} out) and survive transcript pruning.
     {%- if report.os_unattributed and report.os_unattributed.os_calls %}
-      A further {{ report.os_unattributed.os_calls }}
-      (~${{ '%.2f'|format(report.os_unattributed.os_cost_usd) }}) belong to no work order
-      and are not in this figure.
+      {{ report.os_unattributed.os_calls }} of those calls
+      (~${{ '%.2f'|format(report.os_unattributed.os_cost_usd) }}) belong to no work order:
+      counted in the total, and listed as their own row below.
     {%- endif %}
   </p>
   {% endif %}
@@ -153,14 +153,17 @@
 
 {# The orders FIRST: "where did it go" is this page's first question (io-82bcb830). #}
 <div class="panel table-wrap" style="margin-top: 14px;">
-  {% if units %}
+  {% set un = report.os_unattributed if report.os_unattributed and report.os_unattributed.os_calls %}
+  {% if units or un %}
   {# Sums the cents the rows SHOW, so a reader's own addition lands here. Every headline
      dollar is in a row, so the only gap possible is rounding. #}
-  {% set listed = units|map(attribute='total_cost_usd')|map('round', 2)|sum %}
+  {% set listed = (units|map(attribute='total_cost_usd')|map('round', 2)|sum)
+                  + (un.os_cost_usd|round(2) if un else 0) %}
   {% set rounding = totals.total_cost_usd - listed %}
   <div style="padding: 10px 16px;">
     <p class="kv mono" style="margin: 0;">
-      <strong>{{ units|length }} order{{ 's' if units|length != 1 }} below add to
+      <strong>{{ units|length }} order{{ 's' if units|length != 1 }}
+      {{- ' and the no-work-order row' if un }} below add to
       ${{ '%.2f'|format(listed) }}</strong>
       {%- if '%.2f'|format(rounding|abs) != '0.00' %}
         {{ '+' if rounding > 0 else '−' }} ${{ '%.2f'|format(rounding|abs) }} from rounding
@@ -168,20 +171,12 @@
       {%- endif %}
       = ~${{ '%.2f'|format(totals.total_cost_usd) }}, the headline above.
     </p>
-    {% set unattributed = report.os_unattributed if report.os_unattributed and report.os_unattributed.os_calls %}
     {% set outside = meter.outside if meter and meter.outside.sessions %}
-    {% if unattributed or outside %}
+    {% if outside %}
     <p class="kv sub" style="margin: 4px 0 0;">
       Not in that total:
-      {%- if unattributed %}
-        {{ unattributed.os_calls }} Jarvis call{{ 's' if unattributed.os_calls != 1 }} that
-        belong to no work order (~${{ '%.2f'|format(unattributed.os_cost_usd) }})
-      {%- endif %}
-      {{- ' ·' if unattributed and outside }}
-      {%- if outside %}
-        {{ outside.n }} session{{ 's' if outside.n != 1 }} Jarvis did not dispatch
-        (${{ '%.2f'|format(outside.total_usd) }}, listed under the meter)
-      {%- endif %}.
+      {{ outside.n }} session{{ 's' if outside.n != 1 }} Jarvis did not dispatch
+      (${{ '%.2f'|format(outside.total_usd) }}, listed under the meter).
     </p>
     {% endif %}
   </div>
@@ -235,6 +230,21 @@
   {% else %}
   <tr><td colspan="4" class="empty">no work orders to measure</td></tr>
   {% endfor %}
+  {# Not an order, so no link and no state; here so the rows sum to the headline (io-82bcb830). #}
+  {% if un %}
+  <tr class="no-work-order">
+    <td class="mono">—</td>
+    <td class="mono num" style="text-align: right; color: var(--ink);">${{ '%.2f'|format(un.os_cost_usd) }}</td>
+    <td class="prose">
+      no work order
+      <div class="sub mono">jarvis ~${{ '%.2f'|format(un.os_cost_usd) }}
+        ({{ un.os_calls }} call{{ 's' if un.os_calls != 1 }}
+        {%- for k in un.os_by_kind %}{{ ', ' if not loop.first else ': ' }}{{ k.calls }} {{ k.label }}{% endfor %})
+      </div>
+    </td>
+    <td class="when"></td>
+  </tr>
+  {% endif %}
   </table>
 </div>
 

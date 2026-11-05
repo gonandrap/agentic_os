@@ -16,6 +16,7 @@ MAX_FILES = 400
 
 _lock = threading.RLock()
 _files: dict[str, dict[str, Any]] = {}
+_light: dict[tuple[str, str], tuple[tuple[int, int], Any]] = {}
 _clock = 0
 _loaded = False
 
@@ -57,6 +58,21 @@ def product(path: Path | str, name: str, build: Callable[[], Any]) -> Any:
         if entry is not None and tuple(entry["stat"]) == stat:
             entry["products"][name] = value
             _evict()
+    return value
+
+
+def light_product(path: Path | str, name: str, build: Callable[[], Any]) -> Any:
+    """A small product outside the LRU and the file: one 7d meter walk touches over MAX_FILES transcripts"""
+    key = (str(path), name)
+    stat = _stat(Path(path))
+    with _lock:
+        held = _light.get(key)
+    if held is not None and held[0] == stat:
+        return held[1]
+    value = build()
+    if stat is not None:
+        with _lock:
+            _light[key] = (stat, value)
     return value
 
 
@@ -112,6 +128,7 @@ def reset() -> None:
     global _loaded, _clock
     with _lock:
         _files.clear()
+        _light.clear()
         _clock = 0
         _loaded = False
 

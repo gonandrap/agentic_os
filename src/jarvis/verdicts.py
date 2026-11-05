@@ -163,6 +163,12 @@ def _payload(classification: str, raw: dict[str, Any],
     elif raw.get("owner"):
         problems.append(f"a {classification} verdict must not carry `owner` — only a GAP "
                         f"files anything, so only a GAP has an owner")
+    if "behaviour_correct" in raw:
+        if classification != "WAITING_ON_USER" or not isinstance(raw["behaviour_correct"], bool):
+            problems.append("`behaviour_correct` is a true or false on a WAITING_ON_USER verdict "
+                            "and nothing else")
+        else:
+            out["behaviour_correct"] = raw["behaviour_correct"]
     for name in REQUIRED_FIELDS[classification]:
         value = raw.get(name)
         if name == "proposed_fix":
@@ -317,7 +323,10 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
         f"  root cause: {verdict.get('root_cause', '')}",
     ]
     if verdict.get("user_owes"):
-        lines.append(f"  you owe: {verdict['user_owes']}")
+        lines.append(f"  {'was asked' if verdict.get('monitor_move') else 'you owe'}: "
+                     f"{verdict['user_owes']}")
+    if verdict.get("monitor_move"):
+        lines.append(f"  monitoring order: {verdict['monitor_move']}")
     unsticks = verdict.get("unsticks") or {}
     if unsticks:
         lines.append(f"  unsticks: {unsticks.get('what', '')} "
@@ -355,4 +364,6 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
             lines.append(f"    {filed['dispatch']}")
     elif verdict.get("filing_error"):
         lines.append(f"  NOT filed: {verdict['filing_error']}")
+    for miss in verdict.get("coverage_miss") or []:
+        lines.append(f"  named with no entry: {miss.get('gap', '')} ({miss.get('quote', '')!r})")
     return lines

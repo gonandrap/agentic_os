@@ -1478,6 +1478,8 @@ elif argv[:2] == ["run", "rerun"]:
         sys.stderr.write(refuse + "\n")
         sys.exit(1)
     print(f"Requested rerun of run {argv[2] if len(argv) > 2 else ''}")
+elif argv[:2] == ["run", "view"] and "--log-failed" in argv:
+    print(json.loads(os.environ.get("FAKE_GH_FAILED_LOGS", "{}")).get(argv[2], ""))
 elif argv[:2] == ["pr", "update-branch"]:
     # THE WRITE, AND IT MODELS THE MERGE REF RATHER THAN MOCKING THE OUTCOME. This is
     # where a test of this feature is easiest to get vacuously right: a fake that simply
@@ -2272,6 +2274,11 @@ def fake_gh(tmp_path, monkeypatch):
             return [c["argv"][2] for c in self.calls
                     if c["argv"][:2] == ["pr", "update-branch"] and len(c["argv"]) > 2]
 
+        def set_failed_log(self, run_id: int, text: str) -> None:
+            """Register what `gh run view <run_id> --log-failed` answers"""
+            logs = json.loads(os.environ.get("FAKE_GH_FAILED_LOGS", "{}"))
+            monkeypatch.setenv("FAKE_GH_FAILED_LOGS", json.dumps({**logs, str(run_id): text}))
+
         def refuse_rerun(self, message: str = "run cannot be rerun") -> None:
             """Make `gh run rerun` fail and NOTHING else (#1123)"""
             monkeypatch.setenv("FAKE_GH_REFUSE_RERUN", message)
@@ -3058,7 +3065,7 @@ class FleetCostFixture:
 
     def os_call(self, kind: str, *, ts: float, wo_id: str = "", cost_usd: float = 0.0,
                 label: str = "", model: str = "claude-opus-5",
-                project: str | None = None, session_id: str = "") -> None:
+                project: str | None = None, session_id: str = "", output: int = 0) -> None:
         from .central_store import CentralStore
 
         central = CentralStore()
@@ -3067,9 +3074,9 @@ class FleetCostFixture:
                 """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model, ok,
                                             cost_usd, input, cache_write, cache_read,
                                             output, session_id)
-                   VALUES (?,?,?,?,?,?,1,?,0,0,0,0,?)""",
+                   VALUES (?,?,?,?,?,?,1,?,0,0,0,?,?)""",
                 (ts, self.name if project is None else project, wo_id, kind, label,
-                 model, cost_usd, session_id))
+                 model, cost_usd, output, session_id))
             central.conn.commit()
         finally:
             central.close()
@@ -3113,6 +3120,22 @@ class FleetCostFixture:
                                      "input": arguments}
                                     for tid, name, arguments in tools]},
         }
+
+    @staticmethod
+    def output_for(usd: float, model: str = "claude-opus-5") -> int:
+        """Output tokens that price at `usd` on the list"""
+        return round(usd * 1_000_000 / usage.priced(model, output=1_000_000).list_cost_usd)
+
+    def spend(self, title: str, usd: float, *, at: float, session_id: str = "",
+              ended_at: float | None = None, kind: str = "dispatch") -> str:
+        """An order whose one turn made one transcript call worth `usd`, at `at`"""
+        session_id = session_id or f"session-{title}-{at}"
+        wo = self.order(title, session_id=session_id)
+        self.turn(wo, started_at=at, ended_at=at + 60 if ended_at is None else ended_at,
+                  kind=kind, cost_usd=usd)
+        self.transcript(session_id, [self.call_row(at=at, out=self.output_for(usd),
+                                                   mid=f"m-{session_id}")])
+        return wo
 
     def placeholder_call_rows(self, *, at: float, read: int = 0, write: int = 0,
                               out: int = 5, mid: str = "",
