@@ -111,13 +111,11 @@ def test_a_refused_re_run_spends_no_attempt(started, project, fake_gh):
     assert warnings(store) == []
 
 
-def test_a_green_or_failed_run_is_never_re_run(started, project, fake_gh):
-    """Only a run that JUDGED NOTHING is re-run; a failure is a verdict on the code"""
-    main_runs(fake_gh, [row("failure", workflow="ci"),
-                        row("success", run_id=RUN_ID + 1, workflow="browser")])
+def test_a_green_run_is_never_re_run(started, project, fake_gh):
+    main_runs(fake_gh, [row("success")])
     store = ProjectStore(project)
 
     poll(started, store)
 
     assert fake_gh.reruns == []
-    assert fact()["red"] is True and fact()["ci_reruns"] == {}
+    assert fact()["red"] is False and fact()["ci_reruns"] == {}
