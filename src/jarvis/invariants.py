@@ -256,6 +256,11 @@ IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish
                           "nothing it started is still running; read its last message, "
                           "then `jarvis wo send` or `jarvis wo done`")
 
+#: The idle line's premise is false here: `finished` stands and nothing above it claimed the order (#1591)
+DELIVERED_UNSETTLED_BLOCKER = ("the worker finished and nothing will judge or close it — "
+                               "its summary is on the record; read it, then `jarvis wo done` "
+                               "to close it or `jarvis wo send` to send it back")
+
 #: WHAT THE IDLE LINE ABOVE SAID ABOUT A HOLD IT DOES NOT DESCRIBE: the worker DID deliver (docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md)
 REFUSAL_UNANSWERED_BLOCKER = (
     f"{REFUSAL_UNANSWERED_REASON} — read your refusal, then `jarvis wo send` telling it "
@@ -433,6 +438,29 @@ def outstanding_children_note(store: ProjectStore, wo: dict[str, Any]) -> str:
             f"({named}{f', +{more} more' if more > 0 else ''})")
 
 
+def _event_stands(store: ProjectStore, wo: dict[str, Any], kind: str) -> bool:
+    """`kind` is on the record and no worker turn has started since (#1591): a compaction is not work"""
+    events = store.events_of_kind(wo["id"], kind)
+    if not events:
+        return False
+    written = float(events[-1]["ts"])
+    return not any(float(t["started_at"] or 0) > written
+                   for t in store.all_turns(wo["id"]) if t["kind"] != worker_session.COMPACT_TURN)
+
+
+def finish_stands(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Did the worker finish, with no later turn to overtake it? (#1591)"""
+    return _event_stands(store, wo, "finished")
+
+
+def release_parked_unshipped(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is this a release settled with nothing shipped and not yet sent back to work? (#1591)"""
+    from . import release
+
+    return (wo["status"] == "needs_review"
+            and _event_stands(store, wo, release.NOTHING_SHIPPED_EVENT))
+
+
 def has_delivered(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Has this work order produced something a person has to decide about?"""
     return bool(wo.get("pr_url")) or bool(store.all_assumptions(wo["id"]))
@@ -465,6 +493,9 @@ RELEASE_NOTHING_SHIPPED_BLOCKER = (
     "production was not deployed, so every fix it was filed to ship is still only on "
     "main. Read its summary for what stopped it, clear that, then `jarvis wo retry "
     "{wo_id}`; `jarvis wo done {wo_id}` if the release is no longer wanted.")
+
+#: The fixed head of that sentence: `ack_decision_blocker` has no order id to format it with
+RELEASE_NOTHING_SHIPPED_HEAD = RELEASE_NOTHING_SHIPPED_BLOCKER.split("{", 1)[0]
 
 
 #: What a work order says when an OS-built prompt for it was past the ceiling (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
@@ -944,7 +975,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(user_action_owed_blocker(
                 str(owed_action.get("command") or "")))
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for something different (#224)
-        if wo.get("pr_state") == "CLOSED":
+        # Rebuilt from the sentence its settler flagged, so both surfaces agree (#1591)
+        if release_parked_unshipped(store, wo):
+            blockers.append(RELEASE_NOTHING_SHIPPED_BLOCKER.format(wo_id=wo["id"]))
+        elif wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
         # 2
         elif validation_escalated(store, wo):
@@ -967,7 +1001,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
                             else REFUSAL_UNANSWERED_BLOCKER)
         # 4; a pushed-branch park always follows `finished`
         elif not pending and pr_pending is None and owed_action is None:
-            blockers.append(IDLE_NO_FINISH_BLOCKER)
+            blockers.append(DELIVERED_UNSETTLED_BLOCKER if finish_stands(store, wo)
+                            else IDLE_NO_FINISH_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43)
     if stuck_message(store, wo, now=now) is not None:
         blockers.append(MESSAGE_STUCK_BLOCKER)
@@ -4541,6 +4576,31 @@ def _tracked_with_basename(root: Path, ref: str, name: str) -> list[str]:
 
 
 INV_PRECONDITION_UNWIRED = "INV-PRECONDITION-UNWIRED"
+INV_BLOCKER_CONTRADICTS_RECORD = "INV-BLOCKER-CONTRADICTS-RECORD"
+
+
+def check_blocker_matches_record(store: ProjectStore) -> Iterator[Violation]:
+    """INV-BLOCKER-CONTRADICTS-RECORD — a derived blocker must not deny the order's own events (#1591)"""
+    for wo in store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True):
+        blockers = true_blockers(store, wo)
+        reason = wo.get("attention_reason") or ""
+        if IDLE_NO_FINISH_BLOCKER in blockers and finish_stands(store, wo):
+            said = "it says the worker never ran `jarvis wo finish`, and its `finished` event stands"
+        elif release_parked_unshipped(store, wo) and reason and reason not in blockers:
+            said = "its attention line is a sentence no derived blocker carries"
+        else:
+            continue
+        # No repair: the routes out ship code or drop an expedited fix, and only the user picks one
+        yield Violation(
+            invariant=INV_BLOCKER_CONTRADICTS_RECORD,
+            wo_id=wo["id"],
+            detail=f"its blocker contradicts its own record: {said}",
+            repaired=False,
+            owed="",
+            notice=f"{wo['id']}: its blocker contradicts its own record: {said} — "
+                   f"`jarvis wo show {wo['id']}`",
+            context={"blockers": blockers},
+        )
 
 
 def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
@@ -4622,6 +4682,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_attention_has_reason,
     check_precondition_is_wired,   # order-free: a pure read that repairs nothing, raises
                                    # no flag and writes no status, so nothing else in the tuple reads its output
+    check_blocker_matches_record,  # order-free: a pure read, like the line above
     check_pull_request_recorded,   # order-free: a pure timeline read that repairs
                                    # nothing and touches no flag
     check_closed_session_removed,  # ditto: a pure read of what the poll could not remove

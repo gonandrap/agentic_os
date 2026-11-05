@@ -330,6 +330,97 @@ def test_an_ordinary_work_order_cuts_no_release_and_completes(started, store):
     assert events(store, wo["id"], release.NOTHING_SHIPPED_EVENT) == []
 
 
+# -- a parked release's blocker, its route out, and the detector: issue #1591
+
+
+def parked_release(store) -> str:
+    """Finished with nothing cut, in a session `jarvis wo retry` can relaunch"""
+    rel = release_order(store)
+    store.update_work_order(rel, session_id="11111111-1111-1111-1111-111111111111")
+    base_health(red=False)
+    ops.finish(rel, "the shipit call was denied — nothing tagged, nothing deployed")
+    return rel
+
+
+def test_a_parked_release_has_one_blocker_and_it_is_its_attention_line(started, store):
+    rel = parked_release(store)
+    wo = store.get_work_order(rel)
+
+    blockers = invariants.true_blockers(store, wo)
+
+    assert blockers == [wo["attention_reason"]]
+    assert f"`jarvis wo retry {rel}`" in blockers[0]
+    assert f"`jarvis wo done {rel}`" in blockers[0]
+    assert [v for v in invariants.check_blocker_matches_record(store)
+            if v.wo_id == rel] == []
+
+
+def test_the_verb_a_parked_release_names_is_accepted(started, store):
+    """The sentence's `jarvis wo retry` must not be refused for `needs_review`"""
+    rel = parked_release(store)
+
+    out = ops.retry(rel, project_name="proj_a")
+
+    msg = store.list_messages(rel)[0]
+    assert msg["content"] == ops.RELEASE_RETRY_NOTE and msg["source"] == "retry"
+    assert out["status"] == "needs_review"
+    assert "`needs_review`" in out["note"] and "`failed`" not in out["note"]
+
+
+def test_retry_stays_refused_for_any_other_needs_review_order(started, store):
+    wo = store.create_work_order("not a release", status="needs_review",
+                                 session_id="11111111-1111-1111-1111-111111111111")
+
+    with pytest.raises(ops.OpsError, match="not failed"):
+        ops.retry(wo["id"], project_name="proj_a")
+
+
+def test_a_later_turn_overtakes_the_park_and_the_finish(started, store):
+    """Sent back to work and stopped again, the idle line is true once more"""
+    rel = parked_release(store)
+    turn = store.create_turn(rel, "message", "carry on")
+    store.finish_turn(turn["id"], "done")
+    wo = store.get_work_order(rel)
+
+    assert not invariants.release_parked_unshipped(store, wo)
+    assert not invariants.finish_stands(store, wo)
+    assert invariants.true_blockers(store, wo) == [invariants.IDLE_NO_FINISH_BLOCKER]
+    with pytest.raises(ops.OpsError, match="not failed"):
+        ops.retry(rel, project_name="proj_a")
+
+
+def test_a_compaction_overtakes_nothing(started, store):
+    """The OS compacting an idle conversation is not the worker going back to work"""
+    rel = parked_release(store)
+    store.create_turn(rel, "compact", "/compact")
+
+    assert invariants.release_parked_unshipped(store, store.get_work_order(rel))
+
+
+def test_a_parked_release_refuses_the_ack_that_would_hide_it(started, store):
+    rel = parked_release(store)
+
+    with pytest.raises(ops.OpsError, match="acknowledging would hide"):
+        ops.ack_attention(rel, project_name="proj_a")
+
+
+def test_the_detector_names_a_blocker_that_denies_the_record(started, store, monkeypatch):
+    """Both predicates, by forcing the regression each one guards against"""
+    rel = parked_release(store)
+    name = "INV-BLOCKER-CONTRADICTS-RECORD"
+
+    monkeypatch.setattr(invariants, "true_blockers",
+                        lambda *_a, **_k: [invariants.IDLE_NO_FINISH_BLOCKER])
+    found = [v for v in invariants.check_blocker_matches_record(store) if v.wo_id == rel]
+    assert [v.invariant for v in found] == [name] and not found[0].repaired
+    assert "`finished` event stands" in found[0].detail
+
+    monkeypatch.setattr(invariants, "finish_stands", lambda *_a: False)
+    found = [v for v in invariants.check_blocker_matches_record(store) if v.wo_id == rel]
+    assert [v.invariant for v in found] == [name]
+    assert "attention line" in found[0].detail
+
+
 # -- 6: the tick that is the only step touching a held release
 
 

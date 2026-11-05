@@ -97,12 +97,24 @@ GAP_CLASSES: dict[str, GapClass] = {
         issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
         since="",
     ),
+    "blocker-contradicts-record": GapClass(
+        id="blocker-contradicts-record",
+        headline="a blocker derivation falls through to a catch-all whose premise the "
+                 "order's own events deny, so it names verbs that cannot clear the wait",
+        symptom="a finished order blocked as 'stopped mid-task', its blocker disagreeing "
+                "with its attention line",
+        detector="INV-BLOCKER-CONTRADICTS-RECORD",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1591",
+        since="",
+    ),
 }
 
 #: Asserted equal to `tuple(GAP_CLASSES)`, on `remedies.SHIPPED_REMEDIES`' precedent
 SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "oversized-input", "unwired-precondition",
-                                        "background-task-silence")
+                                        "background-task-silence",
+                                        "blocker-contradicts-record")
 
 
 def checked_slug(raw: str) -> str:
