@@ -160,6 +160,30 @@ def test_a_notification_that_the_job_ended_clears_it(root):
                                         until=now + 60) == []
 
 
+def _agent_launch(when: float) -> list[dict]:
+    """An async Agent's two rows, as transcript 399234a5 has them: no `backgroundTaskId`"""
+    return [
+        _call(when, "Agent", description="Build it", run_in_background=True),
+        {"type": "user", "timestamp": _stamp(when + 0.1),
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_y", "content": "launched"}]},
+         "toolUseResult": {"isAsync": True, "status": "async_launched",
+                           "agentId": "agent1"}},
+    ]
+
+
+def test_an_async_agent_is_cleared_by_the_notification_naming_its_agent_id(root):
+    """Issue 1566: named by call id, the launch never matched its `<task-id>`"""
+    now = db.now()
+    _transcript(root, "sess-1", _agent_launch(now))
+    assert [j.job_id for j in background.jobs_left_running(
+        "sess-1", since=now - 1, until=now + 60)] == ["agent1"]
+
+    _transcript(root, "sess-1", [*_agent_launch(now), _notification(now + 1, "agent1")])
+    assert background.jobs_left_running("sess-1", since=now - 1,
+                                        until=now + 60) == []
+
+
 def test_a_notification_that_it_is_still_running_does_not(root):
     now = db.now()
     _transcript(root, "sess-1",
