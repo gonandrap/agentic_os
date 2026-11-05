@@ -47,7 +47,8 @@ def test_by_invariant_skips_the_classes_with_no_detector_yet():
 def test_the_classes_with_a_detector_are_named():
     """§2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md, and issue 1562"""
     armed = {slug for slug, c in gaps.GAP_CLASSES.items() if c.detector}
-    assert armed == {"unwired-precondition", "background-task-silence"}
+    assert armed == {"unwired-precondition", "background-task-silence",
+                     "superseded-delivery"}
     assert gaps.GAP_CLASSES["background-task-silence"].detector == "background.live_tasks"
     assert (gaps.by_invariant()["INV-PRECONDITION-UNWIRED"]
             == "unwired-precondition")

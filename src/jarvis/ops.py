@@ -5912,6 +5912,18 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
             "session_stopped": stopped["stopped"]}
 
 
+def settle_superseded(store: ProjectStore, wo: dict[str, Any], why: str,
+                      passed_round: int) -> None:
+    """The OS closed this order's empty pull request: the work is on the base already (#1592)"""
+    store.update_work_order(wo["id"], pr_state="CLOSED")
+    # The written decision INV-WORK-LANDED reads: this pull request will never merge
+    store.add_event(wo["id"], "abandoned", {"reason": why, "source": "superseded"})
+    close_out(store, wo, "pr_superseded_settled", why="its work reached the base first",
+              payload={"pr_url": wo.get("pr_url"), "passed_round": passed_round})
+    mark_backlog_done(wo)
+    notify_completed(store, wo, "superseded, an equivalent change is on the base")
+
+
 def record_pr_closed(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     """The pull request was closed without merging: the delivered work was refused"""
     store.update_work_order(wo["id"], pr_state="CLOSED")
