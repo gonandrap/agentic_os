@@ -8953,8 +8953,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 until, cause = validation_hold(events, int(latest["round"]))
                 ci_held = cause == VALIDATION_CI_CAUSE and until > now
             ci_spans = validation_ci_hold_spans(events, since, now)
-        # A MERGE THE OS IS ITSELF HOLDING ONTO A RED BASE IS NOT STUCK (§1 and §2 of... (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)
-        # ...AND A RELEASE IT HOLDS IN `pending` (docs/superpowers/specs/2026-11-04-a-release-held-by-a-red-base-is-not-stuck.md)
+        # A MERGE OR A `pending` RELEASE THE OS HOLDS ON A RED BASE IS NOT STUCK (docs/superpowers/specs/2026-11-04-a-release-held-by-a-red-base-is-not-stuck.md)
         held_by_red_base = (wo["status"] == "waiting_pr_merge"
                             or (wo["status"] == "pending"
                                 and release.is_release_order(wo)))
@@ -9042,7 +9041,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
                             if base_red and held_by_red_base
-                            # AFTER the red base and BEFORE the dependency: both can be `waiting_pr_merge` and CAN co-occur
+                            # AFTER the red base and BEFORE the dependency: the first two CAN co-occur
                             else stuck.AUTOMERGE_CHECKS_CAUSE if automerge_checks_held
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE
