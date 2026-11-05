@@ -3573,6 +3573,10 @@ class Daemon:
                                  item["pr_number"], item["state"], action)
                 except Exception:  # noqa: BLE001 — one item must not starve the others
                     log.exception("morpheus: action for %s failed", item["id"])
+            if not morpheus.held(central):
+                for item_id in morpheus.reask_answered(central, self.catalog, skip=skip):
+                    log.info("morpheus %s: Neo answered with no way to settle it, asked again",
+                             item_id)
             # One short session per owed order, in that order's production directory (§3)
             armed = morpheus.arm(central, self.catalog, cwd_for, skip=skip)
             ran = {k: v for k, v in armed.items() if v and k not in ("paused", "usage_held")}
