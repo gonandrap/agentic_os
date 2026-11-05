@@ -1369,6 +1369,13 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--clear", action="store_true", help="remove the ceiling")
     v.add_argument("--project")
 
+    v = inv.add_parser("correct", help="record that a WAITING_ON_USER verdict's shipped "
+                                       "behaviour is correct: its monitoring order settles "
+                                       "unverified, never validated")
+    v.add_argument("inv_id")
+    v.add_argument("--reason", required=True, help="how you know the behaviour is correct")
+    v.add_argument("--project")
+
     v = inv.add_parser("verdict", help="(investigators) submit the verdict — the "
                                        "investigator's terminal action, and what settles "
                                        "the order")
@@ -2917,7 +2924,7 @@ def _normalise_issues(argv: list[str]) -> list[str]:
 
 
 #: The `investigate` sub-verbs — a CLOSED set
-INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict", "budget")
+INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict", "budget", "correct")
 
 
 def _normalise_investigate(argv: list[str]) -> list[str]:
@@ -3133,7 +3140,7 @@ def cmd_alarms(args: argparse.Namespace) -> int:
         mark = "!" if row["live"] else " "
         # The id only on the reads that asked for one subject: §1 of... (docs/superpowers/specs/2026-08-31-the-supervisor.md)
         who = (f"{row['id']}  " if (args.wo or args.fo)
-               else f"{row['subject_id']}  {row['project']}  ")
+               else f"{row['subject_id'] or 'machine-wide'}  {row['project']}  ")
         print(f"{mark} {who}{row['kind_label']}  "
               f"{ops.turn_label(row['seq'])}  {_age(row['ts'])} ago")
         print(f"    {row['reason']}")
@@ -3194,7 +3201,7 @@ def cmd_alarms_show(args: argparse.Namespace) -> int:
     if args.json:
         _print(a, True)
         return 0
-    print(f"{a['id']}  {a['project']}  {a['subject_id']}  {a['title']}")
+    print(f"{a['id']}  {a['project']}  {a['subject_id'] or 'machine-wide'}  {a['title']}")
     print(f"  {a['kind_label']}  {ops.turn_label(a['seq'])}  {_age(a['ts'])} ago"
           f"{'  ! still asking' if a['live'] else ''}")
     print(f"  what fired: {a['reason']}")
@@ -4713,6 +4720,9 @@ def cmd_investigate(args: argparse.Namespace) -> int:
             amount = None if args.clear else _parse_budget_amount(args.amount)
             _print(ops.set_investigation_budget(args.inv_id, amount, args.project),
                    args.json)
+
+    elif args.inv_cmd == "correct":
+        _print(ops.correct_investigation(args.inv_id, args.reason, args.project), args.json)
 
     elif args.inv_cmd == "verdict":
         doc, source = _read_submission(args.from_file, "investigator", "verdict")
