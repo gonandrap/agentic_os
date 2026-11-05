@@ -1471,6 +1471,8 @@ elif argv[:2] == ["run", "rerun"]:
         sys.stderr.write(refuse + "\n")
         sys.exit(1)
     print(f"Requested rerun of run {argv[2] if len(argv) > 2 else ''}")
+elif argv[:2] == ["run", "view"] and "--log-failed" in argv:
+    print(json.loads(os.environ.get("FAKE_GH_FAILED_LOGS", "{}")).get(argv[2], ""))
 elif argv[:2] == ["pr", "update-branch"]:
     # THE WRITE, AND IT MODELS THE MERGE REF RATHER THAN MOCKING THE OUTCOME. This is
     # where a test of this feature is easiest to get vacuously right: a fake that simply
@@ -2257,6 +2259,11 @@ def fake_gh(tmp_path, monkeypatch):
             """Every pull request `gh pr update-branch` was called on, in order"""
             return [c["argv"][2] for c in self.calls
                     if c["argv"][:2] == ["pr", "update-branch"] and len(c["argv"]) > 2]
+
+        def set_failed_log(self, run_id: int, text: str) -> None:
+            """Register what `gh run view <run_id> --log-failed` answers"""
+            logs = json.loads(os.environ.get("FAKE_GH_FAILED_LOGS", "{}"))
+            monkeypatch.setenv("FAKE_GH_FAILED_LOGS", json.dumps({**logs, str(run_id): text}))
 
         def refuse_rerun(self, message: str = "run cannot be rerun") -> None:
             """Make `gh run rerun` fail and NOTHING else (#1123)"""

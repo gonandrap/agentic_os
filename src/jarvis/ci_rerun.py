@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,7 @@ log = logging.getLogger("jarvis.ci_rerun")
 RERUN_TIMEOUT = 30
 
 #: Every `gh` subcommand this module may run
-VERBS = (("run", "list"), ("run", "rerun"))
+VERBS = (("run", "list"), ("run", "rerun"), ("run", "view"))
 
 #: Of those, the one that changes something at GitHub
 WRITE_VERBS = (("run", "rerun"),)
@@ -42,6 +43,15 @@ RECOVERED_EVENT = "ci_rerun_recovered"
 FLAKE_RERUN_EVENT = "ci_flake_rerun_requested"
 FLAKE_CONFIRMED_EVENT = "ci_flake_confirmed"
 
+#: `ci_reruns` key prefix of a red default-branch run's one re-run; an aborted run's key is its bare id
+BASE_FAILED_PREFIX = "failed:"
+
+#: A pytest summary line in a failed job's log
+FAILED_TEST_RE = re.compile(r"\b(?:FAILED|ERROR) (\S+\.py(?:::\S+)?)")
+
+#: How many test names one flake record carries
+MAX_FLAKE_TESTS = 20
+
 #: Why the OS stopped, as stable tokens
 CAUSE_CANCELLED_AGAIN = "cancelled_again"
 CAUSE_NO_RUN = "no_run"
@@ -55,7 +65,7 @@ def _run(args: list[str], *, cwd: Path | None, missing_hint: str) -> str:
     shown = "`gh " + " ".join(args[:3]) + "`"
     try:
         proc = subprocess.run([gh_bin(), *args], capture_output=True, text=True,
-                              timeout=RERUN_TIMEOUT, cwd=where)
+                              timeout=RERUN_TIMEOUT, cwd=where, errors="replace")
     except FileNotFoundError as e:
         raise GhUnavailable(gh_missing_message(missing_hint), GitHubError.NO_GH) from e
     except subprocess.TimeoutExpired as e:
@@ -142,6 +152,35 @@ def failed_runs_to_rerun(red: tuple[dict[str, str], ...],
         if found is not None:
             picked[workflow] = found
     return tuple(picked.values())
+
+
+def base_failed_key(run: Run) -> str:
+    """Once per head: a second run of this workflow on this commit shares the key"""
+    return f"{BASE_FAILED_PREFIX}{run.head_sha}:{run.workflow}"
+
+
+def base_verdict(runs: tuple[Run, ...], workflow: str, reruns: Any) -> Run | None:
+    """`ci.latest`, except a red run's re-run stays red until it judges: else an older green opens the merges"""
+    for r in runs:
+        if r.workflow != workflow:
+            continue
+        if (base_failed_key(r) in reruns
+                and (not r.completed or r.conclusion in ABORTED_RUN_CONCLUSIONS)):
+            return replace(r, status="completed", conclusion="failure")
+        if r.completed:
+            return r
+    return None
+
+
+def failed_tests(run_id: int, cwd: Path | None = None) -> tuple[str, ...]:
+    """The tests a finished run failed, or `()` if its log names none or cannot be read"""
+    try:
+        stdout = _run(["run", "view", str(int(run_id)), "--log-failed"], cwd=cwd,
+                      missing_hint="so Jarvis cannot name the failed tests")
+    except GitHubError as e:
+        log.info("could not read the failed log of run %s: %s", run_id, e)
+        return ()
+    return tuple(dict.fromkeys(FAILED_TEST_RE.findall(stdout)))[:MAX_FLAKE_TESTS]
 
 
 def head_events(store: Any, wo_id: str, kind: str, head: str) -> list[dict[str, Any]]:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from jarvis import claude_cli, ops
@@ -75,6 +77,10 @@ def test_delete_also_kills_the_worker_turn(started, fake_claude, project):
     out = ops.delete_work_order(wo["id"])
 
     assert out["session_stopped"] is True
+    # clock-exempt: class 3 — delete sends SIGTERM and returns, so the worker dies a moment later
+    deadline = time.monotonic() + 5
+    while claude_cli.process_alive(turn["pid"]) and time.monotonic() < deadline:
+        time.sleep(0.02)
     assert not claude_cli.process_alive(turn["pid"])
 
 
