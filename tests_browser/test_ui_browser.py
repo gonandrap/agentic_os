@@ -1219,7 +1219,8 @@ def _morpheus_rows() -> tuple[str, str]:
                 wo_id="wo-1234abcd", release_tag="jarvis-0.1.0", hints=_LONG, script="exit 1",
                 script_source="agent", state="monitoring", deadline_ts=time.time() + 86400)
             ids.append(item["id"])
-        central.update_morpheus_item(ids[0], state="failed", last_exit=1, checks=2,
+        # neo:0 names no question: a dead hand-off, so the row is the user's (morpheus.owed_by)
+        central.update_morpheus_item(ids[0], state="failed", last_exit=1, checks=2, action="neo:0",
                                      resolution="script exited 1", last_output="boom")
         central.add_morpheus_run(ids[0], exit=1, output="boom", kind="check",
                                  state_after="failed")

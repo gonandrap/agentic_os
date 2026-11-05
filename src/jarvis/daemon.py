@@ -3551,6 +3551,13 @@ class Daemon:
                     log.info("morpheus %s: its investigation's verdict moved it", item_id)
             except Exception:  # noqa: BLE001 — the rest of the pass still runs
                 log.exception("morpheus: could not settle investigated items")
+            try:
+                from .ops import clear_settled_monitor_attention
+
+                for inv_id in clear_settled_monitor_attention():
+                    log.info("morpheus: %s's attention cleared, its row is decided", inv_id)
+            except Exception:  # noqa: BLE001 — the rest of the pass still runs
+                log.exception("morpheus: could not clear settled investigations' attention")
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
             skip = {*archived_projects(central), *no_production}

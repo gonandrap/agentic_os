@@ -776,6 +776,49 @@ def owed_actions(central: CentralStore) -> list[dict[str, Any]]:
     return [i for i in central.morpheus_items(ACTION_STATES) if not i["action"]]
 
 
+#: Who can owe a row's next move (io-5cc7a40d); a settled row has no next move and no owner
+OWNERS = ("user", "neo", "investigation", "os")
+#: A row whose hand-off ended with nobody to move it; no verb is pre-picked (Q3605)
+USER_VERBS = ('jarvis mo waive {id} --reason "…" | jarvis mo confirm {id} --fix "…" | '
+              'jarvis mo requeue {id} | jarvis mo rewrite {id} --why "…"')
+
+
+def decided(item: dict[str, Any]) -> bool:
+    """Nothing is owed on this row: it is not failed or timed out, or the user confirmed it"""
+    return (item["state"] not in ACTION_STATES
+            or (item.get("resolution") or "").startswith(CONFIRMED))
+
+
+def owed_by(item: dict[str, Any], question: dict[str, Any] | None = None,
+            order: dict[str, Any] | None = None) -> tuple[str, str]:
+    """(owner, the user's one command) of a row; `question`/`order` are what its action names"""
+    from .project_store import FO_OPEN_STATUSES, decide_command
+
+    if item["state"] in OPEN_STATES:
+        return "os", ""
+    if item["state"] not in ACTION_STATES:
+        return "", ""
+    action = item.get("action") or ""
+    if decided(item) or not action or action.startswith(JUDGE_CLAIM):
+        return "os", ""
+    look = f"jarvis mo show {item['id']}"
+    kind = action.partition(":")[0]
+    if kind == "neo" and question:
+        # Answered and still failed: nothing moves it, so it is the user's (wo-ea6895e7 ruling)
+        if question["status"] not in ("answered", "escalated", "refined", "lapsed"):
+            return "neo", ""
+    elif kind in ("investigation", "improvement") and order:
+        if order.get("needs_attention"):
+            ask = (db.from_json(order.get("plan"), None) or {}).get("rewrite_ask")
+            return "user", (ask.get("command") if isinstance(ask, dict) and ask.get("command")
+                            else decide_command(order.get("kind"), order["id"]))
+        if order["status"] in FO_OPEN_STATUSES:
+            return "investigation", ""
+        if order["status"] == "completed":
+            return "os", ""
+    return "user", look  # nobody ruled and nothing retries it (Q3606)
+
+
 def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *, cwd: Path,
         call: Callable[..., Any] | None = None, now: float | None = None,
         investigate: Callable[..., tuple[str, str]] | None = None,
