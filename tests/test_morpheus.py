@@ -704,6 +704,26 @@ def test_settle_never_overrides_an_escalation_or_the_user_s_ruling(central, fiel
     assert central.morpheus_item(item["id"])["state"] == fields["state"]
 
 
+@pytest.mark.parametrize("verdict,offered,level,moved", [
+    ({}, True, "warning", True),                         # no action: nothing retries it
+    ({"action": "requeue"}, True, "info", False),        # it moved
+    ({}, False, "info", True),                           # unmarked: a re-ask still follows
+])
+def test_a_verdict_that_moves_nothing_warns_the_user(central, verdict, offered, level, moved):
+    item = monitoring(central, script="exit 1")
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict",
+                                 next_check_ts=None, action="neo:5")
+    q = {"id": 5, "project": "proj_a",
+         "context": json.dumps({"morpheus_item": item["id"], "settle_offered": offered})}
+    morpheus.record_neo_verdict(central, MorpheusConfig(), q,
+                                {"escalate": False, "answer": "rare path", **verdict})
+    row = central.conn.execute("SELECT level, title, body FROM inbox").fetchone()
+    assert row["level"] == level
+    assert (central.morpheus_item(item["id"])["state"] == "timedout") is moved
+    assert ("nothing moved" in row["title"]) is (level == "warning")
+    assert (f"requeue|waive|confirm|rewrite {item['id']}" in row["body"]) is (level == "warning")
+
+
 def test_a_new_question_offers_settle_and_never_validates(central):
     from jarvis.neo_store import NeoStore
 

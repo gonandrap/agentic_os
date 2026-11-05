@@ -240,7 +240,9 @@ steward candidates with origin `morpheus` (`steward.py` ~444-468), and the invar
     reason added; `action` = `neo:<qid>`. Neo's `requeue` verdict and its cap stay. Its
     `settle` verdict moves the row to `unverified`, never `validated` (a waive stays the
     user's). A row Neo answered on a question predating `settle` is asked once more
-    (`reask_answered`); a user's answer or an escalation is not.
+    (`reask_answered`); a user's answer or an escalation is not. A verdict that moves nothing
+    on a question offering `settle` raises a warning inbox row naming the user's commands:
+    no verdict is synthesised, and the OS is never silent about a row nothing retries.
 * **A judge that fails** (None, kill, timeout): release the claim (`action` back to empty),
   `attempts += 1` on the row; after `MAX_OFFERS` failed judgings, `escalate` without a
   verdict — the question says the judge could not answer. Never a synthesised verdict.

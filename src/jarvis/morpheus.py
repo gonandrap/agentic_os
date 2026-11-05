@@ -893,7 +893,7 @@ not, answer in two sentences; the answer is recorded on the item.
 SETTLE_OFFER = """If the user need not look, add `"action": "settle"`: the item becomes `unverified`, meaning
 nothing wrong was found and no check passed. It is not a pass and nobody owes it a move;
 the user can watch it again with `jarvis morpheus requeue {id}`. An answer with no action
-moves nothing: the item stays {state}."""
+moves nothing: the item stays {state} and the OS warns the user."""
 
 #: The item still has its automatic requeue
 REQUEUE_OFFER = """If the failure was transient — production had not exercised the change yet, a network or
@@ -956,7 +956,7 @@ def reask_answered(central: CentralStore, catalog: Catalog, *,
                 continue
             q = neo.get(int(qid))
             if (not q or q["status"] != "answered" or q["answered_by"] != "neo"
-                    or json.loads(q["context"] or "{}").get("settle_offered")):
+                    or _settle_offered(q)):
                 continue
             try:
                 action = f"neo:{_ask_neo(catalog, item)}"
@@ -976,6 +976,14 @@ def item_of_question(q: dict[str, Any]) -> str:
         return str((json.loads(q.get("context") or "{}") or {}).get("morpheus_item") or "")
     except (ValueError, AttributeError):
         return ""
+
+
+def _settle_offered(q: dict[str, Any]) -> bool:
+    """Whether this question could be answered with `settle`; one that could not is asked again"""
+    try:
+        return bool((json.loads(q.get("context") or "{}") or {}).get("settle_offered"))
+    except (ValueError, AttributeError):
+        return False
 
 
 def verdict_action(verdict: dict[str, Any]) -> str:
@@ -1030,13 +1038,17 @@ def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, 
                 resolution=f"script sent back to be rewritten by Neo: {resolution}")
     else:
         central.update_morpheus_item(item_id, resolution=resolution)
+    # Nothing retries this row now: silence would hide it, so the user hears (wo-ea6895e7)
+    unmoved = (live and not (escalated or requeued or settled or rewritten)
+               and _settle_offered(q) and not (item["resolution"] or "").startswith(CONFIRMED))
     central.add_inbox(
-        project=q.get("project") or "os", level="warning" if escalated else "info",
+        project=q.get("project") or "os", level="warning" if escalated or unmoved else "info",
         title=(f"PR #{item['pr_number']} {item['state']} production validation"
                + (" — Neo escalated" if escalated else
                   " — Neo is watching it again" if requeued else
                   " — Neo sent its script back to be rewritten" if rewritten else
                   " — Neo settled it unverified, not passed" if settled else
+                  " — Neo answered and nothing moved" if unmoved else
                   " — Neo's reading")),
         body=f"{item['pr_url']}\n{reading[:600]}\n"
              + ("the OS is validating it again — its one automatic requeue is now spent\n"
@@ -1045,6 +1057,9 @@ def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, 
                 "automatic rewrite is now spent\n" if rewritten else "")
              + (f"nobody owes it a move; jarvis morpheus requeue {item_id} watches it again\n"
                 if settled else "")
+             + (f"it stays {item['state']} and nothing retries it. Yours to move: jarvis morpheus "
+                f"requeue|waive|confirm|rewrite {item_id}. A wrong reading is a bug to file\n"
+                if unmoved else "")
              + (f"{question_url}\n" if question_url else "")
              + f"jarvis morpheus show {item_id}")
 
