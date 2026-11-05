@@ -1417,7 +1417,7 @@ def test_the_dashboard_shows_a_link_not_the_pr_s_text(central):
 
     from jarvis.ui.app import create_app
 
-    item = _failed(central)
+    item, _ = _escalated(central)
     page = TestClient(create_app()).get("/mo")
     assert page.status_code == 200
     assert '<a href="https://github.com/o/r/pull/7" title="[wo-1234abcd] thing">#7</a>' \
@@ -1867,3 +1867,67 @@ def test_the_detail_shows_its_session_and_cost_only_when_the_bill_exists(central
                         raising=False)
     page = client.get(f"/mo/{item['id']}").text
     assert "$1.50" in page and f"jarvis cost {item['id']}" in page
+
+
+@pytest.mark.parametrize("state,action,question,order,owner", [
+    ("monitoring", "", None, None, "os"),
+    ("validated", "", None, None, ""),
+    ("failed", "", None, None, "os"),
+    ("failed", f"{morpheus.JUDGE_CLAIM}1", None, None, "os"),
+    ("failed", "neo:1", {"status": "queued"}, None, "neo"),
+    ("failed", "neo:1", {"status": "failed"}, None, "neo"),
+    ("failed", "neo:1", {"status": "answered", "answered_by": "neo"}, None, "os"),
+    ("timedout", "neo:1", {"status": "answered", "answered_by": "user"}, None, "user"),
+    ("timedout", "neo:1", {"status": "escalated"}, None, "user"),
+    ("timedout", "neo:1", {"status": "lapsed"}, None, "user"),
+    ("failed", "neo:1", None, None, "user"),
+    ("failed", "investigation:inv-1", None,
+     {"id": "inv-1", "kind": "investigation", "status": "executing"}, "investigation"),
+    ("failed", "investigation:inv-1", None,
+     {"id": "inv-1", "kind": "investigation", "status": "completed"}, "os"),
+    ("failed", "investigation:inv-1", None,
+     {"id": "inv-1", "kind": "investigation", "status": "failed"}, "user"),
+    ("failed", "investigation:inv-1", None, None, "user"),
+    ("failed", "improvement:io-1", None,
+     {"id": "io-1", "kind": "improvement", "status": "completed", "needs_attention": 1}, "user"),
+])
+def test_owed_by_says_who_moves_next(state, action, question, order, owner):
+    item = {"id": "mv-1", "state": state, "action": action, "resolution": "script exited 1"}
+    got, command = morpheus.owed_by(item, question, order)
+    assert got == owner and bool(command) == (owner == "user")
+
+
+def test_a_confirmed_failure_is_the_os_s(central):
+    item = {"id": "mv-1", "state": "failed", "action": "neo:1",
+            "resolution": f"{morpheus.CONFIRMED}; fix filed as wo-1: x"}
+    assert morpheus.owed_by(item, {"status": "escalated"}) == ("os", "")
+
+
+def test_the_heading_status_and_list_count_the_same_user_rows(central, capsys):
+    from fastapi.testclient import TestClient
+
+    from jarvis.cli import main
+    from jarvis.ui.app import create_app
+
+    item, _ = _escalated(central)
+    other = queued(central, 8)
+    unjudged = queued(central, 9)
+    central.update_morpheus_item(unjudged["id"], state="failed", resolution="exit 1")
+    page = TestClient(create_app()).get("/mo").text
+    strip = page.split('needs-you">')[1].split("</section>")[0]
+    assert '<span class="n">1</span>monitors — need you' in strip
+    assert f"jarvis mo show {item['id']}" in strip and other["id"] not in strip
+    assert "OS handling — 2" in page
+    capsys.readouterr()
+    assert main(["mo", "list", "--owed", "user", "--json"]) == 0
+    assert [i["id"] for i in json.loads(capsys.readouterr().out)] == [item["id"]]
+    assert main(["mo", "list", "--owed", "nobody"]) == 1
+    capsys.readouterr()
+    assert main(["mo", "list"]) == 0
+    assert "owed by user" in capsys.readouterr().out
+    assert main(["mo", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "1 need you" in out and f"    jarvis mo show {item['id']}" in out
+    assert "OS handling: 2" in out and other["id"] not in out
+    assert main(["mo", "show", item["id"]]) == 0
+    assert f'jarvis mo waive {item["id"]} --reason' in capsys.readouterr().out

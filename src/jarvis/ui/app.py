@@ -2262,15 +2262,14 @@ def create_app() -> FastAPI:
         options = {"state": list(report["counts"]), "project": filter_options(every, "project")}
         filters = query_filters(request, options)
 
-        def needs_you(i: dict) -> bool:
-            return (i["state"] in ("failed", "timedout")
-                    and not (i.get("resolution") or "").startswith("confirmed failed"))
-
         newest = sorted(filter_rows(every, filters),
                         key=lambda i: i.get("updated_ts") or 0, reverse=True)
-        rows = attention_first(newest, needs_you)
-        return render(request, "morpheus.html", active="morpheus", report=report,
-                      rows=rows, attention=[i for i in rows if needs_you(i)],
+        failures_first = attention_first(newest, lambda i: i["state"] in ("failed", "timedout"))
+        rows = attention_first(failures_first, lambda i: i["owed_by"] == "user")
+        handling = [i for i in rows if i["owed_by"] not in ("", "user")]
+        return render(request, "morpheus.html", active="morpheus", report=report, rows=rows,
+                      attention=[i for i in rows if i["owed_by"] == "user"], handling=handling,
+                      listed=[i for i in rows if i["owed_by"] in ("", "user")],
                       filters=filters, options=options, total=len(every))
 
     @app.get("/mo/{item_id}", response_class=HTMLResponse)

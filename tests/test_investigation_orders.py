@@ -773,6 +773,28 @@ def test_script_wrong_past_its_cap_asks_the_user(started, store):
     assert argv[5] == plan["script_fix"]
 
 
+def test_a_settled_row_takes_its_investigation_s_attention_down(started, store):
+    """io-5cc7a40d: inv-92abc279 still asked to rewrite a validated row"""
+    from jarvis.central_store import CentralStore
+
+    item_id = _failed_item(script_rewrites=1)
+    inv_id, _ = _script_wrong(store, item_id)
+    central = CentralStore()
+    try:
+        central.update_morpheus_item(item_id, action=f"investigation:{inv_id}")
+        [row] = ops.mo_list(owed="user")
+        assert row["owed_command"] == json.loads(
+            store.get_feature_order(inv_id)["plan"])["rewrite_ask"]["command"]
+        assert ops.clear_settled_monitor_attention() == []
+        assert store.get_feature_order(inv_id)["needs_attention"]
+        central.update_morpheus_item(item_id, state="validated")
+    finally:
+        central.close()
+    assert ops.clear_settled_monitor_attention() == [inv_id]
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+    assert ops.mo_list(owed="user") == []
+
+
 def test_script_wrong_is_refused_off_a_morpheus_item(started, store):
     subject = _subject(store)
     inv = ops.create_investigation_order("proj_a", subject, WHY)
