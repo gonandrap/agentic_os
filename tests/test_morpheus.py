@@ -1453,6 +1453,35 @@ def test_open_scripts_naming_the_dev_checkout_go_back_once_without_spending_a_re
     assert morpheus.rewrite_dev_scripts(central, cfg, "proj_a", dev, live) == []
 
 
+@pytest.mark.parametrize("spelling", ["~/work/dev", "$HOME/work/dev", "${HOME}/work/dev"])
+def test_a_script_naming_the_dev_checkout_from_home_goes_back_too(
+        central, cfg, tmp_path, monkeypatch, spelling):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    named = monitoring(central, n=1, script=f"cd {spelling} || exit 75")
+    sibling = monitoring(central, n=2, script=f"cat {spelling}-kb/x")
+    sent = morpheus.rewrite_dev_scripts(central, cfg, "proj_a", tmp_path / "work" / "dev",
+                                        tmp_path / "live")
+    assert sent == [named["id"]] and sibling["id"] not in sent
+
+
+def test_a_manual_check_follows_production_and_never_runs_elsewhere(tmp_path, monkeypatch):
+    from jarvis import ops
+
+    dev, live = tmp_path / "dev", tmp_path / "live"
+    dev.mkdir()
+    live.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    cat = parse_catalog({"projects": [{"name": "p", "path": str(dev),
+                                       "production": {"path": str(live)}}]})
+    item = {"id": "mo-1", "project": "p"}
+    assert ops._morpheus_cwd(cat, item) == live.resolve()
+    live.rmdir()
+    with pytest.raises(ops.OpsError, match="production directory"):
+        ops._morpheus_cwd(cat, item)
+
+
 def test_the_daemon_runs_a_declared_project_from_production_and_holds_it_if_missing(
         central, catalog_file, project, tmp_path):
     from jarvis.catalog import load_catalog

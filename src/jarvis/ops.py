@@ -17245,8 +17245,12 @@ def _morpheus_cwd(catalog: Catalog, item: dict[str, Any]) -> Path:
     if item.get("project") == os_name and prod.is_dir():
         return prod
     for p in catalog.projects:
-        if p.name == item.get("project") and p.production_dir.is_dir():
-            return p.production_dir
+        if p.name == item.get("project"):
+            if p.production_dir.is_dir():
+                return p.production_dir
+            if p.production.path:
+                raise OpsError(f"{p.name}'s production directory {p.production.path} is "
+                               f"missing: {item.get('id')} waits, it is never checked elsewhere")
     return prod if prod.is_dir() else Path.cwd()
 
 

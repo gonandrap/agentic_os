@@ -417,7 +417,11 @@ def rewrite_dev_scripts(central: CentralStore, cfg: MorpheusConfig, project: str
     if central.get_state(key) == str(live):
         return []
     # Not a text swap: a script may read run state the app keeps in the dev folder on purpose
-    names_dev = re.compile(re.escape(str(dev)) + r"(?![\w.-])")
+    spellings = re.escape(str(dev))
+    if dev.is_relative_to(Path.home()):
+        spellings += (r"|(?:~|\$HOME|\$\{HOME\})/"
+                      + re.escape(str(dev.relative_to(Path.home()))))
+    names_dev = re.compile(rf"(?:{spellings})(?![\w.-])")
     why = (f"This script names {dev}, the development checkout. Production is {live}, the "
            f"directory you are in. Check production; keep the development path only for state "
            f"production itself reads there.")
