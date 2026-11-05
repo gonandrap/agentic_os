@@ -34,8 +34,7 @@ GAP_CLASSES: dict[str, GapClass] = {
         id="stale-hold",
         headline="a hold written once, never re-derived, keeps an order parked after its "
                  "cause clears",
-        symptom="the order sits in `validating` or `waiting_pr_merge` with nothing in "
-                "flight and no question open",
+        symptom="parked in `validating` or `waiting_pr_merge`, nothing in flight, no question open",
         detector="",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/786",
@@ -43,10 +42,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "round-burn": GapClass(
         id="round-burn",
-        headline="validation rounds spent on what is not the submitter's work, so the "
-                 "order runs out unjudged",
-        symptom="`max_rounds` reached with panel feedback about the base branch, not the "
-                "diff",
+        headline="rounds spent on what is not the submitter's work, so the order runs out unjudged",
+        symptom="`max_rounds` reached with panel feedback about the base, not the diff",
         detector="",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/806",
@@ -54,8 +51,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "red-main": GapClass(
         id="red-main",
-        headline="`main` is red and nothing notices, so every order built on it inherits "
-                 "a failure it did not cause",
+        headline="`main` is red and nothing notices, so every order on it inherits the failure",
         symptom="a pull request whose checks fail for a reason absent from its own diff",
         detector="",
         remedy=REMEDY_NONE,
@@ -64,8 +60,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "oversized-input": GapClass(
         id="oversized-input",
-        headline="a payload that could never fit is assembled and sent anyway, so the "
-                 "step fails on size, not substance",
+        headline="a payload that could never fit is sent anyway, so the step fails on size, not substance",
         symptom="a question, verdict or prompt refused for length, its work never read",
         detector="",
         remedy=REMEDY_NONE,
@@ -75,10 +70,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     # §2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md
     "unwired-precondition": GapClass(
         id="unwired-precondition",
-        headline="an order's brief states a stop condition in no state the scheduler "
-                 "reads, so a worker pays to rediscover the hold",
-        symptom="a dispatched order whose first line says not to start, abandoned with "
-                "no commits",
+        headline="a brief states a stop condition no state holds, so a worker pays to rediscover it",
+        symptom="dispatched, first line says not to start, abandoned with no commits",
         detector="INV-PRECONDITION-UNWIRED",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1089",
@@ -86,10 +79,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "background-task-silence": GapClass(
         id="background-task-silence",
-        headline="a worker awaiting a background task's result writes nothing, so the "
-                 "sweep reads its open turn as wedged",
-        symptom="a `running` order investigated while its transcript ends on a background "
-                "launch",
+        headline="a worker awaiting a background task writes nothing, so the sweep reads its turn as wedged",
+        symptom="`running`, investigated while its transcript ends on a background launch",
         detector="background.live_tasks",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
@@ -99,8 +90,7 @@ GAP_CLASSES: dict[str, GapClass] = {
         id="designed-wait-undiscounted",
         headline="the sweep is not taught a deliberate hold, so the wait is judged as "
                  "lost time",
-        symptom="investigated with blocker `nothing the record can name`; OS working as "
-                "designed",
+        symptom="blocker `nothing the record can name`; OS working as designed",
         detector="INV-RED-RELEASE-UNDISCOUNTED",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1603",
@@ -108,9 +98,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "superseded-delivery": GapClass(
         id="superseded-delivery",
-        headline="an equivalent change reaches the base first, so the pull request nets "
-                 "to nothing",
-        symptom="a passed order escalated as nothing to review; its open PR changes no files",
+        headline="an equivalent change lands first, so the pull request nets to nothing",
+        symptom="a passed order escalated as nothing to review; its PR changes no files",
         detector="Daemon._settle_superseded",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1592",
@@ -118,10 +107,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "base-chase-livelock": GapClass(
         id="base-chase-livelock",
-        headline="a queued pull request loses its turn when the sibling ahead merges, so "
-                 "it is caught up and re-run after every merge and never reaches the front",
-        symptom="a passed, green order in `waiting_pr_merge` whose history alternates "
-                "`merge_queued` holds with `cause=behind` catch-ups, with no merge",
+        headline="a queued PR loses its turn when the one ahead merges, so it never reaches the front",
+        symptom="green, alternating `merge_queued` holds and catch-ups, no merge",
         detector="INV-BASE-CHASE-LIVELOCK",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1608",
@@ -165,8 +152,7 @@ def by_invariant() -> dict[str, str]:
 
 def render_registry() -> str:
     """The registry as both the investigator's prompt and a fix order's brief see it"""
-    lines = ["Reuse a slug when the MECHANISM matches, whatever the subject. A new slug "
-             "makes the next fix order register it, with a detector, a remedy and a test.",
+    lines = ["Reuse a slug for the same mechanism; a new slug makes the fix order register it.",
              ""]
     for cls in GAP_CLASSES.values():
         # Terse, issue number alone: this list is inside a worker's 10K start budget
