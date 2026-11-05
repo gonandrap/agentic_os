@@ -4349,6 +4349,7 @@ def check_budgets_are_enforced(store: ProjectStore) -> Iterator[Violation]:
 
 def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
     """This project's default branch is red, and the OS says so ONCE, out loud (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3.)"""
+    from . import steward
     from .central_store import CentralStore
 
     central = None
@@ -4356,6 +4357,7 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
         central = CentralStore()
         name = central.project_name_for_path(store.project_path)
         fact = central.base_health(name)
+        verdict = steward.break_verdict(central, name, fact.get("break_run_id"))
     except Exception:  # noqa: BLE001 — an unreadable central database is not a red base
         return
     finally:
@@ -4382,6 +4384,9 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
                   f"itself. {tail}")
     elif fix_wo_id:
         remedy = f"The remedy is a commit on `{base}`, and {fix_wo_id} is producing it."
+    elif verdict:
+        remedy = (f"The remedy is a commit on `{base}`, and no work order is producing it: "
+                  f"{verdict} — {_base_fix_order_command(name, base, url, issue_url)}")
     else:
         remedy = (f"The remedy is a commit on `{base}`, and no work order is producing "
                   f"it yet — {_base_fix_order_command(name, base, url, issue_url)}")
@@ -4609,6 +4614,10 @@ def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
 
     for wo in store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True):
         matched = preconditions.states_hold(wo["title"], wo["description"] or "")
+        if not matched and (db.from_json(wo.get("metadata"), {}) or {}).get("origin_io"):
+            # An OS filing: the wider family, since no human command is at stake (issue 1567)
+            matched = next(iter(preconditions.states_sequence(wo["title"], wo["description"] or "")),
+                           "")[:preconditions.MAX_SENTENCE]
         if not matched:
             continue
         if store.dependencies(wo) or store.open_preconditions(wo["id"]):

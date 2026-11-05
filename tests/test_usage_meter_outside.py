@@ -7,6 +7,8 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from jarvis import nav_volume, usage_meter
 from jarvis.central_store import CentralStore
 
@@ -207,14 +209,13 @@ def test_the_walk_writes_no_rows(fleet_fixture):
     assert after == counts
 
 
-def test_visible_usd_includes_outside_spend(fleet_fixture):
-    wo = fleet_fixture.order(session_id="owned-1")
-    fleet_fixture.turn(wo, started_at=T0, ended_at=T0 + 60, cost_usd=1.0)
+def test_visible_spend_includes_outside_spend(fleet_fixture):
+    fleet_fixture.spend("owned", 1.0, at=T0)
     fleet_fixture.transcript("loose-1", [
         fleet_fixture.call_row(at=T0 + 5, read=1_000_000, out=20_000, mid="m-loose")])
 
-    total = usage_meter._visible_usd(since=SINCE, until=UNTIL,
-                                    home=Path(fleet_fixture.home))
+    visible = usage_meter._visible_spend(Path(fleet_fixture.home), since=SINCE, until=UNTIL)
 
-    assert total > 1.0
-    assert total == 1.0 + usd(walk(fleet_fixture))
+    assert visible(since=SINCE, until=UNTIL) == pytest.approx(
+        1.0 + usd(walk(fleet_fixture)), abs=1e-4)
+    assert visible(since=T0 + 1, until=UNTIL) == pytest.approx(usd(walk(fleet_fixture)))
