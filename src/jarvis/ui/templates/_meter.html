@@ -442,8 +442,12 @@
   {% if meter.outside.sessions %}
   {# Session ids link NOWHERE: these are not Jarvis records, and a link would imply the
      OS knows something about them it does not. #}
+  <p class="kv" style="margin: 12px 0 0;">
+    <strong>Sessions Jarvis did not dispatch</strong> — not work orders, so not in the
+    order list or its headline.
+  </p>
   <table class="mono" style="width: 100%; border-collapse: collapse; font-size: 13px;
-                             margin-top: 10px;">
+                             margin-top: 4px;">
     <tr class="sub">
       <th style="text-align: left;">session</th>
       <th style="text-align: left;">where</th>

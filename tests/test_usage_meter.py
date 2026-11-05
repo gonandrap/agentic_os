@@ -255,6 +255,30 @@ def test_the_nearest_earlier_sample_is_the_start_and_beyond_it_the_head_is_uncov
     assert far.coverage.head_uncovered_seconds == pytest.approx(600.0)
 
 
+def test_a_reset_between_the_head_and_the_first_sample_does_not_seed_the_old_percent():
+    """io-82bcb830: the meter went 0 to 100 and the page said it rose 63"""
+    head = sample(T0 - MINUTE, 37.0, T0)
+    inside = series(T0 + MINUTE, [0.0, 100.0], T0 + 18000)
+    found = usage_meter.segments([head, *inside], since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert [s.start_pct for s in found.segments] == [0.0]
+    assert found.segments[0].start_ts == T0 + MINUTE
+    assert found.delta_points == pytest.approx(100.0)
+    assert found.coverage.head_uncovered_seconds == pytest.approx(MINUTE)
+    assert found.anomalies == 0
+
+
+def test_a_drop_between_the_head_and_the_first_sample_is_a_boundary_and_an_anomaly():
+    head = sample(T0 - MINUTE, 37.0, T0 + 3600)
+    inside = series(T0 + MINUTE, [2.0, 9.0], T0 + 3600)
+    found = usage_meter.segments([head, *inside], since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert found.delta_points == pytest.approx(7.0)
+    assert found.anomalies == 1
+
+
 def test_a_seven_day_reset_runs_through_the_same_path():
     rows_ = (series(T0, [10.0, 40.0], T0 + 3600, key="seven_day")
              + series(T0 + 2 * MINUTE, [3.0, 9.0], T0 + 7200, key="seven_day"))
@@ -441,6 +465,23 @@ def test_three_clean_spans_are_measured_and_the_value_is_the_median(central, jar
     assert found["basis_points"] == pytest.approx(30.0)
     assert found["basis_usd"] == pytest.approx(90.0)
     assert found["low"] < found["value"] < found["high"]
+
+
+def test_the_band_always_holds_the_median_when_one_span_is_an_outlier(central, jarvis_home):
+    """A dear span drags an aggregate band above the median; 1.97 against 2.21-2.34 in production"""
+    starts = [T0, T0 + 2 * 3600, T0 + 4 * 3600]
+    for start in starts:
+        store_samples(central, run(start, minutes=40, points=10.0))
+    central.conn.commit()
+    usd = {starts[0]: 20.0, starts[1]: 20.0, starts[2]: 200.0}
+
+    found = usage_meter.dollars_per_point(
+        now=T0 + 7 * 3600, cfg=cfg_for(), home=Path(jarvis_home),
+        visible=lambda *, since, until: usd[min(usd, key=lambda s: abs(s - since))])
+
+    assert found["value"] == pytest.approx(2.0)
+    assert found["low"] < found["value"] < found["high"]
+    assert found["basis_usd"] == pytest.approx(240.0)
 
 
 def test_one_clean_span_is_thin(central, jarvis_home):

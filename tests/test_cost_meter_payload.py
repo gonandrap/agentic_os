@@ -63,8 +63,7 @@ def calibrate(f, start: float) -> None:
     for offset in (-8 * HOUR, -6 * HOUR, -4 * HOUR):
         at = start + offset
         store_samples(series(at, n=40, first=0.0, last=10.0, resets=start + 9 * HOUR))
-        wo = f.order("a calibration order")
-        f.turn(wo, started_at=at + MINUTE, ended_at=at + 2 * MINUTE, cost_usd=8.2)
+        f.spend("a calibration order", 8.2, at=at + MINUTE)
 
 
 def scene(f, *, since: float = SPAN_SINCE, until: float = SPAN_SINCE + HOUR,
@@ -76,11 +75,10 @@ def scene(f, *, since: float = SPAN_SINCE, until: float = SPAN_SINCE + HOUR,
     n = samples if samples is not None else int((until - since)
                                                 / usage_meter.SAMPLE_SECONDS)
     store_samples(series(since, n=n, first=10.0, last=10.0 + points, resets=until))
-    wo = f.order("the order that spent in this span")
-    f.turn(wo, started_at=since + 2 * MINUTE, ended_at=since + 3 * MINUTE,
-           cost_usd=worker_usd)
+    wo = f.spend("the order that spent in this span", worker_usd, at=since + 2 * MINUTE)
     if os_usd:
-        f.os_call("neo_answer", ts=since + 3 * MINUTE, wo_id=wo, cost_usd=os_usd)
+        f.os_call("neo_answer", ts=since + 3 * MINUTE, wo_id=wo, cost_usd=os_usd,
+                  output=f.output_for(os_usd))
     if outside:
         f.transcript("1a9cd19d-0000-4000-8000-000000000001", [
             prompt_row("look at the cost page", at=since + 4 * MINUTE),
@@ -255,9 +253,7 @@ def test_a_scoped_query_keeps_the_residual_fleet_wide(fleet_fixture):
     other = FleetCostFixture(fleet_fixture.home, second, fleet_fixture.transcript_root,
                              fleet_fixture.catalog_path, name="proj_b")
     resolved = scene(fleet_fixture, outside=False)
-    wo_b = other.order("the order proj_b spent on")
-    other.turn(wo_b, started_at=resolved["since"] + 2 * MINUTE,
-               ended_at=resolved["since"] + 3 * MINUTE, cost_usd=3.0)
+    other.spend("the order proj_b spent on", 3.0, at=resolved["since"] + 2 * MINUTE)
 
     meter = meter_of(fleet_fixture, resolved, project="proj_a")
     spend = meter["spend"]
@@ -657,6 +653,10 @@ def test_a_standing_residual_files_once_and_silently(fleet_fixture, fixed_now, m
     assert filed[0]["notify"] is False and filed[0]["priority"] == "high"
     assert "recurred 3 times" in filed[0]["description"]
     assert "usage_meter" in filed[0]["description"]
+    # The tracker is public: spend stays on the alarm rows it names
+    assert "$" not in filed[0]["description"] and "$" not in filed[0]["actual"]
+    assert all(r["id"] in filed[0]["description"] for r in alarms(fleet_fixture)
+               if r["kind"] == "cost_residual_high")
     kinds = [r["kind"] for r in alarms(fleet_fixture)]
     assert kinds.count("cost_residual_diagnosed") == 1
     central = CentralStore()

@@ -316,10 +316,15 @@ line shows `review_rule`, `review_note`, `reviewed_at`, and the Neo question lin
 
 `ops.promote_backlog(item_id, *, as_feature=None, dry_run=False, ...)` computes the
 transitive closure of the item's `depends_on` whose members are `open` (unsettled,
-unpromoted). `promoted` members are not re-promoted. `dropped`/missing members, or a
-`proposed`/`quarantined` member, refuse the whole promotion with their ids (nothing is
-created). `dry_run=True` returns the plan — `[{id, title, project, kind, waits_on: [...]}]`
-in dependency order — and creates nothing; the CLI and the UI popup both read it.
+unpromoted). `promoted` members are not re-promoted. A `dropped` dependency is a dead edge:
+promotion proceeds without waiting on it, as for `done`. A `dropped` dependency with
+`duplicate_of` set stands for the kept item, which takes its place through the same logic
+(its own status, cycle guard), following a chain with a visited check. A missing member, or a
+`proposed`/`quarantined` member, refuses the whole promotion with their ids (nothing is
+created). `dry_run=True` returns the plan — `[{id, title, project, kind, waits_on: [...],
+dead_deps: [...]}]` in dependency order — and creates nothing; the CLI and the UI popup both
+read it. `dead_deps` holds every dropped id passed through; the CLI confirmation and the popup
+each show one line naming them, and the popup opens for them even on a single-member plan.
 
 ### 7.2 Creating the orders
 
@@ -330,8 +335,9 @@ daemon clears a `bl-` hold once the item reaches `done`/`dropped` (daemon.py ~77
 `preconditions.checked_ref`), which works across projects and for deps promoted as
 feature orders, and a promoted dep stays unsettled until its order closes it. An FO
 member with unsettled dependencies is REFUSED up front (`create_feature_order` has no
-`blocked_by`, so it would start planning at once); the error names it and says to promote
-its dependencies first. `--force` is removed from the dependency check (deps are now
+`blocked_by`, so it would start planning at once); the error names it and says what clears
+it: its dependencies must reach `done` or `dropped`, so they can be promoted on their own now
+and this item promoted once they settle. `--force` is removed from the dependency check (deps are now
 promoted, not skipped); keep the flag accepted for one release as a no-op with a
 deprecation line. Trap: when `blocked_by` is passed, `create_work_order` skips its own
 `backlog_hold` auto-detection (ops.py ~944), so a member would lose that hold — compute
