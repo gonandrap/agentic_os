@@ -21,7 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger("jarvisd.morpheus")
 
-#: `unverified`: an investigation found nothing wrong, yet no check passed; settled, never counted as passed
+#: `unverified`: an investigation found nothing wrong, yet no check passed
 STATES = ("queued", "monitoring", "validated", "unverified", "failed", "timedout", "cancelled")
 OPEN_STATES = ("queued", "monitoring")
 TERMINAL_STATES = ("validated", "unverified", "failed", "timedout", "cancelled")
@@ -483,7 +483,7 @@ def rewrite(central: CentralStore, cfg: MorpheusConfig, item_id: str, why: str, 
 
 def rewrite_from_investigation(central: CentralStore, cfg: MorpheusConfig, item_id: str,
                                inv_id: str, brief: str, cycles: int) -> tuple[bool, str]:
-    """SCRIPT_WRONG verdict: rewrite within MAX_FIX_CYCLES, never MAX_SCRIPT_REWRITES (io-5cc7a40d); (False, …) = user owes it"""
+    """SCRIPT_WRONG verdict: rewrite within MAX_FIX_CYCLES, never MAX_SCRIPT_REWRITES (io-5cc7a40d)"""
     item = _item_or_raise(central, item_id)
     if item["state"] not in ACTION_STATES:
         return True, f"nothing sent back: {item_id} is {item['state']}, decided elsewhere"
