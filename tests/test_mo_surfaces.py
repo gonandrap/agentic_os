@@ -87,7 +87,7 @@ def test_an_arm_session_bills_its_messages_once_at_the_served_model(central, tmp
     mo = _mo(central)
     reply = morpheus.run_session(central, Catalog(os=OsConfig(morpheus=cfg), projects=[]),
                                  mo, purpose="arm", cwd=tmp_path)
-    assert reply == {"script": "exit 0\n", "notes": "ok"}
+    assert reply == {"script": "exit 0\n", "notes": "ok", "trigger": ""}
     assert seen[0][seen[0].index("--model") + 1] == cfg.model  # asked for cfg.model...
 
     got = bill.for_monitoring_order(mo["id"])["total"]
