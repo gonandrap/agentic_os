@@ -233,9 +233,12 @@ Applied in order. The first matching rule wins.
    only toward the feature ledger.
 2. **`minor` / `cosmetic`** → `drop`.
 3. **Generation limit.** The candidate's generation exceeds `max_depth`, where
-   generation 0 is user-originated. → `queue`, never `dispatch`.
+   generation 0 is user-originated. → `queue`, never `dispatch`; `blocker` / `critical`
+   → `ask`, because no wait clears this rule (io-f48bcdcb).
 4. **Self-reference.** The candidate's subject is an order the same detector created.
-   This is the "sweep investigating its own fix" case. → `queue`.
+   This is the "sweep investigating its own fix" case. → `queue`; `blocker` / `critical`
+   → `ask`, as in rule 3. A candidate naming a break (a red `main`, by the run that opened
+   it) writes one `ask` and one inbox row per break, not one per hour.
 5. **`blocker` / `critical`** → `dispatch`, expedited. This is subject to the critical
    ceiling. When the ceiling is spent → `ask`.
 6. **`major`** → `dispatch` if the evolution ledger has room **and** recurrence is at

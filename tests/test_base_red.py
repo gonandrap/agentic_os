@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from jarvis import automerge, bugreport, ci, db, gates, invariants, ops
+from jarvis import automerge, bugreport, ci, db, gates, invariants, ops, steward
 from jarvis.catalog import load_catalog
 from jarvis.central_store import BASE_HEALTH_FRESH_SECONDS, CentralStore
 from jarvis.daemon import Daemon
@@ -1284,6 +1284,79 @@ def test_the_hold_reason_and_the_detail_name_the_order_and_never_change(
     assert len(reasons) == 1 and fix in reasons.pop()
     assert len([n for n in store.unrouted_notifications()
                 if invariants.INV_BASE_RED in n["title"]]) == 1
+
+
+def _break_blamed_on_red_main_fix(tracker, store):
+    """Red `main` blamed on an earlier red-main fix: the steward refuses (self-reference)"""
+    tracker.catalog.project("proj_a").evolution.mode = "enforce"
+    blamed = store.create_work_order("the earlier fix", metadata={steward.STAMP_KEY: {
+        "generation": 0, "origin_kind": "red_main"}})["id"]
+    poll(tracker, store)
+    central = CentralStore()
+    central.set_base_health("proj_a", {**fact(central), "wo_id": blamed})
+    return central
+
+
+def _steward_rows(central):
+    """Every status: delivery moves a row off `new`"""
+    return central.conn.execute("SELECT id FROM inbox WHERE title LIKE 'steward:%'").fetchall()
+
+
+def test_a_refused_red_main_asks_once_and_says_so_everywhere(tracker, spec, project, fake_gh):
+    opt_in(tracker)
+    store, wo = parked(project, pr_url=TRACKER_PR)
+    fake_gh.set_pr(TRACKER_PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    central = _break_blamed_on_red_main_fix(tracker, store)
+
+    details, reasons = set(), set()
+    for _ in range(3):
+        poll(tracker, store)
+        sweep(tracker, store)
+        tracker.check_invariants(spec, store)
+        tracker.poll_pull_requests(spec, store)
+        details.add(next(v.detail for v in check_project(store, repair=False)
+                         if v.invariant == invariants.INV_BASE_RED))
+        reasons.add(db.from_json(
+            store.events_of_kind(wo["id"], "automerge_held")[-1]["payload"], {})["reason"])
+
+    assert not fact()["fix_wo_id"]
+    assert len(_steward_rows(central)) == 1
+    assert len(details) == 1 and len(reasons) == 1
+    for said in (details.pop(), reasons.pop()):
+        assert "said `ask` (self-reference)" in said
+
+
+def test_a_second_red_run_in_one_break_does_not_ask_again(tracker, project, fake_gh):
+    store = ProjectStore(project)
+    central = _break_blamed_on_red_main_fix(tracker, store)
+    sweep(tracker, store)
+    opened = fact()["break_run_id"]
+
+    fake_gh.set_runs("main", [MAIN_RED_AGAIN, MAIN_RED])
+    poll(tracker, store)
+    sweep(tracker, store)
+
+    assert fact()["run_id"] != opened and fact()["break_run_id"] == opened
+    assert len(_steward_rows(central)) == 1
+
+
+def test_a_re_break_after_green_asks_again(tracker, project, fake_gh):
+    store = ProjectStore(project)
+    central = _break_blamed_on_red_main_fix(tracker, store)
+    blamed = fact()["wo_id"]
+    sweep(tracker, store)
+
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+    poll(tracker, store)
+    assert not fact()["break_run_id"]
+
+    fake_gh.set_runs("main", [MAIN_RED_AGAIN, MAIN_GREEN, MAIN_RED])
+    poll(tracker, store)
+    central.set_base_health("proj_a", {**fact(central), "wo_id": blamed})
+    sweep(tracker, store)
+
+    assert fact()["break_run_id"] == MAIN_RED_AGAIN["databaseId"]
+    assert len(_steward_rows(central)) == 2
 
 
 # Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)

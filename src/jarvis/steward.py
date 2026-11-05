@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
@@ -99,6 +100,8 @@ class Candidate:
     file: str = ""
     #: What the caller needs to dispatch it LATER, should it queue (`drain`, #1181)
     payload: dict[str, Any] = field(default_factory=dict)
+    #: The break it answers (a red `main`'s opening run): its `ask` writes one row per break
+    break_id: str = ""
 
     def __post_init__(self) -> None:
         assert self.origin_kind in ORIGIN_KINDS, self.origin_kind
@@ -167,11 +170,13 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
     if c.origin_kind == "release":
         # A7: releases ship what already landed; counted on the ledger, not gated by it
         return "dispatch", "release", "a landed fix ships", severity
+    # No wait clears these two, so an urgent one is the user's now (spec §3.2 decision 1)
+    refused = "ask" if severity in URGENT else "queue"
     if generation > cfg.max_depth:
-        return ("queue", "max-depth",
+        return (refused, "max-depth",
                 f"generation {generation} exceeds max_depth {cfg.max_depth}", severity)
     if parent_kind and parent_kind == c.origin_kind:
-        return ("queue", "self-reference",
+        return (refused, "self-reference",
                 f"its subject is work the `{c.origin_kind}` detector itself created",
                 severity)
     if track_of(c.origin_kind) == "bug":
@@ -440,6 +445,8 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
                 decision.stamp["decision_id"] = duplicate
                 log.info("steward[%s] escalated decision #%s to %s -> %s (%s)",
                          mode, duplicate, severity, outcome, rule)
+                if outcome == "ask" and mode == "enforce" and self_dispatch:
+                    _ask_user(central, c, reason, rule, duplicate, catalog)
                 return decision
             outcome, rule = "drop", "duplicate"
             reason = f"the same defect as steward decision #{duplicate}"
@@ -464,7 +471,14 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
             if mode == "enforce":
                 allowed, budget_usd = False, None
                 decision.allowed, decision.budget_usd = allowed, budget_usd
-        repeat = 0 if duplicate else _repeat_of(central, c, outcome, now)
+        if duplicate:
+            repeat = 0
+        elif outcome == "ask" and c.break_id:
+            # Per break, not per hour: `_repeat_of` would also swallow a NEW break's first ask
+            prior_ask = _latest_of_break(central, c.project, c.origin_kind, c.break_id, "ask")
+            repeat = int(prior_ask["id"]) if prior_ask else 0
+        else:
+            repeat = _repeat_of(central, c, outcome, now)
         if repeat:
             # A site the daemon re-asks every tick (a red `main`
             decision.decision_id = repeat
@@ -481,9 +495,7 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
             **({} if duplicate else _queue_fields(c, outcome, allowed, now))})
         decision.stamp["decision_id"] = decision.decision_id
         if outcome == "ask" and mode == "enforce" and self_dispatch:
-            central.add_inbox(c.project, f"steward: {c.subject[:120]}",
-                              ask_body(c, reason, decision.decision_id, catalog),
-                              level="critical", wo_id=c.parent_wo_id or None)
+            _ask_user(central, c, reason, rule, decision.decision_id, catalog)
         log.info("steward[%s] %s %s -> %s (%s): %s", mode, c.origin_kind, c.subject[:80],
                  outcome, rule, reason)
         return decision
@@ -492,7 +504,14 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
             central.close()
 
 
-def ask_body(c: Candidate, reason: str, decision_id: int, catalog: Catalog) -> str:
+def _ask_user(central: CentralStore, c: Candidate, reason: str, rule: str, decision_id: int,
+              catalog: Catalog) -> None:
+    central.add_inbox(c.project, f"steward: {c.subject[:120]}",
+                      ask_body(c, reason, rule, decision_id, catalog),
+                      level="critical", wo_id=c.parent_wo_id or None)
+
+
+def ask_body(c: Candidate, reason: str, rule: str, decision_id: int, catalog: Catalog) -> str:
     """An `ask`'s inbox body: the one command that acts on it, and where it is listed"""
     from .notify import ui_base_url
 
@@ -502,8 +521,10 @@ def ask_body(c: Candidate, reason: str, decision_id: int, catalog: Catalog) -> s
     if c.origin_kind == "morpheus" and item:
         act += f" {ui_base_url(catalog)}/morpheus#{item}"
     # An `ask` is never re-offered (`_queue_fields`), so the cap is no answer for THIS one
-    return (f"{reason}. Act: {act}. Raising {ceiling_key(c.origin_kind, c.project)} lets later "
-            f"ones through; it does not re-run this one.\n"
+    tail = ("No wait and no budget clears this refusal." if rule in UNCLEARABLE else
+            f"Raising {ceiling_key(c.origin_kind, c.project)} lets later ones through; it does "
+            f"not re-run this one.")
+    return (f"{reason}. Act: {act}. {tail}\n"
             f"{ui_base_url(catalog)}/steward#decision-{decision_id}")
 
 
@@ -518,6 +539,8 @@ def act_on(origin_kind: str, morpheus_item: str, parent_wo_id: str, project: str
     """The one command that acts on held self-work, by where it came from"""
     if issue_url:
         return f"`jarvis issues start {issue_url}`"
+    if origin_kind == "red_main":
+        return f"`jarvis doctor {project}` names the failing run and the command that orders it"
     if origin_kind == "morpheus" and morpheus_item:
         return (f"`jarvis morpheus confirm {morpheus_item} --fix \"<what to fix>\"` files the "
                 f"fix; `jarvis morpheus waive|requeue {morpheus_item}` if it is not broken.")
@@ -543,6 +566,11 @@ def next_step(row: Mapping[str, Any], now: float | None = None) -> dict[str, Any
         return {"yours": False, "text": f"Nothing to do: order {row['wo_id']} carries it."}
     if outcome == "ask" and not row.get("applied"):
         if (now or db.now()) - float(row.get("ts") or 0) < WINDOW_SECONDS:
+            if row.get("rule") in UNCLEARABLE:
+                return {"yours": True, "text": (
+                    f"Needs you: the OS refused this {row.get('severity')} fix "
+                    f"({row.get('rule')}), and no wait or budget clears that. Act: {act} Or "
+                    f"leave it if it no longer matters.")}
             return {"yours": True, "text": (
                 f"Needs you: the OS held this {row.get('severity')} fix because its weekly "
                 f"{'bug ledger' if track_of(kind) == 'bug' else 'critical ceiling'} is spent, "
@@ -554,6 +582,10 @@ def next_step(row: Mapping[str, Any], now: float | None = None) -> dict[str, Any
     # A panel follow-up re-offered becomes a tracker issue, never a work order (Neo Q2941)
     filed = (" Re-offered, it becomes a tracker issue, never a work order: `jarvis "
              "issues start <its url>` starts it." if track_of(kind) == "follow_up" else "")
+    if state == "waiting" and row.get("rule") in UNCLEARABLE:
+        return {"yours": False, "text": (
+            f"Nothing to do: refused by {row.get('rule')}, which no wait clears; it is dropped "
+            f"after {QUEUE_TTL_SECONDS // 86400} days.{filed} Want it now: {act}")}
     if state == "waiting":
         return {"yours": False, "text": (
             f"Nothing to do: the daemon re-offers it every ~{DRAIN_EVERY_MINUTES} min once "
@@ -701,6 +733,32 @@ def _queue_fields(c: Candidate, outcome: str, allowed: bool,
             "queue_ts": (now if now is not None else db.now()) if waits else None}
 
 
+def _latest_of_break(central: CentralStore, project: str, origin_kind: str, break_id: str,
+                     outcome: str = "") -> dict[str, Any] | None:
+    """The newest decision about one break, of one outcome when named"""
+    row = central.conn.execute(
+        "SELECT * FROM steward_decisions WHERE project=? AND origin_kind=? "
+        "AND (?='' OR outcome=?) AND CASE WHEN json_valid(candidate_json) "
+        "THEN json_extract(candidate_json, '$.break_id') END=? ORDER BY id DESC LIMIT 1",
+        (project, origin_kind, outcome, outcome, break_id)).fetchone()
+    return dict(row) if row else None
+
+
+def break_verdict(central: CentralStore, project: str, break_id: object) -> str:
+    """Why no order is fixing this red `main`: its latest decision, '' when none holds it back"""
+    if not break_id:
+        return ""
+    try:
+        row = _latest_of_break(central, project, "red_main", str(break_id))
+    except sqlite3.Error:  # an unreadable verdict changes no hold
+        log.exception("steward: could not read the verdict on break %s", break_id)
+        return ""
+    if not row or row["outcome"] not in ("ask", "queue"):
+        return ""
+    return (f"steward decision #{row['id']} said `{row['outcome']}` ({row['rule']}): "
+            f"{row['reason']}")
+
+
 def _repeat_of(central: CentralStore, c: Candidate, outcome: str,
                now: float | None) -> int:
     """The id of the same decision about the same subject in the last hour, or 0"""
@@ -770,6 +828,8 @@ def _store_for(central: CentralStore, project: str) -> ProjectStore | None:
 # ---------------------------------------------------------------- the queue (#1181)
 
 #: Origin kinds whose `queue` the OS dispatches later on its own; the rest re-ask by themselves
+#: Rules waiting cannot clear: generation and parent never change
+UNCLEARABLE = ("max-depth", "self-reference")
 DRAINABLE = ("panel", "worker_io", "remedy", "neo_rider", "io_finding", "bug_agent")
 #: Origin kinds whose candidate is about the PARENT unit's code: moot once that is cancelled
 PARENT_BOUND = ("panel",)
@@ -1049,10 +1109,14 @@ def track_line(counts: Mapping[str, Mapping[str, int]]) -> str:
 
 def queue_line(counts: Mapping[str, int]) -> str:
     """How much queued self-work is waiting, in one line (`digest`, `jarvis steward decisions`)"""
-    return (f"queued: {counts.get('waiting', 0)} waiting for room (re-offered every "
+    refused = counts.get("refused", 0)
+    stuck = (f"{refused} refused by max-depth or self-reference (no wait clears them; dropped "
+             f"after {QUEUE_TTL_SECONDS // 86400} days), " if refused else "")
+    return (f"queued: {counts.get('waiting', 0) - refused} waiting for room (re-offered every "
             f"~{DRAIN_EVERY_MINUTES} min, severest then oldest, once the ledger and the "
             f"yield line allow; dropped after {QUEUE_TTL_SECONDS // 86400} days), "
-            f"{counts.get('reoffered', 0)} re-offered, {counts.get('expired', 0)} expired")
+            f"{stuck}{counts.get('reoffered', 0)} re-offered, "
+            f"{counts.get('expired', 0)} expired")
 
 
 #: os_state key holding when the weekly digest last went to the inbox

@@ -116,6 +116,7 @@ class BaseRed:
     fix_wo_id: str = ""
     issue_url: str = ""
     issue_os_filed: bool = False
+    steward_verdict: str = ""
 
 
 #: WHO can still clear a scope-drift finding — what the hold reason has to say (#1063)
@@ -359,7 +360,8 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
         blamed = f" (merged by the OS for {base_red.wo_id})" if base_red.wo_id else ""
         # Spec 2026-10-14 §5: tick-stable, so the order's id and nothing that moves
         fixing = (f"{base_red.fix_wo_id} is fixing it" if base_red.fix_wo_id
-                  else "no work order is fixing it yet")
+                  else f"no work order is fixing it: {base_red.steward_verdict}"
+                  if base_red.steward_verdict else "no work order is fixing it yet")
         # Matched on WORKFLOW, never on job name
         rider = (f" This pull request's own `{base_red.workflow}` failure is the same "
                  f"break and not its fault."

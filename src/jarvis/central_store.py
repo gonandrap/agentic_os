@@ -1023,11 +1023,18 @@ class CentralStore:
         return [dict(r) for r in rows.fetchall()]
 
     def steward_queue_counts(self) -> dict[str, int]:
-        """{queue_state: n} over every decision that was ever queued for a re-offer"""
+        """{queue_state: n} over every decision ever queued; `refused`: waiting, and no wait clears"""
+        from .steward import UNCLEARABLE
+
         rows = self.conn.execute(
             "SELECT queue_state, COUNT(*) AS n FROM steward_decisions WHERE queue_state<>'' "
             "GROUP BY queue_state")
-        return {r["queue_state"]: int(r["n"]) for r in rows.fetchall()}
+        counts = {r["queue_state"]: int(r["n"]) for r in rows.fetchall()}
+        marks = ",".join("?" * len(UNCLEARABLE))
+        refused = self.conn.execute(
+            f"SELECT COUNT(*) FROM steward_decisions WHERE queue_state='waiting' "
+            f"AND rule IN ({marks})", UNCLEARABLE).fetchone()[0]
+        return {**counts, "refused": int(refused)} if refused else counts
 
     def steward_decisions(self, since: float = 0.0, *, wo_id: str = "",
                           limit: int = 500) -> list[dict[str, Any]]:
