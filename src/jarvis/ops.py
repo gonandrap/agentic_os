@@ -14649,7 +14649,7 @@ def cost_zone(tz: str | None = None, project: str | None = None) -> str:
 
 
 def cost_report(project: str | None = None, target: str | None = None,
-                limit: int = 50, include_hidden: bool = True,
+                limit: int = 50,
                 window: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the fleet's work has cost in tokens, read back from Claude Code's transcripts (#103)"""
     from . import usage as usage_mod
@@ -14671,18 +14671,16 @@ def cost_report(project: str | None = None, target: str | None = None,
             continue
         store = ProjectStore(path)
         try:
-            rows = store.list_work_orders(
-                limit=limit, include_hidden=include_hidden,
-                active_between=(since, until) if window else None)
+            # Hidden orders too: hiding declutters, their spend stays real and on the meter
+            rows = (_orders_in_window(store, index, since, until) if window
+                    else store.list_work_orders(limit=limit, include_hidden=True))
             # An order whose only in-window activity is an `agent_call`
             seen = {wo["id"] for wo in rows}
             for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
                 try:
-                    extra = store.get_work_order(wo_id)
+                    rows.append(store.get_work_order(wo_id))
                 except KeyError:
                     continue            # a legacy row naming no project: not this one's
-                if include_hidden or not extra["hidden"]:
-                    rows.append(extra)
             for wo in rows:
                 units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
                                        os_groups.get(wo["id"], ()),
@@ -14691,10 +14689,28 @@ def cost_report(project: str | None = None, target: str | None = None,
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
+    listed = {u["id"] for u in units}
+    # A call naming an order no store holds is declared too, or the meter outruns the list
+    unattributed = (_os_spend([g for wo_id, group in os_groups.items()
+                               if wo_id not in listed for g in group])
+                    if window else _os_unattributed(os_groups))
     # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/ `totals` keys...
     return {"scope": project or "fleet", "units": units, "window": window,
-            **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
+            **_rollup(units), "os_unattributed": unattributed,
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
+
+
+def _orders_in_window(store: ProjectStore, index: dict[str, list[Path]], since: float,
+                      until: float) -> list[dict[str, Any]]:
+    """Every order with a transcript call in the window, however its turns fall (kn-58e36cf1)"""
+    from . import usage as usage_mod
+
+    spent = [wo for wo in store.list_work_orders(limit=-1, include_hidden=True)
+             if usage_mod.session_spend(wo.get("session_id") or "", since, until, index)]
+    # A pruned transcript cannot show its calls; its turn is all that says it ran here
+    return spent + [wo for wo in store.list_work_orders(
+        limit=-1, include_hidden=True, active_between=(since, until))
+        if not index.get(wo.get("session_id") or "")]
 
 
 def _os_groups(project: str | None = None, *, since: float | None = None,

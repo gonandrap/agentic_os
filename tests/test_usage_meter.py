@@ -430,6 +430,23 @@ def test_three_clean_spans_are_measured_and_the_value_is_the_median(central, jar
     assert found["low"] < found["value"] < found["high"]
 
 
+def test_the_band_always_holds_the_median_when_one_span_is_an_outlier(central, jarvis_home):
+    """A dear span drags an aggregate band above the median; 1.97 against 2.21-2.34 in production"""
+    starts = [T0, T0 + 2 * 3600, T0 + 4 * 3600]
+    for start in starts:
+        store_samples(central, run(start, minutes=40, points=10.0))
+    central.conn.commit()
+    usd = {starts[0]: 20.0, starts[1]: 20.0, starts[2]: 200.0}
+
+    found = usage_meter.dollars_per_point(
+        now=T0 + 7 * 3600, cfg=cfg_for(), home=Path(jarvis_home),
+        visible=lambda *, since, until: usd[min(usd, key=lambda s: abs(s - since))])
+
+    assert found["value"] == pytest.approx(2.0)
+    assert found["low"] < found["value"] < found["high"]
+    assert found["basis_usd"] == pytest.approx(240.0)
+
+
 def test_one_clean_span_is_thin(central, jarvis_home):
     store_samples(central, run(T0, minutes=40, points=10.0))
     central.conn.commit()
