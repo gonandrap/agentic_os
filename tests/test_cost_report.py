@@ -520,6 +520,39 @@ def test_the_rollup_reports_the_write_split_across_both_halves(store, transcript
                             totals["cache_5m"]) == pytest.approx(2.0)
 
 
+def test_calls_no_work_order_caused_are_in_the_headline_but_are_no_unit(store, transcripts):
+    """io-82bcb830: the page said they were part of a total that left them out"""
+    wo = store.create_work_order("an order", "")
+    give_session(store, wo["id"], "sess-one")
+    transcripts("sess-one", [assistant_row("m1", write=40_000)])
+    _os_call(wo["id"], cache_1h=0, cache_5m=100_000)
+    _os_call("", cache_1h=0, cache_5m=100_000)
+
+    report = ops.cost_report("proj_a")
+    (unit,) = report["units"]
+    totals, un = report["totals"], report["os_unattributed"]
+
+    assert un["os_calls"] == 1 and un["os_cost_usd"] > 0
+    assert totals["os_calls"] == unit["os_calls"] + 1
+    assert totals["os_cost_usd"] == pytest.approx(unit["os_cost_usd"] + un["os_cost_usd"], abs=0.01)
+    assert totals["total_cost_usd"] == pytest.approx(
+        unit["total_cost_usd"] + un["os_cost_usd"], abs=0.01)
+    assert (report["measured"], report["unmeasured"]) == (1, 0)
+
+
+def test_the_cli_list_sums_to_the_total_with_no_work_order_row(store, capsys):
+    """A window holding only unattributed calls still has a total to explain"""
+    from jarvis import cli
+
+    _os_call("", cache_1h=0, cache_5m=100_000)
+
+    assert cli.main(["cost", "proj_a"]) == 0
+
+    out = capsys.readouterr().out
+    assert "(no work order)  1 jarvis calls" in out
+    assert "no work orders found" not in out
+
+
 # -- improvement orders
 
 

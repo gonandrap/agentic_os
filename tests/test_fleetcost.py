@@ -506,7 +506,7 @@ def test_records_are_counted_not_priced(fleet_fixture):
 
 
 FLEET_KEYS = {
-    "version", "window", "scope", "orders", "metrics", "os_cost_by_kind",
+    "version", "window", "scope", "orders", "metrics", "os_cost_by_kind", "os_cost_basis",
     "os_unattributed", "compaction_payoff", "floor", "floor_reason", "notes",
     # §10.6: ADDITIVE under the existing key, and `version` stays 1 — the subtree carries its own
     "tools",

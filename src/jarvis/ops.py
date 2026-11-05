@@ -14661,7 +14661,7 @@ def cost_zone(tz: str | None = None, project: str | None = None) -> str:
 
 
 def cost_report(project: str | None = None, target: str | None = None,
-                limit: int = 50, include_hidden: bool = True,
+                limit: int = 50,
                 window: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the fleet's work has cost in tokens, read back from Claude Code's transcripts (#103)"""
     from . import usage as usage_mod
@@ -14683,18 +14683,16 @@ def cost_report(project: str | None = None, target: str | None = None,
             continue
         store = ProjectStore(path)
         try:
-            rows = store.list_work_orders(
-                limit=limit, include_hidden=include_hidden,
-                active_between=(since, until) if window else None)
+            # Hidden orders too: hiding declutters, their spend stays real and on the meter
+            rows = (_orders_in_window(store, index, since, until) if window
+                    else store.list_work_orders(limit=limit, include_hidden=True))
             # An order whose only in-window activity is an `agent_call`
             seen = {wo["id"] for wo in rows}
             for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
                 try:
-                    extra = store.get_work_order(wo_id)
+                    rows.append(store.get_work_order(wo_id))
                 except KeyError:
                     continue            # a legacy row naming no project: not this one's
-                if include_hidden or not extra["hidden"]:
-                    rows.append(extra)
             for wo in rows:
                 units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
                                        os_groups.get(wo["id"], ()),
@@ -14703,10 +14701,28 @@ def cost_report(project: str | None = None, target: str | None = None,
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
+    listed = {u["id"] for u in units}
+    # A call naming an order no store holds is declared too, or the meter outruns the list
+    unattributed = (_os_spend([g for wo_id, group in os_groups.items()
+                               if wo_id not in listed for g in group])
+                    if window else _os_unattributed(os_groups))
     # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/ `totals` keys...
     return {"scope": project or "fleet", "units": units, "window": window,
-            **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
+            **_rollup(units, unattributed), "os_unattributed": unattributed,
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
+
+
+def _orders_in_window(store: ProjectStore, index: dict[str, list[Path]], since: float,
+                      until: float) -> list[dict[str, Any]]:
+    """Every order with a transcript call in the window, however its turns fall (kn-58e36cf1)"""
+    from . import usage as usage_mod
+
+    spent = [wo for wo in store.list_work_orders(limit=-1, include_hidden=True)
+             if usage_mod.session_spend(wo.get("session_id") or "", since, until, index)]
+    # A pruned transcript cannot show its calls; its turn is all that says it ran here
+    return spent + [wo for wo in store.list_work_orders(
+        limit=-1, include_hidden=True, active_between=(since, until))
+        if not index.get(wo.get("session_id") or "")]
 
 
 def _os_groups(project: str | None = None, *, since: float | None = None,
@@ -14736,12 +14752,15 @@ def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     return _os_spend(groups.get("", []))
 
 
-def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
-    """Totals over the units that could actually be measured"""
+def _rollup(units: list[dict[str, Any]],
+            unattributed: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Totals over the units that could actually be measured, plus OS calls no unit owns"""
     measured = [u for u in units if u["found"]]
     worker_cost = round(sum(u["list_cost_usd"] for u in measured), 2)
+    # The `os_*` figures only: OS calls no work order caused are spend, not a unit (io-82bcb830)
+    os_spenders = [*units, *([unattributed] if unattributed else [])]
     # Over ALL units, not just measured ones
-    os_cost = round(sum(u.get("os_cost_usd") or 0 for u in units), 2)
+    os_cost = round(sum(u.get("os_cost_usd") or 0 for u in os_spenders), 2)
     subproc_cost = round(sum(u.get("subproc_cost_usd") or 0 for u in units), 2)
     return {
         "measured": len(measured),
@@ -14751,17 +14770,17 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "recorded_cost_usd": round(
                 sum(u.get("recorded_cost_usd") or 0 for u in units), 2),
             "list_cost_usd": worker_cost,
-            # The headline: workers, everything the OS spent on their behalf
+            # The headline: workers, everything the OS spent, on their behalf or on no order
             "total_cost_usd": round(worker_cost + os_cost + subproc_cost, 2),
             "os_cost_usd": os_cost,
             "os_recorded_cost_usd": round(
-                sum(u.get("os_recorded_cost_usd") or 0 for u in units), 2),
-            "os_calls": sum(u.get("os_calls") or 0 for u in units),
-            "os_billed_input": sum(u.get("os_billed_input") or 0 for u in units),
+                sum(u.get("os_recorded_cost_usd") or 0 for u in os_spenders), 2),
+            "os_calls": sum(u.get("os_calls") or 0 for u in os_spenders),
+            "os_billed_input": sum(u.get("os_billed_input") or 0 for u in os_spenders),
             # The biggest OS-side input on the whole report (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
             "os_max_input_chars": max(
-                [u.get("os_max_input_chars") or 0 for u in units], default=0),
-            "os_output": sum(u.get("os_output") or 0 for u in units),
+                [u.get("os_max_input_chars") or 0 for u in os_spenders], default=0),
+            "os_output": sum(u.get("os_output") or 0 for u in os_spenders),
             "subproc_cost_usd": subproc_cost,
             "subproc_recorded_cost_usd": round(
                 sum(u.get("subproc_recorded_cost_usd") or 0 for u in units), 2),
@@ -14777,7 +14796,7 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "billed_input": sum(u["billed_input"] for u in measured),
             # Over ALL units: what a window could not place is disclosed whether or not the order it belongs to...
             "undated_messages": sum(u.get("undated_messages") or 0 for u in units),
-            **_write_ttl(measured, units),
+            **_write_ttl(measured, os_spenders),
         },
     }
 
