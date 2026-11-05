@@ -85,6 +85,15 @@ GAP_CLASSES: dict[str, GapClass] = {
         issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
         since="",
     ),
+    "blocker-contradicts-record": GapClass(
+        id="blocker-contradicts-record",
+        headline="a catch-all blocker fires though its order's events deny its premise",
+        symptom="a finished order blocked as 'stopped mid-task'",
+        detector="INV-BLOCKER-CONTRADICTS-RECORD",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1591",
+        since="",
+    ),
     "designed-wait-undiscounted": GapClass(
         id="designed-wait-undiscounted",
         headline="the sweep judges a deliberate hold as lost time",
@@ -127,6 +136,7 @@ GAP_CLASSES: dict[str, GapClass] = {
 SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "oversized-input", "unwired-precondition",
                                         "background-task-silence",
+                                        "blocker-contradicts-record",
                                         "designed-wait-undiscounted",
                                         "superseded-delivery", "base-chase-livelock",
                                         "mention-held-as-act")

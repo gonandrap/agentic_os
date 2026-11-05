@@ -1284,16 +1284,26 @@ RETRY_NOTE = (
     "Finish with `jarvis wo finish` when the work is done."
 )
 
+#: The same relaunch for a parked release, whose worker did not die: `RETRY_NOTE` would say it had (#1591)
+RELEASE_RETRY_NOTE = (
+    "The OS is relaunching this release order because the user asked for it. It finished "
+    "without cutting a release, so nothing was tagged or deployed. Read your last summary, "
+    "check whether what stopped the release has cleared, and cut it. Finish with "
+    "`jarvis wo finish` either way."
+)
+
 #: §5: no status write, so the order really is still `failed` until the turn goes out
 RETRY_QUEUED = ("queued as message {msg}; jarvisd launches the turn on its next tick. The "
                 "order stays `failed` — and stays flagged — until that turn starts.")
+RELEASE_RETRY_QUEUED = ("queued as message {msg}; jarvisd launches the turn on its next tick. "
+                        "The order stays `needs_review` until that turn starts.")
 
 
-def retry_refusal(wo: dict[str, Any]) -> str | None:
+def retry_refusal(store: ProjectStore, wo: dict[str, Any]) -> str | None:
     """Why this work order CANNOT be retried, in the sentence that refuses it — or None (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)"""
     wo_id = str(wo["id"])
     status = str(wo["status"] or "")
-    if status != "failed":
+    if status != "failed" and not invariants.release_parked_unshipped(store, wo):
         return (f"{wo_id} is {status}, not failed — `wo retry` relaunches an order whose "
                 f"worker died without delivering. Carry on a {status} one with "
                 f"`jarvis wo send {wo_id} \"…\"`.")
@@ -1314,7 +1324,7 @@ def retry_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | Non
     """What the work-order page's retry control shows, or None (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)"""
     if str(wo["status"] or "") != "failed":
         return None
-    refusal = retry_refusal(wo)
+    refusal = retry_refusal(store, wo)
     return {"can_retry": refusal is None, "refusal": refusal,
             "assumptions": len(store.pending_assumptions(str(wo["id"])))}
 
@@ -1370,17 +1380,22 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
     """`jarvis wo retry` — relaunch a `failed` work order in its own session (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)"""
     check_model_id(model)
     name, path, wo = find_work_order(wo_id, project_name)
-    refusal = retry_refusal(wo)
-    if refusal is not None:
-        raise OpsError(refusal)
     # §6 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk beats...
     brief_store = ProjectStore(path)
     try:
+        refusal = retry_refusal(brief_store, wo)
+        if refusal is not None:
+            raise OpsError(refusal)
+        parked_release = invariants.release_parked_unshipped(brief_store, wo)
         if model:
             # Before the send: the relaunch reads `model` off the row
             brief_store.update_work_order(wo_id, model=model)
-        text = (message if message is not None
-                else (harvest.retry_brief(brief_store, wo) or RETRY_NOTE))
+        if message is not None:
+            text = message
+        elif parked_release:
+            text = RELEASE_RETRY_NOTE
+        else:
+            text = harvest.retry_brief(brief_store, wo) or RETRY_NOTE
     finally:
         brief_store.close()
     # §3: an OS literal must never carry the user's stamp, whatever the surface said
@@ -1395,8 +1410,10 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "msg_id": sent["msg_id"],
-            "status": "failed", "authored": bool(message),
-            "note": retry_queued_notice(sent["msg_id"]), "assumptions": len(pending)}
+            "status": wo["status"], "authored": bool(message),
+            "note": (RELEASE_RETRY_QUEUED.format(msg=sent["msg_id"]) if parked_release
+                     else retry_queued_notice(sent["msg_id"])),
+            "assumptions": len(pending)}
 
 
 def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
@@ -2091,11 +2108,12 @@ def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
 
 def ack_decision_blocker(blockers: list[str]) -> str | None:
     """The blocker that makes acking unacceptable, or None — the one extraction of it"""
-    from .invariants import IDLE_NO_FINISH_BLOCKER
-
     # An idle park's only exit is the user's action; an ack would hide it from every view (issue 1456)
     return next((b for b in blockers
-                 if "assumption" in b.lower() or b == IDLE_NO_FINISH_BLOCKER), None)
+                 if "assumption" in b.lower()
+                 or b in (invariants.IDLE_NO_FINISH_BLOCKER,
+                          invariants.DELIVERED_UNSETTLED_BLOCKER)
+                 or b.startswith(invariants.RELEASE_NOTHING_SHIPPED_HEAD)), None)
 
 
 def ack_refusal(wo: dict[str, Any], blockers: list[str]) -> str | None:
@@ -2109,6 +2127,12 @@ def ack_refusal(wo: dict[str, Any], blockers: list[str]) -> str | None:
         return (f"{wo['id']} stopped mid-task and nothing will resume it — acknowledging "
                 f"would hide it. `jarvis wo send {wo['id']} \"…\"` sends it back to work; "
                 f"`jarvis wo done {wo['id']}` closes it.")
+    if blocker == invariants.DELIVERED_UNSETTLED_BLOCKER:
+        return (f"{wo['id']} finished and nothing will close it — acknowledging would hide "
+                f"it. `jarvis wo done {wo['id']}` closes it; `jarvis wo send {wo['id']} "
+                f"\"…\"` sends it back to work.")
+    if blocker.startswith(invariants.RELEASE_NOTHING_SHIPPED_HEAD):
+        return f"{wo['id']}: acknowledging would hide this — {blocker}"
     return (f"{wo['id']} is waiting on a decision ({blocker}) — acknowledging would "
             f"bury it. Use `jarvis wo review {wo['id']}` to accept, or `--reject` to "
             f"send it back.")
@@ -2123,7 +2147,7 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     refusals: list[str] = []
 
     # FIRST — §7 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md
-    retry_no = retry_refusal(wo)
+    retry_no = retry_refusal(store, wo)
     if retry_no is None:
         out.append({"command": f"jarvis wo retry {wo_id}",
                     "why": "relaunch the worker in its own session from where it died — "

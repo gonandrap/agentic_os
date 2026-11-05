@@ -10,6 +10,7 @@ from jarvis import db, github, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.invariants import (
+    DELIVERED_UNSETTLED_BLOCKER,
     IDLE_NO_FINISH_BLOCKER,
     PR_CHECKS_BLOCKER,
     PR_CLOSED_BLOCKER,
@@ -121,7 +122,7 @@ def test_the_red_ci_nudge_leaves_the_review_item_on_the_users_list(
     row = store.get_work_order(reviewing["id"])
     assert row["status"] == "needs_review"
     assert row["needs_attention"]
-    assert true_blockers(store, row) == [IDLE_NO_FINISH_BLOCKER]
+    assert true_blockers(store, row) == [DELIVERED_UNSETTLED_BLOCKER]
     assert [v.invariant for v in check_project(store)] == []
 
 

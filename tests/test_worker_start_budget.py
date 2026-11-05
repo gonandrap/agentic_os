@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parents[1]
 ASSETS = REPO / "src" / "jarvis" / "assets"
 STANDING = "S" * 600  # the size of jarvis_os's worker.append_system_prompt
 DESCRIPTION = "D" * 3200  # a bug filed by `jarvis bug report`, issue text inlined
+INVESTIGATION = "D" * 714  # median subject section of 101 live investigator prompts
 
 
 def _spec() -> ProjectSpec:
@@ -54,8 +55,8 @@ def start_breakdown(central: CentralStore, wo: dict) -> dict[str, int]:
               *sorted((REPO / ".claude" / "skills").glob("*/SKILL.md"))]
     agents = sorted((ASSETS / "worker-agents").glob("*.md"))
     chars = {
-        "worker_prompt": len(prompt) - len(DESCRIPTION),
-        "work_order_description": len(DESCRIPTION),
+        "worker_prompt": len(prompt) - len(wo["description"]),
+        "work_order_description": len(wo["description"]),
         "append_system_prompt": len(append),
         "claude_md": len((REPO / "CLAUDE.md").read_text()),
         "session_start_context": len(context.session_start_text(True, REPO)),
@@ -74,7 +75,7 @@ def test_jarvis_share_of_a_worker_start_fits_the_budget(jarvis_home, title, kind
     central = CentralStore()
     _base(central)
     wo = {"id": "wo-71b2ecad", "title": title, "kind": kind,
-          "description": DESCRIPTION}
+          "description": INVESTIGATION if kind == "investigator" else DESCRIPTION}
     parts = start_breakdown(central, wo)
     total = sum(parts.values())
     assert total <= context.START_BUDGET_TOKENS, (

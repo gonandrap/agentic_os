@@ -80,7 +80,7 @@ jarvis wo hide <id> / unhide <id>          # declutter, record kept
 jarvis wo expedite <id> [--off]            # its merge ships ALONE: latest tag + cherry-pick
 jarvis wo delete <id> --yes                # irreversible
 jarvis wo resume-auto <id>                 # what is it ACTUALLY waiting on?
-jarvis wo retry <id> [--message "…"]       # relaunch a FAILED order in its own session; never automatic
+jarvis wo retry <id> [--message "…"]       # relaunch a FAILED order or unshipped release; never automatic
 jarvis wo inject <session-id>              # hand the user's Claude session to Jarvis
 jarvis validation show <wo-id|fo-id>       # WHY a unit was judged as it was (on demand only)
 jarvis validation force <wo-id> --reason "…"    # re-judge a delivered order against the current PR

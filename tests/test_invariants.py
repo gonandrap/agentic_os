@@ -2332,14 +2332,14 @@ def test_an_analyst_held_by_a_refusal_is_pointed_at_wo_finish(project):
     assert "io report" not in sentence and "fo plan" not in sentence
 
 
-def test_an_answered_refusal_still_derives_the_idle_line(project):
-    """The no-regression half: a finish newer than the refusal clears the hold"""
+def test_an_answered_refusal_never_denies_the_finish(project):
+    """The hold clears on a newer finish, and the fallback must not then deny that finish (#1591)"""
     store = ProjectStore(project)
     wo = _held_by_a_refusal(store)
     store.add_event(wo["id"], "finished", {"summary": "re-delivered"})
 
     assert true_blockers(store, store.get_work_order(wo["id"])) == [
-        IDLE_NO_FINISH_BLOCKER]
+        invariants.DELIVERED_UNSETTLED_BLOCKER]
 
 
 def test_unlanded_work_outranks_an_unanswered_refusal(project):
