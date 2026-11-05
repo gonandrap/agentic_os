@@ -607,7 +607,7 @@ EXAMPLES: dict[str, str] = {
     "evolution.critical_weekly_usd": "At $60, expedited critical work stops dispatching once "
                                      "it has used $60 of the week's ledger.",
     "evolution.max_depth": "At 1, an order the OS dispatched cannot itself cause another "
-                           "OS-dispatched order.",
+                           "OS-dispatched order, except the one fix a red `main` gets.",
     "evolution.order_budget_usd": "At $25, each order the steward dispatches stops at $25 "
                                   "and waits for you to raise it.",
     "evolution.weekly_usd": "At $150, once follow-ups and upkeep spent $150 in seven days, a "

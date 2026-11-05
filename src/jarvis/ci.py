@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 import logging
 import re
 import subprocess
@@ -19,19 +20,25 @@ log = logging.getLogger("jarvis.ci")
 CI_TIMEOUT = 30
 
 #: Every `gh` subcommand this module may run
-VERBS = (("run", "list"), ("api", "--method"), ("pr", "update-branch"))
+VERBS = (("run", "list"), ("run", "view"), ("api", "--method"), ("pr", "update-branch"))
 
 #: Of those, the ones that change something at GitHub
 WRITE_VERBS = (("pr", "update-branch"),)
 
 #: What `gh run list --json` is asked for
-RUN_FIELDS = "databaseId,headSha,conclusion,status,startedAt,workflowName"
+RUN_FIELDS = "databaseId,headSha,conclusion,status,startedAt,workflowName,attempt"
 
 #: How far back the base's history is read
 BASE_RUN_LIMIT = 20
 
 #: A `conclusion` on a WORKFLOW RUN that means the base itself was broken
 RED_RUN_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure"})
+
+#: Base job conclusions a branch's failure can match (spec 2026-09-18 §2.1)
+UNPASSED_JOB_CONCLUSIONS = frozenset({"failure", "timed_out", "cancelled"})
+
+#: How a pull request's failure stands against its base (spec 2026-09-18 §2.1)
+OWN_FAILURE, SHARED_FAILURE, UNREAD_FAILURE = "own", "shared", "unread"
 
 #: The shape a branch name must have before it becomes an argument
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -56,6 +63,8 @@ class Run:
     #: Epoch seconds, or None when GitHub gave no parseable time
     started_at: float | None
     workflow: str
+    #: 0 asks `gh run view` for the latest attempt
+    attempt: int = 0
 
     @property
     def completed(self) -> bool:
@@ -122,12 +131,28 @@ def base_runs(base_ref: str, cwd: Path | None = None,
             conclusion=str(r.get("conclusion") or "").lower(),
             status=str(r.get("status") or "").lower(),
             started_at=parse_ts(r.get("startedAt")),
-            workflow=str(r.get("workflowName") or ""))
+            workflow=str(r.get("workflowName") or ""),
+            attempt=int(r.get("attempt") or 0))
         for r in rows if isinstance(r, dict)
     ]
     # Newest first, by the OS's own ordering rather than by trusting the page order
     return tuple(sorted(runs, key=lambda r: (r.started_at is not None, r.started_at or 0),
                         reverse=True))
+
+
+def unpassed_jobs(run: Run, cwd: Path | None = None) -> frozenset[str]:
+    """Jobs that failed or were cancelled on this base run (spec 2026-09-18 §2.1)"""
+    shown = f"`gh run view {run.run_id}`"
+    stdout = _run(["run", "view", str(run.run_id), "--attempt", str(run.attempt),
+                   "--json", "jobs"], cwd=cwd,
+                  missing_hint="so Jarvis cannot tell a red base from a red branch")
+    try:
+        jobs = json.loads(stdout)["jobs"]
+        return frozenset(str(j["name"]) for j in jobs
+                         if str(j.get("conclusion") or "").lower() in UNPASSED_JOB_CONCLUSIONS)
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+        raise GitHubError(f"{shown} returned no job list ({stdout[:200]!r})",
+                          GitHubError.UNREADABLE) from e
 
 
 def update_branch(pr_url: str, cwd: Path | None = None) -> None:
@@ -258,6 +283,28 @@ def inherited(check: dict[str, str], runs: tuple[Run, ...]) -> bool:
         return False
     was = head_when(runs, workflow, parse_ts(check.get("started_at")))
     return bool(was and was.red and (n := latest(runs, workflow)) and n.green)
+
+
+def failure_standing(checks: tuple[dict[str, str], ...], runs: tuple[Run, ...],
+                     jobs_of: Callable[[Run], frozenset[str] | None]) -> str:
+    """Own unless every failing job also did not pass on its red base run (spec 2026-09-18 §2.1)"""
+    unread = False
+    for check in checks:
+        workflow = check.get("workflow") or ""
+        was = head_when(runs, workflow, parse_ts(check.get("started_at"))) if workflow else None
+        if was is None:
+            return OWN_FAILURE
+        if not was.completed:
+            unread = True
+            continue
+        if not was.red:
+            return OWN_FAILURE
+        jobs = jobs_of(was)
+        if not jobs:
+            unread = True
+        elif check.get("name") not in jobs:
+            return OWN_FAILURE
+    return UNREAD_FAILURE if unread else SHARED_FAILURE
 
 
 def base_sha(runs: tuple[Run, ...], workflows: tuple[str, ...]) -> str:
