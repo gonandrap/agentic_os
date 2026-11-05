@@ -66,7 +66,7 @@ MAX_KILLS = 3
 #: How much of a script's output is kept
 OUTPUT_TAIL = 2000
 #: What a `validation` verdict may ask the OS to do — a waive stays the user's (issue #1254)
-VERDICT_ACTIONS = ("requeue", "rewrite")
+VERDICT_ACTIONS = ("requeue", "rewrite", "settle")
 #: How many times Neo's own verdict may put one item back on the watch list
 MAX_AUTO_REQUEUES = 1
 #: Investigate -> fix -> re-validate cycles one item may run before the user decides (#1344)
@@ -861,6 +861,12 @@ Decide whether the user needs to look. If they do, ESCALATE and say what to look
 not, answer in two sentences; the answer is recorded on the item.
 {actions}"""
 
+#: Every question offers it; a question without the `settle_offered` mark predates it
+SETTLE_OFFER = """If the user need not look, add `"action": "settle"`: the item becomes `unverified`, meaning
+nothing wrong was found and no check passed. It is not a pass and nobody owes it a move;
+the user can watch it again with `jarvis morpheus requeue {id}`. An answer with no action
+moves nothing: the item stays {state}."""
+
 #: The item still has its automatic requeue
 REQUEUE_OFFER = """If the failure was transient — production had not exercised the change yet, a network or
 environment hiccup — add `"action": "requeue"` to your JSON and the OS watches it again
@@ -895,15 +901,45 @@ def _ask_neo(catalog: Catalog, item: dict[str, Any], note: str = "") -> int:
     offer = REQUEUE_SPENT if spent else REQUEUE_OFFER
     rewritten = int(item.get("script_rewrites") or 0) >= MAX_SCRIPT_REWRITES
     actions = "\n\n".join(text.format(id=item["id"], state=item["state"]) for text in
-                          (offer, REWRITE_SPENT if rewritten else REWRITE_OFFER))
+                          (SETTLE_OFFER, offer, REWRITE_SPENT if rewritten else REWRITE_OFFER))
     neo = NeoStore()
     try:
         q = neo.ask(item.get("project") or _os_project(catalog), "",
                     VALIDATION_QUESTION.format(why=why, actions=actions),
-                    context=json.dumps({"morpheus_item": item["id"]}), kind="validation")
+                    context=json.dumps({"morpheus_item": item["id"], "settle_offered": True}),
+                    kind="validation")
     finally:
         neo.close()
     return int(q["id"])
+
+
+def reask_answered(central: CentralStore, catalog: Catalog, *,
+                   skip: Collection[str] = ()) -> list[str]:
+    """Ask once more each row Neo answered before it could settle one; returns the rows asked"""
+    from .neo_store import NeoStore
+
+    asked: list[str] = []
+    neo = NeoStore()
+    try:
+        for item in central.morpheus_items(ACTION_STATES):
+            kind, _, qid = (item["action"] or "").partition(":")
+            if (kind != "neo" or not qid.isdigit() or (item["project"] or "") in skip
+                    or (item["resolution"] or "").startswith(CONFIRMED)):
+                continue
+            q = neo.get(int(qid))
+            if (not q or q["status"] != "answered" or q["answered_by"] != "neo"
+                    or json.loads(q["context"] or "{}").get("settle_offered")):
+                continue
+            try:
+                action = f"neo:{_ask_neo(catalog, item)}"
+            except Exception:  # noqa: BLE001 — one item must not starve the others
+                log.exception("morpheus: could not ask Neo again about %s", item["id"])
+                continue
+            central.update_morpheus_item(item["id"], action=action, action_ts=db.now())
+            asked.append(item["id"])
+    finally:
+        neo.close()
+    return asked
 
 
 def item_of_question(q: dict[str, Any]) -> str:
@@ -953,8 +989,14 @@ def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, 
                 and central.claim_morpheus_auto_requeue(item_id, MAX_AUTO_REQUEUES))
     rewritten = (action == "rewrite" and live and bool(reading)
                  and central.claim_morpheus_script_rewrite(item_id, MAX_SCRIPT_REWRITES))
+    # Never over the user's own ruling that the failure is real
+    settled = (action == "settle" and live and bool(reading)
+               and not (item["resolution"] or "").startswith(CONFIRMED))
     if requeued:
         requeue(central, cfg, item_id, resolution=f"re-watched by Neo: {resolution}")
+    elif settled:
+        central.update_morpheus_item(item_id, state="unverified", next_check_ts=None,
+                                     resolution=f"unverified by Neo: {resolution}")
     elif rewritten:
         rewrite(central, cfg, item_id, reading,
                 resolution=f"script sent back to be rewritten by Neo: {resolution}")
@@ -966,12 +1008,15 @@ def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, 
                + (" — Neo escalated" if escalated else
                   " — Neo is watching it again" if requeued else
                   " — Neo sent its script back to be rewritten" if rewritten else
+                  " — Neo settled it unverified, not passed" if settled else
                   " — Neo's reading")),
         body=f"{item['pr_url']}\n{reading[:600]}\n"
              + ("the OS is validating it again — its one automatic requeue is now spent\n"
                 if requeued else "")
              + ("Morpheus writes a new script, then the OS watches it again — its one "
                 "automatic rewrite is now spent\n" if rewritten else "")
+             + (f"nobody owes it a move; jarvis morpheus requeue {item_id} watches it again\n"
+                if settled else "")
              + (f"{question_url}\n" if question_url else "")
              + f"jarvis morpheus show {item_id}")
 

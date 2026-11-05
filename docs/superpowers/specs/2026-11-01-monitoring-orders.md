@@ -54,7 +54,7 @@ one new terminal state `cancelled`:
 | `monitoring` | armed; the daemon runs `script` every `every_minutes` |
 | `validated` | exit 0, or waived — terminal, quiet |
 | `failed` / `timedout` | terminal; JUDGING IS OWED while `action` is empty |
-| `unverified` | not exercised by the deadline, no FAIL seen (§9) — terminal, quiet, never judged, not a pass |
+| `unverified` | not exercised by the deadline, no FAIL seen (§9), or Neo's `settle` (no look needed) — terminal, quiet, not owed, not a pass; `jarvis mo requeue` reverses it |
 | `cancelled` | `jarvis mo cancel` — terminal, never judged, never handed off |
 
 A `queued` order past its deadline times out exactly as today (`sweep`), which is how an
@@ -237,7 +237,10 @@ steward candidates with origin `morpheus` (`steward.py` ~444-468), and the invar
     monitoring agent's reading, not a diagnosis. If the steward declines, or the order
     has no PR (`pr_number` NULL — a user or investigation monitor): escalate.
   * `escalate`: the existing Neo `validation` question (`_ask_neo`), with the judge's
-    reason added; `action` = `neo:<qid>`. Neo's `requeue` verdict and its cap stay.
+    reason added; `action` = `neo:<qid>`. Neo's `requeue` verdict and its cap stay. Its
+    `settle` verdict moves the row to `unverified`, never `validated` (a waive stays the
+    user's). A row Neo answered on a question predating `settle` is asked once more
+    (`reask_answered`); a user's answer or an escalation is not.
 * **A judge that fails** (None, kill, timeout): release the claim (`action` back to empty),
   `attempts += 1` on the row; after `MAX_OFFERS` failed judgings, `escalate` without a
   verdict — the question says the judge could not answer. Never a synthesised verdict.

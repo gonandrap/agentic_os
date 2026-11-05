@@ -653,6 +653,131 @@ def test_timedout_asks_neo_by_default_and_the_route_is_configurable(central):
                         ask_neo=lambda *a: 3) == "investigation:fo-x"
 
 
+def _timed_out_on_neo(central, n: int = 7, *, answered_by: str = "neo",
+                      status: str = "answered", settle_offered: bool = False):
+    """A row parked on a Neo question; `settle_offered` False is one asked before `settle`"""
+    from jarvis.neo_store import NeoStore
+
+    item = queued(central, n)
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
+    context = {"morpheus_item": item["id"]} | ({"settle_offered": True} if settle_offered else {})
+    neo = NeoStore()
+    try:
+        qid = neo.ask("proj_a", "", "old question", context=json.dumps(context),
+                      kind="validation")["id"]
+        if status == "answered":
+            neo.record_answer(qid, "No look needed", answered_by=answered_by)
+        else:
+            neo.mark(qid, status)
+    finally:
+        neo.close()
+    central.update_morpheus_item(item["id"], action=f"neo:{qid}")
+    return central.morpheus_item(item["id"]), qid
+
+
+def test_neo_s_settle_verdict_leaves_the_row_unverified_and_requeue_reverses_it(central):
+    item = monitoring(central, script="exit 75")
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict",
+                                 next_check_ts=None, action="neo:5")
+    _verdict(central, item["id"], action="settle")
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "unverified"
+    assert after["resolution"].startswith("unverified by Neo:")
+    assert morpheus.owed_actions(central) == []
+    assert central.morpheus_counts().get("timedout", 0) == 0
+    title = central.conn.execute("SELECT title FROM inbox").fetchone()["title"]
+    assert "settled it unverified, not passed" in title
+    assert morpheus.requeue(central, MorpheusConfig(), item["id"])["state"] == "monitoring"
+
+
+@pytest.mark.parametrize("fields,verdict", [
+    ({"state": "timedout", "resolution": "no verdict"}, {"action": "settle", "escalate": True}),
+    ({"state": "timedout", "resolution": "no verdict"}, {"action": "settle", "answer": ""}),
+    ({"state": "validated", "resolution": "waived by the user: ok"}, {"action": "settle"}),
+    ({"state": "failed", "resolution": f"{morpheus.CONFIRMED}; fix filed as wo-1"},
+     {"action": "settle"}),
+])
+def test_settle_never_overrides_an_escalation_or_the_user_s_ruling(central, fields, verdict):
+    item = queued(central)
+    central.update_morpheus_item(item["id"], **fields)
+    _verdict(central, item["id"], **verdict)
+    assert central.morpheus_item(item["id"])["state"] == fields["state"]
+
+
+def test_a_new_question_offers_settle_and_never_validates(central):
+    from jarvis.neo_store import NeoStore
+
+    item = queued(central)
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
+    neo = NeoStore()
+    try:
+        q = neo.get(morpheus._ask_neo(catalog(), central.morpheus_item(item["id"])))
+    finally:
+        neo.close()
+    assert '"action": "settle"' in q["question"]
+    assert json.loads(q["context"])["settle_offered"] is True
+    assert "validated" not in morpheus.VERDICT_ACTIONS and "waive" not in morpheus.VERDICT_ACTIONS
+
+
+def test_a_row_neo_answered_before_settle_is_asked_once_more_then_drains(central):
+    from jarvis.neo_store import NeoStore
+
+    item, old = _timed_out_on_neo(central)
+    assert morpheus.reask_answered(central, catalog()) == [item["id"]]
+    action = central.morpheus_item(item["id"])["action"]
+    assert action != f"neo:{old}" and action.startswith("neo:")
+    neo = NeoStore()
+    try:
+        new = neo.get(int(action.partition(":")[2]))
+        neo.record_answer(new["id"], "still no look needed")
+    finally:
+        neo.close()
+    # Answered again, this time with `settle` on offer: never a third question
+    assert morpheus.reask_answered(central, catalog()) == []
+    morpheus.record_neo_verdict(central, MorpheusConfig(), new,
+                                {"escalate": False, "answer": "no look", "action": "settle"})
+    assert central.morpheus_item(item["id"])["state"] == "unverified"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"answered_by": "user"},             # a user's answer stays theirs
+    {"status": "escalated"},             # the user owes it
+    {"status": "queued"},                # Neo has not answered yet
+    {"settle_offered": True},            # already had its chance
+])
+def test_only_a_neo_answer_without_the_offer_is_asked_again(central, kwargs):
+    item, qid = _timed_out_on_neo(central, **kwargs)
+    assert morpheus.reask_answered(central, catalog()) == []
+    assert central.morpheus_item(item["id"])["action"] == f"neo:{qid}"
+
+
+def test_reasking_skips_archived_projects_and_confirmed_failures(central):
+    item, _ = _timed_out_on_neo(central)
+    assert morpheus.reask_answered(central, catalog(), skip={"proj_a"}) == []
+    central.update_morpheus_item(item["id"], resolution=f"{morpheus.CONFIRMED}; fix filed as wo-1")
+    assert morpheus.reask_answered(central, catalog()) == []
+
+
+def test_a_settled_row_shows_on_mo_status_list_and_the_page(central, capsys):
+    from fastapi.testclient import TestClient
+
+    from jarvis.cli import main
+    from jarvis.ui.app import create_app
+
+    item = queued(central)
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
+    _verdict(central, item["id"], action="settle")
+    assert main(["mo", "status"]) == 0
+    assert "1 unverified" in capsys.readouterr().out
+    assert main(["mo", "list", "--state", "unverified"]) == 0
+    assert f"? {item['id']}" in capsys.readouterr().out
+    assert main(["mo", "list"]) == 0
+    assert item["id"] not in capsys.readouterr().out
+    client = TestClient(create_app())
+    assert "1 unverified" in client.get("/mo").text
+    assert 'class="mono tone-muted">unverified' in client.get(f"/mo/{item['id']}").text
+
+
 def _allowed(monkeypatch, allowed: bool = True) -> list:
     from jarvis import steward
 
