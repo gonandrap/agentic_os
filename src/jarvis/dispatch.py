@@ -973,7 +973,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "reading, a validation transcript, a diff — is an opinion, not a diagnosis. "
         "Paraphrase is not a quote. Copy the line as it is printed, name the command that "
         f"printed it, and keep it over {verdicts.MIN_QUOTE_CHARS} characters, which the "
-        f"validator enforces — under that it is a fragment nobody can find again.",
+        f"validator enforces.",
         "",
         "# The five classifications",
         "A classification is a decision about THE SUBJECT, not about the codebase in "
@@ -989,17 +989,18 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "the defect is the subject project's own code.",
         "- **WAITING_ON_USER** — nothing is broken; a person owes a decision. Name it BY "
         "ID in `user_owes`: the assumption, the gate, the Neo question. This is the ONE "
-        "classification that spends the user's attention.",
+        "classification that spends the user's attention. Opened by Morpheus: also set "
+        "`behaviour_correct`; true settles its order `unverified`, off the user.",
         "- **TRANSIENT** — it clears itself. Say in `unsticks` WHAT mechanism clears it "
         "and WHEN. \"It will sort itself out\" with no mechanism is not this "
-        "classification.",
+        "classification. A second on one monitoring order settles it `unverified`.",
         "- **ALREADY_TRACKED** — the cause is already on the tracker or already has a live "
         "order. Put the issue (`#790` or its URL) or the order id in `duplicate_of`.",
         "- **SCRIPT_WRONG** — ONLY when Morpheus opened this investigation on a failed "
         "production validation, and the PR behaves as its hints describe but the "
         "validation SCRIPT checks the wrong thing. Say in `script_fix` what the script got "
         "wrong and what the right check is: the OS sends the item back to Morpheus with it "
-        "as the brief for a new script, once per item.",
+        "as the brief for a new script.",
         "",
         "# Name the gap class — required on all five",
         gaps.render_registry(),
@@ -1019,9 +1020,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"shell heredoc that writes a file is refused for every worker in the fleet "
         f"(`hooks.heredoc_write_decision`). Submit it with the command below, "
         f"which IS your finish. Do not call `jarvis wo finish`: submitting the verdict "
-        f"settles this work order for you. `--from-file` and not inline flags, because "
-        f"the gate classifier's quote-blanking fails on nested and mixed quoting and a "
-        f"verdict is full of repo paths and quoted log lines.",
+        f"settles this work order for you.",
         "",
         f"    jarvis investigate verdict {inv_id} --from-file verdict.json",
         "",
@@ -1045,6 +1044,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         '    "remedy": "an existing remedy id, or none with the reason"',
         "  },",
         '  "user_owes": "…",          // WAITING_ON_USER only, naming an id',
+        '  "behaviour_correct": true, // WAITING_ON_USER on a Morpheus order: required',
         '  "unsticks": {"what": "…", "when": "…"},   // TRANSIENT only',
         '  "duplicate_of": "#790",    // ALREADY_TRACKED only',
         '  "script_fix": "…"          // SCRIPT_WRONG only: what it got wrong, the right check',

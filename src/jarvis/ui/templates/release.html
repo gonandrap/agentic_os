@@ -93,7 +93,7 @@ tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
 <h2>releases</h2>
 <div class="panel table-wrap">
   <table class="rel-list">
-    <tr><th>release</th><th>status</th><th>commits</th><th>validated</th><th>pending</th>
+    <tr><th>release</th><th>status</th><th>commits</th><th>validated</th><th>unverified</th><th>pending</th>
       <th>failed</th><th>unwatched</th><th>cut</th></tr>
     {% for r in releases %}
     <tr id="{{ r.tag }}">
@@ -101,13 +101,14 @@ tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
       <td class="mono {{ rel.tone[r.status] }}">{{ r.status }}</td>
       <td class="mono">{{ r.prs }}</td>
       <td class="mono tone-ok">{{ r.counts.validated or "" }}</td>
+      <td class="mono tone-warn">{{ r.counts.unverified or "" }}</td>
       <td class="mono tone-active">{{ r.counts.pending or "" }}</td>
       <td class="mono tone-bad">{{ r.counts.failed or "" }}</td>
       <td class="mono tone-muted">{{ r.counts.unwatched or "" }}</td>
       <td class="when mono" title="{{ fmt_ts(r.ts) }}">{{ fmt_age(r.ts) }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="8" class="empty">{{ 'nothing matches these filters' if filters else 'no ' ~ report.tag_glob ~ ' tag yet' }}</td></tr>
+    <tr><td colspan="9" class="empty">{{ 'nothing matches these filters' if filters else 'no ' ~ report.tag_glob ~ ' tag yet' }}</td></tr>
     {% endfor %}
   </table>
 </div>

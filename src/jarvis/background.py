@@ -165,7 +165,7 @@ def _scan_results(row: dict[str, Any], launched: dict[str, dict[str, Any]],
     """What came BACK: the id a launch was given, and what a poll said about one (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)"""
     result = row.get("toolUseResult")
     outcome = result if isinstance(result, dict) else {}
-    job_id = str(outcome.get("backgroundTaskId") or "")
+    job_id = _started_task(row)
     for block in usage.blocks_of(row, "tool_result"):
         call_id = str(block.get("tool_use_id") or "")
         if call_id in launched and not _failed(block, result):
