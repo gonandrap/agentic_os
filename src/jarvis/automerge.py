@@ -116,6 +116,8 @@ class BaseRed:
     fix_wo_id: str = ""
     issue_url: str = ""
     issue_os_filed: bool = False
+    #: This pull request's failing jobs also did not pass on the red run it was built on
+    shared_failure: bool = False
 
 
 #: WHO can still clear a scope-drift finding — what the hold reason has to say (#1063)
@@ -360,11 +362,11 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
         # Spec 2026-10-14 §5: tick-stable, so the order's id and nothing that moves
         fixing = (f"{base_red.fix_wo_id} is fixing it" if base_red.fix_wo_id
                   else "no work order is fixing it yet")
-        # Matched on WORKFLOW, never on job name
-        rider = (f" This pull request's own `{base_red.workflow}` failure is the same "
-                 f"break and not its fault."
-                 if any(str(c.get("workflow") or "") == base_red.workflow
-                        for c in pr.red) else "")
+        # Only what was established: job names cannot tell two tests of one shard apart (spec 2026-09-18 §2.1)
+        rider = (f" This pull request's failing jobs ({', '.join(pr.failing)}) also did "
+                 f"not pass on the red `{base_red.base}` run its build started on, so "
+                 f"this may be the same break."
+                 if base_red.shared_failure and pr.failing else "")
         return _held(HELD_BASE_RED,
                      f"`{base_red.base}` itself is red — workflow "
                      f"`{base_red.workflow}`, run {base_red.run_url}, at "
