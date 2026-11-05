@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Re-run main by hand when GitHub drops a push event
+  workflow_dispatch:
 
 # All three jobs are REQUIRED status checks on main (enforced by the repo ruleset
 # "protect-main"): unit tests, behavioral evals, and browser tests must pass before
