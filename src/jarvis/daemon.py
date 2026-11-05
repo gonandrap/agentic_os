@@ -89,7 +89,8 @@ def read_base_red(central: Any, project_name: str) -> Any:
         # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5
         fix_wo_id=str(fact.get("fix_wo_id") or ""),
         issue_url=str(fact.get("issue_url") or ""),
-        issue_os_filed=bool(fact.get("issue_os_filed")))
+        issue_os_filed=bool(fact.get("issue_os_filed")),
+        steward_verdict=steward.break_verdict(central, project_name, fact.get("break_run_id")))
 
 
 #: What the seats read when a head's red checks are the base's (spec 2026-10-13 §9)
@@ -5493,7 +5494,10 @@ class Daemon:
         was_red = bool(prev.get("red"))
         wo_id = issue_url = fix_wo_id = ""
         issue_os_filed = False
+        break_run_id = 0
         if worst is not None:
+            # The run that opened this break: `run_id` moves with each new red run inside it
+            break_run_id = (prev.get("break_run_id") if was_red else 0) or worst.run_id
             wo_id = (str(prev.get("wo_id") or "") if was_red
                      else self._attribute_base_red(project, store, owner, repo,
                                                    worst.head_sha))
@@ -5508,6 +5512,7 @@ class Daemon:
             "base_read_at": base_read_at or time.time(),
             "workflow": worst.workflow if worst else "",
             "run_id": worst.run_id if worst else 0,
+            "break_run_id": break_run_id,
             "run_url": ci.run_url(owner, repo, worst.run_id) if worst else "",
             "head_sha": worst.head_sha if worst else "",
             "wo_id": wo_id,
@@ -5680,7 +5685,9 @@ class Daemon:
             steward.Candidate("red_main", "critical", project.name,
                               f"`{fact.get('base') or 'main'}` is red",
                               evidence=(str(fact.get("run_url") or run_id or ""),),
-                              parent_wo_id=str(fact.get("wo_id") or "")),
+                              parent_wo_id=str(fact.get("wo_id") or ""),
+                              payload={"issue_url": issue_url},
+                              break_id=str(fact.get("break_run_id") or "")),
             catalog=self.catalog, store=store,
             self_dispatch=self.self_dispatch)
         if not self.self_dispatch:
