@@ -39,8 +39,7 @@ different ratio, which the alarm's own text names along with the command that me
 
 AND ONE MORE IS NOT ABOUT THIS PROJECT AT ALL. `cache-1h-dispatched` is the FLEET's
 one-hour cache writes by turns Jarvis armed for five minutes — every transcript on the
-machine. The work order it hangs off carries the foreign key and NOTHING else: it is not
-the exemplar of the number, it did not cause it, and it may have nothing to do with it.
+machine. It names no work order, because no order caused it or is its exemplar.
 It says Jarvis's own transport bought the expensive write, which is a DEFECT IN THIS
 CODEBASE and a work order anyone can act on. A person's own `claude` sessions are not
 alarmed on: Jarvis must never write a user's `~/.claude/settings.json`, so never propose
@@ -191,7 +190,7 @@ An escalation may carry one optional label, which is grouped and reported:
   "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
 evidence-insufficient | user-decision>\""""
 
-#: User-facing copy: inbox rows reach every sink, Telegram included
+#: User-facing copy; both cleared titles are written push=False: inbox and log only
 ACK_INBOX_TITLE = "Supervisor cleared an alarm on {wo_id}"
 ADVICE_INBOX_TITLE = "Neo cleared an alarm on {wo_id}"
 ESCALATED_INBOX_TITLE = "A cost alarm needs you: {alarm_id}"
@@ -555,6 +554,33 @@ BLOCKED_SENTENCES = {
 }
 
 
+def _machine_wide(alarm: dict[str, Any]) -> bool:
+    """A meter alarm recurs as one standing condition (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)"""
+    from .daemon import METER_INBOX_TITLE
+
+    return alarm.get("kind") in METER_INBOX_TITLE
+
+
+def _standing_lines(pstore: Any, alarm: dict[str, Any], cfg: Any) -> list[str]:
+    """Earlier occurrences and their verdicts (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)"""
+    from .daemon import METER_DIAGNOSTIC_ROWS, METER_STANDING_GAP_SECONDS
+
+    if not _machine_wide(alarm):
+        return []
+    now = db.now()
+    chain = pstore.standing_alarms(str(alarm["kind"]), METER_STANDING_GAP_SECONDS)
+    prior = [r for r in chain if float(r["ts"] or 0.0) < float(alarm.get("ts") or 0.0)]
+    lines = ["# This standing condition", f"occurrence {len(prior) + 1}"]
+    if prior:
+        lines[-1] += f", first seen {_for(now - float(prior[0]['ts'] or now))} ago"
+    for row in prior[-METER_DIAGNOSTIC_ROWS:]:
+        verdict = row.get("verdict") or row.get("status")
+        lines.append(f"- {_for(now - float(row['ts'] or now))} ago: "
+                     f"{_clip(str(row.get('reason') or ''), cfg.reason_chars)} — verdict "
+                     f"{verdict}: {_clip(str(row.get('verdict_reason') or ''), cfg.reason_chars)}")
+    return lines
+
+
 def build_evidence(pstore: Any, subject: dict[str, Any],
                    alarm: dict[str, Any] | None,
                    cfg: Any = None, inspect_cfg: Any = None) -> str:
@@ -580,6 +606,9 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
             f"reason: {alarm.get('reason')}",
             f"{raised}, {minutes:.0f} minute(s) ago",
         ])
+        standing = _standing_lines(pstore, alarm, cfg)
+        if standing:
+            sections.append(standing)
 
     row = subject["row"]
     if subject["kind"] == "feature_order":
@@ -597,6 +626,9 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
         history = _history_lines(pstore, "fo", fo_id, share)
         plan = _plan_lines(row, share)
         sections += [rest[0], *([plan] if plan else []), history, tree, *rest[1:]]
+    elif subject["kind"] == "machine":
+        sections.append(["# The subject",
+                         "The whole machine: no work order caused this or can explain it."])
     else:
         from . import health, invariants
 
@@ -692,7 +724,7 @@ def _transport_failure(exc: Exception, reason_chars: int) -> dict[str, Any]:
             "reason": f"{UNREACHABLE_PREFIX}{str(exc)[:reason_chars]}"}
 
 
-def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
+def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any] | None,
            alarm: dict[str, Any], cfg: Any, record: Any = None,
            central: Any = None, inspect_cfg: Any = None) -> dict[str, Any]:
     """Judge one claimed alarm and record the outcome"""
@@ -702,8 +734,9 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
 
     record = record or agent_usage.record
     # Hoisted out of the call because the ESCALATION carries it: Neo answers from the question and its...
-    evidence = build_evidence(pstore, {"kind": "work_order", "row": wo}, alarm,
-                              cfg, inspect_cfg)
+    subject = ({"kind": "work_order", "row": wo} if wo
+               else {"kind": "machine", "row": {}})
+    evidence = build_evidence(pstore, subject, alarm, cfg, inspect_cfg)
     try:
         verdict = structured.request(
             evidence,
@@ -721,7 +754,7 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
             # This call is recorded by `on_usage`, below, under the same kind
             records_itself="supervisor",
             on_usage=agent_usage.recorder(
-                "supervisor", project=project, wo_id=wo["id"],
+                "supervisor", project=project, wo_id=wo["id"] if wo else "",
                 label=str(alarm.get("kind") or ""), model=cfg.model, record=record),
         )
     except claude_cli.ClaudeCliError as exc:
@@ -998,7 +1031,8 @@ def _question_for(verdict: dict[str, Any], alarm: dict[str, Any]) -> str:
     ])
 
 
-def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str, Any],
+def _apply(pstore: Any, neo_store: Any, central: Any, project: str,
+           wo: dict[str, Any] | None,
            alarm: dict[str, Any], verdict: dict[str, Any], evidence: str,
            cfg: Any) -> None:
     """Write the verdict down"""
@@ -1017,6 +1051,13 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
         pstore.update_alarm(alarm_id, status="failed",
                             verdict_reason=verdict["reason"], decided_at=decided)
         log.warning("supervisor review of %s failed: %s", alarm_id, verdict["reason"])
+        return
+
+    if wo is None:
+        # On the row and nowhere else: the user heard at the raise, and no order can take a verdict
+        pstore.update_alarm(alarm_id, status="acked", verdict=verdict["decision"],
+                            verdict_reason=verdict["reason"], note=verdict.get("note") or "",
+                            decided_at=decided)
         return
 
     if verdict["decision"] == "escalate":
@@ -1043,7 +1084,7 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
 
     central.add_inbox(project=project, level="info",
                       title=ACK_INBOX_TITLE.format(wo_id=wo["id"]),
-                      body=verdict["note"], wo_id=wo["id"])
+                      body=verdict["note"], wo_id=wo["id"], push=False)
 
 
 def _propose(pstore: Any, neo_store: Any, central: Any, project: str,

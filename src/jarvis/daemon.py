@@ -49,6 +49,7 @@ from .project_store import (
     ProjectStore,
     kind_contract,
     resume_spends_slot,
+    turn_end_is_delivery,
     validation_hold_until,
 )
 
@@ -88,7 +89,8 @@ def read_base_red(central: Any, project_name: str) -> Any:
         # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5
         fix_wo_id=str(fact.get("fix_wo_id") or ""),
         issue_url=str(fact.get("issue_url") or ""),
-        issue_os_filed=bool(fact.get("issue_os_filed")))
+        issue_os_filed=bool(fact.get("issue_os_filed")),
+        steward_verdict=steward.break_verdict(central, project_name, fact.get("break_run_id")))
 
 
 #: What the seats read when a head's red checks are the base's (spec 2026-10-13 §9)
@@ -428,6 +430,12 @@ CACHE_TTL_TICK_OFFSET = 60
 #: Reconcile the meter against measured spend every N ticks — 30 minutes at the default 5s interval (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)
 METER_RECONCILE_EVERY_TICKS = 360
 
+#: Same-kind meter alarms under this far apart are one standing condition (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)
+METER_STANDING_GAP_SECONDS = 7 * 86_400
+
+#: The occurrence that stops the supervisor's review and, for the residual, files the diagnostic
+METER_STANDING_OCCURRENCES = 3
+
 #: The two kinds `check_meter_residual` raises, and the inbox title of each
 METER_OUTSIDE_ALARM = "cost_outside_spend_high"
 METER_RESIDUAL_ALARM = "cost_residual_high"
@@ -435,6 +443,40 @@ METER_INBOX_TITLE = {
     METER_OUTSIDE_ALARM: "sessions Jarvis did not dispatch are spending the window",
     METER_RESIDUAL_ALARM: "the usage meter and the measured spend do not reconcile",
 }
+#: What the user owes, on the one inbox line each condition sends
+METER_INBOX_ACTION = {
+    METER_OUTSIDE_ALARM: "Your action: if these sessions are yours, none is owed; otherwise "
+                         "stop the ones you do not recognise. Repeats are counted, not sent "
+                         "here.",
+    METER_RESIDUAL_ALARM: "No action is owed from you. Repeats are counted, not sent here, and "
+                          "from occurrence 3 the OS files a bug on the meter accounting.",
+}
+
+#: Records the filing: one inside the chain means do not file again
+METER_DIAGNOSED_ALARM = "cost_residual_diagnosed"
+#: Who the filing is from: not a work order, so the steward counts no lineage from a carrier
+METER_FILED_BY = "the meter reconciliation"
+#: How many occurrences the diagnostic's brief lists
+METER_DIAGNOSTIC_ROWS = 10
+
+
+def _utc(ts: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def meter_diagnostic_brief(chain: list[dict[str, Any]]) -> str:
+    """The filed issue's description: the evidence, and where the defect is looked for"""
+    # Ids, never reasons: a reason states spend and the tracker is public
+    rows = "\n".join(f"- {_utc(float(row['ts']))}: `jarvis alarms show {row['id']}`"
+                     for row in chain[-METER_DIAGNOSTIC_ROWS:])
+    return (f"`{METER_RESIDUAL_ALARM}` has recurred {len(chain)} times since "
+            f"{_utc(float(chain[0]['ts']))} as one standing, machine-wide condition. The work "
+            f"orders those alarms sit on only carry the row; they are not the cause.\n\n"
+            f"Diagnose the meter accounting, `src/jarvis/usage_meter.py` and "
+            f"`src/jarvis/fleetcost.py`. A residual that changes sign points at the "
+            f"arithmetic, not at invisible usage.\n\n{rows}")
 
 #: How many outside sessions the outside alarm NAMES
 METER_ALARM_SESSIONS = 3
@@ -618,6 +660,8 @@ CACHE_1H_INBOX_TITLE = {
     inspection.CACHE_ARM_MISSED_ALARM:
         "A cache-TTL arm is not reaching the CLI — stamped turns paid the other rate",
 }
+CACHE_1H_INBOX_ACTION = ("Your action: this is an OS defect and nothing files it by itself. "
+                         "Report it with `jarvis bug report`, citing this alarm.")
 
 
 def archived_projects(central: CentralStore) -> frozenset[str]:
@@ -1190,6 +1234,7 @@ class Daemon:
                 if reconcile:
                     # Immediately after the settlement above
                     self.clear_answered_investigations(project, store)
+                    self.raise_settled_duplicates(project)
                     # Beside it: the investigator's half of a settled investigation
                     self.settle_landed_investigators(project, store)
                     # A researcher's validated report reaches the user; the order itself stays open
@@ -1211,6 +1256,8 @@ class Daemon:
                     self.abandon_unargued_gates(project, store)
                     # On the reconcile cadence rather than every tick
                     self.auto_review(project, store)
+                    # After it, so a row Neo just settled is acked this pass; reads state, so old rows heal too
+                    self.settle_review_pings(project, store)
                     # Beside it, and AFTER it: the same tick that files an objection is the one that must take it back if...
                     self.withdraw_stale_objections(project, store)
                     # After the withdrawals it counts, so a withdrawal this tick is in the rate
@@ -1587,6 +1634,16 @@ class Daemon:
                 log.info("[%s] feature %s completed (%d work orders)", project.name,
                          fo["id"], len(children))
 
+    def raise_settled_duplicates(self, project: ProjectSpec) -> None:
+        """Investigation spec §2.5: a downgraded GAP whose target settled must come back up"""
+        from . import ops
+
+        try:
+            for item_id in ops.raise_settled_duplicates(project.name, project.path):
+                log.info("[%s] proposed %s from settled duplicates", project.name, item_id)
+        except Exception:  # noqa: BLE001 — unmarked verdicts retry on the next reconcile
+            log.exception("[%s] could not raise settled duplicates", project.name)
+
     def clear_answered_investigations(self, project: ProjectSpec,
                                       store: ProjectStore) -> None:
         """Take down a `WAITING_ON_USER` flag once its subject owes the user nothing"""
@@ -1890,7 +1947,7 @@ class Daemon:
                   f"every SQLite write fails and each invariant reports itself as "
                   f"`database or disk is full`.\n\n"
                   f"The OS reclaims the checkout of a settled work order itself "
-                  f"({self.catalog.os.worktree.reclaim_after_hours}h after it settles); "
+                  f"(`worktree.reclaim_after_hours` after it settles); "
                   f"what is left is the checkouts of open and failed orders, the logs "
                   f"under {logs_dir()} and Claude Code's transcripts."),
         )
@@ -3383,6 +3440,13 @@ class Daemon:
                     log.info("morpheus %s: its fix reached production, watching again", item_id)
             except Exception:  # noqa: BLE001 — the rest of the pass still runs
                 log.exception("morpheus: could not requeue fixed items")
+            try:
+                from .ops import settle_investigated_monitors
+
+                for item_id in settle_investigated_monitors():
+                    log.info("morpheus %s: its investigation's verdict moved it", item_id)
+            except Exception:  # noqa: BLE001 — the rest of the pass still runs
+                log.exception("morpheus: could not settle investigated items")
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
             skip = archived_projects(central)
@@ -3470,6 +3534,17 @@ class Daemon:
             # No work order to flag; revival re-asks it once Neo answers again
             self._backlog_question_unanswered(central, q, f"Neo could not be reached: {detail}")
             return
+        ppath = {p.name: p.path for p in self.catalog.projects}.get(q["project"])
+        if q.get("kind") == "assumption" and ppath and ppath.is_dir():
+            # The row's ping, once: the pass re-asks a dead question (io-ed253c2b)
+            from . import ops
+
+            pstore = ProjectStore(ppath)
+            try:
+                ops.flag_assumptions_pending(pstore, q["wo_id"])
+            finally:
+                pstore.close()
+            return
         head = q["question"].strip().splitlines()[0][:200]
         central.add_inbox(
             project=q["project"], level="warning",
@@ -3482,7 +3557,6 @@ class Daemon:
                  f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
             wo_id=q["wo_id"],
         )
-        ppath = {p.name: p.path for p in self.catalog.projects}.get(q["project"])
         if ppath and ppath.is_dir():
             pstore = ProjectStore(ppath)
             try:
@@ -3911,9 +3985,10 @@ class Daemon:
                      f"Read it with: jarvis alarms show {alarm['id']}\n"
                      "The question in full: "
                      f"{notify.neo_question_url(self.catalog, q['id'])}",
-                wo_id=q["wo_id"])
-            pstore.flag_attention(q["wo_id"], supervisor.ALARM_BLOCKER.format(
-                alarm_id=alarm["id"]))
+                wo_id=q["wo_id"] if alarm["wo_id"] else None)
+            if alarm["wo_id"]:
+                pstore.flag_attention(q["wo_id"], supervisor.ALARM_BLOCKER.format(
+                    alarm_id=alarm["id"]))
             log.info("alarm %s escalated to the user by neo", alarm["id"])
             return
 
@@ -3925,6 +4000,8 @@ class Daemon:
             verdict_reason=supervisor.NEO_ANSWERED_REASON.format(
                 reason=verdict["reason"] or "(no reason given)"),
             decided_at=db_mod.now())
+        if not alarm["wo_id"]:
+            return  # asked before this alarm left its carrier: the row is the record
         pstore.add_event(q["wo_id"], "alarm_advice",
                          {"alarm_id": alarm["id"], "neo_question_id": q["id"],
                           "answer": note})
@@ -3937,7 +4014,7 @@ class Daemon:
             project=q["project"], level="info",
             title=supervisor.ADVICE_INBOX_TITLE.format(wo_id=q["wo_id"]),
             body=f"{note}\n{supervisor.ALARM_PATH.format(project=q['project'], alarm_id=alarm['id'])}",
-            wo_id=q["wo_id"])
+            wo_id=q["wo_id"], push=False)
         log.info("neo answered alarm %s", alarm["id"])
 
     def _supervisor_config(self, project: str) -> Any:
@@ -4021,6 +4098,9 @@ class Daemon:
                       f"Command: {approval['command']}\n"
                       f"Review Neo's call with: jarvis neo review {q['id']}"),
                 wo_id=q["wo_id"],
+                # A settled merge or release asks nothing of the user (io-ed253c2b)
+                push=not (ruling == "approved" and not decided["contested"]
+                          and approval["kind"] in ("auto_merge", "release")),
             )
         log.info("gate %s %s by neo for %s", approval["id"], ruling, q["wo_id"])
 
@@ -4178,7 +4258,7 @@ class Daemon:
                                    f"no longer be prevented")
                 continue
             try:
-                wo = pstore.get_work_order(alarm["wo_id"])
+                wo = pstore.get_work_order(alarm["wo_id"]) if alarm["wo_id"] else None
             except KeyError:
                 pstore.update_alarm(alarm["id"], status="skipped", decided_at=db.now(),
                                     verdict_reason="the work order is gone")
@@ -4463,7 +4543,7 @@ class Daemon:
         last = ops.last_stuck_investigation(project, wo_id)
         if last is None:
             return False
-        cooldown = self.catalog.os.fleet_health.cooldown_minutes * 60.0
+        cooldown = self.catalog.project(project).fleet_health.cooldown_minutes * 60.0
         return (now - float(last.get("updated_at") or 0.0) < cooldown
                 or last[ops.STUCK_FINGERPRINT_KEY] == fingerprint)
 
@@ -4624,6 +4704,20 @@ class Daemon:
                                 wo_id: str | None) -> None:
         """A violation no longer standing acks the inbox row that raised it (issue #1357)"""
         self.central.revise_inbox(project.name, invariant_title(invariant), wo_id, ack=True)
+
+    def settle_review_pings(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """A review ping whose order owes the user nothing more acks itself (io-ed253c2b)"""
+        from . import ops as ops_mod
+
+        reason = ops_mod.ASSUMPTIONS_PENDING_REASON
+        for wo_id in self.central.orders_with_unacked_paired(project.name, reason):
+            try:
+                wo = store.get_work_order(wo_id)
+            except KeyError:
+                wo = None       # deleted since the ping: nothing left to review
+            if (wo is None or wo["status"] in TERMINAL_STATUSES
+                    or not invariants_mod.reviewable_assumptions(store, wo)):
+                self.central.ack_paired_reason(wo_id, reason)
 
     def rules_tick(self, project: ProjectSpec, store: ProjectStore) -> dict[str, Any]:
         """Evaluate the rule registry against this project's open orders (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
@@ -5023,30 +5117,17 @@ class Daemon:
         # Reads the RECORD, not the transcripts, so it holds when they do not read
         raised += inspection.arm_miss_alarms(
             inspection.arm_misses(self._arm_rate_rows(since)), cfg, days=days)
-        if not raised:
-            return
-        carrier = store.latest_settled_order()
-        if carrier is None:
-            # Nothing to hang the foreign key on
-            log.info("[%s] one-hour cache writes found, but no settled order to carry "
-                     "the alarm yet", project.name)
-            return
         for alarm in raised:
             last = store.last_alarm_of_kind(alarm.kind)
             if last is not None and float(last["ts"] or 0.0) >= since:
                 continue
-            row = store.add_finding(carrier["id"], kind=alarm.kind, reason=alarm.reason,
+            row = store.add_finding(None, kind=alarm.kind, reason=alarm.reason,
                                     seq=NO_TURN, source="cost")
-            store.add_event(carrier["id"], "cost_alarm",
-                            {"kind": alarm.kind, "seq": NO_TURN,
-                             "reason": alarm.reason, "alarm_id": row["id"]})
             self.central.add_inbox(
                 project=project.name, level="warning",
                 title=CACHE_1H_INBOX_TITLE[alarm.kind],
-                body=f"{alarm.reason}\n"
-                     f"The supervisor will look before you have to. "
-                     f"Read it with: jarvis alarms show {row['id']}",
-                wo_id=carrier["id"])
+                body=f"{alarm.reason}\n{CACHE_1H_INBOX_ACTION}\n"
+                     f"Read it with: jarvis alarms show {row['id']}")
             log.info("[%s] %s: %s", project.name, alarm.kind, alarm.reason)
 
     def check_meter_residual(self, project: ProjectSpec, store: ProjectStore) -> None:
@@ -5072,31 +5153,56 @@ class Daemon:
         raised = [kind for kind, flag in (
             (METER_OUTSIDE_ALARM, meter["alerts"]["outside"]),
             (METER_RESIDUAL_ALARM, meter["alerts"]["residual"])) if flag]
-        if not raised:
-            return
-        carrier = store.latest_settled_order()
-        if carrier is None:
-            # Nothing to hang the foreign key on
-            log.info("[%s] the meter does not reconcile, but no settled order can carry "
-                     "the alarm yet", project.name)
-            return
         for kind in raised:
-            last = store.last_alarm_of_kind(kind)
-            if last is not None and float(last["ts"] or 0.0) >= resolved["since"]:
-                continue
-            reason = meter_alarm_reason(kind, meter)
-            row = store.add_finding(carrier["id"], kind=kind, reason=reason,
-                                    seq=NO_TURN, source="cost")
-            store.add_event(carrier["id"], "cost_alarm",
-                            {"kind": kind, "seq": NO_TURN, "reason": reason,
-                             "alarm_id": row["id"]})
-            self.central.add_inbox(
-                project=project.name, level="warning", title=METER_INBOX_TITLE[kind],
-                body=f"{reason}\n"
-                     f"The supervisor will look before you have to. "
-                     f"Read it with: jarvis alarms show {row['id']}",
-                wo_id=carrier["id"])
-            log.info("[%s] %s: %s", project.name, kind, reason)
+            chain = store.standing_alarms(kind, METER_STANDING_GAP_SECONDS)
+            if not chain or float(chain[-1]["ts"] or 0.0) < resolved["since"]:
+                occurrence = len(chain) + 1
+                first_seen = float(chain[0]["ts"]) if chain else db.now()
+                reason = meter_alarm_reason(kind, meter)
+                if chain:
+                    reason += (f" Occurrence {occurrence} of this standing condition, "
+                               f"first seen {_utc(first_seen)}.")
+                row = store.add_finding(
+                    None, kind=kind, reason=reason, seq=NO_TURN, source="cost",
+                    status=("raised" if occurrence < METER_STANDING_OCCURRENCES
+                            else "informational"))
+                if not chain:
+                    self.central.add_inbox(
+                        project=project.name, level="warning", title=METER_INBOX_TITLE[kind],
+                        body=f"{reason}\n{METER_INBOX_ACTION[kind]}\n"
+                             f"Read it with: jarvis alarms show {row['id']}")
+                log.info("[%s] %s: %s", project.name, kind, reason)
+                chain.append(row)
+            if kind == METER_RESIDUAL_ALARM and len(chain) >= METER_STANDING_OCCURRENCES:
+                self._file_meter_diagnostic(project, store, chain)
+
+    def _file_meter_diagnostic(self, project: ProjectSpec, store: ProjectStore,
+                               chain: list[dict[str, Any]]) -> None:
+        """A standing residual becomes one filed bug, and never a second inbox line"""
+        from . import bugreport
+        from .project_store import NO_TURN
+
+        done = store.last_alarm_of_kind(METER_DIAGNOSED_ALARM)
+        if done is not None and float(done["ts"] or 0.0) >= float(chain[0]["ts"] or 0.0):
+            return
+        try:
+            filed = bugreport.report_bug(
+                title="The usage meter and the measured spend do not reconcile",
+                description=meter_diagnostic_brief(chain),
+                expected="The meter's implied spend reconciles with measured spend",
+                actual=f"{METER_RESIDUAL_ALARM} recurred {len(chain)} times since "
+                       f"{_utc(float(chain[0]['ts']))}",
+                priority="high", project=project.name,
+                filed_by=METER_FILED_BY, notify=False)
+        except Exception:  # noqa: BLE001 — nothing recorded, so the next pass files it
+            log.exception("[%s] could not file the meter diagnostic", project.name)
+            return
+        store.add_finding(
+            None, kind=METER_DIAGNOSED_ALARM, seq=NO_TURN, source="cost",
+            status="informational",
+            reason=f"{METER_RESIDUAL_ALARM} recurred {len(chain)} times: filed as "
+                   f"{filed.get('url')}")
+        log.info("[%s] meter diagnostic filed: %s", project.name, filed.get("url"))
 
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is"""
@@ -5359,7 +5465,7 @@ class Daemon:
 
     def poll_default_branch(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Is this project's default branch red? (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §1.)"""
-        from . import ci, github
+        from . import ci, ci_rerun, github
         from .invariants import INV_BASE_RED
 
         origin = github.origin_repo(project.path)
@@ -5387,14 +5493,19 @@ class Daemon:
             log.debug("[%s] could not read the default branch's CI: %s", project.name, e)
             return
         workflows = tuple({r.workflow for r in runs if r.workflow})
-        reds = [r for w in workflows if (r := ci.latest(runs, w)) is not None and r.red]
+        prev_reruns = prev.get("ci_reruns") or {}
+        reds = [r for w in workflows
+                if (r := ci_rerun.base_verdict(runs, w, prev_reruns)) is not None and r.red]
         reds.sort(key=lambda r: (r.started_at is not None, r.started_at or 0),
                   reverse=True)
         worst = reds[0] if reds else None
         was_red = bool(prev.get("red"))
         wo_id = issue_url = fix_wo_id = ""
         issue_os_filed = False
+        break_run_id = 0
         if worst is not None:
+            # The run that opened this break: `run_id` moves with each new red run inside it
+            break_run_id = (prev.get("break_run_id") if was_red else 0) or worst.run_id
             wo_id = (str(prev.get("wo_id") or "") if was_red
                      else self._attribute_base_red(project, store, owner, repo,
                                                    worst.head_sha))
@@ -5409,14 +5520,19 @@ class Daemon:
             "base_read_at": base_read_at or time.time(),
             "workflow": worst.workflow if worst else "",
             "run_id": worst.run_id if worst else 0,
+            "break_run_id": break_run_id,
             "run_url": ci.run_url(owner, repo, worst.run_id) if worst else "",
             "head_sha": worst.head_sha if worst else "",
             "wo_id": wo_id,
             "issue_url": issue_url,
             "fix_wo_id": fix_wo_id,
             "issue_os_filed": issue_os_filed,
-            "ci_reruns": self._rerun_aborted_base_ci(project, store, owner, repo, base,
-                                                     runs, prev.get("ci_reruns") or {}),
+            "ci_reruns": {
+                **self._rerun_aborted_base_ci(project, store, owner, repo, base, runs,
+                                              prev_reruns),
+                **self._rerun_failed_base_ci(project, store, owner, repo, base, runs,
+                                             prev_reruns, str(prev.get("wo_id") or "")),
+            },
             "checked_at": db.now(),
         }
         self.central.set_base_health(project.name, fact)
@@ -5493,6 +5609,64 @@ class Daemon:
                 if not r.completed or r.conclusion in ci_rerun.ABORTED_RUN_CONCLUSIONS}
         return {k: v for k, v in state.items() if k in live}
 
+    def _rerun_failed_base_ci(self, project: ProjectSpec, store: ProjectStore,
+                              owner: str, repo: str, base: str, runs: tuple[Any, ...],
+                              prev: Any, blamed: str) -> dict[str, Any]:
+        """Re-run a RED default-branch run once per head, inside the grace before the steward (io-f48bcdcb)"""
+        from . import ci_rerun, github
+
+        state = ({k: v for k, v in prev.items() if k.startswith(ci_rerun.BASE_FAILED_PREFIX)}
+                 if isinstance(prev, dict) else {})
+        newest_of_head: dict[str, Any] = {}
+        newest: dict[str, Any] = {}
+        for r in runs:
+            newest_of_head.setdefault(ci_rerun.base_failed_key(r), r)
+            if r.workflow:
+                newest.setdefault(r.workflow, r)
+        for key, run in newest_of_head.items():
+            if key in state and run.completed and run.green:
+                self._record_base_flake(project, store, owner, repo, base, run,
+                                        state.pop(key), blamed)
+        # A newer run in flight will judge for itself, so only the workflow's newest is re-run
+        for run in newest.values():
+            key = ci_rerun.base_failed_key(run)
+            if (key in state or not run.completed or not run.red or run.run_id <= 0
+                    or not run.head_sha):
+                continue
+            # Before the re-run: its new attempt replaces the log this reads
+            tests = ci_rerun.failed_tests(run.run_id, cwd=project.path)
+            try:
+                ci_rerun.rerun(run.run_id, cwd=project.path)
+            except github.GitHubError as e:
+                # Unread is not unrecoverable: no attempt is spent, the next tick retries
+                log.info("[%s] could not re-run failed %s on %s: %s", project.name,
+                         run.run_id, base, e)
+                continue
+            state[key] = {"run_id": run.run_id, "tests": list(tests)}
+            log.info("[%s] re-ran failed %s on %s (%s) before calling it a break",
+                     project.name, run.workflow, base, ", ".join(tests) or "tests unread")
+        return {k: v for k, v in state.items() if k in newest_of_head}
+
+    def _record_base_flake(self, project: ProjectSpec, store: ProjectStore, owner: str,
+                           repo: str, base: str, run: Any, entry: Any, blamed: str) -> None:
+        """A red default-branch run passed its re-run: green, and the flake stays on the record"""
+        from . import ci, ci_rerun
+
+        tests = ", ".join(entry.get("tests") or ()) if isinstance(entry, dict) else ""
+        named = tests or "its failed log named no test"
+        store.add_notification(
+            title=f"`{base}` failure was a flaky test in {project.name}",
+            body=(f"workflow `{run.workflow}` on {run.head_sha[:10]} failed, then passed the "
+                  f"OS's one re-run: {named} — {ci.run_url(owner, repo, run.run_id)}"),
+            level="info", source="base-health",
+        )
+        if blamed and store.get_work_order(blamed):
+            store.add_event(blamed, ci_rerun.FLAKE_CONFIRMED_EVENT, {
+                "head_sha": run.head_sha, "base": base, "checks": named,
+                "run_ids": [run.run_id]})
+        log.warning("[%s] %s failure on %s passed its re-run — a flake (%s)", project.name,
+                    base, run.head_sha[:10], named)
+
     def dispatch_base_fix(self, project: ProjectSpec, store: ProjectStore) -> None:
         """A red tracker `main` files-or-adopts an issue and dispatches a work order on it (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §2.)"""
         from . import bugreport, github, issues
@@ -5519,7 +5693,9 @@ class Daemon:
             steward.Candidate("red_main", "critical", project.name,
                               f"`{fact.get('base') or 'main'}` is red",
                               evidence=(str(fact.get("run_url") or run_id or ""),),
-                              parent_wo_id=str(fact.get("wo_id") or "")),
+                              parent_wo_id=str(fact.get("wo_id") or ""),
+                              payload={"issue_url": issue_url},
+                              break_id=str(fact.get("break_run_id") or "")),
             catalog=self.catalog, store=store,
             self_dispatch=self.self_dispatch)
         if not self.self_dispatch:
@@ -5770,8 +5946,8 @@ class Daemon:
                                     base_red=base_red)
                 elif pr.failing:
                     # IS THIS THE BRANCH'S FAILURE AT ALL?
-                    handled, pr = self.heal_inherited_failure(project, store, wo, pr,
-                                                              base_ci)
+                    handled, pr, shared = self.heal_inherited_failure(project, store, wo,
+                                                                      pr, base_ci)
                     if not handled and not self.rerun_failed_checks(project, store, wo,
                                                                     pr):
                         self.heal_pull_request(
@@ -5783,7 +5959,8 @@ class Daemon:
                                 base=pr.base_ref or "its base") if pr.behind else ""),
                             **ops.red_run_fields(pr.head_oid, pr.red))
                     self.auto_merge(project, store, wo, pr, record_only=True,
-                                    base_red=base_red)
+                                    base_red=(dataclasses.replace(base_red, shared_failure=True)
+                                              if shared and base_red else base_red))
                 else:
                     healed = pr.mergeable_now and ops.clear_pr_repair(
                         store, wo, ops.PR_CONFLICT)
@@ -6161,10 +6338,12 @@ class Daemon:
 
         # Hidden orders are excluded by the default
         candidates: list[tuple[dict, list[dict], bool]] = []
-        for early, status in ((False, "needs_review"), (True, "running")):
+        for early, status in ((False, "needs_review"), (False, "idle"), (True, "running")):
             for wo in store.list_work_orders(statuses=(status,)):
                 if wo.get("kind") == "investigator":
                     # A diagnosis is not a submission and nothing is gated on it: §2.3 of...
+                    continue
+                if status == "idle" and not turn_end_is_delivery(wo):
                     continue
                 rows = store.all_assumptions(wo["id"])
                 if any(a["status"] == "pending"
@@ -6327,6 +6506,7 @@ class Daemon:
         dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
+        holds_before = len(store.events_of_kind(wo["id"], "autoreview_held"))
         for a in assumptions:
             # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.1
             if str(a.get("status") or "") != "pending":
@@ -6392,6 +6572,9 @@ class Daemon:
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
                                early=early, cfg=cfg)
+        # After the loop: one pass's holds are one ping
+        if len(store.events_of_kind(wo["id"], "autoreview_held")) > holds_before:
+            ops.flag_assumptions_pending(store, wo["id"])
 
     def _stakes_reviewed(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                          cfg: Any, a: dict, decision: Any,
@@ -6561,6 +6744,7 @@ class Daemon:
                 {**payload, **prior} if confirming else payload)
             log.info("auto-review left assumption #%s of %s with the user: %s",
                      numbered.get("n"), wo["id"], ruling.reason)
+            ops.flag_assumptions_pending(pstore, wo["id"])
             return
 
         project = next((p for p in self.catalog.projects if p.name == q["project"]), None)
@@ -6608,6 +6792,8 @@ class Daemon:
                     pstore.clear_assumption_confirmation(assumption["id"])
                 else:
                     pstore.clear_assumption_question(assumption["id"])
+            else:
+                ops.flag_assumptions_pending(pstore, wo["id"])
             log.info("auto-review dropped its ruling on assumption #%s of %s: %s",
                      numbered.get("n"), wo["id"], still.reason)
             return
@@ -6640,7 +6826,7 @@ class Daemon:
                  f"What it accepted, and why: jarvis wo show {wo['id']}\n"
                  f"If any of it was wrong: jarvis neo review {q['id']} "
                  f"--correct \"…\" teaches Neo not to do it again.",
-            wo_id=wo["id"])
+            wo_id=wo["id"], push=False)
 
     def _asked_early(self, pstore: ProjectStore, wo_id: str, question_id: int) -> bool:
         """Was this assumption question filed by the EARLY pass?"""
@@ -7331,7 +7517,7 @@ class Daemon:
 
     def heal_inherited_failure(self, project: ProjectSpec, store: ProjectStore,
                                wo: dict, pr: Any,
-                               base_ci: dict[str, Any]) -> tuple[bool, Any]:
+                               base_ci: dict[Any, Any]) -> tuple[bool, Any, bool]:
         """A pull request red only because its base was (docs/superpowers/specs/2026-09-18-a-red-base-heals-itself.md)"""
         from . import ci, github, ops
 
@@ -7340,7 +7526,7 @@ class Daemon:
         workflows = tuple(dict.fromkeys(
             c.get("workflow") or "" for c in pr.red if c.get("workflow")))
         if not base_ref or not workflows:
-            return False, pr
+            return False, pr, False
 
         if base_ref not in base_ci:
             try:
@@ -7351,15 +7537,42 @@ class Daemon:
                 base_ci[base_ref] = None
         runs = base_ci[base_ref]
         if runs is None:
-            return False, pr
+            return False, pr, False
 
-        if ci.base_is_red(runs, workflows):
+        standing = ci.failure_standing(
+            pr.red, runs, lambda run: self._base_run_jobs(project, run, base_ci))
+        if standing != ci.OWN_FAILURE and ci.base_is_red(runs, workflows):
             if ops.record_base_health(store, wo, red=True, base=base_ref):
                 log.info("[%s] %s is red — holding %s rather than nudging it",
                          project.name, base_ref, wo["id"])
-            return True, pr
+            return True, pr, standing == ci.SHARED_FAILURE
         ops.record_base_health(store, wo, red=False, base=base_ref)
+        if standing == ci.OWN_FAILURE:
+            return False, pr, False
+        handled, pr = self._rebuild_on_recovered_base(project, store, wo, pr, runs, workflows)
+        return handled, pr, False
 
+    def _base_run_jobs(self, project: ProjectSpec, run: Any,
+                       base_ci: dict[Any, Any]) -> frozenset[str] | None:
+        """This base run's unpassed jobs, read once per tick; None when unreadable"""
+        from . import ci, github
+
+        key = (run.run_id, run.attempt)
+        if key not in base_ci:
+            try:
+                base_ci[key] = ci.unpassed_jobs(run, cwd=project.path)
+            except github.GitHubError as e:
+                log.debug("[%s] could not read run %s's jobs: %s", project.name, run.run_id, e)
+                base_ci[key] = None
+        return base_ci[key]
+
+    def _rebuild_on_recovered_base(self, project: ProjectSpec, store: ProjectStore,
+                                   wo: dict, pr: Any, runs: tuple[Any, ...],
+                                   workflows: tuple[str, ...]) -> tuple[bool, Any]:
+        """Rebuild an inherited failure on a green base (docs/superpowers/specs/2026-09-18-a-red-base-heals-itself.md §3)"""
+        from . import ci, github, ops
+
+        base_ref = pr.base_ref or ""
         if not any(ci.inherited(c, runs) for c in pr.red):
             return False, pr
         base_sha = ci.base_sha(runs, workflows)

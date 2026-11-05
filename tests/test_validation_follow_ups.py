@@ -1095,6 +1095,9 @@ def _rated(title: str, level: str) -> dict:
 def _enforcing(monkeypatch):
     cat = ops.resolve_catalog()
     cat.os.evolution.mode = "enforce"
+    # No project here writes its own block, so its resolved one IS the fleet's
+    for spec in cat.projects:
+        spec.evolution = cat.os.evolution
     monkeypatch.setattr(ops, "resolve_catalog", lambda *a, **k: cat)
 
 

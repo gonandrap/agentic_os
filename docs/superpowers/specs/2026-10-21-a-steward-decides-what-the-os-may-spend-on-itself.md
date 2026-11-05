@@ -233,9 +233,14 @@ Applied in order. The first matching rule wins.
    only toward the feature ledger.
 2. **`minor` / `cosmetic`** → `drop`.
 3. **Generation limit.** The candidate's generation exceeds `max_depth`, where
-   generation 0 is user-originated. → `queue`, never `dispatch`.
+   generation 0 is user-originated. → `queue`, never `dispatch`; `blocker` / `critical`
+   → `ask`, because no wait clears this rule (io-f48bcdcb). *Amended 2026-11-04
+   (io-f48bcdcb):* origin kind `red_main` skips this rule; see A6. Rule 4 and the bug
+   ledger still apply to it.
 4. **Self-reference.** The candidate's subject is an order the same detector created.
-   This is the "sweep investigating its own fix" case. → `queue`.
+   This is the "sweep investigating its own fix" case. → `queue`; `blocker` / `critical`
+   → `ask`, as in rule 3. A candidate naming a break (a red `main`, by the run that opened
+   it) writes one `ask` and one inbox row per break, not one per hour.
 5. **`blocker` / `critical`** → `dispatch`, expedited. This is subject to the critical
    ceiling. When the ceiling is spent → `ask`.
 6. **`major`** → `dispatch` if the evolution ledger has room **and** recurrence is at
@@ -314,8 +319,11 @@ drain re-offers it once there is room (#1305).
 }
 ```
 
-The ledger is fleet-wide, so the steward reads these keys from `os.evolution` only. A
-project's `evolution` block keeps its existing `min_samples` meaning.
+The steward reads these keys from the candidate's project: `projects.<p>.evolution`,
+which inherits `os.evolution` field by field (issue #1553 reversed this section's first
+text). The ledger stays fleet-wide, so a project's cap is measured against the one
+fleet-wide spend figure, not the project's own; `jarvis steward ledger` prints each
+project's caps beside it.
 
 `min_refs_by_kind` is merged over the shipped default, so naming one kind keeps
 `neo_rider: 1`. An unknown origin kind or a negative count is refused at load.
@@ -367,7 +375,7 @@ factor in the measurement.
 
 Success, measured weekly from the ledger:
 - Evolution spend stays at or below `weekly_usd`.
-- No chain runs deeper than `max_depth + 1`.
+- No chain runs deeper than `max_depth + 1`, `red_main` fixes aside (A6).
 - At least 50% of OS-originated dispatched orders get touched or accepted by the user
   (today: 34%).
 - Zero panel follow-up issues are filed for `minor` or `cosmetic` findings.
@@ -394,7 +402,12 @@ Mark each ✅ or ❌ with a note.
   any medium that is still unfixed when the order lands.
 - **A6. `max_depth: 1`.** OS-originated work may be dispatched only from user-originated
   parents. Deeper candidates are queued. This alone would have stopped the 10-generation
-  chain. Generation 2 and deeper cost $764 in the window.
+  chain. Generation 2 and deeper cost $764 in the window. *Amended 2026-11-04
+  (io-f48bcdcb):* `red_main` is exempt. Its candidate names the blamed merge as parent,
+  so a break from an OS-dispatched merge was generation 2 and queued on every re-offer,
+  and main stayed red. It is already bounded: one fix order per break, ever
+  (a-red-main spec §2 step 4). Self-reference and the bug ledger still apply. `max_depth`
+  stays 1 for every other kind.
 - **A7. Release orders count against the evolution ledger.** They are cheap ($124 in the
   window), and keeping them in keeps the accounting honest.
 - **A8. Accepted improvement-order findings are user-originated.** The user decided them

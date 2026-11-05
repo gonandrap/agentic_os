@@ -1089,6 +1089,19 @@ def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: 
     return None
 
 
+def tool_call_open(path: Path | str, since: float) -> bool:
+    """Is any tool call from `since` on still without its result? (issue 1556)"""
+    asked: dict[str, float] = {}
+    for row in usage_mod.rows(path, '"tool_'):
+        ts = usage_mod.parse_stamp(row.get("timestamp"))
+        for block in usage_mod.blocks_of(row, "tool_use"):
+            asked[str(block.get("id") or "")] = ts
+        for block in usage_mod.blocks_of(row, "tool_result"):
+            asked.pop(str(block.get("tool_use_id") or ""), None)
+    # `since`: a span left open by an earlier, killed turn is not this turn's (kn-73bcc2dd)
+    return any(ts >= since for ts in asked.values())
+
+
 def _names(span: ToolSpan, task_id: str) -> bool:
     """Whether this span names that subagent — `detail` or any reported parameter"""
     return span.name in SPAWN_TOOLS and (
@@ -1141,9 +1154,6 @@ CACHE_1H_FOREIGN_ALARM = "cache-1h-foreign"
 
 #: THE STAMP AGAINST THE RATE: an arm that never reached the CLI (docs/superpowers/specs/2026-10-22-the-arm-that-did-not-apply.md)
 CACHE_ARM_MISSED_ALARM = "cache-arm-missed"
-
-#: About the whole fleet: the work order they hang off carries the foreign key only (supervisor.py)
-FLEET_WIDE_KINDS = frozenset({CACHE_1H_DISPATCHED_ALARM, CACHE_ARM_MISSED_ALARM})
 
 #: What each kind IS, for a surface listing alarms rather than raising one
 ALARM_KINDS = {

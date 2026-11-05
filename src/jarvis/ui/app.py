@@ -2350,7 +2350,7 @@ def create_app() -> FastAPI:
         # Spec 2026-11-01 §3: no `project` is the OS's own releases
         options = {"project": [p for p in ops.release_projects()
                                if p != (report["project"] if not project else "")],
-                   "status": ["failed", "pending", "validated", "unwatched"],
+                   "status": ["failed", "pending", "unverified", "validated", "unwatched"],
                    "origin": filter_options(pending, "origin"), "q": []}
         filters = query_filters(request, options)
         shown_pending = filter_rows(pending, {k: v for k, v in filters.items()
@@ -2384,7 +2384,7 @@ def create_app() -> FastAPI:
             return render(request, "error.html", active="release", message=str(e),
                           status_code=404)
         every = d["rows"]
-        options = {"validation": ["failed", "pending", "validated", "unwatched"],
+        options = {"validation": ["failed", "pending", "unverified", "validated", "unwatched"],
                    "origin": filter_options(every, "origin"), "q": []}
         filters = query_filters(request, options)
         rows = attention_first(filter_rows(every, filters, text_keys=("subject", "wo_id", "sha")),
@@ -2992,6 +2992,10 @@ def create_app() -> FastAPI:
                 raise ops.OpsError(f"promoting {item_id} creates {len(plan)} orders ("
                                    + ", ".join(m["id"] for m in plan)
                                    + ") — confirm the list first")
+            dead = sorted({d for m in plan for d in m["dead_deps"]})
+            if dead and not confirm:
+                raise ops.OpsError(f"promoting {item_id} will not wait on dropped dependencies "
+                                   f"{', '.join(dead)} — confirm first")
             result = ops.promote_backlog(item_id)
         except ops.OpsError as e:
             return RedirectResponse(f"/backlog?error={quote(str(e))}", status_code=303)

@@ -296,6 +296,8 @@ def test_a_body_file_the_same_command_writes_is_denied_not_judged_stale(tmp_path
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
     assert "separate call" in reason
     assert "#607" not in reason
+    # The prune clears the file this names (#1538)
+    assert f"`pr-body-{WO['JARVIS_WO_ID']}.md`" in reason
 
 
 def test_writing_some_other_file_first_still_judges_the_body_file(tmp_path):

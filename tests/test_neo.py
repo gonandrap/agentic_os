@@ -267,6 +267,28 @@ def test_correction_requires_feedback(asked):
         ops.neo_review(1, approved=False, feedback="   ")
 
 
+@pytest.mark.parametrize("approved, feedback", [(False, "a worker's own words"), (True, "")])
+def test_a_worker_session_may_not_review_neo(asked, monkeypatch, project, approved, feedback):
+    """Issue 1582: nothing written, or a worker could speak as the user to later Neo answers"""
+    daemon, wo, _ = asked
+    drain(daemon)
+    monkeypatch.setenv("JARVIS_WO_ID", wo["id"])
+    with pytest.raises(ops.OpsError, match="worker session"):
+        ops.neo_review(1, approved=approved, feedback=feedback)
+    neo = NeoStore()
+    try:
+        assert neo.get(1)["review_status"] == "unreviewed"
+        assert neo.learnings("proj_a") == []
+    finally:
+        neo.close()
+    store = ProjectStore(project)
+    try:
+        assert not any("Correction from the user" in m["content"]
+                       for m in store.queued_messages(wo["id"]))
+    finally:
+        store.close()
+
+
 def test_learnings_shape_future_answers(asked, fake_claude):
     """The feedback loop: a correction appears in Neo's next system prompt"""
     daemon, wo, _ = asked
@@ -1230,6 +1252,41 @@ def test_an_unusable_answer_is_never_a_verdict(started, monkeypatch, answer):
 
     assert _item(item["id"])["status"] == "quarantined"
     assert _question(item["neo_question_id"])["status"] == "queued"
+
+
+@pytest.mark.parametrize("settled", ["done", "dropped"])
+def test_a_duplicate_verdict_on_a_settled_item_is_never_a_verdict(started, monkeypatch, settled):
+    kept = _quarantined(started, title="Rename the export flag", severity="minor")
+    central = CentralStore()
+    try:
+        central.mark_backlog(kept["id"], settled)
+    finally:
+        central.close()
+    ref = {"kind": "neo_question", "id": 77}
+    item = _quarantined(started, origin_refs=[ref])
+    _neo_says(monkeypatch, answer=json.dumps(
+        {"decision": "duplicate", "duplicate_of": kept["id"]}))
+
+    drain(started)
+
+    assert _item(item["id"])["status"] == "quarantined"
+    assert _question(item["neo_question_id"])["status"] == "queued"
+    assert ref not in _item(kept["id"])["origin_refs"]
+
+
+def test_the_user_folding_into_a_settled_item_is_refused(started):
+    kept = _quarantined(started, title="Rename the export flag", severity="minor")
+    central = CentralStore()
+    try:
+        central.mark_backlog(kept["id"], "done")
+    finally:
+        central.close()
+    item = _quarantined(started)
+
+    with pytest.raises(ops.OpsError, match=rf"{kept['id']}.*done"):
+        ops.review_backlog_item(item["id"], "duplicate", duplicate_of=kept["id"])
+
+    assert _item(item["id"])["status"] == "quarantined"
 
 
 def test_an_unusable_answer_past_its_attempts_goes_to_the_user(started, monkeypatch):

@@ -25,7 +25,7 @@ from .navigation import (
     is_spec_path,
     navigates_source,
 )
-from .project_store import WO_KIND_CONTRACTS, ProjectStore, inbox_flag
+from .project_store import WO_KIND_CONTRACTS, ProjectStore, inbox_flag, pr_body_file
 
 # A Bash command every worker must be able to run without a permission prompt: a chain of `cd <dir>`...
 _SHELL_DANGEROUS = re.compile(r"[|;`$<>]")
@@ -311,8 +311,9 @@ def pr_body_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, 
         return _deny(
             "This command writes its own `--body-file` and then opens the PR, so the "
             "check would read the file as it was BEFORE this command, not the body you "
-            "wrote. Write the body in a separate call first (the Write tool, to a path "
-            "unique to this work order), then run `gh pr create --body-file <that path>`.")
+            "wrote. Write the body in a separate call first (the Write tool, to "
+            f"`{pr_body_file(env['JARVIS_WO_ID'])}` in your worktree root), then run "
+            "`gh pr create --body-file <that path>`.")
     body = gh_pr_create_body(command, payload.get("cwd") or "")
     if body is None:
         return None

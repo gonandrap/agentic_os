@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import sqlite3
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -13,6 +14,11 @@ from typing import Any
 
 from . import db, release
 from .paths import project_db_path
+
+log = logging.getLogger(__name__)
+
+#: Not `failed`: `wo retry` can resume that order, and its question with it (io-d5e62d4d)
+QUESTION_LAPSING_STATUSES = ("completed", "cancelled")
 
 # Work order lifecycle
 WO_STATUSES = (
@@ -272,10 +278,25 @@ def kind_contract(wo: Mapping[str, Any]) -> KindContract:
     return WO_KIND_CONTRACTS[str(wo.get("kind") or "worker")]
 
 
+def settles_idle(wo: Mapping[str, Any]) -> bool:
+    """Does this kind idle between messages, never finishing?"""
+    return kind_contract(wo).route == SETTLE_IDLE
+
+
+def turn_end_is_delivery(wo: Mapping[str, Any]) -> bool:
+    """An idle manager has delivered: it never reaches `needs_review` (io-d5e62d4d)"""
+    return settles_idle(wo) and wo.get("status") == "idle"
+
+
 def submission_artifacts(wo: Mapping[str, Any]) -> tuple[str, ...]:
     """The file this kind's contract command consumes, as `landing.authored` excludes it"""
     artifact = kind_contract(wo).artifact
     return (artifact,) if artifact else ()
+
+
+def pr_body_file(wo_id: str) -> str:
+    """The worktree file `hooks.pr_body_decision` orders a PR body written to (#1538)"""
+    return f"pr-body-{wo_id}.md"
 
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on somebody else (#134)
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
@@ -452,6 +473,10 @@ ALARM_REVIEWABLE_STATUSES = ("acked", "escalated", "failed")
 ALARM_SUBJECTS = ("work_order", "feature_order")
 #: `invariant` is `invariants.check_undeclared_delivery`'s (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
 ALARM_SOURCES = ("cost", "health", "invariant", "rule")
+#: About the whole machine, so `wo_alarms.wo_id` is NULL (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)
+MACHINE_WIDE_KINDS = ("cost_outside_spend_high", "cost_residual_high",
+                      "cost_residual_diagnosed", "cache-1h-dispatched",
+                      "cache-1h-foreign", "cache-arm-missed")
 
 # How one health sweep ended (`health_reviews.outcome`, §4) (docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md)
 HEALTH_OUTCOMES = ("clear", "findings", "failed", "held")
@@ -491,6 +516,8 @@ WORKTREE_RECLAIMED_EVENT = "worktree_reclaimed"
 SESSION_KEPT_EVENT = "background_session_kept"
 #: The resolved path a `--from-file` submission was read from (#1528)
 SUBMITTED_ARTIFACT_EVENT = "submitted_artifact"
+#: The resolved path a `--from-file` submit refused for its name (#1538)
+REFUSED_ARTIFACT_EVENT = "refused_artifact"
 
 #: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
 MAX_PER_SWEEP_ROWS = 50
@@ -587,7 +614,7 @@ CREATE TABLE IF NOT EXISTS wo_events (
 -- docs/superpowers/specs/2026-08-31-the-supervisor.md and is NULL/default until then.
 CREATE TABLE IF NOT EXISTS wo_alarms (
     id TEXT PRIMARY KEY,                    -- 'al-' + db.new_id, like wo-/fo-
-    wo_id TEXT NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
+    wo_id TEXT REFERENCES work_orders(id) ON DELETE CASCADE,  -- NULL: MACHINE_WIDE_KINDS
     ts REAL NOT NULL,
     kind TEXT NOT NULL,                     -- inspection's alarm kinds
     seq INTEGER NOT NULL,                   -- the turn it judged
@@ -743,7 +770,7 @@ CREATE TABLE IF NOT EXISTS assumptions (
     wo_id TEXT NOT NULL REFERENCES work_orders(id),
     ts REAL NOT NULL,
     content TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected | refined
+    status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected | refined | lapsed
     -- WHO settled it, why, under which model and configuration, and the Neo question
     -- that ruled. All in ADDED_COLUMNS, where the reasoning is — this table already
     -- ships, so a live database gets them only there. So are the PROVISIONAL verdict
@@ -1263,6 +1290,12 @@ ASSUMPTION_DECIDER_USER = "user"
 #: `assumptions.decided_by` when the OS did — `autoreview`
 ASSUMPTION_DECIDER_OS = "neo"
 
+#: `assumptions.status` when its order ended unruled: NOT a verdict (io-d5e62d4d)
+ASSUMPTION_LAPSED = "lapsed"
+
+#: Order statuses that lapse a pending row; never `failed`: `wo retry` can resume it
+ASSUMPTION_LAPSE_STATUSES = ("completed", "cancelled")
+
 #: What an early verdict may say
 PROVISIONAL_VERDICTS = ("accept", "object")
 
@@ -1407,6 +1440,7 @@ class ProjectStore:
 
     def _migrate(self) -> None:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
+        self._free_machine_alarms()
         self._backfill_alarms()
         self._backfill_abandoned_gates()
         self._backfill_spent_gates()
@@ -1517,6 +1551,50 @@ class ProjectStore:
                WHERE status='expired' AND closed_as='lapsed'
                  AND uses > 0 AND uses >= max_uses"""
         )
+
+    def _alarm_wo_id_required(self) -> bool:
+        return any(r["name"] == "wo_id" and r["notnull"] for r in
+                   self.conn.execute("PRAGMA table_info(wo_alarms)").fetchall())
+
+    def _free_machine_alarms(self) -> None:
+        """Once: make `wo_alarms.wo_id` nullable and take machine-wide rows off their carriers (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)"""
+        if not self._alarm_wo_id_required():
+            return
+        with db.write_transaction(self.conn):
+            if not self._alarm_wo_id_required():
+                return  # a concurrent opener got here first
+            objects = self.conn.execute(
+                "SELECT type, sql FROM sqlite_master "
+                "WHERE tbl_name='wo_alarms' AND sql IS NOT NULL").fetchall()
+            # The live DDL, not SCHEMA's: it holds every column ALTERed in, in live order
+            table = next(o["sql"] for o in objects if o["type"] == "table")
+            table = table.replace("wo_id TEXT NOT NULL", "wo_id TEXT", 1)
+            self.conn.execute(table.replace("wo_alarms", "wo_alarms_rebuilt", 1))
+            self.conn.execute("INSERT INTO wo_alarms_rebuilt SELECT * FROM wo_alarms")
+            self.conn.execute("DROP TABLE wo_alarms")
+            self.conn.execute("ALTER TABLE wo_alarms_rebuilt RENAME TO wo_alarms")
+            for other in objects:
+                if other["type"] != "table":
+                    self.conn.execute(other["sql"])
+
+            kinds = ",".join("?" * len(MACHINE_WIDE_KINDS))
+            # A proposed row waits on a gate, and the gate's remedy needs its order
+            freed = {r["id"] for r in self.conn.execute(
+                f"SELECT id FROM wo_alarms WHERE kind IN ({kinds}) AND status<>'proposed'",
+                MACHINE_WIDE_KINDS)}
+            marks = ",".join("?" * len(ALARM_EVENT_KINDS))
+            for event in self.conn.execute(
+                    f"SELECT id, kind, payload FROM wo_events WHERE kind IN ({marks})",
+                    ALARM_EVENT_KINDS).fetchall():
+                payload = db.from_json(event["payload"], {}) or {}
+                alarm_id = payload.get("alarm_id")
+                # Before `wo_alarms`, a cost_alarm event named no row
+                if alarm_id in freed or (event["kind"] == "cost_alarm" and not alarm_id
+                                         and payload.get("kind") in MACHINE_WIDE_KINDS):
+                    self.conn.execute("DELETE FROM wo_events WHERE id=?", (event["id"],))
+            self.conn.execute(
+                f"UPDATE wo_alarms SET wo_id=NULL WHERE kind IN ({kinds}) "
+                "AND status<>'proposed'", MACHINE_WIDE_KINDS)
 
     def _backfill_alarms(self) -> None:
         """Give every alarm raised before `wo_alarms` existed a row of its own (docs/superpowers/specs/2026-08-31-the-supervisor.md)"""
@@ -1707,6 +1785,17 @@ class ProjectStore:
 
     # -- the issue <-> work order relation
 
+    def live_orders_on_cause(self, gap_class: str,
+                             issue_urls: Iterable[str] = ()) -> list[dict[str, Any]]:
+        """Unsettled work orders carrying this gap class or working one of these issues"""
+        urls = list(issue_urls)
+        held = ",".join("?" for _ in TERMINAL_STATUSES)
+        rows = self.conn.execute(
+            f"SELECT * FROM work_orders WHERE status NOT IN ({held}) AND (gap_class=? "
+            f"OR issue_url IN ({','.join('?' for _ in urls)})) ORDER BY created_at DESC",
+            (*TERMINAL_STATUSES, gap_class, *urls)).fetchall()
+        return db.rows_to_dicts(rows)
+
     def link_issue(self, issue_url: str, unit_id: str, kind: str, *,
                    round_no: int = 0, seat: str = "", announced: bool = False) -> bool:
         """Record that `unit_id` raised, was assigned, or cites `issue_url`"""
@@ -1861,6 +1950,20 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    def settled_among(self, wo_ids: list[str], statuses: tuple[str, ...],
+                      settled_before: float) -> list[str]:
+        """Which of `wo_ids` are this project's orders, settled before the cutoff (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §1)"""
+        if not wo_ids:
+            return []
+        rows = self.conn.execute(
+            f"""SELECT id FROM work_orders
+                 WHERE id IN ({','.join('?' for _ in wo_ids)})
+                   AND status IN ({','.join('?' for _ in statuses)})
+                   AND updated_at < ?""",
+            (*wo_ids, *statuses, settled_before),
+        ).fetchall()
+        return [row["id"] for row in rows]
+
     def list_work_orders(
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,
         include_hidden: bool = False,
@@ -1925,7 +2028,7 @@ class ProjectStore:
         })
         rows = self.conn.execute(
             f"SELECT a.*, w.title AS wo_title, {expr} AS _score FROM wo_alarms a "
-            "JOIN work_orders w ON w.id = a.wo_id "
+            "LEFT JOIN work_orders w ON w.id = a.wo_id "
             "WHERE _score > 0 ORDER BY _score DESC, a.ts DESC LIMIT ?",
             (*params, limit),
         ).fetchall()
@@ -2138,12 +2241,35 @@ class ProjectStore:
             at = db.now()
             self._record_span(wo_id, "wo", was, status, trigger, ts=at)
             self.add_event(wo_id, "status", {"status": status}, ts=at)
+            if status in ASSUMPTION_LAPSE_STATUSES:
+                self.lapse_pending_assumptions(wo_id, status)
             # THE CHOKEPOINT, ENFORCED (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
             tail = self.conn.execute(
                 "SELECT to_status FROM wo_state_spans WHERE order_id=? AND "
                 "order_kind='wo' ORDER BY ts DESC, id DESC LIMIT 1", (wo_id,)).fetchone()
             assert tail is not None and tail["to_status"] == status, (
                 f"{wo_id} moved to {status!r} without a span beside it")
+        if status in QUESTION_LAPSING_STATUSES:
+            try:
+                self.lapse_open_questions(wo_id, status)
+            except Exception:  # noqa: BLE001 — a close never fails on Neo's DB; INV-NEO-QUESTION-LAPSED repairs it
+                log.exception("%s: could not lapse its open Neo questions", wo_id)
+
+    def lapse_open_questions(self, wo_id: str, status: str) -> list[int]:
+        """An ended order's open questions lapse, on Neo's DB and this record (io-d5e62d4d)"""
+        from .neo_store import NeoStore
+
+        why = (f"work order {wo_id} reached {status} before this was answered; "
+               f"nobody ruled on it")
+        neo = NeoStore()
+        try:
+            lapsed = neo.lapse_worker_questions(wo_id, why)
+        finally:
+            neo.close()
+        for question_id in lapsed:
+            self.add_event(wo_id, "question_lapsed",
+                           {"question_id": question_id, "reason": why})
+        return lapsed
 
     def _status_of(self, table: str, order_id: str) -> str:
         """The status an order is in right now, '' when the row is not there"""
@@ -2257,14 +2383,19 @@ class ProjectStore:
             (kind,)).fetchone()
         return dict(row) if row else None
 
-    def latest_settled_order(self) -> dict[str, Any] | None:
-        """The most recently settled work order, as a CARRIER and nothing more"""
-        row = self.conn.execute(
-            f"""SELECT * FROM work_orders
-                WHERE status IN ({','.join('?' * len(TERMINAL_STATUSES))})
-                ORDER BY updated_at DESC LIMIT 1""",
-            TERMINAL_STATUSES).fetchone()
-        return dict(row) if row else None
+    def standing_alarms(self, kind: str, gap_seconds: float) -> list[dict[str, Any]]:
+        """One kind's rows still chained to now, OLDEST first (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)"""
+        rows = self.conn.execute(
+            "SELECT * FROM wo_alarms WHERE kind=? ORDER BY ts DESC", (kind,)).fetchall()
+        chain: list[dict[str, Any]] = []
+        later = db.now()
+        for row in rows:
+            if later - float(row["ts"] or 0.0) >= gap_seconds:
+                break
+            chain.append(dict(row))
+            later = float(row["ts"] or 0.0)
+        chain.reverse()
+        return chain
 
     def unsealed_terminal_features(self, limit: int = 2) -> list[dict[str, Any]]:
         marks = ", ".join("?" for _ in FO_TERMINAL_STATUSES)
@@ -2718,7 +2849,7 @@ class ProjectStore:
         )
         return self.get_alarm(alarm_id)
 
-    def add_finding(self, wo_id: str, *, kind: str, reason: str, seq: int = NO_TURN,
+    def add_finding(self, wo_id: str | None, *, kind: str, reason: str, seq: int = NO_TURN,
                     source: str = "cost", probe: str | None = None,
                     subject_kind: str = "work_order",
                     fo_id: str | None = None, remedy: str | None = None,
@@ -2776,10 +2907,14 @@ class ProjectStore:
 
     def alarms_across(self, limit: int = 200, statuses: tuple[str, ...] | None = None,
                       wo_id: str | None = None, fo_id: str | None = None,
-                      sources: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
-        """Every alarm in the project, NEWEST first, with its work order"""
+                      sources: tuple[str, ...] | None = None,
+                      alarm_id: str | None = None) -> list[dict[str, Any]]:
+        """Every alarm in the project, NEWEST first, with its work order if it has one"""
         where = ["1=1"]
         args: list[Any] = []
+        if alarm_id:
+            where.append("a.id=?")
+            args.append(alarm_id)
         if statuses:
             where.append(f"a.status IN ({','.join('?' for _ in statuses)})")
             args.extend(statuses)
@@ -2810,7 +2945,7 @@ class ProjectStore:
             " w.needs_attention AS needs_attention,"
             " w.attention_reason AS attention_reason,"
             " f.title AS fo_title, f.status AS fo_status"
-            " FROM wo_alarms a JOIN work_orders w ON w.id = a.wo_id"
+            " FROM wo_alarms a LEFT JOIN work_orders w ON w.id = a.wo_id"
             " LEFT JOIN feature_orders f ON f.id = a.fo_id"
             f" WHERE {' AND '.join(where)} ORDER BY a.ts DESC LIMIT ?",
             (*args, limit)).fetchall()
@@ -3679,6 +3814,60 @@ class ProjectStore:
             """UPDATE assumptions SET status=?, decided_by=?, decided_reason=?,
                    decided_model=?, decided_config_version=? WHERE id=?""",
             (status, decided_by, reason, model, config_version, assumption_id))
+
+    def lapse_pending_assumptions(self, wo_id: str, status: str, reason: str = "") -> int:
+        """Retire this order's unruled rows: no verdict, no decider (io-d5e62d4d)"""
+        ids = [int(r["id"]) for r in self.conn.execute(
+            "SELECT id FROM assumptions WHERE wo_id=? AND status='pending' ORDER BY id",
+            (wo_id,)).fetchall()]
+        if not ids:
+            return 0
+        why = reason or f"its order reached {status} before anyone ruled"
+        self.conn.execute(
+            "UPDATE assumptions SET status=?, decided_reason=? "
+            "WHERE wo_id=? AND status='pending'",
+            (ASSUMPTION_LAPSED, why, wo_id))
+        self.add_event(wo_id, "assumptions_lapsed",
+                       {"count": len(ids), "assumption_ids": ids, "status": status,
+                        "reason": why})
+        return len(ids)
+
+    def lapse_moot_assumptions(self, wo_id: str, status: str, reason: str) -> int:
+        """A LIVE order's rows, and the Neo questions on them, once nobody can answer them (issue 1572)"""
+        from .neo_store import NeoStore
+
+        rows = self.pending_assumptions(wo_id)
+        linked = [int(a[column]) for a in rows
+                  for column in ("neo_question_id", "confirm_question_id") if a[column]]
+        neo = NeoStore()
+        try:
+            # First: a failure here leaves the rows pending, for the next tick to retry
+            lapsed = neo.lapse_questions(linked, reason)
+        finally:
+            neo.close()
+        for question_id in lapsed:
+            self.add_event(wo_id, "question_lapsed",
+                           {"question_id": question_id, "reason": reason})
+        return self.lapse_pending_assumptions(wo_id, status, reason)
+
+    def live_children_with_pending_assumptions(self) -> list[dict[str, Any]]:
+        """Open non-manager orders under a parent, holding unruled rows (issue 1572)"""
+        marks = ",".join("?" for _ in OPEN_STATUSES)
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT DISTINCT w.* FROM assumptions a "
+            "JOIN work_orders w ON w.id = a.wo_id "
+            "JOIN feature_orders f ON f.id = w.parent_id "
+            f"WHERE a.status='pending' AND w.kind != 'manager' AND w.status IN ({marks}) "
+            "ORDER BY w.id", OPEN_STATUSES).fetchall())
+
+    def ended_orders_with_pending_assumptions(self) -> list[dict[str, Any]]:
+        """Ended orders holding rows `set_status` did not lapse (io-d5e62d4d)"""
+        marks = ",".join("?" for _ in ASSUMPTION_LAPSE_STATUSES)
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT DISTINCT w.id, w.status FROM assumptions a "
+            "JOIN work_orders w ON w.id = a.wo_id "
+            f"WHERE a.status='pending' AND w.status IN ({marks}) ORDER BY w.id",
+            ASSUMPTION_LAPSE_STATUSES).fetchall())
 
     def get_assumption(self, assumption_id: int) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM assumptions WHERE id=?",

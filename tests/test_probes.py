@@ -44,8 +44,7 @@ different ratio, which the alarm's own text names along with the command that me
 
 AND ONE MORE IS NOT ABOUT THIS PROJECT AT ALL. `cache-1h-dispatched` is the FLEET's
 one-hour cache writes by turns Jarvis armed for five minutes — every transcript on the
-machine. The work order it hangs off carries the foreign key and NOTHING else: it is not
-the exemplar of the number, it did not cause it, and it may have nothing to do with it.
+machine. It names no work order, because no order caused it or is its exemplar.
 It says Jarvis's own transport bought the expensive write, which is a DEFECT IN THIS
 CODEBASE and a work order anyone can act on. A person's own `claude` sessions are not
 alarmed on: Jarvis must never write a user's `~/.claude/settings.json`, so never propose

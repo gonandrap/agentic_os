@@ -830,18 +830,53 @@ def read_session(session_id: str, cold_prefix_floor: int,
     for path in sorted(paths):
         result.main = result.main + _usage_of(path, cold_prefix_floor, since=since,
                                               until=until)
-        # Claude Code writes each subagent's own transcript beside the parent's
-        subagent_dir = path.with_suffix("") / "subagents"
-        if subagent_dir.is_dir():
-            for sub in sorted(subagent_dir.glob("*.jsonl")):
-                sub_usage = _usage_of(sub, cold_prefix_floor, since=since, until=until)
-                if sub_usage.messages:
-                    result.subagents = result.subagents + sub_usage
-                    result.subagent_count += 1
-                    result.each_subagent.append(_subagent_detail(sub, sub_usage))
+        for sub in _subagent_files(path):
+            sub_usage = _usage_of(sub, cold_prefix_floor, since=since, until=until)
+            if sub_usage.messages:
+                result.subagents = result.subagents + sub_usage
+                result.subagent_count += 1
+                result.each_subagent.append(_subagent_detail(sub, sub_usage))
     # A further segment file exists only because the session was resumed under a different cwd
     result.main.resume_boundaries += len(paths) - 1
     return result
+
+
+def _subagent_files(path: Path) -> list[Path]:
+    """Claude Code writes each subagent's own transcript beside the parent's"""
+    subagent_dir = path.with_suffix("") / "subagents"
+    return sorted(subagent_dir.glob("*.jsonl")) if subagent_dir.is_dir() else []
+
+
+def _call_spend(path: Path) -> list[tuple[float, float]]:
+    """`(ts, list-price usd)` per API call of one transcript; undated calls keep `ts` 0"""
+    def build() -> list[tuple[float, float]]:
+        return [(m.get("ts") or 0.0, sum(class_costs(
+            m.get("model") or "", input=m.get("input_tokens", 0),
+            cache_write=m.get("cache_creation_input_tokens", 0),
+            cache_read=m.get("cache_read_input_tokens", 0),
+            output=m.get("output_tokens", 0),
+            cache_1h=m.get("ephemeral_1h_input_tokens", 0),
+            cache_5m=m.get("ephemeral_5m_input_tokens", 0)).values()))
+            for m in _assistant_messages(path)]
+    return transcript_cache.light_product(path, "call_spend", build)
+
+
+def _written_since(path: Path, since: float) -> bool:
+    try:
+        return path.stat().st_mtime >= since
+    except OSError:
+        return False        # pruned mid-walk
+
+
+def session_spend(session_id: str, since: float, until: float,
+                  index: dict[str, list[Path]]) -> list[tuple[float, float]]:
+    """The calls `read_session` totals over this window, one `(ts, usd)` each, subagents included"""
+    return [(ts, usd)
+            for path in sorted(index.get(session_id) or [])
+            for file in (path, *_subagent_files(path))
+            # A file last written before the window cannot hold a call inside it, and most orders are that old
+            if _written_since(file, since)
+            for ts, usd in _call_spend(file) if ts and _inside(ts, since, until)]
 
 
 # --- Tool results

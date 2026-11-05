@@ -882,17 +882,142 @@ def test_script_wrong_sends_the_script_back_to_morpheus(started, store):
         item = central.morpheus_item(item_id)
     finally:
         central.close()
-    assert (item["state"], item["script"], item["script_rewrites"]) == ("queued", "", 1)
+    assert (item["state"], item["script"], item["script_rewrites"]) == ("queued", "", 0)
     assert "is producing it" in item["rewrite_brief"] and inv_id in item["rewrite_brief"]
     row = store.get_feature_order(inv_id)
     assert row["status"] == "completed" and not row["needs_attention"]
     assert "sent back to Morpheus" in json.loads(row["plan"])["rewrite"]
 
 
-def test_script_wrong_past_its_cap_asks_the_user(started, store):
+def test_script_wrong_rewrites_though_the_judge_spent_its_rewrite(started, store):
+    """io-5cc7a40d: mv-61c7819f's shape, judge and Neo's cap spent, and no user command"""
     from jarvis.central_store import CentralStore
 
     item_id = _failed_item(script_rewrites=1)
+    _script_wrong(store, item_id)
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id)
+    finally:
+        central.close()
+    assert (item["state"], item["script_rewrites"]) == ("queued", 1)
+
+
+def _item(item_id: str) -> dict:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return central.morpheus_item(item_id)
+    finally:
+        central.close()
+
+
+def _verdict_on(store, item_id: str, classification: str, **fields):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY, morpheus_item=item_id)
+    _investigating(store, inv)
+    ops.submit_verdict(inv["id"], a_verdict(classification, subject=subject, **fields))
+    return inv["id"]
+
+
+def _fail_again(item_id: str) -> None:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.update_morpheus_item(item_id, state="failed", action="")
+    finally:
+        central.close()
+
+
+def test_a_transient_verdict_watches_once_then_settles_unverified(started, store):
+    item_id = _failed_item()
+    _verdict_on(store, item_id, "TRANSIENT")
+    item = _item(item_id)
+    # Neo's cap untouched: the count comes from the verdicts
+    assert (item["state"], item["auto_requeues"]) == ("monitoring", 0)
+    _fail_again(item_id)
+    inv_id = _verdict_on(store, item_id, "TRANSIENT")
+    assert _item(item_id)["state"] == "unverified"
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+
+
+def test_waiting_on_user_settles_unverified_only_when_behaviour_is_correct(started, store):
+    item_id = _failed_item()
+    inv_id = _verdict_on(store, item_id, "WAITING_ON_USER", behaviour_correct=False)
+    assert _item(item_id)["state"] == "failed"
+    assert store.get_feature_order(inv_id)["needs_attention"]
+    _fail_again(item_id)
+    inv_id = _verdict_on(store, item_id, "WAITING_ON_USER", behaviour_correct=True)
+    assert _item(item_id)["state"] == "unverified"
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+
+
+def test_waiting_on_user_on_a_monitor_must_say_whether_behaviour_is_correct(started, store):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY, morpheus_item=_failed_item())
+    _investigating(store, inv)
+    with pytest.raises(ops.OpsError, match="behaviour_correct"):
+        ops.submit_verdict(inv["id"], a_verdict("WAITING_ON_USER", subject=subject))
+
+
+def _stored_before_the_change(store, classification: str, item_id: str, **fields) -> str:
+    """A verdict already stored that never moved its row: the row holds its investigation"""
+    from jarvis.central_store import CentralStore
+
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    verdict = {"classification": classification, "subject": subject, "root_cause": "r" * 80,
+               **fields}
+    store.update_feature_order(inv["id"], plan=json.dumps(verdict))
+    store.set_feature_status(inv["id"], "completed")
+    store.flag_feature_attention(inv["id"], "waiting on you")
+    central = CentralStore()
+    try:
+        central.update_morpheus_item(item_id, action=f"investigation:{inv['id']}")
+    finally:
+        central.close()
+    return inv["id"]
+
+
+def test_the_sweep_backfills_each_stored_verdict_once(started, store):
+    wrong = _failed_item(script_rewrites=1)
+    wrong_inv = _stored_before_the_change(
+        store, "SCRIPT_WRONG", wrong, script_fix="f" * 80,
+        rewrite="its one automatic rewrite is spent", rewrite_ask={"item": wrong})
+    assert ops.settle_investigated_monitors() == [wrong]
+    assert _item(wrong)["state"] == "queued"
+    row = store.get_feature_order(wrong_inv)
+    assert not row["needs_attention"] and "rewrite_ask" not in json.loads(row["plan"])
+    assert ops.settle_investigated_monitors() == []
+
+
+def test_the_sweep_leaves_a_stored_verdict_silent_on_behaviour_to_the_user(started, store):
+    item_id = _failed_item()
+    inv_id = _stored_before_the_change(store, "WAITING_ON_USER", item_id, user_owes="u" * 80)
+    assert ops.settle_investigated_monitors() == []
+    assert _item(item_id)["state"] == "failed"
+    assert store.get_feature_order(inv_id)["needs_attention"]
+    out = ops.correct_investigation(inv_id, "read the root cause: PR is correct")
+    assert out["item"] == item_id and _item(item_id)["state"] == "unverified"
+    row = store.get_feature_order(inv_id)
+    assert not row["needs_attention"] and json.loads(row["plan"])["behaviour_correct"] is True
+
+
+def test_an_unverified_row_never_reads_as_a_passed_release():
+    from jarvis import release_view
+
+    assert release_view.validation_of({"state": "unverified"}) == "unverified"
+    assert release_view.summarize([{"validation": "validated"},
+                                   {"validation": "unverified"}]) == "unverified"
+
+
+def test_script_wrong_past_its_cycles_asks_the_user(started, store, monkeypatch):
+    from jarvis.central_store import CentralStore
+
+    item_id = _failed_item()
+    monkeypatch.setattr(ops, "morpheus_investigations", lambda *_: ["a", "b", "c"])
     inv_id, _ = _script_wrong(store, item_id)
     central = CentralStore()
     try:
@@ -1140,21 +1265,136 @@ def test_an_issue_that_merely_names_the_subject_is_not_the_duplicate(started, st
     assert stored["filed"]["issue_url"] == out["filed"]["issue_url"]
 
 
-def test_a_live_order_already_on_the_subject_counts_as_the_duplicate(started, store):
-    """The second half of §2.5's check: the tracker holds nothing"""
+def test_a_live_order_that_merely_names_the_subject_does_not_stop_the_filing(started, store):
+    """§2.5, io-38a4354f: mentioning an id is not tracking a cause"""
     subject = _subject(store)
-    already = store.create_work_order(
-        "clear the stale panel hold",
-        description=f"the hold on {subject} is never re-derived; re-derive it on the tick")
+    store.create_work_order(
+        "steward queue cleanup",
+        description=f"pending orders: {subject}, wo-22222222, wo-33333333")
     inv = ops.create_investigation_order("proj_a", subject, WHY)
     _investigating(store, inv)
     out = ops.submit_verdict(inv["id"], a_verdict("GAP", subject=subject))
 
-    assert out["classification"] == "ALREADY_TRACKED"
-    stored = json.loads(store.get_feature_order(inv["id"])["plan"])
-    assert stored["duplicate_of"] == already["id"]
+    assert out["classification"] == "GAP"
+    assert out["filed"]["issue_url"]
+    assert any(c["argv"][:2] == ["issue", "create"] for c in started.calls)
+
+
+def _downgraded(store, *, gap_class="stale-hold", **order):
+    """A GAP that a live order with this gap class took, returning (inv id, target id)"""
+    subject = _subject(store)
+    target = store.create_work_order("clear the hold", gap_class=gap_class, **order)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+    verdict = a_verdict("GAP", subject=subject)
+    verdict["gap_class"] = gap_class
+    assert ops.submit_verdict(inv["id"], verdict)["classification"] == "ALREADY_TRACKED"
+    return inv["id"], target["id"]
+
+
+def test_a_live_order_of_the_same_gap_class_is_the_duplicate_and_the_link_is_kept(started,
+                                                                                 store):
+    inv_id, target = _downgraded(store)
+
+    stored = json.loads(store.get_feature_order(inv_id)["plan"])
+    assert (stored["duplicate_of"], stored["duplicate_link"]) == (target, "gap_class")
     assert stored["classified_by"] == "ops"
     assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls)
+    assert any(e["kind"] == "verdict_duplicate_linked" for e in store.list_events(target))
+
+
+def test_a_live_order_on_an_earlier_verdicts_issue_is_the_duplicate(started, store):
+    inv_id, _, first = _submitted(started, store, "GAP")
+    url = first["filed"]["issue_url"]
+    target = store.create_work_order("work the filed issue", issue_url=url)
+    gap_class = json.loads(store.get_feature_order(inv_id)["plan"])["gap_class"]
+    subject = store.create_work_order("another stuck order")["id"]
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+    verdict = a_verdict("GAP", subject=subject)
+    verdict["gap_class"] = gap_class
+    verdict["proposed_fix"]["title"] = "worded differently from the filed one"
+
+    assert ops.submit_verdict(inv["id"], verdict)["classification"] == "ALREADY_TRACKED"
+    stored = json.loads(store.get_feature_order(inv["id"])["plan"])
+    assert (stored["duplicate_of"], stored["duplicate_link"]) == (target["id"], "issue_url")
+
+
+def _proposals(project="proj_a"):
+    return ops.list_backlog(project, status="proposed")
+
+
+def test_a_target_settling_with_no_issue_raises_one_proposal_per_gap_class_once(started, store):
+    first, target = _downgraded(store)
+    second = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    _investigating(store, second)
+    verdict = a_verdict("GAP", subject=json.loads(second["metadata"])[ops.SUBJECT_KEY])
+    verdict["gap_class"] = "stale-hold"
+    ops.submit_verdict(second["id"], verdict)
+    path = store.project_path
+
+    assert ops.raise_settled_duplicates("proj_a", path) == [], "target still live: nothing yet"
+
+    store.set_status(target, "completed")
+    [item_id] = ops.raise_settled_duplicates("proj_a", path)
+    [item] = _proposals()
+    assert item["id"] == item_id and "stale-hold" in item["title"]
+    assert first in item["description"] and second["id"] in item["description"]
+    assert {r["order_id"] for r in item["origin_refs"]} == {first, second["id"]}
+    assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls), "no bulk issues"
+    assert json.loads(store.get_feature_order(first)["plan"])["duplicate_settled"] == {
+        "backlog": item_id}
+
+    assert ops.raise_settled_duplicates("proj_a", path) == [], "once only"
+    assert len(_proposals()) == 1
+
+
+def test_the_daemon_tick_raises_a_settled_duplicate(started, store, catalog_file):
+    from jarvis.daemon import RECONCILE_EVERY_TICKS
+
+    _, target = _downgraded(store)
+    store.set_status(target, "failed")
+    daemon = Daemon(load_catalog(catalog_file))
+    for _ in range(RECONCILE_EVERY_TICKS + 1):
+        daemon.tick()
+    # status=None: the same tick's steward review may already have moved it off `proposed`
+    assert len(ops.list_backlog("proj_a", status=None)) == 1
+
+
+def test_a_settled_target_whose_cause_has_an_issue_raises_nothing(started, store):
+    inv_id, target = _downgraded(store)
+    store.set_status(target, "cancelled")
+    cause = a_verdict("GAP")["proposed_fix"]["title"]
+    started.add_issue("https://github.com/x/y/issues/900", title="later", body=cause)
+
+    assert ops.raise_settled_duplicates("proj_a", store.project_path) == []
+    assert _proposals() == []
+    assert json.loads(store.get_feature_order(inv_id)["plan"])["duplicate_settled"] == {
+        "issue_url": "https://github.com/x/y/issues/900"}
+
+
+def test_a_legacy_downgrade_on_a_settled_order_with_an_unreadable_tracker_retries(started,
+                                                                                  store,
+                                                                                  monkeypatch):
+    """The one mechanical pass: old verdicts have no `duplicate_link`, and a failed read marks nothing"""
+    from jarvis import issues
+
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    gone = "wo-deadbeef"
+    plan = {**a_verdict("GAP"), "classification": "ALREADY_TRACKED", "classified_by": "ops",
+            "submitted_classification": "GAP", "duplicate_of": gone}
+    store.update_feature_order(inv["id"], plan=json.dumps(plan))
+    store.set_feature_status(inv["id"], "completed")
+
+    def boom(*_a):
+        raise RuntimeError("gh is down")
+
+    with monkeypatch.context() as m:
+        m.setattr(issues, "issues_mentioning", boom)
+        assert ops.raise_settled_duplicates("proj_a", store.project_path) == []
+    assert "duplicate_settled" not in json.loads(store.get_feature_order(inv["id"])["plan"])
+
+    assert len(ops.raise_settled_duplicates("proj_a", store.project_path)) == 1
 
 
 def test_waiting_on_user_is_the_only_classification_that_raises_attention(started,
@@ -1376,7 +1616,7 @@ def test_a_verdict_settles_the_investigator_completed_in_its_own_session(
 
 def test_a_pending_assumption_does_not_hold_a_settled_investigator(started, store,
                                                                   catalog_file):
-    """§2.1, wo-1aa88b2f exactly: the row stays pending and holds nothing"""
+    """§2.1, wo-1aa88b2f exactly: the row holds nothing, and lapses with the order (io-d5e62d4d)"""
     _panel_on(catalog_file)
     subject = _subject(store)
     inv = ops.create_investigation_order("proj_a", subject, WHY)
@@ -1389,8 +1629,8 @@ def test_a_pending_assumption_does_not_hold_a_settled_investigator(started, stor
     row = store.get_work_order(investigator)
     assert row["status"] == "completed"
     assert not row["needs_attention"]
-    pending = store.pending_assumptions(investigator)
-    assert len(pending) == 1 and pending[0]["status"] == "pending"
+    (only,) = store.all_assumptions(investigator)
+    assert only["status"] == "lapsed"
 
 
 def test_an_investigator_assumption_is_never_put_to_neo(started, store, catalog_file):

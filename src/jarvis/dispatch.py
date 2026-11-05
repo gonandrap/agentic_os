@@ -988,17 +988,18 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "the defect is the subject project's own code.",
         "- **WAITING_ON_USER** — nothing is broken; a person owes a decision. Name it BY "
         "ID in `user_owes`: the assumption, the gate, the Neo question. This is the ONE "
-        "classification that spends the user's attention.",
+        "classification that spends the user's attention. Opened by Morpheus: also set "
+        "`behaviour_correct`; true settles its order `unverified`, off the user.",
         "- **TRANSIENT** — it clears itself. Say in `unsticks` WHAT mechanism clears it "
         "and WHEN. \"It will sort itself out\" with no mechanism is not this "
-        "classification.",
+        "classification. A second on one monitoring order settles it `unverified`.",
         "- **ALREADY_TRACKED** — the cause is already on the tracker or already has a live "
         "order. Put the issue (`#790` or its URL) or the order id in `duplicate_of`.",
         "- **SCRIPT_WRONG** — ONLY when Morpheus opened this investigation on a failed "
         "production validation, and the PR behaves as its hints describe but the "
         "validation SCRIPT checks the wrong thing. Say in `script_fix` what the script got "
         "wrong and what the right check is: the OS sends the item back to Morpheus with it "
-        "as the brief for a new script, once per item.",
+        "as the brief for a new script.",
         "",
         "# Name the gap class — required on all five",
         gaps.render_registry(),
@@ -1014,9 +1015,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "# The verdict",
         f"Create it with the **`Write` tool** on `verdict.json` in your worktree root — "
         f"that filename exactly, it is the one path you are permitted to write, and "
-        f"`Write` is the one tool that may. Not `cat >`, not a heredoc, not `python3 -`: a "
-        f"shell heredoc that writes a file is refused for every worker in the fleet "
-        f"(`hooks.heredoc_write_decision`). Submit it with the command below, "
+        f"`Write` is the one tool that may. Not `cat >`, not a heredoc, not `python3 -`. "
+        f"Submit it with the command below, "
         f"which IS your finish. Do not call `jarvis wo finish`: submitting the verdict "
         f"settles this work order for you.",
         "",
@@ -1044,6 +1044,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         '    "remedy": "an existing remedy id, or none with the reason"',
         "  },",
         '  "user_owes": "…",          // WAITING_ON_USER only, naming an id',
+        '  "behaviour_correct": true, // WAITING_ON_USER on a Morpheus order: required',
         '  "unsticks": {"what": "…", "when": "…"},   // TRANSIENT only',
         '  "duplicate_of": "#790",    // ALREADY_TRACKED only',
         '  "script_fix": "…"          // SCRIPT_WRONG only: what it got wrong, the right check',

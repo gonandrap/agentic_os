@@ -51,14 +51,17 @@ def test_minor_and_cosmetic_are_dropped():
     assert outcome(cand(severity="cosmetic")) == ("drop", "low-severity")
 
 
-def test_past_max_depth_is_queued_never_dispatched():
-    assert outcome(cand(severity="critical"), generation=2) == ("queue", "max-depth")
+@pytest.mark.parametrize("severity,want", [("critical", "ask"), ("blocker", "ask"),
+                                           ("major", "queue"), ("medium", "queue")])
+def test_past_max_depth_never_dispatches_and_only_urgent_asks(severity, want):
+    assert outcome(cand(severity=severity), generation=2) == (want, "max-depth")
 
 
-def test_a_detector_chasing_its_own_work_is_queued():
+@pytest.mark.parametrize("severity,want", [("critical", "ask"), ("medium", "queue")])
+def test_a_detector_chasing_its_own_work_never_dispatches(severity, want):
     """The 10-generation chain of 2026-10-20: the sweep investigating its own fix orders"""
-    c = cand(origin_kind="investigation", severity="critical")
-    assert outcome(c, parent_kind="investigation") == ("queue", "self-reference")
+    c = cand(origin_kind="investigation", severity=severity)
+    assert outcome(c, parent_kind="investigation") == (want, "self-reference")
 
 
 def test_critical_with_evidence_dispatches_now():
@@ -146,7 +149,17 @@ def test_a_reported_bug_skips_yield_recurrence_precision_and_the_follow_up_ledge
     bug = cand(origin_kind=kind, severity="medium", refs=0)
     assert outcome(bug, held, throttled=True) == ("dispatch", "reported-bug")
     assert outcome(cand(origin_kind=kind, severity="minor")) == ("drop", "low-severity")
-    assert outcome(bug, generation=2) == ("queue", "max-depth")
+    if kind != "red_main":
+        assert outcome(bug, generation=2) == ("queue", "max-depth")
+
+
+def test_red_main_alone_skips_max_depth_and_keeps_its_other_rules():
+    """io-f48bcdcb: spec §3.2 decision 1 rule 3, A6"""
+    red = cand(origin_kind="red_main", severity="critical")
+    assert outcome(red, generation=2, parent_kind="bug_agent") == ("dispatch", "reported-bug")
+    assert outcome(red, generation=2, parent_kind="red_main") == ("ask", "self-reference")
+    spent = steward.Ledger(bug_usd=CFG.bug_weekly_usd)
+    assert outcome(red, spent, generation=2) == ("ask", "bug-budget")
 
 
 def test_a_spent_bug_ledger_asks_with_the_start_command():
@@ -241,6 +254,55 @@ def test_enforce_never_dispatches_with_self_dispatch_off(fleet):
     assert (d.outcome, d.allowed) == ("dispatch", False)
 
 
+def _own_block(project, fleet_block, own_block):
+    return parse_catalog({
+        "os": {"evolution": fleet_block, "autonomy": {"self_dispatch": True}},
+        "projects": [{"name": "proj_a", "path": str(project), "evolution": own_block}]})
+
+
+def test_a_projects_bug_cap_beats_the_fleets_in_both_directions(fleet, project):
+    """Issue #1553: `config set` recorded the raise and the steward went on holding bugs"""
+    _, store = fleet
+    bug = cand(origin_kind="morpheus", severity="critical", parent_wo_id="wo-p1",
+               payload={"morpheus_item": "mv-1"})
+    raised = _own_block(project, {"mode": "enforce", "bug_weekly_usd": 0},
+                        {"bug_weekly_usd": 500})
+    d = steward.gate(bug, catalog=raised, store=store)
+    assert (d.outcome, d.rule, d.allowed) == ("dispatch", "reported-bug", True)
+    lowered = _own_block(project, {"mode": "enforce", "bug_weekly_usd": 500},
+                         {"bug_weekly_usd": 0})
+    d = steward.gate(cand(origin_kind="morpheus", severity="critical", subject="another",
+                          file="b.py"), catalog=lowered, store=store)
+    assert (d.outcome, d.rule) == ("ask", "bug-budget")
+    assert "of $0.00" in d.reason
+
+
+def test_a_projects_mode_beats_the_fleets(fleet, project):
+    _, store = fleet
+    cat = _own_block(project, {"mode": "shadow"}, {"mode": "enforce"})
+    d = steward.gate(cand(severity="minor"), catalog=cat, store=store)
+    assert (d.mode, d.allowed) == ("enforce", False)
+
+
+def test_a_candidate_with_no_catalogued_project_is_held_to_the_fleets_caps(project):
+    cat = _own_block(project, {"weekly_usd": 7}, {"weekly_usd": 9})
+    assert steward.evolution_for(cat, "proj_a").weekly_usd == 9
+    assert steward.evolution_for(cat, "").weekly_usd == 7
+
+
+def test_the_digest_names_only_a_project_that_differs_from_the_fleet(project):
+    def text(own_block):
+        d = {"mode": "shadow", "ledger": steward.Ledger(), "weekly_usd": 7.0,
+             "bug_weekly_usd": 8.0, "critical_weekly_usd": 60.0, "yield_above_usd": 900.0,
+             "by_kind": {}, "held": [], "queue": {}, "precision": {}, "throttled": [],
+             "projects": steward.project_caps(_own_block(
+                 project, {"weekly_usd": 7, "bug_weekly_usd": 8, "critical_weekly_usd": 60,
+                           "yield_above_usd": 900}, own_block))}
+        return steward.render_digest(d)
+    assert "proj_a" not in text({})
+    assert "reported bugs $1500.00" in text({"bug_weekly_usd": 1500})
+
+
 def test_an_ask_reaches_the_inbox_with_a_link_and_the_command_that_acts(fleet):
     make, store = fleet
     cat = make(mode="enforce", bug_weekly_usd=0)
@@ -257,6 +319,7 @@ def test_an_ask_reaches_the_inbox_with_a_link_and_the_command_that_acts(fleet):
     assert "jarvis morpheus confirm mv-1 --fix" in item["body"]
     assert f"/steward#decision-{d.decision_id}" in item["body"]
     assert "does not re-run this one" in item["body"]
+    assert "Raising projects.proj_a.evolution.bug_weekly_usd" in item["body"]
 
 
 def test_the_ledger_counts_stamped_spend_and_what_is_still_reserved(fleet):
@@ -604,6 +667,106 @@ def test_a_candidate_that_names_no_code_is_never_deduped(fleet):
     first = steward.gate(cand(origin_kind="red_main", severity="critical",
                               parent_wo_id=parent["id"]), catalog=cat, store=store)
     assert first.duplicate_of == 0 and first.allowed is True
+
+
+# ---------------------------------------------------------------- one ask per break
+
+
+def _parent_of_kind(store, kind):
+    return store.create_work_order("its parent", metadata={steward.STAMP_KEY: {
+        "generation": 0, "origin_kind": kind}})["id"]
+
+
+def _red_main_parent(store):
+    """A merge a red-main fix order made: the next red `main` is that detector's own work"""
+    return _parent_of_kind(store, "red_main")
+
+
+def _red_main(parent_id, break_id="41935766931"):
+    return cand(origin_kind="red_main", severity="critical", subject="`main` is red",
+                parent_wo_id=parent_id, break_id=break_id)
+
+
+def _inbox_and_asks():
+    central = CentralStore()
+    try:
+        return central.new_inbox(), central.steward_asks(0)
+    finally:
+        central.close()
+
+
+def test_a_refused_critical_asks_once_across_ticks_past_the_hourly_window(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = _red_main_parent(store)
+    t0 = db.now()
+    first = steward.gate(_red_main(parent), catalog=cat, store=store, now=t0)
+    assert (first.outcome, first.rule, first.allowed) == ("ask", "self-reference", False)
+    for hours in (1, 2, 30):
+        again = steward.gate(_red_main(parent), catalog=cat, store=store,
+                             now=t0 + hours * steward.REPEAT_SECONDS + 1)
+        assert again.decision_id == first.decision_id
+    items, asks = _inbox_and_asks()
+    assert len(items) == 1 and [a["id"] for a in asks] == [first.decision_id]
+    assert "No wait and no budget clears" in items[0]["body"]
+    assert "Raising" not in items[0]["body"]
+    assert "jarvis doctor proj_a" in items[0]["body"]
+    step = steward.next_step(asks[0])
+    assert step["yours"] and "no wait or budget clears" in step["text"]
+    assert "Raising" not in step["text"]
+
+
+def test_a_new_break_asks_again_even_inside_the_hourly_window(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = _red_main_parent(store)
+    t0 = db.now()
+    first = steward.gate(_red_main(parent), catalog=cat, store=store, now=t0)
+    second = steward.gate(_red_main(parent, "41935999999"), catalog=cat, store=store, now=t0 + 60)
+    assert second.decision_id != first.decision_id
+    assert len(_inbox_and_asks()[0]) == 2
+
+
+def test_a_medium_refused_for_good_stays_a_quiet_queue_row(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    d = steward.gate(cand(origin_kind="worker_io", severity="medium",
+                          parent_wo_id=_parent_of_kind(store, "worker_io")),
+                     catalog=cat, store=store)
+    assert (d.outcome, d.rule) == ("queue", "self-reference")
+    assert _inbox_and_asks() == ([], [])
+
+
+def test_a_severer_wording_that_turns_a_queue_into_an_ask_reaches_the_inbox(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = _parent_of_kind(store, "panel")
+    held = dict(origin_kind="panel", parent_wo_id=parent, file="src/a.py",
+                subject="the race in the writer")
+    assert steward.gate(cand(severity="medium", **held), catalog=cat,
+                        store=store).outcome == "queue"
+    assert _inbox_and_asks()[0] == []
+    d = steward.gate(cand(severity="critical", **held), catalog=cat, store=store)
+    assert d.outcome == "ask"
+    assert len(_inbox_and_asks()[0]) == 1
+
+
+def test_the_verdict_is_the_breaks_latest_and_silent_once_it_dispatches(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    central = CentralStore()
+    try:
+        assert steward.break_verdict(central, "proj_a", 0) == ""
+        assert steward.break_verdict(central, "proj_a", 41935766931) == ""
+        d = steward.gate(_red_main(_red_main_parent(store)), catalog=cat, store=store,
+                         central=central)
+        said = steward.break_verdict(central, "proj_a", 41935766931)
+        assert f"#{d.decision_id}" in said and "self-reference" in said
+        assert steward.break_verdict(central, "proj_a", 1) == ""
+        steward.gate(_red_main(""), catalog=cat, store=store, central=central)
+        assert steward.break_verdict(central, "proj_a", 41935766931) == ""
+    finally:
+        central.close()
 
 
 # ---------------------------------------------------------------- the queue (#1181)

@@ -75,7 +75,7 @@ stops the order and its analyst. Orders already filed from accepted findings sta
 
 ## `jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"`
 
-an INVESTIGATION order: one order is not moving and you want the cause. A read-only session reads the record and NEVER writes code — a hook refuses every write and every mutating command. It SETTLES ITSELF, unlike `io`, with one of five verdicts: GAP (files an issue after a duplicate check, nothing dispatched), WAITING_ON_USER (the only one that asks for you), TRANSIENT, ALREADY_TRACKED, SCRIPT_WRONG (Morpheus-opened only: the item goes back for a new script, once; past that cap it asks you). One live per subject.
+an INVESTIGATION order: one order is not moving and you want the cause. A read-only session reads the record and NEVER writes code — a hook refuses every write and every mutating command. It SETTLES ITSELF, unlike `io`, with one of five verdicts: GAP (files an issue after a duplicate check, nothing dispatched), WAITING_ON_USER (the only one that asks for you), TRANSIENT, ALREADY_TRACKED, SCRIPT_WRONG (Morpheus-opened only: the item goes back for a new script, up to 3 investigations; past that it asks you). On a monitoring order TRANSIENT re-watches once, then settles `unverified` (terminal, not passed), and WAITING_ON_USER with `behaviour_correct` true settles `unverified` too. One live per subject.
 
 ## `jarvis investigate list / show <inv-id> / cancel <inv-id>`
 
@@ -91,7 +91,7 @@ show renders the report and the orders already filed from it. send asks the rese
 
 ## `jarvis backlog promote <id> [--as feature] [--yes]`
 
-Intake -> orders: the item and every open dependency, each of its `suggested_kind`; `--as` overrides the item's own. More than one member needs `--yes`. A work order waits on its dependencies through `bl-` holds; a feature order cannot wait, so one with unsettled dependencies is refused. A dropped, missing, proposed or quarantined dependency refuses the whole promotion.
+Intake -> orders: the item and every open dependency, each of its `suggested_kind`; `--as` overrides the item's own. More than one member needs `--yes`. A work order waits on its dependencies through `bl-` holds; a feature order cannot wait, so one with unsettled dependencies is refused. A dropped dependency is not waited on, and the confirmation names it; dropped as a duplicate, the kept item stands in for it. A missing, proposed or quarantined dependency refuses the whole promotion.
 
 ## `jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>`
 

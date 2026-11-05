@@ -77,6 +77,8 @@ from .project_store import (
     ALARM_REVIEWABLE_STATUSES,
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
+    ASSUMPTION_LAPSE_STATUSES,
+    ASSUMPTION_LAPSED,
     COUNTED_VALIDATION_OUTCOMES,
     DECISION_CLOSED_EVENT,
     FAMILY_CHILD_KINDS,
@@ -90,6 +92,7 @@ from .project_store import (
     PR_PENDING_EVENT,
     SETTLE_BY_FINISH,
     SETTLE_IN_SESSION,
+    REFUSED_ARTIFACT_EVENT,
     SUBMITTED_ARTIFACT_EVENT,
     TERMINAL_STATUSES,
     WORKER_CHILDREN,
@@ -101,7 +104,9 @@ from .project_store import (
     is_feature_order_id,
     kind_contract,
     order_path,
+    settles_idle,
     submission_artifacts,
+    turn_end_is_delivery,
     validation_standing,
 )
 
@@ -1403,6 +1408,8 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
     wo_id = wo["id"]
     round_note = invariants.parallel_round_note(store, wo_id)
     pending = store.pending_assumptions(wo_id)
+    if turn_end_is_delivery(wo):
+        pending = invariants.assumptions_left_with_user(store, wo, pending)
     turn = store.latest_turn(wo_id)
     working = (turn is not None and turn["state"] == "running"
                and wo["status"] != "waiting_input")
@@ -1837,19 +1844,26 @@ def _derived_trigger(store: ProjectStore, wo_id: str, entered: float) -> str:
     return str(row["kind"]) if row else ""
 
 
+def _worker_transcript(store: ProjectStore, wo: dict[str, Any]) -> Path | None:
+    """Where this order's session writes its transcript, None before it has a session"""
+    from . import claude_cli
+    session_id = str(wo.get("session_id") or "")
+    if not session_id:
+        return None
+    # `worker_session.worktree_path`'s own computation
+    worktree = wo.get("worktree")
+    cwd = (store.project_path / ".claude" / "worktrees" / str(worktree)
+           if worktree else store.project_path)
+    return claude_cli.session_transcript_path(cwd, session_id)
+
+
 def _transcript_activity(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
     """The last write to the worker's transcript and to the subagent files beside it (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
-    from . import claude_cli, inspection
+    from . import inspection
     try:
-        wo = store.get_work_order(wo_id)
-        session_id = str(wo.get("session_id") or "")
-        if not session_id:
+        path = _worker_transcript(store, store.get_work_order(wo_id))
+        if path is None:
             return []
-        # `worker_session.worktree_path`'s own computation
-        worktree = wo.get("worktree")
-        cwd = (store.project_path / ".claude" / "worktrees" / str(worktree)
-               if worktree else store.project_path)
-        path = claude_cli.session_transcript_path(cwd, session_id)
         stamps = []
         for p in [path, *inspection._subagent_transcripts(path)]:
             # `stat()` and not `exists()`: `exists()` swallows a PermissionError into False
@@ -2511,15 +2525,29 @@ def fix_flag_notice(flag: str) -> str | None:
 ASSUMPTIONS_PENDING_REASON = "assumptions pending review"
 
 
+#: Records which assumptions the user was already pinged about: the flag cannot, validating clears it
+ASSUMPTIONS_PINGED_EVENT = "assumptions_pinged"
+
+
 def flag_assumptions_pending(store: ProjectStore, wo_id: str) -> None:
-    """Flag AND notify: the flag reaches only who already looks (issue #244)"""
-    row = store.get_work_order(wo_id) or {}
+    """Flag AND notify (#244), only for rows that are the user's, each row once (io-ed253c2b)"""
+    row = store.get_work_order(wo_id)
+    owed = invariants.assumptions_owed_to_user(store, row)
+    if not owed:
+        return
     already = (row.get("needs_attention")
                and row.get("attention_reason") == ASSUMPTIONS_PENDING_REASON)
     store.flag_attention(wo_id, ASSUMPTIONS_PENDING_REASON)
-    if already:
+    # Without auto-review every assumption of a raised flag is one ping, as it always was
+    if already and not auto_review_at(store.project_path):
         return
-    n = sum(1 for a in store.all_assumptions(wo_id) if a["status"] == "pending")
+    pinged = {int(aid) for e in store.events_of_kind(wo_id, ASSUMPTIONS_PINGED_EVENT)
+              for aid in db.from_json(e["payload"], {}).get("assumption_ids", [])}
+    fresh = [int(a["id"]) for a in owed if int(a["id"]) not in pinged]
+    if not fresh:
+        return
+    n = len(fresh)
+    store.add_event(wo_id, ASSUMPTIONS_PINGED_EVENT, {"assumption_ids": fresh})
     store.add_notification(
         title=f"{wo_id} is waiting on your review of {n} assumption{'s' if n != 1 else ''}",
         body=f"{row.get('title') or ''}\n"
@@ -3427,6 +3455,28 @@ def _owed_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[int]:
     return sorted(owed)
 
 
+def assumptions_held_final(store: ProjectStore, wo: dict[str, Any]) -> set[int]:
+    """Ids whose newest live review event is a delivered-pass hold no later pass retries (io-ed253c2b)"""
+    from . import autoreview, db
+
+    wo_id = wo["id"]
+    stale = _stale_ruling(store, wo_id, status=str(wo.get("status") or ""))
+    events = [(float(r["ts"]), kind, db.from_json(r["payload"], {}))
+              for kind in ("autoreview_held", "autoreview_asked")
+              for r in store.events_of_kind(wo_id, kind)]
+    final: set[int] = set()
+    for _, kind, payload in sorted(events, key=lambda e: e[0]):
+        # An early hold is re-decided on delivery, so that pass writes its own
+        if payload.get("early") or stale(kind, payload):
+            continue
+        aid = int(payload.get("assumption_id") or 0)
+        if kind == "autoreview_held" and payload.get("code") not in autoreview.TRANSIENT_HOLDS:
+            final.add(aid)
+        else:
+            final.discard(aid)
+    return final
+
+
 def _held_pending(store: ProjectStore, wo_id: str, stale: Any) -> list[dict[str, Any]]:
     """The newest live hold per assumption still pending, in assumption order"""
     from . import db
@@ -3448,7 +3498,9 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
     """The decision this work order owes the user, and what each button would do — or None (docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §2.)"""
     from .invariants import validation_escalated
 
-    pending_rows = store.pending_assumptions(wo["id"])
+    # An ended order offers no ruling, even on a row the sweep has not lapsed yet (io-d5e62d4d)
+    pending_rows = ([] if wo["status"] in ASSUMPTION_LAPSE_STATUSES
+                    else store.pending_assumptions(wo["id"]))
     pending = len(pending_rows)
     escalated = (wo["status"] == "needs_review" and validation_escalated(store, wo))
     if not pending and not escalated:
@@ -3590,6 +3642,8 @@ def review_lines(state: dict[str, Any]) -> list[str]:
 
 def assumption_decider(a: dict[str, Any]) -> str:
     """WHO decided this assumption, in words, for whoever is about to read the verdict"""
+    if str(a.get("status") or "") == ASSUMPTION_LAPSED:
+        return "nobody"
     by = str(a.get("decided_by") or "")
     if not by and str(a.get("status") or "") == "pending" \
             and str(a.get("provisional_verdict") or ""):
@@ -4586,6 +4640,10 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     delivered = store.events_of_kind(wo_id, "finished")
     if delivered and float(delivered[-1]["ts"]) > cut:
         return True
+    # A manager never finishes: its turn ending after the refusal is its answer (io-d5e62d4d)
+    if settles_idle(store.get_work_order(wo_id)):
+        turn = store.latest_turn(wo_id)
+        return bool(turn and float(turn["ended_at"] or 0) > cut)
     # One read of the rows, like `validated_head`'s one-read rule: the guard needs the prior counted row...
     counted = [r for r in store.validation_rounds(wo_id=wo_id)
                if str(r["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES]
@@ -6725,13 +6783,13 @@ def select_inbox(items: list[dict[str, Any]], *, level: str = "", project: str =
 
 def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Put down an attention flag the OS raised for ITSELF, acknowledging nothing"""
-    from .invariants import true_blockers
+    from .invariants import surfaced_blockers
 
     name, path, _ = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
     try:
         wo = store.get_work_order(wo_id)
-        blockers = true_blockers(store, wo)
+        blockers = surfaced_blockers(store, wo)
         if blockers:
             # Only when it would actually change: `flag_attention` writes a timeline row every call
             if not wo["needs_attention"] or wo.get("attention_reason") != blockers[0]:
@@ -6922,6 +6980,19 @@ def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
     return land_when_cleared(store, fresh, panel_cleared=cleared)
 
 
+def lapse_moot_assumptions(store: ProjectStore, wo: dict[str, Any], reason: str) -> bool:
+    """INV-ASSUMPTION-LAPSED's repair on a live order: the review is over, so it lands (issue 1572)"""
+    wo_id, status = wo["id"], str(wo["status"])
+    # Resolved first: an order the OS cannot land keeps its rows and is retried
+    name, path, _ = find_work_order(wo_id)
+    if not store.repair_while(
+            wo_id, status, lambda: store.lapse_moot_assumptions(wo_id, status, reason)):
+        return False
+    if status == "needs_review":
+        _land_after_acceptance(store, path, wo_id, validation_config(name))
+    return True
+
+
 def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any],
                       assumption: dict[str, Any], *, reason: str, model: str,
                       question_id: int, cfg: Any,
@@ -6939,11 +7010,13 @@ def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any
         "decided_by": ASSUMPTION_DECIDER_OS})
     pending = store.pending_assumptions(wo_id)
     status = str(wo.get("status") or "")
-    if not pending:
+    # A manager settles with its feature, never on its assumptions (io-d5e62d4d)
+    settled = not pending and not settles_idle(wo)
+    if settled:
         status = _land_after_acceptance(store, project_path, wo_id, cfg)
     return {"wo_id": wo_id, "assumption_id": assumption["id"],
             "n": assumption.get("n"), "status": status, "pending": len(pending),
-            "settled": not pending}
+            "settled": settled}
 
 
 #: The one transport that ships
@@ -7057,6 +7130,9 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
     net = str(getattr(cfg, "stakes_classifier", "") or DEFAULT_STAKES_CLASSIFIER)
     store = ProjectStore(path)
     try:
+        # A row the sweep has not reached yet: ruling it would teach Neo from a choice that decided nothing
+        if wo["status"] in ASSUMPTION_LAPSE_STATUSES:
+            store.lapse_pending_assumptions(wo_id, wo["status"])
         pending = [a for a in store.all_assumptions(wo_id) if a["status"] == "pending"]
         alarms: frozenset[int] = frozenset()
         if false_alarm or FALSE_ALARM_RE.search(feedback or ""):
@@ -7092,13 +7168,20 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
     if park is not None:
         out["pr_pending"] = {k: park.get(k) or ""
                              for k in ("branch", "base", "compare_url")}
-    if not feedback:
+    # No review status will prompt the user for guidance on a manager: it hears either way (io-d5e62d4d)
+    if not feedback and not accept and pending and settles_idle(wo):
+        feedback_to_send = ("The user rejected assumption(s) "
+                            f"{', '.join('#' + str(a.get('n')) for a in pending)}: "
+                            "reconsider those calls and act on it.")
+    else:
+        feedback_to_send = feedback
+    if not feedback_to_send:
         return out
 
     # A rejection without guidance reaching the worker just strands it
     if not accept and wo["status"] in OPEN_STATUSES:
         try:
-            out["delivered"] = send_message(wo_id, feedback, source="jarvis",
+            out["delivered"] = send_message(wo_id, feedback_to_send, source="jarvis",
                                             project_name=name)
         except OpsError as e:
             out["delivery_error"] = str(e)
@@ -7915,6 +7998,9 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
         # The ONE re-decision allowed: a finding whose decision stands but whose orders did not file (§5.2)
         if key in accepted_keys and (f.get("filing_error") or f.get("orders_held")):
             continue
+        # A refusal retrying cannot clear (a misread sequence) needs a way out: the user's rejection
+        if key in rejections and f.get("filing_error") and decided_by == "user":
+            continue
         raise OpsError(
             f"{key!r} is already {f['status']} on {io_id} — a decision is taken once. "
             f"`jarvis io show {io_id}` for what was decided."
@@ -7936,7 +8022,7 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
             f["knowledge_id"] = entry["id"]
             learnings.append(entry["id"])
         if file_orders:
-            made, error = _file_finding_orders(name, io_id, f, steward_decision)
+            made, error = _file_finding_orders(name, io_id, f, steward_decision, report)
             created += made
             if error:
                 errors.append({"key": key, "error": error})
@@ -7949,8 +8035,22 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
         if f.get("status") != "accepted":
             f.update(status="accepted", decided_by=decided_by, decided_at=db.now(),
                      feedback=feedback)
+    # A finding may name a sibling this same call files after it (issue 1567)
+    progress = bool(errors)
+    while progress:
+        progress = False
+        for failed in list(errors):
+            made, error = _file_finding_orders(name, io_id, by_key[failed["key"]],
+                                               steward_decision, report)
+            created += made
+            progress = progress or bool(made)
+            if error:
+                failed["error"] = error
+            else:
+                errors.remove(failed)
 
     for key, reason in rejections.items():
+        by_key[key].pop("filing_error", None)
         by_key[key].update(status="rejected", decided_by=decided_by, decided_at=db.now(),
                            feedback=reason)
     if rejections and decided_by == "user":
@@ -8024,8 +8124,103 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
             "learnings": learnings, "rejected": sorted(rejections), "errors": errors}
 
 
+def _filed_work(finding: Mapping[str, Any], target: str) -> list[str]:
+    """The work orders this finding has already filed in `target`"""
+    return [str(o["id"]) for o in finding.get("created_orders") or []
+            if o.get("type") == "work" and o.get("project") == target]
+
+
+def _sequence_holds(target: str, io_id: str, f: Mapping[str, Any],
+                    report: Mapping[str, Any], order: Mapping[str, Any]
+                    ) -> tuple[list[str], list[str]]:
+    """The edges and rows expressing the sequence an order's text states, or OpsError (issue 1567)"""
+    import re
+
+    from . import preconditions
+    from .project_store import DEPENDENCY_DEAD_STATUSES
+
+    clauses = preconditions.states_sequence(order.get("title", ""),
+                                            order.get("description", ""),
+                                            f.get("recommendation", ""))
+    if not clauses:
+        return [], []
+
+    def refused(clause: str, why: str) -> OpsError:
+        return OpsError(
+            f"cannot file this order: \"{clause[:preconditions.MAX_SENTENCE]}\" states a sequence "
+            f"and {why}, so nothing "
+            f"would hold it back and jarvisd would dispatch it (wo-87e007eb cost 0.78 USD "
+            f"this way). File the prerequisite, then retry `jarvis io review {io_id} "
+            f"--accept {f.get('key', '<key>')}`, or reject the finding and file the order "
+            f"by hand with `--depends-on`/`--blocked-by`.")
+
+    if (order.get("type") or "work") == "feature":
+        raise refused(clauses[0], "a feature order takes no dependency edge")
+    path = registered_project_paths().get(target)
+    if path is None:
+        return [], []  # create_work_order names the unregistered project
+    siblings = [x for x in report.get("findings") or []
+                if isinstance(x, dict) and x.get("key") != f.get("key")]
+    depends: list[str] = []
+    holds: list[str] = []
+    store = ProjectStore(path)
+    try:
+        for clause in clauses:
+            named = [x for x in siblings if re.search(
+                rf"(?<![\w-]){re.escape(str(x.get('key')))}(?![\w-])", clause)]
+            refs = [r for r in preconditions.sequence_refs(clause) if r != ("io", io_id)]
+            if not refs and not named:
+                raise refused(clause, "names no order, pull request or finding")
+            found_by_clause: list[str] = []
+            for finding in named:
+                filed = _filed_work(finding, target)
+                if not filed:
+                    raise refused(clause, f"finding {finding.get('key')} has no order filed "
+                                          f"in {target}")
+                found_by_clause += filed
+            for kind, value in refs:
+                if kind == "bl":
+                    holds.append(value)
+                    continue
+                if kind == "pr":
+                    owners = store.work_orders_for_pr_number(int(value))
+                    if not owners:
+                        raise refused(clause, f"no order in {target} owns PR {value}")
+                    # Newest first; a live owner still carries the PR even if a newer one died
+                    live = [o for o in owners if o["status"] not in DEPENDENCY_DEAD_STATUSES]
+                    found_by_clause.append(str((live or owners)[0]["id"]))
+                elif kind == "io":
+                    try:
+                        other = db.from_json(store.get_feature_order(value).get("plan"),
+                                             None) or {}
+                    except KeyError:
+                        raise refused(clause, f"{value} is not in {target}") from None
+                    entries = [x for x in other.get("findings") or [] if isinstance(x, dict)]
+                    keyed = [x for x in entries if str(x.get("key")) in clause]
+                    found = [i for x in (keyed or entries) for i in _filed_work(x, target)]
+                    if not found:
+                        raise refused(clause, f"{value} has no order filed in {target}")
+                    found_by_clause += found
+                else:
+                    found_by_clause.append(value)
+            for wo_id in found_by_clause:
+                try:
+                    holder = store.get_work_order(wo_id)
+                except KeyError:
+                    raise refused(clause, f"{wo_id} is not in {target}") from None
+                if holder["status"] in DEPENDENCY_DEAD_STATUSES:
+                    raise refused(clause, f"{wo_id} is {holder['status']} and can never "
+                                          f"complete")
+                depends.append(wo_id)
+    finally:
+        store.close()
+    return list(dict.fromkeys(depends)), list(dict.fromkeys(holds))
+
+
 def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
-                         decision: Any = None) -> tuple[list[dict[str, Any]], str]:
+                         decision: Any = None,
+                         report: Mapping[str, Any] | None = None
+                         ) -> tuple[list[dict[str, Any]], str]:
     """File the finding's proposed orders not filed yet: (created, error), stopping at the first failure"""
     from . import steward
 
@@ -8050,6 +8245,7 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             metadata = steward.stamped(metadata, decision)
             budget_usd = decision.budget_usd
         try:
+            depends, holds = _sequence_holds(target, io_id, f, report or {}, order)
             if order_type == "feature":
                 row = create_feature_order(target, order.get("title", ""),
                                            description=description,
@@ -8057,6 +8253,8 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             else:
                 row = create_work_order(target, order.get("title", ""),
                                         description=description, parent_id=None,
+                                        depends_on=depends or None,
+                                        blocked_by=holds or None,
                                         metadata=metadata, budget_usd=budget_usd)
         except OpsError as e:
             error = str(e)
@@ -8423,7 +8621,7 @@ def reoffer_io_finding(row: Mapping[str, Any], candidate: Any, decision: Any) ->
               if isinstance(x, dict) and x.get("key") == key), None)
     if f is None or f.get("status") != "accepted" or not f.get("orders_held"):
         return ""  # decided or filed some other way meanwhile: nothing left to file
-    created, error = _file_finding_orders(name, io_id, f, decision)
+    created, error = _file_finding_orders(name, io_id, f, decision, report)
     if not error:
         f.pop("orders_held", None)
     store = ProjectStore(path)
@@ -8717,8 +8915,8 @@ def investigation_fix_order(inv_id: str) -> str:
     return str(wo["id"]) if wo else ""
 
 
-def _script_wrong_rewrite(item_id: str, inv_id: str,
-                          verdict: Mapping[str, Any]) -> tuple[bool, str]:
+def _script_wrong_rewrite(item_id: str, inv_id: str, verdict: Mapping[str, Any],
+                          cycles: int) -> tuple[bool, str]:
     """Settle a SCRIPT_WRONG verdict through `morpheus.rewrite` (#1374); False = user owes it"""
     from . import morpheus
 
@@ -8726,11 +8924,122 @@ def _script_wrong_rewrite(item_id: str, inv_id: str,
     central = CentralStore()
     try:
         return morpheus.rewrite_from_investigation(
-            central, _morpheus_catalog().os.morpheus, item_id, inv_id, brief)
+            central, _morpheus_catalog().os.morpheus, item_id, inv_id, brief, cycles)
     except KeyError:
         return True, f"nothing sent back: {item_id} no longer exists"
     finally:
         central.close()
+
+
+def _earlier_transients(project: str, item_id: str, inv_id: str) -> int:
+    """TRANSIENT verdicts this item's other investigations reached (Q3599)"""
+    count = 0
+    for other in morpheus_investigations(project, item_id):
+        if other != inv_id and _investigation_verdict(
+                find_feature_order(other, project)[2]).get("classification") == "TRANSIENT":
+            count += 1
+    return count
+
+
+def _move_monitor(project: str, item_id: str, inv_id: str, verdict: dict[str, Any]) -> bool:
+    """A verdict moves its monitoring order (io-5cc7a40d); True = the user owes it, GAP moves on its fix"""
+    from . import morpheus
+
+    classification = verdict["classification"]
+    central = CentralStore()
+    try:
+        if classification == "SCRIPT_WRONG":
+            cycles = len({*morpheus_investigations(project, item_id), inv_id})
+            settled, verdict["rewrite"] = _script_wrong_rewrite(item_id, inv_id, verdict, cycles)
+            verdict.pop("rewrite_ask", None)
+            if not settled:
+                verdict["rewrite_ask"] = _rewrite_ask(item_id, verdict["script_fix"])
+                verdict["rewrite_capped"] = True
+            return not settled
+        if classification == "TRANSIENT":
+            why = f"{verdict['unsticks']['what']} ({verdict['unsticks']['when']})"
+            verdict["monitor_move"] = morpheus.requeue_from_investigation(
+                central, _morpheus_catalog().os.morpheus, item_id, inv_id, why,
+                _earlier_transients(project, item_id, inv_id))
+        elif classification == "WAITING_ON_USER":
+            if not verdict.get("behaviour_correct"):
+                return True
+            verdict["monitor_move"] = morpheus.settle_unverified(
+                central, item_id, inv_id, verdict["root_cause"])
+    except KeyError:
+        verdict["monitor_move"] = f"nothing moved: {item_id} no longer exists"
+    finally:
+        central.close()
+    return False
+
+
+def _store_moved_verdict(path: Path, inv_id: str, verdict: dict[str, Any], owed: bool) -> None:
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(inv_id, plan=db.to_json(verdict))
+        if not owed:
+            store.clear_feature_attention(inv_id)
+    finally:
+        store.close()
+
+
+def settle_investigated_monitors() -> list[str]:
+    """Level-triggered: a completed verdict that never moved its row moves it now (io-5cc7a40d)"""
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        items = central.morpheus_items(morpheus.ACTION_STATES)
+    finally:
+        central.close()
+    moved = []
+    for item in items:
+        kind, _, inv_id = (item.get("action") or "").partition(":")
+        if kind != "investigation" or not inv_id:
+            continue
+        try:
+            _name, path, fo = find_feature_order(inv_id, item.get("project") or None)
+        except OpsError:
+            continue
+        verdict = _investigation_verdict(fo)
+        if (fo["status"] != "completed" or verdict.get("rewrite_capped")
+                or verdict.get("classification") not in (
+                    "SCRIPT_WRONG", "TRANSIENT", "WAITING_ON_USER")):
+            continue
+        if verdict["classification"] == "WAITING_ON_USER" and not verdict.get("behaviour_correct"):
+            continue  # its attention flag already asks the user
+        owed = _move_monitor(item.get("project") or "", item["id"], inv_id, verdict)
+        _store_moved_verdict(path, inv_id, verdict, owed)
+        if not owed:
+            moved.append(item["id"])
+    return moved
+
+
+def correct_investigation(inv_id: str, reason: str,
+                          project_name: str | None = None) -> dict[str, Any]:
+    """A person read a verdict stored without `behaviour_correct`: record it, which settles the row (Q3598)"""
+    from . import morpheus
+
+    if not (reason or "").strip():
+        raise OpsError("say how you know the behaviour is correct")
+    name, path, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo show")
+    verdict = _investigation_verdict(fo)
+    if verdict.get("classification") != "WAITING_ON_USER":
+        raise OpsError(f"{inv_id} is {verdict.get('classification') or 'without a verdict'}: "
+                       f"only a WAITING_ON_USER verdict carries `behaviour_correct`")
+    central = CentralStore()
+    try:
+        item_id = next((str(i["id"]) for i in central.morpheus_items(morpheus.ACTION_STATES)
+                        if i.get("action") == f"investigation:{inv_id}"), "")
+    finally:
+        central.close()
+    if not item_id:
+        raise OpsError(f"no failed or timed-out monitoring order is waiting on {inv_id}")
+    verdict.update(behaviour_correct=True, behaviour_correct_reason=reason.strip())
+    _move_monitor(name, item_id, inv_id, verdict)
+    _store_moved_verdict(path, inv_id, verdict, owed=False)
+    return {"inv_id": inv_id, "item": item_id, "monitor_move": verdict["monitor_move"]}
 
 
 def _rewrite_ask(item_id: str, script_fix: str) -> dict[str, Any]:
@@ -8832,7 +9141,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                base_red_until: float = 0.0,
                stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
     """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)"""
-    from . import budget, bus, holds, stuck, worker_session
+    from . import background, budget, bus, holds, inspection, stuck, worker_session
     from .central_store import base_red_hold_spans
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
@@ -8932,8 +9241,22 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # Issue 1451: a stalled turn lapses the exclusion and is judged stuck outright
         stalled = worker_session.is_stalled(turn, now)
         turn_in_flight = bool(turn) and not stalled
+        silence = now - (durations.last_activity_ts or since)
+        # Issues 1556, 1562: the transcript is read only once the silence would be judged
+        silent_turn = (turn_in_flight and silence
+                       >= thresholds.get("running", cfg.fallback_minutes * 60.0))
+        path = _worker_transcript(pstore, wo) if silent_turn else None
+        tool_executing = bool(path) and inspection.tool_call_open(
+            path, float(turn["started_at"]))
+        awaits_task = False
+        if silent_turn:
+            try:
+                awaits_task = bool(background.live_tasks(
+                    str(wo.get("session_id") or ""), since=float(turn["started_at"])))
+            except OSError:
+                pass  # an unreadable transcript is no evidence of a wait: judged as silent
         verdict = stuck.assess(
-            str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
+            str(wo["status"]), now - since, silence,
             discounted, thresholds, cfg.fallback_minutes * 60.0,
             # CI and base-red cannot collide: `validating` and `waiting_pr_merge` (§1 of the 2026-10-15 spec)
             excluded_cause=(PAUSE_USAGE_LIMIT
@@ -8950,11 +9273,14 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else stuck.PRECONDITION_CAUSE if pre_held
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact about one feature's plan
-                            else stuck.PLAN_ASSUMPTION_CAUSE if plan_held else ""),
+                            else stuck.PLAN_ASSUMPTION_CAUSE if plan_held
+                            # `running`-only, so it collides with nothing but the usage window above
+                            else stuck.BACKGROUND_TASK_CAUSE if awaits_task else ""),
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,
             turn_in_flight=turn_in_flight,
+            tool_executing=tool_executing,
             stalled_turn_seconds=(now - float(turn["started_at"])) if stalled else 0.0)
         if stuck_only and not verdict.stuck:
             continue
@@ -9165,6 +9491,12 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
         raise OpsError(
             f"the verdict was not accepted, and nothing was stored: {inv_id} has no "
             f"investigator work order yet, and `other_gaps` are filed against that order.")
+    if (verdict["classification"] == "WAITING_ON_USER" and morpheus_item_id
+            and "behaviour_correct" not in verdict):
+        raise OpsError(
+            f"the verdict was not accepted, and nothing was stored: {inv_id} is on a monitoring "
+            f"order, so a WAITING_ON_USER verdict must carry `behaviour_correct`: true when the "
+            f"shipped behaviour is correct, which settles the order without the user.")
 
     verdict["classified_by"] = "investigator"
     verdict["filed"] = None
@@ -9181,16 +9513,17 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
                             f"{name} bugs.repo <owner/name> --reason …`")
     if verdict["classification"] == "GAP" and not filing_error:
         try:
-            duplicate = _verdict_duplicate(name, subject, verdict, fo, tracker)
+            duplicate, link = _verdict_duplicate(path, subject, verdict, fo, tracker)
         except Exception as e:  # noqa: BLE001 — an unreadable tracker is the §2.5 case
             filing_error = f"the duplicate check could not read the tracker: {e}"
-            duplicate = ""
+            duplicate, link = "", ""
         if not filing_error and duplicate:
             # RECORDED AS `ops`' DECISION, and the submitted classification is kept: the record must never read...
             verdict["submitted_classification"] = "GAP"
             verdict["classification"] = "ALREADY_TRACKED"
             verdict["classified_by"] = "ops"
             verdict["duplicate_of"] = duplicate
+            verdict["duplicate_link"] = link
         elif not filing_error and verdict.get("owner") == "project":
             # OFF THE OS BUG RAILS: no steward, no OS pickup — the project's own tracker
             fix = verdict["proposed_fix"]
@@ -9217,6 +9550,9 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
                     expected=verdict["proposed_fix"]["expected"],
                     actual=verdict["proposed_fix"]["actual"],
                     priority=verdict["proposed_fix"]["priority"],
+                    gap_class=verdict["gap_class"],
+                    detector=verdict["proposed_fix"]["detector"],
+                    remedy=verdict["proposed_fix"]["remedy"],
                     project=name, wo_id=fo.get("plan_wo_id") or "",
                     # Neo agreeing plus the steward starts it, through the triage question (#1344)
                     expedite=False, investigation={
@@ -9237,11 +9573,8 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
         return _verdict_filing_failed(name, path, fo, inv_id, verdict, filing_error)
 
     escalate = verdict["classification"] == "WAITING_ON_USER"
-    if verdict["classification"] == "SCRIPT_WRONG":
-        settled, verdict["rewrite"] = _script_wrong_rewrite(morpheus_item_id, inv_id, verdict)
-        escalate = not settled
-        if escalate:
-            verdict["rewrite_ask"] = _rewrite_ask(morpheus_item_id, verdict["script_fix"])
+    if morpheus_item_id:
+        escalate = _move_monitor(name, morpheus_item_id, inv_id, verdict)
 
     classification = verdict["classification"]
     store = ProjectStore(path)
@@ -9270,6 +9603,10 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
                 })
             except (KeyError, sqlite3.IntegrityError):
                 pass  # not this project's work order any more
+        if verdict.get("duplicate_link") in LIVE_ORDER_LINKS:
+            store.add_event(verdict["duplicate_of"], "verdict_duplicate_linked", {
+                "investigation": inv_id, "gap_class": verdict.get("gap_class"),
+                "link": verdict["duplicate_link"]})
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {
                 "investigation": inv_id, "classification": classification,
@@ -9301,6 +9638,24 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
             if settled is not None:
                 out["investigator"] = settled
     return out
+
+
+def record_refused_artifact(kind: str, source: Path) -> None:
+    """The submitting session's own refused file is OS-ordered, so the prune can find it (#1538)"""
+    wo_id = os.environ.get(WORKER_SESSION_ENV)
+    if not wo_id:
+        return
+    try:
+        _, path, wo = find_work_order(wo_id)
+    except OpsError:
+        return  # the refusal itself must still reach the caller
+    if str(wo.get("kind") or "worker") != kind:
+        return  # only this kind was told to submit; any other's file may be real work
+    store = ProjectStore(path)
+    try:
+        store.add_event(wo_id, REFUSED_ARTIFACT_EVENT, {"path": str(source)})
+    finally:
+        store.close()
 
 
 def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
@@ -9337,23 +9692,116 @@ def submitter_unsettled(what: str, order_id: str, wo_id: str, error: Exception) 
             f"is the OS's to clear, not yours: {error}")
 
 
-def _verdict_duplicate(project: str, subject: str, verdict: dict[str, Any],
-                       fo: dict[str, Any], repo: str = "") -> str:
-    """What already covers this GAP — an issue url on `repo` (else the OS's) or a live order id — or `""`"""
-    from . import bugreport, issues, search as search_mod
+#: How a live order can cover a GAP's cause; a text mention of the subject is NOT one (spec §2.5)
+LIVE_ORDER_LINKS = ("gap_class", "issue_url")
+
+
+def _verdict_duplicate(path: Path, subject: str, verdict: dict[str, Any],
+                       fo: dict[str, Any], repo: str = "") -> tuple[str, str]:
+    """(what already covers this GAP, how it is linked) or `("", "")` (spec §2.5)"""
+    from . import bugreport, issues
 
     title = (verdict.get("proposed_fix") or {}).get("title") or ""
     repo = repo or bugreport.bug_repo()
     if title:
         for row in issues.issues_mentioning(repo, title):
-            return str(row["url"])
+            return str(row["url"]), "tracker"
+    gap_class = str(verdict.get("gap_class") or "")
     ours = {subject, fo["id"], fo.get("plan_wo_id") or ""}
-    for hit in search_mod.search(subject, project=project,
-                                 kinds=("work_order", "feature_order")):
-        if hit["id"] in ours or hit.get("status") in TERMINAL_STATUSES:
-            continue
-        return str(hit["id"])
-    return ""
+    store = ProjectStore(path)
+    try:
+        filed_urls = set()
+        for row in store.list_feature_orders(statuses=("completed",), kind="investigation",
+                                             limit=VERDICT_SCAN_LIMIT):
+            earlier = db.from_json(row.get("plan"), {}) or {}
+            url = (earlier.get("filed") or {}).get("issue_url")
+            if url and earlier.get("gap_class") == gap_class:
+                filed_urls.add(str(url))
+        for wo in store.live_orders_on_cause(gap_class, filed_urls):
+            if wo["id"] not in ours:
+                link = "gap_class" if wo.get("gap_class") == gap_class else "issue_url"
+                return str(wo["id"]), link
+    finally:
+        store.close()
+    return "", ""
+
+
+#: How many of a project's investigations one scan reads; `list_feature_orders` defaults to 200
+VERDICT_SCAN_LIMIT = 1000
+
+
+def raise_settled_duplicates(project: str, path: Path) -> list[str]:
+    """GAP verdicts whose order target settled with no issue become backlog proposals (spec §2.5)"""
+    from . import bugreport, issues
+
+    store = ProjectStore(path)
+    central = CentralStore()
+    raised: list[str] = []
+    try:
+        groups: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+        for fo in store.list_feature_orders(statuses=("completed",), kind="investigation",
+                                            limit=VERDICT_SCAN_LIMIT):
+            plan = db.from_json(fo.get("plan"), {}) or {}
+            target = str(plan.get("duplicate_of") or "")
+            if (plan.get("submitted_classification") != "GAP" or not target
+                    or plan.get("duplicate_link") == "tracker" or target.startswith("http")
+                    or plan.get("duplicate_settled")
+                    or not _order_settled(store, target)):
+                continue
+            title = str((plan.get("proposed_fix") or {}).get("title") or "")
+            repo = bugreport.bug_repo()
+            if plan.get("owner") == "project":
+                spec = _spec_or_none(project)
+                repo = follow_up_repo(spec.path if spec is not None else path,
+                                      spec.bugs.repo if spec is not None else "")
+            try:
+                found = issues.issues_mentioning(repo, title) if repo and title else []
+            except Exception:  # noqa: BLE001 — stays unmarked, so the next pass retries it
+                log.exception("[%s] %s: could not read the tracker", project, fo["id"])
+                continue
+            if found:
+                plan["duplicate_settled"] = {"issue_url": str(found[0]["url"])}
+                store.update_feature_order(fo["id"], plan=db.to_json(plan))
+                continue
+            groups.setdefault(str(plan.get("gap_class") or "unclassified"), []).append((fo, plan))
+
+        for gap_class, members in groups.items():
+            first = members[0][1]
+            title = (str((first.get("proposed_fix") or {}).get("title") or gap_class)
+                     if len(members) == 1
+                     else f"{gap_class}: {len(members)} GAP verdicts were never filed")
+            lines = [f"GAP verdicts downgraded to ALREADY_TRACKED on an order that settled "
+                     f"with no issue for the cause. Gap class: {gap_class}."]
+            lines += [f"- {fo['id']} (subject {plan.get('subject')}, was duplicate of "
+                      f"{plan.get('duplicate_of')}): "
+                      f"{(plan.get('proposed_fix') or {}).get('title')}. "
+                      f"Full fix: `jarvis investigate show {fo['id']}`"
+                      for fo, plan in members]
+            item = central.propose_backlog(
+                project, title, "\n".join(lines),
+                item_type="bug", severity="major", suggested_kind="wo",
+                origin_refs=[{"kind": "finding", "order_id": fo["id"], "key": gap_class}
+                             for fo, _ in members],
+                origin_fo_id=members[0][0]["id"],
+                origin_note=f"settled duplicate target, gap class {gap_class}")
+            raised.append(item["id"])
+            for fo, plan in members:
+                plan["duplicate_settled"] = {"backlog": item["id"]}
+                store.update_feature_order(fo["id"], plan=db.to_json(plan))
+    finally:
+        central.close()
+        store.close()
+    return raised
+
+
+def _order_settled(store: ProjectStore, order_id: str) -> bool:
+    """Terminal, or gone: either way nothing is left to carry the cause"""
+    try:
+        row = (store.get_feature_order(order_id) if is_feature_order_id(order_id)
+               else store.get_work_order(order_id))
+    except KeyError:
+        return True
+    return row.get("status") in TERMINAL_STATUSES
 
 
 def _verdict_filing_failed(name: str, path: Path, fo: dict[str, Any], inv_id: str,
@@ -9411,6 +9859,11 @@ def show_feature_order(fo_id: str, project_name: str | None = None, *,
         mgr = store.manager_work_order(fo_id)
         manager = ({k: mgr[k] for k in ("id", "title", "status", "result_summary")}
                    if mgr else None)
+        if mgr:
+            # What the strip's "assumptions pending" points at (io-d5e62d4d)
+            manager["pending_assumptions"] = [
+                {k: a[k] for k in ("n", "content")}
+                for a in store.all_assumptions(mgr["id"]) if a["status"] == "pending"]
         return {
             "project": name, **fo,
             "plan": plan,
@@ -10652,6 +11105,12 @@ def validate_seat(seat: str) -> None:
 def neo_review(question_id: int, approved: bool, feedback: str = "",
                seat: str = "") -> dict[str, Any]:
     """Review one of Neo's answers"""
+    wo_id = os.environ.get(WORKER_SESSION_ENV)
+    if wo_id:
+        raise OpsError(
+            f"{wo_id} is a worker session — a worker may not review Neo's answer. "
+            "A correction is stored as the user's own words; a worker with a doubt "
+            "asks with `jarvis wo ask`.")
     from . import neo as neo_mod
     from .neo_store import NeoStore
 
@@ -10752,6 +11211,9 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
         q = neo.get(question_id)
         if q is None:
             raise OpsError(f"neo question {question_id} not found")
+        if q["status"] == "lapsed":
+            raise OpsError(f"neo question {question_id} has lapsed, so it takes no answer "
+                           f"and nothing was sent: {q['lapsed_reason']}")
         if q["status"] not in ("escalated", "failed", "queued"):
             raise OpsError(f"neo question {question_id} is {q['status']} — "
                            "only escalated/failed/queued questions take a user answer")
@@ -13994,6 +14456,21 @@ def propose_backlog(project: str, title: str, description: str = "", *,
         central.close()
 
 
+def _live_dependency(central: CentralStore, dep_id: str,
+                     dead: list[str]) -> tuple[str | None, dict[str, Any] | None]:
+    """What a dependency stands for once dropped ids are in `dead`; id None when nothing does (§7.1)"""
+    while True:
+        dep = central.get_backlog(dep_id)
+        if not dep or dep["status"] != "dropped":
+            return dep_id, dep
+        if dep_id not in dead:
+            dead.append(dep_id)
+        kept = dep["duplicate_of"]
+        if not kept or kept in dead:
+            return None, None
+        dep_id = kept
+
+
 def _promotion_plan(central: CentralStore, item_id: str,
                     as_feature: bool | None) -> list[dict[str, Any]]:
     """Open closure, dependencies first (docs/superpowers/specs/2026-11-03-backlog-operability.md §7.1)"""
@@ -14010,9 +14487,12 @@ def _promotion_plan(central: CentralStore, item_id: str,
     def visit(item: dict[str, Any]) -> None:
         seen.add(item["id"])
         path.append(item["id"])
-        waits_on = []
+        waits_on: list[str] = []
+        dead_deps: list[str] = []
         for dep_id in item["depends_on"]:
-            dep = central.get_backlog(dep_id)
+            dep_id, dep = _live_dependency(central, dep_id, dead_deps)
+            if dep_id is None or dep_id in waits_on:
+                continue
             status = dep["status"] if dep else "missing"
             if status == "done":
                 continue
@@ -14031,7 +14511,7 @@ def _promotion_plan(central: CentralStore, item_id: str,
         if item["id"] == item_id and as_feature is not None:
             kind = "fo" if as_feature else "wo"
         plan.append({"id": item["id"], "title": item["title"], "project": item["project"],
-                     "kind": kind, "waits_on": waits_on})
+                     "kind": kind, "waits_on": waits_on, "dead_deps": dead_deps})
 
     visit(root)
     if refused:
@@ -14043,7 +14523,8 @@ def _promotion_plan(central: CentralStore, item_id: str,
             f"cannot promote {item_id}, nothing was created: a feature order starts planning "
             "at once and cannot wait, so " + "; ".join(
                 f"{m['id']} waits on {', '.join(m['waits_on'])}" for m in waiting_features)
-            + " — promote its dependencies first")
+            + " — those dependencies must reach done or dropped first: they can be promoted "
+            "on their own now, then promote this item once they settle")
     # create_feature_order refuses these; caught here, a late member cannot strand the early ones
     bare = [m["id"] for m in plan if m["kind"] == "fo"
             and not (central.get_backlog(m["id"])["description"] or "").strip()]
@@ -14415,7 +14896,7 @@ def cost_zone(tz: str | None = None, project: str | None = None) -> str:
 
 
 def cost_report(project: str | None = None, target: str | None = None,
-                limit: int = 50, include_hidden: bool = True,
+                limit: int = 50,
                 window: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the fleet's work has cost in tokens, read back from Claude Code's transcripts (#103)"""
     from . import usage as usage_mod
@@ -14437,18 +14918,16 @@ def cost_report(project: str | None = None, target: str | None = None,
             continue
         store = ProjectStore(path)
         try:
-            rows = store.list_work_orders(
-                limit=limit, include_hidden=include_hidden,
-                active_between=(since, until) if window else None)
+            # Hidden orders too: hiding declutters, their spend stays real and on the meter
+            rows = (_orders_in_window(store, index, since, until) if window
+                    else store.list_work_orders(limit=limit, include_hidden=True))
             # An order whose only in-window activity is an `agent_call`
             seen = {wo["id"] for wo in rows}
             for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
                 try:
-                    extra = store.get_work_order(wo_id)
+                    rows.append(store.get_work_order(wo_id))
                 except KeyError:
                     continue            # a legacy row naming no project: not this one's
-                if include_hidden or not extra["hidden"]:
-                    rows.append(extra)
             for wo in rows:
                 units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
                                        os_groups.get(wo["id"], ()),
@@ -14457,10 +14936,28 @@ def cost_report(project: str | None = None, target: str | None = None,
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
+    listed = {u["id"] for u in units}
+    # A call naming an order no store holds is declared too, or the meter outruns the list
+    unattributed = (_os_spend([g for wo_id, group in os_groups.items()
+                               if wo_id not in listed for g in group])
+                    if window else _os_unattributed(os_groups))
     # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/ `totals` keys...
     return {"scope": project or "fleet", "units": units, "window": window,
-            **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
+            **_rollup(units, unattributed), "os_unattributed": unattributed,
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
+
+
+def _orders_in_window(store: ProjectStore, index: dict[str, list[Path]], since: float,
+                      until: float) -> list[dict[str, Any]]:
+    """Every order with a transcript call in the window, however its turns fall (kn-58e36cf1)"""
+    from . import usage as usage_mod
+
+    spent = [wo for wo in store.list_work_orders(limit=-1, include_hidden=True)
+             if usage_mod.session_spend(wo.get("session_id") or "", since, until, index)]
+    # A pruned transcript cannot show its calls; its turn is all that says it ran here
+    return spent + [wo for wo in store.list_work_orders(
+        limit=-1, include_hidden=True, active_between=(since, until))
+        if not index.get(wo.get("session_id") or "")]
 
 
 def _os_groups(project: str | None = None, *, since: float | None = None,
@@ -14490,12 +14987,15 @@ def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     return _os_spend(groups.get("", []))
 
 
-def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
-    """Totals over the units that could actually be measured"""
+def _rollup(units: list[dict[str, Any]],
+            unattributed: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Totals over the units that could actually be measured, plus OS calls no unit owns"""
     measured = [u for u in units if u["found"]]
     worker_cost = round(sum(u["list_cost_usd"] for u in measured), 2)
+    # The `os_*` figures only: OS calls no work order caused are spend, not a unit (io-82bcb830)
+    os_spenders = [*units, *([unattributed] if unattributed else [])]
     # Over ALL units, not just measured ones
-    os_cost = round(sum(u.get("os_cost_usd") or 0 for u in units), 2)
+    os_cost = round(sum(u.get("os_cost_usd") or 0 for u in os_spenders), 2)
     subproc_cost = round(sum(u.get("subproc_cost_usd") or 0 for u in units), 2)
     return {
         "measured": len(measured),
@@ -14505,17 +15005,17 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "recorded_cost_usd": round(
                 sum(u.get("recorded_cost_usd") or 0 for u in units), 2),
             "list_cost_usd": worker_cost,
-            # The headline: workers, everything the OS spent on their behalf
+            # The headline: workers, everything the OS spent, on their behalf or on no order
             "total_cost_usd": round(worker_cost + os_cost + subproc_cost, 2),
             "os_cost_usd": os_cost,
             "os_recorded_cost_usd": round(
-                sum(u.get("os_recorded_cost_usd") or 0 for u in units), 2),
-            "os_calls": sum(u.get("os_calls") or 0 for u in units),
-            "os_billed_input": sum(u.get("os_billed_input") or 0 for u in units),
+                sum(u.get("os_recorded_cost_usd") or 0 for u in os_spenders), 2),
+            "os_calls": sum(u.get("os_calls") or 0 for u in os_spenders),
+            "os_billed_input": sum(u.get("os_billed_input") or 0 for u in os_spenders),
             # The biggest OS-side input on the whole report (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
             "os_max_input_chars": max(
-                [u.get("os_max_input_chars") or 0 for u in units], default=0),
-            "os_output": sum(u.get("os_output") or 0 for u in units),
+                [u.get("os_max_input_chars") or 0 for u in os_spenders], default=0),
+            "os_output": sum(u.get("os_output") or 0 for u in os_spenders),
             "subproc_cost_usd": subproc_cost,
             "subproc_recorded_cost_usd": round(
                 sum(u.get("subproc_recorded_cost_usd") or 0 for u in units), 2),
@@ -14531,7 +15031,7 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "billed_input": sum(u["billed_input"] for u in measured),
             # Over ALL units: what a window could not place is disclosed whether or not the order it belongs to...
             "undated_messages": sum(u.get("undated_messages") or 0 for u in units),
-            **_write_ttl(measured, units),
+            **_write_ttl(measured, os_spenders),
         },
     }
 
@@ -14936,6 +15436,19 @@ def schedule_config_at(project_path: Path, catalog: Catalog | None = None) -> An
     return ScheduleConfig()
 
 
+def validation_config_at(project_path: Path) -> Any:
+    """`validation` for the project rooted at `project_path`, or the OS's, or None"""
+    try:
+        catalog = resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in catalog.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.validation
+        return catalog.os.validation
+    except (OpsError, CatalogError, OSError, ValueError):
+        return None
+
+
 def messaging_config_at(project_path: Path) -> Any:
     """`os.messaging` for the project rooted at `project_path`"""
     from .catalog import MessagingConfig
@@ -15302,8 +15815,8 @@ def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
     return {
         "project": name,
         "wo_id": row["wo_id"],
-        "title": (row["fo_title"] if feature else row["title"]),
-        "status": (row["fo_status"] if feature else row["status"]),
+        "title": (row["fo_title"] if feature else row["title"]) or "",
+        "status": (row["fo_status"] if feature else row["status"]) or "",
         "hidden": bool(row["hidden"]),
         "ts": row["ts"],
         "kind": row["kind"],
@@ -15319,7 +15832,7 @@ def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
         "source": row["source"],
         "probe": row["probe"],
         "subject_kind": row["subject_kind"],
-        "subject_id": row["fo_id"] or row["wo_id"],
+        "subject_id": row["fo_id"] or row["wo_id"] or "",
     }
 
 
@@ -15414,9 +15927,6 @@ def _reviewable(name: str, row: dict[str, Any],
     })
     # The frozen dict carries the probe ID; every review surface renders its TITLE
     view["kind_label"] = alarm_kind_label(view, titles or {})
-    from .inspection import FLEET_WIDE_KINDS
-
-    view["fleet_wide"] = view["kind"] in FLEET_WIDE_KINDS
     return view
 
 
@@ -15515,12 +16025,7 @@ def _find_alarm(alarm_id: str, project_name: str | None = None
             continue
         store = ProjectStore(path)
         try:
-            try:
-                bare = store.get_alarm(alarm_id)
-            except KeyError:
-                continue
-            joined = [r for r in store.alarms_across(wo_id=bare["wo_id"], limit=1000)
-                      if r["id"] == alarm_id]
+            joined = store.alarms_across(alarm_id=alarm_id, limit=1)
         finally:
             store.close()
         if joined:
@@ -15620,18 +16125,9 @@ def _settle_alarm_attention(name: str, path: Path, wo_id: str, alarm_id: str) ->
             return
         if wo.get("attention_reason") != ALARM_BLOCKER.format(alarm_id=alarm_id):
             return  # the flag names something else: not this review's to touch
-        owed = [a for a in store.alarms_of(wo_id)
-                if a["id"] != alarm_id and a["status"] in ("escalated", "failed")
-                and a["review_status"] == "unreviewed"]
     finally:
         store.close()
-    settled = ack_os_flag(wo_id, name)
-    if not settled["blockers"] and owed:
-        store = ProjectStore(path)
-        try:
-            store.flag_attention(wo_id, ALARM_BLOCKER.format(alarm_id=owed[0]["id"]))
-        finally:
-            store.close()
+    ack_os_flag(wo_id, name)  # re-derives, so another owed alarm takes the flag over
 
 
 def approve_alarm_queue(project_name: str | None = None,
@@ -16222,6 +16718,7 @@ def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
     out: dict[str, Any] = {key: 0 for key in ASSUMPTION_BUCKETS}
     never_by_hold: dict[str, int] = {}
     unsettled = {"count": 0, "reached_neo": 0, "never_reached_neo": 0}
+    lapsed = 0
     ages: list[float] = []
     rows = high = alarms = 0
     dropped = {"total": 0, "re_asked": 0}
@@ -16233,6 +16730,10 @@ def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
         for a in f["rows"]:
             rows += 1
             aid = int(a["id"])
+            # Nobody decided it, so it is in no bucket and no rate (io-d5e62d4d)
+            if str(a.get("status") or "") == ASSUMPTION_LAPSED:
+                lapsed += 1
+                continue
             # Reached = a question was ever filed: the column, or the ask event a cleared link leaves behind
             reached = bool(a.get("neo_question_id") or a.get("confirm_question_id")
                            or aid in f["asked"])
@@ -16259,6 +16760,7 @@ def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
         "rates": {key: _share(out[key], settled) for key in ASSUMPTION_BUCKETS},
         "never_reached_by_hold": never_by_hold,
         "unsettled": unsettled,
+        "lapsed": lapsed,
         "dropped_rulings": dropped,
         # The net's own defect rate, the `jarvis gate rules` false-positive idiom
         "stakes_net": {"held": high, "false_alarms": alarms,
@@ -16327,7 +16829,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     scope = {project: paths[project]} if project else paths
 
     questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
-                 "superseded": 0, "refined": 0, "escalation_rate": None,
+                 "superseded": 0, "refined": 0, "lapsed": 0, "escalation_rate": None,
                  "unreachable_rate": None}
     by_kind: dict[str, dict[str, Any]] = {}
     by_project: dict[str, dict[str, Any]] = {}
@@ -16360,6 +16862,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         elif row["status"] == "refined":
             # Bounced to the asker to split: not an escalation (wo-ea3c6f0c)
             questions["refined"] += n
+        elif row["status"] == "lapsed":
+            # Its order ended first: nobody ruled (io-d5e62d4d)
+            questions["lapsed"] += n
         elif row["status"] in ("escalated", "failed"):
             for bucket in buckets:
                 bucket[row["status"]] += n
@@ -17487,7 +17992,7 @@ def release_overview(project: str = "") -> dict[str, Any]:
         releases = []
         for t, rows in zip(tags, contents):
             counts = {s: sum(r["validation"] == s for r in rows)
-                      for s in ("validated", "pending", "failed", "unwatched")}
+                      for s in ("validated", "unverified", "pending", "failed", "unwatched")}
             releases.append({**t, "prs": len(rows), "counts": counts,
                              "status": release_view.summarize(rows)})
     except (OSError, subprocess.SubprocessError) as e:

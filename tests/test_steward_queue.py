@@ -43,6 +43,33 @@ def _drain(central):
     return steward.drain(ops.resolve_catalog(), central)
 
 
+# ---------------------------------------------------------------- the header
+
+
+def test_the_header_promises_no_drain_for_rows_no_wait_clears(store, central, catalog_file,
+                                                              enforcing):
+    daemon = enforcing()
+    parent = store.create_work_order("its parent", metadata={steward.STAMP_KEY: {
+        "generation": 1, "origin_kind": "bug_agent"}})["id"]
+    steward.gate(steward.Candidate("worker_io", "medium", "proj_a", "past the depth",
+                                   evidence=("e",), parent_wo_id=parent, payload={"title": "t"}),
+                 catalog=daemon.catalog, store=store, central=central)
+    steward.gate(steward.Candidate("worker_io", "medium", "proj_a", "needs a second sighting",
+                                   evidence=("e",), payload={"title": "t"}),
+                 catalog=daemon.catalog, store=store, central=central)
+    counts = central.steward_queue_counts()
+    assert (counts["waiting"], counts["refused"]) == (2, 1)
+    line = steward.queue_line(counts)
+    assert "queued: 1 waiting for room" in line
+    assert "1 refused by max-depth or self-reference (no wait clears them" in line
+    # The rows themselves stay in `drain`: raising max_depth is the one thing that can clear them
+    rows = {r["rule"]: r for r in central.steward_queue()}
+    assert len(central.steward_queue()) == 2
+    assert "which no wait clears" in steward.next_step(rows["max-depth"])["text"]
+    assert "once the ledger has room" in steward.next_step(rows["recurrence"])["text"]
+    assert "refused" not in steward.queue_line({"waiting": 3})
+
+
 # ---------------------------------------------------------------- remedies drain
 
 
@@ -65,6 +92,45 @@ def _queue_a_remedy(enforcing, store, central):
                                         remedies.Intent.from_alarm(store, alarm))
     [row] = central.steward_decisions()
     return alarm, subject, row
+
+
+def _write_own_block(catalog_file, **own_block):
+    data = json.loads(catalog_file.read_text())
+    data["projects"][0]["evolution"] = own_block
+    catalog_file.write_text(json.dumps(data))
+    ops.start_os(str(catalog_file), foreground=True)
+
+
+def test_a_projects_own_room_drains_what_the_fleet_cap_holds(enforcing, store, central,
+                                                             catalog_file):
+    """Issue #1553: the drain re-decides each row under its own project's caps"""
+    _queue_a_remedy(enforcing, store, central)
+    assert _drain(central)["waiting"] == 1
+    _write_own_block(catalog_file, weekly_usd=30.0, order_budget_usd=25.0)
+    assert _drain(central)["dispatched"] == 1
+
+
+def test_a_project_in_shadow_is_not_drained_under_an_enforcing_fleet(enforcing, store, central,
+                                                                     catalog_file):
+    _queue_a_remedy(enforcing, store, central)
+    _write_own_block(catalog_file, mode="shadow", weekly_usd=30.0)
+    assert _drain(central) == {"waiting": 1, "dispatched": 0, "expired": 0, "failed": 0}
+
+
+def test_the_ledger_shows_the_cap_in_force_for_a_project(enforcing, catalog_file, capsys):
+    """Issue #1553: the screen said `$150.00 (os.evolution...)` beside a recorded raise"""
+    from jarvis.cli import main
+
+    enforcing(bug_weekly_usd=150.0)
+    _write_own_block(catalog_file, bug_weekly_usd=1500.0)
+    assert main(["steward", "ledger"]) == 0
+    text = capsys.readouterr().out
+    assert "of $150.00 (os.evolution.bug_weekly_usd)" in text
+    assert "proj_a" in text and "reported bugs $1500.00" in text
+    assert main(["steward", "ledger", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["projects"]["proj_a"]["bug_weekly_usd"] == 1500.0
+    assert data["bug_weekly_usd"] == 150.0
 
 
 def test_a_queued_remedy_is_kept_and_filed_with_its_ship_order_once_there_is_room(

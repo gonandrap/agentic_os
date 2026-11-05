@@ -48,10 +48,13 @@ sequenceDiagram
         end
     else WAITING_ON_USER (user_owes)
         O-->>U: attention on the investigation<br/>(cleared once the subject is clear)
+        Note over O: on a monitoring order, behaviour_correct true settles it unverified, no attention
     else SCRIPT_WRONG (script_fix; Morpheus-opened only)
-        O->>O: morpheus.rewrite under MAX_SCRIPT_REWRITES,<br/>script_fix + root_cause as the brief
-        O-->>U: cap spent: attention + inbox naming jarvis morpheus rewrite
-    else TRANSIENT (unsticks) / ALREADY_TRACKED (duplicate_of)
+        O->>O: morpheus.rewrite within MAX_FIX_CYCLES,<br/>script_fix + root_cause as the brief
+        O-->>U: past the cycles: attention + inbox naming jarvis morpheus rewrite
+    else TRANSIENT (unsticks)
+        O->>O: on a monitoring order: watch once more; a second TRANSIENT settles it unverified
+    else ALREADY_TRACKED (duplicate_of)
         O->>O: nothing further
     end
     O->>D: FO completed, investigation_verdict event on the subject,<br/>investigator closed out
