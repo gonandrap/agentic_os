@@ -21,7 +21,7 @@ from jarvis.daemon import (
     runnable_round,
     settles_turn,
 )
-from jarvis.neo_store import NEO_HELD_Q_STATUSES, NeoStore
+from jarvis.neo_store import NEO_HELD_Q_STATUSES, USER_HELD_Q_STATUSES, NeoStore
 from jarvis.invariants import user_facing_wait
 from jarvis.project_store import (
     CLAIM_RULES,
@@ -450,14 +450,131 @@ def test_a_needs_review_round_held_on_ci_names_the_panel(jarvis_home, project,
     """#1199: `work_orders_awaiting_validation` filters on `OPEN_STATUSES`, not on `validating`"""
     store = ProjectStore(project)
     wo = _delivered_with_a_confirming_assumption(store)
-    assert true_blockers_of(store, wo) == [
-        invariants.NO_ACTOR_BLOCKER.format(status="needs_review")], "the premise"
+    assert ops.scheduled_actor(store, wo).pass_name == "Daemon.auto_review", "the premise"
 
     row = _ci_held_round(store, wo["id"])
 
     actor = ops.scheduled_actor(store, row)
     assert actor is not None and actor.pass_name == "Daemon.validation_tick"
     assert true_blockers_of(store, row) == []
+
+
+# -- io-ed253c2b: while Neo holds a row, Neo is the actor; once it is the user's, the row surfaces
+
+def _delivered_with_an_assumption(store: ProjectStore) -> tuple[dict, int]:
+    wo = store.create_work_order("add feature X", status="needs_review")
+    store.update_work_order(wo["id"], result_summary="done")
+    return store.get_work_order(wo["id"]), store.add_assumption(wo["id"], "one call I made")
+
+
+def _ask_neo(wo_id: str, status: str) -> int:
+    neo = NeoStore()
+    try:
+        qid = int(neo.ask("proj_a", wo_id, "ok?", kind="assumption")["id"])
+        neo.conn.execute("UPDATE questions SET status=? WHERE id=?", (status, qid))
+    finally:
+        neo.close()
+    return qid
+
+
+def test_a_row_awaiting_its_first_ask_names_auto_review(jarvis_home, project,
+                                                        _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo, _ = _delivered_with_an_assumption(store)
+
+    assert ops.scheduled_actor(store, wo).pass_name == "Daemon.auto_review"
+    assert true_blockers_of(store, wo) == []
+
+
+@pytest.mark.parametrize("status", NEO_HELD_Q_STATUSES)
+def test_an_open_confirmation_names_auto_review(jarvis_home, project, status,
+                                                _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo = _delivered_with_a_confirming_assumption(store)
+    aid = store.pending_assumptions(wo["id"])[0]["id"]
+    store.link_assumption_confirmation(aid, _ask_neo(wo["id"], status))
+
+    assert ops.scheduled_actor(store, wo).pass_name == "Daemon.auto_review"
+    assert true_blockers_of(store, wo) == []
+
+
+@pytest.mark.parametrize("status", USER_HELD_Q_STATUSES)
+def test_a_question_neo_cannot_answer_still_surfaces(jarvis_home, project, status,
+                                                     _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo, aid = _delivered_with_an_assumption(store)
+    store.link_assumption_question(aid, _ask_neo(wo["id"], status))
+
+    assert ops.scheduled_actor(store, wo) is None
+    assert true_blockers_of(store, wo) == ["1 assumption pending your review"]
+
+
+def test_a_mixed_order_names_auto_review_and_surfaces_the_users_row(jarvis_home, project,
+                                                                    _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo, aid = _delivered_with_an_assumption(store)
+    store.link_assumption_question(aid, _ask_neo(wo["id"], "failed"))
+    store.add_assumption(wo["id"], "a second call, not asked yet")
+
+    assert ops.scheduled_actor(store, wo).pass_name == "Daemon.auto_review"
+    assert true_blockers_of(store, wo) == ["1 assumption pending your review"]
+
+
+def test_nothing_pending_names_nobody(jarvis_home, project, _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="needs_review")
+
+    assert ops.scheduled_actor(store, wo) is None
+    assert true_blockers_of(store, wo) == [invariants.IDLE_NO_FINISH_BLOCKER]
+
+
+@pytest.mark.parametrize("asked", [False, True], ids=["first-ask", "question-held"])
+def test_waiting_on_agrees_while_neo_holds_the_row(jarvis_home, project, asked,
+                                                   _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo, aid = _delivered_with_an_assumption(store)
+    if asked:
+        store.link_assumption_question(aid, _ask_neo(wo["id"], "queued"))
+
+    wait = ops.waiting_on(store, wo)
+
+    assert wait["what"] == "assumptions_with_neo"
+    assert ops._disagreements(wait, true_blockers_of(store, wo)) == []
+
+
+def test_waiting_on_sends_the_user_only_their_rows(jarvis_home, project,
+                                                   _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo, aid = _delivered_with_an_assumption(store)
+    store.link_assumption_question(aid, _ask_neo(wo["id"], "failed"))
+    store.add_assumption(wo["id"], "a second call, not asked yet")
+
+    wait = ops.waiting_on(store, wo)
+
+    assert wait["what"] == "assumptions" and wait["detail"].startswith("1 assumption(s)")
+    assert ops._disagreements(wait, true_blockers_of(store, wo)) == []
+
+
+def test_a_hidden_order_is_outside_the_pass_so_the_hole_is_named(jarvis_home, project,
+                                                                 _os_reviews_assumptions):
+    store = ProjectStore(project)
+    wo, _ = _delivered_with_an_assumption(store)
+    store.update_work_order(wo["id"], hidden=1)
+    row = store.get_work_order(wo["id"])
+
+    assert ops.scheduled_actor(store, row) is None
+    assert invariants.true_blockers(store, row) == [
+        invariants.NO_ACTOR_BLOCKER.format(status="needs_review")]
+
+
+def test_auto_review_off_has_no_actor_and_the_row_is_the_users(jarvis_home, project,
+                                                               monkeypatch):
+    monkeypatch.setattr(ops, "auto_review_at", lambda _path: False)
+    store = ProjectStore(project)
+    wo, _ = _delivered_with_an_assumption(store)
+
+    assert ops.scheduled_actor(store, wo) is None
+    assert true_blockers_of(store, wo) == ["1 assumption pending your review"]
 
 
 def test_every_open_status_carries_the_panel_pass(jarvis_home, project):
@@ -626,9 +743,8 @@ def test_a_queued_message_is_the_delivery_passs_row_not_the_settlers(jarvis_home
 
 
 @pytest.mark.parametrize("status", ["needs_review", "budget_exhausted"])
-def test_a_none_because_status_blocks_on_the_user(jarvis_home, project, status):
+def test_a_bare_user_owned_status_blocks_on_the_user(jarvis_home, project, status):
     store = ProjectStore(project)
-    assert ops.SCHEDULED_ACTORS[status].none_because
     wo = _row(store, status, "jarvis")
     assert (ops.scheduled_actor(store, wo),
             invariants.true_blockers(store, wo) != []) == (None, True)
@@ -683,7 +799,7 @@ def test_a_held_request_on_a_running_ungoverned_row_names_the_gate_sweep(
 
 
 @pytest.mark.parametrize("status", ["needs_review", "budget_exhausted"])
-def test_a_held_request_names_an_actor_on_a_none_because_status(jarvis_home, project,
+def test_a_held_request_names_an_actor_on_a_user_owned_status(jarvis_home, project,
                                                                 status):
     """Those two statuses' `None` was unconditional; it is now the predicate's answer"""
     store = ProjectStore(project)
@@ -693,4 +809,3 @@ def test_a_held_request_names_an_actor_on_a_none_because_status(jarvis_home, pro
     actor = ops.scheduled_actor(store, wo)
 
     assert actor is not None and actor.predicate == "daemon.reviews_gate"
-    assert ops.SCHEDULED_ACTORS[status].none_because

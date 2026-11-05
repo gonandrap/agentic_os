@@ -54,6 +54,10 @@ _FRESH_WATCH = {"last_reason": "", "saw_fail": 0, "held_since_ts": None}
 RELEASE_KEY = "morpheus.last_release"
 #: Per project: the last `pr_merged` event already queued
 MERGE_CURSOR_KEY = "morpheus.merge_cursor.{project}"
+#: Per tag-shipped project: the live HEAD and newest merge already scanned, so no `gh` call repeats
+DEPLOY_SEEN_KEY = "morpheus.deploy_seen.{project}"
+#: Per project: the production directory its open scripts were already sent back for
+REPOINTED_KEY = "morpheus.repointed.{project}"
 # Morpheus's own brake, over the fleet's: "paused" holds it, "running" lets it through a fleet pause
 PAUSE_KEY = "morpheus.pause"
 PAUSE_MODES = ("paused", "running")
@@ -210,6 +214,7 @@ class PullRequestBody:
     url: str
     title: str
     body: str
+    merge_sha: str = ""
 
 
 def fetch_pr(repo_slug: str, number: int, cwd: Path | None = None) -> PullRequestBody:
@@ -217,7 +222,8 @@ def fetch_pr(repo_slug: str, number: int, cwd: Path | None = None) -> PullReques
     from .bugreport import gh_bin
 
     url = f"https://github.com/{repo_slug}/pull/{number}"
-    out = subprocess.run([gh_bin(), "pr", "view", url, "--json", "number,title,body,url"],
+    out = subprocess.run([gh_bin(), "pr", "view", url, "--json",
+                          "number,title,body,url,mergeCommit"],
                          capture_output=True, text=True, timeout=60,
                          cwd=str(cwd) if cwd else None)
     if out.returncode != 0:
@@ -227,7 +233,8 @@ def fetch_pr(repo_slug: str, number: int, cwd: Path | None = None) -> PullReques
     return PullRequestBody(number=int(data.get("number") or number),
                            url=str(data.get("url") or url),
                            title=str(data.get("title") or ""),
-                           body=str(data.get("body") or ""))
+                           body=str(data.get("body") or ""),
+                           merge_sha=str((data.get("mergeCommit") or {}).get("oid") or ""))
 
 
 def repo_slug(repo: Path) -> str:
@@ -368,6 +375,79 @@ def queue_merges(central: CentralStore, cfg: MorpheusConfig, project: str,
         cursor = float(merged["ts"])
         central.set_state(key, str(cursor))
     return queued
+
+
+def contains(repo: Path, sha: str) -> bool:
+    """True only when HEAD carries the commit; a commit the checkout never fetched does not count"""
+    return bool(sha) and subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, "HEAD"],
+        capture_output=True, timeout=60).returncode == 0
+
+
+def queue_deployed(central: CentralStore, cfg: MorpheusConfig, project: str,
+                   store: ProjectStore, live: Path, *,
+                   fetch: Callable[[str, int], PullRequestBody] | None = None) -> list[str]:
+    """A tag-shipped project: queue each merged PR once live HEAD contains it; the clock starts there"""
+    key = MERGE_CURSOR_KEY.format(project=project)
+    raw = central.get_state(key)
+    if raw is None:
+        central.set_state(key, str(db.now()))
+        return []
+    merges = store.merged_prs_since(float(raw or 0))
+    if not merges:
+        return []
+    seen_key = DEPLOY_SEEN_KEY.format(project=project)
+    seen = f"{_git(live, 'rev-parse', 'HEAD').strip()} {merges[-1]['ts']}"
+    if central.get_state(seen_key) == seen:
+        return []
+    fetch = fetch or (lambda s, n: fetch_pr(s, n))
+    version = checked_version(live)
+    queued: list[str] = []
+    waiting = False
+    for merged in merges:
+        parsed = parse_pr_url(merged["pr_url"])
+        if parsed:
+            try:
+                pr = fetch(*parsed)
+                if not contains(live, pr.merge_sha):
+                    # The cursor stays behind the oldest merge still waiting for a deploy
+                    waiting = True
+                    continue
+                item = enqueue(central, cfg, pr, project=project, repo=parsed[0],
+                               release_tag=version)
+            except Exception as e:  # noqa: BLE001 — retried next pass: nothing is marked seen
+                log.warning("morpheus: could not queue %s: %s", merged["pr_url"], e)
+                return queued
+            if item:
+                queued.append(item["id"])
+        if not waiting:
+            central.set_state(key, str(float(merged["ts"])))
+    central.set_state(seen_key, seen)
+    return queued
+
+
+def rewrite_dev_scripts(central: CentralStore, cfg: MorpheusConfig, project: str,
+                        dev: Path, live: Path) -> list[str]:
+    """Once per declared directory, open scripts naming the dev checkout get a new one; no cap spent"""
+    key = REPOINTED_KEY.format(project=project)
+    if central.get_state(key) == str(live):
+        return []
+    # Not a text swap: a script may read run state the app keeps in the dev folder on purpose
+    spellings = re.escape(str(dev))
+    if dev.is_relative_to(Path.home()):
+        spellings += (r"|(?:~|\$HOME|\$\{HOME\})/"
+                      + re.escape(str(dev.relative_to(Path.home()))))
+    names_dev = re.compile(rf"(?:{spellings})(?![\w.-])")
+    why = (f"This script names {dev}, the development checkout. Production is {live}, the "
+           f"directory you are in. Check production; keep the development path only for state "
+           f"production itself reads there.")
+    sent = []
+    for item in central.morpheus_items(OPEN_STATES):
+        if item["project"] == project and names_dev.search(item["script"] or ""):
+            rewrite(central, cfg, item["id"], why)
+            sent.append(item["id"])
+    central.set_state(key, str(live))
+    return sent
 
 
 def set_script(central: CentralStore, item_id: str, script: str, source: str,
