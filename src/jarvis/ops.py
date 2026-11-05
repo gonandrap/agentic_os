@@ -8954,8 +8954,12 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 ci_held = cause == VALIDATION_CI_CAUSE and until > now
             ci_spans = validation_ci_hold_spans(events, since, now)
         # A MERGE THE OS IS ITSELF HOLDING ONTO A RED BASE IS NOT STUCK (§1 and §2 of... (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)
+        # ...AND A RELEASE IT HOLDS IN `pending` (docs/superpowers/specs/2026-11-04-a-release-held-by-a-red-base-is-not-stuck.md)
+        held_by_red_base = (wo["status"] == "waiting_pr_merge"
+                            or (wo["status"] == "pending"
+                                and release.is_release_order(wo)))
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
-                          if wo["status"] == "waiting_pr_merge" else [])
+                          if held_by_red_base else [])
         # A MERGE THE OS IS ITSELF HOLDING FOR GITHUB'S RUNNING CHECKS IS NOT STUCK (§2 and §3 of...
         automerge_checks_held, automerge_spans, am_note = False, [], ""
         if wo["status"] == "waiting_pr_merge":
@@ -9032,13 +9036,13 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         verdict = stuck.assess(
             str(wo["status"]), now - since, silence,
             discounted, thresholds, cfg.fallback_minutes * 60.0,
-            # CI and base-red cannot collide: `validating` and `waiting_pr_merge` (§1 of the 2026-10-15 spec)
+            # CI and base-red cannot collide: CI is `validating`-only (§1 of the 2026-10-15 spec)
             excluded_cause=(PAUSE_USAGE_LIMIT
                             if window or any(h.open for h in usage)
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
-                            if base_red and wo["status"] == "waiting_pr_merge"
-                            # AFTER the red base and BEFORE the dependency: both are `waiting_pr_merge`-only and CAN co-occur
+                            if base_red and held_by_red_base
+                            # AFTER the red base and BEFORE the dependency: both can be `waiting_pr_merge` and CAN co-occur
                             else stuck.AUTOMERGE_CHECKS_CAUSE if automerge_checks_held
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE

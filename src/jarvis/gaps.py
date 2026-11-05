@@ -97,12 +97,24 @@ GAP_CLASSES: dict[str, GapClass] = {
         issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
         since="",
     ),
+    "designed-wait-undiscounted": GapClass(
+        id="designed-wait-undiscounted",
+        headline="the OS holds an order on purpose and the sweep is not taught the hold, "
+                 "so the wait is judged as lost time",
+        symptom="an order investigated past its threshold with blocker `nothing the record "
+                "can name`, and the answer is the OS working as designed",
+        detector="INV-RED-RELEASE-UNDISCOUNTED",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1603",
+        since="",
+    ),
 }
 
 #: Asserted equal to `tuple(GAP_CLASSES)`, on `remedies.SHIPPED_REMEDIES`' precedent
 SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "oversized-input", "unwired-precondition",
-                                        "background-task-silence")
+                                        "background-task-silence",
+                                        "designed-wait-undiscounted")
 
 
 def checked_slug(raw: str) -> str:
