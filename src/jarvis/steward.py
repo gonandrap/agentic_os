@@ -172,7 +172,8 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
         return "dispatch", "release", "a landed fix ships", severity
     # No wait clears these two, so an urgent one is the user's now (spec §3.2 decision 1)
     refused = "ask" if severity in URGENT else "queue"
-    if generation > cfg.max_depth:
+    # red_main is exempt: spec §3.2 decision 1 rule 3 and A6, bounded at one fix per break
+    if generation > cfg.max_depth and c.origin_kind != "red_main":
         return (refused, "max-depth",
                 f"generation {generation} exceeds max_depth {cfg.max_depth}", severity)
     if parent_kind and parent_kind == c.origin_kind:
@@ -827,10 +828,10 @@ def _store_for(central: CentralStore, project: str) -> ProjectStore | None:
 
 # ---------------------------------------------------------------- the queue (#1181)
 
-#: Origin kinds whose `queue` the OS dispatches later on its own; the rest re-ask by themselves
 #: Rules waiting cannot clear: generation and parent never change
 UNCLEARABLE = ("max-depth", "self-reference")
-DRAINABLE = ("panel", "worker_io", "remedy", "neo_rider", "io_finding", "bug_agent")
+#: Origin kinds whose `queue` the OS dispatches later on its own; the rest re-ask by themselves
+DRAINABLE =("panel", "worker_io", "remedy", "neo_rider", "io_finding", "bug_agent")
 #: Origin kinds whose candidate is about the PARENT unit's code: moot once that is cancelled
 PARENT_BOUND = ("panel",)
 #: A queued decision older than this is not re-offered: the code it named has moved on
