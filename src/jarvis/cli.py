@@ -3357,7 +3357,8 @@ def cmd_cost(args: argparse.Namespace) -> int:
 
     units = res["units"]
     totals = res["totals"]
-    if not units:
+    unattributed = res.get("os_unattributed") or {}
+    if not units and not unattributed.get("os_calls"):
         print(f"no work orders found for {res['scope']}")
         return 0
     header = f"{res['scope']} — {res['measured']} measured"
@@ -3383,6 +3384,12 @@ def cmd_cost(args: argparse.Namespace) -> int:
               f"{agent_cost:>9} {u['turns']:>5} "
               f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
               f"{u['id']}  {u['title'][:44]}")
+    # Not a unit, but in the total: the rows have to sum to it (io-82bcb830)
+    if unattributed.get("os_calls"):
+        un_cost = unattributed["os_cost_usd"]
+        print(f"{un_cost:>7.2f} {un_cost:>7.2f} {'—':>8} {'—':>9} {'—':>5} "
+              f"{'—':>7} {'—':>9}  (no work order)  "
+              f"{unattributed['os_calls']} jarvis calls")
 
     _print_turn_table(res)
     _print_os_calls(res)
@@ -3424,7 +3431,6 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"  {totals['undated_messages']} transcript messages carried no readable "
               f"timestamp and are excluded from this window")
     _print_write_ttl(totals)
-    unattributed = res.get("os_unattributed") or {}
     if unattributed.get("os_calls"):
         print(f"  OS overhead   ~${unattributed['os_cost_usd']:.2f} — "
               f"{unattributed['os_calls']} calls no work order caused "
@@ -3546,6 +3552,7 @@ def _print_fleet(fleet: dict) -> None:
     kinds = fleet["os_cost_by_kind"]
     if kinds:
         print("\nwhat jarvis itself spent, by kind (dearest first, $0 kinds included)")
+        print(f"  {fleet['os_cost_basis']}")
         for row in kinds:
             print(f"  {row['kind']:<22} {row['calls']:>6} "
                   f"call{'s' if row['calls'] != 1 else ' '}  "

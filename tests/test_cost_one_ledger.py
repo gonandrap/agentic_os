@@ -18,11 +18,12 @@ def window(since: float, until: float) -> dict:
 
 
 def report_total(picked: dict) -> float:
-    """The list, and the part of it declared beside the rows"""
+    """The headline: the rows plus the no-work-order row"""
     report = ops.cost_report(window=picked)
-    assert sum(u["total_cost_usd"] for u in report["units"]) == pytest.approx(
+    rows = sum(u["total_cost_usd"] for u in report["units"])
+    assert rows + report["os_unattributed"]["os_cost_usd"] == pytest.approx(
         report["totals"]["total_cost_usd"], abs=0.01)
-    return report["totals"]["total_cost_usd"] + report["os_unattributed"]["os_cost_usd"]
+    return report["totals"]["total_cost_usd"]
 
 
 def plot_total(f, picked: dict) -> tuple[float, float]:
@@ -195,4 +196,4 @@ def test_a_project_scope_matches_the_scoped_list(fleet_fixture):
                            now=picked["until"])["meter"]
 
     assert meter["spend"]["scope_jarvis_usd"] == pytest.approx(
-        report["totals"]["total_cost_usd"] + report["os_unattributed"]["os_cost_usd"], abs=0.01)
+        report["totals"]["total_cost_usd"], abs=0.01)

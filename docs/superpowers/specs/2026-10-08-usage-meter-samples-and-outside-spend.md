@@ -346,8 +346,8 @@ compactions twice and booked a whole turn at its start):
   inside the span, at its start, middle or end, and counts only that portion. Turn
   timestamps select nothing, except a turn whose transcript was pruned;
 * **jarvis calls** — every `agent_calls` row inside the span, at list price. The list's
-  `totals` plus its `os_unattributed` is this same figure, so `os_unattributed` is NOT
-  added to it again.
+  `totals` already hold `os_unattributed` and are this same figure, so `os_unattributed`
+  is NOT added to it again.
 
 An order whose transcript was pruned counts nothing here and shows as unmeasured on the list.
 
