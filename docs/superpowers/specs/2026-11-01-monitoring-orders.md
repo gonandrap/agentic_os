@@ -303,6 +303,12 @@ Owns `ui/app.py` routes for Morpheus (~817, ~2190-2285), templates `morpheus.htm
 
 Does NOT touch daemon logic, CLI or search.
 
+**Who owes the next move (io-5cc7a40d).** `morpheus.owed_by` derives one owner per row (`user`,
+`neo`, `investigation`, `os`), stored nowhere. The `/mo` heading, `jarvis mo status` and
+`jarvis mo list --owed user` count the same `user` rows, each with its one command; the rest
+collapse under `OS handling`. A finished investigation's attention flag comes down once its
+row is decided (`ops.clear_settled_monitor_attention`, each Morpheus pass).
+
 ## 7. Cost, search, references, inspect and the docs
 
 Owns `bill.py`, `cli.cmd_cost` (~3202), `search.py`, `ops._resolve_report_target`

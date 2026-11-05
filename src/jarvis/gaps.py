@@ -42,10 +42,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "round-burn": GapClass(
         id="round-burn",
-        headline="validation rounds spent on what is not the submitter's work, so the "
-                 "order runs out unjudged",
-        symptom="`max_rounds` reached with panel feedback about the base branch, not the "
-                "diff",
+        headline="rounds spent on what is not the submitter's work, so the order runs out unjudged",
+        symptom="`max_rounds` reached with panel feedback about the base, not the diff",
         detector="",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/806",
@@ -62,8 +60,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "oversized-input": GapClass(
         id="oversized-input",
-        headline="a payload too big for its destination is sent anyway, so the step "
-                 "fails on size, not substance",
+        headline="a payload that could never fit is sent anyway, so the step fails on size",
         symptom="a question, verdict or prompt refused for length, work unread",
         detector="",
         remedy=REMEDY_NONE,
@@ -73,10 +70,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     # §2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md
     "unwired-precondition": GapClass(
         id="unwired-precondition",
-        headline="a brief's stop condition exists in no state the scheduler reads, so a "
-                 "worker pays to rediscover the hold",
-        symptom="a dispatched order whose first line forbids starting, abandoned, "
-                "no commits",
+        headline="a brief states a stop condition no state holds, so a worker pays to rediscover it",
+        symptom="dispatched, first line says not to start, abandoned, no commits",
         detector="INV-PRECONDITION-UNWIRED",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1089",
@@ -84,10 +79,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "background-task-silence": GapClass(
         id="background-task-silence",
-        headline="a worker awaiting a background task writes nothing, so the "
-                 "sweep reads its turn as wedged",
-        symptom="a `running` order investigated while its transcript ends on a background "
-                "launch",
+        headline="a worker awaiting a background task writes nothing, so the sweep reads its turn as wedged",
+        symptom="`running`, its transcript ending on a background launch",
         detector="background.live_tasks",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
@@ -95,7 +88,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "blocker-contradicts-record": GapClass(
         id="blocker-contradicts-record",
-        headline="a catch-all blocker fires though its order's events deny its premise",
+        headline="a catch-all blocker's premise is denied by its order's events",
         symptom="a finished order blocked as 'stopped mid-task'",
         detector="INV-BLOCKER-CONTRADICTS-RECORD",
         remedy=REMEDY_NONE,
@@ -104,8 +97,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "designed-wait-undiscounted": GapClass(
         id="designed-wait-undiscounted",
-        headline="the sweep is not taught a deliberate hold, so the wait reads as "
-                 "lost time",
+        headline="the sweep not taught a deliberate hold reads the wait as lost time",
         symptom="investigated with blocker `nothing the record can name`",
         detector="INV-RED-RELEASE-UNDISCOUNTED",
         remedy=REMEDY_NONE,
@@ -114,12 +106,20 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "superseded-delivery": GapClass(
         id="superseded-delivery",
-        headline="an equivalent change reaches the base first, so the PR nets "
-                 "to nothing",
-        symptom="a passed order escalated as nothing to review; its open PR changes no files",
+        headline="an equivalent change lands first, so the PR nets to nothing",
+        symptom="a passed order escalated as nothing to review; its PR changes no files",
         detector="Daemon._settle_superseded",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1592",
+        since="",
+    ),
+    "base-chase-livelock": GapClass(
+        id="base-chase-livelock",
+        headline="a queued PR loses its turn whenever the one ahead merges",
+        symptom="green, alternating `merge_queued` holds and catch-ups, no merge",
+        detector="INV-BASE-CHASE-LIVELOCK",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1608",
         since="",
     ),
 }
@@ -130,7 +130,7 @@ SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "background-task-silence",
                                         "blocker-contradicts-record",
                                         "designed-wait-undiscounted",
-                                        "superseded-delivery")
+                                        "superseded-delivery", "base-chase-livelock")
 
 
 def checked_slug(raw: str) -> str:
@@ -161,8 +161,7 @@ def by_invariant() -> dict[str, str]:
 
 def render_registry() -> str:
     """The registry as both the investigator's prompt and a fix order's brief see it"""
-    lines = ["Reuse a slug when the MECHANISM matches, whatever the subject. A new slug "
-             "makes the next fix order register it, with a detector, a remedy and a test.",
+    lines = ["Reuse a slug for the same mechanism; a new slug makes the fix order register it.",
              ""]
     for cls in GAP_CLASSES.values():
         # Terse, issue number alone: this list is inside a worker's 10K start budget

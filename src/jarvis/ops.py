@@ -17577,9 +17577,64 @@ def morpheus_report() -> dict[str, Any]:
 
     central = CentralStore()
     try:
-        return morpheus.report(central, _morpheus_catalog())
+        rep = morpheus.report(central, _morpheus_catalog())
     finally:
         central.close()
+    rep["items"] = _mo_owed(rep["items"])
+    return rep
+
+
+def _mo_owed(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each row with `morpheus.owed_by` read from its Neo question or order; stored nowhere"""
+    from . import morpheus
+    from .neo_store import NeoStore
+
+    out = []
+    neo = NeoStore()
+    try:
+        for item in items:
+            question = order = None
+            kind, _, ref = (item.get("action") or "").partition(":")
+            if not morpheus.decided(item):
+                if kind == "neo" and ref.isdigit():
+                    question = neo.get(int(ref))
+                elif kind in ("investigation", "improvement"):
+                    try:
+                        order = find_feature_order(ref, item.get("project") or None)[2]
+                    except OpsError:
+                        pass  # gone: `owed_by` hands it to the user
+            owner, command = morpheus.owed_by(item, question, order)
+            out.append({**item, "owed_by": owner, "owed_command": command})
+    finally:
+        neo.close()
+    return out
+
+
+def clear_settled_monitor_attention() -> list[str]:
+    """Lower a finished investigation's attention once its monitoring row is decided (io-5cc7a40d)"""
+    from . import morpheus
+
+    cleared = []
+    central = CentralStore()
+    try:
+        for path in registered_project_paths().values():
+            if not project_db_path(Path(path)).exists():
+                continue
+            store = ProjectStore(path)
+            try:
+                for fo in store.flagged_feature_orders():
+                    item_id = (db.from_json(fo.get("metadata"), {}) or {}).get(MORPHEUS_ITEM_KEY)
+                    if fo.get("kind") != "investigation" or fo["status"] != "completed" or not item_id:
+                        continue
+                    item = central.morpheus_item(str(item_id))
+                    if item and morpheus.decided(item):
+                        store.clear_feature_attention(fo["id"])
+                        cleared.append(str(fo["id"]))
+            finally:
+                store.close()
+    finally:
+        central.close()
+    return cleared
 
 
 def morpheus_item(item_id: str) -> dict[str, Any]:
@@ -17599,7 +17654,7 @@ def morpheus_detail(item_id: str) -> dict[str, Any]:
     from .central_store import headline
     from .neo_store import NeoStore
 
-    item = morpheus_item(item_id)
+    item = _mo_owed([morpheus_item(item_id)])[0]
     central = CentralStore()
     try:
         runs = central.morpheus_runs(item_id)
@@ -17874,12 +17929,14 @@ def mo_create(project: str, title: str, prompt: str = "", script: str = "",
 
 
 def mo_list(project: str | None = None, include_all: bool = False,
-            state: str | None = None) -> list[dict[str, Any]]:
+            state: str | None = None, owed: str | None = None) -> list[dict[str, Any]]:
     """Open orders and the failed/timed-out ones owed a look; `include_all` adds the settled"""
     from . import morpheus
 
     if state and state not in morpheus.STATES:
         raise OpsError(f"no state {state!r}; one of {', '.join(morpheus.STATES)}")
+    if owed and owed not in morpheus.OWNERS:
+        raise OpsError(f"no owner {owed!r}; one of {', '.join(morpheus.OWNERS)}")
     states = [state] if state else (None if include_all else
                                     [*morpheus.OPEN_STATES, *morpheus.ACTION_STATES])
     central = CentralStore()
@@ -17887,7 +17944,8 @@ def mo_list(project: str | None = None, include_all: bool = False,
         items = central.morpheus_items(states)
     finally:
         central.close()
-    return [i for i in items if not project or i.get("project") == project]
+    return [i for i in _mo_owed([i for i in items if not project or i.get("project") == project])
+            if not owed or i["owed_by"] == owed]
 
 
 def mo_show(mo_id: str) -> dict[str, Any]:

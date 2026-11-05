@@ -3551,6 +3551,13 @@ class Daemon:
                     log.info("morpheus %s: its investigation's verdict moved it", item_id)
             except Exception:  # noqa: BLE001 — the rest of the pass still runs
                 log.exception("morpheus: could not settle investigated items")
+            try:
+                from .ops import clear_settled_monitor_attention
+
+                for inv_id in clear_settled_monitor_attention():
+                    log.info("morpheus: %s's attention cleared, its row is decided", inv_id)
+            except Exception:  # noqa: BLE001 — the rest of the pass still runs
+                log.exception("morpheus: could not clear settled investigations' attention")
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
             skip = {*archived_projects(central), *no_production}
@@ -6237,8 +6244,8 @@ class Daemon:
                     drift=drift, no_ci=no_ci)
             if not decision.armed and not record_only \
                     and decision.code == automerge.HELD_BASE_MOVED:
-                # #1459: no catch-up while another merge on this base is in flight
-                queued = automerge.merge_queued(store, wo, pr)
+                # #1459, #1608: no catch-up while another merge is in flight or ahead in the queue
+                queued = self._merge_queued(project, store, wo, pr)
                 if queued is not None:
                     self._note_automerge_held(store, wo_id, queued)
                     return
@@ -6334,8 +6341,8 @@ class Daemon:
                                       automerge.held_grant_lapsed(approval, decision))
             approval = None
         if approval is None:
-            # #1459: one merge request in flight per base tip
-            queued = automerge.merge_queued(store, wo, pr)
+            # #1459, #1608: one merge request in flight per base tip, in queue order
+            queued = self._merge_queued(project, store, wo, pr)
             if queued is not None:
                 self._note_automerge_held(store, wo_id, queued)
                 return
@@ -7328,6 +7335,28 @@ class Daemon:
                 neo.close()
         # A wedged one raises the flag through `invariants.true_blockers`, not from here
         return automerge.drift_hold(alarm, question)
+
+    def _merge_queued(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                      pr: Any) -> Any:
+        """`automerge.merge_queued`, telling the user about every wedged turn it passes over"""
+        from . import automerge
+
+        for entry in automerge.passed_over(store, wo, pr):
+            noted = store.events_of_kind(entry.wo_id, automerge.TURN_PASSED_OVER_EVENT)
+            if any(float(db.from_json(e["payload"], {}).get("last_ts") or 0.0) == entry.last_ts
+                   for e in noted):
+                continue
+            store.add_event(entry.wo_id, automerge.TURN_PASSED_OVER_EVENT,
+                            {"last_code": entry.last_code, "last_ts": entry.last_ts})
+            self.central.add_inbox(
+                project=project.name, level="warning",
+                title=f"The merge queue passed over {entry.wo_id}",
+                body=f"Its last hold was `{entry.last_code}` with no change for over an hour, "
+                     f"so the orders behind it no longer wait for it. Nothing was merged. It "
+                     f"takes its place back as soon as its hold changes. "
+                     f"`jarvis wo show {entry.wo_id}` says what it is waiting on.",
+                wo_id=entry.wo_id)
+        return automerge.merge_queued(store, wo, pr)
 
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:

@@ -4639,6 +4639,47 @@ def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+INV_BASE_CHASE_LIVELOCK = "INV-BASE-CHASE-LIVELOCK"
+
+
+def check_queue_turn_survives_merge(store: ProjectStore) -> Iterator[Violation]:
+    """INV-BASE-CHASE-LIVELOCK — a second lap straight after a queue hold on an order that has merged (#1608)"""
+    from . import automerge, ops as ops_mod
+
+    for wo in store.list_work_orders(statuses=("waiting_pr_merge",), include_hidden=True):
+        row = store.latest_validation_round(wo_id=wo["id"])
+        if row is None or row.get("outcome") != "passed":
+            continue
+        since = float(row["ts"] or 0.0)
+        events = sorted((e for kind in ("automerge_held", PR_BASE_UPDATED_EVENT)
+                         for e in store.events_of_kind(wo["id"], kind)
+                         if float(e["ts"] or 0.0) >= since),
+                        key=lambda e: float(e["ts"] or 0.0))
+        behind = ""
+        lost: list[str] = []
+        for event in events:
+            payload = db.from_json(event.get("payload"), {}) or {}
+            if event["kind"] == "automerge_held":
+                behind = (str(payload.get("queued_behind") or "")
+                          if payload.get("code") == automerge.HELD_MERGE_QUEUED else "")
+            elif (payload.get("cause") == ops_mod.BASE_UPDATE_BEHIND and behind
+                    and store.events_of_kind(behind, "pr_merged")):
+                lost.append(behind)
+        if len(lost) < 2:
+            continue
+        yield Violation(
+            invariant=INV_BASE_CHASE_LIVELOCK,
+            wo_id=wo["id"],
+            detail=f"it lost its merge queue turn {len(lost)} times, each to a catch-up "
+                   f"right after {', '.join(lost)} merged ahead of it: the queue should "
+                   f"catch up only the order at its front",
+            repaired=False,
+            owed="",
+            notice=f"{wo['id']}: caught up {len(lost)} times after queued merges ahead of it "
+                   f"landed, so the merge queue is not holding its turn",
+        )
+
+
 INV_RED_RELEASE_UNDISCOUNTED = "INV-RED-RELEASE-UNDISCOUNTED"
 
 
@@ -4735,6 +4776,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # already flagged: whichever sees it first raises the same `true_blockers[0]`
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_queue_turn_survives_merge,   # order-free: a pure read that repairs nothing
     check_precondition_is_wired,   # order-free: a pure read that repairs nothing, raises
                                    # no flag and writes no status, so nothing else in the tuple reads its output
     check_blocker_matches_record,  # order-free: a pure read, like the line above
