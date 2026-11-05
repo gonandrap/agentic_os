@@ -207,6 +207,9 @@ for `ci.inherited`'s reason: fail-fast makes the base and the branch name differ
 of one matrix (`src/jarvis/ci.py:314-323`). The fact comes from the passed-in `base_red`,
 so `decide` stays pure.
 
+**Superseded by 2026-09-18 §2.1:** the clause is emitted only when the poll established a
+shared failure (`BaseRed.shared_failure`), and it says "may be the same break".
+
 The pause does not touch the heal: `heal_inherited_failure` runs in an earlier branch of
 the poll (`src/jarvis/daemon.py:4586-4597`) and is unaffected.
 
@@ -413,7 +416,8 @@ leaves no stale sentence — but all of them render the new reason text.
 * **Job-level naming of the base failure.** `gh run list` answers `workflowName` and no
   job (`src/jarvis/ci.py:71`), so rows and holds name the workflow and the run URL, not
   `unit (3.13)`. A job name would need `gh run view --json jobs`, a second call and a new
-  `VERBS` entry, for a string the run URL already shows.
+  `VERBS` entry, for a string the run URL already shows. (2026-09-18 §2.1 now pays that
+  call to compare jobs; holds still name the workflow and the run URL.)
 * **`status_label` / `base_red_note`.** Unchanged, for the per-listing read cost stated in
   §6.
 * **Blocking DISPATCH while `main` is red.** Not asked for, and it would stop work that
