@@ -421,6 +421,17 @@ def reviews_gate(store: ProjectStore, wo: dict[str, Any],
     return invariants.waiting_on_neo_gate(store, wo)
 
 
+def reviews_assumptions(store: ProjectStore, wo: dict[str, Any],
+                        now: float | None = None) -> bool:
+    """True when a pending row is not yet the user's, so `Daemon.auto_review` holds it (io-ed253c2b)"""
+    from . import invariants
+    # `Daemon.auto_review` lists rows with the hidden-excluding default
+    if wo.get("hidden"):
+        return False
+    return (len(invariants.reviewable_assumptions(store, wo))
+            > len(invariants.assumptions_owed_to_user(store, wo)))
+
+
 #: Walk the transcript tree for one-hour cache writes every N ticks
 CACHE_TTL_EVERY_TICKS = 4320
 
@@ -3491,21 +3502,36 @@ class Daemon:
             prod = production_code_dir()
             os_name = self._os_project()
             # Where each project's production lives: the OS runs from its deployed checkout
-            dirs = {p.name: p.path for p in self.catalog.projects if p.path.is_dir()}
+            dirs = {p.name: p.production_dir for p in self.catalog.projects
+                    if p.production_dir.is_dir()}
             if os_name and prod.is_dir():
                 dirs[os_name] = prod
-            # The OS ships by release; every other project ships when its PR merges
+            # A declared production directory that is gone: its rows wait, never checked elsewhere
+            no_production = {p.name for p in self.catalog.projects
+                             if p.name != os_name and not p.production_dir.is_dir()
+                             and p.production.path}
+            for name in sorted(no_production):
+                log.warning("[%s] morpheus: its production directory is missing", name)
+            # The OS ships by release; every other project by merge or, when it says so, by tag
             if os_name and (prod / ".git").exists():
                 try:
                     morpheus.ensure_release_queued(central, cfg, prod, project=os_name)
                 except Exception:  # noqa: BLE001 — the rest of the pass still runs
                     log.exception("morpheus: could not queue the running release")
             for project in self.catalog.projects:
-                if project.name == os_name or not project.path.is_dir():
+                if (project.name == os_name or project.name in no_production
+                        or not project.path.is_dir()):
                     continue
                 store = ProjectStore(project.path)  # thread-local
                 try:
-                    morpheus.queue_merges(central, cfg, project.name, store)
+                    if project.production.path:
+                        morpheus.rewrite_dev_scripts(central, cfg, project.name, project.path,
+                                                     project.production.path)
+                    if project.production.ships == "tag":
+                        morpheus.queue_deployed(central, cfg, project.name, store,
+                                                project.production_dir)
+                    else:
+                        morpheus.queue_merges(central, cfg, project.name, store)
                 except Exception:  # noqa: BLE001
                     log.exception("[%s] morpheus: could not queue merged PRs", project.name)
                 finally:
@@ -3527,7 +3553,7 @@ class Daemon:
                 log.exception("morpheus: could not settle investigated items")
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
-            skip = archived_projects(central)
+            skip = {*archived_projects(central), *no_production}
             def cwd_for(item: dict) -> Path:
                 return dirs.get(item.get("project") or "", fallback)
 
@@ -3547,6 +3573,10 @@ class Daemon:
                                  item["pr_number"], item["state"], action)
                 except Exception:  # noqa: BLE001 — one item must not starve the others
                     log.exception("morpheus: action for %s failed", item["id"])
+            if not morpheus.held(central):
+                for item_id in morpheus.reask_answered(central, self.catalog, skip=skip):
+                    log.info("morpheus %s: Neo answered with no way to settle it, asked again",
+                             item_id)
             # One short session per owed order, in that order's production directory (§3)
             armed = morpheus.arm(central, self.catalog, cwd_for, skip=skip)
             ran = {k: v for k, v in armed.items() if v and k not in ("paused", "usage_held")}

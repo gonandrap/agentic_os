@@ -58,6 +58,7 @@ from .daemon import (
     polls_and_can_act_on_pull_request,
     polls_pull_request,
     retries_turn,
+    reviews_assumptions,
     reviews_gate,
     settles_turn,
     validation_round,
@@ -1425,7 +1426,9 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
     wo_id = wo["id"]
     round_note = invariants.parallel_round_note(store, wo_id)
     pending = store.pending_assumptions(wo_id)
-    if turn_end_is_delivery(wo):
+    if wo["status"] == "needs_review":
+        pending = invariants.assumptions_owed_to_user(store, wo)
+    elif turn_end_is_delivery(wo):
         pending = invariants.assumptions_left_with_user(store, wo, pending)
     turn = store.latest_turn(wo_id)
     working = (turn is not None and turn["state"] == "running"
@@ -1459,11 +1462,12 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
                           f"comes the OS abandons it unreviewed on the "
                           f"`gates.case_ttl_seconds` timer"}
     question = awaiting_neo(wo_id)
-    # The worker's own escalated question on an order parked for review falls through to the status arm:... (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
+    # Escalated worker question or Neo-held assumption question falls to the status arms (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
     outranked = (question is not None
-                 and question["status"] in USER_HELD_Q_STATUSES
-                 and question["kind"] == "question"
-                 and wo["status"] == "needs_review")
+                 and wo["status"] == "needs_review"
+                 and question["kind"] == ("question"
+                                          if question["status"] in USER_HELD_Q_STATUSES
+                                          else "assumption"))
     if question is not None and not outranked:
         if question["status"] in USER_HELD_Q_STATUSES:
             return {"what": "neo_escalated", "stalled": False,
@@ -1527,6 +1531,10 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
         return {"what": "failed", "stalled": False,
                 "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
                           f"relaunches it in the same session; nothing is running to nudge"}
+    if wo["status"] == "needs_review" and reviews_assumptions(store, wo):
+        return {"what": "assumptions_with_neo", "stalled": False,
+                "detail": "Neo is reviewing its assumptions — each is settled by itself "
+                          "or comes to you once Neo has ruled"}
     if wo["status"] in ("completed", "cancelled", "waiting_pr_merge",
                         "needs_review"):
         return {"what": wo["status"], "stalled": False,
@@ -2260,7 +2268,7 @@ def _disagreements(blocker: dict[str, Any], needs_you: list[str]) -> list[str]:
 FIX_NOTHING_TO_CLEAR: tuple[str, ...] = (
     "turn_running", "validating", "retry_pending", "neo_question", "gate_with_neo",
     "queued_message", "pending", "manager_idle", "completed", "cancelled", "failed",
-    "waiting_pr_merge", "needs_review",
+    "waiting_pr_merge", "needs_review", "assumptions_with_neo",
 )
 
 #: Said of a blocker no shipped remedy covers AND whose way through somebody can type
@@ -9218,9 +9226,12 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 until, cause = validation_hold(events, int(latest["round"]))
                 ci_held = cause == VALIDATION_CI_CAUSE and until > now
             ci_spans = validation_ci_hold_spans(events, since, now)
-        # A MERGE THE OS IS ITSELF HOLDING ONTO A RED BASE IS NOT STUCK (§1 and §2 of... (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)
+        # A MERGE OR A `pending` RELEASE THE OS HOLDS ON A RED BASE IS NOT STUCK (docs/superpowers/specs/2026-11-04-a-release-held-by-a-red-base-is-not-stuck.md)
+        held_by_red_base = (wo["status"] == "waiting_pr_merge"
+                            or (wo["status"] == "pending"
+                                and release.is_release_order(wo)))
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
-                          if wo["status"] == "waiting_pr_merge" else [])
+                          if held_by_red_base else [])
         # A MERGE THE OS IS ITSELF HOLDING FOR GITHUB'S RUNNING CHECKS IS NOT STUCK (§2 and §3 of...
         automerge_checks_held, automerge_spans, am_note = False, [], ""
         if wo["status"] == "waiting_pr_merge":
@@ -9297,13 +9308,13 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         verdict = stuck.assess(
             str(wo["status"]), now - since, silence,
             discounted, thresholds, cfg.fallback_minutes * 60.0,
-            # CI and base-red cannot collide: `validating` and `waiting_pr_merge` (§1 of the 2026-10-15 spec)
+            # CI and base-red cannot collide: CI is `validating`-only (§1 of the 2026-10-15 spec)
             excluded_cause=(PAUSE_USAGE_LIMIT
                             if window or any(h.open for h in usage)
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
-                            if base_red and wo["status"] == "waiting_pr_merge"
-                            # AFTER the red base and BEFORE the dependency: both are `waiting_pr_merge`-only and CAN co-occur
+                            if base_red and held_by_red_base
+                            # AFTER the red base and BEFORE the dependency: the first two CAN co-occur
                             else stuck.AUTOMERGE_CHECKS_CAUSE if automerge_checks_held
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE
@@ -17471,10 +17482,15 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "daemon.polls_pull_request", polls_pull_request),
         REVIEWS_GATE,
     )),
-    # The USER is the actor: `true_blockers`' four-way triage always yields a line for a governed order
-    "needs_review": ActorPasses((JUDGES_ROUND, REVIEWS_GATE), none_because=(
-        "no daemon pass of its own — the user reviews it, and "
-        "`invariants.true_blockers` is what puts it in front of them")),
+    # With no pass selecting it the USER is the actor: `true_blockers`' triage gives them the line
+    "needs_review": ActorPasses((
+        JUDGES_ROUND,
+        _Pass("Daemon.auto_review",
+              "Neo holds or is about to be asked a pending assumption of this order: "
+              "a row `invariants.assumptions_owed_to_user` does not yet give the user",
+              "daemon.reviews_assumptions", reviews_assumptions),
+        REVIEWS_GATE,
+    )),
     "waiting_pr_merge": ActorPasses((
         # wo-d3a70c29: the poll still SELECTS a stalled row (`polls_pull_request` is untouched)
         _Pass("Daemon.poll_pull_requests", _pr_poll_why,
@@ -17547,8 +17563,12 @@ def _morpheus_cwd(catalog: Catalog, item: dict[str, Any]) -> Path:
     if item.get("project") == os_name and prod.is_dir():
         return prod
     for p in catalog.projects:
-        if p.name == item.get("project") and p.path.is_dir():
-            return p.path
+        if p.name == item.get("project"):
+            if p.production_dir.is_dir():
+                return p.production_dir
+            if p.production.path:
+                raise OpsError(f"{p.name}'s production directory {p.production.path} is "
+                               f"missing: {item.get('id')} waits, it is never checked elsewhere")
     return prod if prod.is_dir() else Path.cwd()
 
 
