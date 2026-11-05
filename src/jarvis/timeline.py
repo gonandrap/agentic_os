@@ -648,6 +648,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return ("Closing and reopening the pull request to make GitHub recompute it",
                 (f"branch at {ref[:10]}, pull request head at {head[:10]}"
                  if ref and head else str(p.get("pr_url") or "")))
+    if kind == "pr_superseded":
+        return "Closing the pull request as superseded", str(p.get("reason") or "")
+    if kind == "pr_superseded_settled":
+        return ("Settled as superseded: an equivalent change is on the base",
+                f"round {p.get('passed_round')} passed its work")
     if kind == "pr_resync_done":
         # TWO WRITERS, ONE EVENT KIND, told apart by `observed`: the OS's own reopen returning
         if p.get("observed"):
