@@ -97,12 +97,24 @@ GAP_CLASSES: dict[str, GapClass] = {
         issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
         since="",
     ),
+    "superseded-delivery": GapClass(
+        id="superseded-delivery",
+        headline="an order's pull request nets to nothing because an equivalent change "
+                 "reached the base first, so a round has nothing to judge",
+        symptom="an order that already passed, escalated as nothing to review, its open "
+                "pull request reporting zero changed files",
+        detector="Daemon._settle_superseded",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1592",
+        since="",
+    ),
 }
 
 #: Asserted equal to `tuple(GAP_CLASSES)`, on `remedies.SHIPPED_REMEDIES`' precedent
 SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "oversized-input", "unwired-precondition",
-                                        "background-task-silence")
+                                        "background-task-silence",
+                                        "superseded-delivery")
 
 
 def checked_slug(raw: str) -> str:

@@ -616,6 +616,14 @@ NO_VALIDATOR_REASON = (
 )
 
 #: Why an abandonment with nothing produced closes its round unjudged and unescalated
+#: Written before the OS closes a superseded pull request, read by the poll (#1592)
+PR_SUPERSEDED_EVENT = "pr_superseded"
+#: `cause` on the `validation_failed` event of a close GitHub refused
+SUPERSEDED_CLOSE_CAUSE = "superseded_close"
+SUPERSEDED_VOID_REASON = (
+    "{url} now changes no files and round {round} passed its work, and `{base}` has "
+    "since changed those files ({commits}), so the OS closed it as superseded.")
+
 ABANDONED_VOID_REASON = (
     "the worker abandoned this order and it produced nothing — no files, no pull "
     "request, no other durable effect — so there is no work for a reviewer and no "
@@ -2493,6 +2501,10 @@ class Daemon:
                                f"has judged the work.",
                                cause=ops.ESCALATION_USER_ACTION, user_action=needs_user)
                 return
+            # NOTHING CHANGED BECAUSE AN EQUIVALENT CHANGE REACHED THE BASE FIRST (#1592)
+            if empty == "escalate" and base_red is None and self._settle_superseded(
+                    project, store, wo, round_id, n, packet):
+                return
             if empty == "escalate":
                 self._escalate(store, wo, round_id, n,
                                "this submission changes no files and records no other "
@@ -2717,6 +2729,72 @@ class Daemon:
         bus.post(store, subject=bus.Subject(wo_id=wo_id),
                  from_role="reviewer", to_role="implementor",
                  payload=bus.ReviewFeedback(round=n, outcome="rejected", reason=text))
+
+    def _settle_superseded(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                           round_id: int, n: int, packet: Any) -> bool:
+        """Close an empty pull request and settle on its passed round, if git proves the work reached the base (#1592)"""
+        from . import evidence as evidence_mod
+        from . import github, invariants, ops, pr_resync
+
+        wo_id = wo["id"]
+        state = str((packet.pr or {}).get("state") or "")
+        closing = store.events_of_kind(wo_id, PR_SUPERSEDED_EVENT)
+        if not (state == "OPEN" or (state == "CLOSED" and closing)):
+            return False
+        verdicts = [r for r in store.validation_rounds(wo_id=wo_id)
+                    if int(r["round"]) < n and r["outcome"] in ("passed", "rejected")]
+        if not verdicts or verdicts[-1]["outcome"] != "passed":
+            return False
+        passed = verdicts[-1]
+        landed = evidence_mod.base_commits_touching(
+            project.path, packet.base, str(passed["head_sha"] or ""),
+            db.from_json(passed["file_shas"], {}) or {})
+        if (not landed or worker_session.busy(store, wo_id) is not None
+                or invariants.reviewable_assumptions(store, wo)
+                or not ops.refusal_answered(store, wo_id)):
+            return False
+        why = SUPERSEDED_VOID_REASON.format(
+            url=packet.pr_url, round=passed["round"], base=packet.base,
+            commits="; ".join(landed))
+        if not closing:
+            # BEFORE the close: `poll_pull_requests` must not read it as refused work
+            store.add_event(wo_id, PR_SUPERSEDED_EVENT,
+                            {"pr_url": packet.pr_url, "reason": why})
+        if state == "OPEN":
+            try:
+                pr_resync.pr_close(packet.pr_url, cwd=project.path)
+            except github.GitHubError as e:
+                self._superseded_close_failed(store, wo, round_id, n, why, e)
+                return True
+        store.settle_validation_round(
+            round_id, "void", {"round": n, "round_id": round_id, "reason": why},
+            wo_id=wo_id, reason=why)
+        ops.settle_superseded(store, wo, why, int(passed["round"]))
+        log.info("[%s] %s: round %d voided — superseded on the base (%s)",
+                 project.name, wo_id, n, packet.pr_url)
+        return True
+
+    def _superseded_close_failed(self, store: ProjectStore, wo: dict, round_id: int,
+                                 n: int, why: str, error: Exception) -> None:
+        """GitHub refused the close: retried as an outage is, then named to the user"""
+        from . import ops
+
+        wo_id = wo["id"]
+        attempts = 1 + sum(
+            1 for e in store.events_of_kind(wo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == SUPERSEDED_CLOSE_CAUSE)
+        store.settle_validation_round(
+            round_id, "failed",
+            {"round": n, "cause": SUPERSEDED_CLOSE_CAUSE, "attempt": attempts,
+             "error": str(error)[:500]},
+            wo_id=wo_id, reason=f"the superseded pull request could not be closed: {error}")
+        if attempts >= VALIDATION_OUTAGE_LIMIT:
+            self._escalate(
+                store, wo, round_id, n,
+                f"{why} The OS could not close it {attempts} times running: {error}. "
+                f"Close it by hand, then `jarvis wo done {wo_id}`.",
+                cause=ops.ESCALATION_NOTHING_TO_JUDGE)
 
     @staticmethod
     def _void(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -5840,6 +5918,9 @@ class Daemon:
                         log.info("[%s] %s is closed because the OS closed it to resync "
                                  "it — %s is not refused work", project.name,
                                  wo["pr_url"], wo["id"])
+                    elif store.events_of_kind(wo["id"], PR_SUPERSEDED_EVENT):
+                        log.info("[%s] %s is closed as superseded — %s settles on its "
+                                 "round", project.name, wo["pr_url"], wo["id"])
                     elif not store.pr_closure_told(wo["id"]):
                         log.info("[%s] %s closed unmerged — %s needs the user",
                                  project.name, wo["pr_url"], wo["id"])
