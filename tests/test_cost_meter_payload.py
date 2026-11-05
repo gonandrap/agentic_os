@@ -341,12 +341,6 @@ def test_an_unreliable_span_suppresses_both_alarms_and_the_daemon_writes_nothing
         assert central.unacked_inbox("warning") == []
     finally:
         central.close()
-    store = ProjectStore(fleet_fixture.project_path)
-    try:
-        carrier = store.latest_settled_order()
-        assert store.events_of_kind(carrier["id"], "cost_alarm") == []
-    finally:
-        store.close()
 
 
 def test_a_window_ending_ahead_of_now_reconciles_like_the_same_span_ending_now(fleet_fixture):
@@ -528,7 +522,6 @@ def reconcile(f, daemon, *, name: str = "proj_a"):
 def test_the_outside_alarm_fires_once_per_window_for_the_os_owner(
         fleet_fixture, fixed_now):
     assert METER_RECONCILE_EVERY_TICKS == 360
-    fleet_fixture.order("the carrier", status="completed")
     scene(fleet_fixture, until=SPAN_UNTIL, samples=120)
     daemon = daemon_for(fleet_fixture)
 
@@ -538,15 +531,12 @@ def test_the_outside_alarm_fires_once_per_window_for_the_os_owner(
     assert [r["kind"] for r in raised] == ["cost_outside_spend_high"]
     assert "1a9cd19d" in raised[0]["reason"]
     assert "look at the cost page" in raised[0]["reason"]
-    carrier = ProjectStore(fleet_fixture.project_path)
-    try:
-        assert raised[0]["wo_id"] == carrier.latest_settled_order()["id"]
-    finally:
-        carrier.close()
+    assert raised[0]["wo_id"] is None, "no order settled yet, and none would carry it"
     central = CentralStore()
     try:
-        told = central.unacked_inbox("warning")
-        assert len(told) == 1 and told[0]["wo_id"] == raised[0]["wo_id"]
+        (told,) = central.unacked_inbox("warning")
+        assert told["wo_id"] is None
+        assert "Your action:" in told["body"]
     finally:
         central.close()
 
@@ -558,11 +548,10 @@ def seed_occurrences(f, kind: str, ages_days: list[float]) -> None:
     """Rows of `kind` already on the record, this many days old, with the review's verdict"""
     store = ProjectStore(f.project_path)
     try:
-        carrier = store.latest_settled_order()
         for age in ages_days:
-            row = store.add_finding(carrier["id"], kind=kind, reason=f"seen {age}d ago")
+            row = store.add_finding(None, kind=kind, reason=f"seen {age}d ago")
             store.update_alarm(row["id"], status="acked", verdict="escalate",
-                               verdict_reason=f"carrier cannot explain {age}",
+                               verdict_reason=f"cannot be explained {age}",
                                ts=T0 - age * 86_400)
     finally:
         store.close()
@@ -684,46 +673,82 @@ def test_a_failed_filing_retries_on_the_next_pass(fleet_fixture, fixed_now, monk
     assert len(filed) == 1
 
 
-def test_the_packet_carries_prior_verdicts_and_a_verdict_stays_off_the_carrier(
+def test_the_packet_carries_prior_verdicts_and_a_verdict_stays_on_the_row(
         fleet_fixture, fixed_now):
     from jarvis import supervisor
     from jarvis.catalog import SupervisorConfig
 
-    fleet_fixture.order("the carrier", status="completed")
     seed_occurrences(fleet_fixture, "cost_residual_high", [3.0])
     store = ProjectStore(fleet_fixture.project_path)
     central = CentralStore()
     try:
-        carrier = store.latest_settled_order()
-        alarm = store.add_finding(carrier["id"], kind="cost_residual_high", reason="again")
+        alarm = store.add_finding(None, kind="cost_residual_high", reason="again")
 
-        packet = supervisor.build_evidence(store, {"kind": "work_order", "row": carrier}, alarm)
+        packet = supervisor.build_evidence(store, {"kind": "machine", "row": {}}, alarm)
         assert "# This standing condition" in packet
         assert "occurrence 2" in packet
-        assert "carrier cannot explain 3.0" in packet
+        assert "cannot be explained 3.0" in packet
+        assert "# The work order" not in packet
 
-        supervisor._apply(store, None, central, "proj_a", carrier, alarm,
+        supervisor._apply(store, None, central, "proj_a", None, alarm,
                           {"decision": "escalate", "failed": False, "reason": "unexplained",
                            "note": ""}, packet, SupervisorConfig())
         row = store.get_alarm(alarm["id"])
         assert (row["status"], row["verdict"]) == ("acked", "escalate")
-        assert not store.get_work_order(carrier["id"])["needs_attention"]
         assert central.unacked_inbox("warning") == []
     finally:
         central.close()
         store.close()
 
 
+def test_the_inbox_line_states_what_the_user_owes(fleet_fixture, fixed_now, monkeypatch):
+    daemon = residual_scene(fleet_fixture, monkeypatch)
+    reconcile(fleet_fixture, daemon)
+
+    central = CentralStore()
+    try:
+        (told,) = central.unacked_inbox("warning")
+    finally:
+        central.close()
+    assert told["wo_id"] is None
+    assert "No action is owed from you" in told["body"]
+    assert alarms(fleet_fixture)[0]["id"] in told["body"]
+    assert "wo-" not in told["body"]
+
+
+def test_a_machine_wide_review_runs_with_no_work_order(fleet_fixture, fixed_now, monkeypatch):
+    from jarvis import structured, supervisor
+    from jarvis.catalog import SupervisorConfig
+    from jarvis.neo_store import NeoStore
+
+    seen: list[str] = []
+
+    def judged(evidence, **_):
+        seen.append(evidence)
+        return {"decision": "escalate", "failed": False, "reason": "unexplained", "note": ""}
+
+    monkeypatch.setattr(structured, "request", judged)
+    store = ProjectStore(fleet_fixture.project_path)
+    neo = NeoStore()
+    try:
+        alarm = store.add_finding(None, kind="cost_residual_high", reason="again")
+        supervisor.review(store, neo, "proj_a", None, alarm, SupervisorConfig())
+        assert store.get_alarm(alarm["id"])["verdict"] == "escalate"
+        assert "The whole machine" in seen[0] and "# The work order" not in seen[0]
+    finally:
+        neo.close()
+        store.close()
+
+
 def test_a_work_order_alarm_gets_no_standing_section(fleet_fixture, fixed_now):
     from jarvis import supervisor
 
-    fleet_fixture.order("the carrier", status="completed")
+    order = fleet_fixture.order("an order", status="completed")
     store = ProjectStore(fleet_fixture.project_path)
     try:
-        carrier = store.latest_settled_order()
-        alarm = store.add_finding(carrier["id"], kind="some_cost_kind", reason="x")
+        alarm = store.add_finding(order, kind="some_cost_kind", reason="x")
         assert "# This standing condition" not in supervisor.build_evidence(
-            store, {"kind": "work_order", "row": carrier}, alarm)
+            store, {"kind": "work_order", "row": store.get_work_order(order)}, alarm)
     finally:
         store.close()
 

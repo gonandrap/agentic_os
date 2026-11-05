@@ -20,7 +20,7 @@ Rows of one kind form a chain while neighbours are under `METER_STANDING_GAP_SEC
 (7 days) apart, and the newest is that close to now (`ProjectStore.standing_alarms`).
 Consecutive windows cannot define it: production raised on 5 of about 16 windows. The count
 and first-seen are derived from `wo_alarms`, so no schema change, and rows from before this
-release count (Q3395). A row states both in its reason and in its `cost_alarm` event.
+release count (Q3395). A row states both in its reason.
 
 ### What each occurrence does
 
@@ -29,7 +29,7 @@ release count (Q3395). A row states both in its reason and in its `cost_alarm` e
 - From 3: an `informational` row. No model call, no inbox.
 
 For these kinds a verdict is written on the row and goes no further: no Neo question, no
-attention flag on the carrier, no inbox line, no remedy (`supervisor._apply`). The packet
+attention flag, no inbox line, no remedy (`supervisor._apply`). The packet
 gains a section with prior occurrences and their verdicts (`supervisor._standing_lines`).
 
 ### The diagnostic
@@ -42,3 +42,15 @@ second. A failed filing records nothing and retries on the next 30-minute pass.
 
 `cost_outside_spend_high` files nothing (Q3396): outside spend is the user's own sessions,
 with no accounting fix to diagnose. Its repeats are counted, visible in `jarvis alarms`.
+
+### No carrier (wo-87e007eb, Q3553)
+
+`project_store.MACHINE_WIDE_KINDS` (the meter and cache-TTL kinds; `check_cache_ttl` has no
+causal order either) write `wo_alarms.wo_id` NULL, no `wo_events` row and no inbox `wo_id`, and
+need no settled order to raise. The review gets subject kind `machine`; its verdict stays on
+the row. The rebuild to nullable runs once on open, and also takes existing rows off their
+carriers and deletes those rows' events there. `proposed` rows keep their carrier, for their
+gate. Attention flags already up stay for the user's ack.
+
+The inbox line states the user's action, or says none is owed. A cache-TTL defect owes a
+`jarvis bug report`, since nothing files it. Recurrence stays meter-only (kn-9a7e536a).

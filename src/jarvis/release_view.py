@@ -74,8 +74,8 @@ def prefix(pending: list[dict[str, Any]], base: str) -> list[dict[str, Any]]:
 
 
 #: morpheus item state to the colour a release row shows
-VALIDATION = {"validated": "validated", "queued": "pending", "monitoring": "pending",
-              "failed": "failed", "timedout": "failed"}
+VALIDATION = {"validated": "validated", "unverified": "unverified", "queued": "pending",
+              "monitoring": "pending", "failed": "failed", "timedout": "failed"}
 
 
 def validation_of(item: dict[str, Any] | None) -> str:
@@ -83,9 +83,9 @@ def validation_of(item: dict[str, Any] | None) -> str:
 
 
 def summarize(rows: list[dict[str, Any]]) -> str:
-    """One word for a whole release: failed beats pending beats validated"""
+    """One word for a whole release: failed beats pending beats unverified beats validated"""
     states = {r["validation"] for r in rows}
-    for s in ("failed", "pending", "validated"):
+    for s in ("failed", "pending", "unverified", "validated"):
         if s in states:
             return s
     return "unwatched"

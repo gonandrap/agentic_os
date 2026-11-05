@@ -143,21 +143,22 @@ def _raise(daemon, store, transcripts, *, dispatched=0, foreign=0, now=None, **o
     return store.alarms_across()
 
 
-def test_the_daemon_raises_one_alarm_per_fault_on_the_latest_settled_order(
-        started, store, transcripts):
-    store.create_work_order("an old one", status="completed")
-    carrier = store.create_work_order("the newest settled one", status="completed")
+def test_the_daemon_raises_one_alarm_per_fault_on_no_order(started, store, transcripts):
+    settled = store.create_work_order("the newest settled one", status="completed")
 
     rows = _raise(started, store, transcripts, dispatched=90_000, foreign=900_000)
 
     assert {r["kind"] for r in rows} == {inspection.CACHE_1H_DISPATCHED_ALARM}
     for row in rows:
-        assert row["wo_id"] == carrier["id"]
+        assert row["wo_id"] is None
         assert row["seq"] == NO_TURN          # it judged no turn
         assert row["source"] == "cost"
         assert row["alarm_status"] == "raised"     # on the supervisor's queue
-    # The carrier is a hook, not a subject: it must not be flagged for the user
-    assert not store.get_work_order(carrier["id"])["needs_attention"]
+    assert not store.get_work_order(settled["id"])["needs_attention"]
+    assert store.events_of_kind(settled["id"], "cost_alarm") == []
+    (told,) = started.central.unacked_inbox("warning")
+    assert told["wo_id"] is None
+    assert "Your action:" in told["body"] and "jarvis bug report" in told["body"]
 
 
 def test_the_inbox_says_it_is_a_transport_defect(started, store, transcripts):
@@ -211,12 +212,11 @@ def test_the_off_switch_covers_this_too(started, store, transcripts):
     assert _raise(started, store, transcripts, dispatched=9_000_000, enabled=False) == []
 
 
-def test_with_no_settled_order_nothing_is_raised_and_nothing_breaks(started, store,
-                                                                    transcripts):
-    """`wo_alarms.wo_id` is a real foreign key and a young project has nothing to hang one on"""
+def test_a_project_with_no_settled_order_still_raises(started, store, transcripts):
     store.create_work_order("still running", status="running")
 
-    assert _raise(started, store, transcripts, dispatched=9_000_000) == []
+    (row,) = _raise(started, store, transcripts, dispatched=9_000_000)
+    assert row["wo_id"] is None
 
 
 def test_a_quiet_fleet_raises_nothing(started, store, transcripts):
@@ -266,7 +266,6 @@ def test_the_real_loop_raises_these_on_the_offset_tick(started, store, transcrip
     """THE WIRE, and the only test that fails if `Daemon.tick` stops calling this at all"""
     from jarvis import daemon as daemon_mod, db
 
-    carrier = store.create_work_order("carrier", status="completed")
     _both_halves(transcripts, db.now(), dispatched=9_000_000, foreign=9_000_000)
     started.tick_count = daemon_mod.CACHE_TTL_TICK_OFFSET - 1
 
@@ -275,8 +274,8 @@ def test_the_real_loop_raises_these_on_the_offset_tick(started, store, transcrip
     assert started.tick_count == daemon_mod.CACHE_TTL_TICK_OFFSET
     rows = store.alarms_across()
     assert {r["kind"] for r in rows} == {inspection.CACHE_1H_DISPATCHED_ALARM}
-    assert all(r["wo_id"] == carrier["id"] for r in rows)
-    titles = {r["title"] for r in started.central.unacked_inbox()}
+    assert all(r["wo_id"] is None for r in rows)
+    titles ={r["title"] for r in started.central.unacked_inbox()}
     assert _hour_titles(daemon_mod) <= titles
 
 
@@ -368,7 +367,7 @@ def test_the_drain_hands_it_to_the_judge(started, store, transcripts):
     class _Judge:
         @staticmethod
         def review(pstore, neo_store, project_name, wo, row, cfg, **kw):
-            seen.append((row["id"], row["kind"], wo["status"]))
+            seen.append((row["id"], row["kind"], wo))
             return {"decision": "ack", "reason": "the user's own sessions",
                     "note": "ok", "failed": False}
 
@@ -380,7 +379,7 @@ def test_the_drain_hands_it_to_the_judge(started, store, transcripts):
 
     judged = {row[0]: row for row in seen}
     assert alarm["id"] in judged, "the drain never handed this alarm to the judge"
-    assert judged[alarm["id"]][1:] == (inspection.CACHE_1H_DISPATCHED_ALARM, "completed")
+    assert judged[alarm["id"]][1:] == (inspection.CACHE_1H_DISPATCHED_ALARM, None)
     assert not [r for r in store.alarms_across() if r["alarm_status"] == "skipped"]
 
 
@@ -391,12 +390,11 @@ def test_the_evidence_packet_carries_the_kind_and_no_turn_number(started, store,
     from jarvis.catalog import SupervisorConfig
 
     alarm = _raised(started, store, transcripts)
-    carrier = store.get_work_order(alarm["wo_id"])
 
     packet = supervisor.build_evidence(
-        store, {"kind": "work_order", "row": carrier}, alarm,
-        SupervisorConfig(), InspectConfig())
+        store, {"kind": "machine", "row": {}}, alarm, SupervisorConfig(), InspectConfig())
 
+    assert "# The work order" not in packet
     assert "raised on no particular turn" in packet
     assert "turn -1" not in packet
     assert inspection.CACHE_1H_DISPATCHED_ALARM in packet
@@ -513,7 +511,7 @@ def _stamped_rate(store, *, arm: str, cache_1h: int, cache_5m: int) -> dict:
 def test_the_daemon_raises_it_off_the_record_with_no_transcript_at_all(
         started, store, transcripts):
     """THE WHOLE POINT: the 1h-armed session never mentions the 1h key, so only the record sees it"""
-    carrier = _stamped_rate(store, arm="1h", cache_1h=0, cache_5m=900_000)
+    _stamped_rate(store, arm="1h", cache_1h=0, cache_5m=900_000)
     project = started.catalog.projects[0]
     project.inspect = InspectConfig()
 
@@ -521,7 +519,7 @@ def test_the_daemon_raises_it_off_the_record_with_no_transcript_at_all(
 
     rows = store.alarms_across()
     assert [r["kind"] for r in rows] == [inspection.CACHE_ARM_MISSED_ALARM]
-    assert rows[0]["wo_id"] == carrier["id"] and rows[0]["seq"] == NO_TURN
+    assert rows[0]["wo_id"] is None and rows[0]["seq"] == NO_TURN
     assert rows[0]["source"] == "cost" and rows[0]["alarm_status"] == "raised"
 
     from jarvis import daemon as daemon_mod
@@ -545,7 +543,7 @@ def test_a_turn_outside_the_window_is_not_in_it(started, store, transcripts):
     """The window is the same cohort the 1h pair uses"""
     from jarvis import db
 
-    wo = _stamped_rate(store, arm="1h", cache_1h=0, cache_5m=900_000)
+    _stamped_rate(store, arm="1h", cache_1h=0, cache_5m=900_000)
     store.conn.execute("UPDATE wo_turns SET started_at=?", (db.now() - 60 * DAY,))
     store.conn.commit()
     project = started.catalog.projects[0]
@@ -557,7 +555,7 @@ def test_a_turn_outside_the_window_is_not_in_it(started, store, transcripts):
     store.conn.execute("UPDATE wo_turns SET started_at=?", (db.now() - DAY,))
     store.conn.commit()
     started.check_cache_ttl(project, store)
-    assert [r["wo_id"] for r in store.alarms_across()] == [wo["id"]]
+    assert [r["kind"] for r in store.alarms_across()] == [inspection.CACHE_ARM_MISSED_ALARM]
 
 
 def test_an_unreadable_transcript_tree_no_longer_hides_the_record_half(

@@ -473,6 +473,10 @@ ALARM_REVIEWABLE_STATUSES = ("acked", "escalated", "failed")
 ALARM_SUBJECTS = ("work_order", "feature_order")
 #: `invariant` is `invariants.check_undeclared_delivery`'s (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
 ALARM_SOURCES = ("cost", "health", "invariant", "rule")
+#: About the whole machine, so `wo_alarms.wo_id` is NULL (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)
+MACHINE_WIDE_KINDS = ("cost_outside_spend_high", "cost_residual_high",
+                      "cost_residual_diagnosed", "cache-1h-dispatched",
+                      "cache-1h-foreign", "cache-arm-missed")
 
 # How one health sweep ended (`health_reviews.outcome`, §4) (docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md)
 HEALTH_OUTCOMES = ("clear", "findings", "failed", "held")
@@ -610,7 +614,7 @@ CREATE TABLE IF NOT EXISTS wo_events (
 -- docs/superpowers/specs/2026-08-31-the-supervisor.md and is NULL/default until then.
 CREATE TABLE IF NOT EXISTS wo_alarms (
     id TEXT PRIMARY KEY,                    -- 'al-' + db.new_id, like wo-/fo-
-    wo_id TEXT NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
+    wo_id TEXT REFERENCES work_orders(id) ON DELETE CASCADE,  -- NULL: MACHINE_WIDE_KINDS
     ts REAL NOT NULL,
     kind TEXT NOT NULL,                     -- inspection's alarm kinds
     seq INTEGER NOT NULL,                   -- the turn it judged
@@ -1436,6 +1440,7 @@ class ProjectStore:
 
     def _migrate(self) -> None:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
+        self._free_machine_alarms()
         self._backfill_alarms()
         self._backfill_abandoned_gates()
         self._backfill_spent_gates()
@@ -1546,6 +1551,50 @@ class ProjectStore:
                WHERE status='expired' AND closed_as='lapsed'
                  AND uses > 0 AND uses >= max_uses"""
         )
+
+    def _alarm_wo_id_required(self) -> bool:
+        return any(r["name"] == "wo_id" and r["notnull"] for r in
+                   self.conn.execute("PRAGMA table_info(wo_alarms)").fetchall())
+
+    def _free_machine_alarms(self) -> None:
+        """Once: make `wo_alarms.wo_id` nullable and take machine-wide rows off their carriers (docs/superpowers/specs/2026-11-04-standing-meter-condition.md)"""
+        if not self._alarm_wo_id_required():
+            return
+        with db.write_transaction(self.conn):
+            if not self._alarm_wo_id_required():
+                return  # a concurrent opener got here first
+            objects = self.conn.execute(
+                "SELECT type, sql FROM sqlite_master "
+                "WHERE tbl_name='wo_alarms' AND sql IS NOT NULL").fetchall()
+            # The live DDL, not SCHEMA's: it holds every column ALTERed in, in live order
+            table = next(o["sql"] for o in objects if o["type"] == "table")
+            table = table.replace("wo_id TEXT NOT NULL", "wo_id TEXT", 1)
+            self.conn.execute(table.replace("wo_alarms", "wo_alarms_rebuilt", 1))
+            self.conn.execute("INSERT INTO wo_alarms_rebuilt SELECT * FROM wo_alarms")
+            self.conn.execute("DROP TABLE wo_alarms")
+            self.conn.execute("ALTER TABLE wo_alarms_rebuilt RENAME TO wo_alarms")
+            for other in objects:
+                if other["type"] != "table":
+                    self.conn.execute(other["sql"])
+
+            kinds = ",".join("?" * len(MACHINE_WIDE_KINDS))
+            # A proposed row waits on a gate, and the gate's remedy needs its order
+            freed = {r["id"] for r in self.conn.execute(
+                f"SELECT id FROM wo_alarms WHERE kind IN ({kinds}) AND status<>'proposed'",
+                MACHINE_WIDE_KINDS)}
+            marks = ",".join("?" * len(ALARM_EVENT_KINDS))
+            for event in self.conn.execute(
+                    f"SELECT id, kind, payload FROM wo_events WHERE kind IN ({marks})",
+                    ALARM_EVENT_KINDS).fetchall():
+                payload = db.from_json(event["payload"], {}) or {}
+                alarm_id = payload.get("alarm_id")
+                # Before `wo_alarms`, a cost_alarm event named no row
+                if alarm_id in freed or (event["kind"] == "cost_alarm" and not alarm_id
+                                         and payload.get("kind") in MACHINE_WIDE_KINDS):
+                    self.conn.execute("DELETE FROM wo_events WHERE id=?", (event["id"],))
+            self.conn.execute(
+                f"UPDATE wo_alarms SET wo_id=NULL WHERE kind IN ({kinds}) "
+                "AND status<>'proposed'", MACHINE_WIDE_KINDS)
 
     def _backfill_alarms(self) -> None:
         """Give every alarm raised before `wo_alarms` existed a row of its own (docs/superpowers/specs/2026-08-31-the-supervisor.md)"""
@@ -1979,7 +2028,7 @@ class ProjectStore:
         })
         rows = self.conn.execute(
             f"SELECT a.*, w.title AS wo_title, {expr} AS _score FROM wo_alarms a "
-            "JOIN work_orders w ON w.id = a.wo_id "
+            "LEFT JOIN work_orders w ON w.id = a.wo_id "
             "WHERE _score > 0 ORDER BY _score DESC, a.ts DESC LIMIT ?",
             (*params, limit),
         ).fetchall()
@@ -2347,15 +2396,6 @@ class ProjectStore:
             later = float(row["ts"] or 0.0)
         chain.reverse()
         return chain
-
-    def latest_settled_order(self) -> dict[str, Any] | None:
-        """The most recently settled work order, as a CARRIER and nothing more"""
-        row = self.conn.execute(
-            f"""SELECT * FROM work_orders
-                WHERE status IN ({','.join('?' * len(TERMINAL_STATUSES))})
-                ORDER BY updated_at DESC LIMIT 1""",
-            TERMINAL_STATUSES).fetchone()
-        return dict(row) if row else None
 
     def unsealed_terminal_features(self, limit: int = 2) -> list[dict[str, Any]]:
         marks = ", ".join("?" for _ in FO_TERMINAL_STATUSES)
@@ -2809,7 +2849,7 @@ class ProjectStore:
         )
         return self.get_alarm(alarm_id)
 
-    def add_finding(self, wo_id: str, *, kind: str, reason: str, seq: int = NO_TURN,
+    def add_finding(self, wo_id: str | None, *, kind: str, reason: str, seq: int = NO_TURN,
                     source: str = "cost", probe: str | None = None,
                     subject_kind: str = "work_order",
                     fo_id: str | None = None, remedy: str | None = None,
@@ -2867,10 +2907,14 @@ class ProjectStore:
 
     def alarms_across(self, limit: int = 200, statuses: tuple[str, ...] | None = None,
                       wo_id: str | None = None, fo_id: str | None = None,
-                      sources: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
-        """Every alarm in the project, NEWEST first, with its work order"""
+                      sources: tuple[str, ...] | None = None,
+                      alarm_id: str | None = None) -> list[dict[str, Any]]:
+        """Every alarm in the project, NEWEST first, with its work order if it has one"""
         where = ["1=1"]
         args: list[Any] = []
+        if alarm_id:
+            where.append("a.id=?")
+            args.append(alarm_id)
         if statuses:
             where.append(f"a.status IN ({','.join('?' for _ in statuses)})")
             args.extend(statuses)
@@ -2901,7 +2945,7 @@ class ProjectStore:
             " w.needs_attention AS needs_attention,"
             " w.attention_reason AS attention_reason,"
             " f.title AS fo_title, f.status AS fo_status"
-            " FROM wo_alarms a JOIN work_orders w ON w.id = a.wo_id"
+            " FROM wo_alarms a LEFT JOIN work_orders w ON w.id = a.wo_id"
             " LEFT JOIN feature_orders f ON f.id = a.fo_id"
             f" WHERE {' AND '.join(where)} ORDER BY a.ts DESC LIMIT ?",
             (*args, limit)).fetchall()
