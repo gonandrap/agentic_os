@@ -54,7 +54,7 @@ one new terminal state `cancelled`:
 | `monitoring` | armed; the daemon runs `script` every `every_minutes` |
 | `validated` | exit 0, or waived — terminal, quiet |
 | `failed` / `timedout` | terminal; JUDGING IS OWED while `action` is empty |
-| `unverified` | not exercised by the deadline, no FAIL seen (§9) — terminal, quiet, never judged, not a pass |
+| `unverified` | not exercised by the deadline, no FAIL seen (§9), or an investigation found nothing wrong — terminal, quiet, never judged, not a pass |
 | `cancelled` | `jarvis mo cancel` — terminal, never judged, never handed off |
 
 A `queued` order past its deadline times out exactly as today (`sweep`), which is how an
