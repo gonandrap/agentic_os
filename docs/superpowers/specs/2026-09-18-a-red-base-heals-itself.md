@@ -61,6 +61,26 @@ would refuse to heal half the population this exists for.
 The asymmetry that makes this safe: a **false positive** costs one branch update, bounded
 by §3. A **false negative** costs exactly today's behaviour — the worker is nudged.
 
+### 2.1 Amendment: a red base must not hide the branch's own failure (io-f48bcdcb, Neo 3600)
+
+Every job in one workflow made every failure on a red base read as inherited: PRs 1585 and
+1586 sat held for failures `main` did not have. So both the hold and the rebuild now also
+require, by `ci.failure_standing`, for EVERY failing check:
+
+* the base run that was head when it started (`ci.head_when`, which is when the red episode
+  opened as far as this build is concerned) is red, and
+* its job failed or was **cancelled** on that run.
+
+Counting cancelled is what answers the fail-fast objection above: a job the base never
+finished proves nothing against the branch, so #298 still heals. Any other job means the
+failure is the branch's own, and it gets the normal `ops.PR_CHECKS` nudge. A base run still
+building, or a job list that cannot be read, gives no verdict: held while the base is red,
+rebuilt as before once it is green, and nothing is claimed.
+
+Known limits, accepted: `pytest-split` can move `main`'s failing test to another shard on a
+branch, which is then nudged; two different tests in one shard stay held, which is why the
+rider says only "may be the same break". The merge brake (`HELD_BASE_RED`) is untouched.
+
 **Where the network is.** `poll_pull_requests` already talks to `gh`; `invariants.py` must
 not. So the recogniser's reads live in the poll, and everything the status line needs is
 written down for `invariants.base_red_note` to read back (§4).
