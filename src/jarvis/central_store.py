@@ -1023,11 +1023,18 @@ class CentralStore:
         return [dict(r) for r in rows.fetchall()]
 
     def steward_queue_counts(self) -> dict[str, int]:
-        """{queue_state: n} over every decision that was ever queued for a re-offer"""
+        """{queue_state: n} over every decision ever queued; `refused`: waiting, and no wait clears"""
+        from .steward import UNCLEARABLE
+
         rows = self.conn.execute(
             "SELECT queue_state, COUNT(*) AS n FROM steward_decisions WHERE queue_state<>'' "
             "GROUP BY queue_state")
-        return {r["queue_state"]: int(r["n"]) for r in rows.fetchall()}
+        counts = {r["queue_state"]: int(r["n"]) for r in rows.fetchall()}
+        marks = ",".join("?" * len(UNCLEARABLE))
+        refused = self.conn.execute(
+            f"SELECT COUNT(*) FROM steward_decisions WHERE queue_state='waiting' "
+            f"AND rule IN ({marks})", UNCLEARABLE).fetchone()[0]
+        return {**counts, "refused": int(refused)} if refused else counts
 
     def steward_decisions(self, since: float = 0.0, *, wo_id: str = "",
                           limit: int = 500) -> list[dict[str, Any]]:
@@ -1080,6 +1087,19 @@ class CentralStore:
         return self.conn.execute(
             "UPDATE inbox SET status='acked' WHERE wo_id=? AND paired_reason IS NOT NULL "
             "AND status != 'acked'", (wo_id,)).rowcount
+
+    def orders_with_unacked_paired(self, project: str, reason: str) -> list[str]:
+        """The orders still holding an unacked row raised with this attention reason"""
+        rows = self.conn.execute(
+            "SELECT DISTINCT wo_id FROM inbox WHERE project=? AND paired_reason=? "
+            "AND wo_id IS NOT NULL AND status != 'acked'", (project, reason)).fetchall()
+        return [r["wo_id"] for r in rows]
+
+    def ack_paired_reason(self, wo_id: str, reason: str) -> int:
+        """Ack only the rows raised with THIS reason: another incident's row stays (io-ed253c2b)"""
+        return self.conn.execute(
+            "UPDATE inbox SET status='acked' WHERE wo_id=? AND paired_reason=? "
+            "AND status != 'acked'", (wo_id, reason)).rowcount
 
     def purge_work_order(self, wo_id: str) -> dict[str, int]:
         """Drop every central trace of a deleted work order"""

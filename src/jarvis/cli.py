@@ -529,7 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--release", metavar="TAG",
                     help="every monitoring order of that release tag, summed")
     sp.add_argument("--limit", type=int, default=50,
-                    help="work orders per project to measure (default: 50)")
+                    help="work orders to print (default: 50); totals cover them all")
     # The DISTRIBUTION, beside the listing rather than instead of it: what a typical order costs (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)
     sp.add_argument("--fleet", action="store_true",
                     help="what a TYPICAL order costs: n, avg, p90 and max per metric "
@@ -3364,7 +3364,8 @@ def cmd_cost(args: argparse.Namespace) -> int:
 
     units = res["units"]
     totals = res["totals"]
-    if not units:
+    unattributed = res.get("os_unattributed") or {}
+    if not units and not unattributed.get("os_calls"):
         print(f"no work orders found for {res['scope']}")
         return 0
     header = f"{res['scope']} — {res['measured']} measured"
@@ -3377,7 +3378,7 @@ def cmd_cost(args: argparse.Namespace) -> int:
     # `$` is the whole bill — the worker's conversation
     print(f"{'$':>7} {'jarvis':>7} {'subproc':>8} {'subagent':>9} {'turns':>5} "
           f"{'output':>7} {'re-write':>9}  work order")
-    for u in units:
+    for u in units[:args.limit]:
         os_cost = f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
         sub_cost = f"{u['subproc_cost_usd']:.2f}" if u.get("subproc_calls") else "—"
         agent_cost = (f"{u['subagent_cost_usd']:.2f}"
@@ -3390,6 +3391,12 @@ def cmd_cost(args: argparse.Namespace) -> int:
               f"{agent_cost:>9} {u['turns']:>5} "
               f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
               f"{u['id']}  {u['title'][:44]}")
+    # Not a unit, but in the total: the rows have to sum to it (io-82bcb830)
+    if unattributed.get("os_calls"):
+        un_cost = unattributed["os_cost_usd"]
+        print(f"{un_cost:>7.2f} {un_cost:>7.2f} {'—':>8} {'—':>9} {'—':>5} "
+              f"{'—':>7} {'—':>9}  (no work order)  "
+              f"{unattributed['os_calls']} jarvis calls")
 
     _print_turn_table(res)
     _print_os_calls(res)
@@ -3431,7 +3438,6 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"  {totals['undated_messages']} transcript messages carried no readable "
               f"timestamp and are excluded from this window")
     _print_write_ttl(totals)
-    unattributed = res.get("os_unattributed") or {}
     if unattributed.get("os_calls"):
         print(f"  OS overhead   ~${unattributed['os_cost_usd']:.2f} — "
               f"{unattributed['os_calls']} calls no work order caused "
@@ -3553,6 +3559,7 @@ def _print_fleet(fleet: dict) -> None:
     kinds = fleet["os_cost_by_kind"]
     if kinds:
         print("\nwhat jarvis itself spent, by kind (dearest first, $0 kinds included)")
+        print(f"  {fleet['os_cost_basis']}")
         for row in kinds:
             print(f"  {row['kind']:<22} {row['calls']:>6} "
                   f"call{'s' if row['calls'] != 1 else ' '}  "

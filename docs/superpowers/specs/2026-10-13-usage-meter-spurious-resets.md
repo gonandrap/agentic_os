@@ -150,6 +150,11 @@ MIN_RELIABLE_COVERAGE_SHARE` (`"low_coverage"`) or when
 — a whole 5h window could have opened and closed inside the hole, so neither the rise nor
 the reset count is bounded). The production case trips both.
 
+Amended by io-82bcb830: `coverage.share` is no longer readings over a nominal count. It is
+the share of `since..min(until, now)` lying between readings at most
+`COVERED_GAP_SECONDS` apart, so a window ending ahead of now is judged on what has happened
+and a gapless series at the sampler's real cadence reads 100%.
+
 ### 3. The honesty — one gate, reused
 
 `reconciliation` already has the "nothing can be derived" path: `covered` false gives

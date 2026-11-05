@@ -54,6 +54,13 @@ NOTES = (
     "the conversation and the transcript carries no window",
 )
 
+#: Printed beside `os_cost_by_kind`: its dollars are not the headline's list prices
+OS_COST_BASIS = (
+    "recorded cost, as each call reported it; the headline's jarvis figure reprices the same "
+    "calls at list prices, so the two differ. No work order is a subset of the kinds, not an "
+    "addition to them"
+)
+
 
 # The window
 
@@ -982,6 +989,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
         "metrics": _metrics(orders, os_turn_cost, os_unattributed_to_turn,
                             cfg=cfg, floor=floor, index=index),
         "os_cost_by_kind": kinds,
+        "os_cost_basis": OS_COST_BASIS,
         "os_unattributed": unattributed,
         # ADDITIVE, and `version` above stays 1: §10.6's rule, the one `cost_report` already applies
         "tools": tool_costs(orders.values(), cfg=cfg, floor=floor,
