@@ -1445,8 +1445,7 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
                           f"comes the OS abandons it unreviewed on the "
                           f"`gates.case_ttl_seconds` timer"}
     question = awaiting_neo(wo_id)
-    # The worker's own escalated question on an order parked for review falls through to the status arm:... (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
-    # A Neo-held assumption question is no worker's next turn: the assumptions_with_neo arm says it
+    # Escalated worker question or Neo-held assumption question falls to the status arms (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
     outranked = (question is not None
                  and wo["status"] == "needs_review"
                  and question["kind"] == ("question"
