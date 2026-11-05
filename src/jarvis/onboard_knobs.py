@@ -99,7 +99,7 @@ AREA_PREFIXES: dict[str, tuple[str, ...]] = {
     "inspect": ("inspect",),
     "observability": ("observability",),
     "messaging": ("messaging",),
-    "delivery": ("bugs", "pull_requests", "release"),
+    "delivery": ("bugs", "pull_requests", "release", "production"),
     "knowledge": ("knowledge_digest_chars", "knowledge_digest_limit", "knowledge_hint_chars",
                   "knowledge_hint_limit", "knowledge_inject_limit", "knowledge_pinned_chars"),
     "wiring": ("wiring",),

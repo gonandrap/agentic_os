@@ -3491,21 +3491,36 @@ class Daemon:
             prod = production_code_dir()
             os_name = self._os_project()
             # Where each project's production lives: the OS runs from its deployed checkout
-            dirs = {p.name: p.path for p in self.catalog.projects if p.path.is_dir()}
+            dirs = {p.name: p.production_dir for p in self.catalog.projects
+                    if p.production_dir.is_dir()}
             if os_name and prod.is_dir():
                 dirs[os_name] = prod
-            # The OS ships by release; every other project ships when its PR merges
+            # A declared production directory that is gone: its rows wait, never checked elsewhere
+            no_production = {p.name for p in self.catalog.projects
+                             if p.name != os_name and not p.production_dir.is_dir()
+                             and p.production.path}
+            for name in sorted(no_production):
+                log.warning("[%s] morpheus: its production directory is missing", name)
+            # The OS ships by release; every other project by merge or, when it says so, by tag
             if os_name and (prod / ".git").exists():
                 try:
                     morpheus.ensure_release_queued(central, cfg, prod, project=os_name)
                 except Exception:  # noqa: BLE001 — the rest of the pass still runs
                     log.exception("morpheus: could not queue the running release")
             for project in self.catalog.projects:
-                if project.name == os_name or not project.path.is_dir():
+                if (project.name == os_name or project.name in no_production
+                        or not project.path.is_dir()):
                     continue
                 store = ProjectStore(project.path)  # thread-local
                 try:
-                    morpheus.queue_merges(central, cfg, project.name, store)
+                    if project.production.path:
+                        morpheus.rewrite_dev_scripts(central, cfg, project.name, project.path,
+                                                     project.production.path)
+                    if project.production.ships == "tag":
+                        morpheus.queue_deployed(central, cfg, project.name, store,
+                                                project.production_dir)
+                    else:
+                        morpheus.queue_merges(central, cfg, project.name, store)
                 except Exception:  # noqa: BLE001
                     log.exception("[%s] morpheus: could not queue merged PRs", project.name)
                 finally:
@@ -3527,7 +3542,7 @@ class Daemon:
                 log.exception("morpheus: could not settle investigated items")
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
-            skip = archived_projects(central)
+            skip = {*archived_projects(central), *no_production}
             def cwd_for(item: dict) -> Path:
                 return dirs.get(item.get("project") or "", fallback)
 

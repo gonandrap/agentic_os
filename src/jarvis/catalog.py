@@ -763,6 +763,18 @@ class ReleaseConfig:
     refile_window_days: int = DEFAULT_RELEASE_REFILE_WINDOW_DAYS
 
 
+PRODUCTION_SHIPS = ("merge", "tag")
+
+
+@dataclass
+class ProductionConfig:
+    """Where a project's production lives and what puts a change there (its monitors follow both)"""
+
+    #: The deployed checkout; None means the project's own path
+    path: Path | None = None
+    ships: str = "merge"
+
+
 @dataclass
 class AutonomyConfig:
     """Whether the OS may create orders nobody typed (bug pickups, riders, red-main fixes, releases)"""
@@ -1034,7 +1046,12 @@ class ProjectSpec:
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
+    production: ProductionConfig = field(default_factory=ProductionConfig)
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def production_dir(self) -> Path:
+        return self.production.path or self.path
 
 
 # The seats the panel runs by default
@@ -1948,6 +1965,22 @@ def _parse_release(raw: Any, base: ReleaseConfig | None = None,
     return cfg
 
 
+def _parse_production(raw: Any, where: str) -> ProductionConfig:
+    """A project's `production`: optional, and a tag needs a checkout to look for it in"""
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    ships = raw.get("ships", "merge")
+    if ships not in PRODUCTION_SHIPS:
+        raise _err(f"{where}.ships {ships!r} not in {list(PRODUCTION_SHIPS)}")
+    path = raw.get("path")
+    if path is not None and (not isinstance(path, str) or not path.strip()):
+        raise _err(f"{where}.path must be a directory path")
+    if ships == "tag" and not path:
+        raise _err(f"{where}.ships tag needs {where}.path")
+    return ProductionConfig(path=Path(path).expanduser().resolve() if path else None,
+                            ships=ships)
+
+
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
                      where: str = "os.messaging") -> MessagingConfig:
     """`os.messaging`, or a project's override of it — field-level, like `_parse_inspect`"""
@@ -2524,6 +2557,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 schedule=schedule_cfg,
                 wiring=wiring_cfg,
                 worktree=worktree_cfg,
+                production=_parse_production(p.get("production", {}),
+                                             f"projects[{i}] ({name}).production"),
                 raw=p,
             )
         )

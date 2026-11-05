@@ -1490,6 +1490,172 @@ def test_an_owed_action_is_a_violation_and_a_taken_one_is_not(central, monkeypat
     assert list(invariants.check_morpheus_moves()) == []
 
 
+# -- 9b. a project that ships by tag from its own live checkout
+
+
+def _commit(repo: Path, name: str) -> str:
+    (repo / name).write_text(name)
+    subprocess.run(["git", "-C", str(repo), "add", name], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-qm", name], check=True)
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def test_a_tag_shipped_pr_queues_only_when_live_head_contains_it(
+        central, cfg, project, clock, tmp_path):
+    from jarvis.project_store import ProjectStore
+
+    live = tmp_path / "live"
+    live.mkdir()
+    subprocess.run(["git", "init", "-q", str(live)], check=True)
+    _commit(live, "base")
+    # The dev clone's commits exist nowhere in live until the deploy
+    dev = tmp_path / "dev"
+    subprocess.run(["git", "clone", "-q", str(live), str(dev)], check=True)
+    first = _commit(dev, "first")
+    second = _commit(dev, "second")
+    shas = {1: first, 2: second}
+    calls = []
+
+    def fetch(slug, n):
+        calls.append(n)
+        return morpheus.PullRequestBody(number=n, url=f"https://github.com/o/r/pull/{n}",
+                                        title="t", body=HINTS_BODY, merge_sha=shas[n])
+
+    def deploy(sha):
+        subprocess.run(["git", "-C", str(live), "fetch", "-q", str(dev), "HEAD"], check=True)
+        subprocess.run(["git", "-C", str(live), "reset", "-q", "--hard", sha], check=True)
+
+    store = ProjectStore(project)
+    try:
+        queue = lambda: morpheus.queue_deployed(central, cfg, "proj_a", store, live, fetch=fetch)  # noqa: E731
+        assert queue() == []  # first sight
+        clock.advance(10)
+        wo = store.create_work_order(title="x", description="d")
+        store.add_event(wo["id"], "pr_merged", {"pr_url": "https://github.com/o/r/pull/1"})
+        clock.advance(1)
+        store.add_event(wo["id"], "pr_merged", {"pr_url": "https://github.com/o/r/pull/2"})
+
+        assert queue() == []
+        assert central.morpheus_items() == []
+        # Live has not moved: no further `gh` call
+        calls.clear()
+        assert queue() == [] and calls == []
+
+        clock.advance(100)
+        deploy(first)
+        [one] = queue()
+        item = central.morpheus_item(one)
+        assert item["pr_number"] == 1 and item["release_tag"]
+        assert item["deadline_ts"] == db.now() + cfg.timeout_days * DAY
+        calls.clear()
+        assert queue() == [] and calls == []
+
+        clock.advance(100)
+        deploy(second)
+        [two] = queue()
+        assert central.morpheus_item(two)["pr_number"] == 2
+        assert calls == [2]  # the cursor passed PR 1
+    finally:
+        store.close()
+
+
+def test_open_scripts_naming_the_dev_checkout_go_back_once_without_spending_a_rewrite(
+        central, cfg, project, tmp_path):
+    dev, live = project, tmp_path / "live"
+    hard_coded = monitoring(central, n=1, script=f"cd {dev} || exit 75; exit 0")
+    relative = monitoring(central, n=2, script="exit 0")
+    sibling = monitoring(central, n=3, script=f"cat {dev}-kb/x")
+    settled = monitoring(central, n=4, script=f"cd {dev}")
+    central.update_morpheus_item(settled["id"], state="timedout")
+
+    sent = morpheus.rewrite_dev_scripts(central, cfg, "proj_a", dev, live)
+
+    assert sent == [hard_coded["id"]]
+    after = central.morpheus_item(hard_coded["id"])
+    assert (after["state"], after["script"]) == ("queued", "")
+    assert str(live) in after["rewrite_brief"]
+    assert int(after["script_rewrites"] or 0) == 0
+    assert central.morpheus_item(relative["id"])["state"] == "monitoring"
+    assert central.morpheus_item(sibling["id"])["state"] == "monitoring"
+    assert central.morpheus_item(settled["id"])["state"] == "timedout"
+    # A new script may keep the dev path for state: never sent back again
+    central.update_morpheus_item(hard_coded["id"], script=f"ls {dev}/processed",
+                                 state="monitoring")
+    assert morpheus.rewrite_dev_scripts(central, cfg, "proj_a", dev, live) == []
+
+
+@pytest.mark.parametrize("spelling", ["~/work/dev", "$HOME/work/dev", "${HOME}/work/dev"])
+def test_a_script_naming_the_dev_checkout_from_home_goes_back_too(
+        central, cfg, tmp_path, monkeypatch, spelling):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    named = monitoring(central, n=1, script=f"cd {spelling} || exit 75")
+    sibling = monitoring(central, n=2, script=f"cat {spelling}-kb/x")
+    sent = morpheus.rewrite_dev_scripts(central, cfg, "proj_a", tmp_path / "work" / "dev",
+                                        tmp_path / "live")
+    assert sent == [named["id"]] and sibling["id"] not in sent
+
+
+def test_a_manual_check_follows_production_and_never_runs_elsewhere(tmp_path, monkeypatch):
+    from jarvis import ops
+
+    dev, live = tmp_path / "dev", tmp_path / "live"
+    dev.mkdir()
+    live.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    cat = parse_catalog({"projects": [{"name": "p", "path": str(dev),
+                                       "production": {"path": str(live)}}]})
+    item = {"id": "mo-1", "project": "p"}
+    assert ops._morpheus_cwd(cat, item) == live.resolve()
+    live.rmdir()
+    with pytest.raises(ops.OpsError, match="production directory"):
+        ops._morpheus_cwd(cat, item)
+
+
+def test_the_daemon_runs_a_declared_project_from_production_and_holds_it_if_missing(
+        central, catalog_file, project, tmp_path):
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    live = tmp_path / "live"
+    live.mkdir()
+    subprocess.run(["git", "init", "-q", str(live)], check=True)
+    _commit(live, "base")
+    data = json.loads(Path(catalog_file).read_text())
+    data["projects"][0]["production"] = {"path": str(live), "ships": "tag"}
+    Path(catalog_file).write_text(json.dumps(data))
+    daemon = Daemon(load_catalog(catalog_file))
+
+    good = monitoring(central, n=1, script="pwd > ran-here; exit 0")
+    daemon._morpheus_pass()
+    assert central.morpheus_item(good["id"])["state"] == "validated"
+    assert (live / "ran-here").read_text().strip() == str(live)
+
+    waits = monitoring(central, n=2, script="exit 0")
+    live.rename(tmp_path / "gone")
+    daemon._morpheus_pass()
+    assert central.morpheus_item(waits["id"])["state"] == "monitoring"
+
+
+@pytest.mark.parametrize("production, message", [
+    ({"ships": "tag"}, r"production\.ships tag needs"),
+    ({"path": "/x", "ships": "nightly"}, r"production\.ships"),
+    ({"path": ""}, r"production\.path"),
+])
+def test_the_catalog_refuses_a_production_it_cannot_follow(tmp_path, production, message):
+    with pytest.raises(CatalogError, match=message):
+        parse_catalog({"projects": [{"name": "p", "path": str(tmp_path),
+                                     "production": production}]})
+
+
+def test_the_catalog_defaults_production_to_the_project_on_merge(tmp_path):
+    spec = parse_catalog({"projects": [{"name": "p", "path": str(tmp_path)}]}).project("p")
+    assert (spec.production_dir, spec.production.ships) == (tmp_path.resolve(), "merge")
+
+
 # -- 10. the daemon, the CLI and the dashboard
 
 
