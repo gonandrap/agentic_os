@@ -4,6 +4,7 @@ from jarvis.testing import (  # noqa: F401
     catalog_file,
     claude_json,
     clock,
+    coverage_seat_finds_nothing,
     fake_claude,
     fake_gh,
     fake_launchd,

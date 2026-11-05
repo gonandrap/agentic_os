@@ -76,6 +76,9 @@
 
 <h3>What it asked for</h3>
 <div class="panel">
+  {% for miss in inv.coverage_miss %}
+  <div class="row tone-bad">named with no entry: {{ miss.gap }} — “{{ miss.quote }}”</div>
+  {% endfor %}
   {% if inv.filing_error %}
   {# Not a classification: `gh` unreachable keeps the order in `planning` so the verdict
      can be resubmitted (§2.5). #}

@@ -23,6 +23,9 @@ COMPACTION = "compaction"
 #: Morpheus's long-lived session (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
 MORPHEUS = "morpheus"
 
+#: The one seat a GAP verdict passes before it settles (`verdict_coverage`)
+COVERAGE = "coverage_seat"
+
 #: Kinds that belong to the WORKER rather than to the OS
 SUBPROCESS_KINDS = frozenset({WORKER_SUBPROCESS})
 
@@ -59,6 +62,7 @@ KIND_LABELS = {
     OBSERVE_WHY: "diagnosing why the order is not moving",
     OBSERVE_CONTEXT_WRITE: "recording the context ledger",
     MORPHEUS: "Morpheus writing validation scripts",
+    COVERAGE: "checking a GAP verdict's gap coverage",
 }
 
 #: Where accounting rows go when that must differ from `$JARVIS_HOME` (#103)

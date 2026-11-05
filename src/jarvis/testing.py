@@ -2648,6 +2648,21 @@ def no_stray_cost_threads():
 
 
 @pytest.fixture(autouse=True)
+def coverage_seat_finds_nothing(monkeypatch):
+    """No GAP verdict in a test reaches a real model; a test wanting a reply patches over this"""
+    from . import seats
+
+    real = seats.run_blind
+
+    def run_blind(prompts, **kw):
+        if kw.get("kind") != agent_usage.COVERAGE:
+            return real(prompts, **kw)
+        return [seats.Opinion(seat=seat, raw='{"uncovered": []}') for seat in prompts]
+
+    monkeypatch.setattr(seats, "run_blind", run_blind)
+
+
+@pytest.fixture(autouse=True)
 def claude_json(tmp_path, monkeypatch):
     """Point trust checks at a scratch claude.json; tests opt paths in as trusted"""
     path = tmp_path / "claude.json"

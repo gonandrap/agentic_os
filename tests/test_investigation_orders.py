@@ -1484,6 +1484,128 @@ def test_a_filing_failure_is_never_silent(started, store, monkeypatch):
         central.close()
 
 
+# -- the coverage seat (io-38a4354f, finding coverage-unchecked)
+
+SIDE_GAP = "the -$80.09 residual is unexplained"
+A_MISS = json.dumps({"uncovered": [{"gap": "negative residual", "quote": SIDE_GAP}]})
+
+
+def _seat(monkeypatch, *replies):
+    """Stand in for the seat, one reply per call"""
+    from jarvis import agent_usage, seats, verdict_coverage
+
+    calls = []
+
+    def run_blind(prompts, **kw):
+        calls.append(prompts[verdict_coverage.SEAT])
+        assert kw["kind"] == agent_usage.COVERAGE and kw["tools"] == ""
+        reply = replies[len(calls) - 1]
+        if reply is None:
+            return [seats.Opinion(seat=verdict_coverage.SEAT, raw="rc=1", status="abstained",
+                                  replied=False)]
+        return [seats.Opinion(seat=verdict_coverage.SEAT, raw=reply)]
+
+    monkeypatch.setattr(seats, "run_blind", run_blind)
+    return calls
+
+
+def _side_gap_verdict(subject, other_gaps=()):
+    doc = a_verdict("GAP", subject=subject, other_gaps=list(other_gaps))
+    doc["root_cause"] += f" Separately, {SIDE_GAP}."
+    return doc
+
+
+def _coverage_order(store):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+    return subject, inv["id"]
+
+
+def test_a_side_gap_only_in_root_cause_returns_once_then_settles_with_the_miss(
+        started, store, monkeypatch):
+    calls = _seat(monkeypatch, A_MISS, A_MISS)
+    subject, inv_id = _coverage_order(store)
+
+    with pytest.raises(ops.OpsError, match=r"negative residual") as refusal:
+        ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    assert SIDE_GAP in str(refusal.value)
+    row = store.get_feature_order(inv_id)
+    assert row["status"] == "planning" and not row["plan"], "nothing was stored"
+    assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls)
+
+    out = ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    assert out["status"] == "completed" and out["filed"]["issue_url"]
+    assert len(calls) == 2
+    stored = json.loads(store.get_feature_order(inv_id)["plan"])
+    assert stored["coverage_miss"] == [{"gap": "negative residual", "quote": SIDE_GAP}]
+    assert any(SIDE_GAP in line for line in verdicts.render_verdict(stored))
+    from fastapi.testclient import TestClient
+    from jarvis.ui.app import create_app
+    page = TestClient(create_app()).get(f"/inv/proj_a/{inv_id}").text
+    assert "negative residual" in page and SIDE_GAP in page
+
+
+def test_a_returned_verdict_that_now_covers_its_gap_records_no_miss(
+        started, store, monkeypatch):
+    _seat(monkeypatch, A_MISS, '{"uncovered": []}')
+    subject, inv_id = _coverage_order(store)
+    with pytest.raises(ops.OpsError):
+        ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    assert "coverage_miss" not in json.loads(store.get_feature_order(inv_id)["plan"])
+
+
+def test_a_gap_quoted_from_nowhere_in_the_verdict_does_not_block(started, store, monkeypatch):
+    """kn-fd51ff0b: only a gap the text names may block; the seat's own idea is not one"""
+    _seat(monkeypatch, json.dumps({"uncovered": [
+        {"gap": "the seat's idea", "quote": "words the verdict never said"}]}))
+    subject, inv_id = _coverage_order(store)
+    out = ops.submit_verdict(inv_id, a_verdict("GAP", subject=subject, other_gaps=[]))
+    assert out["status"] == "completed"
+    assert "coverage_miss" not in json.loads(store.get_feature_order(inv_id)["plan"])
+
+
+@pytest.mark.parametrize("reply", [None, "no json here", '{"verdict": "fine"}'])
+def test_a_seat_with_no_usable_answer_stays_pending_and_files_nothing(
+        started, store, monkeypatch, reply):
+    """kn-40db1828: never a pass and never a miss"""
+    calls = _seat(monkeypatch, reply, '{"uncovered": []}')
+    subject, inv_id = _coverage_order(store)
+
+    out = ops.submit_verdict(inv_id, _side_gap_verdict(subject))
+    row = store.get_feature_order(inv_id)
+    assert row["status"] == "planning" and row["needs_attention"]
+    assert "UNREACHABLE" in row["attention_reason"]
+    assert "jarvis investigate verdict" in row["attention_reason"]
+    assert out["filed"] is None
+    assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls)
+
+    assert ops.submit_verdict(inv_id, _side_gap_verdict(subject))["status"] == "completed"
+    assert len(calls) == 2
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+
+
+def test_the_seat_never_runs_off_a_gap(started, store, monkeypatch):
+    calls = _seat(monkeypatch)
+    subject, inv_id = _coverage_order(store)
+    ops.submit_verdict(inv_id, a_verdict("TRANSIENT", subject=subject, other_gaps=[]))
+    assert calls == []
+
+
+def test_the_seat_sees_every_field_it_judges(started, store, monkeypatch):
+    calls = _seat(monkeypatch, '{"uncovered": []}')
+    subject, inv_id = _coverage_order(store)
+    entry = {"title": "side gap entry", "why": "w",
+             "description": "a brief long enough to stand alone for a stranger"}
+    ops.submit_verdict(inv_id, _side_gap_verdict(subject, other_gaps=[entry]))
+    _system, shown = calls[0]
+    fix = a_verdict("GAP")["proposed_fix"]
+    for text in (WHY, SIDE_GAP, a_verdict("GAP")["evidence"][0]["quote"], fix["title"],
+                 "side gap entry"):
+        assert text in shown
+
+
 def test_cancelling_one_settles_it_and_stops_the_investigator(started, store):
     subject = _subject(store)
     inv = ops.create_investigation_order("proj_a", subject, WHY)

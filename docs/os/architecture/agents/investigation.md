@@ -39,6 +39,8 @@ sequenceDiagram
     I->>O: jarvis investigate verdict {inv} --from-file verdict.json
     O->>O: verdicts.parse_verdict (fields required and forbidden per class)
     alt GAP (proposed_fix)
+        O->>O: verdict_coverage: one seat, is a gap named with no entry?
+        O-->>I: first miss returned, nothing stored
         O->>GH: duplicate check: issues + live orders
         alt duplicate found
             O->>O: rewritten to ALREADY_TRACKED (classified_by ops)
@@ -69,3 +71,9 @@ Every verdict, whatever its classification, carries `other_gaps`: every gap beyo
 cause, or an explicit `[]`. `ops.submit_verdict` posts each entry through the bus as a
 deferral on the investigator work order, and the router files it as a `proposed` backlog
 row with an origin link. It is never a tracker bug and never dispatched.
+
+Before filing, `verdict_coverage` asks one seat whether the text names a gap with no
+entry in `proposed_fix` or `other_gaps`. A first miss returns to the session naming the items. A second submission
+settles with any remaining miss stored as `coverage_miss`. A seat with no usable answer
+takes the same retry path as an unreachable tracker: nothing filed, order still `planning`.
+A quote the verdict does not contain never blocks.
