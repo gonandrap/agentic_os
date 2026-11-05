@@ -178,6 +178,78 @@ def test_assumptions_pending_review_reach_the_inbox_once(started, store):
     assert [i["wo_id"] for i in items] == [wo["id"]]
     assert "1 assumption" in items[0]["title"]
     assert store.get_work_order(wo["id"])["attention_reason"] == ops.ASSUMPTIONS_PENDING_REASON
+    # What Daemon.settle_review_pings matches on: a ping raised under another reason never settles
+    assert items[0]["paired_reason"] == ops.ASSUMPTIONS_PENDING_REASON
+
+
+def pinged(store: ProjectStore, n: int = 2, status: str = "needs_review") -> tuple[dict, list[int]]:
+    """An order holding n pending assumptions and the review ping raised for them"""
+    wo = store.create_work_order(title="t", description="d", origin="jarvis")
+    store.set_status(wo["id"], status)
+    ids = [store.add_assumption(wo["id"], f"assumed {i}") for i in range(n)]
+    store.flag_attention(wo["id"], ops.ASSUMPTIONS_PENDING_REASON)
+    store.add_notification(title=f"{wo['id']} is waiting on your review", wo_id=wo["id"],
+                           level="warning", source="assumptions", paired=True)
+    return wo, ids
+
+
+def settle(started, store) -> list[dict]:
+    spec = next(p for p in started.catalog.projects if p.name == "proj_a")
+    route(started, store)
+    started.settle_review_pings(spec, store)
+    return route(started, store)
+
+
+def test_neo_settling_every_assumption_acks_the_ping_on_the_next_pass(started, store):
+    wo, ids = pinged(store)
+    for aid in ids:
+        store.review_assumption(aid, "accepted")
+
+    assert settle(started, store) == []
+
+
+def test_the_daemon_tick_runs_the_settling_pass(started, store):
+    wo, ids = pinged(store, n=1)
+    store.review_assumption(ids[0], "accepted")
+
+    started.tick()
+
+    assert "is waiting on your review" not in " ".join(i["title"] for i in route(started, store))
+
+
+def test_one_assumption_still_pending_keeps_the_ping(started, store):
+    wo, ids = pinged(store)
+    store.review_assumption(ids[0], "accepted")
+
+    assert [i["wo_id"] for i in settle(started, store)] == [wo["id"]]
+
+
+def test_a_failed_order_acks_its_ping_but_keeps_its_failed_turn_row(started, store):
+    """Terminal includes `failed`, pending assumptions or not; the turn's own row stays"""
+    wo, _ = pinged(store, status="failed")
+    store.flag_attention(wo["id"], REASON)  # the failure path moves the flag before its row
+    store.add_notification(title=f"{wo['id']} worker turn failed", wo_id=wo["id"],
+                           level="warning", source="reconciler", paired=True)
+
+    assert [i["title"] for i in settle(started, store)] == [f"{wo['id']} worker turn failed"]
+
+
+def test_a_failed_turn_row_survives_on_the_same_settled_order(started, store):
+    wo, ids = pinged(store)
+    for aid in ids:
+        store.review_assumption(aid, "accepted")
+    store.flag_attention(wo["id"], REASON)
+    store.add_notification(title=f"{wo['id']} worker turn failed", wo_id=wo["id"],
+                           level="warning", source="reconciler", paired=True)
+
+    assert [i["title"] for i in settle(started, store)] == [f"{wo['id']} worker turn failed"]
+
+
+def test_a_stale_ping_on_a_completed_order_heals_with_assumptions_still_pending(started, store):
+    """Today's backlog: terminal is enough, whatever the rows say"""
+    wo, _ = pinged(store, status="completed")
+
+    assert settle(started, store) == []
 
 
 # -- a row is the user's only once Neo cannot take it further (io-ed253c2b)
