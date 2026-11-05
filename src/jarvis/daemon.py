@@ -1246,6 +1246,8 @@ class Daemon:
                     self.abandon_unargued_gates(project, store)
                     # On the reconcile cadence rather than every tick
                     self.auto_review(project, store)
+                    # After it, so a row Neo just settled is acked this pass; reads state, so old rows heal too
+                    self.settle_review_pings(project, store)
                     # Beside it, and AFTER it: the same tick that files an objection is the one that must take it back if...
                     self.withdraw_stale_objections(project, store)
                     # After the withdrawals it counts, so a withdrawal this tick is in the rate
@@ -4682,6 +4684,20 @@ class Daemon:
                                 wo_id: str | None) -> None:
         """A violation no longer standing acks the inbox row that raised it (issue #1357)"""
         self.central.revise_inbox(project.name, invariant_title(invariant), wo_id, ack=True)
+
+    def settle_review_pings(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """A review ping whose order owes the user nothing more acks itself (io-ed253c2b)"""
+        from . import ops as ops_mod
+
+        reason = ops_mod.ASSUMPTIONS_PENDING_REASON
+        for wo_id in self.central.orders_with_unacked_paired(project.name, reason):
+            try:
+                wo = store.get_work_order(wo_id)
+            except KeyError:
+                wo = None       # deleted since the ping: nothing left to review
+            if (wo is None or wo["status"] in TERMINAL_STATUSES
+                    or not invariants_mod.reviewable_assumptions(store, wo)):
+                self.central.ack_paired_reason(wo_id, reason)
 
     def rules_tick(self, project: ProjectSpec, store: ProjectStore) -> dict[str, Any]:
         """Evaluate the rule registry against this project's open orders (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
