@@ -123,12 +123,12 @@ def test_the_dispatched_reason_blames_the_os_and_never_the_users_config():
 
 def test_the_premium_is_the_rate_difference_and_not_the_price():
     """These tokens were written either way"""
-    assert inspection._hour_premium_usd(1_000_000) == pytest.approx(3.75)
+    assert inspection._hour_premium_usd(1_000_000) == pytest.approx(3.0)
 
     now = 1_789_000_000.0
     (alarm,) = inspection.hour_alarms(_found(now, dispatched=1_000_000), InspectConfig(),
                                       days=7)
-    assert "$3.75" in alarm.reason and "Opus list" in alarm.reason
+    assert "$3.00" in alarm.reason and "Opus list" in alarm.reason
 
 
 # -- 2. the daemon: who raises it, on what, and how often
@@ -494,7 +494,7 @@ def test_the_reason_names_both_sides_the_premium_and_the_turns():
 
     assert "2,000,000 cache-write tokens" in alarm.reason and "last 7 days" in alarm.reason
     assert "ephemeral_1h = 0" in alarm.reason and "ephemeral_5m = 0" in alarm.reason
-    assert "$3.75" in alarm.reason, "the premium is charged on the 5m-armed half only"
+    assert "$3.00" in alarm.reason, "the premium is charged on the 5m-armed half only"
     assert "DEFECT IN THE OS" in alarm.reason
     assert "wo-1 turn 1 in proj_a (armed 1h" in alarm.reason
     assert "~/.claude/settings.json" not in alarm.reason, "never the user's own file"

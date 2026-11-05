@@ -380,8 +380,50 @@ def test_synthetic_messages_are_free_but_unknown_models_are_not():
     assert usage.price_for("<synthetic>") == (0.0, 0.0)
     assert usage.price_for("claude-opus-5") == (5.0, 25.0)
     assert usage.price_for("claude-haiku-4-5-20251001") == (1.0, 5.0)
-    assert usage.price_for("claude-sonnet-5") == (3.0, 15.0)
+    assert usage.price_for("claude-sonnet-5") == (2.0, 10.0)
     assert usage.price_for("claude-something-unreleased") == usage.DEFAULT_PRICE
+
+
+@pytest.mark.parametrize("model, tokens, recorded", [
+    # Each figure is one real CLI 2.1.318 envelope's `modelUsage`, issue #1580
+    ("claude-haiku-5-5", dict(input=2, output=4, cache_read=649, cache_write=2953, cache_1h=2953),
+     0.00059929),
+    ("claude-sonnet-5-5", dict(input=2, output=4, cache_read=649, cache_write=2129, cache_1h=2129),
+     0.0086249),
+    ("claude-sonnet-5", dict(input=2, output=4, cache_read=3515, cache_write=5756, cache_1h=5756),
+     0.023771),
+    ("claude-opus-5-5", dict(input=2, output=4, cache_read=649, cache_write=2789, cache_1h=2789),
+     0.0225298),
+])
+def test_list_price_reproduces_what_the_cli_recorded(model, tokens, recorded):
+    assert usage.priced(model, **tokens).list_cost_usd == pytest.approx(recorded)
+
+
+def test_a_call_recorded_without_a_model_names_the_one_that_served_it(tmp_path):
+    """Priced at the opus default otherwise, issue #1580; a row written blank is backfilled once"""
+    from jarvis.central_store import CentralStore
+
+    served = {"output": 10, "by_model": [{"model": "claude-haiku-5-5"}]}
+    path = tmp_path / "os.db"
+    store = CentralStore(path)
+    try:
+        store.add_agent_call("validation_seat", wo_id="wo-new", usage=served)
+        assert store.agent_calls(wo_id="wo-new")[0]["model"] == "claude-haiku-5-5"
+        store.conn.execute(
+            "INSERT INTO agent_calls (ts, kind, wo_id, usage_json) VALUES (1.0, 'digest', 'wo-old', ?)",
+            (json.dumps(served),))
+        store.conn.execute(
+            "INSERT INTO agent_calls (ts, kind, wo_id, usage_json) VALUES (1.0, 'digest', 'wo-two', ?)",
+            (json.dumps({"by_model": [{"model": "a"}, {"model": "b"}]}),))
+        store.conn.execute("DELETE FROM os_state WHERE key='agent_calls_served_models_backfilled'")
+    finally:
+        store.close()
+    store = CentralStore(path)
+    try:
+        assert store.agent_calls(wo_id="wo-old")[0]["model"] == "claude-haiku-5-5"
+        assert store.agent_calls(wo_id="wo-two")[0]["model"] == ""
+    finally:
+        store.close()
 
 
 def test_cost_is_priced_per_message_model_not_per_session(transcripts):

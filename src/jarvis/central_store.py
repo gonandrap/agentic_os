@@ -724,6 +724,7 @@ MORPHEUS_RUNS_KEPT = 50
 
 # One-time backfill marker, NOT a row count
 FTS_BUILT_KEY = "knowledge_fts_built"
+SERVED_MODELS_KEY = "agent_calls_served_models_backfilled"
 
 # Which config version the catalog file currently holds
 CONFIG_HEAD_KEY = "config_head"
@@ -851,6 +852,7 @@ class CentralStore:
         db.add_missing_columns(self.conn, ADDED_COLUMNS)
         self.conn.executescript(POST_MIGRATION_SCHEMA)
         self._rebuild_morpheus_items()
+        self._backfill_served_models()
         with db.write_transaction(self.conn):
             self._fence()
 
@@ -858,6 +860,21 @@ class CentralStore:
         """Raise os.db's user_version to this release's; never lower it"""
         if self.conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _backfill_served_models(self) -> None:
+        """Name the model on `agent_calls` rows written blank, once (issue #1580)"""
+        if self.get_state(SERVED_MODELS_KEY):
+            return
+        try:
+            with db.write_transaction(self.conn):
+                self.conn.execute(
+                    "UPDATE agent_calls SET model = json_extract(usage_json, '$.by_model[0].model') "
+                    "WHERE model = '' AND json_valid(usage_json) "
+                    "AND json_array_length(usage_json, '$.by_model') = 1 "
+                    "AND json_extract(usage_json, '$.by_model[0].model') IS NOT NULL")
+                self.set_state(SERVED_MODELS_KEY, str(db.now()))
+        except sqlite3.Error:
+            pass  # a busy database: the next opener retries, the state key is still unset
 
     def _rebuild_morpheus_items(self) -> None:
         """Move `morpheus_items` into `monitoring_orders`, once (docs/superpowers/specs/2026-11-01-monitoring-orders.md §2)"""
@@ -2459,6 +2476,9 @@ class CentralStore:
                        latency_ms: int | None = None) -> int:
         """Record one Claude call the OS made itself (docs/superpowers/specs/2026-10-01-neo-observability.md)"""
         u = usage or {}
+        served = u.get("by_model") or []
+        if not model and len(served) == 1:  # a seat on the default model, issue #1580
+            model = served[0].get("model") or ""
         cur = self.conn.execute(
             """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model,
                                         question_id, ok, session_id, cost_usd, input,

@@ -14,17 +14,27 @@ from jarvis import transcript_cache
 
 TRANSCRIPT_ROOT_ENV = "JARVIS_TRANSCRIPT_ROOT"
 
-# List price in $ per million tokens
-PRICES: dict[str, tuple[float, float]] = {
-    "opus": (5.0, 25.0),
-    "fable": (10.0, 50.0),
-    "sonnet": (3.0, 15.0),
-    "haiku": (1.0, 5.0),
+# List $/MTok (input, output, cache read), from the CLI's `pricing_tiers` (2.1.318, issue #1580).
+# First substring match wins; a bare family is what its alias serves today.
+PRICES: dict[str, tuple[float, float, float]] = {
+    "opus-5-5": (4.0, 20.0, 0.2),
+    "opus-5": (5.0, 25.0, 0.5),
+    "opus-4": (5.0, 25.0, 0.5),
+    "opus": (4.0, 20.0, 0.2),
+    "fable-5-1": (10.0, 50.0, 0.25),
+    "fable-5": (10.0, 50.0, 1.0),
+    "fable": (10.0, 50.0, 0.25),
+    "sonnet-5-5": (2.0, 10.0, 0.1),
+    "sonnet-5": (2.0, 10.0, 0.2),
+    "sonnet-4": (3.0, 15.0, 0.3),
+    "sonnet": (2.0, 10.0, 0.1),
+    "haiku-4": (1.0, 5.0, 0.1),
+    "haiku": (0.1, 0.5, 0.01),
 }
-DEFAULT_PRICE = PRICES["opus"]
+DEFAULT_PRICE = PRICES["opus"][:2]
 CACHE_WRITE_RATE = 1.25  # x input price, at the 5-minute TTL
 CACHE_WRITE_1H_RATE = 2.0  # x input price, at the 1-hour TTL
-CACHE_READ_RATE = 0.10  # x input price, under either TTL
+CACHE_READ_RATE = 0.10  # x input price, under either TTL; a bill uses `cache_read_price`
 #: The TTL Jarvis buys (`claude_cli.PROMPT_CACHE_5M_ENV`)
 WRITE_TTL_SECONDS = 300.0
 #: The TTL the `worker.cache_ttl` = 1h arm buys
@@ -61,7 +71,7 @@ def class_costs(model: str, *, input: int = 0, cache_write: int = 0, cache_read:
         "input": input * in_rate / 1e6,
         "cache_write": (cache_write * in_rate
                         * write_rate(cache_write, cache_1h, cache_5m) / 1e6),
-        "cache_read": cache_read * in_rate * CACHE_READ_RATE / 1e6,
+        "cache_read": cache_read * cache_read_price(model) / 1e6,
         "output": output * out_rate / 1e6,
     }
 
@@ -76,14 +86,23 @@ def transcript_root() -> Path:
     return base / "projects"
 
 
+def _tier(model: str) -> tuple[float, float, float]:
+    if not model or model == "<synthetic>":
+        return (0.0, 0.0, 0.0)
+    for family, tier in PRICES.items():
+        if family in model:
+            return tier
+    return PRICES["opus"]
+
+
 def price_for(model: str) -> tuple[float, float]:
     """Input and output $/MTok for a model id"""
-    if not model or model == "<synthetic>":
-        return (0.0, 0.0)
-    for family, price in PRICES.items():
-        if family in model:
-            return price
-    return DEFAULT_PRICE
+    return _tier(model)[:2]
+
+
+def cache_read_price(model: str) -> float:
+    """Cache-read $/MTok for a model id: no single multiple of input fits every model"""
+    return _tier(model)[2]
 
 
 @dataclass
