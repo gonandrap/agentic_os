@@ -523,21 +523,21 @@ def _runs(rows: Sequence[Sample], key: str) -> list[list[Sample]]:
     return runs
 
 
-def _visible_usd(*, since: float, until: float, home: Path) -> float:
-    """Every dollar the OS can account for over the span: Jarvis's own (§7) plus §6's outside sessions"""
-    from . import fleetcost
+def _visible_spend(home: Path, *, since: float, until: float) -> Callable[..., float]:
+    """Every dollar the OS can account for over any span inside this range; walks once, on first ask"""
+    stamps: list[float] = []
+    totals: list[float] = []
+    first, last = since, until
 
-    total = 0.0
-    for name, path in fleetcost.registered_paths(home).items():
-        if not paths.project_db_path(path).exists():
-            continue
-        for row in fleetcost.turn_rows(paths.project_db_path(path), since, until,
-                                       project=name):
-            total += row.cost_usd or 0.0
-    by_kind, _ = fleetcost.os_by_kind(since, until)
-    total += sum(float(k["cost_usd"] or 0.0) for k in by_kind)
-    total += sum(s.usd for s in outside_sessions(since=since, until=until, home=home))
-    return total
+    def visible(*, since: float, until: float) -> float:
+        if not totals:
+            totals.append(0.0)
+            for ts, usd, _ in spend_events(since=first, until=last, home=home):
+                stamps.append(ts)
+                totals.append(totals[-1] + usd)
+        return (totals[bisect.bisect_left(stamps, until)]
+                - totals[bisect.bisect_left(stamps, since)])
+    return visible
 
 
 def _scaled_from_five_hour(rows: Sequence[Sample], key: str, *, now: float, cfg: Any,
@@ -566,8 +566,7 @@ def dollars_per_point(*, now: float, cfg: Any, home: Path,
     """What one point of `key`'s window costs, with its uncertainty stated as a band (§5)"""
     since = now - cfg.meter_calibration_days * 86_400
     rows = samples_between(Path(home), since=since, until=now)
-    spend = visible or (lambda *, since, until: _visible_usd(since=since, until=until,
-                                                             home=Path(home)))
+    spend = visible or _visible_spend(Path(home), since=since, until=now)
     ratios: list[float] = []
     total_usd = total_points = 0.0
     for run in _runs(rows, key):
@@ -586,8 +585,11 @@ def dollars_per_point(*, now: float, cfg: Any, home: Path,
         seed = float(cfg.meter_dollars_per_point)
         return {"value": seed, "low": seed, "high": seed, "source": "seed",
                 "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
-    low, high = band(total_usd=total_usd, total_points=total_points, spans=len(ratios))
-    return {"value": statistics.median(ratios), "low": low, "high": high,
+    value = statistics.median(ratios)
+    # Quantisation around the median itself, so the band always holds the value (§5)
+    low, high = band(total_usd=value * total_points, total_points=total_points,
+                     spans=len(ratios))
+    return {"value": value, "low": low, "high": high,
             "source": "measured" if len(ratios) >= 3 else "thin",
             "basis_spans": len(ratios), "basis_points": total_points,
             "basis_usd": total_usd}
@@ -776,25 +778,65 @@ def latest_sample(*, now: float, within: float,
     return fresh[-1] if fresh else None
 
 
-def jarvis_spend(*, since: float, until: float, home: Path | str | None = None,
-                 project: str | None = None) -> tuple[float, float]:
-    """`(workers_usd, jarvis_calls_usd)` over the span, from records already kept (§7)"""
+def _priced_agent_calls(root: Path, *, since: float, until: float,
+                        project: str | None = None) -> list[tuple[float, float, str, str]]:
+    """`(ts, list-price usd, wo_id, project)` per `agent_calls` row, priced as the order list prices them"""
+    conn = _connect_ro(root / "os.db")
+    if conn is None:
+        return []
+    scope, params = ("AND project=?", (since, until, project)) if project else ("", (since, until))
+    try:
+        return [(float(r["ts"]), usage.priced(
+            r["model"] or "unknown", input=r["input"] or 0, cache_write=r["cache_write"] or 0,
+            cache_read=r["cache_read"] or 0, output=r["output"] or 0,
+            cache_1h=r["cache_1h"] or 0, cache_5m=r["cache_5m"] or 0).list_cost_usd,
+            r["wo_id"] or "", r["project"] or "")
+            for r in conn.execute(
+                f"""SELECT ts, wo_id, project, model, input, cache_write, cache_read, output,
+                           json_extract(usage_json, '$.cache_1h') AS cache_1h,
+                           json_extract(usage_json, '$.cache_5m') AS cache_5m
+                    FROM agent_calls WHERE ts >= ? AND ts < ? {scope}""", params)]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _worker_spend(root: Path, *, since: float, until: float,
+                  project: str | None = None) -> list[tuple[float, float]]:
+    """`(ts, usd)` per in-window transcript call of every order, as `ops.cost_report` lists them"""
     from . import fleetcost
 
-    root = _home_path(home)
-    workers = 0.0
+    transcripts = usage.transcript_root()
+    if not transcripts.is_dir():
+        return []
+    index = usage.index_sessions(transcripts)
+    found: list[tuple[float, float]] = []
     for name, path in fleetcost.registered_paths(root).items():
         if project and name != project:
             continue
-        db_path = paths.project_db_path(path)
         # A registered project that has never been written to has no database
-        if not db_path.exists():
+        conn = _connect_ro(paths.project_db_path(path))
+        if conn is None:
             continue
-        for row in fleetcost.turn_rows(db_path, since, until, project=name):
-            workers += row.cost_usd or 0.0
-    by_kind, _ = fleetcost.os_by_kind(since, until, project)
-    calls = sum(float(k["cost_usd"] or 0.0) for k in by_kind)
-    return (workers, calls)
+        try:
+            rows = conn.execute("SELECT session_id FROM work_orders").fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            conn.close()
+        for row in rows:
+            found.extend(usage.session_spend(row["session_id"] or "", since, until, index))
+    return found
+
+
+def jarvis_spend(*, since: float, until: float, home: Path | str | None = None,
+                 project: str | None = None) -> tuple[float, float]:
+    """`(workers_usd, jarvis_calls_usd)` over the span, from the order list's per-call records (§7)"""
+    root = _home_path(home)
+    calls = _priced_agent_calls(root, since=since, until=until, project=project)
+    workers = _worker_spend(root, since=since, until=until, project=project)
+    return (sum(usd for _, usd in workers), sum(c[1] for c in calls))
 
 
 @dataclass
@@ -823,36 +865,19 @@ class SpendSeries:
 def spend_events(*, since: float, until: float,
                  home: Path | str | None = None) -> list[tuple[float, float, bool]]:
     """`(ts, usd, is_jarvis)` for every priced call on this machine over the span"""
-    from . import fleetcost
-
     root = _home_path(home)
-    found: list[tuple[float, float, bool]] = []
-    for name, path in fleetcost.registered_paths(root).items():
-        db_path = paths.project_db_path(path)
-        if not db_path.exists():
-            continue
-        found.extend((row.started_at, row.cost_usd or 0.0, True)
-                     for row in fleetcost.turn_rows(db_path, since, until, project=name))
-    conn = _connect_ro(root / "os.db")
-    if conn is not None:
-        try:
-            found.extend((float(r["ts"]), float(r["cost_usd"] or 0.0), True)
-                         for r in conn.execute(
-                             "SELECT ts, cost_usd FROM agent_calls WHERE ts >= ? AND ts < ?",
-                             (since, until)))
-        except sqlite3.Error:
-            pass
-        finally:
-            conn.close()
+    found: list[tuple[float, float, bool]] = [
+        (c[0], c[1], True) for c in _priced_agent_calls(root, since=since, until=until)]
+    found.extend((ts, usd, True) for ts, usd in _worker_spend(root, since=since, until=until))
     transcripts = usage.transcript_root()
     if transcripts.is_dir():
         index = usage.index_sessions(transcripts)
-        for *_, calls in _outside_calls(transcripts, since=since, until=until,
-                                        home=root, index=index):
+        for *_, outside in _outside_calls(transcripts, since=since, until=until,
+                                          home=root, index=index):
             found.extend((c.ts, usage.priced(
                 c.model, input=c.input, cache_write=c.cache_write,
                 cache_read=c.cache_read, output=c.output, cache_1h=c.cache_1h,
-                cache_5m=c.cache_5m).list_cost_usd, False) for c in calls)
+                cache_5m=c.cache_5m).list_cost_usd, False) for c in outside)
     found.sort(key=lambda e: e[0])
     return found
 
@@ -914,7 +939,10 @@ def timeline_between(*, since: float, until: float,
     root = _home_path(home)
     rows = samples_between(root, since=since, until=until)
     cfg = fleetcost.cost_config(None)
-    rates = {key: dollars_per_point(now=db.now(), cfg=cfg, home=root, key=key)["value"]
+    now = db.now()
+    visible = _visible_spend(root, since=now - cfg.meter_calibration_days * 86_400, until=now)
+    rates = {key: dollars_per_point(now=now, cfg=cfg, home=root, visible=visible,
+                                    key=key)["value"]
              for key in FIRST_CLASS}
     return timeline(rows, spend=spend_series(rows, rates=rates, home=root))
 
@@ -1072,8 +1100,10 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
                     nearest_seconds=cfg.meter_nearest_seconds)
     seven = segments(rows, since=since, until=until, key="seven_day",
                      nearest_seconds=cfg.meter_nearest_seconds)
-    dollars = dollars_per_point(now=now, cfg=cfg, home=root)
-    seven_rate = dollars_per_point(now=now, cfg=cfg, home=root, key="seven_day")["value"]
+    visible = _visible_spend(root, since=now - cfg.meter_calibration_days * 86_400, until=now)
+    dollars = dollars_per_point(now=now, cfg=cfg, home=root, visible=visible)
+    seven_rate = dollars_per_point(now=now, cfg=cfg, home=root, visible=visible,
+                                   key="seven_day")["value"]
     covered = five.coverage.samples > 0
     # Coverage is the span's own reason to derive nothing
     span_unreliable: list[str] = []

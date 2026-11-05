@@ -183,8 +183,8 @@ def test_quiesce_gives_up_rather_than_blocking_a_shutdown_forever(monkeypatch):
 def test_cost_page_lists_work_orders_dearest_first(client, project, transcript):
     cheap = ops.create_work_order("proj_a", "a small ask")
     dear = ops.create_work_order("proj_a", "a large ask")
-    transcript("sess-cheap", write_tok=1_000, out=100)
-    transcript("sess-dear", write_tok=900_000, out=50_000)
+    transcript("sess-cheap", write_tok=1_000, out=100, at=db.now())
+    transcript("sess-dear", write_tok=900_000, out=50_000, at=db.now())
     give_session(project, cheap["id"], "sess-cheap")
     give_session(project, dear["id"], "sess-dear")
     # The page reports the current usage week by default
@@ -213,7 +213,7 @@ def test_cost_page_says_when_a_transcript_is_gone_instead_of_saying_zero(
 
 def test_cost_page_can_be_scoped_to_one_project(client, project, transcript):
     wo = ops.create_work_order("proj_a", "scoped ask")
-    transcript("sess-scoped", write_tok=1_000, out=100)
+    transcript("sess-scoped", write_tok=1_000, out=100, at=db.now())
     give_session(project, wo["id"], "sess-scoped")
     add_recorded_turn(project, wo["id"], 0.0, 1_000)
 
@@ -359,7 +359,7 @@ def add_recorded_turn(project, wo_id: str, cost: float, peak: int,
 def test_cost_page_links_each_work_order_to_its_turn_drilldown(client, project,
                                                                transcript):
     wo = ops.create_work_order("proj_a", "drillable")
-    transcript("sess-drill", write_tok=1_000, out=10)
+    transcript("sess-drill", write_tok=1_000, out=10, at=db.now())
     give_session(project, wo["id"], "sess-drill")
     add_recorded_turn(project, wo["id"], 0.0, 1_000)
 
