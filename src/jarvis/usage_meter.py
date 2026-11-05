@@ -44,7 +44,7 @@ WINDOW_SECONDS = {"five_hour": 5 * 3600.0, "seven_day": 7 * 86_400.0}
 #: More of the span unmeasured than measured: nothing about the rise or the reset count is bounded
 MIN_RELIABLE_COVERAGE_SHARE = 0.5
 
-#: Longer than this between readings is unmeasured: daemon ticks stretch the period (222s mean, 345s longest seen, io-82bcb830), and one missed reading stays inside it
+#: A longer hole is unmeasured: ticks stretch the period to 345s, one miss stays inside (io-82bcb830)
 COVERED_GAP_SECONDS = 3 * SAMPLE_SECONDS
 
 NOTICE_STREAK_KEY = "usage_meter_notice_streak"
@@ -419,7 +419,7 @@ def _retreat(a: Sample, b: Sample, key: str) -> bool:
 
 
 def _covered_share(inside: Sequence[Sample], *, since: float, end: float) -> float:
-    """Share of since..end lying between readings no further apart than `COVERED_GAP_SECONDS`"""
+    """Share of since..end between readings at most `COVERED_GAP_SECONDS` apart"""
     if end <= since or not inside:
         return 0.0
     marks = [since, *(s.ts for s in inside if s.ts < end), end]
@@ -431,7 +431,7 @@ def segments(samples: Sequence[Sample], *, since: float, until: float, key: str,
              nearest_seconds: float | None = None,
              now: float | None = None) -> SegmentSum:
     """Per-segment delta, because utilisation drops to ~0 at `resets_at` (§4)"""
-    end = min(until, db.now() if now is None else now)   # a window ending ahead of now is judged on what has happened
+    end = min(until, db.now() if now is None else now)   # samples from the future cannot exist
     if nearest_seconds is None:
         from .catalog import DEFAULT_COST_METER_NEAREST_SECONDS
 
