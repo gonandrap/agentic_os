@@ -330,7 +330,7 @@ def test_the_cli_prints_the_bill_turn_by_turn(store, transcripts, capsys):
     assert "turn 1" in out and "turn 2" in out
     assert "dispatch" in out and "message" in out
     assert "adds up" in out                     # the reconciliation, stated
-    assert "0.07" in out                        # the second turn's own cost
+    assert "0.048" in out                       # the second turn's own cost, at list
     # The bloat signal survives the rewrite
     assert "9%" in out and "context peak" in out
     # Every class of token, priced — the line items that make it a bill at all

@@ -869,6 +869,24 @@ def os_call_now(project_name: str, wo_id: str, cost: float = 0.25) -> None:
         central.close()
 
 
+def test_the_page_names_a_model_it_had_to_guess(two_project_client):
+    """Issue #1580: a fallback price is visibly a guess"""
+    from jarvis.central_store import CentralStore
+
+    client, _ = two_project_client
+    central = CentralStore()
+    try:
+        central.add_agent_call("digest", project="proj_a", model="claude-sonnet-6",
+                               usage={"total_cost_usd": 0.25, "input": 1_000_000})
+        central.conn.commit()
+    finally:
+        central.close()
+
+    page = cost_page(client, "/cost")
+
+    assert "no list price known: claude-sonnet-6 ~$2.00" in page.text
+
+
 def test_the_default_window_survives_two_projects_with_os_calls(two_project_client):
     """The fleet-wide page: `_os_groups` returns BOTH projects' ids, and each store is opened in turn"""
     client, other = two_project_client

@@ -14818,6 +14818,7 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
         f"{prefix}_calls": calls,
         f"{prefix}_failed_calls": failed,
         f"{prefix}_cost_usd": round(total.list_cost_usd, 4),
+        f"{prefix}_cost_by_model": total.cost_by_model,
         f"{prefix}_recorded_cost_usd": round(exact, 4),
         f"{prefix}_billed_input": total.billed_input,
         f"{prefix}_output": total.output,
@@ -15080,8 +15081,28 @@ def _rollup(units: list[dict[str, Any]],
             # Over ALL units: what a window could not place is disclosed whether or not the order it belongs to...
             "undated_messages": sum(u.get("undated_messages") or 0 for u in units),
             **_write_ttl(measured, os_spenders),
+            **_unpriced_models([*(u.get("cost_by_model") for u in measured),
+                                *(u.get("os_cost_by_model") for u in os_spenders),
+                                *(u.get("subproc_cost_by_model") for u in units)]),
         },
     }
+
+
+def _unpriced_models(spends: Sequence[dict[str, float] | None]) -> dict[str, Any]:
+    """Every id `usage.PRICES` does not list, with the dollars guessed for it (issue #1580)"""
+    from . import usage as usage_mod
+
+    guessed: dict[str, float] = {}
+    for spend in spends:
+        for model, cost in (spend or {}).items():
+            if not usage_mod.is_known_model(model):
+                guessed[model] = guessed.get(model, 0.0) + cost
+    rows = [{"model": model, "list_cost_usd": round(cost, 2)}
+            for model, cost in sorted(guessed.items(), key=lambda kv: -kv[1])]
+    named = ", ".join(f"{r['model']} ~${r['list_cost_usd']:.2f}" for r in rows)
+    return {"unpriced_models": rows,
+            "unpriced_note": f"Guessed at a fallback price, no list price known: {named}."
+            if rows else ""}
 
 
 def _write_ttl(measured: list[dict[str, Any]], units: list[dict[str, Any]]

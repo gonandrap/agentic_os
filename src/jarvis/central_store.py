@@ -2470,6 +2470,9 @@ class CentralStore:
                        latency_ms: int | None = None) -> int:
         """Record one Claude call the OS made itself (docs/superpowers/specs/2026-10-01-neo-observability.md)"""
         u = usage or {}
+        served = u.get("by_model") or []
+        if not model and len(served) == 1:  # a seat on the default model, issue #1580
+            model = served[0].get("model") or ""
         cur = self.conn.execute(
             """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model,
                                         question_id, ok, session_id, cost_usd, input,
