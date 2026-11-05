@@ -333,7 +333,7 @@ MESSAGE_STUCK_STATUSES = ("dispatching", "running", "idle", "waiting_input",
 
 #: The `ops.waiting_on` answers that mean the OS itself will do the next thing, with nobody typing
 IN_FLIGHT_WAITS = ("turn_running", "queued_message", "neo_question", "gate_with_neo",
-                   "retry_pending", "signin", "pending")
+                   "retry_pending", "signin", "pending", "assumptions_with_neo")
 
 #: What `parked_reason` stays silent about
 SPOKEN_FOR_WAITS = IN_FLIGHT_WAITS + ("message_stuck",)
@@ -4579,6 +4579,52 @@ def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+INV_RED_RELEASE_UNDISCOUNTED = "INV-RED-RELEASE-UNDISCOUNTED"
+
+
+def check_red_release_hold_is_discounted(store: ProjectStore) -> Iterator[Violation]:
+    """INV-RED-RELEASE-UNDISCOUNTED — a release held by a red base must be excluded and discounted (docs/superpowers/specs/2026-11-04-a-release-held-by-a-red-base-is-not-stuck.md)"""
+    from . import ops, release, stuck
+    from .central_store import CentralStore
+
+    held = [wo for wo in store.list_work_orders(statuses=("pending",))
+            if release.is_release_order(wo)]
+    if not held:
+        return
+    central = None
+    try:
+        central = CentralStore()
+        name = central.project_name_for_path(store.project_path)
+    except Exception:  # noqa: BLE001 — an unreadable central database is not a red base
+        return
+    finally:
+        if central is not None:
+            central.close()
+    now = db.now()
+    catalog = ops.resolve_catalog()
+    spec = next((p for p in catalog.projects if p.name == name), None)
+    if spec is None or not ops._base_is_red(spec, now):
+        return
+    # The sweep's own reader, so this judges what the sweep does and not a copy of its rule
+    rows = {row["id"]: row for row in ops.stuck_report(name, now)}
+    for wo in held:
+        row = rows.get(wo["id"])
+        if row is None or (row["excluded"] == stuck.BASE_RED_CAUSE
+                           and row["discounted_seconds"] > 0):
+            continue
+        yield Violation(
+            invariant=INV_RED_RELEASE_UNDISCOUNTED,
+            wo_id=wo["id"],
+            detail=(f"a release held in `pending` by a red base, judged with excluded "
+                    f"cause {row['excluded']!r} and {row['discounted_seconds']:.0f}s "
+                    f"discounted: the sweep would buy an investigation for a designed "
+                    f"wait"),
+            repaired=False,
+            context={"excluded": row["excluded"],
+                     "discounted_seconds": row["discounted_seconds"]},
+        )
+
+
 INV_FIX_GAP_UNREGISTERED = "INV-FIX-GAP-UNREGISTERED"
 
 
@@ -4631,6 +4677,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_attention_has_reason,
     check_precondition_is_wired,   # order-free: a pure read that repairs nothing, raises
                                    # no flag and writes no status, so nothing else in the tuple reads its output
+    check_red_release_hold_is_discounted,  # ditto: a pure read of the sweep's own row
     check_pull_request_recorded,   # order-free: a pure timeline read that repairs
                                    # nothing and touches no flag
     check_closed_session_removed,  # ditto: a pure read of what the poll could not remove

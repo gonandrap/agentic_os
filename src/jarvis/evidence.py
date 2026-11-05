@@ -259,6 +259,17 @@ def nothing_to_judge(packet: EvidencePacket) -> str:
     return ""
 
 
+def base_commits_touching(repo: Path, base: str, head: str,
+                          paths: Iterable[str]) -> tuple[str, ...]:
+    """Newest commits on `origin/base`, absent from `head`, that touched `paths` (#1592)"""
+    paths = tuple(paths)
+    if not (base and head and paths):
+        return ()
+    log_lines = _git(repo, "log", "-n3", "--format=%h %s",
+                     f"{head}..origin/{base}", "--", *paths)
+    return tuple(line for line in log_lines.splitlines() if line)
+
+
 def void_reason(packet: EvidencePacket) -> str:
     """Why this round was voided, in the words the record keeps"""
     what = "; ".join(str(e.get("summary") or e.get("kind") or "effect")

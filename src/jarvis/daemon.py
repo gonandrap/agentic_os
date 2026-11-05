@@ -421,6 +421,17 @@ def reviews_gate(store: ProjectStore, wo: dict[str, Any],
     return invariants.waiting_on_neo_gate(store, wo)
 
 
+def reviews_assumptions(store: ProjectStore, wo: dict[str, Any],
+                        now: float | None = None) -> bool:
+    """True when a pending row is not yet the user's, so `Daemon.auto_review` holds it (io-ed253c2b)"""
+    from . import invariants
+    # `Daemon.auto_review` lists rows with the hidden-excluding default
+    if wo.get("hidden"):
+        return False
+    return (len(invariants.reviewable_assumptions(store, wo))
+            > len(invariants.assumptions_owed_to_user(store, wo)))
+
+
 #: Walk the transcript tree for one-hour cache writes every N ticks
 CACHE_TTL_EVERY_TICKS = 4320
 
@@ -623,6 +634,14 @@ NO_VALIDATOR_REASON = (
     "no validator was configured, so this round was never judged — the work order "
     "settled exactly where it settles with validation switched off"
 )
+
+#: Written before the OS closes a superseded pull request, read by the poll (#1592)
+PR_SUPERSEDED_EVENT = "pr_superseded"
+#: `cause` on the `validation_failed` event of a close GitHub refused
+SUPERSEDED_CLOSE_CAUSE = "superseded_close"
+SUPERSEDED_VOID_REASON = (
+    "{url} now changes no files and round {round} passed its work, and `{base}` has "
+    "since changed those files ({commits}), so the OS closed it as superseded.")
 
 #: Why an abandonment with nothing produced closes its round unjudged and unescalated
 ABANDONED_VOID_REASON = (
@@ -2506,6 +2525,10 @@ class Daemon:
                                f"has judged the work.",
                                cause=ops.ESCALATION_USER_ACTION, user_action=needs_user)
                 return
+            # NOTHING CHANGED BECAUSE AN EQUIVALENT CHANGE REACHED THE BASE FIRST (#1592)
+            if empty == "escalate" and base_red is None and self._settle_superseded(
+                    project, store, wo, round_id, n, packet):
+                return
             if empty == "escalate":
                 self._escalate(store, wo, round_id, n,
                                "this submission changes no files and records no other "
@@ -2730,6 +2753,72 @@ class Daemon:
         bus.post(store, subject=bus.Subject(wo_id=wo_id),
                  from_role="reviewer", to_role="implementor",
                  payload=bus.ReviewFeedback(round=n, outcome="rejected", reason=text))
+
+    def _settle_superseded(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                           round_id: int, n: int, packet: Any) -> bool:
+        """Close an empty pull request and settle on its passed round, if git proves the work reached the base (#1592)"""
+        from . import evidence as evidence_mod
+        from . import github, invariants, ops, pr_resync
+
+        wo_id = wo["id"]
+        state = str((packet.pr or {}).get("state") or "")
+        closing = store.events_of_kind(wo_id, PR_SUPERSEDED_EVENT)
+        if not (state == "OPEN" or (state == "CLOSED" and closing)):
+            return False
+        verdicts = [r for r in store.validation_rounds(wo_id=wo_id)
+                    if int(r["round"]) < n and r["outcome"] in ("passed", "rejected")]
+        if not verdicts or verdicts[-1]["outcome"] != "passed":
+            return False
+        passed = verdicts[-1]
+        landed = evidence_mod.base_commits_touching(
+            project.path, packet.base, str(passed["head_sha"] or ""),
+            db.from_json(passed["file_shas"], {}) or {})
+        if (not landed or worker_session.busy(store, wo_id) is not None
+                or invariants.reviewable_assumptions(store, wo)
+                or not ops.refusal_answered(store, wo_id)):
+            return False
+        why = SUPERSEDED_VOID_REASON.format(
+            url=packet.pr_url, round=passed["round"], base=packet.base,
+            commits="; ".join(landed))
+        if not closing:
+            # BEFORE the close: `poll_pull_requests` must not read it as refused work
+            store.add_event(wo_id, PR_SUPERSEDED_EVENT,
+                            {"pr_url": packet.pr_url, "reason": why})
+        if state == "OPEN":
+            try:
+                pr_resync.pr_close(packet.pr_url, cwd=project.path)
+            except github.GitHubError as e:
+                self._superseded_close_failed(store, wo, round_id, n, why, e)
+                return True
+        store.settle_validation_round(
+            round_id, "void", {"round": n, "round_id": round_id, "reason": why},
+            wo_id=wo_id, reason=why)
+        ops.settle_superseded(store, wo, why, int(passed["round"]))
+        log.info("[%s] %s: round %d voided — superseded on the base (%s)",
+                 project.name, wo_id, n, packet.pr_url)
+        return True
+
+    def _superseded_close_failed(self, store: ProjectStore, wo: dict, round_id: int,
+                                 n: int, why: str, error: Exception) -> None:
+        """GitHub refused the close: retried as an outage is, then named to the user"""
+        from . import ops
+
+        wo_id = wo["id"]
+        attempts = 1 + sum(
+            1 for e in store.events_of_kind(wo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == SUPERSEDED_CLOSE_CAUSE)
+        store.settle_validation_round(
+            round_id, "failed",
+            {"round": n, "cause": SUPERSEDED_CLOSE_CAUSE, "attempt": attempts,
+             "error": str(error)[:500]},
+            wo_id=wo_id, reason=f"the superseded pull request could not be closed: {error}")
+        if attempts >= VALIDATION_OUTAGE_LIMIT:
+            self._escalate(
+                store, wo, round_id, n,
+                f"{why} The OS could not close it {attempts} times running: {error}. "
+                f"Close it by hand, then `jarvis wo done {wo_id}`.",
+                cause=ops.ESCALATION_NOTHING_TO_JUDGE)
 
     @staticmethod
     def _void(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -3413,21 +3502,36 @@ class Daemon:
             prod = production_code_dir()
             os_name = self._os_project()
             # Where each project's production lives: the OS runs from its deployed checkout
-            dirs = {p.name: p.path for p in self.catalog.projects if p.path.is_dir()}
+            dirs = {p.name: p.production_dir for p in self.catalog.projects
+                    if p.production_dir.is_dir()}
             if os_name and prod.is_dir():
                 dirs[os_name] = prod
-            # The OS ships by release; every other project ships when its PR merges
+            # A declared production directory that is gone: its rows wait, never checked elsewhere
+            no_production = {p.name for p in self.catalog.projects
+                             if p.name != os_name and not p.production_dir.is_dir()
+                             and p.production.path}
+            for name in sorted(no_production):
+                log.warning("[%s] morpheus: its production directory is missing", name)
+            # The OS ships by release; every other project by merge or, when it says so, by tag
             if os_name and (prod / ".git").exists():
                 try:
                     morpheus.ensure_release_queued(central, cfg, prod, project=os_name)
                 except Exception:  # noqa: BLE001 — the rest of the pass still runs
                     log.exception("morpheus: could not queue the running release")
             for project in self.catalog.projects:
-                if project.name == os_name or not project.path.is_dir():
+                if (project.name == os_name or project.name in no_production
+                        or not project.path.is_dir()):
                     continue
                 store = ProjectStore(project.path)  # thread-local
                 try:
-                    morpheus.queue_merges(central, cfg, project.name, store)
+                    if project.production.path:
+                        morpheus.rewrite_dev_scripts(central, cfg, project.name, project.path,
+                                                     project.production.path)
+                    if project.production.ships == "tag":
+                        morpheus.queue_deployed(central, cfg, project.name, store,
+                                                project.production_dir)
+                    else:
+                        morpheus.queue_merges(central, cfg, project.name, store)
                 except Exception:  # noqa: BLE001
                     log.exception("[%s] morpheus: could not queue merged PRs", project.name)
                 finally:
@@ -3456,7 +3560,7 @@ class Daemon:
                 log.exception("morpheus: could not clear settled investigations' attention")
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
-            skip = archived_projects(central)
+            skip = {*archived_projects(central), *no_production}
             def cwd_for(item: dict) -> Path:
                 return dirs.get(item.get("project") or "", fallback)
 
@@ -3476,6 +3580,10 @@ class Daemon:
                                  item["pr_number"], item["state"], action)
                 except Exception:  # noqa: BLE001 — one item must not starve the others
                     log.exception("morpheus: action for %s failed", item["id"])
+            if not morpheus.held(central):
+                for item_id in morpheus.reask_answered(central, self.catalog, skip=skip):
+                    log.info("morpheus %s: Neo answered with no way to settle it, asked again",
+                             item_id)
             # One short session per owed order, in that order's production directory (§3)
             armed = morpheus.arm(central, self.catalog, cwd_for, skip=skip)
             ran = {k: v for k, v in armed.items() if v and k not in ("paused", "usage_held")}
@@ -5926,6 +6034,9 @@ class Daemon:
                         log.info("[%s] %s is closed because the OS closed it to resync "
                                  "it — %s is not refused work", project.name,
                                  wo["pr_url"], wo["id"])
+                    elif store.events_of_kind(wo["id"], PR_SUPERSEDED_EVENT):
+                        log.info("[%s] %s is closed as superseded — %s settles on its "
+                                 "round", project.name, wo["pr_url"], wo["id"])
                     elif not store.pr_closure_told(wo["id"]):
                         log.info("[%s] %s closed unmerged — %s needs the user",
                                  project.name, wo["pr_url"], wo["id"])

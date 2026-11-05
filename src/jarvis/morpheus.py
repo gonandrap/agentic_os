@@ -54,6 +54,10 @@ _FRESH_WATCH = {"last_reason": "", "saw_fail": 0, "held_since_ts": None}
 RELEASE_KEY = "morpheus.last_release"
 #: Per project: the last `pr_merged` event already queued
 MERGE_CURSOR_KEY = "morpheus.merge_cursor.{project}"
+#: Per tag-shipped project: the live HEAD and newest merge already scanned, so no `gh` call repeats
+DEPLOY_SEEN_KEY = "morpheus.deploy_seen.{project}"
+#: Per project: the production directory its open scripts were already sent back for
+REPOINTED_KEY = "morpheus.repointed.{project}"
 # Morpheus's own brake, over the fleet's: "paused" holds it, "running" lets it through a fleet pause
 PAUSE_KEY = "morpheus.pause"
 PAUSE_MODES = ("paused", "running")
@@ -67,7 +71,7 @@ MAX_KILLS = 3
 #: How much of a script's output is kept
 OUTPUT_TAIL = 2000
 #: What a `validation` verdict may ask the OS to do — a waive stays the user's (issue #1254)
-VERDICT_ACTIONS = ("requeue", "rewrite")
+VERDICT_ACTIONS = ("requeue", "rewrite", "settle")
 #: How many times Neo's own verdict may put one item back on the watch list
 MAX_AUTO_REQUEUES = 1
 #: Investigate -> fix -> re-validate cycles one item may run before the user decides (#1344)
@@ -210,6 +214,7 @@ class PullRequestBody:
     url: str
     title: str
     body: str
+    merge_sha: str = ""
 
 
 def fetch_pr(repo_slug: str, number: int, cwd: Path | None = None) -> PullRequestBody:
@@ -217,7 +222,8 @@ def fetch_pr(repo_slug: str, number: int, cwd: Path | None = None) -> PullReques
     from .bugreport import gh_bin
 
     url = f"https://github.com/{repo_slug}/pull/{number}"
-    out = subprocess.run([gh_bin(), "pr", "view", url, "--json", "number,title,body,url"],
+    out = subprocess.run([gh_bin(), "pr", "view", url, "--json",
+                          "number,title,body,url,mergeCommit"],
                          capture_output=True, text=True, timeout=60,
                          cwd=str(cwd) if cwd else None)
     if out.returncode != 0:
@@ -227,7 +233,8 @@ def fetch_pr(repo_slug: str, number: int, cwd: Path | None = None) -> PullReques
     return PullRequestBody(number=int(data.get("number") or number),
                            url=str(data.get("url") or url),
                            title=str(data.get("title") or ""),
-                           body=str(data.get("body") or ""))
+                           body=str(data.get("body") or ""),
+                           merge_sha=str((data.get("mergeCommit") or {}).get("oid") or ""))
 
 
 def repo_slug(repo: Path) -> str:
@@ -368,6 +375,79 @@ def queue_merges(central: CentralStore, cfg: MorpheusConfig, project: str,
         cursor = float(merged["ts"])
         central.set_state(key, str(cursor))
     return queued
+
+
+def contains(repo: Path, sha: str) -> bool:
+    """True only when HEAD carries the commit; a commit the checkout never fetched does not count"""
+    return bool(sha) and subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, "HEAD"],
+        capture_output=True, timeout=60).returncode == 0
+
+
+def queue_deployed(central: CentralStore, cfg: MorpheusConfig, project: str,
+                   store: ProjectStore, live: Path, *,
+                   fetch: Callable[[str, int], PullRequestBody] | None = None) -> list[str]:
+    """A tag-shipped project: queue each merged PR once live HEAD contains it; the clock starts there"""
+    key = MERGE_CURSOR_KEY.format(project=project)
+    raw = central.get_state(key)
+    if raw is None:
+        central.set_state(key, str(db.now()))
+        return []
+    merges = store.merged_prs_since(float(raw or 0))
+    if not merges:
+        return []
+    seen_key = DEPLOY_SEEN_KEY.format(project=project)
+    seen = f"{_git(live, 'rev-parse', 'HEAD').strip()} {merges[-1]['ts']}"
+    if central.get_state(seen_key) == seen:
+        return []
+    fetch = fetch or (lambda s, n: fetch_pr(s, n))
+    version = checked_version(live)
+    queued: list[str] = []
+    waiting = False
+    for merged in merges:
+        parsed = parse_pr_url(merged["pr_url"])
+        if parsed:
+            try:
+                pr = fetch(*parsed)
+                if not contains(live, pr.merge_sha):
+                    # The cursor stays behind the oldest merge still waiting for a deploy
+                    waiting = True
+                    continue
+                item = enqueue(central, cfg, pr, project=project, repo=parsed[0],
+                               release_tag=version)
+            except Exception as e:  # noqa: BLE001 — retried next pass: nothing is marked seen
+                log.warning("morpheus: could not queue %s: %s", merged["pr_url"], e)
+                return queued
+            if item:
+                queued.append(item["id"])
+        if not waiting:
+            central.set_state(key, str(float(merged["ts"])))
+    central.set_state(seen_key, seen)
+    return queued
+
+
+def rewrite_dev_scripts(central: CentralStore, cfg: MorpheusConfig, project: str,
+                        dev: Path, live: Path) -> list[str]:
+    """Once per declared directory, open scripts naming the dev checkout get a new one; no cap spent"""
+    key = REPOINTED_KEY.format(project=project)
+    if central.get_state(key) == str(live):
+        return []
+    # Not a text swap: a script may read run state the app keeps in the dev folder on purpose
+    spellings = re.escape(str(dev))
+    if dev.is_relative_to(Path.home()):
+        spellings += (r"|(?:~|\$HOME|\$\{HOME\})/"
+                      + re.escape(str(dev.relative_to(Path.home()))))
+    names_dev = re.compile(rf"(?:{spellings})(?![\w.-])")
+    why = (f"This script names {dev}, the development checkout. Production is {live}, the "
+           f"directory you are in. Check production; keep the development path only for state "
+           f"production itself reads there.")
+    sent = []
+    for item in central.morpheus_items(OPEN_STATES):
+        if item["project"] == project and names_dev.search(item["script"] or ""):
+            rewrite(central, cfg, item["id"], why)
+            sent.append(item["id"])
+    central.set_state(key, str(live))
+    return sent
 
 
 def set_script(central: CentralStore, item_id: str, script: str, source: str,
@@ -932,6 +1012,12 @@ Decide whether the user needs to look. If they do, ESCALATE and say what to look
 not, answer in two sentences; the answer is recorded on the item.
 {actions}"""
 
+#: Every question offers it; a question without the `settle_offered` mark predates it
+SETTLE_OFFER = """If the user need not look, add `"action": "settle"`: the item becomes `unverified`, meaning
+nothing wrong was found and no check passed. It is not a pass and nobody owes it a move;
+the user can watch it again with `jarvis morpheus requeue {id}`. An answer with no action
+moves nothing: the item stays {state} and the OS warns the user."""
+
 #: The item still has its automatic requeue
 REQUEUE_OFFER = """If the failure was transient — production had not exercised the change yet, a network or
 environment hiccup — add `"action": "requeue"` to your JSON and the OS watches it again
@@ -966,15 +1052,45 @@ def _ask_neo(catalog: Catalog, item: dict[str, Any], note: str = "") -> int:
     offer = REQUEUE_SPENT if spent else REQUEUE_OFFER
     rewritten = int(item.get("script_rewrites") or 0) >= MAX_SCRIPT_REWRITES
     actions = "\n\n".join(text.format(id=item["id"], state=item["state"]) for text in
-                          (offer, REWRITE_SPENT if rewritten else REWRITE_OFFER))
+                          (SETTLE_OFFER, offer, REWRITE_SPENT if rewritten else REWRITE_OFFER))
     neo = NeoStore()
     try:
         q = neo.ask(item.get("project") or _os_project(catalog), "",
                     VALIDATION_QUESTION.format(why=why, actions=actions),
-                    context=json.dumps({"morpheus_item": item["id"]}), kind="validation")
+                    context=json.dumps({"morpheus_item": item["id"], "settle_offered": True}),
+                    kind="validation")
     finally:
         neo.close()
     return int(q["id"])
+
+
+def reask_answered(central: CentralStore, catalog: Catalog, *,
+                   skip: Collection[str] = ()) -> list[str]:
+    """Ask once more each row Neo answered before it could settle one; returns the rows asked"""
+    from .neo_store import NeoStore
+
+    asked: list[str] = []
+    neo = NeoStore()
+    try:
+        for item in central.morpheus_items(ACTION_STATES):
+            kind, _, qid = (item["action"] or "").partition(":")
+            if (kind != "neo" or not qid.isdigit() or (item["project"] or "") in skip
+                    or (item["resolution"] or "").startswith(CONFIRMED)):
+                continue
+            q = neo.get(int(qid))
+            if (not q or q["status"] != "answered" or q["answered_by"] != "neo"
+                    or _settle_offered(q)):
+                continue
+            try:
+                action = f"neo:{_ask_neo(catalog, item)}"
+            except Exception:  # noqa: BLE001 — one item must not starve the others
+                log.exception("morpheus: could not ask Neo again about %s", item["id"])
+                continue
+            central.update_morpheus_item(item["id"], action=action, action_ts=db.now())
+            asked.append(item["id"])
+    finally:
+        neo.close()
+    return asked
 
 
 def item_of_question(q: dict[str, Any]) -> str:
@@ -983,6 +1099,14 @@ def item_of_question(q: dict[str, Any]) -> str:
         return str((json.loads(q.get("context") or "{}") or {}).get("morpheus_item") or "")
     except (ValueError, AttributeError):
         return ""
+
+
+def _settle_offered(q: dict[str, Any]) -> bool:
+    """Whether this question could be answered with `settle`; one that could not is asked again"""
+    try:
+        return bool((json.loads(q.get("context") or "{}") or {}).get("settle_offered"))
+    except (ValueError, AttributeError):
+        return False
 
 
 def verdict_action(verdict: dict[str, Any]) -> str:
@@ -1024,25 +1148,41 @@ def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, 
                 and central.claim_morpheus_auto_requeue(item_id, MAX_AUTO_REQUEUES))
     rewritten = (action == "rewrite" and live and bool(reading)
                  and central.claim_morpheus_script_rewrite(item_id, MAX_SCRIPT_REWRITES))
+    # Never over the user's own ruling that the failure is real
+    settled = (action == "settle" and live and bool(reading)
+               and not (item["resolution"] or "").startswith(CONFIRMED))
     if requeued:
         requeue(central, cfg, item_id, resolution=f"re-watched by Neo: {resolution}")
+    elif settled:
+        central.update_morpheus_item(item_id, state="unverified", next_check_ts=None,
+                                     resolution=f"unverified by Neo: {resolution}")
     elif rewritten:
         rewrite(central, cfg, item_id, reading,
                 resolution=f"script sent back to be rewritten by Neo: {resolution}")
     else:
         central.update_morpheus_item(item_id, resolution=resolution)
+    # Nothing retries this row now: silence would hide it, so the user hears (wo-ea6895e7)
+    unmoved = (live and not (escalated or requeued or settled or rewritten)
+               and _settle_offered(q) and not (item["resolution"] or "").startswith(CONFIRMED))
     central.add_inbox(
-        project=q.get("project") or "os", level="warning" if escalated else "info",
+        project=q.get("project") or "os", level="warning" if escalated or unmoved else "info",
         title=(f"PR #{item['pr_number']} {item['state']} production validation"
                + (" — Neo escalated" if escalated else
                   " — Neo is watching it again" if requeued else
                   " — Neo sent its script back to be rewritten" if rewritten else
+                  " — Neo settled it unverified, not passed" if settled else
+                  " — Neo answered and nothing moved" if unmoved else
                   " — Neo's reading")),
         body=f"{item['pr_url']}\n{reading[:600]}\n"
              + ("the OS is validating it again — its one automatic requeue is now spent\n"
                 if requeued else "")
              + ("Morpheus writes a new script, then the OS watches it again — its one "
                 "automatic rewrite is now spent\n" if rewritten else "")
+             + (f"nobody owes it a move; jarvis morpheus requeue {item_id} watches it again\n"
+                if settled else "")
+             + (f"it stays {item['state']} and nothing retries it. Yours to move: jarvis morpheus "
+                f"requeue|waive|confirm|rewrite {item_id}. A wrong reading is a bug to file\n"
+                if unmoved else "")
              + (f"{question_url}\n" if question_url else "")
              + f"jarvis morpheus show {item_id}")
 
