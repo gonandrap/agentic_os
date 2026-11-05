@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from jarvis import automerge, bugreport, ci, db, gates, invariants, ops
+from jarvis import automerge, bugreport, ci, db, gates, invariants, ops, steward
 from jarvis.catalog import load_catalog
 from jarvis.central_store import BASE_HEALTH_FRESH_SECONDS, CentralStore
 from jarvis.daemon import Daemon
@@ -802,6 +802,29 @@ def test_a_fresh_red_main_waits_out_the_grace_window(tracker, project, fake_gh):
 
     sweep(tracker, store)
     assert filings(fake_gh) == 1 and fact()["fix_wo_id"]
+
+
+@pytest.mark.parametrize("parent_kind,dispatched", [("bug_agent", True), ("red_main", False)])
+def test_a_break_blamed_on_a_steward_dispatched_merge(tracker, project, fake_gh, parent_kind,
+                                                      dispatched):
+    """io-f48bcdcb: gen-1 parent dispatches; a `red_main` parent is self-reference and does not"""
+    tracker.catalog.project("proj_a").evolution.mode = "enforce"
+    store = ProjectStore(project)
+    poll(tracker, store)
+    stamp = {"origin_kind": parent_kind, "generation": 1}
+    blamed = store.create_work_order("merged", metadata={steward.STAMP_KEY: stamp})["id"]
+    central = CentralStore()
+    central.set_base_health("proj_a", {**fact(central), "wo_id": blamed})
+
+    sweep(tracker, store)
+
+    assert bool(fact().get("fix_wo_id")) is dispatched
+    made = [w for w in orders(store) if w != blamed]
+    assert len(made) == int(dispatched)
+    row = central.conn.execute("SELECT outcome, rule, generation FROM steward_decisions "
+                               "WHERE origin_kind='red_main'").fetchone()
+    want = ("dispatch", "reported-bug") if dispatched else ("queue", "self-reference")
+    assert (row["outcome"], row["rule"], row["generation"]) == (*want, 2)
 
 
 def filings(fake_gh) -> int:
