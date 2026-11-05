@@ -8662,6 +8662,9 @@ STUCK_FINGERPRINT_KEY = "stuck_fingerprint"
 #: `feature_orders.metadata` key: the Morpheus item whose failed validation opened it (#1344)
 MORPHEUS_ITEM_KEY = "morpheus_item"
 
+#: `feature_orders.metadata`: what the coverage seat returned this verdict for, once
+COVERAGE_RETURNED_KEY = "coverage_returned"
+
 
 def create_investigation_order(project_name: str | None, subject: str, why: str,
                                budget_usd: float | None = None,
@@ -9438,6 +9441,7 @@ def show_investigation_order(inv_id: str, project_name: str | None = None
         "classification": verdict.get("classification") or "",
         "filed": verdict.get("filed") or None,
         "filing_error": verdict.get("filing_error") or "",
+        "coverage_miss": verdict.get("coverage_miss") or [],
         "investigator": investigator,
         "assumptions": calls,
         "status_label": investigation_status_label(fo),
@@ -9473,7 +9477,7 @@ def set_investigation_budget(inv_id: str, amount: float | None,
 def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
                    source: Path | None = None) -> dict[str, Any]:
     """(Investigators) hand back the verdict (#792)"""
-    from . import bugreport, verdicts
+    from . import bugreport, verdict_coverage, verdicts
 
     name, path, fo = find_feature_order(inv_id, project_name)
     _require_kind(fo, "investigation", "jarvis fo plan")
@@ -9508,6 +9512,28 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
 
     verdict["classified_by"] = "investigator"
     verdict["filed"] = None
+    # Keyed on `other_gaps`: before that field ships, every side gap would read as a miss
+    if verdict["classification"] == "GAP" and "other_gaps" in verdict:
+        try:
+            missed = verdict_coverage.uncovered(str(fo.get("description") or ""), verdict,
+                                                project=name, wo_id=fo.get("plan_wo_id") or "")
+        except verdict_coverage.SeatUnreachable as e:
+            return _verdict_filing_failed(name, path, fo, inv_id, verdict, str(e))
+        if missed and not metadata.get(COVERAGE_RETURNED_KEY):
+            store = ProjectStore(path)
+            try:
+                store.update_feature_order(inv_id, metadata=db.to_json(
+                    {**metadata, COVERAGE_RETURNED_KEY: missed}))
+            finally:
+                store.close()
+            raise OpsError(
+                f"the verdict was not accepted, and nothing was stored: it names a gap with "
+                f"no entry. Give each one an `other_gaps` entry, or state in `root_cause` "
+                f"why it is dismissed, and resubmit. This return happens once; the next "
+                f"submission settles with any miss recorded.\n  - " + "\n  - ".join(
+                    f"{m['gap']}: {m['quote']!r}" for m in missed))
+        if missed:
+            verdict["coverage_miss"] = missed
     filing_error = ""
     tracker = bugreport.bug_repo()
     if verdict["classification"] == "GAP" and verdict.get("owner") == "project":
