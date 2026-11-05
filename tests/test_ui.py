@@ -1610,7 +1610,7 @@ def test_dashboard_attention_deep_links_an_escalated_gate(gated):
     gated.daemon._neo_drain()
     r = gated.client.get("/")
     assert "NEEDS YOU" in r.text
-    assert f'href="/gates/{approval["id"]}"' in r.text
+    assert f'href="/gates/{approval["id"]}?project=proj_a"' in r.text
 
 
 def test_timeline_hides_plumbing_until_debug_is_requested(client, daemon, project):
@@ -3894,18 +3894,18 @@ def test_a_gate_number_in_two_projects_lists_both_candidates(client, project, tm
         try:
             wo = store.create_work_order(f"ship {name}")
             ids[name] = store.add_approval(wo["id"], "release", f"./ship-{name}.sh")["id"]
+            if name == "proj_a":  # past list_approvals' cap: the old gate #32 case
+                for _ in range(200):
+                    store.add_approval(wo["id"], "release", "./later.sh")
         finally:
             store.close()
     n = ids["proj_a"]
     assert ids["proj_b"] == n
 
-    r = client.get(f"/gates/{n}", follow_redirects=False)
-    assert r.status_code == 303 and r.headers["location"] == f"/gates?id={n}"
-
-    page = client.get(f"/gates?id={n}").text
-    assert f'href="/gates/{n}?project=proj_a"' in page
-    assert f'href="/gates/{n}?project=proj_b"' in page
-    assert "nothing matches these filters" not in page
+    page = client.get(f"/gates/{n}")
+    assert page.status_code == 200
+    assert f'href="/gates/{n}?project=proj_a"' in page.text
+    assert f'href="/gates/{n}?project=proj_b"' in page.text
 
     r = client.get(f"/gates/{n}?project=proj_b")
     assert r.status_code == 200

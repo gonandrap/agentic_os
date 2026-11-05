@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Gate #{{ approval_id }} — Jarvis{% endblock %}
+{% block content %}
+<p>Gate numbers are per project; #{{ approval_id }} exists in several. Which one?</p>
+<ul>
+  {% for name in projects %}
+  <li><a href="/gates/{{ approval_id }}?project={{ name | urlencode }}">{{ name }} #{{ approval_id }}</a></li>
+  {% endfor %}
+</ul>
+{% endblock %}

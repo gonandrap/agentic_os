@@ -2146,8 +2146,7 @@ def create_app() -> FastAPI:
         options = {"state": filter_options(every, "state"),
                    "project": filter_options(every, "project"),
                    "kind": filter_options(every, "kind")}
-        # `id` has no select: /gates/<n> lands here when n names a gate in several projects
-        filters = query_filters(request, {**options, "id": ()})
+        filters = query_filters(request, options)
         rows = filter_rows(every, filters)
         return render(request, "gates.html", active="gates", rows=rows,
                       attention=[g for g in rows if g["state"] == "escalated"],
@@ -2161,9 +2160,11 @@ def create_app() -> FastAPI:
         """One privileged-action request: the case, Neo's review, the decision"""
         try:
             g = ops.show_gate(approval_id, project_name=project or None)
+        except ops.AmbiguousApproval as e:
+            # Reached only by a typed id (/go/gate-<n>); every rendered link names its project
+            return render(request, "gate_choose.html", active="gates",
+                          approval_id=approval_id, projects=e.projects)
         except ops.OpsError as e:
-            if not project and sum(g["id"] == approval_id for g in ops.list_gates()) > 1:
-                return RedirectResponse(f"/gates?id={approval_id}", status_code=303)
             return render(request, "error.html", active="gates", message=str(e),
                           status_code=404)
         back = f"/gates/{approval_id}?project={g['project']}"
