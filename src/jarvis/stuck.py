@@ -63,10 +63,10 @@ EXCLUSION_REASON: Mapping[str, str] = {
                       "until that call returns, so silence says nothing about it — "
                       "nothing is judged until it returns or the turn reaches the "
                       "stalled-turn ceiling"),
-    BASE_RED_CAUSE: ("the OS is holding this merge itself: the default branch's own build "
-                     "is broken and nothing merges onto a red base — it clears when the "
-                     "base goes green, with no decision from you, so nothing is judged "
-                     "while that is true"),
+    BASE_RED_CAUSE: ("the OS is holding this order itself: the default branch's own build "
+                     "is broken, and nothing merges onto a red base or ships a release "
+                     "from it — it clears when the base goes green, with no decision from "
+                     "you, so nothing is judged while that is true"),
     # §1: the default sentence is TRUE here and still says nothing a reader can act on
     AUTOMERGE_CHECKS_CAUSE: ("the OS is holding this merge itself: GitHub has not finished "
                              "running the checks on the commit the panel judged, and "

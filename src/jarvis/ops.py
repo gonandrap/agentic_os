@@ -9202,9 +9202,12 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 until, cause = validation_hold(events, int(latest["round"]))
                 ci_held = cause == VALIDATION_CI_CAUSE and until > now
             ci_spans = validation_ci_hold_spans(events, since, now)
-        # A MERGE THE OS IS ITSELF HOLDING ONTO A RED BASE IS NOT STUCK (§1 and §2 of... (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)
+        # A MERGE OR A `pending` RELEASE THE OS HOLDS ON A RED BASE IS NOT STUCK (docs/superpowers/specs/2026-11-04-a-release-held-by-a-red-base-is-not-stuck.md)
+        held_by_red_base = (wo["status"] == "waiting_pr_merge"
+                            or (wo["status"] == "pending"
+                                and release.is_release_order(wo)))
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
-                          if wo["status"] == "waiting_pr_merge" else [])
+                          if held_by_red_base else [])
         # A MERGE THE OS IS ITSELF HOLDING FOR GITHUB'S RUNNING CHECKS IS NOT STUCK (§2 and §3 of...
         automerge_checks_held, automerge_spans, am_note = False, [], ""
         if wo["status"] == "waiting_pr_merge":
@@ -9281,13 +9284,13 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         verdict = stuck.assess(
             str(wo["status"]), now - since, silence,
             discounted, thresholds, cfg.fallback_minutes * 60.0,
-            # CI and base-red cannot collide: `validating` and `waiting_pr_merge` (§1 of the 2026-10-15 spec)
+            # CI and base-red cannot collide: CI is `validating`-only (§1 of the 2026-10-15 spec)
             excluded_cause=(PAUSE_USAGE_LIMIT
                             if window or any(h.open for h in usage)
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
-                            if base_red and wo["status"] == "waiting_pr_merge"
-                            # AFTER the red base and BEFORE the dependency: both are `waiting_pr_merge`-only and CAN co-occur
+                            if base_red and held_by_red_base
+                            # AFTER the red base and BEFORE the dependency: the first two CAN co-occur
                             else stuck.AUTOMERGE_CHECKS_CAUSE if automerge_checks_held
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE
@@ -17550,9 +17553,64 @@ def morpheus_report() -> dict[str, Any]:
 
     central = CentralStore()
     try:
-        return morpheus.report(central, _morpheus_catalog())
+        rep = morpheus.report(central, _morpheus_catalog())
     finally:
         central.close()
+    rep["items"] = _mo_owed(rep["items"])
+    return rep
+
+
+def _mo_owed(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each row with `morpheus.owed_by` read from its Neo question or order; stored nowhere"""
+    from . import morpheus
+    from .neo_store import NeoStore
+
+    out = []
+    neo = NeoStore()
+    try:
+        for item in items:
+            question = order = None
+            kind, _, ref = (item.get("action") or "").partition(":")
+            if not morpheus.decided(item):
+                if kind == "neo" and ref.isdigit():
+                    question = neo.get(int(ref))
+                elif kind in ("investigation", "improvement"):
+                    try:
+                        order = find_feature_order(ref, item.get("project") or None)[2]
+                    except OpsError:
+                        pass  # gone: `owed_by` hands it to the user
+            owner, command = morpheus.owed_by(item, question, order)
+            out.append({**item, "owed_by": owner, "owed_command": command})
+    finally:
+        neo.close()
+    return out
+
+
+def clear_settled_monitor_attention() -> list[str]:
+    """Lower a finished investigation's attention once its monitoring row is decided (io-5cc7a40d)"""
+    from . import morpheus
+
+    cleared = []
+    central = CentralStore()
+    try:
+        for path in registered_project_paths().values():
+            if not project_db_path(Path(path)).exists():
+                continue
+            store = ProjectStore(path)
+            try:
+                for fo in store.flagged_feature_orders():
+                    item_id = (db.from_json(fo.get("metadata"), {}) or {}).get(MORPHEUS_ITEM_KEY)
+                    if fo.get("kind") != "investigation" or fo["status"] != "completed" or not item_id:
+                        continue
+                    item = central.morpheus_item(str(item_id))
+                    if item and morpheus.decided(item):
+                        store.clear_feature_attention(fo["id"])
+                        cleared.append(str(fo["id"]))
+            finally:
+                store.close()
+    finally:
+        central.close()
+    return cleared
 
 
 def morpheus_item(item_id: str) -> dict[str, Any]:
@@ -17572,7 +17630,7 @@ def morpheus_detail(item_id: str) -> dict[str, Any]:
     from .central_store import headline
     from .neo_store import NeoStore
 
-    item = morpheus_item(item_id)
+    item = _mo_owed([morpheus_item(item_id)])[0]
     central = CentralStore()
     try:
         runs = central.morpheus_runs(item_id)
@@ -17847,12 +17905,14 @@ def mo_create(project: str, title: str, prompt: str = "", script: str = "",
 
 
 def mo_list(project: str | None = None, include_all: bool = False,
-            state: str | None = None) -> list[dict[str, Any]]:
+            state: str | None = None, owed: str | None = None) -> list[dict[str, Any]]:
     """Open orders and the failed/timed-out ones owed a look; `include_all` adds the settled"""
     from . import morpheus
 
     if state and state not in morpheus.STATES:
         raise OpsError(f"no state {state!r}; one of {', '.join(morpheus.STATES)}")
+    if owed and owed not in morpheus.OWNERS:
+        raise OpsError(f"no owner {owed!r}; one of {', '.join(morpheus.OWNERS)}")
     states = [state] if state else (None if include_all else
                                     [*morpheus.OPEN_STATES, *morpheus.ACTION_STATES])
     central = CentralStore()
@@ -17860,7 +17920,8 @@ def mo_list(project: str | None = None, include_all: bool = False,
         items = central.morpheus_items(states)
     finally:
         central.close()
-    return [i for i in items if not project or i.get("project") == project]
+    return [i for i in _mo_owed([i for i in items if not project or i.get("project") == project])
+            if not owed or i["owed_by"] == owed]
 
 
 def mo_show(mo_id: str) -> dict[str, Any]:

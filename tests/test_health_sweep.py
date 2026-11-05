@@ -2886,6 +2886,126 @@ def test_the_held_order_is_a_visible_row_and_never_a_continue(red_base_os):
                 if r["id"] == wo["id"])["excluded"] == stuck.BASE_RED_CAUSE
 
 
+def _held_release(store, hours: float = 4.9, status: str = "pending") -> tuple[dict, float]:
+    """A release order the OS holds on a red base, in `status` for `hours`"""
+    from jarvis import release
+
+    wo = store.create_work_order("Ship the fix", status="pending",
+                                 metadata={release.BATCH_KEY: ["https://x/issues/1"]})
+    return wo, park_order(store, wo["id"], status, hours=hours)
+
+
+def _report_row(wo, now):
+    return next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+
+def test_a_release_held_by_a_red_base_is_excluded_and_discounted(red_base_os):
+    """Issue 1603, wo-98a2b552's shape: a visible row with a named cause, its hold discounted"""
+    from jarvis import stuck
+
+    store = red_base_os["store"]
+    now = db.now()
+    wo, at = _held_release(store, hours=0.6)
+    base_fact(red=True)
+    red_episodes([[at, None]])
+
+    scanned, rows = ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), now,
+                                   base_red=True, red_episodes=[[at, None]],
+                                   base_red_until=now, stuck_only=False)
+    row = _report_row(wo, now)
+
+    assert scanned == 1 and rows[0]["verdict"].excluded == stuck.BASE_RED_CAUSE
+    assert row["stuck"] is False and row["excluded"] == stuck.BASE_RED_CAUSE
+    assert abs(row["discounted_seconds"] - 0.6 * HOUR) < 5, row["discounted_seconds"]
+    assert row["active_seconds"] < 5, row["active_seconds"]
+
+
+def test_a_release_is_judged_on_time_not_held_once_main_goes_green(red_base_os):
+    """kn-0a222b38: an exclusion alone would flag it on the first sweep after green"""
+    store = red_base_os["store"]
+    now = db.now()
+    wo, at = _held_release(store)
+    base_fact(red=False)
+    red_episodes([[at, at + 4.5 * HOUR]])
+
+    row = _report_row(wo, now)
+
+    assert row["excluded"] == ""
+    assert abs(row["discounted_seconds"] - 4.5 * HOUR) < 5, row["discounted_seconds"]
+    assert row["stuck"] is False, row["reason"]
+
+
+def test_the_release_past_its_red_park_is_a_user_wait_and_stays_judged(red_base_os):
+    """kn-6e836793: `needs_review` is what the user owes"""
+    store = red_base_os["store"]
+    now = db.now()
+    wo, at = _held_release(store, status="needs_review")
+    base_fact(red=True)
+    red_episodes([[at, None]])
+
+    row = _report_row(wo, now)
+
+    assert row["excluded"] == "" and row["discounted_seconds"] == 0.0
+    assert row["stuck"] is True, row["reason"]
+
+
+def test_an_ordinary_pending_order_on_a_red_base_stays_judged(red_base_os):
+    """The widening is the release hold's: a red base withholds no other `pending` dispatch"""
+    store = red_base_os["store"]
+    now = db.now()
+    wo, at = _parked(store, status="pending", title="an ordinary order")
+    base_fact(red=True)
+    red_episodes([[at, None]])
+
+    row = _report_row(wo, now)
+
+    assert row["excluded"] == "" and row["discounted_seconds"] == 0.0
+    assert row["stuck"] is True, row["reason"]
+
+
+def test_a_stale_red_fact_leaves_the_release_judged_to_the_horizon(red_base_os):
+    """§5(5) of the 2026-10-15 spec, which the release side keeps"""
+    from jarvis.central_store import BASE_HEALTH_FRESH_SECONDS
+
+    store = red_base_os["store"]
+    now = db.now()
+    wo, at = _held_release(store, hours=1.0)
+    checked_at = base_fact(red=True, age=BASE_HEALTH_FRESH_SECONDS + 600)
+    red_episodes([[at, None]])
+
+    row = _report_row(wo, now)
+
+    assert row["excluded"] == ""
+    horizon = checked_at + BASE_HEALTH_FRESH_SECONDS
+    assert abs(row["discounted_seconds"] - (horizon - at)) < 2, row["discounted_seconds"]
+
+
+def test_the_invariant_is_quiet_on_a_discounted_hold(red_base_os):
+    from jarvis import invariants
+
+    store = red_base_os["store"]
+    _wo, at = _held_release(store, hours=0.6)
+    base_fact(red=True)
+    red_episodes([[at, None]])
+
+    assert list(invariants.check_red_release_hold_is_discounted(store)) == []
+
+
+def test_the_invariant_names_a_hold_with_no_episode_behind_it(red_base_os):
+    """Issue 1603's detector: a fresh red fact with no span is the undiscounted hold"""
+    from jarvis import invariants
+
+    store = red_base_os["store"]
+    wo, _at = _held_release(store, hours=0.6)
+    base_fact(red=True)
+    red_episodes([])
+
+    found = list(invariants.check_red_release_hold_is_discounted(store))
+
+    assert [v.wo_id for v in found] == [wo["id"]]
+    assert found[0].invariant == invariants.INV_RED_RELEASE_UNDISCOUNTED
+
+
 @pytest.mark.parametrize("auto_merge, excluded", [(True, True), (False, False)])
 def test_both_callers_derive_the_same_bool(jarvis_home, project, tmp_path, auto_merge,
                                            excluded):

@@ -756,10 +756,11 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("project", nargs="?")
     m.add_argument("--all", action="store_true", help="settled orders too")
     m.add_argument("--state", help="only this state")
+    m.add_argument("--owed", help="only rows this owner owes: user, neo, investigation or os")
     m = mo.add_parser("cancel", help="stop watching an open order; it is never judged")
     m.add_argument("item_id")
-    m = mo.add_parser("status", help="counts by state, pause, activity, then every order")
-    m.add_argument("--all", action="store_true", help="list settled orders too")
+    m = mo.add_parser("status", help="counts by state, pause, activity, then the rows you owe")
+    m.add_argument("--all", action="store_true", help="list every other order too")
     m = mo.add_parser("show", help="one order: its hints or prompt, script, last output and "
                                    "action")
     m.add_argument("item_id")
@@ -4342,9 +4343,10 @@ MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "unve
 def _morpheus_line(item: dict) -> str:
     action = f" → {item['action']}" if item.get("action") else ""
     what = f"PR #{item['pr_number']} " if item.get("pr_number") else ""
+    owner = f" · owed by {item['owed_by']}" if item.get("owed_by") else ""
     return (f"{MORPHEUS_ICON.get(item['state'], '•')} {item['id']} "
             f"[{item.get('project') or '?'}] {what}"
-            f"{item['state']}{action} — {(item.get('pr_title') or item.get('title') or '')[:70]}")
+            f"{item['state']}{action}{owner} — {(item.get('pr_title') or item.get('title') or '')[:70]}")
 
 
 def _fix_lines(fix: dict | None, dispatch: str) -> list[str]:
@@ -4385,7 +4387,7 @@ def _chain_lines(chain: dict, inv_id: str) -> list[str]:
 
 def cmd_morpheus(args: argparse.Namespace) -> int:
     """`jarvis morpheus …` — a thin wrapper over `ops.morpheus_*`"""
-    from . import ops
+    from . import morpheus, ops
 
     if getattr(args, "item_id", None) is not None:
         ops.require_mo_id(args.item_id)
@@ -4404,12 +4406,14 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
                      else " — the daemon runs its script from production"))
         return 0
     if args.morpheus_cmd == "list":
-        items = ops.mo_list(args.project, args.all, args.state)
+        items = ops.mo_list(args.project, args.all, args.state, args.owed)
         if args.json:
             _print(items, True)
             return 0
         for item in items:
             print(_morpheus_line(item))
+            if item["owed_command"]:
+                print(f"    {item['owed_command']}")
         if not items:
             print("no monitoring orders" + ("" if args.all else " open — --all for settled"))
         return 0
@@ -4431,8 +4435,16 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
               (f" · last release {rep['last_release']}" if rep["last_release"] else ""))
         print(f"{_morpheus_pause_text(rep['pause'])}"
               f" · {_morpheus_activity_text(rep['activity'])}")
-        for item in rep["items"]:
+        yours = [i for i in rep["items"] if i["owed_by"] == "user"]
+        rest = [i for i in rep["items"] if i["owed_by"] != "user"]
+        print(f"{len(yours)} need you")
+        for item in yours:
             print(_morpheus_line(item))
+            print(f"    {item['owed_command']}")
+        print(f"OS handling: {sum(1 for i in rest if i['owed_by'])} (jarvis mo list)")
+        if args.all:
+            for item in rest:
+                print(_morpheus_line(item))
         return 0
     if args.morpheus_cmd == "show":
         detail = ops.morpheus_detail(args.item_id)
@@ -4441,6 +4453,8 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             _print(item, True)
             return 0
         print(_morpheus_line(item))
+        if item["owed_command"] == f"jarvis mo show {item['id']}":
+            print(f"your move: {morpheus.USER_VERBS.format(id=item['id'])}")
         if item.get("pr_number"):
             print(f"{item['pr_url']}  first release with this PR {item['release_tag'] or '—'}"
                   f"  work order {item['wo_id'] or '—'}")
