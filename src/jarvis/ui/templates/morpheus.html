@@ -75,14 +75,16 @@
 </div>
 {% endmacro %}
 
+{% if listed or not handling %}
+{{ monitor_table(listed, 'nothing matches these filters' if filters else 'nothing watched — a release, a merge or "New monitor" fills this') }}
+{% endif %}
+
 {% if handling %}
 <details class="panel"{% if filters %} open{% endif %}>
   <summary>OS handling — {{ handling | length }}</summary>
   {{ monitor_table(handling, "") }}
 </details>
 {% endif %}
-
-{{ monitor_table(listed, 'nothing else here' if handling else 'nothing matches these filters' if filters else 'nothing watched — a release, a merge or "New monitor" fills this') }}
 
 {% call ui.explain("how it works") %}
 <p class="kv">
