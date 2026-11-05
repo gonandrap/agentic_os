@@ -75,6 +75,13 @@ HELD_MERGE_QUEUED = "merge_queued"
 #: The grant for this head expired unspent; a fresh request is filed (#1513)
 HELD_GRANT_LAPSED = "grant_lapsed"
 
+#: The wedge timer took this order's queue turn; recorded once per stale hold (spec 2026-11-05)
+TURN_PASSED_OVER_EVENT = "merge_turn_passed_over"
+#: Holds that leave an order moving through its queue turn; any other gives the turn up (spec 2026-11-05)
+TURN_KEEPING_HOLDS = frozenset({
+    HELD_MERGE_QUEUED, HELD_BASE_MOVED, HELD_CHECKS_RUNNING, HELD_CHECKS_NONE, HELD_SHA_MOVED,
+    HELD_NOT_MERGEABLE, HELD_MERGE_STATE_UNCLEAN, HELD_GRANT_LAPSED})
+
 #: WHY the merge command did not succeed on a pull request that merged anyway (§5.5)
 CLEANUP = "cleanup"
 UNFINISHED = "unfinished"
@@ -228,6 +235,9 @@ class Decision:
     catch_up_cause: str = ""
     #: Armed with no check at all because the repository has no workflow (#1347)
     no_ci: bool = False
+    #: On a queue hold: the base branch and the order ahead (spec 2026-11-05)
+    base: str = ""
+    queued_behind: str = ""
 
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
@@ -239,7 +249,8 @@ def hold_payload(decision: Decision) -> dict[str, Any]:
     return {"code": decision.code, "reason": decision.reason,
             "judged_sha": decision.judged_sha, "head_sha": decision.head_sha,
             "round": decision.round_n, "catch_up": decision.catch_up,
-            "catch_up_cause": decision.catch_up_cause}
+            "catch_up_cause": decision.catch_up_cause, "base": decision.base,
+            "queued_behind": decision.queued_behind}
 
 
 def hold_is_live(state: dict[str, Any] | None) -> bool:
@@ -302,18 +313,107 @@ def held_grant_lapsed(approval: dict[str, Any], decision: Decision) -> Decision:
                  head_sha=decision.judged_sha, round_n=decision.round_n)
 
 
-def merge_queued(store: Any, wo: dict[str, Any], pr: Any) -> Decision | None:
-    """Held behind another order's merge in flight on this base tip, or None (#1459)"""
-    base_oid = str(getattr(pr, "base_oid", "") or "")
-    lease = store.merge_lease(GATE_KIND, base_oid, wo["id"]) if base_oid else None
-    if lease is None:
+@dataclass(frozen=True)
+class QueueEntry:
+    """One order's place in the merge queue, read from its `automerge_held` events"""
+
+    wo_id: str
+    base: str
+    entered: float
+    last_code: str
+    last_ts: float
+
+
+def _keeps_turn(hold: dict[str, Any]) -> bool:
+    from . import ops
+
+    if hold.get("code") != HELD_BASE_MOVED:
+        return hold.get("code") in TURN_KEEPING_HOLDS
+    return (hold.get("catch_up") not in (ops.CATCH_UP_EXHAUSTED, ops.CATCH_UP_FAILED)
+            and hold.get("catch_up_cause") != ops.CATCH_UP_DEFER_CARRY_UNPROVEN)
+
+
+def queue_entry(store: Any, wo: dict[str, Any]) -> QueueEntry | None:
+    """This order's standing place in the queue, or None (docs/superpowers/specs/2026-11-05-a-merge-queue-turn-survives-the-merge-ahead.md)"""
+    from . import db
+
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if row is None or row.get("outcome") != "passed":
         return None
-    base = str(getattr(pr, "base_ref", "") or "the base")
+    latest = next((a for a in store.list_approvals(wo["id"]) if a["kind"] == GATE_KIND), None)
+    if latest is not None and (
+            latest["status"] == "denied"
+            or (latest["status"] in ("pending", "awaiting_case") and latest.get("escalated"))):
+        return None
+    since = float(row["ts"] or 0.0)
+    entered, base, last_code, last_ts = 0.0, "", "", 0.0
+    for event in store.events_of_kind(wo["id"], "automerge_held"):
+        ts = float(event["ts"] or 0.0)
+        if ts < since:
+            continue
+        hold = db.from_json(event.get("payload"), {}) or {}
+        last_code, last_ts = str(hold.get("code") or ""), ts
+        if not _keeps_turn(hold):
+            entered, base = 0.0, ""
+        elif not entered and last_code == HELD_MERGE_QUEUED and hold.get("base"):
+            entered, base = ts, str(hold["base"])
+    if not entered:
+        return None
+    return QueueEntry(wo["id"], base, entered, last_code, last_ts)
+
+
+def _turn_standing(store: Any, wo: dict[str, Any], pr: Any,
+                   ) -> tuple[QueueEntry | None, list[QueueEntry]]:
+    """(the live order ahead of this one, the wedged ones passed over on the way to it)"""
+    from . import db, gates, issues
+
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if issues.was_expedited(wo) or row is None or row.get("outcome") != "passed":
+        return None, []
+    base = str(getattr(pr, "base_ref", "") or "")
+    mine = queue_entry(store, wo)
+    entries = [entry for other in store.list_work_orders(statuses=("waiting_pr_merge",),
+                                                         include_hidden=True)
+               if other["id"] != wo["id"]
+               and (entry := queue_entry(store, other)) is not None and entry.base == base]
+    wedged_before = db.now() - gates.GRANT_TTL_SECONDS
+    passed: list[QueueEntry] = []
+    for entry in sorted(entries, key=lambda e: (e.entered, e.wo_id)):
+        if mine is not None and (entry.entered, entry.wo_id) > (mine.entered, mine.wo_id):
+            break
+        # A queued order is waiting by design, so its old hold is not a wedge
+        if entry.last_code != HELD_MERGE_QUEUED and entry.last_ts < wedged_before:
+            passed.append(entry)
+            continue
+        return entry, passed
+    return None, passed
+
+
+def passed_over(store: Any, wo: dict[str, Any], pr: Any) -> list[QueueEntry]:
+    """Orders ahead of this one that lost their turn to the wedge timer"""
+    return _turn_standing(store, wo, pr)[1]
+
+
+def merge_queued(store: Any, wo: dict[str, Any], pr: Any) -> Decision | None:
+    """Held behind another order's merge in flight on this tip (#1459) or its older place in the queue (#1608), or None"""
+    base_oid = str(getattr(pr, "base_oid", "") or "")
+    base = str(getattr(pr, "base_ref", "") or "")
+    named = base or "the base"
+    head = str(getattr(pr, "head_oid", "") or "")
+    lease = store.merge_lease(GATE_KIND, base_oid, wo["id"]) if base_oid else None
+    if lease is not None:
+        return _held(HELD_MERGE_QUEUED,
+                     f"queued behind {lease['wo_id']}, whose merge into `{named}` at "
+                     f"{base_oid[:10]} is in flight (gate request {lease['id']}); this "
+                     f"branch is caught up and proposed once that one merges or is refused",
+                     head_sha=head, base=base, queued_behind=str(lease["wo_id"]))
+    ahead = _turn_standing(store, wo, pr)[0]
+    if ahead is None:
+        return None
     return _held(HELD_MERGE_QUEUED,
-                 f"queued behind {lease['wo_id']}, whose merge into `{base}` at "
-                 f"{base_oid[:10]} is in flight (gate request {lease['id']}); this "
-                 f"branch is caught up and proposed once that one merges or is refused",
-                 head_sha=str(getattr(pr, "head_oid", "") or ""))
+                 f"queued behind {ahead.wo_id}, which entered the merge queue for `{named}` "
+                 f"first; this branch is caught up and proposed when its turn comes",
+                 head_sha=head, base=base, queued_behind=ahead.wo_id)
 
 
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,

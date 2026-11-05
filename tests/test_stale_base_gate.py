@@ -412,6 +412,129 @@ def test_a_branch_behind_the_base_is_not_caught_up_while_another_merge_is_in_fli
     assert store.list_approvals(second["id"]) == []
 
 
+# -- #1608: the queue's order survives the merge ahead
+
+
+PR_3 = "https://github.com/acme/proj/pull/9"
+JUDGED_3 = "b761ae3d09000000000000000000000000000ddd"
+
+
+def three_queued(project_path, fake_gh, daemon):
+    """A filed, B then C queued behind it on BASE_1, by a real poll each"""
+    store, first, second = two_parked(project_path, fake_gh)
+    poll(daemon, store)
+    first, second = leader(store, first, second)
+    third = ops.create_work_order("proj_a", "add feature Z")
+    ops.finish(third["id"], "opened a PR", pr_url=PR_3)
+    row = store.open_validation_round(wo_id=third["id"], fingerprint="fp-3")
+    store.set_validation_head(row["id"], JUDGED_3)
+    store.close_validation_round(row["id"], "passed", "")
+    fake_gh.set_pr(PR_3, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED_3,
+                   base_oid=BASE_1)
+    poll(daemon, store)
+    second, third = sorted((second, store.get_work_order(third["id"])), key=lambda w:
+                           store.events_of_kind(w["id"], "automerge_held")[0]["ts"])
+    return store, first, second, third
+
+
+def land(fake_gh, local, leader_wo, waiters, tip=BASE_2):
+    """The leader merges: main moves to `tip` and every waiter is behind it"""
+    fake_gh.set_pr(leader_wo["pr_url"], "MERGED", checks=GREEN, merge_state="CLEAN",
+                   head_oid=automerge_head(leader_wo), base_oid=tip)
+    for wo in waiters:
+        fake_gh.set_pr(wo["pr_url"], "OPEN", checks=GREEN, merge_state="CLEAN",
+                       head_oid=automerge_head(wo), base_oid=tip)
+    fake_gh.base_sha(tip)
+    local.update({"tip": tip, "contains": {BASE_1}})
+
+
+def automerge_head(wo):
+    return {PR: JUDGED, PR_2: JUDGED_2, PR_3: JUDGED_3}[wo["pr_url"]]
+
+
+def holds(store, wo):
+    return [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(wo["id"], "automerge_held")]
+
+
+def test_only_the_front_of_the_queue_catches_up_when_the_leader_merges(
+        started, project, fake_gh, local):
+    """#1608: one catch-up for the next in line, none for the order behind it, then its turn"""
+    opt_in(started)
+    store, first, second, third = three_queued(project, fake_gh, started)
+    land(fake_gh, local, first, (second, third))
+
+    poll(started, store)
+
+    assert fake_gh.updates.count(second["pr_url"]) == 1
+    assert third["pr_url"] not in fake_gh.updates
+    assert holds(store, third)[-1]["queued_behind"] == second["id"]
+    assert ops.base_chase_laps(store, third["id"]) == []
+
+    land(fake_gh, local, second, (third,), tip=BASE_3)
+    poll(started, store)
+    poll(started, store)    # the poll's order is not this test's: the merge may close second
+
+    assert fake_gh.updates.count(second["pr_url"]) == 1
+    assert fake_gh.updates.count(third["pr_url"]) == 1
+
+
+def test_the_front_gives_up_its_turn_when_its_ci_fails(started, project, fake_gh, local):
+    """#1608: a red front order never stalls the queue behind it"""
+    opt_in(started)
+    store, _, second, third = three_queued(project, fake_gh, started)
+    store.add_event(second["id"], "automerge_held",
+                    {"code": automerge.HELD_CHECKS_FAILED, "head_sha": automerge_head(second)})
+
+    assert automerge.queue_entry(store, second) is None
+    assert automerge.queue_entry(store, third) is not None
+
+
+def test_a_wedged_front_is_passed_over_and_the_user_is_told_once(
+        started, project, fake_gh, local, monkeypatch):
+    """#1608, Neo Q3672: the wedge timer never rotates a turn silently"""
+    opt_in(started)
+    store, first, second, third = three_queued(project, fake_gh, started)
+    land(fake_gh, local, first, (second, third))
+    store.add_event(second["id"], "automerge_held",
+                    {"code": automerge.HELD_CHECKS_RUNNING, "head_sha": JUDGED_2})
+    pr = fake_gh_pr(third, BASE_2)
+    assert automerge.merge_queued(store, third, pr).queued_behind == second["id"]
+    monkeypatch.setattr(gates, "GRANT_TTL_SECONDS", -1)
+
+    assert automerge.merge_queued(store, third, pr) is None
+    started._merge_queued(started.catalog.project("proj_a"), store, third, pr)
+    started._merge_queued(started.catalog.project("proj_a"), store, third, pr)
+
+    assert len(store.events_of_kind(second["id"], automerge.TURN_PASSED_OVER_EVENT)) == 1
+    assert [row for row in started.central.unacked_inbox()
+            if row["title"] == f"The merge queue passed over {second['id']}"]
+
+
+def fake_gh_pr(wo, base_oid):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(base_oid=base_oid, base_ref="main", head_oid=automerge_head(wo))
+
+
+def test_two_lost_turns_are_reported_by_the_invariant(started, project, fake_gh, local):
+    """#1608: the detector counts a lap right after a queue hold on an order that merged"""
+    from jarvis import invariants
+
+    store, first, second = two_parked(project, fake_gh)
+    store.add_event(first["id"], "pr_merged", {})
+    for _ in range(2):
+        store.add_event(second["id"], "automerge_held",
+                        {"code": automerge.HELD_MERGE_QUEUED, "queued_behind": first["id"]})
+        store.add_event(second["id"], invariants.PR_BASE_UPDATED_EVENT,
+                        {"cause": ops.BASE_UPDATE_BEHIND, "base_sha": BASE_2})
+
+    [violation] = list(invariants.check_queue_turn_survives_merge(store))
+
+    assert violation.wo_id == second["id"]
+    assert violation.invariant == "INV-BASE-CHASE-LIVELOCK"
+
+
 # -- #1513: a grant that lapses unspent is re-requested
 
 

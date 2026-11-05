@@ -107,13 +107,24 @@ GAP_CLASSES: dict[str, GapClass] = {
         issue_url="https://github.com/gonandrap/agentic_os/issues/1592",
         since="",
     ),
+    "base-chase-livelock": GapClass(
+        id="base-chase-livelock",
+        headline="a queued pull request loses its turn when the sibling ahead merges, so "
+                 "it is caught up and re-run after every merge and never reaches the front",
+        symptom="a passed, green order in `waiting_pr_merge` whose history alternates "
+                "`merge_queued` holds with `cause=behind` catch-ups, with no merge",
+        detector="INV-BASE-CHASE-LIVELOCK",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1608",
+        since="",
+    ),
 }
 
 #: Asserted equal to `tuple(GAP_CLASSES)`, on `remedies.SHIPPED_REMEDIES`' precedent
 SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "oversized-input", "unwired-precondition",
                                         "background-task-silence",
-                                        "superseded-delivery")
+                                        "superseded-delivery", "base-chase-livelock")
 
 
 def checked_slug(raw: str) -> str:
