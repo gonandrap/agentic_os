@@ -975,8 +975,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(user_action_owed_blocker(
                 str(owed_action.get("command") or "")))
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for something different (#224)
-        # Rebuilt from the sentence its settler flagged, so both surfaces agree (#1591)
         if release_parked_unshipped(store, wo):
+            # Rebuilt from the sentence its settler flagged, so both surfaces agree (#1591)
             blockers.append(RELEASE_NOTHING_SHIPPED_BLOCKER.format(wo_id=wo["id"]))
         elif wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
