@@ -647,7 +647,7 @@ CREATE TABLE IF NOT EXISTS monitoring_orders (
     hints TEXT NOT NULL DEFAULT '',         -- the PR's validation section, verbatim
     script TEXT NOT NULL DEFAULT '',
     script_source TEXT NOT NULL DEFAULT '', -- agent | user
-    state TEXT NOT NULL,                    -- queued | monitoring | validated | failed | timedout | cancelled
+    state TEXT NOT NULL,                    -- queued | monitoring | validated | unverified | failed | timedout | cancelled
     created_ts REAL NOT NULL,
     updated_ts REAL NOT NULL,
     deadline_ts REAL NOT NULL,
@@ -733,6 +733,13 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 
 # Columns added after the first release, exactly as in `neo_store` and `project_store`
 ADDED_COLUMNS = {
+    # docs/superpowers/specs/2026-11-01-monitoring-orders.md §9
+    "monitoring_orders": {
+        "last_reason": "TEXT NOT NULL DEFAULT ''",  # what the last exit 75 named
+        "saw_fail": "INTEGER NOT NULL DEFAULT 0",  # this watch ran an exit 1 or printed a FAIL line
+        "held_since_ts": "REAL",  # the first not_deployed check of this watch
+        "trigger_kind": "TEXT NOT NULL DEFAULT ''",  # probe | ambient; '' = not said
+    },
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
         "paired_reason": "TEXT",
@@ -2636,6 +2643,7 @@ class CentralStore:
         allowed = {"script", "script_source", "state", "deadline_ts", "last_check_ts",
                    "next_check_ts", "checks", "last_exit", "last_output", "resolution",
                    "last_check_version", "rewrite_brief",
+                   "last_reason", "saw_fail", "held_since_ts", "trigger_kind",
                    "action", "action_ts", "hints",
                    "attempts", "kills", "last_attempt_ts", "last_session_id"}
         bad = set(fields) - allowed
