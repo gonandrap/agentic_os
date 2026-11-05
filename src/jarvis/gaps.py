@@ -32,8 +32,8 @@ class GapClass:
 GAP_CLASSES: dict[str, GapClass] = {
     "stale-hold": GapClass(
         id="stale-hold",
-        headline="a hold written once and never re-derived keeps an order parked after "
-                 "the cause has cleared",
+        headline="a hold written once, never re-derived, keeps an order parked after its "
+                 "cause clears",
         symptom="the order sits in `validating` or `waiting_pr_merge` with nothing in "
                 "flight and no question open",
         detector="",
@@ -43,10 +43,10 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "round-burn": GapClass(
         id="round-burn",
-        headline="a validation round is spent on something that is not the submitter's "
-                 "work, so the order runs out of rounds without ever being judged",
-        symptom="`max_rounds` reached with the panel's feedback about the base branch "
-                "rather than the diff",
+        headline="validation rounds spent on what is not the submitter's work, so the "
+                 "order runs out unjudged",
+        symptom="`max_rounds` reached with panel feedback about the base branch, not the "
+                "diff",
         detector="",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/806",
@@ -54,8 +54,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "red-main": GapClass(
         id="red-main",
-        headline="`main` is red and nothing in the OS notices, so every order built on "
-                 "it inherits a failure it did not cause",
+        headline="`main` is red and nothing notices, so every order built on it inherits "
+                 "a failure it did not cause",
         symptom="a pull request whose checks fail for a reason absent from its own diff",
         detector="",
         remedy=REMEDY_NONE,
@@ -64,10 +64,9 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "oversized-input": GapClass(
         id="oversized-input",
-        headline="a payload that could never fit where it was going is assembled and "
-                 "sent anyway, so the step fails on size rather than on substance",
-        symptom="a question, verdict or prompt refused for its length, with the work "
-                "itself never read",
+        headline="a payload that could never fit is assembled and sent anyway, so the "
+                 "step fails on size, not substance",
+        symptom="a question, verdict or prompt refused for length, its work never read",
         detector="",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/797",
@@ -76,11 +75,10 @@ GAP_CLASSES: dict[str, GapClass] = {
     # §2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md
     "unwired-precondition": GapClass(
         id="unwired-precondition",
-        headline="an order's brief states a stop condition that exists in no state the "
-                 "scheduler reads, so the claim takes it and a worker pays to rediscover "
-                 "the hold",
-        symptom="a dispatched order whose first line says it must not start, abandoned "
-                "with no commits",
+        headline="an order's brief states a stop condition in no state the scheduler "
+                 "reads, so a worker pays to rediscover the hold",
+        symptom="a dispatched order whose first line says not to start, abandoned with "
+                "no commits",
         detector="INV-PRECONDITION-UNWIRED",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1089",
@@ -95,6 +93,17 @@ GAP_CLASSES: dict[str, GapClass] = {
         detector="background.live_tasks",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
+        since="",
+    ),
+    "designed-wait-undiscounted": GapClass(
+        id="designed-wait-undiscounted",
+        headline="the sweep is not taught a deliberate hold, so the wait is judged as "
+                 "lost time",
+        symptom="investigated with blocker `nothing the record can name`; OS working as "
+                "designed",
+        detector="INV-RED-RELEASE-UNDISCOUNTED",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1603",
         since="",
     ),
     "superseded-delivery": GapClass(
@@ -113,6 +122,7 @@ GAP_CLASSES: dict[str, GapClass] = {
 SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "oversized-input", "unwired-precondition",
                                         "background-task-silence",
+                                        "designed-wait-undiscounted",
                                         "superseded-delivery")
 
 
@@ -144,8 +154,7 @@ def by_invariant() -> dict[str, str]:
 
 def render_registry() -> str:
     """The registry as both the investigator's prompt and a fix order's brief see it"""
-    lines = ["# Gap classes the OS already knows",
-             "Reuse a slug when the MECHANISM matches, whatever the subject. A new slug "
+    lines = ["Reuse a slug when the MECHANISM matches, whatever the subject. A new slug "
              "makes the next fix order register it, with a detector, a remedy and a test.",
              ""]
     for cls in GAP_CLASSES.values():
@@ -155,6 +164,6 @@ def render_registry() -> str:
             f"  Seen: {cls.symptom}",
             f"  Detector: {cls.detector or 'NONE YET'}"
             + (f"; remedy: {cls.remedy}" if cls.remedy != REMEDY_NONE else "")
-            + (f" (issue {cls.issue_url.rsplit('/', 1)[-1]})" if cls.issue_url else ""),
+            + (f" (#{cls.issue_url.rsplit('/', 1)[-1]})" if cls.issue_url else ""),
         ]
     return "\n".join(lines)
