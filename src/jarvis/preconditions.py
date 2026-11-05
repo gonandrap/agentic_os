@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 #: The five, and only the five — §4: a sixth is a one-line diff behind the posture above
 STOP_PHRASES = ("do not start until", "do not start before",
                 "do not dispatch until", "held until", "blocked until")
@@ -44,6 +46,39 @@ def states_hold(title: str, description: str) -> str | None:
                 if remainder:
                     return line[at:].strip(_MARKERS + "*")[:MAX_SENTENCE]
     return None
+
+
+_REF = (r"(?:(?:PR|pull request)\s*#?\d+|#\d+|\S*/pull/\d+"
+        r"|wo-[0-9a-f]{8}|io-[0-9a-f]{8}|bl-[0-9a-f]{8})")
+_QUOTED_RE = re.compile(r"(?<!\w)'[^'\n]*'(?!\w)|\"[^\"\n]*\"|`[^`\n]*`")
+_CLAUSE_RE = re.compile(r"(?<=[.;])\s+|\n")
+# Wider than STOP_PHRASES: an OS filing refuses no human's command (issue 1567)
+_SEQUENCE_RE = re.compile(
+    r"^[-*•>#\s]*(?:(?:start|begin|dispatch)(?:\s+(?:this|it|work))?(?:\s+only)?"
+    r"\s+(?:after|once|until)\b|sequenced?\s+(?:this\s+|it\s+)?(?:after|behind)\b)"
+    rf"|\b(?:depends on|requires|blocked (?:on|by)|waits? (?:for|on|until)|prerequisite:?)\s+{_REF}"
+    rf"|\b(?:after|once|when|until)\s+{_REF}[^.;]*?\b(?:merges?|lands?|ships?|completes?"
+    r"|finishes|closes|settles|(?:is|are|has|have)(?:\s+been)?\s+"
+    r"(?:merged|landed|shipped|completed?|finished|closed|settled|done))\b",
+    re.IGNORECASE)
+_ID_RE = re.compile(r"\b(wo|io|bl)-([0-9a-f]{8})\b")
+_PR_RE = re.compile(r"(?:\bPR\s*#?|\bpull request\s*#?|/pull/|(?<![\w/])#)(\d+)", re.IGNORECASE)
+
+
+def states_sequence(*texts: str) -> list[str]:
+    """Every clause stating work must wait, untruncated, quoted text aside"""
+    clauses: list[str] = []
+    for text in texts:
+        for clause in _CLAUSE_RE.split(_QUOTED_RE.sub(" ", text or "")):
+            if _SEQUENCE_RE.search(clause) or states_hold(clause, ""):
+                clauses.append(clause.strip())
+    return clauses
+
+
+def sequence_refs(clause: str) -> list[tuple[str, str]]:
+    """What a sequence clause names: (`wo`|`io`|`bl`|`pr`, value)"""
+    named = [(kind, f"{kind}-{tail}") for kind, tail in _ID_RE.findall(clause)]
+    return named + [("pr", number) for number in _PR_RE.findall(clause)]
 
 
 def deployed_target(ref: str) -> str:
