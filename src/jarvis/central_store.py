@@ -670,7 +670,11 @@ CREATE TABLE IF NOT EXISTS monitoring_orders (
     attempts INTEGER NOT NULL DEFAULT 0,    -- failed sessions for the step now owed
     kills INTEGER NOT NULL DEFAULT 0,
     last_attempt_ts REAL,
-    last_session_id TEXT NOT NULL DEFAULT ''
+    last_session_id TEXT NOT NULL DEFAULT '',
+    last_reason TEXT NOT NULL DEFAULT '',   -- what the last exit 75 named
+    saw_fail INTEGER NOT NULL DEFAULT 0,    -- this watch ran an exit 1 or printed a FAIL line
+    held_since_ts REAL,                     -- the first not_deployed check of this watch
+    trigger_kind TEXT NOT NULL DEFAULT ''   -- probe | ambient; '' = not said
 );
 CREATE INDEX IF NOT EXISTS idx_monitoring_orders_state ON monitoring_orders(state);
 -- One order per PR, ever; an order with no PR is never a duplicate
