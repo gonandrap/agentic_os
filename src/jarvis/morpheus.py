@@ -362,7 +362,7 @@ def queue_merges(central: CentralStore, cfg: MorpheusConfig, project: str,
 
 
 def contains(repo: Path, sha: str) -> bool:
-    """Does the checkout's HEAD carry this commit? A commit it never fetched does not count"""
+    """True only when HEAD carries the commit; a commit the checkout never fetched does not count"""
     return bool(sha) and subprocess.run(
         ["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, "HEAD"],
         capture_output=True, timeout=60).returncode == 0
