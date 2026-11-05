@@ -129,8 +129,8 @@ INV_BASE_FIX_DEAD = "INV-BASE-FIX-DEAD"
 INV_WORK_LANDED = "INV-WORK-LANDED"
 
 #: What a work order says while its base is broken
-BASE_RED_NOTE = ("waiting for `{base}` to go green — the base's own build is red, so "
-                 "nothing this branch pushes can pass")
+BASE_RED_NOTE = ("waiting for `{base}` to go green — its build is red and this branch's "
+                 "failure could not be told apart from it")
 
 #: What a work order says when its pull request conflicts and the worker could not fix it in...
 PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pull request "
