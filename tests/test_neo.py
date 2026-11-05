@@ -267,6 +267,28 @@ def test_correction_requires_feedback(asked):
         ops.neo_review(1, approved=False, feedback="   ")
 
 
+@pytest.mark.parametrize("approved, feedback", [(False, "a worker's own words"), (True, "")])
+def test_a_worker_session_may_not_review_neo(asked, monkeypatch, project, approved, feedback):
+    """Issue 1582: nothing written, or a worker could speak as the user to later Neo answers"""
+    daemon, wo, _ = asked
+    drain(daemon)
+    monkeypatch.setenv("JARVIS_WO_ID", wo["id"])
+    with pytest.raises(ops.OpsError, match="worker session"):
+        ops.neo_review(1, approved=approved, feedback=feedback)
+    neo = NeoStore()
+    try:
+        assert neo.get(1)["review_status"] == "unreviewed"
+        assert neo.learnings("proj_a") == []
+    finally:
+        neo.close()
+    store = ProjectStore(project)
+    try:
+        assert not any("Correction from the user" in m["content"]
+                       for m in store.queued_messages(wo["id"]))
+    finally:
+        store.close()
+
+
 def test_learnings_shape_future_answers(asked, fake_claude):
     """The feedback loop: a correction appears in Neo's next system prompt"""
     daemon, wo, _ = asked
