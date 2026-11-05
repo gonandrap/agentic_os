@@ -438,10 +438,15 @@ def segments(samples: Sequence[Sample], *, since: float, until: float, key: str,
     prior = [s for s in ordered
              if s.ok and s.ts < since and s.pct(key) is not None]
     head = prior[-1] if prior and since - prior[-1].ts <= nearest_seconds else None
+    head_edge = _boundary(head, inside[0], key) if head else ""
+    if head_edge:
+        head = None  # its percent belongs to the expired window
     if head is None:
         coverage.head_uncovered_seconds = inside[0].ts - since
 
     found = SegmentSum(coverage=coverage)
+    if head_edge == "drop":
+        found.anomalies += 1
     start_pct = (head or inside[0]).pct(key)
     start_ts = (head or inside[0]).ts
     cause = ""

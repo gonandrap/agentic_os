@@ -43,6 +43,33 @@ def _drain(central):
     return steward.drain(ops.resolve_catalog(), central)
 
 
+# ---------------------------------------------------------------- the header
+
+
+def test_the_header_promises_no_drain_for_rows_no_wait_clears(store, central, catalog_file,
+                                                              enforcing):
+    daemon = enforcing()
+    parent = store.create_work_order("its parent", metadata={steward.STAMP_KEY: {
+        "generation": 1, "origin_kind": "bug_agent"}})["id"]
+    steward.gate(steward.Candidate("worker_io", "medium", "proj_a", "past the depth",
+                                   evidence=("e",), parent_wo_id=parent, payload={"title": "t"}),
+                 catalog=daemon.catalog, store=store, central=central)
+    steward.gate(steward.Candidate("worker_io", "medium", "proj_a", "needs a second sighting",
+                                   evidence=("e",), payload={"title": "t"}),
+                 catalog=daemon.catalog, store=store, central=central)
+    counts = central.steward_queue_counts()
+    assert (counts["waiting"], counts["refused"]) == (2, 1)
+    line = steward.queue_line(counts)
+    assert "queued: 1 waiting for room" in line
+    assert "1 refused by max-depth or self-reference (no wait clears them" in line
+    # The rows themselves stay in `drain`: raising max_depth is the one thing that can clear them
+    rows = {r["rule"]: r for r in central.steward_queue()}
+    assert len(central.steward_queue()) == 2
+    assert "which no wait clears" in steward.next_step(rows["max-depth"])["text"]
+    assert "once the ledger has room" in steward.next_step(rows["recurrence"])["text"]
+    assert "refused" not in steward.queue_line({"waiting": 3})
+
+
 # ---------------------------------------------------------------- remedies drain
 
 
