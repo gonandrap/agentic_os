@@ -3368,6 +3368,8 @@ def cmd_cost(args: argparse.Namespace) -> int:
     # VERBATIM from the payload: the page prints the same string
     if meter:
         print(f"{meter['sentence']}\n")
+    if totals.get("unpriced_note"):
+        print(f"{totals['unpriced_note']}\n")
     # `$` is the whole bill — the worker's conversation
     print(f"{'$':>7} {'jarvis':>7} {'subproc':>8} {'subagent':>9} {'turns':>5} "
           f"{'output':>7} {'re-write':>9}  work order")

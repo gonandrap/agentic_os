@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -18,16 +19,21 @@ TRANSCRIPT_ROOT_ENV = "JARVIS_TRANSCRIPT_ROOT"
 PRICES: dict[str, tuple[float, float, float]] = {
     "opus-5-5": (4.0, 20.0, 0.2),
     "opus-5": (5.0, 25.0, 0.5),
-    "opus-4": (5.0, 25.0, 0.5),
+    "opus-4-8": (5.0, 25.0, 0.5),
+    "opus-4-7": (5.0, 25.0, 0.5),
+    "opus-4-6": (5.0, 25.0, 0.5),
+    "opus-4-5": (5.0, 25.0, 0.5),
     "opus": (4.0, 20.0, 0.2),
     "fable-5-1": (10.0, 50.0, 0.25),
     "fable-5": (10.0, 50.0, 1.0),
     "fable": (10.0, 50.0, 0.25),
     "sonnet-5-5": (2.0, 10.0, 0.1),
     "sonnet-5": (2.0, 10.0, 0.2),
-    "sonnet-4": (3.0, 15.0, 0.3),
+    "sonnet-4-6": (3.0, 15.0, 0.3),
+    "sonnet-4-5": (3.0, 15.0, 0.3),
     "sonnet": (2.0, 10.0, 0.1),
-    "haiku-4": (1.0, 5.0, 0.1),
+    "haiku-5-5": (0.1, 0.5, 0.01),
+    "haiku-4-5": (1.0, 5.0, 0.1),
     "haiku": (0.1, 0.5, 0.01),
 }
 DEFAULT_PRICE = PRICES["opus"][:2]
@@ -92,6 +98,11 @@ def _tier(model: str) -> tuple[float, float, float]:
         if family in model:
             return tier
     return PRICES["opus"]
+
+
+def is_known_model(model: str) -> bool:
+    """False when `PRICES` has no entry for this exact id, so its price is a fallback guess"""
+    return re.sub(r"(-\d{8})?(\[\w+\])?$", "", model.removeprefix("claude-")) in PRICES
 
 
 def price_for(model: str) -> tuple[float, float]:
