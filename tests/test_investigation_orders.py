@@ -742,17 +742,142 @@ def test_script_wrong_sends_the_script_back_to_morpheus(started, store):
         item = central.morpheus_item(item_id)
     finally:
         central.close()
-    assert (item["state"], item["script"], item["script_rewrites"]) == ("queued", "", 1)
+    assert (item["state"], item["script"], item["script_rewrites"]) == ("queued", "", 0)
     assert "is producing it" in item["rewrite_brief"] and inv_id in item["rewrite_brief"]
     row = store.get_feature_order(inv_id)
     assert row["status"] == "completed" and not row["needs_attention"]
     assert "sent back to Morpheus" in json.loads(row["plan"])["rewrite"]
 
 
-def test_script_wrong_past_its_cap_asks_the_user(started, store):
+def test_script_wrong_rewrites_though_the_judge_spent_its_rewrite(started, store):
+    """io-5cc7a40d: mv-61c7819f's shape, judge and Neo's cap spent, and no user command"""
     from jarvis.central_store import CentralStore
 
     item_id = _failed_item(script_rewrites=1)
+    _script_wrong(store, item_id)
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id)
+    finally:
+        central.close()
+    assert (item["state"], item["script_rewrites"]) == ("queued", 1)
+
+
+def _item(item_id: str) -> dict:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return central.morpheus_item(item_id)
+    finally:
+        central.close()
+
+
+def _verdict_on(store, item_id: str, classification: str, **fields):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY, morpheus_item=item_id)
+    _investigating(store, inv)
+    ops.submit_verdict(inv["id"], a_verdict(classification, subject=subject, **fields))
+    return inv["id"]
+
+
+def _fail_again(item_id: str) -> None:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.update_morpheus_item(item_id, state="failed", action="")
+    finally:
+        central.close()
+
+
+def test_a_transient_verdict_watches_once_then_settles_unverified(started, store):
+    item_id = _failed_item()
+    _verdict_on(store, item_id, "TRANSIENT")
+    item = _item(item_id)
+    # Neo's cap untouched: the count comes from the verdicts
+    assert (item["state"], item["auto_requeues"]) == ("monitoring", 0)
+    _fail_again(item_id)
+    inv_id = _verdict_on(store, item_id, "TRANSIENT")
+    assert _item(item_id)["state"] == "unverified"
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+
+
+def test_waiting_on_user_settles_unverified_only_when_behaviour_is_correct(started, store):
+    item_id = _failed_item()
+    inv_id = _verdict_on(store, item_id, "WAITING_ON_USER", behaviour_correct=False)
+    assert _item(item_id)["state"] == "failed"
+    assert store.get_feature_order(inv_id)["needs_attention"]
+    _fail_again(item_id)
+    inv_id = _verdict_on(store, item_id, "WAITING_ON_USER", behaviour_correct=True)
+    assert _item(item_id)["state"] == "unverified"
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+
+
+def test_waiting_on_user_on_a_monitor_must_say_whether_behaviour_is_correct(started, store):
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY, morpheus_item=_failed_item())
+    _investigating(store, inv)
+    with pytest.raises(ops.OpsError, match="behaviour_correct"):
+        ops.submit_verdict(inv["id"], a_verdict("WAITING_ON_USER", subject=subject))
+
+
+def _stored_before_the_change(store, classification: str, item_id: str, **fields) -> str:
+    """A verdict already stored that never moved its row: the row holds its investigation"""
+    from jarvis.central_store import CentralStore
+
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    verdict = {"classification": classification, "subject": subject, "root_cause": "r" * 80,
+               **fields}
+    store.update_feature_order(inv["id"], plan=json.dumps(verdict))
+    store.set_feature_status(inv["id"], "completed")
+    store.flag_feature_attention(inv["id"], "waiting on you")
+    central = CentralStore()
+    try:
+        central.update_morpheus_item(item_id, action=f"investigation:{inv['id']}")
+    finally:
+        central.close()
+    return inv["id"]
+
+
+def test_the_sweep_backfills_each_stored_verdict_once(started, store):
+    wrong = _failed_item(script_rewrites=1)
+    wrong_inv = _stored_before_the_change(
+        store, "SCRIPT_WRONG", wrong, script_fix="f" * 80,
+        rewrite="its one automatic rewrite is spent", rewrite_ask={"item": wrong})
+    assert ops.settle_investigated_monitors() == [wrong]
+    assert _item(wrong)["state"] == "queued"
+    row = store.get_feature_order(wrong_inv)
+    assert not row["needs_attention"] and "rewrite_ask" not in json.loads(row["plan"])
+    assert ops.settle_investigated_monitors() == []
+
+
+def test_the_sweep_leaves_a_stored_verdict_silent_on_behaviour_to_the_user(started, store):
+    item_id = _failed_item()
+    inv_id = _stored_before_the_change(store, "WAITING_ON_USER", item_id, user_owes="u" * 80)
+    assert ops.settle_investigated_monitors() == []
+    assert _item(item_id)["state"] == "failed"
+    assert store.get_feature_order(inv_id)["needs_attention"]
+    out = ops.correct_investigation(inv_id, "read the root cause: PR is correct")
+    assert out["item"] == item_id and _item(item_id)["state"] == "unverified"
+    row = store.get_feature_order(inv_id)
+    assert not row["needs_attention"] and json.loads(row["plan"])["behaviour_correct"] is True
+
+
+def test_an_unverified_row_never_reads_as_a_passed_release():
+    from jarvis import release_view
+
+    assert release_view.validation_of({"state": "unverified"}) == "unverified"
+    assert release_view.summarize([{"validation": "validated"},
+                                   {"validation": "unverified"}]) == "unverified"
+
+
+def test_script_wrong_past_its_cycles_asks_the_user(started, store, monkeypatch):
+    from jarvis.central_store import CentralStore
+
+    item_id = _failed_item()
+    monkeypatch.setattr(ops, "morpheus_investigations", lambda *_: ["a", "b", "c"])
     inv_id, _ = _script_wrong(store, item_id)
     central = CentralStore()
     try:
@@ -773,11 +898,12 @@ def test_script_wrong_past_its_cap_asks_the_user(started, store):
     assert argv[5] == plan["script_fix"]
 
 
-def test_a_settled_row_takes_its_investigation_s_attention_down(started, store):
+def test_a_settled_row_takes_its_investigation_s_attention_down(started, store, monkeypatch):
     """io-5cc7a40d: inv-92abc279 still asked to rewrite a validated row"""
     from jarvis.central_store import CentralStore
 
-    item_id = _failed_item(script_rewrites=1)
+    item_id = _failed_item()
+    monkeypatch.setattr(ops, "morpheus_investigations", lambda *_: ["a", "b", "c"])
     inv_id, _ = _script_wrong(store, item_id)
     central = CentralStore()
     try:
