@@ -179,9 +179,29 @@ _HST_DESTRUCTIVE = (rf"\b(?:(?:{_HST_DESTRUCTIVE_VERBS})\s+(?:{_HST_DETERMINER})
 _HST_MONEY_OBJECT = (r"(?:\$\s?[\d,]+(?:\.\d+)?|\b\d+(?:\.\d+)?\s*(?:usd|dollars?|"
                      r"cents?|eur|gbp)\b|\bdollars?\b|\busd\b|\bmoney\b|"
                      r"\breal\s+api\s+calls?\b)")
-#: `bill` is DROPPED, not narrowed: 6 false positives and zero high rows
-_HST_MONEY = (r"\bprice|\bpricing\b|\binvoice|\bcharge[ds]?\b"
-              rf"|\bspen(?:d|ds|t|ding)\b[^.;]{{0,40}}?{_HST_MONEY_OBJECT}")
+_HST_MONEY_VERB = r"\b(?:charg(?:e|es|ed|ing)|bill(?:s|ed|ing)?|invoic(?:e|es|ed|ing))\s+"
+_HST_MONEY_DETERMINER = rf"(?:{_HST_DETERMINER}|(?:their|our|each|that)\s+)(?:[\w-]+'s\s+)?"
+_HST_MONEY_ACCOUNT = r"(?:accounts?|(?:credit\s+)?cards?|payment\s+methods?)\b(?!')"
+_HST_MONEY_PERSON = r"(?:customers?|clients?|users?|subscribers?|buyers?)\b(?!')"
+#: Price/invoice/charge/bill only with the money act or object, never the bare noun (issue 1610)
+_HST_MONEY = (
+    _HST_MONEY_VERB + rf"(?:{_HST_MONEY_DETERMINER}{_NOT_A_PREPOSITION}"
+    rf"(?:{_HST_MONEY_PERSON}|{_HST_MONEY_ACCOUNT})"
+    r"|(?:customers|clients|users|subscribers|buyers)\b(?!')"
+    rf"|(?:\S+\s+){{0,3}}?(?:to|on|against)\s+(?:{_HST_MONEY_DETERMINER})?"
+    rf"{_NOT_A_PREPOSITION}{_HST_MONEY_ACCOUNT}"
+    rf"|{_NOT_A_PREPOSITION}{_HST_MONEY_OBJECT})"
+    rf"|\b(?:{_HST_MONEY_PERSON}|{_HST_MONEY_ACCOUNT})\s+"
+    r"(?:(?:was|were|is|are|will|gets?|got|be|been|being)\s+){1,2}(?:charg|bill|invoic)ed\b"
+    rf"|\b(?:rais|lower|increas|hik|cut)\w*\s+(?:(?:the|our)\s+)?prices?\s+(?:to|by)\s+{_HST_MONEY_OBJECT}"
+    rf"|{_HST_MONEY_OBJECT}\s+(?:charge|invoice)s?\b"
+    rf"|\b(?:charge|invoice)s?\s+(?:for|of)\s+{_HST_MONEY_OBJECT}"
+    r"|\b(?:approv|pay|paid|send|sent|issu|void|refund|submit|rais|settl|disput|generat)\w*\s+"
+    rf"(?:{_HST_DETERMINER})?{_NOT_A_PREPOSITION}invoices?\b"
+    r"|\bprices?\s+(?:\S+\s+){0,3}?(?:customers?|clients?|subscribers?|buyers?)\s+pay\b"
+    r"|\b(?:rais|lower|increas|chang|set)\w*\s+(?:(?:the|our)\s+)?"
+    r"(?:customer|subscription|retail)\s+pric(?:e|es|ing)\b"
+    rf"|\bspen(?:d|ds|t|ding)\b[^.;]{{0,40}}?{_HST_MONEY_OBJECT}")
 #: 4 false positives are the ADDED_COLUMNS mechanism or a gap left open on purpose ("no migration"
 _HST_MIGRATION = (r"\b(?:run|runs|ran|running|appl(?:y|ies|ied|ying)|"
                   r"execut(?:e|es|ed|ing))\s+(?:(?:the|a|an|another|its|one)\s+)?"

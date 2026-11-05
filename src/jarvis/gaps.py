@@ -32,8 +32,7 @@ class GapClass:
 GAP_CLASSES: dict[str, GapClass] = {
     "stale-hold": GapClass(
         id="stale-hold",
-        headline="a hold written once, never re-derived, keeps an order parked after its "
-                 "cause clears",
+        headline="a hold never re-derived keeps an order parked after its cause clears",
         symptom="parked in `validating` or `waiting_pr_merge`, nothing in flight, no question open",
         detector="",
         remedy=REMEDY_NONE,
@@ -60,8 +59,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "oversized-input": GapClass(
         id="oversized-input",
-        headline="a payload that could never fit is sent anyway, so the step fails on size, not substance",
-        symptom="a question, verdict or prompt refused for length, its work never read",
+        headline="a payload that can never fit is sent anyway; the step fails on size",
+        symptom="a question, verdict or prompt refused for length",
         detector="",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/797",
@@ -79,7 +78,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "background-task-silence": GapClass(
         id="background-task-silence",
-        headline="a worker awaiting a background task writes nothing, so the sweep reads its turn as wedged",
+        headline="a worker awaiting a background task writes nothing; the sweep reads it as wedged",
         symptom="`running`, investigated while its transcript ends on a background launch",
         detector="background.live_tasks",
         remedy=REMEDY_NONE,
@@ -88,8 +87,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "designed-wait-undiscounted": GapClass(
         id="designed-wait-undiscounted",
-        headline="the sweep is not taught a deliberate hold, so the wait is judged as "
-                 "lost time",
+        headline="the sweep judges a deliberate hold as lost time",
         symptom="blocker `nothing the record can name`; OS working as designed",
         detector="INV-RED-RELEASE-UNDISCOUNTED",
         remedy=REMEDY_NONE,
@@ -107,11 +105,20 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "base-chase-livelock": GapClass(
         id="base-chase-livelock",
-        headline="a queued PR loses its turn when the one ahead merges, so it never reaches the front",
+        headline="a queued PR loses its turn when the one ahead merges",
         symptom="green, alternating `merge_queued` holds and catch-ups, no merge",
         detector="INV-BASE-CHASE-LIVELOCK",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1608",
+        since="",
+    ),
+    "mention-held-as-act": GapClass(
+        id="mention-held-as-act",
+        headline="high-stakes net matches a word, not an act; routine assumption waits for user",
+        symptom="`needs_review` held as `commits to an act`; Neo's advice would approve",
+        detector="rules.mention-held-as-act",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1610",
         since="",
     ),
 }
@@ -121,7 +128,8 @@ SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "oversized-input", "unwired-precondition",
                                         "background-task-silence",
                                         "designed-wait-undiscounted",
-                                        "superseded-delivery", "base-chase-livelock")
+                                        "superseded-delivery", "base-chase-livelock",
+                                        "mention-held-as-act")
 
 
 def checked_slug(raw: str) -> str:
@@ -155,12 +163,8 @@ def render_registry() -> str:
     lines = ["Reuse a slug for the same mechanism; a new slug makes the fix order register it.",
              ""]
     for cls in GAP_CLASSES.values():
-        # Terse, issue number alone: this list is inside a worker's 10K start budget
-        lines += [
-            f"- `{cls.id}` — {cls.headline}",
-            f"  Seen: {cls.symptom}",
-            f"  Detector: {cls.detector or 'NONE YET'}"
-            + (f"; remedy: {cls.remedy}" if cls.remedy != REMEDY_NONE else "")
-            + (f" (#{cls.issue_url.rsplit('/', 1)[-1]})" if cls.issue_url else ""),
-        ]
+        # One line, no issue number: this list is inside a worker's 10K start budget
+        lines.append(f"- `{cls.id}`: {cls.headline}. Seen: {cls.symptom}. "
+                     f"Detector: {cls.detector or 'NONE YET'}"
+                     + (f"; remedy: {cls.remedy}" if cls.remedy != REMEDY_NONE else ""))
     return "\n".join(lines)
