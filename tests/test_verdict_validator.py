@@ -194,3 +194,48 @@ def test_the_rendered_verdict_leads_with_the_class_and_shows_the_deliverables():
     owed = "\n".join(verdicts.render_verdict(
         verdicts.parse_verdict(a_verdict("WAITING_ON_USER"))))
     assert "stale-hold" in owed.splitlines()[0]
+
+
+# -- `other_gaps`: every gap beyond the root cause (io-38a4354f one-fix-slot)
+
+
+A_GAP = {"title": "search prints 744KB for one query",
+         "why": "no reader can use output that size",
+         "description": "`jarvis search` has no output bound, so one query printed 744KB."}
+
+
+@pytest.mark.parametrize("classification", ["GAP", "WAITING_ON_USER", "TRANSIENT",
+                                            "ALREADY_TRACKED", "SCRIPT_WRONG"])
+def test_a_missing_other_gaps_key_is_refused_naming_the_field(classification):
+    doc = a_verdict(classification)
+    del doc["other_gaps"]
+    with pytest.raises(verdicts.VerdictError, match="`other_gaps` is required"):
+        verdicts.parse_verdict(doc)
+
+
+def test_an_explicit_empty_list_is_accepted():
+    assert verdicts.parse_verdict(a_verdict(other_gaps=[]))["other_gaps"] == []
+
+
+@pytest.mark.parametrize("field", verdicts.OTHER_GAP_FIELDS)
+def test_an_other_gap_needs_every_field(field):
+    gap = {k: v for k, v in A_GAP.items() if k != field}
+    with pytest.raises(verdicts.VerdictError, match=rf"`other_gaps\[1\]\.{field}` is required"):
+        verdicts.parse_verdict(a_verdict(other_gaps=[A_GAP, gap]))
+
+
+@pytest.mark.parametrize("bad, words", [(None, "must be a list"), ("a gap", "must be a list"),
+                                        (["a gap"], "must be an object"),
+                                        ([{**A_GAP, "description": "short"}], "brief a stranger")])
+def test_a_malformed_other_gaps_is_refused(bad, words):
+    with pytest.raises(verdicts.VerdictError, match=words):
+        verdicts.parse_verdict(a_verdict(other_gaps=bad))
+
+
+def test_the_rendered_verdict_lists_other_gaps_and_an_old_verdict_still_renders():
+    text = "\n".join(verdicts.render_verdict(
+        verdicts.parse_verdict(a_verdict(other_gaps=[A_GAP]))))
+    assert f"{A_GAP['title']}: {A_GAP['why']}" in text
+    old = verdicts.parse_verdict(a_verdict())
+    del old["other_gaps"]
+    assert "other gaps" not in "\n".join(verdicts.render_verdict(old))

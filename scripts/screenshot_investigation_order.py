@@ -122,7 +122,14 @@ def seed() -> tuple[str, str]:
                                                     "quote": "as-4 pending review — the "
                                                              "worker has taken no turn "
                                                              "since"}]))
-    out = ops.submit_verdict(gap["id"], a_verdict("GAP", subject=gap_subject))
+    out = ops.submit_verdict(gap["id"], a_verdict("GAP", subject=gap_subject, other_gaps=[
+        {"title": "`jarvis search` prints 744KB for one query",
+         "why": "no reader can use output that size",
+         "description": "`jarvis search` has no output bound, so one query printed 744KB."},
+        {"title": "nothing counts how often a panel hold outlives its cause",
+         "why": "the class cannot be sized without a count",
+         "description": "Stale panel holds leave no counter, so nobody can say how often."},
+    ]))
     if not (out.get("filed") or {}).get("issue_url"):
         raise SystemExit(f"the GAP was not filed, so there is nothing to shoot: {out}")
     return gap["id"], waiting["id"]

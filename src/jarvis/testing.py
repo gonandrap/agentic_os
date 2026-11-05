@@ -2648,6 +2648,20 @@ def no_stray_cost_threads():
 
 
 @pytest.fixture(autouse=True)
+def coverage_seat_finds_nothing(monkeypatch):
+    """No GAP verdict in a test reaches a real model; a test wanting a reply patches over this"""
+    from types import SimpleNamespace
+
+    from . import seats, verdict_coverage
+
+    def run_blind(prompts, **kw):
+        return [seats.Opinion(seat=seat, raw='{"uncovered": []}') for seat in prompts]
+
+    # Only this module's handle: wrapping `seats.run_blind` broke its eval attribution refusal
+    monkeypatch.setattr(verdict_coverage, "seats", SimpleNamespace(run_blind=run_blind))
+
+
+@pytest.fixture(autouse=True)
 def claude_json(tmp_path, monkeypatch):
     """Point trust checks at a scratch claude.json; tests opt paths in as trusted"""
     path = tmp_path / "claude.json"
@@ -2830,6 +2844,7 @@ def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
             {"source": f"jarvis wo show {subject}",
              "quote": "validating — the panel gave up after 3 rounds (round 3, 6h ago)"},
         ],
+        "other_gaps": [],
     }
     if classification == "GAP":
         doc["owner"] = "os"

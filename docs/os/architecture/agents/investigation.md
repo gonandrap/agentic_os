@@ -67,9 +67,13 @@ up with `jarvis issues start` unless Neo's triage confirms critical/blocker. If 
 tracker cannot be reached, the investigation raises attention and shows the retry
 command.
 
+Every verdict, whatever its classification, carries `other_gaps`: every gap beyond the root
+cause, or an explicit `[]`. `ops.submit_verdict` posts each entry through the bus as a
+deferral on the investigator work order, and the router files it as a `proposed` backlog
+row with an origin link. It is never a tracker bug and never dispatched.
+
 Before filing, `verdict_coverage` asks one seat whether the text names a gap with no
-entry in `proposed_fix` or `other_gaps`. The seat runs only once a parsed verdict carries
-`other_gaps`. A first miss returns to the session naming the items. A second submission
+entry in `proposed_fix` or `other_gaps`. A first miss returns to the session naming the items. A second submission
 settles with any remaining miss stored as `coverage_miss`. A seat with no usable answer
 takes the same retry path as an unreachable tracker: nothing filed, order still `planning`.
 A quote the verdict does not contain never blocks.
