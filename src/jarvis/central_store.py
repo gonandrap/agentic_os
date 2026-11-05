@@ -647,7 +647,7 @@ CREATE TABLE IF NOT EXISTS monitoring_orders (
     hints TEXT NOT NULL DEFAULT '',         -- the PR's validation section, verbatim
     script TEXT NOT NULL DEFAULT '',
     script_source TEXT NOT NULL DEFAULT '', -- agent | user
-    state TEXT NOT NULL,                    -- queued | monitoring | validated | failed | timedout | cancelled
+    state TEXT NOT NULL,                    -- queued | monitoring | validated | unverified | failed | timedout | cancelled
     created_ts REAL NOT NULL,
     updated_ts REAL NOT NULL,
     deadline_ts REAL NOT NULL,

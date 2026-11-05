@@ -21,9 +21,10 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger("jarvisd.morpheus")
 
-STATES = ("queued", "monitoring", "validated", "failed", "timedout", "cancelled")
+#: `unverified`: an investigation found nothing wrong, yet no check passed; settled, never counted as passed
+STATES = ("queued", "monitoring", "validated", "unverified", "failed", "timedout", "cancelled")
 OPEN_STATES = ("queued", "monitoring")
-TERMINAL_STATES = ("validated", "failed", "timedout", "cancelled")
+TERMINAL_STATES = ("validated", "unverified", "failed", "timedout", "cancelled")
 #: The terminal states that must cause something
 ACTION_STATES = ("failed", "timedout")
 
@@ -481,19 +482,19 @@ def rewrite(central: CentralStore, cfg: MorpheusConfig, item_id: str, why: str, 
 
 
 def rewrite_from_investigation(central: CentralStore, cfg: MorpheusConfig, item_id: str,
-                               inv_id: str, brief: str) -> tuple[bool, str]:
-    """SCRIPT_WRONG verdict: rewrite under the cap; (False, …) = cap spent, user owes it (#1374)"""
+                               inv_id: str, brief: str, cycles: int) -> tuple[bool, str]:
+    """SCRIPT_WRONG verdict: rewrite within MAX_FIX_CYCLES, never MAX_SCRIPT_REWRITES (io-5cc7a40d); (False, …) = user owes it"""
     item = _item_or_raise(central, item_id)
     if item["state"] not in ACTION_STATES:
         return True, f"nothing sent back: {item_id} is {item['state']}, decided elsewhere"
-    if not central.claim_morpheus_script_rewrite(item_id, MAX_SCRIPT_REWRITES):
+    if cycles > MAX_FIX_CYCLES:
         command = f'jarvis morpheus rewrite {item_id} --why "…"'
         central.add_inbox(
             project=item.get("project") or "os", level="warning",
             title=f"PR #{item['pr_number']} {item['state']} production validation — its "
-                  f"script is wrong and its one automatic rewrite is spent",
+                  f"script is wrong after {cycles} investigations",
             body=f"{item['pr_url']}\n{inv_id}: {brief[:600]}\n{command}")
-        return False, f"its one automatic rewrite is spent — `{command}`"
+        return False, f"{cycles} investigations, over the {MAX_FIX_CYCLES} allowed — `{command}`"
     rewrite(central, cfg, item_id, brief,
             resolution=f"script sent back to be rewritten by {inv_id}: {brief[:600]}")
     central.add_inbox(
@@ -501,7 +502,34 @@ def rewrite_from_investigation(central: CentralStore, cfg: MorpheusConfig, item_
         title=f"PR #{item['pr_number']} — {inv_id} found its validation script wrong; "
               f"Morpheus is rewriting it",
         body=f"{item['pr_url']}\n{brief[:600]}\njarvis morpheus show {item_id}")
-    return True, f"{item_id} sent back to Morpheus for a new script; its one rewrite is spent"
+    return True, f"{item_id} sent back to Morpheus for a new script"
+
+
+def settle_unverified(central: CentralStore, item_id: str, inv_id: str, why: str) -> str:
+    """An investigation says nothing is wrong: settled, not passed, nothing on the user (io-5cc7a40d)"""
+    item = _item_or_raise(central, item_id)
+    if item["state"] not in ACTION_STATES:
+        return f"nothing settled: {item_id} is {item['state']}, decided elsewhere"
+    central.update_morpheus_item(item_id, state="unverified", next_check_ts=None,
+                                 resolution=f"unverified, {inv_id}: {why[:600]}")
+    central.add_inbox(
+        project=item.get("project") or "os", level="info",
+        title=f"PR #{item['pr_number']} — {inv_id} found nothing wrong; its validation "
+              f"settled unverified, not passed",
+        body=f"{item['pr_url']}\n{why[:600]}\njarvis morpheus show {item_id}")
+    return f"{item_id} settled unverified"
+
+
+def requeue_from_investigation(central: CentralStore, cfg: MorpheusConfig, item_id: str,
+                               inv_id: str, why: str, earlier_transients: int) -> str:
+    """TRANSIENT verdict: watch again once, without Neo's auto_requeues; a second settles it (Q3599)"""
+    item = _item_or_raise(central, item_id)
+    if item["state"] not in ACTION_STATES:
+        return f"nothing requeued: {item_id} is {item['state']}, decided elsewhere"
+    if earlier_transients:
+        return settle_unverified(central, item_id, inv_id, why)
+    requeue(central, cfg, item_id, resolution=f"re-watched, {inv_id} found it transient: {why[:600]}")
+    return f"{item_id} is being watched again"
 
 
 def _item_or_raise(central: CentralStore, item_id: str) -> dict[str, Any]:

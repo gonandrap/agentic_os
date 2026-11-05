@@ -8800,8 +8800,8 @@ def investigation_fix_order(inv_id: str) -> str:
     return str(wo["id"]) if wo else ""
 
 
-def _script_wrong_rewrite(item_id: str, inv_id: str,
-                          verdict: Mapping[str, Any]) -> tuple[bool, str]:
+def _script_wrong_rewrite(item_id: str, inv_id: str, verdict: Mapping[str, Any],
+                          cycles: int) -> tuple[bool, str]:
     """Settle a SCRIPT_WRONG verdict through `morpheus.rewrite` (#1374); False = user owes it"""
     from . import morpheus
 
@@ -8809,11 +8809,122 @@ def _script_wrong_rewrite(item_id: str, inv_id: str,
     central = CentralStore()
     try:
         return morpheus.rewrite_from_investigation(
-            central, _morpheus_catalog().os.morpheus, item_id, inv_id, brief)
+            central, _morpheus_catalog().os.morpheus, item_id, inv_id, brief, cycles)
     except KeyError:
         return True, f"nothing sent back: {item_id} no longer exists"
     finally:
         central.close()
+
+
+def _earlier_transients(project: str, item_id: str, inv_id: str) -> int:
+    """TRANSIENT verdicts this item's other investigations reached (Q3599)"""
+    count = 0
+    for other in morpheus_investigations(project, item_id):
+        if other != inv_id and _investigation_verdict(
+                find_feature_order(other, project)[2]).get("classification") == "TRANSIENT":
+            count += 1
+    return count
+
+
+def _move_monitor(project: str, item_id: str, inv_id: str, verdict: dict[str, Any]) -> bool:
+    """A verdict moves its monitoring order (io-5cc7a40d); True = the user owes it, GAP moves on its fix"""
+    from . import morpheus
+
+    classification = verdict["classification"]
+    central = CentralStore()
+    try:
+        if classification == "SCRIPT_WRONG":
+            cycles = len({*morpheus_investigations(project, item_id), inv_id})
+            settled, verdict["rewrite"] = _script_wrong_rewrite(item_id, inv_id, verdict, cycles)
+            verdict.pop("rewrite_ask", None)
+            if not settled:
+                verdict["rewrite_ask"] = _rewrite_ask(item_id, verdict["script_fix"])
+                verdict["rewrite_capped"] = True
+            return not settled
+        if classification == "TRANSIENT":
+            why = f"{verdict['unsticks']['what']} ({verdict['unsticks']['when']})"
+            verdict["monitor_move"] = morpheus.requeue_from_investigation(
+                central, _morpheus_catalog().os.morpheus, item_id, inv_id, why,
+                _earlier_transients(project, item_id, inv_id))
+        elif classification == "WAITING_ON_USER":
+            if not verdict.get("behaviour_correct"):
+                return True
+            verdict["monitor_move"] = morpheus.settle_unverified(
+                central, item_id, inv_id, verdict["root_cause"])
+    except KeyError:
+        verdict["monitor_move"] = f"nothing moved: {item_id} no longer exists"
+    finally:
+        central.close()
+    return False
+
+
+def _store_moved_verdict(path: Path, inv_id: str, verdict: dict[str, Any], owed: bool) -> None:
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(inv_id, plan=db.to_json(verdict))
+        if not owed:
+            store.clear_feature_attention(inv_id)
+    finally:
+        store.close()
+
+
+def settle_investigated_monitors() -> list[str]:
+    """Level-triggered: a completed verdict that never moved its row moves it now (io-5cc7a40d)"""
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        items = central.morpheus_items(morpheus.ACTION_STATES)
+    finally:
+        central.close()
+    moved = []
+    for item in items:
+        kind, _, inv_id = (item.get("action") or "").partition(":")
+        if kind != "investigation" or not inv_id:
+            continue
+        try:
+            _name, path, fo = find_feature_order(inv_id, item.get("project") or None)
+        except OpsError:
+            continue
+        verdict = _investigation_verdict(fo)
+        if (fo["status"] != "completed" or verdict.get("rewrite_capped")
+                or verdict.get("classification") not in (
+                    "SCRIPT_WRONG", "TRANSIENT", "WAITING_ON_USER")):
+            continue
+        if verdict["classification"] == "WAITING_ON_USER" and not verdict.get("behaviour_correct"):
+            continue  # its attention flag already asks the user
+        owed = _move_monitor(item.get("project") or "", item["id"], inv_id, verdict)
+        _store_moved_verdict(path, inv_id, verdict, owed)
+        if not owed:
+            moved.append(item["id"])
+    return moved
+
+
+def correct_investigation(inv_id: str, reason: str,
+                          project_name: str | None = None) -> dict[str, Any]:
+    """A person read a verdict stored without `behaviour_correct`: record it, which settles the row (Q3598)"""
+    from . import morpheus
+
+    if not (reason or "").strip():
+        raise OpsError("say how you know the behaviour is correct")
+    name, path, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo show")
+    verdict = _investigation_verdict(fo)
+    if verdict.get("classification") != "WAITING_ON_USER":
+        raise OpsError(f"{inv_id} is {verdict.get('classification') or 'without a verdict'}: "
+                       f"only a WAITING_ON_USER verdict carries `behaviour_correct`")
+    central = CentralStore()
+    try:
+        item_id = next((str(i["id"]) for i in central.morpheus_items(morpheus.ACTION_STATES)
+                        if i.get("action") == f"investigation:{inv_id}"), "")
+    finally:
+        central.close()
+    if not item_id:
+        raise OpsError(f"no failed or timed-out monitoring order is waiting on {inv_id}")
+    verdict.update(behaviour_correct=True, behaviour_correct_reason=reason.strip())
+    _move_monitor(name, item_id, inv_id, verdict)
+    _store_moved_verdict(path, inv_id, verdict, owed=False)
+    return {"inv_id": inv_id, "item": item_id, "monitor_move": verdict["monitor_move"]}
 
 
 def _rewrite_ask(item_id: str, script_fix: str) -> dict[str, Any]:
@@ -9261,6 +9372,12 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
             f"the verdict was not accepted, and nothing was stored: SCRIPT_WRONG is only for "
             f"an investigation Morpheus opened on a failed production validation, and "
             f"{inv_id} was not. Pick one of the other four classifications and resubmit.")
+    if (verdict["classification"] == "WAITING_ON_USER" and morpheus_item_id
+            and "behaviour_correct" not in verdict):
+        raise OpsError(
+            f"the verdict was not accepted, and nothing was stored: {inv_id} is on a monitoring "
+            f"order, so a WAITING_ON_USER verdict must carry `behaviour_correct`: true when the "
+            f"shipped behaviour is correct, which settles the order without the user.")
 
     verdict["classified_by"] = "investigator"
     verdict["filed"] = None
@@ -9337,11 +9454,8 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
         return _verdict_filing_failed(name, path, fo, inv_id, verdict, filing_error)
 
     escalate = verdict["classification"] == "WAITING_ON_USER"
-    if verdict["classification"] == "SCRIPT_WRONG":
-        settled, verdict["rewrite"] = _script_wrong_rewrite(morpheus_item_id, inv_id, verdict)
-        escalate = not settled
-        if escalate:
-            verdict["rewrite_ask"] = _rewrite_ask(morpheus_item_id, verdict["script_fix"])
+    if morpheus_item_id:
+        escalate = _move_monitor(name, morpheus_item_id, inv_id, verdict)
 
     classification = verdict["classification"]
     store = ProjectStore(path)
@@ -17734,7 +17848,7 @@ def release_overview(project: str = "") -> dict[str, Any]:
         releases = []
         for t, rows in zip(tags, contents):
             counts = {s: sum(r["validation"] == s for r in rows)
-                      for s in ("validated", "pending", "failed", "unwatched")}
+                      for s in ("validated", "unverified", "pending", "failed", "unwatched")}
             releases.append({**t, "prs": len(rows), "counts": counts,
                              "status": release_view.summarize(rows)})
     except (OSError, subprocess.SubprocessError) as e:

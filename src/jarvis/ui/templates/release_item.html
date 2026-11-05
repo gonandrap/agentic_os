@@ -10,7 +10,7 @@
 {% for r in d.rows %}{% if counts.update({r.validation: counts.get(r.validation, 0) + 1}) %}{% endif %}{% endfor %}
 {% set meta -%}
   {{ d.rows | length }} commits since {{ d.previous or "the first commit" }}
-  {%- for s in ("failed", "pending", "validated", "unwatched") if counts.get(s) %} · {{ counts[s] }} {{ s }}{% endfor %}
+  {%- for s in ("failed", "pending", "unverified", "validated", "unwatched") if counts.get(s) %} · {{ counts[s] }} {{ s }}{% endfor %}
   · cut {{ fmt_ts(d.ts) }}
 {%- endset %}
 {% set qs = "?project=" ~ (project | urlencode) if project else "" %}

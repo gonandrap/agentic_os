@@ -3427,6 +3427,13 @@ class Daemon:
                     log.info("morpheus %s: its fix reached production, watching again", item_id)
             except Exception:  # noqa: BLE001 — the rest of the pass still runs
                 log.exception("morpheus: could not requeue fixed items")
+            try:
+                from .ops import settle_investigated_monitors
+
+                for item_id in settle_investigated_monitors():
+                    log.info("morpheus %s: its investigation's verdict moved it", item_id)
+            except Exception:  # noqa: BLE001 — the rest of the pass still runs
+                log.exception("morpheus: could not settle investigated items")
             fallback = next(iter(dirs.values()), Path.cwd())
             # Else the fallback runs an archived project's scripts in another checkout (§6.2 of the offboard spec)
             skip = archived_projects(central)

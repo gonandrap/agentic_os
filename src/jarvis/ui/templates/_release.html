@@ -1,5 +1,5 @@
 {# Shared by release.html and release_item.html — docs/superpowers/specs/2026-11-01-release-console.md §1 #}
-{% set tone = {"validated": "tone-ok", "pending": "tone-active", "failed": "tone-bad",
+{% set tone = {"validated": "tone-ok", "unverified": "tone-warn", "pending": "tone-active", "failed": "tone-bad",
                "unwatched": "tone-muted"} %}
 
 {% macro validation(r) -%}

@@ -989,17 +989,20 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "the defect is the subject project's own code.",
         "- **WAITING_ON_USER** — nothing is broken; a person owes a decision. Name it BY "
         "ID in `user_owes`: the assumption, the gate, the Neo question. This is the ONE "
-        "classification that spends the user's attention.",
+        "classification that spends the user's attention. When Morpheus opened this "
+        "investigation, also set `behaviour_correct`: true when the shipped behaviour is "
+        "correct, and the OS settles the monitoring order `unverified` without the user.",
         "- **TRANSIENT** — it clears itself. Say in `unsticks` WHAT mechanism clears it "
         "and WHEN. \"It will sort itself out\" with no mechanism is not this "
-        "classification.",
+        "classification. On a monitoring order the OS watches once more at once; a second "
+        "TRANSIENT on that order settles it `unverified`.",
         "- **ALREADY_TRACKED** — the cause is already on the tracker or already has a live "
         "order. Put the issue (`#790` or its URL) or the order id in `duplicate_of`.",
         "- **SCRIPT_WRONG** — ONLY when Morpheus opened this investigation on a failed "
         "production validation, and the PR behaves as its hints describe but the "
         "validation SCRIPT checks the wrong thing. Say in `script_fix` what the script got "
         "wrong and what the right check is: the OS sends the item back to Morpheus with it "
-        "as the brief for a new script, once per item.",
+        "as the brief for a new script.",
         "",
         "# Name the gap class — required on all five",
         gaps.render_registry(),
@@ -1045,6 +1048,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         '    "remedy": "an existing remedy id, or none with the reason"',
         "  },",
         '  "user_owes": "…",          // WAITING_ON_USER only, naming an id',
+        '  "behaviour_correct": true, // WAITING_ON_USER on a Morpheus order: required',
         '  "unsticks": {"what": "…", "when": "…"},   // TRANSIENT only',
         '  "duplicate_of": "#790",    // ALREADY_TRACKED only',
         '  "script_fix": "…"          // SCRIPT_WRONG only: what it got wrong, the right check',

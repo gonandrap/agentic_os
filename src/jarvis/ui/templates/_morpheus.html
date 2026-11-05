@@ -1,5 +1,6 @@
 {# Shared by morpheus.html and morpheus_item.html — spec 2026-10-29 dashboard §4, 2026-11-01-monitoring-orders.md §6 #}
 {% set tone = {"queued": "tone-active", "monitoring": "tone-active", "validated": "tone-ok",
+               "unverified": "tone-warn",
                "failed": "tone-bad", "timedout": "tone-warn", "cancelled": "tone-muted"} %}
 
 {# `item.action` is `neo:<qid>` / `investigation:<id>` / `improvement:<io-id>` / `none:<why>` #}
