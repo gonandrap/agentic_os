@@ -487,7 +487,7 @@ def test_unverified_is_terminal_and_never_counted_as_passed():
 
     assert "unverified" in morpheus.TERMINAL_STATES
     assert "unverified" not in morpheus.ACTION_STATES
-    assert validation_of({"state": "unverified"}) == "unwatched"
+    assert validation_of({"state": "unverified"}) == "unverified"
 
 
 @pytest.mark.parametrize("earlier,output", [
