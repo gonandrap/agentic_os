@@ -2009,7 +2009,7 @@ def test_the_detail_shows_its_session_and_cost_only_when_the_bill_exists(central
     ("failed", f"{morpheus.JUDGE_CLAIM}1", None, None, "os"),
     ("failed", "neo:1", {"status": "queued"}, None, "neo"),
     ("failed", "neo:1", {"status": "failed"}, None, "neo"),
-    ("failed", "neo:1", {"status": "answered", "answered_by": "neo"}, None, "os"),
+    ("failed", "neo:1", {"status": "answered", "answered_by": "neo"}, None, "user"),
     ("timedout", "neo:1", {"status": "answered", "answered_by": "user"}, None, "user"),
     ("timedout", "neo:1", {"status": "escalated"}, None, "user"),
     ("timedout", "neo:1", {"status": "lapsed"}, None, "user"),

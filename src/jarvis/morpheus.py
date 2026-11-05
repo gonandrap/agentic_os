@@ -724,10 +724,8 @@ def owed_by(item: dict[str, Any], question: dict[str, Any] | None = None,
     look = f"jarvis mo show {item['id']}"
     kind = action.partition(":")[0]
     if kind == "neo" and question:
-        if question["status"] == "answered":
-            # A user's answer moves no row (Q3605); Neo's own leaves it to the OS (kn-1f7ca96a)
-            return ("user", look) if question.get("answered_by") == "user" else ("os", "")
-        if question["status"] not in ("escalated", "refined", "lapsed"):
+        # Answered and still failed: nothing moves it, so it is the user's (wo-ea6895e7 ruling)
+        if question["status"] not in ("answered", "escalated", "refined", "lapsed"):
             return "neo", ""
     elif kind in ("investigation", "improvement") and order:
         if order.get("needs_attention"):
