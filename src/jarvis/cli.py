@@ -529,7 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--release", metavar="TAG",
                     help="every monitoring order of that release tag, summed")
     sp.add_argument("--limit", type=int, default=50,
-                    help="work orders per project to measure (default: 50)")
+                    help="work orders to print (default: 50); totals cover them all")
     # The DISTRIBUTION, beside the listing rather than instead of it: what a typical order costs (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)
     sp.add_argument("--fleet", action="store_true",
                     help="what a TYPICAL order costs: n, avg, p90 and max per metric "
@@ -3370,7 +3370,7 @@ def cmd_cost(args: argparse.Namespace) -> int:
     # `$` is the whole bill — the worker's conversation
     print(f"{'$':>7} {'jarvis':>7} {'subproc':>8} {'subagent':>9} {'turns':>5} "
           f"{'output':>7} {'re-write':>9}  work order")
-    for u in units:
+    for u in units[:args.limit]:
         os_cost = f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
         sub_cost = f"{u['subproc_cost_usd']:.2f}" if u.get("subproc_calls") else "—"
         agent_cost = (f"{u['subagent_cost_usd']:.2f}"
