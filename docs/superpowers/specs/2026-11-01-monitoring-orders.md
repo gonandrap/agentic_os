@@ -54,6 +54,7 @@ one new terminal state `cancelled`:
 | `monitoring` | armed; the daemon runs `script` every `every_minutes` |
 | `validated` | exit 0, or waived — terminal, quiet |
 | `failed` / `timedout` | terminal; JUDGING IS OWED while `action` is empty |
+| `unverified` | not exercised by the deadline, no FAIL seen (§9) — terminal, quiet, never judged, not a pass |
 | `cancelled` | `jarvis mo cancel` — terminal, never judged, never handed off |
 
 A `queued` order past its deadline times out exactly as today (`sweep`), which is how an
@@ -354,6 +355,28 @@ Does NOT touch daemon passes or the session runner.
   its minimal render edits); §7 after §5. The before/after number is taken on
   the first real release after §3 ships (`jarvis cost --release <tag>` vs the previous
   release's fleet window).
+
+## 9. An exit 75 names why (io-5cc7a40d, wo-03bbd107)
+
+A script's exit 75 ends with a `REASON <word>` line. `check` stores the last such line in
+`last_reason`; a missing or unknown word is `ambiguous`. Scripts armed earlier are not re-armed,
+so they stay `ambiguous` and keep today's route.
+
+| reason | at the deadline |
+|---|---|
+| `not_deployed` | holds: each check moves `deadline_ts` to a full `timeout_days` ahead, at most 14 days after the watch's first `not_deployed` (`held_since_ts`). At the cap, `timedout` and judged |
+| `not_exercised` | `unverified` with zero model calls, unless the watch saw a FAIL; then `timedout` and judged |
+| `unreadable`, `ambiguous` | `timedout` and judged |
+
+`saw_fail` is sticky across the watch: an exit 1, a `FAIL` line, or output long enough to have
+lost one to the tail. It keeps a real signal from settling quietly. `requeue`, `rewrite` and a
+new script start a fresh watch. `unverified` is not in `ACTION_STATES`, so nothing is owed; a
+release row shows it as `unwatched`, never `validated`. `jarvis mo waive` and `requeue` still
+apply.
+
+Arming prefers a read-only probe over waiting for traffic and replies `trigger: probe|ambient`,
+stored in `trigger_kind` (`''` when unsaid). No model call enters a script, and
+`timeout_days` does not move.
 
 ## Agent profile
 
