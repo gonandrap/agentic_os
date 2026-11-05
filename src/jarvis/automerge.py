@@ -77,7 +77,7 @@ HELD_GRANT_LAPSED = "grant_lapsed"
 
 #: The wedge timer took this order's queue turn; recorded once per stale hold (spec 2026-11-05)
 TURN_PASSED_OVER_EVENT = "merge_turn_passed_over"
-#: Holds that leave an order moving through its queue turn; any other gives the turn up (spec 2026-11-05)
+#: Holds that leave an order moving through its turn; any other gives it up (spec 2026-11-05)
 TURN_KEEPING_HOLDS = frozenset({
     HELD_MERGE_QUEUED, HELD_BASE_MOVED, HELD_CHECKS_RUNNING, HELD_CHECKS_NONE, HELD_SHA_MOVED,
     HELD_NOT_MERGEABLE, HELD_MERGE_STATE_UNCLEAN, HELD_GRANT_LAPSED})
@@ -366,13 +366,13 @@ def queue_entry(store: Any, wo: dict[str, Any]) -> QueueEntry | None:
 
 
 def _wedged(store: Any, entry: QueueEntry) -> bool:
-    """Has this order stopped moving? Spec 2026-11-05, Wedge"""
+    """Has this order stopped moving? (spec 2026-11-05, Wedge)"""
     from . import db, gates
 
     now = db.now()
     if entry.last_code != HELD_MERGE_QUEUED:
         return entry.last_ts < now - gates.GRANT_TTL_SECONDS
-    # A queued order's clock starts when the order it named last moved, and spans that order's wedge too
+    # The clock runs from the named order's last move and spans that order's own wedge
     named = store.list_events(entry.last_behind, limit=1) if entry.last_behind else []
     moved = max([entry.last_ts] + [float(e["ts"] or 0.0) for e in named])
     return moved < now - 2 * gates.GRANT_TTL_SECONDS
@@ -409,7 +409,7 @@ def passed_over(store: Any, wo: dict[str, Any], pr: Any) -> list[QueueEntry]:
 
 
 def merge_queued(store: Any, wo: dict[str, Any], pr: Any) -> Decision | None:
-    """Held behind another order's merge in flight on this tip (#1459) or its older place in the queue (#1608), or None"""
+    """Held behind a merge in flight on this tip (#1459) or an older queue place (#1608), or None"""
     base_oid = str(getattr(pr, "base_oid", "") or "")
     base = str(getattr(pr, "base_ref", "") or "")
     named = base or "the base"
