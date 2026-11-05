@@ -268,8 +268,10 @@ an outlier the median ignores still moved the band.
 **The band is not the estimator's error (issue 1613).** Clean spans on one machine ran
 $0.72 to $1.52 per point around a $1.20 median while the band said ±3%, because the band
 counts rounding and nothing else. `spread_low` and `spread_high` carry the minimum and
-maximum of the span ratios (3+ spans; otherwise `None`). A span whose visible $/point sits
-inside them is one the meter itself produced this week, so its residual is not evidence.
+maximum of the ratios of spans that ended before the judged span began (3+ spans, counted
+in `spread_spans`; otherwise `None`), because a span in its own range can never leave it. A
+span whose visible $/point sits inside them is one the meter itself produced this week, so
+its residual is not evidence.
 Not p10/p90: those exclude 20% of normal spans by construction, and replaying the seven
 alarms of issue 1613 left six firing. The price is that one real phone session widens the
 range for up to 7 days, so `spread_widened` (an end outside Tukey's fences) says so, and the

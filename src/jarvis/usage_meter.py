@@ -571,7 +571,7 @@ def _has_outlier(ratios: Sequence[float]) -> bool:
 def spread_phrase(dollars: dict[str, Any]) -> str:
     """The range an alarm was judged against, stated so an outlier-widened one is visible (§5)"""
     said = (f"${dollars['spread_low']:.2f}-${dollars['spread_high']:.2f}/point over "
-            f"{dollars['basis_spans']} spans")
+            f"{dollars['spread_spans']} earlier spans")
     return said + ", widened by an outlier span" if dollars.get("spread_widened") else said
 
 
@@ -596,23 +596,27 @@ def _scaled_from_five_hour(rows: Sequence[Sample], key: str, *, now: float, cfg:
     five = dollars_per_point(now=now, cfg=cfg, home=home, visible=visible)
     if five_points <= 0 or key_points <= 0:
         return {"value": None, "low": None, "high": None, "spread_low": None,
-                "spread_high": None, "spread_widened": False, "source": "none", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
+                "spread_high": None, "spread_spans": 0, "spread_widened": False,
+                "source": "none", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
     scale = five_points / key_points
     return {"value": five["value"] * scale, "low": five["low"] * scale,
             "high": five["high"] * scale, "spread_low": None, "spread_high": None,
-            "spread_widened": False, "source": "scaled",
+            "spread_spans": 0, "spread_widened": False, "source": "scaled",
             "basis_spans": five["basis_spans"], "basis_points": key_points,
             "basis_usd": five["basis_usd"]}
 
 
 def dollars_per_point(*, now: float, cfg: Any, home: Path,
                       visible: Callable[..., float] | None = None,
-                      key: str = "five_hour") -> dict[str, Any]:
+                      key: str = "five_hour",
+                      judged_since: float | None = None) -> dict[str, Any]:
     """What one point of `key`'s window costs, with its uncertainty stated as a band (§5)"""
     since = now - cfg.meter_calibration_days * 86_400
     rows = samples_between(Path(home), since=since, until=now)
     spend = visible or _visible_spend(Path(home), since=since, until=now)
     ratios: list[float] = []
+    # A span must not vouch for itself: the range is what the meter did BEFORE the judged span
+    earlier: list[float] = []
     total_usd = total_points = 0.0
     for run in _runs(rows, key):
         points = float(run[-1].pct(key) or 0.0) - float(run[0].pct(key) or 0.0)
@@ -622,6 +626,8 @@ def dollars_per_point(*, now: float, cfg: Any, home: Path,
             continue
         usd = spend(since=run[0].ts, until=run[-1].ts)
         ratios.append(usd / points)
+        if judged_since is None or run[-1].ts <= judged_since:
+            earlier.append(usd / points)
         total_usd += usd
         total_points += points
     if not ratios and key != "five_hour":
@@ -629,17 +635,19 @@ def dollars_per_point(*, now: float, cfg: Any, home: Path,
     if not ratios:
         seed = float(cfg.meter_dollars_per_point)
         return {"value": seed, "low": seed, "high": seed, "spread_low": None,
-                "spread_high": None, "spread_widened": False, "source": "seed", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
+                "spread_high": None, "spread_spans": 0, "spread_widened": False,
+                "source": "seed", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
     value = statistics.median(ratios)
     # Quantisation around the median itself, so the band always holds the value (§5)
     low, high = band(total_usd=value * total_points, total_points=total_points,
                      spans=len(ratios))
     # How far spans really stray from the median; quantisation alone understates it (§5)
-    spread = len(ratios) >= MIN_SPREAD_SPANS
+    spread = len(earlier) >= MIN_SPREAD_SPANS
     return {"value": value, "low": low, "high": high,
-            "spread_low": min(ratios) if spread else None,
-            "spread_high": max(ratios) if spread else None,
-            "spread_widened": _has_outlier(ratios) if spread else False,
+            "spread_low": min(earlier) if spread else None,
+            "spread_high": max(earlier) if spread else None,
+            "spread_spans": len(earlier),
+            "spread_widened": _has_outlier(earlier) if spread else False,
             "source": "measured" if len(ratios) >= 3 else "thin",
             "basis_spans": len(ratios), "basis_points": total_points,
             "basis_usd": total_usd}
@@ -1153,7 +1161,8 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
     seven = segments(rows, since=since, until=until, key="seven_day",
                      nearest_seconds=cfg.meter_nearest_seconds, now=now)
     visible = _visible_spend(root, since=now - cfg.meter_calibration_days * 86_400, until=now)
-    dollars = dollars_per_point(now=now, cfg=cfg, home=root, visible=visible)
+    dollars = dollars_per_point(now=now, cfg=cfg, home=root, visible=visible,
+                                judged_since=since)
     seven_rate = dollars_per_point(now=now, cfg=cfg, home=root, visible=visible,
                                    key="seven_day")["value"]
     covered = five.coverage.samples > 0
