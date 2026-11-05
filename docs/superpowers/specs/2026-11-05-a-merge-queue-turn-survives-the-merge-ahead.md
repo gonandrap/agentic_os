@@ -30,8 +30,11 @@ paths that spend a catch-up or a Neo question already pass through it.
   outside `TURN_KEEPING_HOLDS`. An exhausted, failed or unprovable catch-up counts as such a
   hold. `base_red` is one too, so a red-main fix never waits behind the queue.
 - **Wedge.** An entry whose last hold is not `merge_queued` and is older than
-  `gates.GRANT_TTL_SECONDS` is passed over. `merge_turn_passed_over` and one inbox row name
-  the order, once per stale hold. A new hold puts it back in its place.
+  `gates.GRANT_TTL_SECONDS` is passed over. A queued entry is passed over after twice that,
+  counted from the later of its last hold and the last event of the order it named, so a
+  long wait is not a wedge but an order the poll stopped reaching is.
+  `merge_turn_passed_over` and one inbox row name the order, once per stale hold. A new hold
+  puts it back in its place.
 - **Bypass.** An expedited order, or one whose round has not passed, ignores position and
   obeys only the lease.
 

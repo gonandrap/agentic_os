@@ -322,6 +322,8 @@ class QueueEntry:
     entered: float
     last_code: str
     last_ts: float
+    #: The order its last hold named, when that hold was `merge_queued`
+    last_behind: str = ""
 
 
 def _keeps_turn(hold: dict[str, Any]) -> bool:
@@ -346,26 +348,40 @@ def queue_entry(store: Any, wo: dict[str, Any]) -> QueueEntry | None:
             or (latest["status"] in ("pending", "awaiting_case") and latest.get("escalated"))):
         return None
     since = float(row["ts"] or 0.0)
-    entered, base, last_code, last_ts = 0.0, "", "", 0.0
+    entered, base, last_code, last_ts, last_behind = 0.0, "", "", 0.0, ""
     for event in store.events_of_kind(wo["id"], "automerge_held"):
         ts = float(event["ts"] or 0.0)
         if ts < since:
             continue
         hold = db.from_json(event.get("payload"), {}) or {}
         last_code, last_ts = str(hold.get("code") or ""), ts
+        last_behind = str(hold.get("queued_behind") or "")
         if not _keeps_turn(hold):
             entered, base = 0.0, ""
         elif not entered and last_code == HELD_MERGE_QUEUED and hold.get("base"):
             entered, base = ts, str(hold["base"])
     if not entered:
         return None
-    return QueueEntry(wo["id"], base, entered, last_code, last_ts)
+    return QueueEntry(wo["id"], base, entered, last_code, last_ts, last_behind)
+
+
+def _wedged(store: Any, entry: QueueEntry) -> bool:
+    """Has this order stopped moving? Spec 2026-11-05, Wedge"""
+    from . import db, gates
+
+    now = db.now()
+    if entry.last_code != HELD_MERGE_QUEUED:
+        return entry.last_ts < now - gates.GRANT_TTL_SECONDS
+    # A queued order's clock starts when the order it named last moved, and spans that order's wedge too
+    named = store.list_events(entry.last_behind, limit=1) if entry.last_behind else []
+    moved = max([entry.last_ts] + [float(e["ts"] or 0.0) for e in named])
+    return moved < now - 2 * gates.GRANT_TTL_SECONDS
 
 
 def _turn_standing(store: Any, wo: dict[str, Any], pr: Any,
                    ) -> tuple[QueueEntry | None, list[QueueEntry]]:
     """(the live order ahead of this one, the wedged ones passed over on the way to it)"""
-    from . import db, gates, issues
+    from . import issues
 
     row = store.latest_validation_round(wo_id=wo["id"])
     if issues.was_expedited(wo) or row is None or row.get("outcome") != "passed":
@@ -376,13 +392,11 @@ def _turn_standing(store: Any, wo: dict[str, Any], pr: Any,
                                                          include_hidden=True)
                if other["id"] != wo["id"]
                and (entry := queue_entry(store, other)) is not None and entry.base == base]
-    wedged_before = db.now() - gates.GRANT_TTL_SECONDS
     passed: list[QueueEntry] = []
     for entry in sorted(entries, key=lambda e: (e.entered, e.wo_id)):
         if mine is not None and (entry.entered, entry.wo_id) > (mine.entered, mine.wo_id):
             break
-        # A queued order is waiting by design, so its old hold is not a wedge
-        if entry.last_code != HELD_MERGE_QUEUED and entry.last_ts < wedged_before:
+        if _wedged(store, entry):
             passed.append(entry)
             continue
         return entry, passed
