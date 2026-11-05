@@ -134,6 +134,9 @@
     {%- endif %}
   </p>
   {% endif %}
+  {% if totals.unpriced_note %}
+  <p class="kv" style="margin: 6px 0 0;">{{ totals.unpriced_note }}</p>
+  {% endif %}
   {% if totals.rewrite_excess %}
   <p class="kv" style="margin: 8px 0 0;">
     <strong>Re-write tax ~${{ '%.2f'|format(totals.rewrite_cost_usd) }}</strong> —

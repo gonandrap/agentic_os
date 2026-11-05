@@ -32,9 +32,8 @@ class GapClass:
 GAP_CLASSES: dict[str, GapClass] = {
     "stale-hold": GapClass(
         id="stale-hold",
-        headline="a hold never re-derived keeps an order parked after its cause cleared",
-        symptom="sits in `validating` or `waiting_pr_merge`, nothing in flight, no "
-                "question open",
+        headline="a hold never re-derived keeps an order parked after its cause clears",
+        symptom="parked in `validating` or `waiting_pr_merge`, nothing in flight, no question open",
         detector="",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/786",
@@ -51,8 +50,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "red-main": GapClass(
         id="red-main",
-        headline="`main` is red unnoticed, so orders built on it inherit the failure",
-        symptom="a PR whose checks fail for a reason absent from its own diff",
+        headline="`main` is red and nothing notices, so every order on it inherits the failure",
+        symptom="a pull request whose checks fail for a reason absent from its own diff",
         detector="",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/793",
@@ -60,8 +59,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "oversized-input": GapClass(
         id="oversized-input",
-        headline="a payload that could never fit is sent anyway, so the step fails on size",
-        symptom="a question, verdict or prompt refused for length, work unread",
+        headline="a payload that can never fit is sent anyway; the step fails on size",
+        symptom="a question, verdict or prompt refused for length",
         detector="",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/797",
@@ -71,7 +70,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     "unwired-precondition": GapClass(
         id="unwired-precondition",
         headline="a brief states a stop condition no state holds, so a worker pays to rediscover it",
-        symptom="dispatched, first line says not to start, abandoned, no commits",
+        symptom="dispatched, first line says not to start, abandoned with no commits",
         detector="INV-PRECONDITION-UNWIRED",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1089",
@@ -79,8 +78,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "background-task-silence": GapClass(
         id="background-task-silence",
-        headline="a worker awaiting a background task writes nothing, so the sweep reads its turn as wedged",
-        symptom="`running`, its transcript ending on a background launch",
+        headline="a worker awaiting a background task writes nothing; the sweep reads it as wedged",
+        symptom="`running`, investigated while its transcript ends on a background launch",
         detector="background.live_tasks",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1562",
@@ -88,7 +87,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "blocker-contradicts-record": GapClass(
         id="blocker-contradicts-record",
-        headline="a catch-all blocker's premise is denied by its order's events",
+        headline="a catch-all blocker fires though its order's events deny its premise",
         symptom="a finished order blocked as 'stopped mid-task'",
         detector="INV-BLOCKER-CONTRADICTS-RECORD",
         remedy=REMEDY_NONE,
@@ -97,8 +96,8 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "designed-wait-undiscounted": GapClass(
         id="designed-wait-undiscounted",
-        headline="the sweep not taught a deliberate hold reads the wait as lost time",
-        symptom="investigated with blocker `nothing the record can name`",
+        headline="the sweep judges a deliberate hold as lost time",
+        symptom="blocker `nothing the record can name`; OS working as designed",
         detector="INV-RED-RELEASE-UNDISCOUNTED",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1603",
@@ -106,7 +105,7 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "superseded-delivery": GapClass(
         id="superseded-delivery",
-        headline="an equivalent change lands first, so the PR nets to nothing",
+        headline="an equivalent change lands first, so the pull request nets to nothing",
         symptom="a passed order escalated as nothing to review; its PR changes no files",
         detector="Daemon._settle_superseded",
         remedy=REMEDY_NONE,
@@ -115,11 +114,20 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "base-chase-livelock": GapClass(
         id="base-chase-livelock",
-        headline="a queued PR loses its turn whenever the one ahead merges",
+        headline="a queued PR loses its turn when the one ahead merges",
         symptom="green, alternating `merge_queued` holds and catch-ups, no merge",
         detector="INV-BASE-CHASE-LIVELOCK",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1608",
+        since="",
+    ),
+    "mention-held-as-act": GapClass(
+        id="mention-held-as-act",
+        headline="high-stakes net matches a word, not an act; routine assumption waits for user",
+        symptom="`needs_review` held as `commits to an act`; Neo's advice would approve",
+        detector="rules.mention-held-as-act",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1610",
         since="",
     ),
 }
@@ -130,7 +138,8 @@ SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "background-task-silence",
                                         "blocker-contradicts-record",
                                         "designed-wait-undiscounted",
-                                        "superseded-delivery", "base-chase-livelock")
+                                        "superseded-delivery", "base-chase-livelock",
+                                        "mention-held-as-act")
 
 
 def checked_slug(raw: str) -> str:
@@ -164,12 +173,8 @@ def render_registry() -> str:
     lines = ["Reuse a slug for the same mechanism; a new slug makes the fix order register it.",
              ""]
     for cls in GAP_CLASSES.values():
-        # Terse, issue number alone: this list is inside a worker's 10K start budget
-        lines += [
-            f"- `{cls.id}` — {cls.headline}",
-            f"  {cls.symptom}",
-            f"  Detector: {cls.detector or 'NONE YET'}"
-            + (f"; remedy: {cls.remedy}" if cls.remedy != REMEDY_NONE else "")
-            + (f" (#{cls.issue_url.rsplit('/', 1)[-1]})" if cls.issue_url else ""),
-        ]
+        # One line, no issue number: this list is inside a worker's 10K start budget
+        lines.append(f"- `{cls.id}`: {cls.headline}. Seen: {cls.symptom}. "
+                     f"Detector: {cls.detector or 'NONE YET'}"
+                     + (f"; remedy: {cls.remedy}" if cls.remedy != REMEDY_NONE else ""))
     return "\n".join(lines)

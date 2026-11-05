@@ -944,9 +944,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "# Your job: diagnose ONE subject and classify it",
         f"You READ. You change nothing — no file, no commit, no pull request, nothing "
-        f"filed. That is not a request: two PreToolUse hooks refuse your writes and your "
-        f"mutating shell commands, so a session that tries to fix what it found spends "
-        f"its turns being denied. Your output is a VERDICT about "
+        f"filed. Two PreToolUse hooks refuse your writes and mutating shell commands. "
+        f"Your output is a VERDICT about "
         f"{subject or 'the subject'} and nothing else.",
         "",
         "# Read the evidence through the CLI, never the databases",
@@ -1016,9 +1015,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "# The verdict",
         f"Create it with the **`Write` tool** on `verdict.json` in your worktree root — "
         f"that filename exactly, it is the one path you are permitted to write, and "
-        f"`Write` is the one tool that may. Not `cat >`, not a heredoc, not `python3 -`: a "
-        f"shell heredoc that writes a file is refused for every worker in the fleet "
-        f"(`hooks.heredoc_write_decision`). Submit it with the command below, "
+        f"`Write` is the one tool that may. Not `cat >`, not a heredoc, not `python3 -`. "
+        f"Submit it with the command below, "
         f"which IS your finish. Do not call `jarvis wo finish`: submitting the verdict "
         f"settles this work order for you.",
         "",
@@ -1033,6 +1031,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         '  "evidence": [',
         f'    {{"source": "{read_subject}", "quote": "the verbatim line"}}',
         "  ],",
+        '  "other_gaps": [{"title": "…", "why": "…", "description": "the brief, standing '
+        'alone"}],   // [] when none',
         '  "owner": "os",             // GAP only',
         '  "proposed_fix": {          // GAP only',
         '    "title": "what the bug report is titled",',
@@ -1051,8 +1051,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "}",
         "```",
         "",
-        "`subject`, `classification`, `gap_class`, `root_cause` and at least one "
-        "`evidence` entry are "
+        "`subject`, `classification`, `gap_class`, `root_cause`, `other_gaps` and at least "
+        "one `evidence` entry are "
         "required for all five. CARRY ONLY YOUR CLASSIFICATION'S FIELD: the validator "
         "refuses a GAP with no `proposed_fix`, and a TRANSIENT that also says the user "
         "owes something; it names every problem at once. The `//` notes are not JSON: "
@@ -1062,8 +1062,10 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- Never paste a diff, a transcript or a log into the verdict: cite the command "
         f"and quote the decisive line. Over {verdicts.MAX_VERDICT_CHARS} characters the "
         f"whole document is refused.",
-        "- One subject, one root cause, one classification. A symptom with two independent "
-        "causes is an improvement order, and belongs in the verdict as that recommendation.",
+        "- One subject, one root cause, one classification. EVERY OTHER GAP you found, related "
+        "or not, is one `other_gaps` entry, never prose in `root_cause`: no code reads that. "
+        "The OS posts each to this project's backlog as a proposal, never a tracker bug and "
+        "never dispatched.",
         "",
         "# What you may run",
         "Reads: `git log|show|diff|status|blame`, `gh pr view|diff|checks`, "
@@ -1081,8 +1083,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "route around that check is how one cause gets two issues. So a bug you hit in "
         "Jarvis OS ITSELF while investigating — even one unrelated to your subject — "
         "cannot be filed from here and does not use your `report-jarvis-bug` skill. Put it "
-        "in the verdict: in `proposed_fix` if it IS the root cause, and in `root_cause`'s "
-        "last sentence if it is not.",
+        "in the verdict: in `proposed_fix` if it IS the root cause, and in `other_gaps` if "
+        "it is not.",
         "",
         "# Operating contract",
         f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "

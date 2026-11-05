@@ -1197,7 +1197,7 @@ def investigator_write_decision(payload: dict[str, Any],
         f"`{VERDICT_FILE}` in your worktree root — written whole with `Write`, never "
         f"edited — and submit it with `jarvis investigate verdict <inv-id> --from-file "
         f"{VERDICT_FILE}`. A fix you found belongs in the verdict's `proposed_fix`, which "
-        f"the OS files for you after a duplicate check."
+        f"the OS files for you after a duplicate check; any other gap, in `other_gaps`."
     )
 
 

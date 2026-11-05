@@ -9538,6 +9538,10 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
             f"the verdict was not accepted, and nothing was stored: SCRIPT_WRONG is only for "
             f"an investigation Morpheus opened on a failed production validation, and "
             f"{inv_id} was not. Pick one of the other four classifications and resubmit.")
+    if verdict["other_gaps"] and not fo.get("plan_wo_id"):
+        raise OpsError(
+            f"the verdict was not accepted, and nothing was stored: {inv_id} has no "
+            f"investigator work order yet, and `other_gaps` are filed against that order.")
     if (verdict["classification"] == "WAITING_ON_USER" and morpheus_item_id
             and "behaviour_correct" not in verdict):
         raise OpsError(
@@ -9547,8 +9551,7 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
 
     verdict["classified_by"] = "investigator"
     verdict["filed"] = None
-    # Keyed on `other_gaps`: before that field ships, every side gap would read as a miss
-    if verdict["classification"] == "GAP" and "other_gaps" in verdict:
+    if verdict["classification"] == "GAP":
         try:
             missed = verdict_coverage.uncovered(str(fo.get("description") or ""), verdict,
                                                 project=name, wo_id=fo.get("plan_wo_id") or "")
@@ -9648,6 +9651,13 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
     classification = verdict["classification"]
     store = ProjectStore(path)
     try:
+        # Before the status, so a failed post stays resubmittable; a resubmit skips titles already posted
+        posted = ({d["title"] for d in deferrals_of(store, fo["plan_wo_id"])}
+                  if verdict["other_gaps"] else set())
+        for gap in verdict["other_gaps"]:
+            if gap["title"] not in posted:
+                _post_deferral(store, fo["plan_wo_id"], gap["title"], gap["why"],
+                               gap["description"])
         store.update_feature_order(inv_id, plan=db.to_json(verdict))
         store.set_feature_status(inv_id, "completed")
         # THE ONE CLASSIFICATION THAT SPENDS ATTENTION
@@ -9682,6 +9692,7 @@ def submit_verdict(inv_id: str, doc: Any, project_name: str | None = None,
         "project": name, "inv_id": inv_id, "status": "completed",
         "classification": classification, "filed": verdict.get("filed"),
         "classified_by": verdict["classified_by"],
+        "other_gaps_proposed": len(verdict["other_gaps"]),
         "note": "the investigation is settled — end your turn.",
     }
     if fo.get("plan_wo_id"):
@@ -14096,12 +14107,27 @@ def adopt_config(*, reason: str = "", catalog_path: str | None = None,
 
 # -- deferral
 
+def _post_deferral(store: ProjectStore, wo_id: str, title: str, why: str, description: str = "",
+                   neo_question_id: int | None = None) -> int:
+    """Put a deferral on the bus and on the work order's own record"""
+    from . import bus
+
+    env_id = bus.post(
+        store, subject=bus.Subject(wo_id=wo_id), from_role="implementor",
+        to_role="manager",
+        payload=bus.DeferralRequest(title=title, why=why,
+                                    neo_question_id=neo_question_id,
+                                    description=description))
+    store.add_event(wo_id, "deferral_submitted",
+                    {"title": title, "why": why, "envelope_id": env_id,
+                     "neo_question_id": neo_question_id})
+    return env_id
+
+
 def defer(wo_id: str, title: str, why: str, description: str = "",
           neo_question_id: int | None = None,
           project_name: str | None = None) -> dict[str, Any]:
     """(Workers) hand work found on the way to whoever owns deciding about it"""
-    from . import bus
-
     if not why.strip():
         raise OpsError(
             "--why is the whole argument for deferring: it is what a reader sees months "
@@ -14109,16 +14135,7 @@ def defer(wo_id: str, title: str, why: str, description: str = "",
     name, path, wo = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
     try:
-        env_id = bus.post(
-            store, subject=bus.Subject(wo_id=wo_id), from_role="implementor",
-            to_role="manager",
-            payload=bus.DeferralRequest(title=title, why=why,
-                                        neo_question_id=neo_question_id,
-                                        description=description))
-        # On the work order's own record
-        store.add_event(wo_id, "deferral_submitted",
-                        {"title": title, "why": why, "envelope_id": env_id,
-                         "neo_question_id": neo_question_id})
+        env_id = _post_deferral(store, wo_id, title, why, description, neo_question_id)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "envelope_id": env_id, "title": title,
@@ -14825,6 +14842,7 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
         f"{prefix}_calls": calls,
         f"{prefix}_failed_calls": failed,
         f"{prefix}_cost_usd": round(total.list_cost_usd, 4),
+        f"{prefix}_cost_by_model": total.cost_by_model,
         f"{prefix}_recorded_cost_usd": round(exact, 4),
         f"{prefix}_billed_input": total.billed_input,
         f"{prefix}_output": total.output,
@@ -15087,8 +15105,28 @@ def _rollup(units: list[dict[str, Any]],
             # Over ALL units: what a window could not place is disclosed whether or not the order it belongs to...
             "undated_messages": sum(u.get("undated_messages") or 0 for u in units),
             **_write_ttl(measured, os_spenders),
+            **_unpriced_models([*(u.get("cost_by_model") for u in measured),
+                                *(u.get("os_cost_by_model") for u in os_spenders),
+                                *(u.get("subproc_cost_by_model") for u in units)]),
         },
     }
+
+
+def _unpriced_models(spends: Sequence[dict[str, float] | None]) -> dict[str, Any]:
+    """Every id `usage.PRICES` does not list, with the dollars guessed for it (issue #1580)"""
+    from . import usage as usage_mod
+
+    guessed: dict[str, float] = {}
+    for spend in spends:
+        for model, cost in (spend or {}).items():
+            if not usage_mod.is_known_model(model):
+                guessed[model] = guessed.get(model, 0.0) + cost
+    rows = [{"model": model, "list_cost_usd": round(cost, 2)}
+            for model, cost in sorted(guessed.items(), key=lambda kv: -kv[1])]
+    named = ", ".join(f"{r['model']} ~${r['list_cost_usd']:.2f}" for r in rows)
+    return {"unpriced_models": rows,
+            "unpriced_note": f"Guessed at a fallback price, no list price known: {named}."
+            if rows else ""}
 
 
 def _write_ttl(measured: list[dict[str, Any]], units: list[dict[str, Any]]

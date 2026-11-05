@@ -380,8 +380,61 @@ def test_synthetic_messages_are_free_but_unknown_models_are_not():
     assert usage.price_for("<synthetic>") == (0.0, 0.0)
     assert usage.price_for("claude-opus-5") == (5.0, 25.0)
     assert usage.price_for("claude-haiku-4-5-20251001") == (1.0, 5.0)
-    assert usage.price_for("claude-sonnet-5") == (3.0, 15.0)
+    assert usage.price_for("claude-sonnet-5") == (2.0, 10.0)
     assert usage.price_for("claude-something-unreleased") == usage.DEFAULT_PRICE
+
+
+@pytest.mark.parametrize("model, tokens, recorded", [
+    # Each figure is one real CLI 2.1.318 envelope's `modelUsage`, issue #1580
+    ("claude-haiku-5-5", dict(input=2, output=4, cache_read=649, cache_write=2953, cache_1h=2953),
+     0.00059929),
+    ("claude-sonnet-5-5", dict(input=2, output=4, cache_read=649, cache_write=2129, cache_1h=2129),
+     0.0086249),
+    ("claude-sonnet-5", dict(input=2, output=4, cache_read=3515, cache_write=5756, cache_1h=5756),
+     0.023771),
+    ("claude-opus-5-5", dict(input=2, output=4, cache_read=649, cache_write=2789, cache_1h=2789),
+     0.0225298),
+])
+def test_list_price_reproduces_what_the_cli_recorded(model, tokens, recorded):
+    assert usage.priced(model, **tokens).list_cost_usd == pytest.approx(recorded)
+
+
+def test_only_an_id_the_table_lists_or_an_alias_counts_as_known():
+    for model in ("sonnet", "claude-opus-5-5", "claude-haiku-4-5-20251001", "claude-opus-5[1m]"):
+        assert usage.is_known_model(model), model
+    for model in ("unknown", "claude-sonnet-6", "claude-opus-5-9"):
+        assert not usage.is_known_model(model), model
+
+
+def test_the_report_names_every_id_it_had_to_guess():
+    """Dollars stay in the total, so the ledger still matches the meter; the guess is named (issue #1580)"""
+    from jarvis import ops
+
+    totals = ops._rollup([], ops._os_spend([
+        {"kind": "digest", "model": "", "calls": 1, "input": 1_000_000},
+        {"kind": "digest", "model": "claude-sonnet-6", "calls": 1, "input": 1_000_000},
+        {"kind": "digest", "model": "claude-opus-5-5", "calls": 1, "input": 1_000_000},
+    ]))["totals"]
+    assert totals["unpriced_models"] == [{"model": "unknown", "list_cost_usd": 4.0},
+                                         {"model": "claude-sonnet-6", "list_cost_usd": 2.0}]
+    assert "unknown ~$4.00, claude-sonnet-6 ~$2.00" in totals["unpriced_note"]
+    assert totals["os_cost_usd"] == 10.0
+
+
+def test_a_call_recorded_without_a_model_names_the_one_that_served_it(tmp_path):
+    """Priced at the opus default otherwise, issue #1580; several models name none"""
+    from jarvis.central_store import CentralStore
+
+    store = CentralStore(tmp_path / "os.db")
+    try:
+        store.add_agent_call("validation_seat", wo_id="wo-one",
+                             usage={"by_model": [{"model": "claude-haiku-5-5"}]})
+        store.add_agent_call("validation_seat", wo_id="wo-two",
+                             usage={"by_model": [{"model": "a"}, {"model": "b"}]})
+        assert store.agent_calls(wo_id="wo-one")[0]["model"] == "claude-haiku-5-5"
+        assert store.agent_calls(wo_id="wo-two")[0]["model"] == ""
+    finally:
+        store.close()
 
 
 def test_cost_is_priced_per_message_model_not_per_session(transcripts):
