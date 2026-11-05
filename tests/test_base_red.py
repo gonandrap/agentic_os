@@ -161,8 +161,7 @@ def test_the_poll_costs_one_run_list_per_project_per_tick_and_nothing_else(
     poll(started, store)
 
     assert runs_called(fake_gh) == 1
-    # Two pinned GETs on this FIRST poll and neither again: the default branch name
-    # The red head's one log read and one re-run are not repeated either
+    # FIRST poll only: two pinned GETs for the default branch, red head's log read and re-run
     first = [["api", "--method"]] * 2 + [["run", "view"], ["run", "rerun"]]
     assert [c["argv"][:2] for c in fake_gh.calls
             if c["argv"][:2] != ["run", "list"]] == first

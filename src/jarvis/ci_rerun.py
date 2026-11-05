@@ -160,7 +160,7 @@ def base_failed_key(run: Run) -> str:
 
 
 def base_verdict(runs: tuple[Run, ...], workflow: str, reruns: Any) -> Run | None:
-    """`ci.latest`, except a red run's re-run stays red until it judges: else an older green opens the merges"""
+    """`ci.latest`, except a red run's re-run stays red until judged: older green opens the merges"""
     for r in runs:
         if r.workflow != workflow:
             continue
