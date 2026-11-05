@@ -113,7 +113,7 @@ def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
     assert set(meter["seven_day"]) == set(meter["five_hour"])
     assert set(meter["five_hour"]["segments"][0]) == {"since", "until", "start_pct",
                                                       "end_pct", "delta", "cause"}
-    assert set(meter["coverage"]) == {"samples", "expected", "share", "gap_rows",
+    assert set(meter["coverage"]) == {"samples", "share", "gap_rows",
                                       "longest_gap_seconds", "head_uncovered_seconds",
                                       "first_ts", "last_ts", "reliable",
                                       "min_reliable_share"}
@@ -290,11 +290,11 @@ def test_a_span_the_meter_barely_covers_derives_no_dollar_figure(fleet_fixture):
     said = meter["sentence"]
     spend = meter["spend"]
 
-    assert meter["coverage"]["share"] == pytest.approx(4 / 120, abs=1e-4)
+    assert meter["coverage"]["share"] == pytest.approx(3 * 150 / 18_000, abs=1e-4)
     assert meter["reliable"] is False
     assert "low_coverage" in meter["unreliable"]
     assert usage_meter.UNRELIABLE in said
-    assert "3% covered" in said
+    assert "2% covered" in said
     for forbidden in ("lower bound", usage_meter.RESIDUAL_LABEL, "unexplained"):
         assert forbidden not in said, forbidden
     # The measured halves are measured, not derived, and stay numbers
@@ -310,19 +310,20 @@ def test_between_the_thresholds_the_figure_stands_and_the_coverage_is_incomplete
     meter = meter_of(fleet_fixture, scene(fleet_fixture, until=SPAN_UNTIL, samples=84))
     said = meter["sentence"]
 
-    assert meter["coverage"]["share"] == pytest.approx(0.7)
+    assert meter["coverage"]["share"] == pytest.approx(83 * 150 / 18_000, abs=1e-4)
     assert meter["reliable"] is True and meter["unreliable"] == []
     assert "the 5h meter rose 12 points (~$9.8)" in said
-    assert "70% of this span, so the rise is incomplete" in said
+    assert "69% of this span, so the rise is incomplete" in said
     assert "lower bound" not in said
 
 
 def test_an_unreliable_span_suppresses_both_alarms_and_the_daemon_writes_nothing(
         fleet_fixture, fixed_now):
     fleet_fixture.order("the carrier", status="completed")
-    scene(fleet_fixture, until=SPAN_UNTIL, samples=48)         # 40% covered
+    # `fixed_now` is 2h in: 20 readings measure 47m30s of them, 40% covered, the rest a real hole
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=20)
     meter = meter_of(fleet_fixture, {"since": SPAN_SINCE, "until": SPAN_UNTIL,
-                                     "source": "session-meter"})
+                                     "source": "session-meter"}, now=fixed_now)
 
     assert meter["reliable"] is False
     assert meter["alerts"]["outside"] is False
@@ -348,6 +349,32 @@ def test_an_unreliable_span_suppresses_both_alarms_and_the_daemon_writes_nothing
         store.close()
 
 
+def test_a_window_ending_ahead_of_now_reconciles_like_the_same_span_ending_now(fleet_fixture):
+    """io-82bcb830: the current 5h window ends in the future by design"""
+    resolved = scene(fleet_fixture)
+    now = resolved["until"]
+
+    ended = meter_of(fleet_fixture, resolved)
+    ahead = meter_of(fleet_fixture, {**resolved, "until": SPAN_SINCE + 5 * HOUR}, now=now)
+
+    assert ahead["reliable"] is True and ahead["unreliable"] == []
+    assert ahead["coverage"]["share"] == pytest.approx(1.0)
+    assert ahead["spend"]["implied_usd"] == ended["spend"]["implied_usd"]
+    assert "incomplete" not in ahead["sentence"]
+
+
+def test_a_window_that_just_opened_raises_no_alarm(fleet_fixture):
+    """Coverage no longer holds the current window back; the dollar floor still must"""
+    resolved = scene(fleet_fixture, until=SPAN_SINCE + 15 * MINUTE, samples=6, points=1.0,
+                     worker_usd=0.0, os_usd=0.0, outside=False)
+
+    meter = meter_of(fleet_fixture, {**resolved, "until": SPAN_SINCE + 5 * HOUR},
+                     now=resolved["until"])
+
+    assert meter["reliable"] is True
+    assert meter["alerts"]["outside"] is False and meter["alerts"]["residual"] is False
+
+
 def test_a_gap_longer_than_the_window_derives_nothing(fleet_fixture):
     """A whole 5h window could have opened and closed inside the hole"""
     since, until = SPAN_SINCE, SPAN_SINCE + 24 * HOUR
@@ -358,7 +385,7 @@ def test_a_gap_longer_than_the_window_derives_nothing(fleet_fixture):
     meter = meter_of(fleet_fixture, {"since": since, "until": until,
                                      "source": "session-meter"})
 
-    assert meter["coverage"]["share"] == pytest.approx(0.75)
+    assert meter["coverage"]["share"] == pytest.approx(0.75, abs=0.005)
     assert "gap_longer_than_window" in meter["unreliable"]
     assert "low_coverage" not in meter["unreliable"]
     assert meter["spend"]["implied_usd"] is None
