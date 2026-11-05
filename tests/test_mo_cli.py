@@ -69,7 +69,10 @@ def test_morpheus_is_an_alias_of_mo(central, capsys):
     assert main(["mo", "status"]) == 0
     mo_out = capsys.readouterr().out
     assert main(["morpheus", "status"]) == 0
-    assert capsys.readouterr().out == mo_out and "1 queued" in mo_out and "watch" in mo_out
+    assert capsys.readouterr().out == mo_out and "1 queued" in mo_out
+    assert "0 need you" in mo_out and "OS handling: 1" in mo_out and "watch" not in mo_out
+    assert main(["mo", "status", "--all"]) == 0
+    assert "watch" in capsys.readouterr().out
 
 
 def test_list_filters_and_cancel_refuses_a_settled_order(central, capsys):

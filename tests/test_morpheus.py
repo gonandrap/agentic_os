@@ -653,6 +653,151 @@ def test_timedout_asks_neo_by_default_and_the_route_is_configurable(central):
                         ask_neo=lambda *a: 3) == "investigation:fo-x"
 
 
+def _timed_out_on_neo(central, n: int = 7, *, answered_by: str = "neo",
+                      status: str = "answered", settle_offered: bool = False):
+    """A row parked on a Neo question; `settle_offered` False is one asked before `settle`"""
+    from jarvis.neo_store import NeoStore
+
+    item = queued(central, n)
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
+    context = {"morpheus_item": item["id"]} | ({"settle_offered": True} if settle_offered else {})
+    neo = NeoStore()
+    try:
+        qid = neo.ask("proj_a", "", "old question", context=json.dumps(context),
+                      kind="validation")["id"]
+        if status == "answered":
+            neo.record_answer(qid, "No look needed", answered_by=answered_by)
+        else:
+            neo.mark(qid, status)
+    finally:
+        neo.close()
+    central.update_morpheus_item(item["id"], action=f"neo:{qid}")
+    return central.morpheus_item(item["id"]), qid
+
+
+def test_neo_s_settle_verdict_leaves_the_row_unverified_and_requeue_reverses_it(central):
+    item = monitoring(central, script="exit 75")
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict",
+                                 next_check_ts=None, action="neo:5")
+    _verdict(central, item["id"], action="settle")
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "unverified"
+    assert after["resolution"].startswith("unverified by Neo:")
+    assert morpheus.owed_actions(central) == []
+    assert central.morpheus_counts().get("timedout", 0) == 0
+    title = central.conn.execute("SELECT title FROM inbox").fetchone()["title"]
+    assert "settled it unverified, not passed" in title
+    assert morpheus.requeue(central, MorpheusConfig(), item["id"])["state"] == "monitoring"
+
+
+@pytest.mark.parametrize("fields,verdict", [
+    ({"state": "timedout", "resolution": "no verdict"}, {"action": "settle", "escalate": True}),
+    ({"state": "timedout", "resolution": "no verdict"}, {"action": "settle", "answer": ""}),
+    ({"state": "validated", "resolution": "waived by the user: ok"}, {"action": "settle"}),
+    ({"state": "failed", "resolution": f"{morpheus.CONFIRMED}; fix filed as wo-1"},
+     {"action": "settle"}),
+])
+def test_settle_never_overrides_an_escalation_or_the_user_s_ruling(central, fields, verdict):
+    item = queued(central)
+    central.update_morpheus_item(item["id"], **fields)
+    _verdict(central, item["id"], **verdict)
+    assert central.morpheus_item(item["id"])["state"] == fields["state"]
+
+
+@pytest.mark.parametrize("verdict,offered,level,moved", [
+    ({}, True, "warning", True),                         # no action: nothing retries it
+    ({"action": "requeue"}, True, "info", False),        # it moved
+    ({}, False, "info", True),                           # unmarked: a re-ask still follows
+])
+def test_a_verdict_that_moves_nothing_warns_the_user(central, verdict, offered, level, moved):
+    item = monitoring(central, script="exit 1")
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict",
+                                 next_check_ts=None, action="neo:5")
+    q = {"id": 5, "project": "proj_a",
+         "context": json.dumps({"morpheus_item": item["id"], "settle_offered": offered})}
+    morpheus.record_neo_verdict(central, MorpheusConfig(), q,
+                                {"escalate": False, "answer": "rare path", **verdict})
+    row = central.conn.execute("SELECT level, title, body FROM inbox").fetchone()
+    assert row["level"] == level
+    assert (central.morpheus_item(item["id"])["state"] == "timedout") is moved
+    assert ("nothing moved" in row["title"]) is (level == "warning")
+    assert (f"requeue|waive|confirm|rewrite {item['id']}" in row["body"]) is (level == "warning")
+
+
+def test_a_new_question_offers_settle_and_never_validates(central):
+    from jarvis.neo_store import NeoStore
+
+    item = queued(central)
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
+    neo = NeoStore()
+    try:
+        q = neo.get(morpheus._ask_neo(catalog(), central.morpheus_item(item["id"])))
+    finally:
+        neo.close()
+    assert '"action": "settle"' in q["question"]
+    assert json.loads(q["context"])["settle_offered"] is True
+    assert "validated" not in morpheus.VERDICT_ACTIONS and "waive" not in morpheus.VERDICT_ACTIONS
+
+
+def test_a_row_neo_answered_before_settle_is_asked_once_more_then_drains(central):
+    from jarvis.neo_store import NeoStore
+
+    item, old = _timed_out_on_neo(central)
+    assert morpheus.reask_answered(central, catalog()) == [item["id"]]
+    action = central.morpheus_item(item["id"])["action"]
+    assert action != f"neo:{old}" and action.startswith("neo:")
+    neo = NeoStore()
+    try:
+        new = neo.get(int(action.partition(":")[2]))
+        neo.record_answer(new["id"], "still no look needed")
+    finally:
+        neo.close()
+    # Answered again, this time with `settle` on offer: never a third question
+    assert morpheus.reask_answered(central, catalog()) == []
+    morpheus.record_neo_verdict(central, MorpheusConfig(), new,
+                                {"escalate": False, "answer": "no look", "action": "settle"})
+    assert central.morpheus_item(item["id"])["state"] == "unverified"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"answered_by": "user"},             # a user's answer stays theirs
+    {"status": "escalated"},             # the user owes it
+    {"status": "queued"},                # Neo has not answered yet
+    {"settle_offered": True},            # already had its chance
+])
+def test_only_a_neo_answer_without_the_offer_is_asked_again(central, kwargs):
+    item, qid = _timed_out_on_neo(central, **kwargs)
+    assert morpheus.reask_answered(central, catalog()) == []
+    assert central.morpheus_item(item["id"])["action"] == f"neo:{qid}"
+
+
+def test_reasking_skips_archived_projects_and_confirmed_failures(central):
+    item, _ = _timed_out_on_neo(central)
+    assert morpheus.reask_answered(central, catalog(), skip={"proj_a"}) == []
+    central.update_morpheus_item(item["id"], resolution=f"{morpheus.CONFIRMED}; fix filed as wo-1")
+    assert morpheus.reask_answered(central, catalog()) == []
+
+
+def test_a_settled_row_shows_on_mo_status_list_and_the_page(central, capsys):
+    from fastapi.testclient import TestClient
+
+    from jarvis.cli import main
+    from jarvis.ui.app import create_app
+
+    item = queued(central)
+    central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
+    _verdict(central, item["id"], action="settle")
+    assert main(["mo", "status"]) == 0
+    assert "1 unverified" in capsys.readouterr().out
+    assert main(["mo", "list", "--state", "unverified"]) == 0
+    assert f"? {item['id']}" in capsys.readouterr().out
+    assert main(["mo", "list"]) == 0
+    assert item["id"] not in capsys.readouterr().out
+    client = TestClient(create_app())
+    assert "1 unverified" in client.get("/mo").text
+    assert 'class="mono tone-muted">unverified' in client.get(f"/mo/{item['id']}").text
+
+
 def _allowed(monkeypatch, allowed: bool = True) -> list:
     from jarvis import steward
 
@@ -1490,6 +1635,172 @@ def test_an_owed_action_is_a_violation_and_a_taken_one_is_not(central, monkeypat
     assert list(invariants.check_morpheus_moves()) == []
 
 
+# -- 9b. a project that ships by tag from its own live checkout
+
+
+def _commit(repo: Path, name: str) -> str:
+    (repo / name).write_text(name)
+    subprocess.run(["git", "-C", str(repo), "add", name], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-qm", name], check=True)
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def test_a_tag_shipped_pr_queues_only_when_live_head_contains_it(
+        central, cfg, project, clock, tmp_path):
+    from jarvis.project_store import ProjectStore
+
+    live = tmp_path / "live"
+    live.mkdir()
+    subprocess.run(["git", "init", "-q", str(live)], check=True)
+    _commit(live, "base")
+    # The dev clone's commits exist nowhere in live until the deploy
+    dev = tmp_path / "dev"
+    subprocess.run(["git", "clone", "-q", str(live), str(dev)], check=True)
+    first = _commit(dev, "first")
+    second = _commit(dev, "second")
+    shas = {1: first, 2: second}
+    calls = []
+
+    def fetch(slug, n):
+        calls.append(n)
+        return morpheus.PullRequestBody(number=n, url=f"https://github.com/o/r/pull/{n}",
+                                        title="t", body=HINTS_BODY, merge_sha=shas[n])
+
+    def deploy(sha):
+        subprocess.run(["git", "-C", str(live), "fetch", "-q", str(dev), "HEAD"], check=True)
+        subprocess.run(["git", "-C", str(live), "reset", "-q", "--hard", sha], check=True)
+
+    store = ProjectStore(project)
+    try:
+        queue = lambda: morpheus.queue_deployed(central, cfg, "proj_a", store, live, fetch=fetch)  # noqa: E731
+        assert queue() == []  # first sight
+        clock.advance(10)
+        wo = store.create_work_order(title="x", description="d")
+        store.add_event(wo["id"], "pr_merged", {"pr_url": "https://github.com/o/r/pull/1"})
+        clock.advance(1)
+        store.add_event(wo["id"], "pr_merged", {"pr_url": "https://github.com/o/r/pull/2"})
+
+        assert queue() == []
+        assert central.morpheus_items() == []
+        # Live has not moved: no further `gh` call
+        calls.clear()
+        assert queue() == [] and calls == []
+
+        clock.advance(100)
+        deploy(first)
+        [one] = queue()
+        item = central.morpheus_item(one)
+        assert item["pr_number"] == 1 and item["release_tag"]
+        assert item["deadline_ts"] == db.now() + cfg.timeout_days * DAY
+        calls.clear()
+        assert queue() == [] and calls == []
+
+        clock.advance(100)
+        deploy(second)
+        [two] = queue()
+        assert central.morpheus_item(two)["pr_number"] == 2
+        assert calls == [2]  # the cursor passed PR 1
+    finally:
+        store.close()
+
+
+def test_open_scripts_naming_the_dev_checkout_go_back_once_without_spending_a_rewrite(
+        central, cfg, project, tmp_path):
+    dev, live = project, tmp_path / "live"
+    hard_coded = monitoring(central, n=1, script=f"cd {dev} || exit 75; exit 0")
+    relative = monitoring(central, n=2, script="exit 0")
+    sibling = monitoring(central, n=3, script=f"cat {dev}-kb/x")
+    settled = monitoring(central, n=4, script=f"cd {dev}")
+    central.update_morpheus_item(settled["id"], state="timedout")
+
+    sent = morpheus.rewrite_dev_scripts(central, cfg, "proj_a", dev, live)
+
+    assert sent == [hard_coded["id"]]
+    after = central.morpheus_item(hard_coded["id"])
+    assert (after["state"], after["script"]) == ("queued", "")
+    assert str(live) in after["rewrite_brief"]
+    assert int(after["script_rewrites"] or 0) == 0
+    assert central.morpheus_item(relative["id"])["state"] == "monitoring"
+    assert central.morpheus_item(sibling["id"])["state"] == "monitoring"
+    assert central.morpheus_item(settled["id"])["state"] == "timedout"
+    # A new script may keep the dev path for state: never sent back again
+    central.update_morpheus_item(hard_coded["id"], script=f"ls {dev}/processed",
+                                 state="monitoring")
+    assert morpheus.rewrite_dev_scripts(central, cfg, "proj_a", dev, live) == []
+
+
+@pytest.mark.parametrize("spelling", ["~/work/dev", "$HOME/work/dev", "${HOME}/work/dev"])
+def test_a_script_naming_the_dev_checkout_from_home_goes_back_too(
+        central, cfg, tmp_path, monkeypatch, spelling):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    named = monitoring(central, n=1, script=f"cd {spelling} || exit 75")
+    sibling = monitoring(central, n=2, script=f"cat {spelling}-kb/x")
+    sent = morpheus.rewrite_dev_scripts(central, cfg, "proj_a", tmp_path / "work" / "dev",
+                                        tmp_path / "live")
+    assert sent == [named["id"]] and sibling["id"] not in sent
+
+
+def test_a_manual_check_follows_production_and_never_runs_elsewhere(tmp_path, monkeypatch):
+    from jarvis import ops
+
+    dev, live = tmp_path / "dev", tmp_path / "live"
+    dev.mkdir()
+    live.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    cat = parse_catalog({"projects": [{"name": "p", "path": str(dev),
+                                       "production": {"path": str(live)}}]})
+    item = {"id": "mo-1", "project": "p"}
+    assert ops._morpheus_cwd(cat, item) == live.resolve()
+    live.rmdir()
+    with pytest.raises(ops.OpsError, match="production directory"):
+        ops._morpheus_cwd(cat, item)
+
+
+def test_the_daemon_runs_a_declared_project_from_production_and_holds_it_if_missing(
+        central, catalog_file, project, tmp_path):
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    live = tmp_path / "live"
+    live.mkdir()
+    subprocess.run(["git", "init", "-q", str(live)], check=True)
+    _commit(live, "base")
+    data = json.loads(Path(catalog_file).read_text())
+    data["projects"][0]["production"] = {"path": str(live), "ships": "tag"}
+    Path(catalog_file).write_text(json.dumps(data))
+    daemon = Daemon(load_catalog(catalog_file))
+
+    good = monitoring(central, n=1, script="pwd > ran-here; exit 0")
+    daemon._morpheus_pass()
+    assert central.morpheus_item(good["id"])["state"] == "validated"
+    assert (live / "ran-here").read_text().strip() == str(live)
+
+    waits = monitoring(central, n=2, script="exit 0")
+    live.rename(tmp_path / "gone")
+    daemon._morpheus_pass()
+    assert central.morpheus_item(waits["id"])["state"] == "monitoring"
+
+
+@pytest.mark.parametrize("production, message", [
+    ({"ships": "tag"}, r"production\.ships tag needs"),
+    ({"path": "/x", "ships": "nightly"}, r"production\.ships"),
+    ({"path": ""}, r"production\.path"),
+])
+def test_the_catalog_refuses_a_production_it_cannot_follow(tmp_path, production, message):
+    with pytest.raises(CatalogError, match=message):
+        parse_catalog({"projects": [{"name": "p", "path": str(tmp_path),
+                                     "production": production}]})
+
+
+def test_the_catalog_defaults_production_to_the_project_on_merge(tmp_path):
+    spec = parse_catalog({"projects": [{"name": "p", "path": str(tmp_path)}]}).project("p")
+    assert (spec.production_dir, spec.production.ships) == (tmp_path.resolve(), "merge")
+
+
 # -- 10. the daemon, the CLI and the dashboard
 
 
@@ -1550,7 +1861,7 @@ def test_the_dashboard_shows_a_link_not_the_pr_s_text(central):
 
     from jarvis.ui.app import create_app
 
-    item = _failed(central)
+    item, _ = _escalated(central)
     page = TestClient(create_app()).get("/mo")
     assert page.status_code == 200
     assert '<a href="https://github.com/o/r/pull/7" title="[wo-1234abcd] thing">#7</a>' \
@@ -2000,3 +2311,67 @@ def test_the_detail_shows_its_session_and_cost_only_when_the_bill_exists(central
                         raising=False)
     page = client.get(f"/mo/{item['id']}").text
     assert "$1.50" in page and f"jarvis cost {item['id']}" in page
+
+
+@pytest.mark.parametrize("state,action,question,order,owner", [
+    ("monitoring", "", None, None, "os"),
+    ("validated", "", None, None, ""),
+    ("failed", "", None, None, "os"),
+    ("failed", f"{morpheus.JUDGE_CLAIM}1", None, None, "os"),
+    ("failed", "neo:1", {"status": "queued"}, None, "neo"),
+    ("failed", "neo:1", {"status": "failed"}, None, "neo"),
+    ("failed", "neo:1", {"status": "answered", "answered_by": "neo"}, None, "user"),
+    ("timedout", "neo:1", {"status": "answered", "answered_by": "user"}, None, "user"),
+    ("timedout", "neo:1", {"status": "escalated"}, None, "user"),
+    ("timedout", "neo:1", {"status": "lapsed"}, None, "user"),
+    ("failed", "neo:1", None, None, "user"),
+    ("failed", "investigation:inv-1", None,
+     {"id": "inv-1", "kind": "investigation", "status": "executing"}, "investigation"),
+    ("failed", "investigation:inv-1", None,
+     {"id": "inv-1", "kind": "investigation", "status": "completed"}, "os"),
+    ("failed", "investigation:inv-1", None,
+     {"id": "inv-1", "kind": "investigation", "status": "failed"}, "user"),
+    ("failed", "investigation:inv-1", None, None, "user"),
+    ("failed", "improvement:io-1", None,
+     {"id": "io-1", "kind": "improvement", "status": "completed", "needs_attention": 1}, "user"),
+])
+def test_owed_by_says_who_moves_next(state, action, question, order, owner):
+    item = {"id": "mv-1", "state": state, "action": action, "resolution": "script exited 1"}
+    got, command = morpheus.owed_by(item, question, order)
+    assert got == owner and bool(command) == (owner == "user")
+
+
+def test_a_confirmed_failure_is_the_os_s(central):
+    item = {"id": "mv-1", "state": "failed", "action": "neo:1",
+            "resolution": f"{morpheus.CONFIRMED}; fix filed as wo-1: x"}
+    assert morpheus.owed_by(item, {"status": "escalated"}) == ("os", "")
+
+
+def test_the_heading_status_and_list_count_the_same_user_rows(central, capsys):
+    from fastapi.testclient import TestClient
+
+    from jarvis.cli import main
+    from jarvis.ui.app import create_app
+
+    item, _ = _escalated(central)
+    other = queued(central, 8)
+    unjudged = queued(central, 9)
+    central.update_morpheus_item(unjudged["id"], state="failed", resolution="exit 1")
+    page = TestClient(create_app()).get("/mo").text
+    strip = page.split('needs-you">')[1].split("</section>")[0]
+    assert '<span class="n">1</span>monitors — need you' in strip
+    assert f"jarvis mo show {item['id']}" in strip and other["id"] not in strip
+    assert "OS handling — 2" in page
+    capsys.readouterr()
+    assert main(["mo", "list", "--owed", "user", "--json"]) == 0
+    assert [i["id"] for i in json.loads(capsys.readouterr().out)] == [item["id"]]
+    assert main(["mo", "list", "--owed", "nobody"]) == 1
+    capsys.readouterr()
+    assert main(["mo", "list"]) == 0
+    assert "owed by user" in capsys.readouterr().out
+    assert main(["mo", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "1 need you" in out and f"    jarvis mo show {item['id']}" in out
+    assert "OS handling: 2" in out and other["id"] not in out
+    assert main(["mo", "show", item["id"]]) == 0
+    assert f'jarvis mo waive {item["id"]} --reason' in capsys.readouterr().out
