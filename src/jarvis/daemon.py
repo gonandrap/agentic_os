@@ -500,9 +500,12 @@ def meter_alarm_reason(kind: str, meter: dict[str, Any]) -> str:
     spend = meter["spend"]
     implied = float(spend["implied_usd"] or 0.0)
     if kind == METER_RESIDUAL_ALARM:
+        dollars = meter["dollars_per_point"]
+        spread = (f" Outside this meter's normal spread: {meter_mod.spread_phrase(dollars)}."
+                  if dollars.get("spread_low") is not None else "")
         return (f"${spend['residual_usd']:.2f} of the ~${implied:.2f} implied by the 5h "
                 f"meter ({round(100 * (spend['residual_share'] or 0.0))}%) is "
-                f"unexplained — {meter_mod.RESIDUAL_LABEL}.")
+                f"unexplained — {meter_mod.RESIDUAL_LABEL}.{spread}")
     rows = meter["outside"]["sessions"][:METER_ALARM_SESSIONS]
     named = "; ".join(
         f"{row['session_id'][:8]} in {row['project'] or row['project_dir']} "

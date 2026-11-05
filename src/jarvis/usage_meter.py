@@ -561,6 +561,20 @@ def _visible_spend(home: Path, *, since: float, until: float) -> Callable[..., f
     return visible
 
 
+def _has_outlier(ratios: Sequence[float]) -> bool:
+    """Tukey's fences: an end of the range this far out is one span, not the meter's habit (§5)"""
+    q1, _, q3 = statistics.quantiles(ratios, n=4, method="inclusive")
+    fence = 1.5 * (q3 - q1)
+    return min(ratios) < q1 - fence or max(ratios) > q3 + fence
+
+
+def spread_phrase(dollars: dict[str, Any]) -> str:
+    """The range an alarm was judged against, stated so an outlier-widened one is visible (§5)"""
+    said = (f"${dollars['spread_low']:.2f}-${dollars['spread_high']:.2f}/point over "
+            f"{dollars['basis_spans']} spans")
+    return said + ", widened by an outlier span" if dollars.get("spread_widened") else said
+
+
 def _inside_spread(spend: dict[str, Any], dollars: dict[str, Any]) -> bool:
     """Whether this span's visible $/point is one the calibration spans themselves produced (§5)"""
     low, high, implied = dollars.get("spread_low"), dollars.get("spread_high"), spend["implied_usd"]
@@ -582,11 +596,11 @@ def _scaled_from_five_hour(rows: Sequence[Sample], key: str, *, now: float, cfg:
     five = dollars_per_point(now=now, cfg=cfg, home=home, visible=visible)
     if five_points <= 0 or key_points <= 0:
         return {"value": None, "low": None, "high": None, "spread_low": None,
-                "spread_high": None, "source": "none", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
+                "spread_high": None, "spread_widened": False, "source": "none", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
     scale = five_points / key_points
     return {"value": five["value"] * scale, "low": five["low"] * scale,
             "high": five["high"] * scale, "spread_low": None, "spread_high": None,
-            "source": "scaled",
+            "spread_widened": False, "source": "scaled",
             "basis_spans": five["basis_spans"], "basis_points": key_points,
             "basis_usd": five["basis_usd"]}
 
@@ -615,17 +629,17 @@ def dollars_per_point(*, now: float, cfg: Any, home: Path,
     if not ratios:
         seed = float(cfg.meter_dollars_per_point)
         return {"value": seed, "low": seed, "high": seed, "spread_low": None,
-                "spread_high": None, "source": "seed", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
+                "spread_high": None, "spread_widened": False, "source": "seed", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
     value = statistics.median(ratios)
     # Quantisation around the median itself, so the band always holds the value (§5)
     low, high = band(total_usd=value * total_points, total_points=total_points,
                      spans=len(ratios))
     # How far spans really stray from the median; quantisation alone understates it (§5)
-    deciles = (statistics.quantiles(ratios, n=10, method="inclusive")
-               if len(ratios) >= MIN_SPREAD_SPANS else None)
+    spread = len(ratios) >= MIN_SPREAD_SPANS
     return {"value": value, "low": low, "high": high,
-            "spread_low": deciles[0] if deciles else None,
-            "spread_high": deciles[-1] if deciles else None,
+            "spread_low": min(ratios) if spread else None,
+            "spread_high": max(ratios) if spread else None,
+            "spread_widened": _has_outlier(ratios) if spread else False,
             "source": "measured" if len(ratios) >= 3 else "thin",
             "basis_spans": len(ratios), "basis_points": total_points,
             "basis_usd": total_usd}
@@ -1066,9 +1080,8 @@ def sentence(*, five_hour: dict[str, Any], spend: dict[str, Any],
     outside = f"other sessions on this machine {_money(spend['outside_usd'])} " \
               f"({_share(spend['outside_share'])}"
     outside += f": {_named(sessions)})" if sessions else ")"
-    why = (f"inside this meter's normal spread (${dollars['spread_low']:.2f}-"
-           f"${dollars['spread_high']:.2f}/point), so no evidence of unseen usage"
-           if _inside_spread(spend, dollars) else RESIDUAL_LABEL)
+    why = (f"inside this meter's normal spread ({spread_phrase(dollars)}), so no evidence "
+           f"of unseen usage" if _inside_spread(spend, dollars) else RESIDUAL_LABEL)
     said += f", {outside}, unexplained {_money(spend['residual_usd'])} " \
             f"({_share(spend['residual_share'])}) — {why}"
     if spend.get("scope_project"):
