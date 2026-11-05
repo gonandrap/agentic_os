@@ -10873,6 +10873,12 @@ def validate_seat(seat: str) -> None:
 def neo_review(question_id: int, approved: bool, feedback: str = "",
                seat: str = "") -> dict[str, Any]:
     """Review one of Neo's answers"""
+    wo_id = os.environ.get(WORKER_SESSION_ENV)
+    if wo_id:
+        raise OpsError(
+            f"{wo_id} is a worker session — a worker may not review Neo's answer. "
+            "A correction is stored as the user's own words; a worker with a doubt "
+            "asks with `jarvis wo ask`.")
     from . import neo as neo_mod
     from .neo_store import NeoStore
 
