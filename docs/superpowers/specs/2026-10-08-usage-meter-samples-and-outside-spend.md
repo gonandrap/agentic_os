@@ -263,7 +263,15 @@ point, and a 30-minute span that moved 5 points is a ±20% figure. With `n` cont
 spans and `value * total_points` as the dollars, `low = usd / (total_points + n)` and
 `high = usd / max(total_points - n, 0.5)`: the band is quantisation around the median, so
 it always holds it. Bracketing `total_usd` instead put 1.97 outside 2.21-2.34 (io-82bcb830):
-an outlier the median ignores still moved the band. `source` is:
+an outlier the median ignores still moved the band.
+
+**The band is not the estimator's error (issue 1613).** Clean spans on one machine ran
+$0.72 to $1.52 per point around a $1.20 median while the band said ±3%, because the band
+counts rounding and nothing else. `spread_low` and `spread_high` carry the p10 and p90 of
+the span ratios (inclusive quantiles, 3+ spans; otherwise `None`). A span whose visible
+$/point sits inside them is one the meter itself produces, so its residual is not evidence.
+
+`source` is:
 
 * `"measured"` — 3 or more clean spans. The band is printed.
 * `"thin"` — 1 or 2 clean spans. The band is printed AND the sentence in §9 says
@@ -445,7 +453,7 @@ the carrier is the foreign key and nothing more. Two kinds:
 | kind | fires when |
 |---|---|
 | `cost_outside_spend_high` | `outside_usd / implied_usd >= cost.meter_outside_alert_share` (default 0.25) |
-| `cost_residual_high` | `abs(residual_share) >= cost.meter_residual_alert_share` (default 0.25) |
+| `cost_residual_high` | `abs(residual_share) >= cost.meter_residual_alert_share` (default 0.25) AND the span's visible $/point is outside the §5 spread |
 
 Both are gated on `implied_usd >= cost.meter_alert_min_usd` (default 5.0): a quarter of a
 $1 window is 25 cents, and alarming on it would teach the user to ignore the alarm. Both

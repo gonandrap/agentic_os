@@ -117,7 +117,8 @@ def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
                                       "longest_gap_seconds", "head_uncovered_seconds",
                                       "first_ts", "last_ts", "reliable",
                                       "min_reliable_share"}
-    assert set(meter["dollars_per_point"]) == {"value", "low", "high", "source",
+    assert set(meter["dollars_per_point"]) == {"value", "low", "high", "spread_low",
+                                               "spread_high", "source",
                                                "basis_spans", "basis_points",
                                                "basis_usd"}
     assert set(meter["spend"]) == {"implied_usd", "workers_usd", "jarvis_calls_usd",
@@ -188,6 +189,41 @@ def test_the_zoom_endpoint_carries_the_calculated_series(fleet_fixture):
 
     assert tl[-1]["five_hour_calc_jarvis"] > tl[0]["five_hour_calc_jarvis"] > 0
     assert tl[-1]["five_hour_calc_outside"] > 0
+
+
+def _spread_scene(f, usd: float) -> dict:
+    """Calibration spans at $0.60-$1.40/point, then 15 points that spent `usd`"""
+    since = SPAN_SINCE
+    for hours, cost in ((12, 6.0), (10, 8.0), (8, 10.0), (6, 12.0), (4, 14.0)):
+        at = since - hours * HOUR
+        store_samples(series(at, n=40, first=0.0, last=10.0, resets=since + 9 * HOUR))
+        f.spend("a calibration order", cost, at=at + MINUTE)
+    # Under the 30 minutes that would make this span one of its own calibration spans
+    until = since + 25 * MINUTE
+    store_samples(series(since, n=int((until - since) / usage_meter.SAMPLE_SECONDS),
+                         first=10.0, last=25.0, resets=until))
+    f.spend("the order that spent in this span", usd, at=since + 2 * MINUTE)
+    return {"since": since, "until": until, "source": "session-meter",
+            "label": "the span", "window": "5h", "offset": 0, "zone": "UTC"}
+
+
+def test_a_gap_the_calibration_spans_also_show_raises_nothing_and_says_why(fleet_fixture):
+    """Issue 1613: $0.75/point against a $1.00 median is a 25% gap and an ordinary span"""
+    meter = meter_of(fleet_fixture, _spread_scene(fleet_fixture, 11.25))
+
+    assert meter["dollars_per_point"]["value"] == pytest.approx(1.0)
+    assert abs(meter["spend"]["residual_share"]) >= 0.25
+    assert meter["alerts"]["residual"] is False
+    assert "normal spread ($0.68-$1.32/point)" in meter["sentence"]
+    assert usage_meter.RESIDUAL_LABEL not in meter["sentence"]
+
+
+@pytest.mark.parametrize("usd", [6.0, 24.0])
+def test_a_gap_beyond_the_spread_still_alarms_in_either_direction(fleet_fixture, usd):
+    meter = meter_of(fleet_fixture, _spread_scene(fleet_fixture, usd))
+
+    assert meter["alerts"]["residual"] is True
+    assert usage_meter.RESIDUAL_LABEL in meter["sentence"]
 
 
 # -- 30-32. the sentence

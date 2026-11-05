@@ -509,6 +509,10 @@ def segments(samples: Sequence[Sample], *, since: float, until: float, key: str,
 # -- 5. dollars per point
 
 
+#: Fewer spans than this have no spread worth stating: `thin`, whose residual is noise anyway
+MIN_SPREAD_SPANS = 3
+
+
 def band(*, total_usd: float, total_points: float, spans: int) -> tuple[float, float]:
     """The quantisation band: the meter reports whole percent, so ±1 point PER SPAN (§5)"""
     low = total_usd / (total_points + spans) if total_points + spans > 0 else 0.0
@@ -557,6 +561,15 @@ def _visible_spend(home: Path, *, since: float, until: float) -> Callable[..., f
     return visible
 
 
+def _inside_spread(spend: dict[str, Any], dollars: dict[str, Any]) -> bool:
+    """Whether this span's visible $/point is one the calibration spans themselves produced (§5)"""
+    low, high, implied = dollars.get("spread_low"), dollars.get("spread_high"), spend["implied_usd"]
+    if low is None or high is None or not implied:
+        return False
+    rate = (spend["jarvis_usd"] + spend["outside_usd"]) / (implied / float(dollars["value"]))
+    return low <= rate <= high
+
+
 def _scaled_from_five_hour(rows: Sequence[Sample], key: str, *, now: float, cfg: Any,
                            home: Path, visible: Callable[..., float] | None
                            ) -> dict[str, Any]:
@@ -568,11 +581,12 @@ def _scaled_from_five_hour(rows: Sequence[Sample], key: str, *, now: float, cfg:
             key_points += float(sub[-1].pct(key)) - float(sub[0].pct(key))
     five = dollars_per_point(now=now, cfg=cfg, home=home, visible=visible)
     if five_points <= 0 or key_points <= 0:
-        return {"value": None, "low": None, "high": None, "source": "none",
-                "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
+        return {"value": None, "low": None, "high": None, "spread_low": None,
+                "spread_high": None, "source": "none", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
     scale = five_points / key_points
     return {"value": five["value"] * scale, "low": five["low"] * scale,
-            "high": five["high"] * scale, "source": "scaled",
+            "high": five["high"] * scale, "spread_low": None, "spread_high": None,
+            "source": "scaled",
             "basis_spans": five["basis_spans"], "basis_points": key_points,
             "basis_usd": five["basis_usd"]}
 
@@ -600,13 +614,18 @@ def dollars_per_point(*, now: float, cfg: Any, home: Path,
         return _scaled_from_five_hour(rows, key, now=now, cfg=cfg, home=home, visible=visible)
     if not ratios:
         seed = float(cfg.meter_dollars_per_point)
-        return {"value": seed, "low": seed, "high": seed, "source": "seed",
-                "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
+        return {"value": seed, "low": seed, "high": seed, "spread_low": None,
+                "spread_high": None, "source": "seed", "basis_spans": 0, "basis_points": 0.0, "basis_usd": 0.0}
     value = statistics.median(ratios)
     # Quantisation around the median itself, so the band always holds the value (§5)
     low, high = band(total_usd=value * total_points, total_points=total_points,
                      spans=len(ratios))
+    # How far spans really stray from the median; quantisation alone understates it (§5)
+    deciles = (statistics.quantiles(ratios, n=10, method="inclusive")
+               if len(ratios) >= MIN_SPREAD_SPANS else None)
     return {"value": value, "low": low, "high": high,
+            "spread_low": deciles[0] if deciles else None,
+            "spread_high": deciles[-1] if deciles else None,
             "source": "measured" if len(ratios) >= 3 else "thin",
             "basis_spans": len(ratios), "basis_points": total_points,
             "basis_usd": total_usd}
@@ -1047,8 +1066,11 @@ def sentence(*, five_hour: dict[str, Any], spend: dict[str, Any],
     outside = f"other sessions on this machine {_money(spend['outside_usd'])} " \
               f"({_share(spend['outside_share'])}"
     outside += f": {_named(sessions)})" if sessions else ")"
+    why = (f"inside this meter's normal spread (${dollars['spread_low']:.2f}-"
+           f"${dollars['spread_high']:.2f}/point), so no evidence of unseen usage"
+           if _inside_spread(spend, dollars) else RESIDUAL_LABEL)
     said += f", {outside}, unexplained {_money(spend['residual_usd'])} " \
-            f"({_share(spend['residual_share'])}) — {RESIDUAL_LABEL}"
+            f"({_share(spend['residual_share'])}) — {why}"
     if spend.get("scope_project"):
         # The scoped figure, named and never subtracted from the meter (§7)
         said += (f"; {spend['scope_project']}'s own share of that is "
@@ -1211,7 +1233,8 @@ def alerts(*, spend: dict[str, Any], dollars: dict[str, Any],
         "outside": bool(big and measured and not unreliable and outside is not None
                         and outside >= cfg.meter_outside_alert_share),
         "residual": bool(big and measured and not unreliable and residual is not None
-                         and abs(residual) >= cfg.meter_residual_alert_share),
+                         and abs(residual) >= cfg.meter_residual_alert_share
+                         and not _inside_spread(spend, dollars)),
         "unreliable": bool(unreliable),
         "suppressed": bool(unreliable and measured and raw_implied_usd is not None
                            and raw_implied_usd >= cfg.meter_alert_min_usd),
