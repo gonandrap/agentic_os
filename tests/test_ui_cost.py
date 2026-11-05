@@ -183,8 +183,8 @@ def test_quiesce_gives_up_rather_than_blocking_a_shutdown_forever(monkeypatch):
 def test_cost_page_lists_work_orders_dearest_first(client, project, transcript):
     cheap = ops.create_work_order("proj_a", "a small ask")
     dear = ops.create_work_order("proj_a", "a large ask")
-    transcript("sess-cheap", write_tok=1_000, out=100)
-    transcript("sess-dear", write_tok=900_000, out=50_000)
+    transcript("sess-cheap", write_tok=1_000, out=100, at=db.now())
+    transcript("sess-dear", write_tok=900_000, out=50_000, at=db.now())
     give_session(project, cheap["id"], "sess-cheap")
     give_session(project, dear["id"], "sess-dear")
     # The page reports the current usage week by default
@@ -213,7 +213,7 @@ def test_cost_page_says_when_a_transcript_is_gone_instead_of_saying_zero(
 
 def test_cost_page_can_be_scoped_to_one_project(client, project, transcript):
     wo = ops.create_work_order("proj_a", "scoped ask")
-    transcript("sess-scoped", write_tok=1_000, out=100)
+    transcript("sess-scoped", write_tok=1_000, out=100, at=db.now())
     give_session(project, wo["id"], "sess-scoped")
     add_recorded_turn(project, wo["id"], 0.0, 1_000)
 
@@ -292,6 +292,31 @@ def test_a_work_order_with_no_transcript_shows_no_cost_line_at_all(client, proje
     assert "details →" not in page.text
 
 
+def test_calls_no_work_order_caused_get_a_row_and_a_true_sentence(client, project):
+    """io-82bcb830: rows sum to the headline, and the by-kind line states its price basis"""
+    from jarvis import agent_usage
+
+    agent_usage.record("digest", project="proj_a", wo_id="", label="d",
+                       model="claude-opus-5",
+                       usage={"total_cost_usd": 1.0, "input": 10, "cache_write": 0,
+                              "cache_read": 0, "output": 1_000_000})
+    report = ops.cost_report(project="proj_a", window=ops.cost_window(project="proj_a"))
+    un = report["os_unattributed"]["os_cost_usd"]
+    assert report["totals"]["total_cost_usd"] == pytest.approx(un, abs=0.01)
+
+    page = cost_page(client, "/cost?project=proj_a").text
+
+    assert f"~${report['totals']['total_cost_usd']:.2f}</p>" in page
+    assert 'class="no-work-order"' in page
+    assert f"${un:.2f}</td>" in page
+    assert "the no-work-order row below add to" in page
+    assert f"= ~${un:.2f}, the headline above." in page
+    assert "from rounding" not in page
+    assert "of those calls" in page and "of them" not in page
+    assert "counted in the total" in page
+    assert "recorded cost, as each call reported it" in page
+
+
 def test_a_broken_transcript_read_never_takes_the_work_order_page_down(
         client, project, monkeypatch):
     """The work order page carries the gate decision and the assumption review"""
@@ -334,7 +359,7 @@ def add_recorded_turn(project, wo_id: str, cost: float, peak: int,
 def test_cost_page_links_each_work_order_to_its_turn_drilldown(client, project,
                                                                transcript):
     wo = ops.create_work_order("proj_a", "drillable")
-    transcript("sess-drill", write_tok=1_000, out=10)
+    transcript("sess-drill", write_tok=1_000, out=10, at=db.now())
     give_session(project, wo["id"], "sess-drill")
     add_recorded_turn(project, wo["id"], 0.0, 1_000)
 
@@ -674,7 +699,7 @@ def test_what_the_headline_leaves_out_is_named_and_the_outside_table_is_headed(
     html = cost_page(client, "/cost?window=5h").text
 
     tally = html.split("Not in that total:", 1)[1].split("</p>", 1)[0]
-    assert "1 Jarvis call that" in tally and "belong to no work order" in tally
+    assert "belong to no work order" not in tally, "those calls are in the total now"
     assert "1 session Jarvis did not dispatch" in tally and "$5.76" in tally
     heading = html.index("<strong>Sessions Jarvis did not dispatch</strong>")
     assert html.index("the headline above") < heading < html.index("abcdef01")
