@@ -89,7 +89,8 @@ def read_base_red(central: Any, project_name: str) -> Any:
         # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5
         fix_wo_id=str(fact.get("fix_wo_id") or ""),
         issue_url=str(fact.get("issue_url") or ""),
-        issue_os_filed=bool(fact.get("issue_os_filed")))
+        issue_os_filed=bool(fact.get("issue_os_filed")),
+        steward_verdict=steward.break_verdict(central, project_name, fact.get("break_run_id")))
 
 
 #: What the seats read when a head's red checks are the base's (spec 2026-10-13 §9)
@@ -5472,7 +5473,7 @@ class Daemon:
 
     def poll_default_branch(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Is this project's default branch red? (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §1.)"""
-        from . import ci, github
+        from . import ci, ci_rerun, github
         from .invariants import INV_BASE_RED
 
         origin = github.origin_repo(project.path)
@@ -5500,14 +5501,19 @@ class Daemon:
             log.debug("[%s] could not read the default branch's CI: %s", project.name, e)
             return
         workflows = tuple({r.workflow for r in runs if r.workflow})
-        reds = [r for w in workflows if (r := ci.latest(runs, w)) is not None and r.red]
+        prev_reruns = prev.get("ci_reruns") or {}
+        reds = [r for w in workflows
+                if (r := ci_rerun.base_verdict(runs, w, prev_reruns)) is not None and r.red]
         reds.sort(key=lambda r: (r.started_at is not None, r.started_at or 0),
                   reverse=True)
         worst = reds[0] if reds else None
         was_red = bool(prev.get("red"))
         wo_id = issue_url = fix_wo_id = ""
         issue_os_filed = False
+        break_run_id = 0
         if worst is not None:
+            # The run that opened this break: `run_id` moves with each new red run inside it
+            break_run_id = (prev.get("break_run_id") if was_red else 0) or worst.run_id
             wo_id = (str(prev.get("wo_id") or "") if was_red
                      else self._attribute_base_red(project, store, owner, repo,
                                                    worst.head_sha))
@@ -5522,14 +5528,19 @@ class Daemon:
             "base_read_at": base_read_at or time.time(),
             "workflow": worst.workflow if worst else "",
             "run_id": worst.run_id if worst else 0,
+            "break_run_id": break_run_id,
             "run_url": ci.run_url(owner, repo, worst.run_id) if worst else "",
             "head_sha": worst.head_sha if worst else "",
             "wo_id": wo_id,
             "issue_url": issue_url,
             "fix_wo_id": fix_wo_id,
             "issue_os_filed": issue_os_filed,
-            "ci_reruns": self._rerun_aborted_base_ci(project, store, owner, repo, base,
-                                                     runs, prev.get("ci_reruns") or {}),
+            "ci_reruns": {
+                **self._rerun_aborted_base_ci(project, store, owner, repo, base, runs,
+                                              prev_reruns),
+                **self._rerun_failed_base_ci(project, store, owner, repo, base, runs,
+                                             prev_reruns, str(prev.get("wo_id") or "")),
+            },
             "checked_at": db.now(),
         }
         self.central.set_base_health(project.name, fact)
@@ -5606,6 +5617,64 @@ class Daemon:
                 if not r.completed or r.conclusion in ci_rerun.ABORTED_RUN_CONCLUSIONS}
         return {k: v for k, v in state.items() if k in live}
 
+    def _rerun_failed_base_ci(self, project: ProjectSpec, store: ProjectStore,
+                              owner: str, repo: str, base: str, runs: tuple[Any, ...],
+                              prev: Any, blamed: str) -> dict[str, Any]:
+        """Re-run a RED default-branch run once per head, inside the grace before the steward (io-f48bcdcb)"""
+        from . import ci_rerun, github
+
+        state = ({k: v for k, v in prev.items() if k.startswith(ci_rerun.BASE_FAILED_PREFIX)}
+                 if isinstance(prev, dict) else {})
+        newest_of_head: dict[str, Any] = {}
+        newest: dict[str, Any] = {}
+        for r in runs:
+            newest_of_head.setdefault(ci_rerun.base_failed_key(r), r)
+            if r.workflow:
+                newest.setdefault(r.workflow, r)
+        for key, run in newest_of_head.items():
+            if key in state and run.completed and run.green:
+                self._record_base_flake(project, store, owner, repo, base, run,
+                                        state.pop(key), blamed)
+        # A newer run in flight will judge for itself, so only the workflow's newest is re-run
+        for run in newest.values():
+            key = ci_rerun.base_failed_key(run)
+            if (key in state or not run.completed or not run.red or run.run_id <= 0
+                    or not run.head_sha):
+                continue
+            # Before the re-run: its new attempt replaces the log this reads
+            tests = ci_rerun.failed_tests(run.run_id, cwd=project.path)
+            try:
+                ci_rerun.rerun(run.run_id, cwd=project.path)
+            except github.GitHubError as e:
+                # Unread is not unrecoverable: no attempt is spent, the next tick retries
+                log.info("[%s] could not re-run failed %s on %s: %s", project.name,
+                         run.run_id, base, e)
+                continue
+            state[key] = {"run_id": run.run_id, "tests": list(tests)}
+            log.info("[%s] re-ran failed %s on %s (%s) before calling it a break",
+                     project.name, run.workflow, base, ", ".join(tests) or "tests unread")
+        return {k: v for k, v in state.items() if k in newest_of_head}
+
+    def _record_base_flake(self, project: ProjectSpec, store: ProjectStore, owner: str,
+                           repo: str, base: str, run: Any, entry: Any, blamed: str) -> None:
+        """A red default-branch run passed its re-run: green, and the flake stays on the record"""
+        from . import ci, ci_rerun
+
+        tests = ", ".join(entry.get("tests") or ()) if isinstance(entry, dict) else ""
+        named = tests or "its failed log named no test"
+        store.add_notification(
+            title=f"`{base}` failure was a flaky test in {project.name}",
+            body=(f"workflow `{run.workflow}` on {run.head_sha[:10]} failed, then passed the "
+                  f"OS's one re-run: {named} — {ci.run_url(owner, repo, run.run_id)}"),
+            level="info", source="base-health",
+        )
+        if blamed and store.get_work_order(blamed):
+            store.add_event(blamed, ci_rerun.FLAKE_CONFIRMED_EVENT, {
+                "head_sha": run.head_sha, "base": base, "checks": named,
+                "run_ids": [run.run_id]})
+        log.warning("[%s] %s failure on %s passed its re-run — a flake (%s)", project.name,
+                    base, run.head_sha[:10], named)
+
     def dispatch_base_fix(self, project: ProjectSpec, store: ProjectStore) -> None:
         """A red tracker `main` files-or-adopts an issue and dispatches a work order on it (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §2.)"""
         from . import bugreport, github, issues
@@ -5632,7 +5701,9 @@ class Daemon:
             steward.Candidate("red_main", "critical", project.name,
                               f"`{fact.get('base') or 'main'}` is red",
                               evidence=(str(fact.get("run_url") or run_id or ""),),
-                              parent_wo_id=str(fact.get("wo_id") or "")),
+                              parent_wo_id=str(fact.get("wo_id") or ""),
+                              payload={"issue_url": issue_url},
+                              break_id=str(fact.get("break_run_id") or "")),
             catalog=self.catalog, store=store,
             self_dispatch=self.self_dispatch)
         if not self.self_dispatch:

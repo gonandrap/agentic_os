@@ -116,6 +116,7 @@ class BaseRed:
     fix_wo_id: str = ""
     issue_url: str = ""
     issue_os_filed: bool = False
+    steward_verdict: str = ""
     #: This pull request's failing jobs also did not pass on the red run it was built on
     shared_failure: bool = False
 
@@ -361,7 +362,8 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
         blamed = f" (merged by the OS for {base_red.wo_id})" if base_red.wo_id else ""
         # Spec 2026-10-14 §5: tick-stable, so the order's id and nothing that moves
         fixing = (f"{base_red.fix_wo_id} is fixing it" if base_red.fix_wo_id
-                  else "no work order is fixing it yet")
+                  else f"no work order is fixing it: {base_red.steward_verdict}"
+                  if base_red.steward_verdict else "no work order is fixing it yet")
         # Only what was established: job names cannot tell two tests of one shard apart (spec 2026-09-18 §2.1)
         rider = (f" This pull request's failing jobs ({', '.join(pr.failing)}) also did "
                  f"not pass on the red `{base_red.base}` run its build started on, so "
