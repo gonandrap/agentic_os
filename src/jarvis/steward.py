@@ -167,7 +167,8 @@ def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: in
     if c.origin_kind == "release":
         # A7: releases ship what already landed; counted on the ledger, not gated by it
         return "dispatch", "release", "a landed fix ships", severity
-    if generation > cfg.max_depth:
+    # red_main is exempt: spec §3.2 decision 1 rule 3 and A6, bounded at one fix per break
+    if generation > cfg.max_depth and c.origin_kind != "red_main":
         return ("queue", "max-depth",
                 f"generation {generation} exceeds max_depth {cfg.max_depth}", severity)
     if parent_kind and parent_kind == c.origin_kind:

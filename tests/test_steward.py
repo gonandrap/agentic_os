@@ -146,7 +146,17 @@ def test_a_reported_bug_skips_yield_recurrence_precision_and_the_follow_up_ledge
     bug = cand(origin_kind=kind, severity="medium", refs=0)
     assert outcome(bug, held, throttled=True) == ("dispatch", "reported-bug")
     assert outcome(cand(origin_kind=kind, severity="minor")) == ("drop", "low-severity")
-    assert outcome(bug, generation=2) == ("queue", "max-depth")
+    if kind != "red_main":
+        assert outcome(bug, generation=2) == ("queue", "max-depth")
+
+
+def test_red_main_alone_skips_max_depth_and_keeps_its_other_rules():
+    """io-f48bcdcb: spec §3.2 decision 1 rule 3, A6"""
+    red = cand(origin_kind="red_main", severity="critical")
+    assert outcome(red, generation=2, parent_kind="bug_agent") == ("dispatch", "reported-bug")
+    assert outcome(red, generation=2, parent_kind="red_main") == ("queue", "self-reference")
+    spent = steward.Ledger(bug_usd=CFG.bug_weekly_usd)
+    assert outcome(red, spent, generation=2) == ("ask", "bug-budget")
 
 
 def test_a_spent_bug_ledger_asks_with_the_start_command():
