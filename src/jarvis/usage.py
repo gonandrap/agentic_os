@@ -14,8 +14,7 @@ from jarvis import transcript_cache
 
 TRANSCRIPT_ROOT_ENV = "JARVIS_TRANSCRIPT_ROOT"
 
-# List $/MTok (input, output, cache read), from the CLI's `pricing_tiers` (2.1.318, issue #1580).
-# First substring match wins; a bare family is what its alias serves today.
+# List $/MTok (input, output, cache read), CLI 2.1.318 `pricing_tiers`; first match wins
 PRICES: dict[str, tuple[float, float, float]] = {
     "opus-5-5": (4.0, 20.0, 0.2),
     "opus-5": (5.0, 25.0, 0.5),
