@@ -99,10 +99,10 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "designed-wait-undiscounted": GapClass(
         id="designed-wait-undiscounted",
-        headline="the OS holds an order on purpose and the sweep is not taught the hold, "
-                 "so the wait is judged as lost time",
-        symptom="an order investigated past its threshold with blocker `nothing the record "
-                "can name`, and the answer is the OS working as designed",
+        headline="the sweep is not taught a deliberate hold, so the wait is judged as "
+                 "lost time",
+        symptom="an order investigated with blocker `nothing the record can name`, and "
+                "the OS working as designed",
         detector="INV-RED-RELEASE-UNDISCOUNTED",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1603",
@@ -145,18 +145,17 @@ def by_invariant() -> dict[str, str]:
 
 def render_registry() -> str:
     """The registry as both the investigator's prompt and a fix order's brief see it"""
-    lines = ["# Gap classes the OS already knows",
-             "Reuse a slug when the MECHANISM matches, whatever the subject. Coin a new "
-             "one only when none of these is the same mechanism — and know what that "
-             "commits: a new slug makes the fix order that follows responsible for "
-             "registering it, with a detector, a remedy and a test.",
+    lines = ["Reuse a slug when the MECHANISM matches, whatever the subject. A new slug "
+             "commits the fix order that follows to registering it, with a detector, a "
+             "remedy and a test. No remedy shown means none.",
              ""]
     for cls in GAP_CLASSES.values():
         lines += [
             f"- `{cls.id}` — {cls.headline}",
-            f"  Looks like: {cls.symptom}",
-            f"  Detector: {cls.detector or 'NONE YET'}; remedy: {cls.remedy}"
+            f"  Seen: {cls.symptom}",
+            f"  Detector: {cls.detector or 'NONE YET'}"
+            + (f"; remedy: {cls.remedy}" if cls.remedy != REMEDY_NONE else "")
             # The number alone: this list is inside a worker's 10K start budget
-            + (f" (issue {cls.issue_url.rsplit('/', 1)[-1]})" if cls.issue_url else ""),
+            + (f" (#{cls.issue_url.rsplit('/', 1)[-1]})" if cls.issue_url else ""),
         ]
     return "\n".join(lines)
