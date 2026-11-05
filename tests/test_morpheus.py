@@ -440,6 +440,139 @@ def test_not_yet_past_the_deadline_is_timedout(central, cfg, tmp_path):
     assert after["resolution"] == "no exit 0 or 1 within 3 day(s) (last exit None)"
 
 
+# -- an exit 75 names why (monitoring-orders §9)
+
+
+def _said(output: str, code: int = 75):
+    return lambda script, cwd, timeout: morpheus.CheckResult(code, output)
+
+
+@pytest.mark.parametrize("output,reason", [
+    ("UNKNOWN x\nREASON not_exercised", "not_exercised"),
+    ("REASON not_deployed\nsome stderr after it", "not_deployed"),
+    ("REASON unreadable\nREASON ambiguous", "ambiguous"),
+    ("REASON because", "ambiguous"), ("UNKNOWN x", "ambiguous"), ("", "ambiguous")])
+def test_check_stores_the_reason_and_a_missing_one_means_ambiguous(central, cfg, tmp_path,
+                                                                   output, reason):
+    item = monitoring(central)
+    morpheus.check(central, cfg, item, tmp_path, now=TEST_EPOCH, run=_said(output))
+    assert central.morpheus_item(item["id"])["last_reason"] == reason
+
+
+@pytest.mark.parametrize("code", [0, 1, None])
+def test_only_an_exit_75_has_a_reason(central, cfg, tmp_path, code):
+    item = monitoring(central)
+    morpheus.check(central, cfg, item, tmp_path, now=TEST_EPOCH,
+                   run=_said("REASON not_exercised", code))
+    assert central.morpheus_item(item["id"])["last_reason"] == ""
+
+
+def test_a_not_exercised_timeout_settles_unverified_with_no_model_call(central, cfg, tmp_path):
+    item = monitoring(central)
+    moved = morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 3 * DAY + 1,
+                           run=_said("UNKNOWN no event yet\nREASON not_exercised"))
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "unverified" and moved["unverified"] == 1
+    assert after["next_check_ts"] is None and "never exercised" in after["resolution"]
+    assert morpheus.owed_actions(central) == []
+
+    def no_model(*a, **kw):
+        raise AssertionError("a settled order made a model call")
+    assert morpheus.act(central, catalog(), after, cwd=tmp_path, call=no_model,
+                        ask_neo=no_model, investigate=no_model) == ""
+
+
+def test_unverified_is_terminal_and_never_counted_as_passed():
+    from jarvis.release_view import validation_of
+
+    assert "unverified" in morpheus.TERMINAL_STATES
+    assert "unverified" not in morpheus.ACTION_STATES
+    assert validation_of({"state": "unverified"}) == "unwatched"
+
+
+@pytest.mark.parametrize("earlier,output", [
+    ("FAIL the symptom is back\nREASON not_exercised", "REASON not_exercised"),
+    ("said 1", "REASON not_exercised"),
+    ("UNKNOWN x", "FAIL the symptom is back\nREASON not_exercised"),
+    ("x" * morpheus.OUTPUT_TAIL, "REASON not_exercised")])
+def test_a_fail_line_anywhere_in_the_watch_keeps_the_judge_route(central, cfg, tmp_path,
+                                                                 earlier, output):
+    item = monitoring(central)
+    code = 1 if earlier == "said 1" else 75
+    morpheus.check(central, cfg, item, tmp_path, now=TEST_EPOCH, run=_said(earlier, code))
+    morpheus.check(central, cfg, central.morpheus_item(item["id"]), tmp_path,
+                   now=TEST_EPOCH + 3 * DAY + 1, run=_said(output))
+    assert central.morpheus_item(item["id"])["state"] == "timedout"
+    assert [i["id"] for i in morpheus.owed_actions(central)] == [item["id"]]
+
+
+@pytest.mark.parametrize("output", ["REASON unreadable", "REASON ambiguous", "no reason at all"])
+def test_unreadable_and_ambiguous_keep_the_judge_route(central, cfg, tmp_path, output):
+    item = monitoring(central)
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 3 * DAY + 1, run=_said(output))
+    assert central.morpheus_item(item["id"])["state"] == "timedout"
+    assert [i["id"] for i in morpheus.owed_actions(central)] == [item["id"]]
+
+
+def test_not_deployed_holds_the_deadline_and_the_window_starts_once_deployed(central, cfg,
+                                                                              tmp_path):
+    item = monitoring(central)
+    held_at = TEST_EPOCH + 5 * DAY
+    morpheus.sweep(central, cfg, tmp_path, now=held_at, run=_said("REASON not_deployed"))
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "monitoring" and after["held_since_ts"] == held_at
+    assert after["deadline_ts"] == held_at + 3 * DAY
+    # Deployed now: the full window remains, then the ordinary not_exercised settle
+    morpheus.check(central, cfg, after, tmp_path, now=held_at + DAY,
+                   run=_said("REASON not_exercised"))
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "monitoring" and after["deadline_ts"] == held_at + 3 * DAY
+    morpheus.check(central, cfg, after, tmp_path, now=held_at + 3 * DAY,
+                   run=_said("REASON not_exercised"))
+    assert central.morpheus_item(item["id"])["state"] == "unverified"
+
+
+def test_not_deployed_stops_holding_at_the_hard_cap_and_goes_to_the_judge(central, cfg, tmp_path):
+    item = monitoring(central)
+    since = TEST_EPOCH + DAY
+    for day in range(0, 14):
+        morpheus.check(central, cfg, central.morpheus_item(item["id"]), tmp_path,
+                       now=since + day * DAY, run=_said("REASON not_deployed"))
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "monitoring" and after["deadline_ts"] == since + 14 * DAY
+    assert after["held_since_ts"] == since
+    morpheus.check(central, cfg, after, tmp_path, now=since + 14 * DAY,
+                   run=_said("REASON not_deployed"))
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "timedout" and "not deployed after 14 day(s)" in after["resolution"]
+    assert [i["id"] for i in morpheus.owed_actions(central)] == [item["id"]]
+
+
+def test_a_requeue_gives_a_fresh_watch(central, cfg, tmp_path):
+    item = monitoring(central)
+    morpheus.check(central, cfg, item, tmp_path, now=TEST_EPOCH,
+                   run=_said("FAIL x\nREASON not_deployed"))
+    morpheus.requeue(central, cfg, item["id"])
+    after = central.morpheus_item(item["id"])
+    assert (after["last_reason"], after["saw_fail"], after["held_since_ts"]) == ("", 0, None)
+
+
+def test_arming_asks_for_a_probe_first_and_a_reason_and_the_judge_inherits_the_rule():
+    for text in (morpheus.ARM_CONTRACT, morpheus.JUDGE_CONTRACT):
+        assert "REASON" in text and "not_exercised" in text and "probe" in text.lower()
+    assert '"trigger"' in morpheus.ARM_CONTRACT
+
+
+@pytest.mark.parametrize("said,stored", [("probe", "probe"), ("Ambient", "ambient"),
+                                         ("whenever", ""), (None, "")])
+def test_arming_records_the_trigger(central, tmp_path, said, stored):
+    item = queued(central, 3)
+    reply = {"script": "exit 75", "notes": "n", "trigger": said}
+    morpheus.arm(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeCall(reply=reply))
+    after = central.morpheus_item(item["id"])
+    assert (after["state"], after["trigger_kind"]) == ("monitoring", stored)
+
+
 def test_a_queued_pr_that_never_got_a_script_times_out_too(central, cfg, tmp_path):
     item = queued(central, 2)
     morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 3 * DAY + 1, run=_run(0))

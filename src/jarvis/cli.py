@@ -4329,8 +4329,8 @@ def cmd_io(args: argparse.Namespace) -> int:
     return 0
 
 
-MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "failed": "✗",
-                 "timedout": "⌛"}
+MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "unverified": "?",
+                 "failed": "✗", "timedout": "⌛"}
 
 
 def _morpheus_line(item: dict) -> str:
@@ -4458,7 +4458,9 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
             print(f"last check {_stamp(item['last_check_ts'])}"
                   f" on {item.get('last_check_version') or 'an unknown version'}")
         print(f"checks {item['checks']} · last exit {item['last_exit']}"
-              f" · deadline {_stamp(item['deadline_ts'])}"
+              + (f" ({item['last_reason']})" if item.get("last_reason") else "")
+              + (f" · trigger {item['trigger_kind']}" if item.get("trigger_kind") else "")
+              + f" · deadline {_stamp(item['deadline_ts'])}"
               + (f" · {item['auto_requeues']} automatic requeue(s)"
                  if item.get("auto_requeues") else ""))
         if item["resolution"]:
