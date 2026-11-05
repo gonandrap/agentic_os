@@ -99,10 +99,9 @@ GAP_CLASSES: dict[str, GapClass] = {
     ),
     "superseded-delivery": GapClass(
         id="superseded-delivery",
-        headline="an order's pull request nets to nothing because an equivalent change "
-                 "reached the base first, so a round has nothing to judge",
-        symptom="an order that already passed, escalated as nothing to review, its open "
-                "pull request reporting zero changed files",
+        headline="an equivalent change reaches the base first, so the pull request nets "
+                 "to nothing",
+        symptom="a passed order escalated as nothing to review; its open PR changes no files",
         detector="Daemon._settle_superseded",
         remedy=REMEDY_NONE,
         issue_url="https://github.com/gonandrap/agentic_os/issues/1592",
@@ -146,17 +145,16 @@ def by_invariant() -> dict[str, str]:
 def render_registry() -> str:
     """The registry as both the investigator's prompt and a fix order's brief see it"""
     lines = ["# Gap classes the OS already knows",
-             "Reuse a slug when the MECHANISM matches, whatever the subject. Coin a new "
-             "one only when none of these is the same mechanism — and know what that "
-             "commits: a new slug makes the fix order that follows responsible for "
-             "registering it, with a detector, a remedy and a test.",
+             "Reuse a slug when the MECHANISM matches, whatever the subject. A new slug "
+             "makes the next fix order register it, with a detector, a remedy and a test.",
              ""]
     for cls in GAP_CLASSES.values():
+        # Terse, issue number alone: this list is inside a worker's 10K start budget
         lines += [
             f"- `{cls.id}` — {cls.headline}",
-            f"  Looks like: {cls.symptom}",
-            f"  Detector: {cls.detector or 'NONE YET'}; remedy: {cls.remedy}"
-            # The number alone: this list is inside a worker's 10K start budget
+            f"  Seen: {cls.symptom}",
+            f"  Detector: {cls.detector or 'NONE YET'}"
+            + (f"; remedy: {cls.remedy}" if cls.remedy != REMEDY_NONE else "")
             + (f" (issue {cls.issue_url.rsplit('/', 1)[-1]})" if cls.issue_url else ""),
         ]
     return "\n".join(lines)

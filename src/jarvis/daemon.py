@@ -615,7 +615,6 @@ NO_VALIDATOR_REASON = (
     "settled exactly where it settles with validation switched off"
 )
 
-#: Why an abandonment with nothing produced closes its round unjudged and unescalated
 #: Written before the OS closes a superseded pull request, read by the poll (#1592)
 PR_SUPERSEDED_EVENT = "pr_superseded"
 #: `cause` on the `validation_failed` event of a close GitHub refused
@@ -624,6 +623,7 @@ SUPERSEDED_VOID_REASON = (
     "{url} now changes no files and round {round} passed its work, and `{base}` has "
     "since changed those files ({commits}), so the OS closed it as superseded.")
 
+#: Why an abandonment with nothing produced closes its round unjudged and unescalated
 ABANDONED_VOID_REASON = (
     "the worker abandoned this order and it produced nothing — no files, no pull "
     "request, no other durable effect — so there is no work for a reviewer and no "
