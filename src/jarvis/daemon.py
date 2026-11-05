@@ -443,6 +443,14 @@ METER_INBOX_TITLE = {
     METER_OUTSIDE_ALARM: "sessions Jarvis did not dispatch are spending the window",
     METER_RESIDUAL_ALARM: "the usage meter and the measured spend do not reconcile",
 }
+#: What the user owes, on the one inbox line each condition sends
+METER_INBOX_ACTION = {
+    METER_OUTSIDE_ALARM: "Your action: if these sessions are yours, none is owed; otherwise "
+                         "stop the ones you do not recognise. Repeats are counted, not sent "
+                         "here.",
+    METER_RESIDUAL_ALARM: "No action is owed from you. Repeats are counted, not sent here, and "
+                          "from occurrence 3 the OS files a bug on the meter accounting.",
+}
 
 #: Records the filing: one inside the chain means do not file again
 METER_DIAGNOSED_ALARM = "cost_residual_diagnosed"
@@ -652,6 +660,8 @@ CACHE_1H_INBOX_TITLE = {
     inspection.CACHE_ARM_MISSED_ALARM:
         "A cache-TTL arm is not reaching the CLI — stamped turns paid the other rate",
 }
+CACHE_1H_INBOX_ACTION = ("Your action: this is an OS defect and nothing files it by itself. "
+                         "Report it with `jarvis bug report`, citing this alarm.")
 
 
 def archived_projects(central: CentralStore) -> frozenset[str]:
@@ -3968,9 +3978,10 @@ class Daemon:
                      f"Read it with: jarvis alarms show {alarm['id']}\n"
                      "The question in full: "
                      f"{notify.neo_question_url(self.catalog, q['id'])}",
-                wo_id=q["wo_id"])
-            pstore.flag_attention(q["wo_id"], supervisor.ALARM_BLOCKER.format(
-                alarm_id=alarm["id"]))
+                wo_id=q["wo_id"] if alarm["wo_id"] else None)
+            if alarm["wo_id"]:
+                pstore.flag_attention(q["wo_id"], supervisor.ALARM_BLOCKER.format(
+                    alarm_id=alarm["id"]))
             log.info("alarm %s escalated to the user by neo", alarm["id"])
             return
 
@@ -3982,6 +3993,8 @@ class Daemon:
             verdict_reason=supervisor.NEO_ANSWERED_REASON.format(
                 reason=verdict["reason"] or "(no reason given)"),
             decided_at=db_mod.now())
+        if not alarm["wo_id"]:
+            return  # asked before this alarm left its carrier: the row is the record
         pstore.add_event(q["wo_id"], "alarm_advice",
                          {"alarm_id": alarm["id"], "neo_question_id": q["id"],
                           "answer": note})
@@ -4238,7 +4251,7 @@ class Daemon:
                                    f"no longer be prevented")
                 continue
             try:
-                wo = pstore.get_work_order(alarm["wo_id"])
+                wo = pstore.get_work_order(alarm["wo_id"]) if alarm["wo_id"] else None
             except KeyError:
                 pstore.update_alarm(alarm["id"], status="skipped", decided_at=db.now(),
                                     verdict_reason="the work order is gone")
@@ -5097,30 +5110,17 @@ class Daemon:
         # Reads the RECORD, not the transcripts, so it holds when they do not read
         raised += inspection.arm_miss_alarms(
             inspection.arm_misses(self._arm_rate_rows(since)), cfg, days=days)
-        if not raised:
-            return
-        carrier = store.latest_settled_order()
-        if carrier is None:
-            # Nothing to hang the foreign key on
-            log.info("[%s] one-hour cache writes found, but no settled order to carry "
-                     "the alarm yet", project.name)
-            return
         for alarm in raised:
             last = store.last_alarm_of_kind(alarm.kind)
             if last is not None and float(last["ts"] or 0.0) >= since:
                 continue
-            row = store.add_finding(carrier["id"], kind=alarm.kind, reason=alarm.reason,
+            row = store.add_finding(None, kind=alarm.kind, reason=alarm.reason,
                                     seq=NO_TURN, source="cost")
-            store.add_event(carrier["id"], "cost_alarm",
-                            {"kind": alarm.kind, "seq": NO_TURN,
-                             "reason": alarm.reason, "alarm_id": row["id"]})
             self.central.add_inbox(
                 project=project.name, level="warning",
                 title=CACHE_1H_INBOX_TITLE[alarm.kind],
-                body=f"{alarm.reason}\n"
-                     f"The supervisor will look before you have to. "
-                     f"Read it with: jarvis alarms show {row['id']}",
-                wo_id=carrier["id"])
+                body=f"{alarm.reason}\n{CACHE_1H_INBOX_ACTION}\n"
+                     f"Read it with: jarvis alarms show {row['id']}")
             log.info("[%s] %s: %s", project.name, alarm.kind, alarm.reason)
 
     def check_meter_residual(self, project: ProjectSpec, store: ProjectStore) -> None:
@@ -5146,14 +5146,6 @@ class Daemon:
         raised = [kind for kind, flag in (
             (METER_OUTSIDE_ALARM, meter["alerts"]["outside"]),
             (METER_RESIDUAL_ALARM, meter["alerts"]["residual"])) if flag]
-        if not raised:
-            return
-        carrier = store.latest_settled_order()
-        if carrier is None:
-            # Nothing to hang the foreign key on
-            log.info("[%s] the meter does not reconcile, but no settled order can carry "
-                     "the alarm yet", project.name)
-            return
         for kind in raised:
             chain = store.standing_alarms(kind, METER_STANDING_GAP_SECONDS)
             if not chain or float(chain[-1]["ts"] or 0.0) < resolved["since"]:
@@ -5164,28 +5156,21 @@ class Daemon:
                     reason += (f" Occurrence {occurrence} of this standing condition, "
                                f"first seen {_utc(first_seen)}.")
                 row = store.add_finding(
-                    carrier["id"], kind=kind, reason=reason, seq=NO_TURN, source="cost",
+                    None, kind=kind, reason=reason, seq=NO_TURN, source="cost",
                     status=("raised" if occurrence < METER_STANDING_OCCURRENCES
                             else "informational"))
-                store.add_event(carrier["id"], "cost_alarm",
-                                {"kind": kind, "seq": NO_TURN, "reason": reason,
-                                 "alarm_id": row["id"], "occurrence": occurrence,
-                                 "first_seen": first_seen})
                 if not chain:
                     self.central.add_inbox(
                         project=project.name, level="warning", title=METER_INBOX_TITLE[kind],
-                        body=f"{reason}\n"
-                             f"The supervisor will look before you have to, and repeats are "
-                             f"counted, not sent here. "
-                             f"Read it with: jarvis alarms show {row['id']}",
-                        wo_id=carrier["id"])
+                        body=f"{reason}\n{METER_INBOX_ACTION[kind]}\n"
+                             f"Read it with: jarvis alarms show {row['id']}")
                 log.info("[%s] %s: %s", project.name, kind, reason)
                 chain.append(row)
             if kind == METER_RESIDUAL_ALARM and len(chain) >= METER_STANDING_OCCURRENCES:
-                self._file_meter_diagnostic(project, store, carrier["id"], chain)
+                self._file_meter_diagnostic(project, store, chain)
 
     def _file_meter_diagnostic(self, project: ProjectSpec, store: ProjectStore,
-                               carrier_id: str, chain: list[dict[str, Any]]) -> None:
+                               chain: list[dict[str, Any]]) -> None:
         """A standing residual becomes one filed bug, and never a second inbox line"""
         from . import bugreport
         from .project_store import NO_TURN
@@ -5206,7 +5191,7 @@ class Daemon:
             log.exception("[%s] could not file the meter diagnostic", project.name)
             return
         store.add_finding(
-            carrier_id, kind=METER_DIAGNOSED_ALARM, seq=NO_TURN, source="cost",
+            None, kind=METER_DIAGNOSED_ALARM, seq=NO_TURN, source="cost",
             status="informational",
             reason=f"{METER_RESIDUAL_ALARM} recurred {len(chain)} times: filed as "
                    f"{filed.get('url')}")

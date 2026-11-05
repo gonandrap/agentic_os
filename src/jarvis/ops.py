@@ -15683,8 +15683,8 @@ def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
     return {
         "project": name,
         "wo_id": row["wo_id"],
-        "title": (row["fo_title"] if feature else row["title"]),
-        "status": (row["fo_status"] if feature else row["status"]),
+        "title": (row["fo_title"] if feature else row["title"]) or "",
+        "status": (row["fo_status"] if feature else row["status"]) or "",
         "hidden": bool(row["hidden"]),
         "ts": row["ts"],
         "kind": row["kind"],
@@ -15700,7 +15700,7 @@ def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
         "source": row["source"],
         "probe": row["probe"],
         "subject_kind": row["subject_kind"],
-        "subject_id": row["fo_id"] or row["wo_id"],
+        "subject_id": row["fo_id"] or row["wo_id"] or "",
     }
 
 
@@ -15795,9 +15795,6 @@ def _reviewable(name: str, row: dict[str, Any],
     })
     # The frozen dict carries the probe ID; every review surface renders its TITLE
     view["kind_label"] = alarm_kind_label(view, titles or {})
-    from .inspection import FLEET_WIDE_KINDS
-
-    view["fleet_wide"] = view["kind"] in FLEET_WIDE_KINDS
     return view
 
 
@@ -15896,12 +15893,7 @@ def _find_alarm(alarm_id: str, project_name: str | None = None
             continue
         store = ProjectStore(path)
         try:
-            try:
-                bare = store.get_alarm(alarm_id)
-            except KeyError:
-                continue
-            joined = [r for r in store.alarms_across(wo_id=bare["wo_id"], limit=1000)
-                      if r["id"] == alarm_id]
+            joined = store.alarms_across(alarm_id=alarm_id, limit=1)
         finally:
             store.close()
         if joined:

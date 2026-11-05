@@ -182,18 +182,43 @@ def test_approve_shown_approves_only_the_rows_shown(started):
     assert ops.alarm_review_queue() == []
 
 
-def test_a_fleet_wide_alarm_says_its_order_is_only_the_carrier(started):
+def test_a_machine_wide_alarm_names_no_order(started):
     """al-9c89fd13 read as blaming a release order (wo-b6e2ddda)"""
     from jarvis import inspection
 
     wo = ops.create_work_order("proj_a", "ship version 0.13.11")
     store = ProjectStore(ops.find_work_order(wo["id"])[1])
     try:
-        store.add_alarm(wo["id"], inspection.CACHE_1H_DISPATCHED_ALARM, -1, FIRED)
+        row = store.add_finding(None, kind=inspection.CACHE_1H_DISPATCHED_ALARM, reason=FIRED)
     finally:
         store.close()
 
-    assert "fleet-wide · filed on" in _client().get("/alarms").text
+    client = _client()
+    for page in (client.get("/alarms").text,
+                 client.get(f"/alarms/proj_a/{row['id']}").text):
+        assert "machine-wide" in page
+        assert wo["id"] not in page
+    assert ops.alarm_detail(row["id"])["subject_id"] == ""
+
+
+def test_a_machine_wide_alarm_reads_and_reviews_without_an_order(started, capsys):
+    from jarvis import cli, inspection
+
+    wo = ops.create_work_order("proj_a", "an innocent order")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        row = store.add_finding(None, kind=inspection.CACHE_ARM_MISSED_ALARM, reason=FIRED)
+        store.update_alarm(row["id"], status="acked", verdict="ack", verdict_reason="why")
+    finally:
+        store.close()
+
+    assert cli.main(["alarms"]) == 0
+    assert cli.main(["alarms", "show", row["id"]]) == 0
+    out = capsys.readouterr().out
+    assert "machine-wide" in out and wo["id"] not in out
+
+    assert ops.review_alarm(row["id"], True)["review"] == "approved"
+    assert [a["id"] for a in ops.alarm_feed("proj_a")] == [row["id"]]
 
 
 # -- the control is one macro, and this is the only observable form of that
