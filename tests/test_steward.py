@@ -51,14 +51,17 @@ def test_minor_and_cosmetic_are_dropped():
     assert outcome(cand(severity="cosmetic")) == ("drop", "low-severity")
 
 
-def test_past_max_depth_is_queued_never_dispatched():
-    assert outcome(cand(severity="critical"), generation=2) == ("queue", "max-depth")
+@pytest.mark.parametrize("severity,want", [("critical", "ask"), ("blocker", "ask"),
+                                           ("major", "queue"), ("medium", "queue")])
+def test_past_max_depth_never_dispatches_and_only_urgent_asks(severity, want):
+    assert outcome(cand(severity=severity), generation=2) == (want, "max-depth")
 
 
-def test_a_detector_chasing_its_own_work_is_queued():
+@pytest.mark.parametrize("severity,want", [("critical", "ask"), ("medium", "queue")])
+def test_a_detector_chasing_its_own_work_never_dispatches(severity, want):
     """The 10-generation chain of 2026-10-20: the sweep investigating its own fix orders"""
-    c = cand(origin_kind="investigation", severity="critical")
-    assert outcome(c, parent_kind="investigation") == ("queue", "self-reference")
+    c = cand(origin_kind="investigation", severity=severity)
+    assert outcome(c, parent_kind="investigation") == (want, "self-reference")
 
 
 def test_critical_with_evidence_dispatches_now():
@@ -154,7 +157,7 @@ def test_red_main_alone_skips_max_depth_and_keeps_its_other_rules():
     """io-f48bcdcb: spec §3.2 decision 1 rule 3, A6"""
     red = cand(origin_kind="red_main", severity="critical")
     assert outcome(red, generation=2, parent_kind="bug_agent") == ("dispatch", "reported-bug")
-    assert outcome(red, generation=2, parent_kind="red_main") == ("queue", "self-reference")
+    assert outcome(red, generation=2, parent_kind="red_main") == ("ask", "self-reference")
     spent = steward.Ledger(bug_usd=CFG.bug_weekly_usd)
     assert outcome(red, spent, generation=2) == ("ask", "bug-budget")
 
@@ -664,6 +667,106 @@ def test_a_candidate_that_names_no_code_is_never_deduped(fleet):
     first = steward.gate(cand(origin_kind="red_main", severity="critical",
                               parent_wo_id=parent["id"]), catalog=cat, store=store)
     assert first.duplicate_of == 0 and first.allowed is True
+
+
+# ---------------------------------------------------------------- one ask per break
+
+
+def _parent_of_kind(store, kind):
+    return store.create_work_order("its parent", metadata={steward.STAMP_KEY: {
+        "generation": 0, "origin_kind": kind}})["id"]
+
+
+def _red_main_parent(store):
+    """A merge a red-main fix order made: the next red `main` is that detector's own work"""
+    return _parent_of_kind(store, "red_main")
+
+
+def _red_main(parent_id, break_id="41935766931"):
+    return cand(origin_kind="red_main", severity="critical", subject="`main` is red",
+                parent_wo_id=parent_id, break_id=break_id)
+
+
+def _inbox_and_asks():
+    central = CentralStore()
+    try:
+        return central.new_inbox(), central.steward_asks(0)
+    finally:
+        central.close()
+
+
+def test_a_refused_critical_asks_once_across_ticks_past_the_hourly_window(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = _red_main_parent(store)
+    t0 = db.now()
+    first = steward.gate(_red_main(parent), catalog=cat, store=store, now=t0)
+    assert (first.outcome, first.rule, first.allowed) == ("ask", "self-reference", False)
+    for hours in (1, 2, 30):
+        again = steward.gate(_red_main(parent), catalog=cat, store=store,
+                             now=t0 + hours * steward.REPEAT_SECONDS + 1)
+        assert again.decision_id == first.decision_id
+    items, asks = _inbox_and_asks()
+    assert len(items) == 1 and [a["id"] for a in asks] == [first.decision_id]
+    assert "No wait and no budget clears" in items[0]["body"]
+    assert "Raising" not in items[0]["body"]
+    assert "jarvis doctor proj_a" in items[0]["body"]
+    step = steward.next_step(asks[0])
+    assert step["yours"] and "no wait or budget clears" in step["text"]
+    assert "Raising" not in step["text"]
+
+
+def test_a_new_break_asks_again_even_inside_the_hourly_window(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = _red_main_parent(store)
+    t0 = db.now()
+    first = steward.gate(_red_main(parent), catalog=cat, store=store, now=t0)
+    second = steward.gate(_red_main(parent, "41935999999"), catalog=cat, store=store, now=t0 + 60)
+    assert second.decision_id != first.decision_id
+    assert len(_inbox_and_asks()[0]) == 2
+
+
+def test_a_medium_refused_for_good_stays_a_quiet_queue_row(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    d = steward.gate(cand(origin_kind="worker_io", severity="medium",
+                          parent_wo_id=_parent_of_kind(store, "worker_io")),
+                     catalog=cat, store=store)
+    assert (d.outcome, d.rule) == ("queue", "self-reference")
+    assert _inbox_and_asks() == ([], [])
+
+
+def test_a_severer_wording_that_turns_a_queue_into_an_ask_reaches_the_inbox(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = _parent_of_kind(store, "panel")
+    held = dict(origin_kind="panel", parent_wo_id=parent, file="src/a.py",
+                subject="the race in the writer")
+    assert steward.gate(cand(severity="medium", **held), catalog=cat,
+                        store=store).outcome == "queue"
+    assert _inbox_and_asks()[0] == []
+    d = steward.gate(cand(severity="critical", **held), catalog=cat, store=store)
+    assert d.outcome == "ask"
+    assert len(_inbox_and_asks()[0]) == 1
+
+
+def test_the_verdict_is_the_breaks_latest_and_silent_once_it_dispatches(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    central = CentralStore()
+    try:
+        assert steward.break_verdict(central, "proj_a", 0) == ""
+        assert steward.break_verdict(central, "proj_a", 41935766931) == ""
+        d = steward.gate(_red_main(_red_main_parent(store)), catalog=cat, store=store,
+                         central=central)
+        said = steward.break_verdict(central, "proj_a", 41935766931)
+        assert f"#{d.decision_id}" in said and "self-reference" in said
+        assert steward.break_verdict(central, "proj_a", 1) == ""
+        steward.gate(_red_main(""), catalog=cat, store=store, central=central)
+        assert steward.break_verdict(central, "proj_a", 41935766931) == ""
+    finally:
+        central.close()
 
 
 # ---------------------------------------------------------------- the queue (#1181)

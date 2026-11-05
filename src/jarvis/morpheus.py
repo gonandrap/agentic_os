@@ -21,9 +21,9 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger("jarvisd.morpheus")
 
-STATES = ("queued", "monitoring", "validated", "failed", "timedout", "cancelled")
+STATES = ("queued", "monitoring", "validated", "unverified", "failed", "timedout", "cancelled")
 OPEN_STATES = ("queued", "monitoring")
-TERMINAL_STATES = ("validated", "failed", "timedout", "cancelled")
+TERMINAL_STATES = ("validated", "unverified", "failed", "timedout", "cancelled")
 #: The terminal states that must cause something
 ACTION_STATES = ("failed", "timedout")
 
@@ -33,6 +33,21 @@ SECTION = "How to validate in production"
 #: The script contract — Morpheus knows the exit code and nothing else
 EXIT_VALIDATED = 0
 EXIT_FAILED = 1
+EXIT_NOT_YET = 75
+
+#: What an exit 75 names on a `REASON <word>` line (docs/superpowers/specs/2026-11-01-monitoring-orders.md §9)
+NOT_DEPLOYED = "not_deployed"
+NOT_EXERCISED = "not_exercised"
+AMBIGUOUS = "ambiguous"
+REASONS = (NOT_DEPLOYED, NOT_EXERCISED, "unreadable", AMBIGUOUS)
+#: How long `not_deployed` may hold a deadline, from the first check that said it
+NOT_DEPLOYED_CAP_DAYS = 14
+#: How an arming session says its script gets its evidence
+TRIGGERS = ("probe", "ambient")
+_REASON_LINE = re.compile(r"^REASON[ \t]+(\S+)[ \t]*$", re.MULTILINE)
+_FAIL_LINE = re.compile(r"^FAIL\b", re.MULTILINE)
+#: What a new watch forgets of the last one (§9)
+_FRESH_WATCH = {"last_reason": "", "saw_fail": 0, "held_since_ts": None}
 
 #: The os_state key naming the last release whose PRs were queued
 RELEASE_KEY = "morpheus.last_release"
@@ -434,13 +449,15 @@ def rewrite_dev_scripts(central: CentralStore, cfg: MorpheusConfig, project: str
     return sent
 
 
-def set_script(central: CentralStore, item_id: str, script: str, source: str) -> dict:
+def set_script(central: CentralStore, item_id: str, script: str, source: str,
+               trigger: str = "") -> dict:
     """Give an item its script; a queued item starts monitoring now"""
     item = _item_or_raise(central, item_id)
     script = (script or "").strip()
     if not script:
         raise ValueError("an empty script validates nothing")
-    fields: dict[str, Any] = {"script": script, "script_source": source}
+    fields: dict[str, Any] = {"script": script, "script_source": source, "trigger_kind": trigger,
+                              **_FRESH_WATCH}
     if item["state"] == "queued":
         # Armed: attempts restart (docs/superpowers/specs/2026-11-01-monitoring-orders.md §1.3)
         fields.update(state="monitoring", next_check_ts=db.now(), attempts=0)
@@ -534,7 +551,7 @@ def requeue(central: CentralStore, cfg: MorpheusConfig, item_id: str, *,
         item_id, state="monitoring" if item["script"] else "queued",
         deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY,
         next_check_ts=now if item["script"] else None, resolution=resolution, action="",
-        action_ts=None, attempts=0, kills=0, last_attempt_ts=None)
+        action_ts=None, attempts=0, kills=0, last_attempt_ts=None, **_FRESH_WATCH)
     return central.morpheus_item(item_id) or {}
 
 
@@ -556,7 +573,7 @@ def rewrite(central: CentralStore, cfg: MorpheusConfig, item_id: str, why: str, 
                        f"{item['script'][:3000] or '(none)'}"),
         deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY, next_check_ts=None,
         resolution=resolution or f"script sent back to be rewritten: {why[:600]}",
-        action="", action_ts=None)
+        action="", action_ts=None, trigger_kind="", **_FRESH_WATCH)
     return central.morpheus_item(item_id) or {}
 
 
@@ -620,6 +637,15 @@ def run_script(script: str, cwd: Path, timeout: int) -> CheckResult:
     return CheckResult(proc.returncode, out[-OUTPUT_TAIL:])
 
 
+def exit_reason(result: CheckResult) -> str:
+    """What an exit 75 named; a missing or unknown word means ambiguous (§9)"""
+    if result.exit != EXIT_NOT_YET:
+        return ""
+    # Output is stdout then stderr, so the script's last line need not be the output's last
+    named = _REASON_LINE.findall(result.output)
+    return named[-1] if named and named[-1] in REASONS else AMBIGUOUS
+
+
 def checked_version(repo: Path) -> str:
     """What production ran at a check: its tag, else tag-distance or commit; '' outside git"""
     try:
@@ -640,20 +666,38 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
     now = db.now() if now is None else now
     where = _cwd(cwd, item)
     result = run(item["script"], where, cfg.script_timeout_seconds)
+    reason = exit_reason(result)
+    # Output cut to its tail may have lost a FAIL line, so a full tail cannot count as clean
+    saw_fail = bool(item.get("saw_fail") or result.exit == EXIT_FAILED
+                    or _FAIL_LINE.search(result.output) or len(result.output) >= OUTPUT_TAIL)
     fields: dict[str, Any] = {"last_check_ts": now, "checks": int(item["checks"]) + 1,
                               "last_check_version": (version or checked_version)(where),
                               "last_exit": result.exit, "last_output": result.output,
+                              "last_reason": reason, "saw_fail": int(saw_fail),
                               "next_check_ts": now + int(item.get("every_minutes")
                                                          or cfg.check_every_minutes) * 60}
+    held_since = float(item.get("held_since_ts") or now)
+    hold_cap = held_since + NOT_DEPLOYED_CAP_DAYS * SECONDS_PER_DAY
     if result.exit == EXIT_VALIDATED:
         fields.update(state="validated", next_check_ts=None, resolution="script exited 0")
     # One exit 1 may be the environment, not the PR, so `failed` needs a second in a row (#1255)
     elif result.exit == EXIT_FAILED and item.get("last_exit") == EXIT_FAILED:
         fields.update(state="failed", next_check_ts=None,
                       resolution="script exited 1 twice in a row")
+    elif reason == NOT_DEPLOYED and now < hold_cap:
+        # Not deployed starts no clock: the whole window stays for once it is (§9)
+        fields.update(held_since_ts=held_since,
+                      deadline_ts=max(float(item["deadline_ts"]),
+                                      min(now + cfg.timeout_days * SECONDS_PER_DAY, hold_cap)))
     elif now >= float(item["deadline_ts"]):
-        fields.update(state="timedout", next_check_ts=None,
-                      resolution=_timeout_reason(item, cfg, result.exit))
+        if reason == NOT_EXERCISED and not saw_fail:
+            fields.update(state="unverified", next_check_ts=None,
+                          resolution=f"production never exercised the change within "
+                                     f"{cfg.timeout_days:g} day(s) and no check saw a FAIL: "
+                                     f"not proof it works")
+        else:
+            fields.update(state="timedout", next_check_ts=None,
+                          resolution=_timeout_reason(item, cfg, result.exit, reason))
     state = str(fields.get("state", item["state"]))
     with db.write_transaction(central.conn):  # the run and the item move together: db.write_transaction
         central.update_morpheus_item(item["id"], **fields)
@@ -663,9 +707,11 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
 
 
 def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig,
-                    last_exit: int | None = None) -> str:
+                    last_exit: int | None = None, reason: str = "") -> str:
     if not item.get("script"):
         return f"no script was registered within {cfg.timeout_days:g} day(s)"
+    if reason == NOT_DEPLOYED:
+        return f"not deployed after {NOT_DEPLOYED_CAP_DAYS} day(s) of holding its deadline"
     if last_exit == EXIT_FAILED:
         return (f"one exit 1 within {cfg.timeout_days:g} day(s), "
                 "never confirmed by a second")
@@ -766,7 +812,7 @@ def _judge(central: CentralStore, catalog: Catalog, item: dict[str, Any], *, cwd
                 script_source="agent", last_exit=None, attempts=0, kills=0,
                 deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY, next_check_ts=now,
                 resolution=f"script rewritten by the monitoring agent: {reply['reason'][:600]}",
-                action="", action_ts=None)
+                action="", action_ts=None, trigger_kind="", **_FRESH_WATCH)
             return "rewrite"
         note = f"its {MAX_SCRIPT_REWRITES} automatic script rewrite(s) are spent"
     elif verdict == "confirm":
@@ -1033,14 +1079,20 @@ ARM_CONTRACT = """Write the bash script that monitors this order. The script:
 - exits 1 ONLY when production shows THIS change's own failure signature: the exact symptom
   it fixed, happening again. Anything the change does not own is NOT a failure: a command
   that errored, an endpoint that was unreachable, a missing file. Those exit 75;
-- exits 75 when it cannot read the environment, including production not having exercised
-  the change yet;
+- exits 75 when it can say neither, and then prints as its LAST line `REASON <why>`, one of:
+  not_deployed (the change is not in this production yet), not_exercised (it is deployed,
+  every read is clean, and nothing has triggered it yet), unreadable (it cannot read the
+  environment), ambiguous (it read evidence that settles nothing, or looks wrong without
+  being this change's own failure signature). Anything else counts as ambiguous;
+- PROBES when it can: a read-only command that exercises the change now (a CLI read, an HTTP
+  GET) comes before waiting for traffic, and it waits only when no such probe exists;
 - finishes in well under a minute;
 - prints ONE line per thing it checks, starting PASS, FAIL or UNKNOWN, naming it in plain
   words a human reads without the script, never a bare internal field name;
 - never prints the release that first carried the change: the OS records that already.
 
-Reply {"script": "<the bash script>", "notes": "<one line: what it checks>"}.
+Reply {"script": "<the bash script>", "trigger": "probe" if it exercises the change itself or
+"ambient" if it can only wait for production to, "notes": "<one line: what it checks>"}.
 If what to watch cannot be made mechanical, reply {"refuse": "<why>"} instead."""
 
 #: The os_state key holding the account's usage-window hold: one for every order
@@ -1074,7 +1126,9 @@ def _arm_reply(data: dict[str, Any]) -> dict[str, str]:
     script = data.get("script")
     if not isinstance(script, str) or not script.strip():
         raise ValueError("neither a script nor a refusal")
-    return {"script": script, "notes": str(data.get("notes") or "")}
+    trigger = str(data.get("trigger") or "").strip().lower()
+    return {"script": script, "notes": str(data.get("notes") or ""),
+            "trigger": trigger if trigger in TRIGGERS else ""}
 
 
 #: What a judge session may answer (monitoring-orders §4)
@@ -1245,7 +1299,8 @@ def arm(central: CentralStore, catalog: Catalog, cwd_for: CwdFor, *,
             continue
         user = (item["script_source"] == "user"
                 and reply["script"].strip() == (item["script"] or "").strip())
-        set_script(central, item["id"], reply["script"], "user" if user else "agent")
+        set_script(central, item["id"], reply["script"], "user" if user else "agent",
+                   trigger=reply["trigger"])
         central.update_morpheus_item(item["id"], kills=0, last_attempt_ts=now)
         out["armed"] += 1
     return out

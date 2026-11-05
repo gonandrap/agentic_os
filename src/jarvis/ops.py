@@ -7998,6 +7998,9 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
         # The ONE re-decision allowed: a finding whose decision stands but whose orders did not file (§5.2)
         if key in accepted_keys and (f.get("filing_error") or f.get("orders_held")):
             continue
+        # A refusal retrying cannot clear (a misread sequence) needs a way out: the user's rejection
+        if key in rejections and f.get("filing_error") and decided_by == "user":
+            continue
         raise OpsError(
             f"{key!r} is already {f['status']} on {io_id} — a decision is taken once. "
             f"`jarvis io show {io_id}` for what was decided."
@@ -8019,7 +8022,7 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
             f["knowledge_id"] = entry["id"]
             learnings.append(entry["id"])
         if file_orders:
-            made, error = _file_finding_orders(name, io_id, f, steward_decision)
+            made, error = _file_finding_orders(name, io_id, f, steward_decision, report)
             created += made
             if error:
                 errors.append({"key": key, "error": error})
@@ -8032,8 +8035,22 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
         if f.get("status") != "accepted":
             f.update(status="accepted", decided_by=decided_by, decided_at=db.now(),
                      feedback=feedback)
+    # A finding may name a sibling this same call files after it (issue 1567)
+    progress = bool(errors)
+    while progress:
+        progress = False
+        for failed in list(errors):
+            made, error = _file_finding_orders(name, io_id, by_key[failed["key"]],
+                                               steward_decision, report)
+            created += made
+            progress = progress or bool(made)
+            if error:
+                failed["error"] = error
+            else:
+                errors.remove(failed)
 
     for key, reason in rejections.items():
+        by_key[key].pop("filing_error", None)
         by_key[key].update(status="rejected", decided_by=decided_by, decided_at=db.now(),
                            feedback=reason)
     if rejections and decided_by == "user":
@@ -8107,8 +8124,103 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
             "learnings": learnings, "rejected": sorted(rejections), "errors": errors}
 
 
+def _filed_work(finding: Mapping[str, Any], target: str) -> list[str]:
+    """The work orders this finding has already filed in `target`"""
+    return [str(o["id"]) for o in finding.get("created_orders") or []
+            if o.get("type") == "work" and o.get("project") == target]
+
+
+def _sequence_holds(target: str, io_id: str, f: Mapping[str, Any],
+                    report: Mapping[str, Any], order: Mapping[str, Any]
+                    ) -> tuple[list[str], list[str]]:
+    """The edges and rows expressing the sequence an order's text states, or OpsError (issue 1567)"""
+    import re
+
+    from . import preconditions
+    from .project_store import DEPENDENCY_DEAD_STATUSES
+
+    clauses = preconditions.states_sequence(order.get("title", ""),
+                                            order.get("description", ""),
+                                            f.get("recommendation", ""))
+    if not clauses:
+        return [], []
+
+    def refused(clause: str, why: str) -> OpsError:
+        return OpsError(
+            f"cannot file this order: \"{clause[:preconditions.MAX_SENTENCE]}\" states a sequence "
+            f"and {why}, so nothing "
+            f"would hold it back and jarvisd would dispatch it (wo-87e007eb cost 0.78 USD "
+            f"this way). File the prerequisite, then retry `jarvis io review {io_id} "
+            f"--accept {f.get('key', '<key>')}`, or reject the finding and file the order "
+            f"by hand with `--depends-on`/`--blocked-by`.")
+
+    if (order.get("type") or "work") == "feature":
+        raise refused(clauses[0], "a feature order takes no dependency edge")
+    path = registered_project_paths().get(target)
+    if path is None:
+        return [], []  # create_work_order names the unregistered project
+    siblings = [x for x in report.get("findings") or []
+                if isinstance(x, dict) and x.get("key") != f.get("key")]
+    depends: list[str] = []
+    holds: list[str] = []
+    store = ProjectStore(path)
+    try:
+        for clause in clauses:
+            named = [x for x in siblings if re.search(
+                rf"(?<![\w-]){re.escape(str(x.get('key')))}(?![\w-])", clause)]
+            refs = [r for r in preconditions.sequence_refs(clause) if r != ("io", io_id)]
+            if not refs and not named:
+                raise refused(clause, "names no order, pull request or finding")
+            found_by_clause: list[str] = []
+            for finding in named:
+                filed = _filed_work(finding, target)
+                if not filed:
+                    raise refused(clause, f"finding {finding.get('key')} has no order filed "
+                                          f"in {target}")
+                found_by_clause += filed
+            for kind, value in refs:
+                if kind == "bl":
+                    holds.append(value)
+                    continue
+                if kind == "pr":
+                    owners = store.work_orders_for_pr_number(int(value))
+                    if not owners:
+                        raise refused(clause, f"no order in {target} owns PR {value}")
+                    # Newest first; a live owner still carries the PR even if a newer one died
+                    live = [o for o in owners if o["status"] not in DEPENDENCY_DEAD_STATUSES]
+                    found_by_clause.append(str((live or owners)[0]["id"]))
+                elif kind == "io":
+                    try:
+                        other = db.from_json(store.get_feature_order(value).get("plan"),
+                                             None) or {}
+                    except KeyError:
+                        raise refused(clause, f"{value} is not in {target}") from None
+                    entries = [x for x in other.get("findings") or [] if isinstance(x, dict)]
+                    keyed = [x for x in entries if str(x.get("key")) in clause]
+                    found = [i for x in (keyed or entries) for i in _filed_work(x, target)]
+                    if not found:
+                        raise refused(clause, f"{value} has no order filed in {target}")
+                    found_by_clause += found
+                else:
+                    found_by_clause.append(value)
+            for wo_id in found_by_clause:
+                try:
+                    holder = store.get_work_order(wo_id)
+                except KeyError:
+                    raise refused(clause, f"{wo_id} is not in {target}") from None
+                if holder["status"] in DEPENDENCY_DEAD_STATUSES:
+                    raise refused(clause, f"{wo_id} is {holder['status']} and can never "
+                                          f"complete")
+                depends.append(wo_id)
+    finally:
+        store.close()
+    return list(dict.fromkeys(depends)), list(dict.fromkeys(holds))
+
+
 def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
-                         decision: Any = None) -> tuple[list[dict[str, Any]], str]:
+                         decision: Any = None,
+                         report: Mapping[str, Any] | None = None
+                         ) -> tuple[list[dict[str, Any]], str]:
     """File the finding's proposed orders not filed yet: (created, error), stopping at the first failure"""
     from . import steward
 
@@ -8133,6 +8245,7 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             metadata = steward.stamped(metadata, decision)
             budget_usd = decision.budget_usd
         try:
+            depends, holds = _sequence_holds(target, io_id, f, report or {}, order)
             if order_type == "feature":
                 row = create_feature_order(target, order.get("title", ""),
                                            description=description,
@@ -8140,6 +8253,8 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             else:
                 row = create_work_order(target, order.get("title", ""),
                                         description=description, parent_id=None,
+                                        depends_on=depends or None,
+                                        blocked_by=holds or None,
                                         metadata=metadata, budget_usd=budget_usd)
         except OpsError as e:
             error = str(e)
@@ -8506,7 +8621,7 @@ def reoffer_io_finding(row: Mapping[str, Any], candidate: Any, decision: Any) ->
               if isinstance(x, dict) and x.get("key") == key), None)
     if f is None or f.get("status") != "accepted" or not f.get("orders_held"):
         return ""  # decided or filed some other way meanwhile: nothing left to file
-    created, error = _file_finding_orders(name, io_id, f, decision)
+    created, error = _file_finding_orders(name, io_id, f, decision, report)
     if not error:
         f.pop("orders_held", None)
     store = ProjectStore(path)
@@ -14649,7 +14764,7 @@ def cost_zone(tz: str | None = None, project: str | None = None) -> str:
 
 
 def cost_report(project: str | None = None, target: str | None = None,
-                limit: int = 50, include_hidden: bool = True,
+                limit: int = 50,
                 window: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the fleet's work has cost in tokens, read back from Claude Code's transcripts (#103)"""
     from . import usage as usage_mod
@@ -14671,18 +14786,16 @@ def cost_report(project: str | None = None, target: str | None = None,
             continue
         store = ProjectStore(path)
         try:
-            rows = store.list_work_orders(
-                limit=limit, include_hidden=include_hidden,
-                active_between=(since, until) if window else None)
+            # Hidden orders too: hiding declutters, their spend stays real and on the meter
+            rows = (_orders_in_window(store, index, since, until) if window
+                    else store.list_work_orders(limit=limit, include_hidden=True))
             # An order whose only in-window activity is an `agent_call`
             seen = {wo["id"] for wo in rows}
             for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
                 try:
-                    extra = store.get_work_order(wo_id)
+                    rows.append(store.get_work_order(wo_id))
                 except KeyError:
                     continue            # a legacy row naming no project: not this one's
-                if include_hidden or not extra["hidden"]:
-                    rows.append(extra)
             for wo in rows:
                 units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
                                        os_groups.get(wo["id"], ()),
@@ -14691,10 +14804,28 @@ def cost_report(project: str | None = None, target: str | None = None,
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
+    listed = {u["id"] for u in units}
+    # A call naming an order no store holds is declared too, or the meter outruns the list
+    unattributed = (_os_spend([g for wo_id, group in os_groups.items()
+                               if wo_id not in listed for g in group])
+                    if window else _os_unattributed(os_groups))
     # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/ `totals` keys...
     return {"scope": project or "fleet", "units": units, "window": window,
-            **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
+            **_rollup(units, unattributed), "os_unattributed": unattributed,
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
+
+
+def _orders_in_window(store: ProjectStore, index: dict[str, list[Path]], since: float,
+                      until: float) -> list[dict[str, Any]]:
+    """Every order with a transcript call in the window, however its turns fall (kn-58e36cf1)"""
+    from . import usage as usage_mod
+
+    spent = [wo for wo in store.list_work_orders(limit=-1, include_hidden=True)
+             if usage_mod.session_spend(wo.get("session_id") or "", since, until, index)]
+    # A pruned transcript cannot show its calls; its turn is all that says it ran here
+    return spent + [wo for wo in store.list_work_orders(
+        limit=-1, include_hidden=True, active_between=(since, until))
+        if not index.get(wo.get("session_id") or "")]
 
 
 def _os_groups(project: str | None = None, *, since: float | None = None,
@@ -14724,12 +14855,15 @@ def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     return _os_spend(groups.get("", []))
 
 
-def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
-    """Totals over the units that could actually be measured"""
+def _rollup(units: list[dict[str, Any]],
+            unattributed: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Totals over the units that could actually be measured, plus OS calls no unit owns"""
     measured = [u for u in units if u["found"]]
     worker_cost = round(sum(u["list_cost_usd"] for u in measured), 2)
+    # The `os_*` figures only: OS calls no work order caused are spend, not a unit (io-82bcb830)
+    os_spenders = [*units, *([unattributed] if unattributed else [])]
     # Over ALL units, not just measured ones
-    os_cost = round(sum(u.get("os_cost_usd") or 0 for u in units), 2)
+    os_cost = round(sum(u.get("os_cost_usd") or 0 for u in os_spenders), 2)
     subproc_cost = round(sum(u.get("subproc_cost_usd") or 0 for u in units), 2)
     return {
         "measured": len(measured),
@@ -14739,17 +14873,17 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "recorded_cost_usd": round(
                 sum(u.get("recorded_cost_usd") or 0 for u in units), 2),
             "list_cost_usd": worker_cost,
-            # The headline: workers, everything the OS spent on their behalf
+            # The headline: workers, everything the OS spent, on their behalf or on no order
             "total_cost_usd": round(worker_cost + os_cost + subproc_cost, 2),
             "os_cost_usd": os_cost,
             "os_recorded_cost_usd": round(
-                sum(u.get("os_recorded_cost_usd") or 0 for u in units), 2),
-            "os_calls": sum(u.get("os_calls") or 0 for u in units),
-            "os_billed_input": sum(u.get("os_billed_input") or 0 for u in units),
+                sum(u.get("os_recorded_cost_usd") or 0 for u in os_spenders), 2),
+            "os_calls": sum(u.get("os_calls") or 0 for u in os_spenders),
+            "os_billed_input": sum(u.get("os_billed_input") or 0 for u in os_spenders),
             # The biggest OS-side input on the whole report (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
             "os_max_input_chars": max(
-                [u.get("os_max_input_chars") or 0 for u in units], default=0),
-            "os_output": sum(u.get("os_output") or 0 for u in units),
+                [u.get("os_max_input_chars") or 0 for u in os_spenders], default=0),
+            "os_output": sum(u.get("os_output") or 0 for u in os_spenders),
             "subproc_cost_usd": subproc_cost,
             "subproc_recorded_cost_usd": round(
                 sum(u.get("subproc_recorded_cost_usd") or 0 for u in units), 2),
@@ -14765,7 +14899,7 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "billed_input": sum(u["billed_input"] for u in measured),
             # Over ALL units: what a window could not place is disclosed whether or not the order it belongs to...
             "undated_messages": sum(u.get("undated_messages") or 0 for u in units),
-            **_write_ttl(measured, units),
+            **_write_ttl(measured, os_spenders),
         },
     }
 

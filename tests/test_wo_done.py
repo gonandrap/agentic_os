@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json as _json
+import time
 
 import pytest
 
@@ -44,6 +45,10 @@ def test_mark_done_kills_a_running_worker_turn(started, fake_claude, project):
 
     assert out["session_stopped"] is True
     assert store.latest_turn(wo["id"])["state"] == "failed"
+    # clock-exempt: class 3 — SIGTERM is asynchronous; run 41935766931 read it before delivery
+    deadline = time.monotonic() + 5
+    while claude_cli.process_alive(turn["pid"]) and time.monotonic() < deadline:
+        time.sleep(0.02)
     assert not claude_cli.process_alive(turn["pid"])
 
 

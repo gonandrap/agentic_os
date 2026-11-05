@@ -56,7 +56,10 @@
 </div>
 
 <p class="kv">
-  {{ r.checks }} check(s) run · {{ r.auto_requeues }} of {{ r.max_auto_requeues }} auto-requeue(s) used ·
+  {{ r.checks }} check(s) run
+  {% if item.last_reason %}· last 75: <span class="mono">{{ item.last_reason }}</span>{% endif %}
+  {% if item.trigger_kind %}· trigger <span class="mono">{{ item.trigger_kind }}</span>{% endif %}
+  · {{ r.auto_requeues }} of {{ r.max_auto_requeues }} auto-requeue(s) used ·
   {% if open and d.next_check_ts %}next check {{ fmt_ts(d.next_check_ts) }} (in {{ fmt_left(d.next_check_ts) }}),
     deadline {{ fmt_ts(item.deadline_ts) }}
   {% elif open %}no check due: waiting for a check script · deadline {{ fmt_ts(item.deadline_ts) }}

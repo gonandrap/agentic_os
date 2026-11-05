@@ -17,6 +17,7 @@ from jarvis.claude_cli import CREDENTIALS_ENV
 TOKEN = "sk-ant-oat01-SANDBOX-TOKEN-VALUE"
 MINUTE = 60.0
 T0 = 1_760_000_000.0
+WEEK_SECONDS = 7 * 86_400.0
 
 
 # -- fixtures
@@ -254,6 +255,30 @@ def test_the_nearest_earlier_sample_is_the_start_and_beyond_it_the_head_is_uncov
     assert far.coverage.head_uncovered_seconds == pytest.approx(600.0)
 
 
+def test_a_reset_between_the_head_and_the_first_sample_does_not_seed_the_old_percent():
+    """io-82bcb830: the meter went 0 to 100 and the page said it rose 63"""
+    head = sample(T0 - MINUTE, 37.0, T0)
+    inside = series(T0 + MINUTE, [0.0, 100.0], T0 + 18000)
+    found = usage_meter.segments([head, *inside], since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert [s.start_pct for s in found.segments] == [0.0]
+    assert found.segments[0].start_ts == T0 + MINUTE
+    assert found.delta_points == pytest.approx(100.0)
+    assert found.coverage.head_uncovered_seconds == pytest.approx(MINUTE)
+    assert found.anomalies == 0
+
+
+def test_a_drop_between_the_head_and_the_first_sample_is_a_boundary_and_an_anomaly():
+    head = sample(T0 - MINUTE, 37.0, T0 + 3600)
+    inside = series(T0 + MINUTE, [2.0, 9.0], T0 + 3600)
+    found = usage_meter.segments([head, *inside], since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert found.delta_points == pytest.approx(7.0)
+    assert found.anomalies == 1
+
+
 def test_a_seven_day_reset_runs_through_the_same_path():
     rows_ = (series(T0, [10.0, 40.0], T0 + 3600, key="seven_day")
              + series(T0 + 2 * MINUTE, [3.0, 9.0], T0 + 7200, key="seven_day"))
@@ -274,8 +299,44 @@ def test_gap_rows_are_excluded_from_segments_and_counted_in_coverage():
     assert found.delta_points == pytest.approx(7.0)
     assert found.coverage.gap_rows == 3
     assert found.coverage.samples == 2
-    assert found.coverage.share == pytest.approx(2 / 5)
+    # The 4-period hole is unmeasured; only the one period after the last reading is covered
+    assert found.coverage.share == pytest.approx(1 / 5)
     assert found.coverage.longest_gap_seconds == pytest.approx(4 * period)
+
+
+def _gapless(step: float, span: float) -> list[usage_meter.Sample]:
+    return series(T0, [10.0] * (int(span // step) + 1), T0 + WEEK_SECONDS, step=step)
+
+
+def test_a_window_ending_ahead_of_now_is_judged_only_up_to_now():
+    """Issue io-82bcb830: same readings, same answer, whatever the window's future end"""
+    rows_ = _gapless(150.0, 3600.0)
+    ended = usage_meter.segments(rows_, since=T0, until=T0 + 3600, key="five_hour",
+                                 now=T0 + 3600)
+    ahead = usage_meter.segments(rows_, since=T0, until=T0 + 7 * 86_400, key="five_hour",
+                                 now=T0 + 3600)
+
+    assert ended.coverage.share == pytest.approx(1.0)
+    assert ahead.coverage.share == pytest.approx(1.0)
+    assert ahead.max_resets == ended.max_resets == 1
+
+
+def test_the_sampler_real_cadence_covers_the_whole_span():
+    """A gapless span at the measured 222s mean and 345s longest gap is not 'incomplete'"""
+    assert usage_meter.segments(_gapless(222.0, 6 * 3600), since=T0, until=T0 + 6 * 3600,
+                                key="five_hour").coverage.share > 0.98
+    assert usage_meter.segments(_gapless(345.0, 6 * 3600), since=T0, until=T0 + 6 * 3600,
+                                key="five_hour").coverage.share > 0.98
+
+
+def test_a_real_hole_still_lowers_coverage_below_the_reliable_share():
+    """Five hours measured, then seven dark and up to now: the refusal stands"""
+    rows_ = _gapless(222.0, 5 * 3600)
+    found = usage_meter.segments(rows_, since=T0, until=T0 + 24 * 3600, key="five_hour",
+                                 now=T0 + 12 * 3600)
+
+    assert found.coverage.share == pytest.approx(5 / 12, abs=0.02)
+    assert found.coverage.share < usage_meter.MIN_RELIABLE_COVERAGE_SHARE
 
 
 # -- the reset tolerance and the segment bound
@@ -404,6 +465,23 @@ def test_three_clean_spans_are_measured_and_the_value_is_the_median(central, jar
     assert found["basis_points"] == pytest.approx(30.0)
     assert found["basis_usd"] == pytest.approx(90.0)
     assert found["low"] < found["value"] < found["high"]
+
+
+def test_the_band_always_holds_the_median_when_one_span_is_an_outlier(central, jarvis_home):
+    """A dear span drags an aggregate band above the median; 1.97 against 2.21-2.34 in production"""
+    starts = [T0, T0 + 2 * 3600, T0 + 4 * 3600]
+    for start in starts:
+        store_samples(central, run(start, minutes=40, points=10.0))
+    central.conn.commit()
+    usd = {starts[0]: 20.0, starts[1]: 20.0, starts[2]: 200.0}
+
+    found = usage_meter.dollars_per_point(
+        now=T0 + 7 * 3600, cfg=cfg_for(), home=Path(jarvis_home),
+        visible=lambda *, since, until: usd[min(usd, key=lambda s: abs(s - since))])
+
+    assert found["value"] == pytest.approx(2.0)
+    assert found["low"] < found["value"] < found["high"]
+    assert found["basis_usd"] == pytest.approx(240.0)
 
 
 def test_one_clean_span_is_thin(central, jarvis_home):
