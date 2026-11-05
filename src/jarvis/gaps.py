@@ -114,6 +114,15 @@ GAP_CLASSES: dict[str, GapClass] = {
         issue_url="https://github.com/gonandrap/agentic_os/issues/1608",
         since="",
     ),
+    "mention-held-as-act": GapClass(
+        id="mention-held-as-act",
+        headline="the high-stakes net matches a word, not an act, so a routine assumption waits for the user",
+        symptom="`needs_review`, held with `commits to an act` while Neo's advice would approve",
+        detector="rules.mention-held-as-act",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1610",
+        since="",
+    ),
 }
 
 #: Asserted equal to `tuple(GAP_CLASSES)`, on `remedies.SHIPPED_REMEDIES`' precedent
@@ -121,7 +130,8 @@ SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "oversized-input", "unwired-precondition",
                                         "background-task-silence",
                                         "designed-wait-undiscounted",
-                                        "superseded-delivery", "base-chase-livelock")
+                                        "superseded-delivery", "base-chase-livelock",
+                                        "mention-held-as-act")
 
 
 def checked_slug(raw: str) -> str:

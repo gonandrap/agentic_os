@@ -140,6 +140,36 @@ TIGHTENED_TABLE = [
     ("logged-secret", "Logged the client secret at debug level.", True),
     ("service-credentials", "Uses the service account credentials in the vault.", True),
     ("bypass-auth", "Bypassed auth on the admin endpoint for the probe.", True),
+    # 15. price/invoice/charge/bill only as the money act or object: issue 1610
+    ("price-held-sentence",
+     "Per Q3665 and user ruling on assumption 1: bare aliases price at family newest; an "
+     "id not exactly in usage.PRICES (after stripping claude-, date, [1m]) keeps a "
+     "fallback price and is named with its dollars in totals.unpriced_note on jarvis cost "
+     "and /cost. Rejected zero-pricing: it breaks the ledger identity with the meter.",
+     False),
+    ("price-rate-table", "The table prices sonnet at $2 per million input tokens.", False),
+    ("price-report", "The report prints the list price of each model id.", False),
+    ("pricing-tiers", "Rates come from the pricing table and its tiers.", False),
+    ("charged-rate", "Cache writes are charged at $3.75 per million tokens.", False),
+    ("charged-on-tokens", "The cache-write price is charged on the prompt tokens.", False),
+    ("charges-attention", "An escalation charges the user's attention, nothing else.", False),
+    ("in-charge", "The manager in charge of the sweep reads the ledger.", False),
+    ("billed-at-rate", "Haiku rows are billed at the newest tier.", False),
+    ("invoice-noun", "The invoice column on the report stays blank.", False),
+    ("charge-customer", "Charge the customer once the trial ends.", True),
+    ("charged-card", "Charged the user's card when the retry passed.", True),
+    ("charge-amount", "The retry charged $40 before anyone noticed.", True),
+    ("charged-to-account", "The overage is charged to the team's account.", True),
+    ("charge-of-amount", "A charge of $40 hit the sandbox.", True),
+    ("amount-charge", "A $40 charge hit the sandbox.", True),
+    ("bill-customers", "Bill customers for the overage from next month.", True),
+    ("billed-account", "Billed the account twice for the same seat.", True),
+    ("billed-amount", "The sweep billed 12 dollars to the sandbox.", True),
+    ("invoice-amount", "The vendor sent an invoice for $900.", True),
+    ("invoice-issued", "Issued an invoice to the reseller.", True),
+    ("price-customers-pay", "Raised the price that customers pay next quarter.", True),
+    ("subscription-price", "Raised the subscription price before the renewal.", True),
+    ("spend-budget", "Spending $200 on the paired probe is the plan.", True),
 ]
 
 
