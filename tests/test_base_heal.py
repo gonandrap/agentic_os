@@ -420,7 +420,8 @@ def test_the_head_the_carry_rests_on_is_re_read_immediately_before_the_update(
 
     poll(started, store)
 
-    order = [" ".join(c["argv"][:2]) for c in fake_gh.calls]
+    order = [" ".join(c["argv"][:2]) for c in fake_gh.calls
+             if c["argv"][:2] != ["run", "view"]]
     assert order[:4] == ["pr view", "run list", "pr view", "pr update-branch"]
 
 

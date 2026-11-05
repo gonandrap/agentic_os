@@ -188,16 +188,16 @@ def test_a_red_base_holds_before_the_sha_checks_so_no_round_is_spent():
     assert decision.round_id == 0 and decision.judged_sha == ""
 
 
-def test_the_not_its_fault_clause_needs_the_same_workflow_red_on_this_branch():
-    """Matched on WORKFLOW and never on job name: fail-fast makes the base and the branch different shards..."""
-    same = decide(rnd(), base_red=BASE_RED, pull=pr(checks=(
-        {**check("unit (3.13)", "FAILURE"), "workflow": "ci"},)))
-    assert "not its fault" in same.reason
-    other = decide(rnd(), base_red=BASE_RED, pull=pr(checks=(
-        {**check("lint", "FAILURE"), "workflow": "lint"},)))
-    assert "not its fault" not in other.reason
-    green = decide(rnd(), base_red=BASE_RED)
-    assert "not its fault" not in green.reason
+def test_the_rider_says_only_what_the_poll_established():
+    """Spec 2026-09-18 §2.1: same workflow is not enough; the poll's job and timing test decides"""
+    red = pr(checks=({**check("unit (3.13)", "FAILURE"), "workflow": "ci"},))
+    unproven = decide(rnd(), base_red=BASE_RED, pull=red)
+    assert unproven.code == automerge.HELD_BASE_RED
+    assert "same break" not in unproven.reason
+    shared = decide(rnd(), base_red=replace(BASE_RED, shared_failure=True), pull=red)
+    assert "unit (3.13)" in shared.reason and "may be the same break" in shared.reason
+    green = decide(rnd(), base_red=replace(BASE_RED, shared_failure=True))
+    assert "same break" not in green.reason
 
 
 #: The break's issue, as the OS filed it and as the fix order carries it
