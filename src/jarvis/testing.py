@@ -1464,6 +1464,13 @@ elif argv[:2] == ["run", "list"]:
     limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else 30
     rows = json.loads(os.environ.get("FAKE_GH_RUNS", "{}")).get(branch, [])
     print(json.dumps(rows[:limit]))
+elif argv[:2] == ["run", "view"] and "jobs" in argv:
+    # One base run's jobs; unregistered reads as a `gh` that could not answer
+    jobs = json.loads(os.environ.get("FAKE_GH_RUN_JOBS", "{}")).get(argv[2])
+    if jobs is None:
+        sys.stderr.write(f"run {argv[2]} not found\n")
+        sys.exit(1)
+    print(json.dumps({"jobs": jobs}))
 elif argv[:2] == ["run", "rerun"]:
     # Recorded, and turns nothing green: only a test that registers the new run's outcome gets one (#1123)
     refuse = os.environ.get("FAKE_GH_REFUSE_RERUN")
@@ -2188,11 +2195,18 @@ def fake_gh(tmp_path, monkeypatch):
                     landed.write_text(json.dumps(held))
 
         runs: dict[str, list[dict]] = {}
+        run_jobs: dict[str, list[dict]] = {}
 
         def set_runs(self, branch: str, rows: list[dict]) -> None:
             """Register what `gh run list --branch <branch>` answers, NEWEST FIRST"""
             self.runs[branch] = list(rows)
             monkeypatch.setenv("FAKE_GH_RUNS", json.dumps(self.runs))
+
+        def set_run_jobs(self, run_id: int, conclusions: dict[str, str]) -> None:
+            """Register what `gh run view <id> --json jobs` answers: job name, conclusion"""
+            self.run_jobs[str(run_id)] = [{"name": name, "conclusion": conclusion}
+                                          for name, conclusion in conclusions.items()]
+            monkeypatch.setenv("FAKE_GH_RUN_JOBS", json.dumps(self.run_jobs))
 
         def set_parents(self, sha: str, parents: list[str]) -> None:
             """Say what `gh api …/commits/<sha>` answers for a commit's parents"""

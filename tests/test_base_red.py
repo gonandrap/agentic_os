@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from jarvis import automerge, bugreport, ci, db, gates, invariants, ops
+from jarvis import automerge, bugreport, ci, db, gates, invariants, ops, steward
 from jarvis.catalog import load_catalog
 from jarvis.central_store import BASE_HEALTH_FRESH_SECONDS, CentralStore
 from jarvis.daemon import Daemon
@@ -645,16 +645,132 @@ def test_a_red_base_spends_no_round_number_on_a_moved_head(
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED, merge_state="CLEAN", head_oid="f00dfeed0000")
     red_fleet(fake_gh)
+    fake_gh.set_run_jobs(MAIN_RED["databaseId"], {"unit (3.13)": "failure"})
     before = store.latest_validation_round(wo_id=wo["id"])
 
     poll(started, store)
     started.poll_pull_requests(spec, store)
 
     assert store.latest_validation_round(wo_id=wo["id"]) == before
-    held = store.events_of_kind(wo["id"], "automerge_held")
-    assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_BASE_RED
-    # The rider: this pull request's own `ci` failure is the same break
-    assert "not its fault" in db.from_json(held[-1]["payload"], {})["reason"]
+    assert last_hold(store, wo)["code"] == automerge.HELD_BASE_RED
+
+
+# -- a red base must not hide a pull request's own failure (spec 2026-09-18 §2.1)
+
+
+#: `main` before it broke, so a check can have started on a green head
+MAIN_WAS_GREEN = run(36273000000, "1111111", "success", "2026-09-26T21:00:00Z")
+#: The incident's shape: `main` fails one shard and the aggregator over it
+MAIN_JOBS = {"unit-shard (8)": "failure", "unit (3.13)": "failure",
+             "unit-shard (3)": "success", "evals": "success"}
+BEFORE_THE_BREAK = "2026-09-26T21:20:00Z"
+
+
+def last_hold(store, wo) -> dict:
+    return db.from_json(store.events_of_kind(wo["id"], "automerge_held")[-1]["payload"], {})
+
+
+def poll_red_main(started, spec, project, fake_gh, checks, *, jobs=MAIN_JOBS,
+                  rows=(MAIN_RED, MAIN_WAS_GREEN)):
+    """A parked order with these failing checks, polled once against a red `main`"""
+    opt_in(started)
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=checks, merge_state="CLEAN", head_oid=JUDGED)
+    red_fleet(fake_gh, rows)
+    if jobs is not None:
+        fake_gh.set_run_jobs(MAIN_RED["databaseId"], jobs)
+    poll(started, store)
+    started.poll_pull_requests(spec, store)
+    return store, store.get_work_order(wo["id"])
+
+
+def assert_own_failure(store, wo, fake_gh):
+    """The worker hears about it now, the record claims nothing, and the brake still holds"""
+    assert store.pr_repair_attempts(wo["id"], "checks") == 1
+    assert store.events_of_kind(wo["id"], "pr_base_health") == []
+    hold = last_hold(store, wo)
+    assert hold["code"] == automerge.HELD_BASE_RED
+    assert "same break" not in hold["reason"]
+    assert fake_gh.updates == []
+    assert [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]] == []
+
+
+def test_a_job_that_passed_on_the_red_base_is_the_pull_requests_own(
+        started, spec, project, fake_gh):
+    """PR 1586: `evals` failed here and passed on `main`"""
+    store, wo = poll_red_main(started, spec, project, fake_gh, [check("evals", "FAILURE")])
+    assert_own_failure(store, wo, fake_gh)
+
+
+def test_a_run_that_started_before_the_break_is_the_pull_requests_own(
+        started, spec, project, fake_gh):
+    """PR 1585: same job as `main`'s, but built on the green head before it"""
+    store, wo = poll_red_main(started, spec, project, fake_gh,
+                              [check("unit (3.13)", "FAILURE", started=BEFORE_THE_BREAK)])
+    assert_own_failure(store, wo, fake_gh)
+
+
+def test_one_unmatched_job_makes_the_whole_failure_its_own(started, spec, project, fake_gh):
+    """The aggregator matches `main`; the shard behind it does not"""
+    store, wo = poll_red_main(started, spec, project, fake_gh,
+                              [check("unit (3.13)", "FAILURE"),
+                               check("unit-shard (3)", "FAILURE")])
+    assert_own_failure(store, wo, fake_gh)
+
+
+def test_the_same_job_after_the_break_is_held_and_says_only_may_be(
+        started, spec, project, fake_gh):
+    """Job names cannot split two tests of one shard, so the rider does not claim it is the same"""
+    store, wo = poll_red_main(started, spec, project, fake_gh,
+                              [check("unit-shard (8)", "FAILURE"),
+                               check("unit (3.13)", "FAILURE")])
+    assert store.pr_repair_attempts(wo["id"], "checks") == 0
+    assert store.queued_messages(wo["id"]) == []
+    hold = last_hold(store, wo)
+    assert hold["code"] == automerge.HELD_BASE_RED
+    assert "may be the same break" in hold["reason"]
+    assert "unit-shard (8)" in hold["reason"]
+    assert "waiting for `main`" in invariants.status_label(store, wo)
+
+
+def test_a_job_cancelled_on_the_base_counts_as_a_match(started, spec, project, fake_gh):
+    """Fail-fast hides the base's true failing set: the specs' objection to matching job names"""
+    store, wo = poll_red_main(started, spec, project, fake_gh,
+                              [check("unit (3.11)", "FAILURE")],
+                              jobs={"unit (3.12)": "failure", "unit (3.11)": "cancelled"})
+    assert store.pr_repair_attempts(wo["id"], "checks") == 0
+    assert "may be the same break" in last_hold(store, wo)["reason"]
+
+
+def test_an_unreadable_job_list_holds_and_claims_nothing(started, spec, project, fake_gh):
+    """kn-40db1828: a failed read yields no verdict either way"""
+    store, wo = poll_red_main(started, spec, project, fake_gh,
+                              [check("unit (3.13)", "FAILURE")], jobs=None)
+    assert store.pr_repair_attempts(wo["id"], "checks") == 0
+    hold = last_hold(store, wo)
+    assert hold["code"] == automerge.HELD_BASE_RED
+    assert "same break" not in hold["reason"]
+
+
+def test_a_base_run_still_building_is_not_called_own_or_shared():
+    """The build holds whatever that run proves to be, so no verdict yet"""
+    building = ci.Run(2, "b", "", "in_progress", ci.parse_ts("2026-09-26T21:38:00Z"), "ci")
+    red = ci.Run(1, "a", "failure", "completed", ci.parse_ts("2026-09-26T21:35:00Z"), "ci")
+    checks = ({"name": "unit (3.13)", "workflow": "ci", "started_at": "2026-09-26T21:40:00Z"},)
+    assert ci.failure_standing(checks, (building, red), lambda _: None) == ci.UNREAD_FAILURE
+
+
+@pytest.mark.parametrize("evals_on_main,rebuilt", [("success", False), ("cancelled", True)])
+def test_a_recovered_base_rebuilds_only_a_failure_it_shared(
+        started, spec, project, fake_gh, evals_on_main, rebuilt):
+    """The post-green heal takes the same test; a job cancelled on the base still heals (#298)"""
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=[check("evals", "FAILURE")], head_oid=JUDGED)
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+    fake_gh.set_run_jobs(MAIN_RED["databaseId"], {**MAIN_JOBS, "evals": evals_on_main})
+    started.poll_pull_requests(spec, store)
+    assert fake_gh.updates == ([PR] if rebuilt else [])
+    assert store.pr_repair_attempts(wo["id"], "checks") == (0 if rebuilt else 1)
 
 
 # -- the red-episode list
@@ -802,6 +918,29 @@ def test_a_fresh_red_main_waits_out_the_grace_window(tracker, project, fake_gh):
 
     sweep(tracker, store)
     assert filings(fake_gh) == 1 and fact()["fix_wo_id"]
+
+
+@pytest.mark.parametrize("parent_kind,dispatched", [("bug_agent", True), ("red_main", False)])
+def test_a_break_blamed_on_a_steward_dispatched_merge(tracker, project, fake_gh, parent_kind,
+                                                      dispatched):
+    """io-f48bcdcb: gen-1 parent dispatches; a `red_main` parent is self-reference and does not"""
+    tracker.catalog.project("proj_a").evolution.mode = "enforce"
+    store = ProjectStore(project)
+    poll(tracker, store)
+    stamp = {"origin_kind": parent_kind, "generation": 1}
+    blamed = store.create_work_order("merged", metadata={steward.STAMP_KEY: stamp})["id"]
+    central = CentralStore()
+    central.set_base_health("proj_a", {**fact(central), "wo_id": blamed})
+
+    sweep(tracker, store)
+
+    assert bool(fact().get("fix_wo_id")) is dispatched
+    made = [w for w in orders(store) if w != blamed]
+    assert len(made) == int(dispatched)
+    row = central.conn.execute("SELECT outcome, rule, generation FROM steward_decisions "
+                               "WHERE origin_kind='red_main'").fetchone()
+    want = ("dispatch", "reported-bug") if dispatched else ("queue", "self-reference")
+    assert (row["outcome"], row["rule"], row["generation"]) == (*want, 2)
 
 
 def filings(fake_gh) -> int:

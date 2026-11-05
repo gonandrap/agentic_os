@@ -5867,8 +5867,8 @@ class Daemon:
                                     base_red=base_red)
                 elif pr.failing:
                     # IS THIS THE BRANCH'S FAILURE AT ALL?
-                    handled, pr = self.heal_inherited_failure(project, store, wo, pr,
-                                                              base_ci)
+                    handled, pr, shared = self.heal_inherited_failure(project, store, wo,
+                                                                      pr, base_ci)
                     if not handled and not self.rerun_failed_checks(project, store, wo,
                                                                     pr):
                         self.heal_pull_request(
@@ -5880,7 +5880,8 @@ class Daemon:
                                 base=pr.base_ref or "its base") if pr.behind else ""),
                             **ops.red_run_fields(pr.head_oid, pr.red))
                     self.auto_merge(project, store, wo, pr, record_only=True,
-                                    base_red=base_red)
+                                    base_red=(dataclasses.replace(base_red, shared_failure=True)
+                                              if shared and base_red else base_red))
                 else:
                     healed = pr.mergeable_now and ops.clear_pr_repair(
                         store, wo, ops.PR_CONFLICT)
@@ -7437,7 +7438,7 @@ class Daemon:
 
     def heal_inherited_failure(self, project: ProjectSpec, store: ProjectStore,
                                wo: dict, pr: Any,
-                               base_ci: dict[str, Any]) -> tuple[bool, Any]:
+                               base_ci: dict[Any, Any]) -> tuple[bool, Any, bool]:
         """A pull request red only because its base was (docs/superpowers/specs/2026-09-18-a-red-base-heals-itself.md)"""
         from . import ci, github, ops
 
@@ -7446,7 +7447,7 @@ class Daemon:
         workflows = tuple(dict.fromkeys(
             c.get("workflow") or "" for c in pr.red if c.get("workflow")))
         if not base_ref or not workflows:
-            return False, pr
+            return False, pr, False
 
         if base_ref not in base_ci:
             try:
@@ -7457,15 +7458,42 @@ class Daemon:
                 base_ci[base_ref] = None
         runs = base_ci[base_ref]
         if runs is None:
-            return False, pr
+            return False, pr, False
 
-        if ci.base_is_red(runs, workflows):
+        standing = ci.failure_standing(
+            pr.red, runs, lambda run: self._base_run_jobs(project, run, base_ci))
+        if standing != ci.OWN_FAILURE and ci.base_is_red(runs, workflows):
             if ops.record_base_health(store, wo, red=True, base=base_ref):
                 log.info("[%s] %s is red — holding %s rather than nudging it",
                          project.name, base_ref, wo["id"])
-            return True, pr
+            return True, pr, standing == ci.SHARED_FAILURE
         ops.record_base_health(store, wo, red=False, base=base_ref)
+        if standing == ci.OWN_FAILURE:
+            return False, pr, False
+        handled, pr = self._rebuild_on_recovered_base(project, store, wo, pr, runs, workflows)
+        return handled, pr, False
 
+    def _base_run_jobs(self, project: ProjectSpec, run: Any,
+                       base_ci: dict[Any, Any]) -> frozenset[str] | None:
+        """This base run's unpassed jobs, read once per tick; None when unreadable"""
+        from . import ci, github
+
+        key = (run.run_id, run.attempt)
+        if key not in base_ci:
+            try:
+                base_ci[key] = ci.unpassed_jobs(run, cwd=project.path)
+            except github.GitHubError as e:
+                log.debug("[%s] could not read run %s's jobs: %s", project.name, run.run_id, e)
+                base_ci[key] = None
+        return base_ci[key]
+
+    def _rebuild_on_recovered_base(self, project: ProjectSpec, store: ProjectStore,
+                                   wo: dict, pr: Any, runs: tuple[Any, ...],
+                                   workflows: tuple[str, ...]) -> tuple[bool, Any]:
+        """Rebuild an inherited failure on a green base (docs/superpowers/specs/2026-09-18-a-red-base-heals-itself.md §3)"""
+        from . import ci, github, ops
+
+        base_ref = pr.base_ref or ""
         if not any(ci.inherited(c, runs) for c in pr.red):
             return False, pr
         base_sha = ci.base_sha(runs, workflows)
