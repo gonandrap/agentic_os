@@ -2650,16 +2650,15 @@ def no_stray_cost_threads():
 @pytest.fixture(autouse=True)
 def coverage_seat_finds_nothing(monkeypatch):
     """No GAP verdict in a test reaches a real model; a test wanting a reply patches over this"""
-    from . import seats
+    from types import SimpleNamespace
 
-    real = seats.run_blind
+    from . import seats, verdict_coverage
 
     def run_blind(prompts, **kw):
-        if kw.get("kind") != agent_usage.COVERAGE:
-            return real(prompts, **kw)
         return [seats.Opinion(seat=seat, raw='{"uncovered": []}') for seat in prompts]
 
-    monkeypatch.setattr(seats, "run_blind", run_blind)
+    # Only this module's handle: wrapping `seats.run_blind` broke its eval attribution refusal
+    monkeypatch.setattr(verdict_coverage, "seats", SimpleNamespace(run_blind=run_blind))
 
 
 @pytest.fixture(autouse=True)

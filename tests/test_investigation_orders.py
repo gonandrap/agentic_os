@@ -1505,7 +1505,7 @@ def _seat(monkeypatch, *replies):
                                   replied=False)]
         return [seats.Opinion(seat=verdict_coverage.SEAT, raw=reply)]
 
-    monkeypatch.setattr(seats, "run_blind", run_blind)
+    monkeypatch.setattr(verdict_coverage.seats, "run_blind", run_blind)
     return calls
 
 
