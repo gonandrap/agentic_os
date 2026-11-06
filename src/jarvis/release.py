@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 
-from . import service_manager
+from . import gitrefs, service_manager
 from .paths import production_code_dir, run_dir
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -406,15 +406,9 @@ def tags_containing(root: Path, shas: Sequence[str]) -> tuple[list[str], str]:
     if not shas:
         return [], "no payload commits to look for"
     # FIRST, and best-effort: a tag another release path cut is not in this checkout until it is fetched
-    try:
-        fetched = subprocess.run(
-            ["git", "-C", str(root), "fetch", "--tags", "--quiet", "--force", "origin"],
-            capture_output=True, text=True, timeout=60, check=False)
-        if fetched.returncode != 0:
-            log.debug("could not fetch tags in %s: %s", root,
-                      (fetched.stderr or "").strip()[:200])
-    except (OSError, subprocess.SubprocessError) as e:
-        log.debug("could not fetch tags in %s: %s", root, e)
+    fetched = gitrefs.refresh(root, force=True)
+    if not fetched.ok:
+        log.debug("could not fetch tags in %s: %s", root, fetched.error)
 
     common: set[str] | None = None
     for sha in shas:
