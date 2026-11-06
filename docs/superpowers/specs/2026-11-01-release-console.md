@@ -34,6 +34,13 @@ A page `/release` under **system** (`src/jarvis/ui/app.py`, `ops.release_*`,
 
 Tags never move, so a tag's commit range is cached in-process by `(repo, previous, tag)`.
 
+**Provenance (io-c1bbfff4, Neo Q46).** A local clone is a cache, so the page states what it
+compared: when it asked origin (`release_view.origin_newest`, a read-only
+`git ls-remote --tags origin` — never a fetch, which another order owns), origin's newest
+tag, and the version production runs (`release.production_status`, OS project only). When
+ls-remote fails the page says so and labels the local newest tag `(local)`; it never
+presents it as origin's.
+
 ### 2. Cutting (Q2850)
 
 shipit ships everything up to ONE `--base` sha, so selection is a **prefix cut**: ticking a
@@ -49,6 +56,11 @@ landed fix into an order carrying `BASE_KEY`.
 
 A cut is refused while any release order is still open, naming it — concurrent release
 orders are how empty versions shipped before (kn-4f5aaa2b).
+
+An OS cut is also refused when a `jarvis-*` tag already carries the oldest commit it would
+ship (`release.tags_containing`, which fetches tags first, so a release cut on another
+machine counts). It is refused by tag name BEFORE the order is filed: this was prose in
+`RELEASE_CUT_BRIEF`, enforced by a worker only after a session had been spawned.
 
 Out of scope: arbitrary non-prefix subsets (a cherry-pick mode in shipit).
 

@@ -42,6 +42,23 @@ def tags(repo: Path, glob: str = release.RELEASE_TAG_GLOB) -> list[dict[str, Any
     return rows[::-1]
 
 
+def origin_newest(repo: Path, glob: str = release.RELEASE_TAG_GLOB) -> tuple[str, str]:
+    """origin's newest tag matching `glob`, or why it could not be read (Q46)"""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "ls-remote", "--tags", "--refs",
+             "--sort=version:refname", "origin", f"refs/tags/{glob}"],
+            capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        return "", f"{type(e).__name__}: {e}"
+    if out.returncode != 0:
+        return "", (out.stderr or out.stdout).strip().replace("\n", " ")[:200] or \
+            f"git ls-remote exited {out.returncode}"
+    names = [line.split("refs/tags/", 1)[1] for line in out.stdout.splitlines()
+             if "refs/tags/" in line]
+    return (names[-1] if names else ""), "" if names else f"origin has no {glob} tag"
+
+
 def commits(repo: Path, from_ref: str, to_ref: str) -> list[dict[str, Any]]:
     """First-parent commits of `from..to`, newest first, release bump commits dropped"""
     span = f"{from_ref}..{to_ref}" if from_ref else to_ref

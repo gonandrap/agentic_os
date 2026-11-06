@@ -54,6 +54,13 @@ def seed() -> Path:
         if tag:
             _git(repo, "tag", tag)
     store.close()
+    bare = repo.parent / "origin.git"  # origin is ahead of this clone, as in io-c1bbfff4
+    _git(repo.parent, "init", "-q", "--bare", "origin.git")
+    _git(repo, "remote", "add", "origin", str(bare))
+    _git(repo, "push", "-q", "origin", "main")
+    _git(repo, "tag", "jarvis-0.1.4")
+    _git(repo, "push", "-q", "origin", "jarvis-0.1.4")
+    _git(repo, "tag", "-d", "jarvis-0.1.4")
     app = repo.parent / "shop"  # another project, spec §3
     app.mkdir()
     _git(app, "init", "-q", "-b", "main")
