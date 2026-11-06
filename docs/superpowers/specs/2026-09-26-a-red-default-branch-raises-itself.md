@@ -208,7 +208,10 @@ of one matrix (`src/jarvis/ci.py:314-323`). The fact comes from the passed-in `b
 so `decide` stays pure.
 
 **Superseded by 2026-09-18 §2.1:** the clause is emitted only when the poll established a
-shared failure (`BaseRed.shared_failure`), and it says "may be the same break".
+shared failure (`BaseRed.shared_failure`), and it says "may be the same break". "By WORKFLOW
+and never by job name" and its fail-fast reason are superseded too, not merely qualified (Neo
+3600, 2026-11-04): job-name matching is required, with a job cancelled on the red base run
+counting as a match. The hold itself still pauses the merge unchanged.
 
 The pause does not touch the heal: `heal_inherited_failure` runs in an earlier branch of
 the poll (`src/jarvis/daemon.py:4586-4597`) and is unaffected.

@@ -43,6 +43,13 @@ A failing check is an inherited failure when both hold:
 `ci.inherited` is that predicate, pure. Three things about it are decisions rather than
 implementation:
 
+> **Superseded 2026-11-04 (Neo 3600, io-f48bcdcb).** "Workflow, not job name" below (Neo 435)
+> no longer stands, and its fail-fast rationale is superseded, not merely qualified:
+> **job-name matching is required, with a job cancelled on the red base run counting as a
+> match.** This governs the hold, the rider and the post-green rebuild, so §4's hold and §6's
+> first two steps now sit behind `ci.failure_standing`. §2.1 is the rule. The merge brake does
+> not change.
+
 **Head-when-it-started, not head-when-it-finished.** A pull request built at *t* was
 built as a merge with whatever commit was head at *t*, so the verdict that commit
 eventually received is the verdict describing the base it inherited — whether or not the
