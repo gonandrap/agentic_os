@@ -12556,7 +12556,7 @@ _REQUESTOR_LABELS = {"fleet_health": "fleet health", "neo": "neo rider"}
 
 
 def requestor(store: Any, wo: dict[str, Any]) -> Requestor:
-    """Did a person ask for this work? Judged on the ROOT (spec 2026-11-07-neo-owns-os-origin-assumption-review.md §2.1)"""
+    """Whether a person asked for this work; the ROOT decides (fo-eaf1a59a spec §2.1)"""
     from . import steward
 
     row, is_wo, seen = wo, True, {wo.get("id")}

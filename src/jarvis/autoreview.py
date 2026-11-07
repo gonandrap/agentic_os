@@ -22,7 +22,7 @@ from .stakes import Stakes
 
 log = logging.getLogger(__name__)
 
-#: The `assumptions.requestor` stamp that turns owner mode on (spec 2026-11-07-neo-owns-os-origin-assumption-review.md §1.3)
+#: The `assumptions.requestor` stamp that turns owner mode on (fo-eaf1a59a spec §1.3)
 OWNER_REQUESTOR = "os"
 
 #: The Neo question kind

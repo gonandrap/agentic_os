@@ -1271,7 +1271,7 @@ ADDED_COLUMNS = {
         "spec_path": "TEXT",
         "spec_which": "TEXT",
         "spec_text": "TEXT",
-        # WHO ASKED FOR THE ORDER, stamped at ask time: 'user' | 'os'; NULL reads as user (spec 2026-11-07-neo-owns-os-origin-assumption-review.md §2.2)
+        # WHO ASKED FOR THE ORDER at ask time: 'user' | 'os'; NULL reads as user (§2.2)
         "requestor": "TEXT",
     },
     # WHICH MESSAGE AN ENVELOPE BECAME
