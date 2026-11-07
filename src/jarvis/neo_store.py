@@ -518,6 +518,22 @@ class NeoStore:
         rows = self.conn.execute(" ".join(q), (*params, limit)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def delegations(self, project: str = "", since: float | None = None) -> int:
+        """How many assumption questions the user handed back to Neo (io-c223fe10)"""
+        from .neo import DELEGATED_MARKER
+
+        where, params = ["substr(question, 1, ?) = ?"], [len(DELEGATED_MARKER),
+                                                        DELEGATED_MARKER]
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        return int(self.conn.execute(
+            f"SELECT COUNT(*) FROM questions WHERE {' AND '.join(where)}",
+            params).fetchone()[0])
+
     def question_outcomes(self, project: str = "",
                           since: float | None = None) -> list[dict[str, Any]]:
         """Every question in the window, grouped on (kind, project, day, outcome) (docs/superpowers/specs/2026-10-01-neo-observability.md)"""

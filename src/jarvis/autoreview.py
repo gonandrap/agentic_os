@@ -11,7 +11,8 @@ from itertools import zip_longest
 from typing import Any
 
 from . import concision, sections, specs
-from .neo import MAX_REFINES, REFINE_INSTRUCTION, REFINE_PREFIX, refine_note
+from .neo import (DELEGATED_MARKER, MAX_REFINES, REFINE_INSTRUCTION, REFINE_PREFIX,
+                  refine_note)
 from .catalog import (
     DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
     DEFAULT_VALIDATION_DECISION_RECORD_CHARS,
@@ -1194,7 +1195,8 @@ def _no_summary(wo: dict[str, Any]) -> str:
 def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
                      siblings: list[dict[str, Any]], *, early: bool = False,
                      record: str = "", spec: dict[str, str] | None = None,
-                     spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) -> str:
+                     spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
+                     delegated: bool = False) -> str:
     """What the reviewer reads (#832)"""
     n = assumption.get("n")
     # Pointers, not text: a sibling this one cites is in the decision record (wo-ea3c6f0c)
@@ -1213,6 +1215,10 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         "Answer with `escalate`, `verdict` (`approve`; `deny` OBJECTS, `reason` reaches "
         "the worker), `stakes` (`routine`|`high`), one-line `reason`."
         if early else
+        "Answer with `escalate: false`, `verdict` (`approve`; `deny` sends it back to the "
+        "worker with your `reason` as guidance), `stakes` (`routine`|`high`), one-line "
+        "`reason`. Escalating is NOT an answer here: the user delegated it to you."
+        if delegated else
         "Answer with `escalate`, `verdict` (`approve`; `deny` sends it to the user), "
         "`stakes` (`routine`|`high`), one-line `reason`.")
     answers += (" Where the record or spec settles it, cite the id, or cite the section "
@@ -1324,6 +1330,57 @@ ADVISORY_INTRO = (f"{ADVISORY_MARKER} The OS held this assumption as high-stakes
 def is_advisory(question: dict[str, Any] | None) -> bool:
     """Was this question filed by `propose(advisory=True)`?"""
     return str((question or {}).get("question") or "").startswith(ADVISORY_MARKER)
+
+
+#: Heads a question the user handed back to Neo
+DELEGATED_INTRO = (f"{DELEGATED_MARKER} The user reviewed this escalation and handed it "
+                   "back to you: they do not hold the preference it needs. Decide it: "
+                   "approve, or deny with the reason the worker acts on.")
+
+#: The holds a delegation never overrides
+DELEGATION_NETS = (HELD_HIGH_STAKES, HELD_EVIDENCE_SECRET)
+
+
+def delegation_refusal(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any,
+                       holds: list[dict[str, Any]]) -> str:
+    """Why this row may NOT be delegated to Neo, or "" — the nets still hold (io-c223fe10)"""
+    n = assumption.get("n")
+    for hold in holds:
+        if int(hold.get("assumption_id") or 0) == int(assumption["id"]) \
+                and hold.get("code") in DELEGATION_NETS:
+            return str(hold.get("reason") or f"assumption #{n} is held by a net")
+    evidence = decide_evidence(assumption, summary=str(wo.get("result_summary") or ""))
+    if not evidence.armed:
+        return evidence.reason
+    if not _neo_settles_stakes(cfg):
+        # No model here: the wide regex when the project runs it, the tightened one otherwise
+        wide = str(getattr(cfg, "stakes_classifier", "") or "") in ("regex", "shadow")
+        marker = high_stakes_marker(str(assumption.get("content") or ""),
+                                    tightened=not wide)
+        if marker:
+            return (f"assumption #{n} mentions {marker!r} — high-stakes rows are yours, "
+                    f"delegated or not")
+    return ""
+
+
+def propose_delegated(store: Any, neo: Any, project: str, wo: dict[str, Any],
+                      assumption: dict[str, Any], siblings: list[dict[str, Any]], *,
+                      feedback: str = "", cfg: Any = None) -> dict[str, Any]:
+    """Put ONE escalated assumption back to Neo because the user said "you decide" (io-c223fe10)"""
+    text = _ruling_question(
+        project, wo, assumption, siblings, delegated=True,
+        record=decision_record(store, neo, wo["id"], siblings, assumption,
+                               chars=_record_chars(cfg)),
+        spec=specs.spec_of(store, wo), spec_chars=_spec_chars(cfg))
+    note = f"\n\nThe user's note: {feedback.strip()}" if feedback.strip() else ""
+    question = neo.ask(project, wo["id"], f"{DELEGATED_INTRO}{note}\n\n{text}",
+                       kind=QUESTION_KIND)
+    store.link_assumption_question(assumption["id"], question["id"])
+    store.add_event(wo["id"], "autoreview_asked", {
+        "assumption_id": assumption["id"], "n": assumption.get("n"),
+        "neo_question_id": question["id"], "early": False, "delegated": True,
+        "feedback": feedback})
+    return question
 
 
 def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],

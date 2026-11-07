@@ -377,6 +377,25 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "assumptions_lapsed":
         return "Assumptions lapsed", (f"{p.get('count')} unruled when the order reached "
                                       f"{p.get('status')}; no verdict recorded")
+    if kind == "assumptions_delegated":
+        asked, refused = p.get("asked") or [], p.get("refused") or []
+        return (f"You delegated {len(asked)} assumption(s) to Neo"
+                + (f"; {len(refused)} refused" if refused else ""),
+                "; ".join(f"#{r.get('n')} refused: {r.get('reason')}" for r in refused))
+    if kind == "autoreview_asked" and p.get("delegated"):
+        return (f"Assumption #{p.get('n')} delegated by you to Neo",
+                f"question {p.get('neo_question_id')}")
+    if kind == "autoreview_accepted" and p.get("delegated"):
+        return (f"Assumption #{p.get('n')} accepted — Neo decided (delegated by you), "
+                f"{p.get('model') or 'model not recorded'}",
+                p.get("reason") or "no reason recorded")
+    if kind == "autoreview_rejected":
+        return (f"Assumption #{p.get('n')} rejected — Neo decided (delegated by you); "
+                f"its reason went to the worker",
+                p.get("reason") or "no reason recorded")
+    if kind == "autoreview_escalated" and p.get("delegated"):
+        return (f"Assumption #{p.get('n')}: Neo did not decide it — yours again",
+                p.get("reason") or "no reason recorded")
     # Auto-review's (`ops.AUTOREVIEW_EVENTS`
     if kind == "autoreview_asked":
         return (f"Asked Neo to rule on assumption #{p.get('n')}",
