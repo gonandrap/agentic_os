@@ -1031,6 +1031,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "to the worker. Rows the high-stakes or secret-evidence net "
                         "holds stay yours")
 
+    ov = wo.add_parser("overrule", help="reverse Neo's ruling on one assumption: teaches "
+                                        "Neo; an open order's worker is told, a merged "
+                                        "order gets a fix order")
+    ov.add_argument("wo_id")
+    ov.add_argument("n", type=int, help="the assumption number (#n in `jarvis wo show`)")
+    ov.add_argument("--feedback", default="",
+                    help="what Neo should have ruled, and why (required)")
+    ov.add_argument("--feedback-file", dest="feedback_file", metavar="PATH",
+                    help=_PROSE_FILE_HELP)
+
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
 
@@ -3937,6 +3947,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
                                      feedback=args.feedback,
                                      false_alarm=args.false_alarm), args.json)
+    elif args.wo_cmd == "overrule":
+        _print(ops.overrule_assumption(args.wo_id, args.n, args.feedback), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
     elif args.wo_cmd == "done":
