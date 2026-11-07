@@ -51,7 +51,10 @@ def test_an_owner_rework_is_one_neo_row(started):
 
     r, _ = one_notice(store, wo["id"], "reworked")
     assert r["title"] == f"Neo sent back for rework assumption #1 on {wo['id']}"
-    assert f"jarvis wo overrule {wo['id']} 1" in r["body"]
+    # A rework leaves the row pending, which `wo overrule` refuses: steer the worker instead
+    assert row(store, wo["id"])["status"] == "pending"
+    assert f'jarvis wo send {wo["id"]} "…"' in r["body"]
+    assert "overrule" not in r["body"]
 
 
 def test_the_rework_cap_hands_it_to_the_user_with_why(started):
