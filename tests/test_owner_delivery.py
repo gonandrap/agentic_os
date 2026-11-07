@@ -11,7 +11,7 @@ from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 
 # The fixtures are `test_autoreview.py`'s
-from tests.test_autoreview import JUDGED, PR, ROUTINE, ask, drain, started  # noqa: F401
+from tests.test_autoreview import JUDGED, PR, ROUTINE, ask, drain, inbox, started  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("neo_projects")
 
@@ -143,6 +143,57 @@ def test_a_disallowed_escalate_is_a_rework_and_an_answer(started):
     assert len(reworks(store, wo["id"])) == 1
     assert question(row(store, wo["id"])["neo_question_id"])["status"] == "answered"
     assert events(store, wo["id"], "autoreview_escalated") == []
+
+
+def test_a_routine_owner_refine_is_a_rework(started):
+    store, wo = park(started, f"FORCE_REFINE — {ROUTINE}")
+    ask(started, store)
+    drain(started)
+
+    (msg,) = reworks(store, wo["id"])
+    assert "narrow it" in msg["content"]
+    assert len(events(store, wo["id"], autoreview.REWORKED_EVENT)) == 1
+    assert events(store, wo["id"], "autoreview_escalated") == []
+
+
+def test_a_high_stakes_owner_refine_escalates_not_reworks(started):
+    """Neo Q3768: the stakes net is not owner-overridable, a refine included"""
+    store, wo = park(started, f"FORCE_REFINE_HIGH — {ROUTINE}")
+    ask(started, store)
+    drain(started)
+
+    assert reworks(store, wo["id"]) == []
+    assert events(store, wo["id"], autoreview.REWORKED_EVENT) == []
+    a = row(store, wo["id"])
+    assert a["status"] == "pending"
+    (esc,) = events(store, wo["id"], "autoreview_escalated")
+    assert esc["stakes"] == "high"
+    (ruled,) = events(store, wo["id"], "autoreview_owner_ruled")
+    assert ruled["outcome"] == "escalated" and ruled["cause"] == "stakes-high"
+    (r,) = [x for x in inbox(wo["id"]) if x["title"].startswith("Neo ")]
+    assert r["title"] == f"Neo handed you assumption #1 on {wo['id']}"
+    assert "Neo marked it high-stakes, and those are yours" in r["body"]
+    assert "stakes-high" not in r["body"]
+
+
+def test_a_high_stakes_owner_deny_is_told_too(started):
+    store, wo = park(started, f"FORCE_DENY_HIGH — {ROUTINE}")
+    ask(started, store)
+    drain(started)
+
+    assert events(store, wo["id"], autoreview.REWORKED_EVENT) == []
+    (ruled,) = events(store, wo["id"], "autoreview_owner_ruled")
+    assert ruled["outcome"] == "escalated" and ruled["cause"] == "stakes-high"
+
+
+def test_a_high_stakes_owner_accept_is_not_an_owner_notice(started):
+    """An overridden accept is the OS's net, not Neo's ruling"""
+    store, wo = park(started, f"FORCE_ACCEPT_HIGH — {ROUTINE}")
+    ask(started, store)
+    drain(started)
+
+    assert row(store, wo["id"])["status"] == "pending"
+    assert events(store, wo["id"], "autoreview_owner_ruled") == []
 
 
 def test_conflicting_authority_still_escalates(started):

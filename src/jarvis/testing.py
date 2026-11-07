@@ -1188,6 +1188,15 @@ elif "-p" in argv and "--resume" not in argv:
             verdict = {"escalate": True, "verdict": "deny", "stakes": "routine",
                        "cause": "conflicting-authority",
                        "reason": "test-forced: contradicts the user's answer on Q1"}
+        elif "FORCE_REFINE_HIGH" in prompt:
+            verdict = {"escalate": False, "refine": True, "verdict": "deny",
+                       "stakes": "high", "reason": "test-forced: narrow it, high-stakes"}
+        elif "FORCE_REFINE" in prompt:
+            verdict = {"escalate": False, "refine": True, "verdict": "deny",
+                       "stakes": "routine", "reason": "test-forced: narrow it"}
+        elif "FORCE_DENY_HIGH" in prompt:
+            verdict = {"escalate": False, "verdict": "deny", "stakes": "high",
+                       "reason": "test-forced: wrong, and high-stakes"}
         elif "FORCE_ACCEPT_HIGH" in prompt:
             verdict = {"escalate": False, "verdict": "approve", "stakes": "high",
                        "reason": "test-forced: accepted, and high-stakes"}
