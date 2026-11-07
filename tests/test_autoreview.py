@@ -1916,6 +1916,7 @@ class FakeStore:
         pass
 
     link_assumption_confirmation = link_assumption_question
+    set_assumption_requestor = link_assumption_question
 
     def add_event(self, *a) -> None:
         pass

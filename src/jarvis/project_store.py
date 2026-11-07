@@ -1271,6 +1271,8 @@ ADDED_COLUMNS = {
         "spec_path": "TEXT",
         "spec_which": "TEXT",
         "spec_text": "TEXT",
+        # WHO ASKED FOR THE ORDER, stamped at ask time: 'user' | 'os'; NULL reads as user (spec 2026-11-07-neo-owns-os-origin-assumption-review.md §2.2)
+        "requestor": "TEXT",
     },
     # WHICH MESSAGE AN ENVELOPE BECAME
     "envelopes": {
@@ -3909,6 +3911,11 @@ class ProjectStore:
         """Link the SECOND question"""
         self.conn.execute("UPDATE assumptions SET confirm_question_id=? WHERE id=?",
                           (question_id, assumption_id))
+
+    def set_assumption_requestor(self, assumption_id: int, kind: str) -> None:
+        """Stamp who asked for the order, at ask time (`ops.requestor`)"""
+        self.conn.execute("UPDATE assumptions SET requestor=? WHERE id=?",
+                          (kind, assumption_id))
 
     def clear_assumption_confirmation(self, assumption_id: int) -> None:
         """Forget a confirmation the OS itself threw the ruling away on, so it re-asks"""

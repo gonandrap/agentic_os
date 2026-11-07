@@ -86,6 +86,8 @@ class _Store:
     def link_assumption_question(self, *_a):
         pass
 
+    set_assumption_requestor = link_assumption_question
+
     def review_assumption(self, aid, status, **kw):
         self.reviewed.append((aid, status, kw["decided_by"]))
 

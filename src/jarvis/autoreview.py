@@ -22,6 +22,9 @@ from .stakes import Stakes
 
 log = logging.getLogger(__name__)
 
+#: The `assumptions.requestor` stamp that turns owner mode on (spec 2026-11-07-neo-owns-os-origin-assumption-review.md §1.3)
+OWNER_REQUESTOR = "os"
+
 #: The Neo question kind
 QUESTION_KIND = "assumption"
 
@@ -1192,11 +1195,28 @@ def _no_summary(wo: dict[str, Any]) -> str:
             if wo.get("kind") == "manager" else "(nothing recorded)")
 
 
+def _requestor_block(label: str) -> list[str]:
+    """A fact, not an instruction; empty keeps a user-origin packet byte-identical (§2.3)"""
+    return [f"# Who asked for this work order\n{label}"] if label else []
+
+
+def _requestor(store: Any, wo: dict[str, Any]) -> Any:
+    """`ops.requestor`, imported late: ops imports daemon, which imports this module"""
+    from . import ops
+
+    return ops.requestor(store, wo)
+
+
+def _requestor_label(who: Any) -> str:
+    """Only an OS-origin order names its source; a user one stays byte-identical (§2.3)"""
+    return who.label if who.kind == OWNER_REQUESTOR else ""
+
+
 def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
                      siblings: list[dict[str, Any]], *, early: bool = False,
                      record: str = "", spec: dict[str, str] | None = None,
                      spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
-                     delegated: bool = False) -> str:
+                     delegated: bool = False, requestor_label: str = "") -> str:
     """What the reviewer reads (#832)"""
     n = assumption.get("n")
     # Pointers, not text: a sibling this one cites is in the decision record (wo-ea3c6f0c)
@@ -1232,6 +1252,7 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         f"# The assumption\n{assumption.get('content') or '(empty)'}",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:2000]}",
+        *_requestor_block(requestor_label),
         *_spec_blocks(assumption, spec, spec_chars),
         delivered,
         f"# Other assumptions on this order — do not rule on these: {others}",
@@ -1248,7 +1269,8 @@ CONFIRM_SUMMARY_CHARS = 1500
 def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
                       siblings: list[dict[str, Any]],
                       record: str = "", spec: dict[str, str] | None = None,
-                      spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) -> str:
+                      spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
+                      requestor_label: str = "") -> str:
     """What the reviewer reads at DELIVERY (#102)"""
     n = assumption.get("n")
     others = "\n".join(sibling_line(s) for s in siblings
@@ -1268,6 +1290,7 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"panel's judgement, not yours.",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:CONFIRM_DESCRIPTION_CHARS]}",
+        *_requestor_block(requestor_label),
         *_spec_blocks(assumption, spec, spec_chars),
         f"# What the worker says it delivered\n"
         f"{(wo.get('result_summary') or _no_summary(wo))[:CONFIRM_SUMMARY_CHARS]}",
@@ -1300,6 +1323,7 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                          assumption: dict[str, Any], siblings: list[dict[str, Any]],
                          *, cfg: Any = None) -> dict[str, Any]:
     """Put ONE already-judged assumption back to Neo at delivery"""
+    who = _requestor(store, wo)
     question = neo.ask(project, wo["id"],
                        _confirm_question(project, wo, assumption, siblings,
                                          decision_record(
@@ -1307,10 +1331,13 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                                              chars=_record_chars(cfg)),
                                          # GitHub issue #1035
                                          spec=specs.spec_of(store, wo),
-                                         spec_chars=_spec_chars(cfg)),
+                                         spec_chars=_spec_chars(cfg),
+                                         requestor_label=_requestor_label(who)),
                        # No `context`: the packet carries the description already (wo-ea3c6f0c)
                        kind=QUESTION_KIND)
     store.link_assumption_confirmation(assumption["id"], question["id"])
+    # Re-stamped by the same predicate: never flipped unless the predicate says so (§2.2)
+    store.set_assumption_requestor(assumption["id"], who.kind)
     store.add_event(wo["id"], "autoreview_asked", {
         "assumption_id": assumption["id"], "n": assumption.get("n"),
         "neo_question_id": question["id"], "confirm": True})
@@ -1393,6 +1420,7 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
                        concision.DEFAULT_ASSUME_MAX_CHARS) if early else ""
     if note and neo.refines(wo["id"], QUESTION_KIND) >= MAX_REFINES:
         note = ""
+    who = _requestor(store, wo)
     if note:
         # A row, so `neo stats` counts it; it holds what was returned and goes to no model
         question = neo.ask(project, wo["id"],
@@ -1402,6 +1430,7 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
                            kind=QUESTION_KIND)
         neo.mark(question["id"], "refined", reason=note)
         store.link_assumption_question(assumption["id"], question["id"])
+        store.set_assumption_requestor(assumption["id"], who.kind)
         return_to_worker(store, wo["id"], assumption, note, question["id"])
         return question
     text = _ruling_question(
@@ -1410,12 +1439,15 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
                                chars=_record_chars(cfg)),
         # GitHub issue #1035: resolved here, so no caller changes
         spec=specs.spec_of(store, wo),
-        spec_chars=_spec_chars(cfg))
+        spec_chars=_spec_chars(cfg),
+        requestor_label=_requestor_label(who))
     if advisory:
         text = f"{ADVISORY_INTRO}\n\n{text}"
     # No `context`: the packet carries the description already (wo-ea3c6f0c)
     question = neo.ask(project, wo["id"], text, kind=QUESTION_KIND)
     store.link_assumption_question(assumption["id"], question["id"])
+    # Advisory too: stamped, though §4 never runs owner mode on it
+    store.set_assumption_requestor(assumption["id"], who.kind)
     if advisory:
         # No `autoreview_asked`: the hold stays the row's state until the advice lands
         log.info("auto-review asked Neo to advise on held assumption #%s of %s as "
