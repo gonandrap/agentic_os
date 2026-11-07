@@ -12544,6 +12544,53 @@ def launched_by_os(wo: dict[str, Any]) -> bool:
                 or wo.get("trigger_wo_id") or steward.stamp_of(wo))
 
 
+@dataclass(frozen=True)
+class Requestor:
+    """Who asked for an order: `user` or `os`, and the source in the user's words"""
+    kind: str
+    label: str
+
+
+#: How a self origin reads to the user; one not listed reads as itself
+_REQUESTOR_LABELS = {"fleet_health": "fleet health", "neo": "neo rider"}
+
+
+def requestor(store: Any, wo: dict[str, Any]) -> Requestor:
+    """Whether a person asked for this work; the ROOT decides (fo-eaf1a59a spec §2.1)"""
+    from . import steward
+
+    row, is_wo, seen = wo, True, {wo.get("id")}
+    while row.get("parent_id"):
+        pid = row["parent_id"]
+        if pid in seen:
+            log.warning("requestor: parent cycle at %s under %s; reads as os", pid, wo.get("id"))
+            return Requestor("os", "os")
+        seen.add(pid)
+        # Feature order first: `create_work_order` only takes one as parent
+        try:
+            row, is_wo = store.get_feature_order(pid), False
+        except KeyError:
+            try:
+                row, is_wo = store.get_work_order(pid), True
+            except KeyError:
+                # Dangling parent: judge the last row found by provenance alone
+                log.warning("requestor: parent %s of %s not found", pid, wo.get("id"))
+                is_wo = False
+                break
+    stamp = steward.stamp_of(row)
+    # Not `launched_by_os` on a feature-order root: its legacy clause reads a user's `fo create` as OS
+    own = launched_by_os(row) if is_wo else (row.get("origin") in _SELF_ORIGINS or bool(stamp))
+    if not own:
+        return Requestor("user", "you")
+    if stamp:
+        decision = stamp.get("decision_id")
+        return Requestor("os", f"steward: {stamp.get('origin_kind') or 'unknown'}"
+                               + (f", decision #{decision}" if decision else ""))
+    origin = row.get("origin")
+    return Requestor("os", _REQUESTOR_LABELS.get(origin, origin)
+                     if origin in _SELF_ORIGINS else "os")
+
+
 def wo_tags(wo: dict[str, Any], project: str) -> list[str]:
     """The chips on an order's row: project, bug, expedite, automatic|manual"""
     from . import issues
