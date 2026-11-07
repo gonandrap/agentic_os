@@ -11284,7 +11284,7 @@ def validate_seat(seat: str) -> None:
 def record_neo_correction(neo: Any, question_id: int, feedback: str, *, seat: str = "",
                           origin_kind: str = "question", origin_id: str = ""
                           ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Mark one Neo answer corrected and teach Neo the user's words (shared by `neo_review` and `overrule_assumption`)"""
+    """Mark one Neo answer corrected and teach Neo the user's words"""
     from . import neo as neo_mod
 
     q = neo.review(question_id, False, feedback)
