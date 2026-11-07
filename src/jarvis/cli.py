@@ -5740,6 +5740,12 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
           f"{'' if q['asked'] == 1 else 's'} asked\n")
     _print_assumption_rows(res["assumptions"])
     print(f"  objections          {_objection_line(res['objections'])}\n")
+    you, os_ = res["by_requestor"]["user"], res["by_requestor"]["os"]
+    print(f"  asked by you        {you['rows']:>4} rows · Neo decided {you['neo_decided']} · "
+          f"escalated {you['neo_escalated']} · never reached Neo {you['never_reached_neo']}")
+    print(f"  asked by the OS     {os_['rows']:>4} rows · Neo decided {os_['neo_decided']} · "
+          f"escalated {os_['neo_escalated']} · reworked {os_['reworked']} · "
+          f"rework cap {os_['rework_capped']} · overruled by you {os_['overruled']}\n")
 
     print("QUESTIONS — plumbing telemetry")
     print(f"  note: {res['questions_note']}")
