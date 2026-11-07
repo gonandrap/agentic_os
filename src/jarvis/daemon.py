@@ -6872,8 +6872,8 @@ class Daemon:
         confirming = int(assumption.get("confirm_question_id") or 0) == int(q["id"])
         if ruling.rework and str(wo.get("status") or "") not in TERMINAL_STATUSES:
             # BEFORE the `decide` re-check below, which would drop it (fo-eaf1a59a spec §4.2)
-            self._rework_assumption(neo_store, pstore, wo, numbered, q, verdict, ruling,
-                                    confirming=confirming)
+            self._rework_assumption(central, neo_store, pstore, wo, numbered, q, verdict,
+                                    ruling, confirming=confirming)
             return
         prior = {"provisional_verdict": assumption.get("provisional_verdict") or "",
                  "provisional_reason": assumption.get("provisional_reason") or "",
@@ -6897,6 +6897,12 @@ class Daemon:
             log.info("auto-review left assumption #%s of %s with the user: %s",
                      numbered.get("n"), wo["id"], ruling.reason)
             ops.flag_assumptions_pending(pstore, wo["id"])
+            cause = str(verdict.get("cause") or "")
+            if (owner and not ruling.overridden
+                    and cause in autoreview.OWNER_ESCALATION_CAUSES):
+                self._notify_owner_ruling(central, pstore, wo, numbered, q,
+                                          outcome="escalated", reason=ruling.reason,
+                                          cause=cause)
             return
 
         project = next((p for p in self.catalog.projects if p.name == q["project"]), None)
@@ -6966,6 +6972,11 @@ class Daemon:
                 "model": ruling.model, "neo_question_id": q["id"], **prior})
         log.info("auto-review accepted assumption #%s of %s (%s left) — %s",
                  numbered.get("n"), wo["id"], out["pending"], out["status"])
+        if owner:
+            # One row per owner ruling REPLACES the batched notice below (fo-eaf1a59a spec §6)
+            self._notify_owner_ruling(central, pstore, wo, numbered, q,
+                                      outcome="accepted", reason=ruling.reason)
+            return
         if not out["settled"]:
             return
         decided = [a for a in pstore.all_assumptions(wo["id"])
@@ -7076,9 +7087,44 @@ class Daemon:
                 for e in pstore.events_of_kind(wo_id, autoreview.REWORKED_EVENT)
                 if int(e["id"]) < last}
 
-    def _rework_assumption(self, neo_store: Any, pstore: ProjectStore, wo: dict,
-                           assumption: dict, q: dict, verdict: dict, ruling: Any, *,
-                           confirming: bool) -> None:
+    def _notify_owner_ruling(self, central: CentralStore, pstore: ProjectStore, wo: dict,
+                             assumption: dict, q: dict, *, outcome: str, reason: str,
+                             cause: str = "") -> None:
+        """Tell the user one owner ruling they did not make (fo-eaf1a59a spec §6)"""
+        from . import autoreview, ops
+
+        n, wo_id = assumption.get("n"), wo["id"]
+        # The ruling is already written; a failed notice is logged, never raised (spec §6)
+        try:
+            pstore.add_event(wo_id, "autoreview_owner_ruled", {
+                "assumption_id": assumption["id"], "n": n, "outcome": outcome,
+                "reason": reason, "neo_question_id": q["id"], "cause": cause})
+            verb = {"accepted": "accepted", "reworked": "sent back for rework",
+                    "escalated": "handed you"}[outcome]
+            line = (str(reason or "").strip().splitlines() or ["no reason given"])[0]
+            if outcome == "escalated":
+                # The cause's OS label (`rework-cap`) is never shown; the user reads why
+                why = (f"Neo sent it back for rework {autoreview.MAX_REWORKS} times and the "
+                       f"work still did not satisfy it" if cause == "rework-cap" else
+                       "it conflicts with something you ruled, so only you can settle it")
+                last = (f"Why it is yours: {why}.\n"
+                        f"Decide it: jarvis wo review {wo_id} [--reject] --feedback \"…\"")
+            else:
+                last = (f"Wrong call? jarvis wo overrule {wo_id} {n} --feedback \"…\"")
+            central.add_inbox(
+                project=q["project"], level="info",
+                title=f"Neo {verb} assumption #{n} on {wo_id}",
+                body=f"{wo.get('title') or ''}\n"
+                     f"Asked by: {ops.requestor(pstore, wo).label}\n"
+                     f"Neo: {line}\n"
+                     f"What it ruled: jarvis wo show {wo_id}\n{last}",
+                wo_id=wo_id, push=False)
+        except Exception:  # noqa: BLE001 — a notice must never undo the ruling
+            log.exception("owner-ruling notice for assumption #%s of %s failed", n, wo_id)
+
+    def _rework_assumption(self, central: CentralStore, neo_store: Any, pstore: ProjectStore,
+                           wo: dict, assumption: dict, q: dict, verdict: dict, ruling: Any,
+                           *, confirming: bool) -> None:
         """Neo, as owner, sends one assumption back to the worker (fo-eaf1a59a spec §4.2)"""
         from . import autoreview, db, ops
 
@@ -7097,6 +7143,8 @@ class Daemon:
                 "cause": cause, "confirming": confirming})
             log.info("auto-review: rework cap spent on assumption #%s of %s", n, wo_id)
             ops.flag_assumptions_pending(pstore, wo_id)
+            self._notify_owner_ruling(central, pstore, wo, assumption, q,
+                                      outcome="escalated", reason=ruling.reason, cause=cause)
             return
         if verdict.get("escalate"):
             # The drain marked it escalated; a disallowed escalate read as rework is an answer
@@ -7115,6 +7163,8 @@ class Daemon:
             "neo_question_id": q["id"], "confirming": confirming, "attempt": attempt})
         log.info("auto-review: Neo sent assumption #%s of %s back for rework (%d/%d)",
                  n, wo_id, attempt, autoreview.MAX_REWORKS)
+        self._notify_owner_ruling(central, pstore, wo, assumption, q,
+                                  outcome="reworked", reason=ruling.reason)
 
     def _record_advice(self, neo_store: Any, pstore: ProjectStore, wo: dict,
                        assumption: dict, q: dict, verdict: dict) -> None:
