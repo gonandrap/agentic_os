@@ -3558,7 +3558,20 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
         " the work order" + landing
     reject = ("Rejects " + rows + " and resumes" if pending else "Resumes") + \
         " the worker, with your reason as the guidance it is sent back with"
+    from . import autoreview
+
+    delegable = 0
+    if pending and wo["status"] == autoreview.REVIEW_PASS_STATUS:
+        holds = [db.from_json(e["payload"], {})
+                 for e in store.events_of_kind(wo["id"], "autoreview_held")]
+        # Not offered when every row is held: the nets keep those (io-c223fe10); cfg=None is the strict net
+        delegable = sum(1 for a in pending_rows
+                        if not autoreview.delegation_refusal(a, wo, None, holds))
     return {
+        "delegate": (f"Neo re-rules {delegable} of {rows} you do not hold the "
+                     f"preference for: accepts, or rejects with its reason to the worker; "
+                     f"high-stakes and secret-bearing rows stay yours"
+                     if delegable else ""),
         "pending": pending,
         "escalated": escalated,
         "round": int(latest["round"]) if latest else None,
@@ -3669,7 +3682,8 @@ def review_lines(state: dict[str, Any]) -> list[str]:
         lines.append(f"why: {state['why']}")
     lines += [f"next: {command}" for command in state.get("next") or []]
     return lines + [f"accept: {state['accept']}",
-                    f"reject: {state['reject']} {state['strands']}"]
+                    f"reject: {state['reject']} {state['strands']}"] + (
+        [f"delegate: {state['delegate']} (--delegate)"] if state.get("delegate") else [])
 
 
 def assumption_decider(a: dict[str, Any]) -> str:
@@ -4190,6 +4204,13 @@ def _autoreview_line(state: dict[str, Any]) -> str:
     # One shared suffix: both "left with you" branches make the same claim...
     since = (f"; since {state['resolved_status']} by {state['resolved_decider']}"
              if state.get("resolved_status") else "")
+    if kind == "autoreview_accepted" and state.get("delegated"):
+        return (f"assumption #{n} accepted — Neo decided (delegated by you), "
+                f"{state.get('model') or 'model not recorded'}: "
+                f"{state.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_asked" and state.get("delegated") and not state.get("unreachable"):
+        return (f"assumption #{n} delegated by you — with Neo (question "
+                f"{state.get('neo_question_id')})")
     if kind == "autoreview_accepted":
         return (f"assumption #{n} accepted by the OS (Neo, "
                 f"{state.get('model') or 'model not recorded'}) — "
@@ -7040,7 +7061,8 @@ def lapse_moot_assumptions(store: ProjectStore, wo: dict[str, Any], reason: str)
 def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any],
                       assumption: dict[str, Any], *, reason: str, model: str,
                       question_id: int, cfg: Any,
-                      config_version_id: str | None = None) -> dict[str, Any]:
+                      config_version_id: str | None = None,
+                      delegated: bool = False, land: bool = True) -> dict[str, Any]:
     """THE OS settling ONE assumption on the user's behalf (docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md §4.)"""
     wo_id = wo["id"]
     store.review_assumption(
@@ -7051,11 +7073,12 @@ def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any
     store.add_event(wo_id, "autoreview_accepted", {
         "assumption_id": assumption["id"], "n": assumption.get("n"),
         "reason": reason, "model": model, "neo_question_id": question_id,
-        "decided_by": ASSUMPTION_DECIDER_OS})
+        "decided_by": ASSUMPTION_DECIDER_OS,
+        **({"delegated": True} if delegated else {})})
     pending = store.pending_assumptions(wo_id)
     status = str(wo.get("status") or "")
     # A manager settles with its feature, never on its assumptions (io-d5e62d4d)
-    settled = not pending and not settles_idle(wo)
+    settled = land and not pending and not settles_idle(wo)
     if settled:
         status = _land_after_acceptance(store, project_path, wo_id, cfg)
     return {"wo_id": wo_id, "assumption_id": assumption["id"],
@@ -7230,6 +7253,59 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
         except OpsError as e:
             out["delivery_error"] = str(e)
     return out
+
+
+#: The one event a `--delegate` writes: what went to Neo and what the nets kept (io-c223fe10)
+DELEGATED_EVENT = "assumptions_delegated"
+
+
+def delegate_assumptions(wo_id: str, feedback: str = "") -> dict[str, Any]:
+    """"Let Neo decide": re-ask Neo on every pending row the nets allow (io-c223fe10)"""
+    from . import autoreview
+    from .neo_store import NEO_HELD_Q_STATUSES, NeoStore
+
+    name, path, wo = find_work_order(wo_id)
+    if wo["status"] != autoreview.REVIEW_PASS_STATUS:
+        raise OpsError(f"{wo_id} is {wo['status']}, not needs_review: there is no "
+                       f"escalation to delegate")
+    marker = autoreview.secret_marker_text(feedback or "")
+    if marker:
+        raise OpsError(f"your note carries {marker}; the OS will not copy a secret into "
+                       f"a stored question — drop it and delegate again")
+    cfg = validation_config(name)
+    store = ProjectStore(path)
+    neo = NeoStore()
+    try:
+        rows = store.all_assumptions(wo_id)
+        holds = [db.from_json(e["payload"], {})
+                 for e in store.events_of_kind(wo_id, "autoreview_held")]
+        asked, refused = [], []
+        for a in rows:
+            if a["status"] != "pending":
+                continue
+            linked = neo.get(int(a.get("neo_question_id") or 0))
+            why = (f"assumption #{a['n']} is already with Neo (question {linked['id']})"
+                   if linked and linked["status"] in NEO_HELD_Q_STATUSES
+                   else autoreview.delegation_refusal(a, wo, cfg, holds))
+            if why:
+                refused.append({"n": a["n"], "assumption_id": a["id"], "reason": why})
+                continue
+            q = autoreview.propose_delegated(store, neo, name, wo, a, rows,
+                                             feedback=feedback, cfg=cfg)
+            asked.append({"n": a["n"], "assumption_id": a["id"], "question_id": q["id"]})
+        # Recorded even when nothing went: a refusal the timeline omits is silence
+        store.add_event(wo_id, DELEGATED_EVENT, {"asked": asked, "refused": refused,
+                                                 "feedback": feedback})
+    finally:
+        neo.close()
+        store.close()
+    if not asked:
+        reasons = "; ".join(r["reason"] for r in refused) or "no pending assumptions"
+        raise OpsError(f"nothing on {wo_id} can go to Neo — {reasons}. Decide it "
+                       f"yourself: jarvis wo review {wo_id} [--reject] --feedback \"…\"")
+    return {"project": name, "wo_id": wo_id, "delegated": asked, "refused": refused,
+            "note": "Neo decides each one: accepted, or rejected with its reason sent "
+                    "to the worker; the ruling shows as 'Neo decided (delegated by you)'"}
 
 
 # -- feature orders
@@ -16933,6 +17009,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         outcomes = neo.question_outcomes(project or "", since)
         cause_rows = neo.escalation_cause_counts(project or "", since)
         order_rows = neo.questions_per_order(project or "", since)
+        questions["delegated"] = neo.delegations(project or "", since)
     finally:
         neo.close()
 

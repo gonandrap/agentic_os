@@ -2570,6 +2570,14 @@ def create_app() -> FastAPI:
     @app.post("/wo/{name}/{wo_id}/review")
     def review(name: str, wo_id: str, decision: str = Form(...),
                feedback: str = Form("")):
+        if decision == "delegate":
+            try:
+                ops.delegate_assumptions(wo_id, feedback=feedback)
+            except ops.OpsError as e:
+                # The refusal says why on the page, not as a silent no-op (kn-53a20d3a)
+                return RedirectResponse(f"/wo/{name}/{wo_id}?error={quote(str(e))}",
+                                        status_code=303)
+            return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
         ops.review_work_order(wo_id, accept=(decision == "accept"), feedback=feedback)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 

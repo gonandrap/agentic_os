@@ -24,7 +24,8 @@ from .central_store import ARCHIVED, SETTLED_BACKLOG_STATUSES, CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE, invariant_title
-from .neo_store import QuestionTooLargeError
+from .neo import ANSWER_PREFIX, is_delegated
+from .neo_store import MAX_ANSWER_ATTEMPTS, QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
 # The `os_state` keys the dashboard's self-heal keeps
 from .uilog import (UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS,
@@ -6823,6 +6824,10 @@ class Daemon:
         if autoreview.is_advisory(q):
             self._record_advice(neo_store, pstore, wo, numbered, q, verdict)
             return
+        if is_delegated(q):
+            self._deliver_delegated_verdict(central, neo_store, pstore, wo, numbered, q,
+                                            verdict)
+            return
         if verdict.get("refine"):
             if self._asked_early(pstore, wo["id"], int(q["id"])):
                 autoreview.return_to_worker(pstore, wo["id"], numbered,
@@ -6945,6 +6950,81 @@ class Daemon:
                  f"If any of it was wrong: jarvis neo review {q['id']} "
                  f"--correct \"…\" teaches Neo not to do it again.",
             wo_id=wo["id"], push=False)
+
+    def _deliver_delegated_verdict(self, central: CentralStore, neo_store: Any,
+                                   pstore: ProjectStore, wo: dict, assumption: dict,
+                                   q: dict, verdict: dict) -> None:
+        """Neo's ruling on a row the user delegated: accept, or reject to the worker (io-c223fe10)"""
+        from . import autoreview, db, ops
+
+        n, wo_id = assumption.get("n"), wo["id"]
+        ruling = autoreview.read_ruling(verdict, default_model=self.catalog.os.neo.model)
+        project = next((p for p in self.catalog.projects if p.name == q["project"]), None)
+        if verdict.get("escalate"):
+            why = (f"Neo did not decide it after you delegated it "
+                   f"({MAX_ANSWER_ATTEMPTS} tries): {ruling.reason}")
+        elif str(wo.get("status") or "") != autoreview.REVIEW_PASS_STATUS:
+            why = (f"the order moved to {wo.get('status')} before Neo ruled, so its ruling "
+                   f"was not applied")
+        elif ruling.overridden:
+            why = ruling.reason
+        elif project is None:
+            why = f"project {q['project']!r} is not in the catalog"
+        else:
+            why = ""
+        if why:
+            # Back with the user, SAYING WHY: silence is the failure (kn-53a20d3a)
+            if not verdict.get("escalate"):
+                neo_store.mark(q["id"], "escalated", reason=why,
+                               cause=autoreview.escalation_cause(ruling))
+            pstore.add_event(wo_id, "autoreview_escalated", {
+                "assumption_id": assumption["id"], "n": n, "reason": why,
+                "stakes": ruling.stakes, "model": ruling.model,
+                "neo_question_id": q["id"], "overridden": ruling.overridden,
+                "delegated": True})
+            central.add_inbox(
+                project=q["project"], level="warn",
+                title=f"Neo did not decide assumption #{n} on {wo_id} — it is yours again",
+                body=f"{wo.get('title') or ''}\n{why}\nDecide it: jarvis wo review {wo_id} "
+                     f"[--reject] --feedback \"…\"",
+                wo_id=wo_id, push=False)
+            ops.flag_assumptions_pending(pstore, wo_id)
+            return
+        assert project is not None
+        reason = str(verdict.get("reason") or "").strip() or "no reason given"
+        if ruling.accept:
+            # A sibling Neo rejected in the same delegation sends the order back: never land over it
+            batch = [db.from_json(e["payload"], {})
+                     for e in pstore.events_of_kind(wo_id, ops.DELEGATED_EVENT)]
+            ids = {int(x["assumption_id"]) for x in (batch[-1].get("asked") or [])} \
+                if batch else set()
+            rejected = any(a["status"] == "rejected" and int(a["id"]) in ids
+                           for a in pstore.all_assumptions(wo_id))
+            ops.accept_assumption(pstore, project.path, wo, assumption,
+                                  reason=reason, model=ruling.model,
+                                  question_id=int(q["id"]), cfg=project.validation,
+                                  delegated=True, land=not rejected)
+            verb = "accepted"
+        else:
+            pstore.review_assumption(assumption["id"], "rejected",
+                                     decided_by=autoreview.DECIDER, reason=reason,
+                                     model=ruling.model,
+                                     config_version=ops.current_config_version())
+            pstore.queue_message(
+                wo_id, f"{ANSWER_PREFIX} the user delegated assumption #{n} to Neo, and "
+                       f"Neo rejected it: {reason}. Reconsider that call and act on it.",
+                source="neo")
+            pstore.add_event(wo_id, "autoreview_rejected", {
+                "assumption_id": assumption["id"], "n": n, "reason": reason,
+                "model": ruling.model, "neo_question_id": q["id"],
+                "decided_by": autoreview.DECIDER, "delegated": True})
+            verb = "rejected — its reason went to the worker"
+        central.add_inbox(
+            project=q["project"], level="info",
+            title=f"Neo decided (delegated by you): assumption #{n} on {wo_id} {verb}",
+            body=f"{wo.get('title') or ''}\n{reason}\n"
+                 f"If it was wrong: jarvis neo review {q['id']} --correct \"…\"",
+            wo_id=wo_id, push=False)
 
     def _asked_early(self, pstore: ProjectStore, wo_id: str, question_id: int) -> bool:
         """Was this assumption question filed by the EARLY pass?"""

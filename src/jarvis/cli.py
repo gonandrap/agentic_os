@@ -1025,6 +1025,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the high-stakes net was WRONG to hold these: record a defect "
                         "in the net that fired (also read from 'false alarm' in "
                         "--feedback)")
+    r.add_argument("--delegate", action="store_true",
+                   help="'Let Neo decide': you do not hold the preference, so Neo "
+                        "re-rules each escalated row — accept, or reject with its reason "
+                        "to the worker. Rows the high-stakes or secret-evidence net "
+                        "holds stay yours")
 
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
@@ -3923,6 +3928,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                           evidence=args.evidence, abandon=args.abandon,
                           superseded_by=args.superseded_by,
                           needs_user=args.needs_user), args.json)
+    elif args.wo_cmd == "review" and args.delegate:
+        if args.reject or args.false_alarm:
+            raise ops.OpsError("--delegate hands the decision to Neo; it cannot be "
+                               "combined with --reject or --false-alarm")
+        _print(ops.delegate_assumptions(args.wo_id, feedback=args.feedback), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
                                      feedback=args.feedback,
@@ -5728,6 +5738,8 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     print(f"  superseded        {q['superseded']}  (decided elsewhere, out of the rate)")
     print(f"  refined           {q['refined']}  (returned to the asker to split, out of the rate)")
     print(f"  lapsed            {q['lapsed']}  (its order ended first, out of the rate)")
+    print(f"  delegated by you  {q.get('delegated', 0)}  (escalations you handed back: "
+          f"`wo review --delegate`)")
     print(f"  escalation rate   {_pct(q['escalation_rate'])}  "
           f"(over settled questions only)")
     # Its own figure, never blended into the escalation rate: a crash is not a decision

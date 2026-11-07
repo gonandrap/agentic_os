@@ -14,6 +14,16 @@ log = logging.getLogger("neo")
 # Keep in sync with the OPERATION.md / worker-contract wording: workers are told the answer arrives...
 ANSWER_PREFIX = "[Neo, answering for the user]"
 
+#: Heads an assumption question the USER handed back to Neo (`jarvis wo review --delegate`, io-c223fe10)
+DELEGATED_MARKER = "[DELEGATED-BY-USER]"
+#: Stamped on a delegated question re-queued because Neo escalated or refined instead of ruling
+DELEGATED_NOT_ANSWER = "delegated, so escalate/refine is not an answer — asked again: "
+
+
+def is_delegated(question: dict[str, Any] | None) -> bool:
+    """Was this question filed by `ops.delegate_assumptions`?"""
+    return str((question or {}).get("question") or "").startswith(DELEGATED_MARKER)
+
 PERSONA = """You are Neo, the user's delegate inside the Jarvis agentic OS.
 
 Worker agents across the user's projects ask questions when they need a human
@@ -398,6 +408,14 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             if store.requeue_unreadable(q["id"], f"{UNPARSEABLE_PREFIX}{raw}"):
                 results.append({"question": q, "verdict": None, "outcome": "queued"})
                 continue
+        elif is_delegated(q) and (verdict.get("escalate") or verdict.get("refine")):
+            # The user delegated it: only accept or reject is an answer (kn-40db1828)
+            if store.requeue_unreadable(q["id"],
+                                        f"{DELEGATED_NOT_ANSWER}{verdict.get('reason') or ''}"):
+                results.append({"question": q, "verdict": None, "outcome": "queued"})
+                continue
+            # Attempts spent: the user gets it back, saying Neo did not decide it
+            verdict = {**verdict, "refine": False, "escalate": True}
         if verdict.get("refine") and not refinable:
             # The loop cap: a bounce past it is the user's to settle
             verdict = {**verdict, "refine": False, "escalate": True,
