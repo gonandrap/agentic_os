@@ -33,6 +33,9 @@
     <button name="decision" value="reject" class="danger"
             title="{{ review.reject }}">{{ 'Reject all' if review.pending
                                            else 'Send it back' }}</button>
+    {# io-c223fe10: absent when the nets hold every row #}
+    {% if review.delegate %}<button name="decision" value="delegate"
+            title="{{ review.delegate }}">Let Neo decide</button>{% endif %}
   </form>
 </div>
 {# WHAT EACH BUTTON DOES, as text beside it — a `title=` is a thing nobody hovers, and the
@@ -67,4 +70,7 @@
 <div class="row"><span class="sub">Accept: {{ review.accept }}</span></div>
 <div class="row"><span class="sub">Send back: {{ review.reject }}
   {{ review.strands }}</span></div>
+{% if review.delegate %}<div class="row"><span class="sub">Let Neo decide: {{
+  review.delegate }}.</span></div>
+{% endif %}
 {% endmacro %}
