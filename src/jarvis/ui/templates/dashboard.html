@@ -28,7 +28,7 @@
   {% elif a.fo_id %}{{ ui.row_id(a.fo_id, order_path(a.project, a.fo_id)) }}{% endif %}
   <strong>{{ a.project }}</strong> — {{ a.title }}
   <div class="sub">{{ a.reason }}
-    {%- if a.approval_id %} · <a href="/gates/{{ a.approval_id }}">decide it →</a>
+    {%- if a.approval_id %} · <a href="/gates/{{ a.approval_id }}?project={{ a.project | urlencode }}">decide it →</a>
     {%- elif a.status == 'backlog_escalated' %} · <a href="/backlog?project={{ a.project }}">decide it →</a>{% endif %}</div>
 {% endcall %}
 <div class="sub">{{ attention_list_note }}</div>
