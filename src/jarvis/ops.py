@@ -116,6 +116,15 @@ class OpsError(RuntimeError):
     """User-facing operational error"""
 
 
+class AmbiguousApproval(OpsError):
+    """An approval number that names a gate in several projects"""
+
+    def __init__(self, approval_id: int, projects: list[str]) -> None:
+        super().__init__(f"approval id {approval_id} exists in {projects} — "
+                         f"disambiguate with --project")
+        self.projects = projects
+
+
 # -- catalog resolution
 
 def resolve_catalog(catalog_path: str | None = None) -> Catalog:
@@ -11670,10 +11679,7 @@ def _find_approval(approval_id: int, project_name: str | None = None
     if not hits:
         raise OpsError(f"approval {approval_id} not found in any registered project")
     if len(hits) > 1:
-        raise OpsError(
-            f"approval id {approval_id} exists in {[h[0] for h in hits]} — "
-            f"disambiguate with --project"
-        )
+        raise AmbiguousApproval(approval_id, [h[0] for h in hits])
     return hits[0]
 
 
