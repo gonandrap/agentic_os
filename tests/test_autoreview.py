@@ -1997,8 +1997,18 @@ def test_a_cited_question_answered_outside_the_query_window_is_shown_in_full():
     out = record(*newer, cited, siblings=[cites], ruling_on=cites, window=3)
 
     assert "not answered" not in out
-    assert "  Q887 (cited by the assumption) [answered by neo]" in out
+    assert "  Q887 (cited by the assumption) [answered by neo" in out
     assert "the user said: keep the shim" in out
+
+
+def test_neo_answered_rows_are_labelled_as_neos_own_ruling():
+    """io-c223fe10: Neo read its own Q3714 back as 'the premise the user chose'"""
+    out = record(qrow(id=887), qrow(id=886, answered_by="user"),
+                 qrow(id=885, review_status="corrected", review_feedback="no, keep it"))
+
+    assert f"  Q887 [{autoreview.NEO_OWN_RULING}]" in out
+    assert "  Q886 [answered by user]" in out
+    assert "  Q885 [answered by neo]" in out, "a user-corrected row is the user's ruling"
 
 
 def test_short_items_the_cap_evicts_are_counted_exactly():
