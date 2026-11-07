@@ -71,6 +71,7 @@ jarvis backlog promote <id> --as feature   # intake -> feature order
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--yes]   # --yes: its open dependencies are promoted too
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on reject it reaches the worker
+jarvis wo overrule <id> <n> --feedback "why"   # reverse NEO's ruling on #n; merged work gets a fix order
 jarvis wo budget <id> [<usd>] [--clear]    # dollar ceiling on one order; raising it resumes it
 jarvis fo budget <id> [<usd>] [--clear]    # family budget for a whole feature
 jarvis wo ack <id> / --all                 # "seen it" — refuses on pending assumptions
