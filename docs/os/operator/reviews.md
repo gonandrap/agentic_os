@@ -13,6 +13,10 @@ authoritative flag list; this is the WHY behind each command.
 
 feedback teaches Neo; on --reject it also goes to the worker. A project may hand the ROUTINE ones to Neo: `jarvis config set <project> validation.auto_review true --reason "…"`. Ships OFF everywhere, and it only ever ACCEPTS — anything Neo cannot defend, and anything high-stakes, still waits for the user, with Neo's reading attached. What it decided, and why, is on `jarvis wo show` against each assumption, saying the OS decided it and never you. Correct one with `jarvis neo review <qid> --correct "…"`.
 
+## `jarvis wo overrule <id> <n> --feedback "why"`
+
+Reverse Neo's ruling on assumption `#n` (any row Neo decided; a row the user decided, or one still pending, is `wo review`'s). It marks Neo's answer corrected and teaches Neo the feedback, flips the row to rejected by the user, and then: an open order's worker gets the feedback as a message; a merged (`completed`) order gets a new fix order the user owns; a failed or cancelled order gets the record only, and the output says so.
+
 ## `jarvis validation show <wo-id|fo-id>`
 
 HOW a unit was judged. `wo show` and `fo show` already carry each round — its number, its outcome and the reason the submitter was sent back. This is the deliberation behind them: every seat's verdict, model, latency and raw reply, plus the envelopes the feedback travelled in. On demand only, so nothing pushes it at the user; reach for it when they ask WHY a unit was rejected, not to report that it was. Takes either id.
