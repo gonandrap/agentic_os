@@ -1183,7 +1183,12 @@ elif "-p" in argv and "--resume" not in argv:
         #
         # HIGH before ACCEPT: the one contains the other, and the override it exercises
         # is the net that has to hold when Neo says yes.
-        if "FORCE_ACCEPT_HIGH" in prompt:
+        if "FORCE_CONFLICT" in prompt:
+            # The one cause an owner-mode escalation keeps (fo-eaf1a59a spec §3.2)
+            verdict = {"escalate": True, "verdict": "deny", "stakes": "routine",
+                       "cause": "conflicting-authority",
+                       "reason": "test-forced: contradicts the user's answer on Q1"}
+        elif "FORCE_ACCEPT_HIGH" in prompt:
             verdict = {"escalate": False, "verdict": "approve", "stakes": "high",
                        "reason": "test-forced: accepted, and high-stakes"}
         elif "FORCE_ACCEPT" in prompt:

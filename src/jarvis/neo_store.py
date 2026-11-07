@@ -64,6 +64,7 @@ ESCALATION_CAUSES_OVERRIDDEN = (
     "stakes-unreadable",      # a stakes word the OS cannot read as routine
     "neo-denied",             # `verdict: deny`, and there is no machine rejection
     "scope-over-cap",         # children at or over `plans.CHILD_CAP`
+    "rework-cap",             # owner order: `autoreview.MAX_REWORKS` reworks spent
 )
 # FAILED is derived by the OS at the code path too
 ESCALATION_CAUSES_FAILED = (
