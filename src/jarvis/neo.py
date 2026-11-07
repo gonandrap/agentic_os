@@ -14,7 +14,7 @@ log = logging.getLogger("neo")
 # Keep in sync with the OPERATION.md / worker-contract wording: workers are told the answer arrives...
 ANSWER_PREFIX = "[Neo, answering for the user]"
 
-#: Heads an assumption question the USER handed back to Neo (`jarvis wo review --delegate`, io-c223fe10)
+#: Heads a question the user delegated via `wo review --delegate`; persisted, never change it
 DELEGATED_MARKER = "[DELEGATED-BY-USER]"
 #: Stamped on a delegated question re-queued because Neo escalated or refined instead of ruling
 DELEGATED_NOT_ANSWER = "delegated, so escalate/refine is not an answer — asked again: "

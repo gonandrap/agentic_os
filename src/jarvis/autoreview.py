@@ -1315,7 +1315,7 @@ def is_advisory(question: dict[str, Any] | None) -> bool:
     return str((question or {}).get("question") or "").startswith(ADVISORY_MARKER)
 
 
-#: Heads a question the user handed back to Neo; the marker is persisted, the words are free (io-c223fe10)
+#: Heads a question the user handed back to Neo
 DELEGATED_INTRO = (f"{DELEGATED_MARKER} The user reviewed this escalation and handed it "
                    "back to you: they do not hold the preference it needs. Decide it: "
                    "approve, or deny with the reason the worker acts on.")

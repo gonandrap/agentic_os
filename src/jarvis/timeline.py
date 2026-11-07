@@ -377,8 +377,6 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "assumptions_lapsed":
         return "Assumptions lapsed", (f"{p.get('count')} unruled when the order reached "
                                       f"{p.get('status')}; no verdict recorded")
-    # Auto-review's (`ops.AUTOREVIEW_EVENTS`
-    # A delegation (io-c223fe10): the user handed escalations back to Neo
     if kind == "assumptions_delegated":
         asked, refused = p.get("asked") or [], p.get("refused") or []
         return (f"You delegated {len(asked)} assumption(s) to Neo"
@@ -398,6 +396,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "autoreview_escalated" and p.get("delegated"):
         return (f"Assumption #{p.get('n')}: Neo did not decide it — yours again",
                 p.get("reason") or "no reason recorded")
+    # Auto-review's (`ops.AUTOREVIEW_EVENTS`
     if kind == "autoreview_asked":
         return (f"Asked Neo to rule on assumption #{p.get('n')}",
                 f"question {p['neo_question_id']}" if p.get("neo_question_id") else "")
