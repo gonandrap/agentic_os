@@ -6863,11 +6863,6 @@ class Daemon:
         ruling = autoreview.read_ruling(verdict,
                                         default_model=self.catalog.os.neo.model,
                                         owner=owner)
-        if owner and refined:
-            # A delivered refine on an owner order is a rework (fo-eaf1a59a spec §4.4)
-            ruling = autoreview.Ruling(
-                accept=False, rework=True, stakes=ruling.stakes, model=ruling.model,
-                reason=str(verdict.get("reason") or "").strip() or "no reason given")
         # WHICH PASS THIS VERDICT ANSWERS IS A FACT RECORDED AT ASK TIME
         confirming = int(assumption.get("confirm_question_id") or 0) == int(q["id"])
         if ruling.rework and str(wo.get("status") or "") not in TERMINAL_STATUSES:
@@ -6898,8 +6893,11 @@ class Daemon:
                      numbered.get("n"), wo["id"], ruling.reason)
             ops.flag_assumptions_pending(pstore, wo["id"])
             cause = str(verdict.get("cause") or "")
+            if owner and not ruling.overridden and ruling.stakes == autoreview.STAKES_HIGH:
+                # A high-stakes deny or refine is the user's, and never silent (Neo Q3793, kn-53a20d3a)
+                cause = "stakes-high"
             if (owner and not ruling.overridden
-                    and cause in autoreview.OWNER_ESCALATION_CAUSES):
+                    and cause in (*autoreview.OWNER_ESCALATION_CAUSES, "stakes-high")):
                 self._notify_owner_ruling(central, pstore, wo, numbered, q,
                                           outcome="escalated", reason=ruling.reason,
                                           cause=cause)
@@ -7106,6 +7104,8 @@ class Daemon:
                 # The cause's OS label (`rework-cap`) is never shown; the user reads why
                 why = (f"Neo sent it back for rework {autoreview.MAX_REWORKS} times and the "
                        f"work still did not satisfy it" if cause == "rework-cap" else
+                       "Neo marked it high-stakes, and those are yours"
+                       if cause == "stakes-high" else
                        "it conflicts with something you ruled, so only you can settle it")
                 last = (f"Why it is yours: {why}.\n"
                         f"Decide it: jarvis wo review {wo_id} [--reject] --feedback \"…\"")
