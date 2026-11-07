@@ -503,6 +503,7 @@ def test_every_cause_this_helper_can_return_is_in_the_overridden_class():
         autoreview.escalation_cause(autoreview.read_ruling(accepted(stakes="elevated"))),
         autoreview.escalation_cause(autoreview.read_ruling(accepted(verdict="denied"))),
         autoreview.escalation_cause(over_cap=True),
+        autoreview.escalation_cause(rework_cap=True),
     }
     assert produced == set(ESCALATION_CAUSES_OVERRIDDEN)
     assert not produced & set(ESCALATION_CAUSES_CHOSEN)

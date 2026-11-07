@@ -497,6 +497,8 @@ class Ruling:
 MAX_REWORKS = 2
 #: The only cause Neo may CHOOSE to escalate an owner-mode assumption (spec 2026-11-07 §3.2)
 OWNER_ESCALATION_CAUSES = ("conflicting-authority",)
+# Neo sent one assumption back to the worker; the rework cap counts these (fo-eaf1a59a spec §4.2)
+REWORKED_EVENT = "autoreview_reworked"
 
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
@@ -567,7 +569,8 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
            refusal_answered: bool = True, undeclared_delivery: bool = False,
            asked_question_id: int = 0,
            unreachable_question_ids: Collection[int] = (),
-           stakes: Stakes | None = None) -> Decision:
+           stakes: Stakes | None = None,
+           reworked_question_ids: Collection[int] = ()) -> Decision:
     """May the OS decide this assumption right now?"""
     if not (getattr(cfg, "enabled", False) and getattr(cfg, "auto_review", False)):
         return _held(HELD_DISABLED,
@@ -594,8 +597,10 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      REFUSAL_UNDECLARED_REASON if undeclared_delivery
                      else REFUSAL_UNANSWERED_REASON, **fields)
     asked = int(assumption.get("neo_question_id") or 0)
+    # A reworked link is re-asked on re-delivery (fo-eaf1a59a spec §4.2)
     if asked and asked != int(asked_question_id or 0) \
-            and asked not in unreachable_question_ids:
+            and asked not in unreachable_question_ids \
+            and asked not in reworked_question_ids:
         return _held(HELD_ASKED,
                      f"assumption #{n} is already with Neo (question {asked})", **fields)
     if _neo_settles_stakes(cfg):
@@ -620,7 +625,8 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                    objections_outstanding: bool = False,
                    unreachable_question_ids: Collection[int] = (),
                    confirmation_open: bool = True,
-                   stakes: Stakes | None = None) -> Decision:
+                   stakes: Stakes | None = None,
+                   reworked_question_ids: Collection[int] = ()) -> Decision:
     """May the OS CONFIRM this early verdict now, at delivery? (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md §7.)"""
     verdict = str(assumption.get("provisional_verdict") or "")
     aid = int(assumption.get("id") or 0)
@@ -640,7 +646,8 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      f"nothing, so there is nothing to confirm and it is yours",
                      **fields)
     confirming = int(assumption.get("confirm_question_id") or 0)
-    if confirming and confirming not in unreachable_question_ids:
+    if (confirming and confirming not in unreachable_question_ids
+            and confirming not in reworked_question_ids):
         if not confirmation_open:
             # 2026-09-28 spec §6: the question id is in the PROSE because the dashboard's link is driven by...
             return _held(HELD_CONFIRM_SPENT,
@@ -668,7 +675,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                   # Forwarded, not consumed: both gates need it
                   unreachable_question_ids=unreachable_question_ids,
                   # Forwarded unchanged (2026-09-25 spec SS3.7): the confirmation pass is gated by the same verdict the...
-                  stakes=stakes)
+                  stakes=stakes, reworked_question_ids=reworked_question_ids)
 
 
 def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
@@ -758,10 +765,12 @@ def read_ruling(verdict: dict[str, Any], default_model: str = "", *,
 
 
 def escalation_cause(ruling: Ruling | None = None, *, escalate: bool = False,
-                     over_cap: bool = False) -> str:
+                     over_cap: bool = False, rework_cap: bool = False) -> str:
     """WHY THE OS ESCALATED A QUESTION NEO HAD ALREADY ANSWERED, as one groupable label (docs/superpowers/specs/2026-10-01-neo-observability.md)"""
     if over_cap:
         return "" if escalate else "scope-over-cap"
+    if rework_cap:
+        return "rework-cap"
     if ruling is None or escalate:
         return ""
     if ruling.overridden:
@@ -1383,7 +1392,8 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                                          # GitHub issue #1035
                                          spec=specs.spec_of(store, wo),
                                          spec_chars=_spec_chars(cfg),
-                                         requestor_label=_requestor_label(who)),
+                                         requestor_label=_requestor_label(who),
+                                         owner=who.kind == OWNER_REQUESTOR),
                        # No `context`: the packet carries the description already (wo-ea3c6f0c)
                        kind=QUESTION_KIND)
     store.link_assumption_confirmation(assumption["id"], question["id"])
@@ -1491,7 +1501,9 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
         # GitHub issue #1035: resolved here, so no caller changes
         spec=specs.spec_of(store, wo),
         spec_chars=_spec_chars(cfg),
-        requestor_label=_requestor_label(who))
+        requestor_label=_requestor_label(who),
+        # Advice is the user's to act on, never the owner's (fo-eaf1a59a spec §4.1)
+        owner=who.kind == OWNER_REQUESTOR and not advisory)
     if advisory:
         text = f"{ADVISORY_INTRO}\n\n{text}"
     # No `context`: the packet carries the description already (wo-ea3c6f0c)

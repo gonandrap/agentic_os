@@ -1005,7 +1005,7 @@ def test_the_three_classes_are_disjoint_and_sum_to_the_enum():
     assert chosen | overridden | failed == set(ESCALATION_CAUSES)
     assert len(ESCALATION_CAUSES) == len(set(ESCALATION_CAUSES))
     assert overridden == {"stakes-high", "stakes-unclassified", "stakes-unreadable",
-                          "neo-denied", "scope-over-cap"}
+                          "neo-denied", "scope-over-cap", "rework-cap"}
 
 
 def test_a_model_may_never_name_an_overridden_cause(jarvis_home):

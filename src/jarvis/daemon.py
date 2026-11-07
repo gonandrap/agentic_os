@@ -25,7 +25,7 @@ from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE, invariant_title
 from .neo import ANSWER_PREFIX, is_delegated
-from .neo_store import MAX_ANSWER_ATTEMPTS, QuestionTooLargeError
+from .neo_store import ESCALATION_CAUSES_FAILED, MAX_ANSWER_ATTEMPTS, QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
 # The `os_state` keys the dashboard's self-heal keeps
 from .uilog import (UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS,
@@ -6626,6 +6626,9 @@ class Daemon:
         undeclared = not answered and invariants_mod.undeclared_delivery(store, wo)
         objecting = bool(store.outstanding_objections(wo["id"]))
         dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
+        # Early pass never re-asks a reworked link: the kept link is what holds it (fo-eaf1a59a spec §4.2)
+        reworked = {} if early else {
+            "reworked_question_ids": self._reworked_questions(store, wo["id"])}
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
         holds_before = len(store.events_of_kind(wo["id"], "autoreview_held"))
@@ -6633,8 +6636,12 @@ class Daemon:
             # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.1
             if str(a.get("status") or "") != "pending":
                 continue
+            owner = str(a.get("requestor") or "") == autoreview.OWNER_REQUESTOR
+            # An owner's early objection is re-asked on the delivered pass, never HELD_OBJECTED (§4.4)
+            owner_objected = (owner and str(a.get("provisional_verdict") or "")
+                              == autoreview.PROVISIONAL_OBJECT)
             # `not early` is the third guard on this branch
-            if not early and str(a.get("provisional_verdict") or ""):
+            if not early and str(a.get("provisional_verdict") or "") and not owner_objected:
                 def confirm(stakes_verdict=None, a=a):
                     return autoreview.decide_confirm(
                         a, wo, cfg, round_outcome=outcome, round_n=round_n,
@@ -6644,7 +6651,7 @@ class Daemon:
                         # 2026-09-28 spec §6: is Neo still holding the confirmation?
                         confirmation_open=int(a.get("confirm_question_id") or 0)
                         in open_questions,
-                        stakes=stakes_verdict)
+                        stakes=stakes_verdict, **reworked)
 
                 decision = self._stakes_reviewed(project, store, wo, cfg, a,
                                                  confirm(), confirm)
@@ -6670,6 +6677,8 @@ class Daemon:
             # Advice on a hold is not a ruling in flight: the hold stays the row's state (wo-6d90354c)
             advised = linked if linked and not early and autoreview.is_advisory(
                 neo_store.get(linked)) else 0
+            if owner_objected and linked and self._asked_early(store, wo["id"], linked):
+                advised = linked
 
             def judge(stakes_verdict=None, a=a, advised=advised):
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
@@ -6678,7 +6687,7 @@ class Daemon:
                             undeclared_delivery=undeclared,
                             asked_question_id=advised,
                             unreachable_question_ids=dead_questions,
-                            stakes=stakes_verdict)
+                            stakes=stakes_verdict, **reworked)
 
             decision = self._stakes_reviewed(project, store, wo, cfg, a, judge(), judge)
             if not decision.armed:
@@ -6831,32 +6840,49 @@ class Daemon:
             self._deliver_delegated_verdict(central, neo_store, pstore, wo, numbered, q,
                                             verdict)
             return
-        if verdict.get("refine"):
-            if self._asked_early(pstore, wo["id"], int(q["id"])):
+        early = self._asked_early(pstore, wo["id"], int(q["id"]))
+        # Owner mode is the ask-time stamp; a failed call is never an owner ruling (kn-40db1828)
+        owner = (str(assumption.get("requestor") or "") == autoreview.OWNER_REQUESTOR
+                 and verdict.get("cause") not in ESCALATION_CAUSES_FAILED)
+        refined = bool(verdict.get("refine"))
+        if refined:
+            if early:
                 autoreview.return_to_worker(pstore, wo["id"], numbered,
                                             verdict["reason"], int(q["id"]))
                 return
-            # A delivered worker cannot re-file: the user settles it
-            neo_store.mark(q["id"], "escalated", reason=verdict["reason"],
-                           cause="scope-too-large")
-            verdict = {**verdict, "refine": False, "escalate": True}
-        if self._asked_early(pstore, wo["id"], int(q["id"])):
+            if not owner:
+                # A delivered worker cannot re-file: the user settles it
+                neo_store.mark(q["id"], "escalated", reason=verdict["reason"],
+                               cause="scope-too-large")
+                verdict = {**verdict, "refine": False, "escalate": True}
+        if early:
             # THE EARLY PASS ASKED THIS ONE, so its answer may only be RECORDED
             self._record_early_assumption_verdict(neo_store, pstore, wo, numbered, q,
                                                   verdict)
             return
         ruling = autoreview.read_ruling(verdict,
-                                        default_model=self.catalog.os.neo.model)
+                                        default_model=self.catalog.os.neo.model,
+                                        owner=owner)
+        if owner and refined:
+            # A delivered refine on an owner order is a rework (fo-eaf1a59a spec §4.4)
+            ruling = autoreview.Ruling(
+                accept=False, rework=True, stakes=ruling.stakes, model=ruling.model,
+                reason=str(verdict.get("reason") or "").strip() or "no reason given")
         # WHICH PASS THIS VERDICT ANSWERS IS A FACT RECORDED AT ASK TIME
         confirming = int(assumption.get("confirm_question_id") or 0) == int(q["id"])
+        if ruling.rework and str(wo.get("status") or "") not in TERMINAL_STATUSES:
+            # BEFORE the `decide` re-check below, which would drop it (fo-eaf1a59a spec §4.2)
+            self._rework_assumption(neo_store, pstore, wo, numbered, q, verdict, ruling,
+                                    confirming=confirming)
+            return
         prior = {"provisional_verdict": assumption.get("provisional_verdict") or "",
                  "provisional_reason": assumption.get("provisional_reason") or "",
                  "provisional_model": assumption.get("provisional_model") or ""}
         if not ruling.accept:
             if not verdict.get("escalate"):
-                # NEO ANSWERED AND THE ANSWER IS NOT WHAT HAPPENS
+                # NEO ANSWERED AND THE ANSWER IS NOT WHAT HAPPENS; a rework is never `neo-denied` (§3.2)
                 neo_store.mark(q["id"], "escalated", reason=ruling.reason,
-                               cause=autoreview.escalation_cause(
+                               cause="" if ruling.rework else autoreview.escalation_cause(
                                    ruling, escalate=bool(verdict.get("escalate"))))
             payload = {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
@@ -7038,6 +7064,57 @@ class Daemon:
             if int(payload.get("neo_question_id") or 0) == question_id:
                 return bool(payload.get("early"))
         return False
+
+    def _reworked_questions(self, pstore: ProjectStore, wo_id: str) -> set[int]:
+        """Questions Neo sent back for rework that a later `finished` re-delivered (fo-eaf1a59a spec §4.2)"""
+        from . import autoreview, db
+
+        # Before the worker finishes again the summary is stale: re-asking then judges old text
+        last = max((int(e["id"]) for e in pstore.events_of_kind(wo_id, "finished")),
+                   default=0)
+        return {int(db.from_json(e["payload"], {}).get("neo_question_id") or 0)
+                for e in pstore.events_of_kind(wo_id, autoreview.REWORKED_EVENT)
+                if int(e["id"]) < last}
+
+    def _rework_assumption(self, neo_store: Any, pstore: ProjectStore, wo: dict,
+                           assumption: dict, q: dict, verdict: dict, ruling: Any, *,
+                           confirming: bool) -> None:
+        """Neo, as owner, sends one assumption back to the worker (fo-eaf1a59a spec §4.2)"""
+        from . import autoreview, db, ops
+
+        wo_id, n, aid = wo["id"], assumption.get("n"), int(assumption["id"])
+        attempt = 1 + sum(
+            1 for e in pstore.events_of_kind(wo_id, autoreview.REWORKED_EVENT)
+            if int(db.from_json(e["payload"], {}).get("assumption_id") or 0) == aid)
+        if attempt > autoreview.MAX_REWORKS:
+            why = (f"Neo asked for rework {autoreview.MAX_REWORKS} times and delivery "
+                   f"{attempt} still did not satisfy it. Neo's last reason: {ruling.reason}")
+            cause = autoreview.escalation_cause(rework_cap=True)
+            neo_store.mark(q["id"], "escalated", reason=why, cause=cause)
+            pstore.add_event(wo_id, "autoreview_escalated", {
+                "assumption_id": aid, "n": n, "reason": why, "stakes": ruling.stakes,
+                "model": ruling.model, "neo_question_id": q["id"], "overridden": False,
+                "cause": cause, "confirming": confirming})
+            log.info("auto-review: rework cap spent on assumption #%s of %s", n, wo_id)
+            ops.flag_assumptions_pending(pstore, wo_id)
+            return
+        if verdict.get("escalate"):
+            # The drain marked it escalated; a disallowed escalate read as rework is an answer
+            neo_store.record_answer(q["id"], str(verdict.get("answer") or ""),
+                                    answered_by="neo", reason=ruling.reason)
+        # PLAIN, never an objection envelope: `deliver_messages` withdraws those on `needs_review`
+        pstore.queue_message(
+            wo_id, f"[Neo, owner of this OS-origin order] rework assumption #{n}: "
+                   f"{ruling.reason}. Change the work, then run jarvis wo finish again "
+                   f"with a fresh summary; if the decision itself changed, record it with "
+                   f"jarvis wo assume citing assumption #{n}.",
+            source="neo")
+        # The link is KEPT: clearing it would arm the early pass while the worker reworks
+        pstore.add_event(wo_id, autoreview.REWORKED_EVENT, {
+            "assumption_id": aid, "n": n, "reason": ruling.reason,
+            "neo_question_id": q["id"], "confirming": confirming, "attempt": attempt})
+        log.info("auto-review: Neo sent assumption #%s of %s back for rework (%d/%d)",
+                 n, wo_id, attempt, autoreview.MAX_REWORKS)
 
     def _record_advice(self, neo_store: Any, pstore: ProjectStore, wo: dict,
                        assumption: dict, q: dict, verdict: dict) -> None:
