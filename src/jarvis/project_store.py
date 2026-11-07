@@ -4006,20 +4006,31 @@ class ProjectStore:
         args: tuple[Any, ...] = () if since is None else (since,)
         rows = db_mod.rows_to_dicts(self.conn.execute(
             "SELECT id, wo_id, ts, status, decided_by, neo_question_id,"
-            f" confirm_question_id FROM assumptions{bound} ORDER BY ts, id",
+            f" confirm_question_id, requestor FROM assumptions{bound} ORDER BY ts, id",
             args).fetchall())
         asked: set[int] = set()
         last_hold: dict[int, str] = {}
         high_stakes: set[int] = set()
         false_alarms: set[int] = set()
         dropped = {"total": 0, "re_asked": 0}
+        # Per row, so `neo stats` can split each by `assumptions.requestor` (spec 2026-11-07 §7)
+        dropped_events: list[tuple[int, bool]] = []
+        owner: dict[str, dict[int, int]] = {"reworked": {}, "rework_capped": {},
+                                            "overruled": {}}
         for event in self.conn.execute(
                 "SELECT kind, payload FROM wo_events WHERE kind IN ('autoreview_asked',"
                 " 'autoreview_held', 'autoreview_escalated',"
-                " 'autoreview_stakes_false_alarm') ORDER BY ts").fetchall():
+                " 'autoreview_stakes_false_alarm', 'autoreview_reworked',"
+                " 'assumption_overruled') ORDER BY ts").fetchall():
             payload = db_mod.from_json(event["payload"], {})
             aid = int(payload.get("assumption_id") or 0)
             kind = event["kind"]
+            if kind in ("autoreview_reworked", "assumption_overruled"):
+                key = "reworked" if kind == "autoreview_reworked" else "overruled"
+                owner[key][aid] = owner[key].get(aid, 0) + 1
+                continue
+            if kind == "autoreview_escalated" and payload.get("cause") == "rework-cap":
+                owner["rework_capped"][aid] = owner["rework_capped"].get(aid, 0) + 1
             if kind == "autoreview_asked":
                 asked.add(aid)
             elif kind == "autoreview_held":
@@ -4032,9 +4043,10 @@ class ProjectStore:
             elif payload.get("dropped"):
                 dropped["total"] += 1
                 dropped["re_asked"] += 1 if payload.get("re_asked") else 0
+                dropped_events.append((aid, bool(payload.get("re_asked"))))
         return {"rows": rows, "asked": asked, "last_hold": last_hold,
                 "high_stakes": high_stakes, "false_alarms": false_alarms,
-                "dropped": dropped}
+                "dropped": dropped, "dropped_events": dropped_events, **owner}
 
     def delivered_objections(self, since: float | None = None) -> list[dict[str, Any]]:
         """Assumptions whose objection reached the worker, objection sent since `since`"""

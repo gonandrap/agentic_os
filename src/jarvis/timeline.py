@@ -420,6 +420,10 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                     p.get("reason") or "no reason recorded")
         return (f"Assumption #{p.get('n')} left with you{why}",
                 p.get("reason") or "no reason recorded")
+    if kind == "assumption_overruled":
+        then = (f"; fix order {p['fix_wo_id']}" if p.get("fix_wo_id") else "")
+        return (f"You overruled Neo on assumption #{p.get('n')}{then}",
+                p.get("feedback") or "")
     if kind == "autoreview_held":
         if p.get("early"):
             # Held by the early pass while the worker works: nothing is owed yet (#1482)

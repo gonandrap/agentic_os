@@ -7264,6 +7264,104 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
     return out
 
 
+def overrule_assumption(wo_id: str, n: int, feedback: str) -> dict[str, Any]:
+    """The user reverses Neo's ruling on assumption #n (docs/superpowers/specs/2026-11-07-neo-owns-os-origin-assumption-review.md §5)"""
+    worker = os.environ.get(WORKER_SESSION_ENV)
+    if worker:
+        raise OpsError(
+            f"{worker} is a worker session — a worker may not overrule Neo. An overrule "
+            "is stored as the user's own words; a worker with a doubt asks with "
+            "`jarvis wo ask`.")
+    if not feedback.strip():
+        raise OpsError("an overrule needs feedback — what should Neo have ruled, and why? "
+                       f"`jarvis wo overrule {wo_id} {n} --feedback \"…\"`")
+    from .neo_store import NeoStore
+
+    name, path, wo = find_work_order(wo_id)
+    store = ProjectStore(path)
+    try:
+        # Every refusal before the first write
+        rows = [a for a in store.all_assumptions(wo_id) if a["n"] == n]
+        if not rows:
+            raise OpsError(f"{wo_id} has no assumption #{n} — `jarvis wo show {wo_id}` "
+                           "lists them")
+        a = rows[0]
+        if a["status"] == "pending" or a.get("decided_by") != ASSUMPTION_DECIDER_OS:
+            raise OpsError(f"assumption #{n} of {wo_id} was not decided by Neo — nothing "
+                           f"of Neo's to overrule — use `jarvis wo review {wo_id}`")
+        accepted = [e for e in store.events_of_kind(wo_id, "autoreview_accepted")
+                    if db.from_json(e["payload"], {}).get("assumption_id") == a["id"]]
+        # The latest event names the question Neo answered: the confirm question on a confirmation
+        qid = (db.from_json(accepted[-1]["payload"], {}).get("neo_question_id")
+               if accepted else None) or a.get("neo_question_id")
+    finally:
+        store.close()
+
+    learning_id = None
+    if qid:
+        neo = NeoStore()
+        try:
+            if neo.get(int(qid)) is not None:
+                _, learning = record_neo_correction(
+                    neo, int(qid), feedback, origin_kind="assumption",
+                    origin_id=str(a["id"]))
+                learning_id = learning["id"]
+        finally:
+            neo.close()
+
+    store = ProjectStore(path)
+    try:
+        store.review_assumption(a["id"], "rejected", decided_by=ASSUMPTION_DECIDER_USER,
+                                reason=feedback)
+    finally:
+        store.close()
+
+    out: dict[str, Any] = {"project": name, "wo_id": wo_id, "n": n,
+                           "question_id": qid, "learning_id": learning_id}
+    status = wo["status"]
+    fix_wo_id = None
+    if status == "completed":
+        first = (a["content"] or "").strip().splitlines()[0] if a["content"] else f"#{n}"
+        pr = wo.get("pr_url") or "no PR recorded"
+        # No parent_id, no trigger_wo_id: the user asked for this order (spec §2)
+        try:
+            fix = create_work_order(
+                name, f"Overrule: {first}"[:200],
+                description=(f"The user overruled Neo on assumption #{n} of {wo_id}, "
+                             f"which is merged ({pr}).\n\nAssumption:\n{a['content']}\n\n"
+                             f"Neo accepted it because: {a.get('decided_reason') or '(none)'}"
+                             f"\n\nThe user says:\n{feedback}\n\nChange the merged work "
+                             f"to follow the user."),
+                origin="jarvis",
+                metadata={"overrules": {"wo_id": wo_id, "n": n, "question_id": qid}})
+            fix_wo_id = fix["id"]
+            out["fix_wo_id"] = fix_wo_id
+        except OpsError as e:
+            out["fix_error"] = (f"{e} — the overrule is recorded; file the fix with "
+                                f"`jarvis wo create {name} \"…\"`")
+    elif status in OPEN_STATUSES:
+        try:
+            out["delivered"] = send_message(
+                wo_id, f"The user overruled Neo on assumption #{n}: {feedback}",
+                source="jarvis", project_name=name)
+        except OpsError as e:
+            out["delivery_error"] = str(e)
+    else:
+        out["note"] = (f"{wo_id} is {status}: overrule and learning recorded, no worker "
+                       f"told and no fix order filed — `jarvis wo create {name} \"…\"` if "
+                       f"work is owed")
+
+    store = ProjectStore(path)
+    try:
+        store.add_event(wo_id, "assumption_overruled", {
+            "assumption_id": a["id"], "n": n, "prior_decided_by": a.get("decided_by"),
+            "neo_question_id": qid, "feedback": feedback, "learning_id": learning_id,
+            "fix_wo_id": fix_wo_id})
+    finally:
+        store.close()
+    return out
+
+
 #: The one event a `--delegate` writes: what went to Neo and what the nets kept (io-c223fe10)
 DELEGATED_EVENT = "assumptions_delegated"
 
@@ -11259,6 +11357,22 @@ def validate_seat(seat: str) -> None:
                        f"{', '.join(LEARNING_SCOPES)}")
 
 
+def record_neo_correction(neo: Any, question_id: int, feedback: str, *, seat: str = "",
+                          origin_kind: str = "question", origin_id: str = ""
+                          ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Mark one Neo answer corrected and teach Neo the user's words"""
+    from . import neo as neo_mod
+
+    q = neo.review(question_id, False, feedback)
+    learning = neo.add_learning(
+        neo_mod.learning_from_review(q, feedback),
+        project=q["project"], source="review", question_id=question_id,
+        seat=seat, wo_id=q["wo_id"] or "", origin_kind=origin_kind,
+        origin_id=origin_id or str(question_id),
+    )
+    return q, learning
+
+
 def neo_review(question_id: int, approved: bool, feedback: str = "",
                seat: str = "") -> dict[str, Any]:
     """Review one of Neo's answers"""
@@ -11268,7 +11382,6 @@ def neo_review(question_id: int, approved: bool, feedback: str = "",
             f"{wo_id} is a worker session — a worker may not review Neo's answer. "
             "A correction is stored as the user's own words; a worker with a doubt "
             "asks with `jarvis wo ask`.")
-    from . import neo as neo_mod
     from .neo_store import NeoStore
 
     # Every refusal below happens before the first write: a rejected review must leave the question...
@@ -11297,15 +11410,11 @@ def neo_review(question_id: int, approved: bool, feedback: str = "",
                     f"the {seat!r} seat did not opine on neo question {question_id}, so "
                     f"it never saw the question — the seats that did: "
                     f"{', '.join(opined)}. Drop --seat to teach every seat.")
-        q = neo.review(question_id, approved, feedback)
         learning = None
-        if not approved:
-            learning = neo.add_learning(
-                neo_mod.learning_from_review(q, feedback),
-                project=q["project"], source="review", question_id=question_id,
-                seat=seat, wo_id=q["wo_id"] or "", origin_kind="question",
-                origin_id=str(question_id),
-            )
+        if approved:
+            q = neo.review(question_id, approved, feedback)
+        else:
+            q, learning = record_neo_correction(neo, question_id, feedback, seat=seat)
     finally:
         neo.close()
     forwarded = False
@@ -16990,6 +17099,33 @@ def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
     }
 
 
+def assumption_outcomes_by_requestor(facts: Sequence[dict[str, Any]],
+                                     now: float | None = None) -> dict[str, Any]:
+    """`assumption_row_outcomes` per `assumptions.requestor`, NULL as user (spec 2026-11-07 §7)"""
+    from .autoreview import OWNER_REQUESTOR
+
+    out: dict[str, Any] = {}
+    for who in ("user", OWNER_REQUESTOR):
+        split: list[dict[str, Any]] = []
+        counts = {"reworked": 0, "rework_capped": 0, "overruled": 0}
+        for f in facts:
+            rows = [a for a in f["rows"]
+                    if (a.get("requestor") == OWNER_REQUESTOR) == (who == OWNER_REQUESTOR)]
+            ids = {int(a["id"]) for a in rows}
+            # A row's events go where its row goes; an event outside the window counts nowhere
+            drops = [again for aid, again in f.get("dropped_events", ()) if aid in ids]
+            split.append({**f, "rows": rows,
+                          "high_stakes": f["high_stakes"] & ids,
+                          "false_alarms": f["false_alarms"] & ids,
+                          "dropped": {"total": len(drops), "re_asked": sum(drops)}})
+            for key in counts:
+                counts[key] += sum(n for aid, n in f.get(key, {}).items() if aid in ids)
+        out[who] = assumption_row_outcomes(split, now)
+        if who == OWNER_REQUESTOR:
+            out[who].update(counts)
+    return out
+
+
 def objection_outcomes(store: ProjectStore, since: float | None = None) -> dict[str, Any]:
     """Sent, delivered, ACTED ON, withdrawn — `objection_counts` plus `objection_response` (io-ce566253)"""
     counted = store.objection_counts(since=since)
@@ -17235,6 +17371,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         "scope": project or "fleet", "days": days, "since": since,
         # THE HEADLINE: per assumption ROW, what the user's inbox actually shows (io-51469add)
         "assumptions": assumption_row_outcomes(row_facts),
+        "by_requestor": assumption_outcomes_by_requestor(row_facts),
         "questions": questions, "questions_note": NEO_QUESTIONS_PLUMBING_NOTE,
         "objections": objections,
         "by_kind": by_kind, "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
