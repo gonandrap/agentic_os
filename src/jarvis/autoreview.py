@@ -489,6 +489,14 @@ class Ruling:
     model: str
     #: True when Neo accepted and this module overrode it — the `stakes: high` net
     overridden: bool = False
+    #: Owner mode only: Neo's non-accept goes back to the worker, not the user (spec 2026-11-07 §3.2)
+    rework: bool = False
+
+
+#: Reworks Neo may send on one owner-mode assumption before the user decides (spec 2026-11-07 §4.3)
+MAX_REWORKS = 2
+#: The only cause Neo may CHOOSE to escalate an owner-mode assumption (spec 2026-11-07 §3.2)
+OWNER_ESCALATION_CAUSES = ("conflicting-authority",)
 
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
@@ -720,7 +728,8 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                            f"worker can still act on it", **fields)
 
 
-def read_ruling(verdict: dict[str, Any], default_model: str = "") -> Ruling:
+def read_ruling(verdict: dict[str, Any], default_model: str = "", *,
+                owner: bool = False) -> Ruling:
     """What Neo's reply means for one assumption"""
     stakes = str(verdict.get("stakes") or "").strip().lower() or STAKES_UNCLASSIFIED
     reason = str(verdict.get("reason") or "").strip() or "no reason given"
@@ -737,6 +746,11 @@ def read_ruling(verdict: dict[str, Any], default_model: str = "") -> Ruling:
                 f"routine")
         return Ruling(accept=False, stakes=stakes, model=model, overridden=True,
                       reason=f"Neo would have accepted it but {said}: {reason}")
+    # Neither the stakes net nor a failed call is owner-overridable (Neo Q3768, kn-40db1828)
+    if (owner and not accept and stakes in ROUTINE_STAKES and not verdict.get("failed")
+            and not (verdict.get("escalate")
+                     and verdict.get("cause") in OWNER_ESCALATION_CAUSES)):
+        return Ruling(accept=False, rework=True, stakes=stakes, model=model, reason=reason)
     if not accept and not verdict.get("escalate"):
         return Ruling(accept=False, stakes=stakes, model=model,
                       reason=f"Neo would have turned this down: {reason}")
@@ -854,6 +868,11 @@ RULING ON A RUNNING ORDER MEANS RULING ON AN INTENTION. There is no diff and no 
 summary, because the work does not exist yet; the question says so where the summary would
 be. Judge what the worker says it decided, and if your ruling would turn on a result you
 cannot see, escalate rather than guess.
+
+A QUESTION MAY GRANT YOU OWNER MODE, on a work order the user did not ask for; it then
+carries a `# YOU OWN THIS DECISION` block. When it does, the question's answers line wins
+over the answers above, including "on a finished order your answers are accept and
+escalate".
 
 `reason` is ONE LINE, and WHO READS IT DEPENDS ON YOUR ANSWER. On an acceptance it says
 why the call was routine and the user reads it on the record. On an escalation it says
@@ -1200,6 +1219,26 @@ def _requestor_block(label: str) -> list[str]:
     return [f"# Who asked for this work order\n{label}"] if label else []
 
 
+def _owner_block(owner: bool, *, early: bool = False) -> list[str]:
+    """Owner text rides here, never in a second persona: cached prefix stays stable (§3.1)"""
+    if not owner:
+        return []
+    disagree = ("a disagreement is your objection as owner, not an escalation" if early
+                else "a disagreement is a REWORK, not an escalation")
+    return [f"# YOU OWN THIS DECISION\nThe user did not ask for this work order; who "
+            f"asked is named above. You own this ruling: {disagree}. Missing data is a "
+            f"rework asking the worker to restate the assumption self-contained. Judge "
+            f"`stakes` honestly still: `high` goes to the user whatever you rule."]
+
+
+OWNER_ANSWERS = (
+    "`deny` is a REWORK: your `reason` reaches the worker as the change to make), `stakes` "
+    "(`routine`|`high`), one-line `reason`. `escalate: true` is open ONLY with `cause: "
+    "conflicting-authority`, and only when the decision record holds a question the USER "
+    "answered, a message the user sent, or a pinned user ruling that this assumption "
+    "contradicts; `reason` names that id.")
+
+
 def _requestor(store: Any, wo: dict[str, Any]) -> Any:
     """`ops.requestor`, imported late: ops imports daemon, which imports this module"""
     from . import ops
@@ -1216,7 +1255,8 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
                      siblings: list[dict[str, Any]], *, early: bool = False,
                      record: str = "", spec: dict[str, str] | None = None,
                      spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
-                     delegated: bool = False, requestor_label: str = "") -> str:
+                     delegated: bool = False, requestor_label: str = "",
+                     owner: bool = False) -> str:
     """What the reviewer reads (#832)"""
     n = assumption.get("n")
     # Pointers, not text: a sibling this one cites is in the decision record (wo-ea3c6f0c)
@@ -1239,6 +1279,8 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         "worker with your `reason` as guidance), `stakes` (`routine`|`high`), one-line "
         "`reason`. Escalating is NOT an answer here: the user delegated it to you."
         if delegated else
+        f"Answer with `escalate`, `verdict` (`approve` accepts; {OWNER_ANSWERS}"
+        if owner else
         "Answer with `escalate`, `verdict` (`approve`; `deny` sends it to the user), "
         "`stakes` (`routine`|`high`), one-line `reason`.")
     answers += (" Where the record or spec settles it, cite the id, or cite the section "
@@ -1253,6 +1295,7 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:2000]}",
         *_requestor_block(requestor_label),
+        *_owner_block(owner, early=early),
         *_spec_blocks(assumption, spec, spec_chars),
         delivered,
         f"# Other assumptions on this order — do not rule on these: {others}",
@@ -1270,7 +1313,7 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
                       siblings: list[dict[str, Any]],
                       record: str = "", spec: dict[str, str] | None = None,
                       spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
-                      requestor_label: str = "") -> str:
+                      requestor_label: str = "", owner: bool = False) -> str:
     """What the reviewer reads at DELIVERY (#102)"""
     n = assumption.get("n")
     others = "\n".join(sibling_line(s) for s in siblings
@@ -1291,19 +1334,27 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:CONFIRM_DESCRIPTION_CHARS]}",
         *_requestor_block(requestor_label),
+        *_owner_block(owner),
         *_spec_blocks(assumption, spec, spec_chars),
         f"# What the worker says it delivered\n"
         f"{(wo.get('result_summary') or _no_summary(wo))[:CONFIRM_SUMMARY_CHARS]}",
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
         _record_block(record),
-        "You are CONFIRMING that earlier reading against the delivered result. "
-        "Confirming settles this assumption in the user's name; anything else leaves it "
-        "with them, carrying both readings.",
-        "Answer with `escalate`, `verdict` (`approve` to confirm it, `deny` to send it "
-        "to the user), `stakes` (`routine` or `high`) and a one-line `reason`. When the "
-        "decision record above settles it, say which id in `reason` instead of "
-        "escalating to ask for it again; when the spec section does, cite the section.",
+        *([
+            "You are CONFIRMING that earlier reading against the delivered result. "
+            "Confirming settles this assumption; anything else is a rework.",
+            f"Answer with `escalate`, `verdict` (`approve` to confirm it; {OWNER_ANSWERS} "
+            "When the decision record or spec settles it, cite the id or the section.",
+        ] if owner else [
+            "You are CONFIRMING that earlier reading against the delivered result. "
+            "Confirming settles this assumption in the user's name; anything else leaves "
+            "it with them, carrying both readings.",
+            "Answer with `escalate`, `verdict` (`approve` to confirm it, `deny` to send it "
+            "to the user), `stakes` (`routine` or `high`) and a one-line `reason`. When the "
+            "decision record above settles it, say which id in `reason` instead of "
+            "escalating to ask for it again; when the spec section does, cite the section.",
+        ]),
     ])
 
 
