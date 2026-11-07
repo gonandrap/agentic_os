@@ -397,6 +397,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return (f"Assumption #{p.get('n')} sent back to the worker — Neo owns this "
                 f"OS-origin order (rework {p.get('attempt') or 1})",
                 p.get("reason") or "no reason recorded")
+    if kind == "autoreview_owner_ruled":
+        verb = {"accepted": "accepted", "reworked": "sent back for rework",
+                "escalated": "handed to you"}.get(p.get("outcome"), p.get("outcome"))
+        return (f"You were told: Neo {verb} assumption #{p.get('n')} on this OS-origin order",
+                p.get("reason") or "no reason recorded")
     if kind == "autoreview_escalated" and p.get("cause") == "rework-cap":
         return (f"Assumption #{p.get('n')} left with you — Neo's reworks did not settle it",
                 p.get("reason") or "no reason recorded")
