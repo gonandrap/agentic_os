@@ -167,6 +167,77 @@ def test_an_ask_cleared_by_a_dropped_ruling_still_counts_as_reached(fleet, proje
     assert a["dropped_rulings"] == {"total": 1, "re_asked": 1}
 
 
+# -- by requestor: who asked for the order (docs/superpowers/specs/2026-11-07-neo-owns-os-origin-assumption-review.md §7)
+
+
+@pytest.fixture()
+def by_requestor(fleet, project):
+    """Rows and events written directly: the daemon and overrule paths are not exercised"""
+    store = ProjectStore(project)
+    try:
+        store.create_work_order(wo_id=WO_ID, title="t", description="")
+        legacy, user, os_a, os_b, os_c = (store.add_assumption(WO_ID, f"a{i}")
+                                          for i in range(5))
+        store.set_assumption_requestor(user, "user")
+        for aid in (os_a, os_b, os_c):
+            store.set_assumption_requestor(aid, autoreview.OWNER_REQUESTOR)
+        # legacy (NULL) and user: both the user's bucket
+        store.review_assumption(legacy, "accepted", decided_by="user")
+        store.add_event(WO_ID, "autoreview_asked", {"assumption_id": user, "n": 2})
+        store.review_assumption(user, "accepted", decided_by="neo", model="opus")
+        # os_a: reworked twice, then capped and escalated, then the user ruled
+        for attempt in (1, 2):
+            store.add_event(WO_ID, "autoreview_reworked", {
+                "assumption_id": os_a, "n": 3, "reason": "r", "neo_question_id": 1,
+                "confirming": False, "attempt": attempt})
+        store.add_event(WO_ID, "autoreview_asked", {"assumption_id": os_a, "n": 3})
+        store.add_event(WO_ID, "autoreview_escalated", {
+            "assumption_id": os_a, "n": 3, "cause": "rework-cap"})
+        store.review_assumption(os_a, "accepted", decided_by="user")
+        # os_b: Neo accepted, the user overruled it
+        store.add_event(WO_ID, "autoreview_asked", {"assumption_id": os_b, "n": 4})
+        store.review_assumption(os_b, "accepted", decided_by="neo", model="opus")
+        store.add_event(WO_ID, "assumption_overruled", {
+            "assumption_id": os_b, "n": 4, "prior_decided_by": "neo",
+            "neo_question_id": 2, "feedback": "no", "learning_id": "",
+            "fix_wo_id": ""})
+        # os_c: an escalation for another cause is not a rework cap
+        store.add_event(WO_ID, "autoreview_asked", {"assumption_id": os_c, "n": 5})
+        store.add_event(WO_ID, "autoreview_escalated", {
+            "assumption_id": os_c, "n": 5, "cause": "conflicting-authority"})
+    finally:
+        store.close()
+
+
+def test_stats_split_by_who_asked_for_the_order(by_requestor):
+    res = ops.neo_stats_report(project="proj_a")
+    you, os_ = res["by_requestor"]["user"], res["by_requestor"]["os"]
+    assert (you["rows"], you["neo_decided"], you["never_reached_neo"]) == (2, 1, 1)
+    assert "reworked" not in you
+    assert (os_["rows"], os_["neo_decided"], os_["neo_escalated"]) == (3, 1, 1)
+    assert os_["unsettled"]["count"] == 1
+    assert (os_["reworked"], os_["rework_capped"], os_["overruled"]) == (2, 1, 1)
+    # The headline is the whole fleet, unchanged by the split
+    assert res["assumptions"]["rows"] == 5
+    assert res["assumptions"]["neo_decided"] == 2
+
+
+def test_the_terminal_prints_the_requestor_block(by_requestor, capsys):
+    cli._print_neo_stats(ops.neo_stats_report(project="proj_a"), as_json=False)
+    out = capsys.readouterr().out
+    assert "asked by you" in out and "asked by the OS" in out
+    assert "reworked 2 · rework cap 1 · overruled by you 1" in out
+    assert out.index("asked by the OS") < out.index("QUESTIONS — plumbing")
+
+
+def test_a_user_only_fleet_has_an_empty_os_bucket(seeded):
+    """Every pre-stamp row is the user's: the split adds nothing to their figures"""
+    res = ops.neo_stats_report(project="proj_a")
+    you = res["by_requestor"]["user"]
+    assert you == res["assumptions"]
+    assert res["by_requestor"]["os"]["rows"] == 0
+
+
 # -- objections: sent, delivered, ACTED ON, withdrawn (io-ce566253)
 
 

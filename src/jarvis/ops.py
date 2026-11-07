@@ -16990,6 +16990,33 @@ def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
     }
 
 
+def assumption_outcomes_by_requestor(facts: Sequence[dict[str, Any]],
+                                     now: float | None = None) -> dict[str, Any]:
+    """`assumption_row_outcomes` per `assumptions.requestor`, NULL as user (spec 2026-11-07 §7)"""
+    from .autoreview import OWNER_REQUESTOR
+
+    out: dict[str, Any] = {}
+    for who in ("user", OWNER_REQUESTOR):
+        split: list[dict[str, Any]] = []
+        counts = {"reworked": 0, "rework_capped": 0, "overruled": 0}
+        for f in facts:
+            rows = [a for a in f["rows"]
+                    if (a.get("requestor") == OWNER_REQUESTOR) == (who == OWNER_REQUESTOR)]
+            ids = {int(a["id"]) for a in rows}
+            # A row's events go where its row goes; an event outside the window counts nowhere
+            drops = [again for aid, again in f.get("dropped_events", ()) if aid in ids]
+            split.append({**f, "rows": rows,
+                          "high_stakes": f["high_stakes"] & ids,
+                          "false_alarms": f["false_alarms"] & ids,
+                          "dropped": {"total": len(drops), "re_asked": sum(drops)}})
+            for key in counts:
+                counts[key] += sum(n for aid, n in f.get(key, {}).items() if aid in ids)
+        out[who] = assumption_row_outcomes(split, now)
+        if who == OWNER_REQUESTOR:
+            out[who].update(counts)
+    return out
+
+
 def objection_outcomes(store: ProjectStore, since: float | None = None) -> dict[str, Any]:
     """Sent, delivered, ACTED ON, withdrawn — `objection_counts` plus `objection_response` (io-ce566253)"""
     counted = store.objection_counts(since=since)
@@ -17235,6 +17262,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         "scope": project or "fleet", "days": days, "since": since,
         # THE HEADLINE: per assumption ROW, what the user's inbox actually shows (io-51469add)
         "assumptions": assumption_row_outcomes(row_facts),
+        "by_requestor": assumption_outcomes_by_requestor(row_facts),
         "questions": questions, "questions_note": NEO_QUESTIONS_PLUMBING_NOTE,
         "objections": objections,
         "by_kind": by_kind, "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
