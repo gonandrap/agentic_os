@@ -7109,6 +7109,9 @@ class Daemon:
                        "it conflicts with something you ruled, so only you can settle it")
                 last = (f"Why it is yours: {why}.\n"
                         f"Decide it: jarvis wo review {wo_id} [--reject] --feedback \"…\"")
+            elif outcome == "reworked":
+                # A rework leaves the row pending, which `wo overrule` refuses; the order is open
+                last = f"Steer the rework: jarvis wo send {wo_id} \"…\""
             else:
                 last = (f"Wrong call? jarvis wo overrule {wo_id} {n} --feedback \"…\"")
             central.add_inbox(
