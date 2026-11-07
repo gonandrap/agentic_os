@@ -818,6 +818,16 @@ in your own prompt spends a review action the user has already spent. An item ma
 `(withheld …)`, `(not answered)` or `(not shown)` is NOT a ruling, and neither is an
 omission line: those are cases to escalate, not blanks to fill in.
 
+A RECORD ITEM MARKED `YOUR OWN earlier ruling` IS YOURS, NOT THE USER'S. The user never
+saw it; never call it the user's choice, premise or decision. When the assumption shows
+that ruling's facts were wrong — corrected figures, a flaw the worker found since — you
+are still its decider: RE-RULE it here on the corrected facts and accept or object on the
+merits, naming the id and what changed. Whether your earlier approach still meets the ask
+on the corrected facts is a merits question you answer, not a preference: if it does,
+accept; if it no longer does, object and tell the worker what to do instead. Escalate only
+when the re-ruling needs a user preference no learning covers, and then say the earlier
+ruling was yours.
+
 A SIBLING MARKED `(withheld — high-stakes …)` IS NOT A BLANK TO FILL IN. The OS holds
 those assumptions for the user and does not show you their text, deliberately. Do not
 guess at what one says, and do not treat its absence as permission.
@@ -1029,9 +1039,12 @@ def _question_item(q: dict[str, Any], n_by_question: dict[int, Any], *,
         raw_tail = str(q.get("review_feedback") or "")
         tail = f" (the user corrected this: {' '.join(raw_tail.split())[:200]})"
     marker = " (cited by the assumption)" if cited else ""
+    by = q.get("answered_by") or "unknown"
+    # io-c223fe10: Neo must not read its own ruling back as the user's
+    label = NEO_OWN_RULING if by == "neo" and not tail else f"answered by {by}"
     return _netted(
         f"Q{qid}{marker}",
-        f"  Q{qid}{marker} [answered by {q.get('answered_by') or 'unknown'}] "
+        f"  Q{qid}{marker} [{label}] "
         f"{headline} -> {answer}{tail}",
         (raw_headline, raw_answer, raw_tail))
 
@@ -1069,6 +1082,10 @@ def _stamp(ts: Any) -> str:
     except (TypeError, ValueError):
         return "unknown time"
 
+
+#: A record row Neo itself answered, uncorrected by the user
+NEO_OWN_RULING = ("answered by neo — YOUR OWN earlier ruling, not the user's; "
+                  "re-rule it if its facts changed")
 
 #: The decision record's heading, and its empty case
 RECORD_HEADING = "# What has already been decided on this work order — authority you may CITE"
