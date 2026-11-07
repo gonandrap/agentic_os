@@ -82,7 +82,7 @@ def test_a_hold_carries_the_key_it_was_paired_on_through_every_cut():
 
 @pytest.mark.parametrize("cause, key, href", [
     (holds.NEO_QUESTION, 41, "/neo/question/41"),
-    (holds.GATE, 7, "/gates/7"),
+    (holds.GATE, 7, "/gates/7?project=proj_a"),
     (holds.VALIDATION, 2, "#round-2"),
     (holds.MESSAGE, 9, "#msg-9"),
 ])

@@ -10,7 +10,8 @@ import pytest
 from jarvis import cli, db, fleetcost, ops, usage_meter
 from jarvis.catalog import CostConfig, load_catalog
 from jarvis.central_store import CentralStore
-from jarvis.daemon import Daemon, METER_RECONCILE_EVERY_TICKS
+from jarvis.daemon import (Daemon, METER_RECONCILE_EVERY_TICKS, METER_RESIDUAL_ALARM,
+                           meter_alarm_reason)
 from jarvis.project_store import ProjectStore
 
 MINUTE = 60.0
@@ -117,7 +118,9 @@ def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
                                       "longest_gap_seconds", "head_uncovered_seconds",
                                       "first_ts", "last_ts", "reliable",
                                       "min_reliable_share"}
-    assert set(meter["dollars_per_point"]) == {"value", "low", "high", "source",
+    assert set(meter["dollars_per_point"]) == {"value", "low", "high", "spread_low",
+                                               "spread_high", "spread_spans",
+                                               "spread_widened", "source",
                                                "basis_spans", "basis_points",
                                                "basis_usd"}
     assert set(meter["spend"]) == {"implied_usd", "workers_usd", "jarvis_calls_usd",
@@ -188,6 +191,67 @@ def test_the_zoom_endpoint_carries_the_calculated_series(fleet_fixture):
 
     assert tl[-1]["five_hour_calc_jarvis"] > tl[0]["five_hour_calc_jarvis"] > 0
     assert tl[-1]["five_hour_calc_outside"] > 0
+
+
+def _spread_scene(f, usd: float, minutes: float = 25.0) -> dict:
+    """Calibration spans at $0.60-$1.40/point, then 15 points that spent `usd`"""
+    since = SPAN_SINCE
+    for hours, cost in ((12, 6.0), (10, 8.0), (8, 10.0), (6, 12.0), (4, 14.0)):
+        at = since - hours * HOUR
+        store_samples(series(at, n=40, first=0.0, last=10.0, resets=since + 9 * HOUR))
+        f.spend("a calibration order", cost, at=at + MINUTE)
+    # By default under the 30 minutes that would make this span a calibration span too
+    until = since + minutes * MINUTE
+    store_samples(series(since, n=int((until - since) / usage_meter.SAMPLE_SECONDS),
+                         first=10.0, last=25.0, resets=until))
+    f.spend("the order that spent in this span", usd, at=since + 2 * MINUTE)
+    return {"since": since, "until": until, "source": "session-meter",
+            "label": "the span", "window": "5h", "offset": 0, "zone": "UTC"}
+
+
+def test_a_gap_the_calibration_spans_also_show_raises_nothing_and_says_why(fleet_fixture):
+    """Issue 1613: $0.75/point against a $1.00 median is a 25% gap and an ordinary span"""
+    meter = meter_of(fleet_fixture, _spread_scene(fleet_fixture, 11.25))
+
+    assert meter["dollars_per_point"]["value"] == pytest.approx(1.0)
+    assert abs(meter["spend"]["residual_share"]) >= 0.25
+    assert meter["alerts"]["residual"] is False
+    assert "normal spread ($0.60-$1.40/point over 5 earlier spans)" in meter["sentence"]
+    assert usage_meter.RESIDUAL_LABEL not in meter["sentence"]
+
+
+@pytest.mark.parametrize("usd", [6.0, 24.0])
+def test_a_gap_beyond_the_spread_still_alarms_in_either_direction(fleet_fixture, usd):
+    meter = meter_of(fleet_fixture, _spread_scene(fleet_fixture, usd))
+
+    assert meter["alerts"]["residual"] is True
+    assert usage_meter.RESIDUAL_LABEL in meter["sentence"]
+
+
+def test_the_alarm_reason_states_the_range_it_was_judged_against(fleet_fixture):
+    meter = meter_of(fleet_fixture, _spread_scene(fleet_fixture, 6.0))
+
+    reason = meter_alarm_reason(METER_RESIDUAL_ALARM, meter)
+
+    assert "normal spread: $0.60-$1.40/point over 5 earlier spans." in reason
+
+
+def test_a_span_long_enough_to_calibrate_does_not_vouch_for_itself(fleet_fixture):
+    """A 60-minute span at $4/point is a calibration span too, and must still alarm"""
+    meter = meter_of(fleet_fixture, _spread_scene(fleet_fixture, 60.0, minutes=60.0))
+
+    assert meter["dollars_per_point"]["basis_spans"] == 6
+    assert meter["dollars_per_point"]["spread_spans"] == 5
+    assert meter["alerts"]["residual"] is True
+
+
+def test_an_outlier_widened_range_says_so():
+    plain = {"spread_low": 0.6, "spread_high": 1.4, "spread_spans": 5, "spread_widened": False}
+    assert usage_meter.spread_phrase(plain) == "$0.60-$1.40/point over 5 earlier spans"
+    assert usage_meter._has_outlier([1.0, 1.1, 1.2, 1.3, 5.5]) is True
+    assert usage_meter._has_outlier([0.6, 0.8, 1.0, 1.2, 1.4]) is False
+    assert usage_meter.spread_phrase({**plain, "spread_widened": True}).endswith(
+        "widened by an outlier span")
 
 
 # -- 30-32. the sentence
