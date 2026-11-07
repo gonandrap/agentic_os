@@ -3910,6 +3910,15 @@ def test_a_gate_number_in_two_projects_lists_both_candidates(client, project, tm
     r = client.get(f"/gates/{n}?project=proj_b")
     assert r.status_code == 200
     assert "./ship-proj_b.sh" in r.text and "./ship-proj_a.sh" not in r.text
+    assert "Which one?" not in r.text  # a link naming its project never sees the chooser
+
+    # a direct link that fails falls back: chooser when ambiguous, redirect when unique
+    assert "Which one?" in client.get(f"/gates/{n}?project=gone").text
+    r = client.get(f"/gates/{n + 200}?project=proj_b", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == f"/gates/{n + 200}?project=proj_a"
+
+
 # -- §7 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md
 
 

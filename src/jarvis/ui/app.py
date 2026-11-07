@@ -2164,9 +2164,21 @@ def create_app() -> FastAPI:
             # Reached only by a typed id (/go/gate-<n>); every rendered link names its project
             return render(request, "gate_choose.html", active="gates",
                           approval_id=approval_id, projects=e.projects)
-        except ops.OpsError as e:
-            return render(request, "error.html", active="gates", message=str(e),
-                          status_code=404)
+        except (ops.OpsError, KeyError) as e:  # KeyError: unknown project name
+            if not project:
+                return render(request, "error.html", active="gates", message=str(e),
+                              status_code=404)
+            # Named project wrong or gone: fall back to wherever the number lives
+            try:
+                g = ops.show_gate(approval_id)
+            except ops.AmbiguousApproval as amb:
+                return render(request, "gate_choose.html", active="gates",
+                              approval_id=approval_id, projects=amb.projects)
+            except ops.OpsError:
+                return render(request, "error.html", active="gates", message=str(e),
+                              status_code=404)
+            return RedirectResponse(
+                f"/gates/{approval_id}?project={quote(str(g['project']))}", status_code=303)
         back = f"/gates/{approval_id}?project={g['project']}"
         return render(request, "gate.html", active="gates", g=g, back=back,
                       display=gate_display(g))
