@@ -38,7 +38,8 @@ asked for nothing.
 | `ops.requestor(store, wo) -> Requestor` | dataclass `Requestor(kind: "user"\|"os", label: str)` | 2 |
 | `assumptions.requestor` | `TEXT`, `'user'`\|`'os'`, NULL on rows asked before §2 shipped | 2 |
 | `autoreview.OWNER_REQUESTOR = "os"` | the stamp value that turns owner mode on | 2 |
-| `_ruling_question(..., owner=False, requestor_label="")`, same on `_confirm_question` | owner text appended only when `owner=True` | 3 |
+| `_ruling_question(..., requestor_label="")`, same on `_confirm_question` | "who asked" block only when non-empty | 2 |
+| `_ruling_question(..., owner=False)`, same on `_confirm_question` | owner text only when `owner=True` | 3 |
 | `Ruling.rework: bool = False`; `read_ruling(verdict, default_model="", *, owner=False)` | | 3 |
 | `autoreview.MAX_REWORKS = 2` | | 3 |
 | `autoreview.OWNER_ESCALATION_CAUSES = ("conflicting-authority",)` | the only cause Neo may CHOOSE on owner mode | 3 |
@@ -78,8 +79,13 @@ merged, the child asks Neo (`jarvis wo ask`) before writing code that overlaps i
    orders all live in `feature_orders`; a work-order parent lives in `work_orders`.
    Stop at a row with no parent. Guard the walk with a visited set (a cycle is `os`,
    logged).
-2. Judge the ROOT with the existing `ops.launched_by_os(root)`. True gives
-   `kind="os"`, false gives `kind="user"`.
+2. Judge the ROOT by provenance only: `kind="os"` when its `origin` is in
+   `ops._SELF_ORIGINS` or it carries a steward stamp (`steward.stamp_of`), else
+   `kind="user"`. Do NOT call `launched_by_os` on the root: its legacy clause reads any
+   `jarvis`-origin row with a non-`worker` kind as OS, and a user-filed feature order is
+   origin `jarvis`, kind `feature`. A root that is itself a work order with no parent is
+   judged by `launched_by_os` (its legacy clause is right for work orders). So a user's
+   `jarvis fo create` / `io create` / `do create` and everything under it is `user`.
 3. `label` names the source in words the user reads, from the root: the steward stamp's
    `origin_kind` (e.g. `steward: bug_agent, decision #916`), else the origin
    (`morpheus`, `fleet health`, `neo rider`, `os`), else `you`.
@@ -107,10 +113,14 @@ link in `metadata.overrules`. This section adds a test that pins it.
 
 ### 2.3 What Neo reads
 
-`_ruling_question` and `_confirm_question` gain one information-only block, after the work
-order block: `# Who asked for this work order\n<label>`. It is added ONLY when the requestor
-is `os`; a user-origin question is byte-identical to today (test pins it). This block
-states a fact; it does not change the answers open to Neo — that is §3.
+`_ruling_question` and `_confirm_question` gain the keyword `requestor_label: str = ""`
+(this section owns it) and one information-only block, after the work order block:
+`# Who asked for this work order\n<label>`, rendered only when the label is non-empty.
+`propose` / `propose_confirmation` pass the label only when the stamp is `os`; a
+user-origin question is byte-identical to today. Prove it against a GOLDEN constant: before
+editing, capture today's output of both builders for one fixture into a test constant, then
+assert the default call still equals it. This block states a fact; it does not change the
+answers open to Neo — that is §3.
 
 ### 2.4 Done means
 
@@ -125,9 +135,11 @@ Pure `autoreview.py`. Ships INERT: nothing calls it with `owner=True` until §4.
 
 ### 3.1 The question text
 
-`_ruling_question(..., owner=False, requestor_label="")` and the same keywords on
-`_confirm_question`. With `owner=False` the output is byte-identical to today. With
-`owner=True` and the delivered pass (`early=False`):
+`_ruling_question(..., owner=False)` and the same keyword on `_confirm_question`
+(`requestor_label` is §2's; the owner block refers to "who asked" above it and never
+repeats the label). With `owner=False` the output is byte-identical to today, proven
+against a golden constant captured before editing. With `owner=True` and the delivered
+pass (`early=False`):
 
 - The answers line becomes: accept (`verdict: approve`), or REWORK (`verdict: deny`, whose
   `reason` is delivered to the worker as the change to make). `escalate: true` is open
@@ -160,23 +172,20 @@ ride in the question, never in a second persona: that keeps the cached prefix st
   - every other non-accept (`deny`, `escalate` with any other cause or none, a `refine`):
     `Ruling(accept=False, rework=True, reason=<Neo's reason>)`. A disagreement on an
     order Neo owns is a rework.
-- Where the cause is read: from the verdict's own `cause` key if the reply carries one,
-  else `neo_store`'s recorded cause for that question (the caller passes it). Read
-  `neo.py`'s drain to see which; do not invent a new reply key.
+- The cause is the verdict's own `cause` key: `neo.parse_verdict` always carries one,
+  filtered to the chosen causes. No new reply key.
+- `escalation_cause(ruling)` returns `neo-denied` for any non-accept; a rework is not an
+  escalation and §4 must never record it with that cause.
 
-### 3.3 The eval
+No LLM eval: the code turns every non-`conflicting-authority` escalation into a rework, so
+"Neo must not escalate" is enforced by code, not by the model.
 
-One Neo judgment eval in `evals/llm/` built from the `wo-f93928c2` assumption #1 packet
-(`jarvis neo show 3715` for the original prompt): rendered with `owner=True`, Neo must not
-escalate. Mark it as an LLM eval the way the neighbouring evals are; it does not run in
-`tests/`.
+### 3.3 Done means
 
-### 3.4 Done means
-
-Byte-identity tests for `owner=False` on both question builders; owner text present and
-naming `requestor_label` with `owner=True`; a `read_ruling` table test covering every row
-of §3.2. `tests/test_neo.py::test_a_model_may_never_name_an_overridden_cause` still passes
-(the persona never names `rework-cap`).
+Golden-constant tests for `owner=False` on both question builders; owner text present with
+`owner=True` and containing no `rework-cap`; a parametrized `read_ruling` table test
+covering every row of §3.2. `tests/test_neo.py::test_a_model_may_never_name_an_overridden_cause`
+still passes.
 
 ## 4. Owner delivery: rework, the cap, and the holds
 
@@ -246,6 +255,14 @@ a disallowed escalate becomes a rework; `conflicting-authority` escalates; a mod
 leaves the question pending with no event; an early objection on an owner row is not
 `HELD_OBJECTED`; a user-origin order's delivery path is unchanged (existing tests green).
 
+Test plumbing this section owns: the fake `claude` (`src/jarvis/testing.py`, the
+`FORCE_*` switches) has no escalation-with-cause knob; add one (e.g. `FORCE_CONFLICT`
+replying `escalate` with cause `conflicting-authority`). The fake's default reply
+(escalate, no cause) is now a REWORK on an `os`-stamped row; that is expected. "Back to
+running" needs a `daemon.tick()` after the drain. Adding `rework-cap` breaks the exact
+five-member pin of the overridden causes in `tests/test_neo.py` (around line 1007):
+update it here.
+
 ## 5. `jarvis wo overrule`: the user reverses an owner ruling
 
 ### 5.1 The verb
@@ -256,8 +273,9 @@ holds no logic. Refused from a worker session (same guard as `ops.neo_review`).
 
 Refusals, each naming the fix:
 - no assumption `#n` on that order;
-- the assumption was not decided by Neo (`decided_by != autoreview.DECIDER`) and is not a
-  pending row Neo reworked: "nothing of Neo's to overrule — use `jarvis wo review`";
+- the assumption was not decided by Neo (`decided_by != autoreview.DECIDER`), including a
+  still-pending row Neo sent back for rework: "nothing of Neo's to overrule — use
+  `jarvis wo review`";
 - empty feedback.
 
 It applies to any Neo-decided assumption, owner mode or not: an overrule adds a verb and
@@ -266,7 +284,7 @@ changes no existing behaviour.
 ### 5.2 What it does, in order
 
 1. Find the question Neo answered: the `neo_question_id` of the latest
-   `autoreview_accepted` / `autoreview_reworked` event for that assumption (on a
+   `autoreview_accepted` event for that assumption (on a
    confirmation that is the confirm question, not `neo_question_id`).
 2. Record the correction: the learning write factored out of `ops.neo_review` (mark the
    question reviewed-corrected, `neo.add_learning(..., origin_kind="assumption")`).
@@ -296,8 +314,9 @@ No dashboard button (out of scope, §8).
 
 `ops.overrule_assumption` tests for: open order (message delivered, learning recorded,
 row rejected, event), completed order (fix order created and `ops.requestor` reads it
-`user`), refusal on a user-decided row, refusal from a worker session. `neo_review`'s
-existing tests unchanged and green.
+`user`), failed/cancelled order (steps 2-4 only, output says so), refusals on a
+user-decided row, on empty feedback and from a worker session (`JARVIS_WO_ID` set).
+`neo_review`'s existing tests unchanged and green.
 
 ## 6. The owner-ruling notice
 
@@ -318,7 +337,9 @@ Every owner ruling the user did not make tells them, without asking for attentio
 - Notification failure must not undo the ruling: the ruling is written first, the notice
   after, a failed notice is logged.
 
-Done means: tests that each outcome writes exactly one info inbox row and one event, the
+Done means: tests that each outcome writes exactly one inbox row of level `info` whose title
+starts `Neo ` (scope the count that way: `ops.flag_assumptions_pending` may add its own row
+on the escalated outcome) and one event, the
 batched notice is absent on an owner order and present on a user order, and the inbox
 text names the overrule command with the right `<n>`.
 
@@ -327,8 +348,10 @@ text names the overrule command with the right `<n>`.
 `ops.neo_stats_report` gains `by_requestor: {"user": {...}, "os": {...}}` built from
 `ProjectStore.assumption_review_facts` / `ops.assumption_row_outcomes` grouped by
 `assumptions.requestor` (NULL counts as `user`). The `os` bucket adds `reworked`
-(count of `autoreview_reworked` events), `rework_capped` and `overruled` (count of
-`assumption_overruled` events). The CLI text prints one two-line block after the
+(count of `autoreview_reworked` events), `rework_capped` (count of `autoreview_escalated`
+events whose payload `cause == "rework-cap"`) and `overruled` (count of
+`assumption_overruled` events). `assumption_review_facts` today selects no `requestor`
+and filters out these event kinds: extend both. The CLI text prints one two-line block after the
 existing headline; `--json` carries the dict. Existing keys and their values unchanged.
 
 Done means: tests that write rows and events directly (no daemon) and assert both buckets;
