@@ -409,15 +409,19 @@ class NeoStore:
         self.record_answer(question_id, answer, answered_by="os", reason=reason)
         return True
 
-    def lapse_worker_questions(self, wo_id: str, reason: str) -> list[int]:
+    def lapse_worker_questions(self, wo_id: str, reason: str,
+                               kinds: tuple[str, ...] = LAPSABLE_Q_KINDS) -> list[int]:
         """Settle an ended order's open worker questions as nobody's ruling (kn-40db1828)"""
+        kinds = tuple(k for k in kinds if k in LAPSABLE_Q_KINDS)
+        if not kinds:
+            return []
         marks = ",".join("?" for _ in LAPSABLE_Q_STATUSES)
-        kinds = ",".join("?" for _ in LAPSABLE_Q_KINDS)
+        kind_marks = ",".join("?" for _ in kinds)
         return [int(r["id"]) for r in self.conn.execute(
             f"""UPDATE questions SET status='lapsed', lapsed_at=?, lapsed_reason=?
-                 WHERE wo_id=? AND kind IN ({kinds}) AND status IN ({marks})
+                 WHERE wo_id=? AND kind IN ({kind_marks}) AND status IN ({marks})
              RETURNING id""",
-            (db.now(), reason, wo_id, *LAPSABLE_Q_KINDS, *LAPSABLE_Q_STATUSES)).fetchall()]
+            (db.now(), reason, wo_id, *kinds, *LAPSABLE_Q_STATUSES)).fetchall()]
 
     def lapse_questions(self, question_ids: list[int], reason: str) -> list[int]:
         """Settle these open questions as nobody's ruling (issue 1572, kn-40db1828)"""

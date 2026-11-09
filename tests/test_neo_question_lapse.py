@@ -64,6 +64,20 @@ def test_a_failed_order_keeps_its_question_open(store, neo):
     assert [v for v in violations if v.invariant == "INV-NEO-QUESTION-LAPSED"] == []
 
 
+def test_the_sweep_lapses_an_alarm_on_an_already_failed_order(store, neo):
+    wo = store.create_work_order(title="t")
+    qid = escalated(neo, wo["id"])
+    alarm = escalated(neo, wo["id"], kind="alarm")
+    store.update_work_order(wo["id"], status="failed")
+
+    repaired = [v for v in check_project(store, repair=True)
+                if v.invariant == "INV-NEO-QUESTION-LAPSED"]
+
+    assert [v.context["question_id"] for v in repaired] == [alarm]
+    assert neo.get(alarm)["status"] == "lapsed"
+    assert neo.get(qid)["status"] == "escalated"
+
+
 def test_a_late_answer_is_refused_plainly_and_teaches_nothing(store, neo):
     wo = store.create_work_order(title="t")
     qid = escalated(neo, wo["id"])
@@ -93,7 +107,7 @@ def test_kinds_with_their_own_subject_stay_open(store, neo):
     assert neo.get(unattached)["status"] == neo.get(empty_alarm)["status"] == "escalated"
 
 
-@pytest.mark.parametrize("status", ["completed", "cancelled"])
+@pytest.mark.parametrize("status", ["completed", "cancelled", "failed"])
 def test_an_alarm_about_an_ended_order_lapses_on_close(store, neo, status):
     wo = store.create_work_order(title="t")
     alarm = escalated(neo, wo["id"], kind="alarm")
