@@ -4336,11 +4336,15 @@ def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, 
         detail = validation_detail(store, **subject)  # type: ignore[arg-type]
         # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5
         owed = review_state(store, row) if unit == "work_order" else None
+        # Body images the OS could not reach, by round (io-87fe02be)
+        unchecked = [db.from_json(e["payload"], {}) for e in store.events_of_kind(
+            unit_id, "validation_images_unchecked")] if unit == "work_order" else []
     finally:
         store.close()
     return {"project": name, "unit": unit, "id": unit_id,
             "title": row["title"], "status": row["status"], **detail,
-            **({"review": owed} if owed else {})}
+            **({"review": owed} if owed else {}),
+            **({"images_unchecked": unchecked} if unchecked else {})}
 
 
 def current_config_version() -> str | None:

@@ -654,6 +654,15 @@ ABANDONED_VOID_REASON = (
     "decision owed to the user: {why}"
 )
 
+#: Why a round went back unjudged: an image in the PR body will not render (io-87fe02be)
+BROKEN_IMAGES_REASON = (
+    "these images in the pull-request body render broken for a reviewer, and the panel "
+    "cannot see pictures, so nobody has judged the work:{images}\n"
+    "Fix the links (the `open-a-pull-request` skill, section 3), edit the PR body, then "
+    "finish again.")
+#: The event naming body images the OS could not reach to check — said, never silently skipped
+VALIDATION_IMAGES_UNCHECKED = "validation_images_unchecked"
+
 #: The pair that records a landing the round machine could not take because a worker turn was in... (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
 VALIDATION_LANDING_DEFERRED = "validation_landing_deferred"
 VALIDATION_LANDED = "validation_landed"
@@ -2556,6 +2565,19 @@ class Daemon:
                          project.name, wo_id, n, refusal)
                 return
 
+            # A BODY IMAGE THAT RENDERS BROKEN is sent back before the panel
+            images = self._image_check(store, wo_id, n, packet)
+            if images is not None and images.broken:
+                self._reject(store, wo, round_id, n, max_rounds,
+                             BROKEN_IMAGES_REASON.format(images="".join(
+                                 f"\n- {t} — {why}" for t, why in images.broken)),
+                             budget_round=pos,
+                             rebind=(rebinds, ops.REBIND_MAX) if as_rebind else None,
+                             uncounted_cause=cause)
+                log.info("[%s] %s: round %d refused before the panel — %d broken "
+                         "image(s)", project.name, wo_id, n, len(images.broken))
+                return
+
             # A REPEAT of the IMMEDIATELY PRECEDING round only
             previous = self._preceding_round(store, n, wo_id=wo_id)
             # A SUBMISSION SENT BACK FOR RED CI MAY COME BACK UNCHANGED (#1023)
@@ -2714,6 +2736,23 @@ class Daemon:
             if int(row["round"]) == n - 1:
                 return row
         return None
+
+    @staticmethod
+    def _image_check(store: ProjectStore, wo_id: str, n: int, packet: Any) -> Any:
+        """The PR body's images fetched, the unreachable ones recorded; None with no PR body"""
+        from . import github
+
+        body = str((packet.pr or {}).get("body") or "")
+        if not body:
+            return None
+        images = github.body_image_check(body)
+        if images.unchecked:
+            store.add_event(wo_id, VALIDATION_IMAGES_UNCHECKED, {
+                "round": n, "images": [{"target": t, "why": why}
+                                       for t, why in images.unchecked]})
+            log.info("%s: round %d — %d body image(s) could not be checked",
+                     wo_id, n, len(images.unchecked))
+        return images
 
     @staticmethod
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
