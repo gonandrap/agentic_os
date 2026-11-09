@@ -1019,6 +1019,24 @@ def test_a_merge_commit_is_refused_rather_than_guessed(tmp_path):
     assert "git branch" not in r.stdout
 
 
+def test_a_pick_the_latest_tag_already_carries_is_refused_as_released(tmp_path):
+    """Issue 1651: not a conflict — the fix rode jarvis-0.2.1 as a cherry-pick copy"""
+    repo, fix = _landed_after_a_release(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "release/jarvis-0.2.1", "jarvis-0.2.0")
+    # The copy `cherry-pick -x` leaves, written by hand: #1 makes a real pick conflict
+    (repo / "notes.txt").write_text("The expedited fix (#2)\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "The expedited fix (#2)",
+         "-m", f"(cherry picked from commit {fix})")
+    _git(repo, "tag", "-a", "jarvis-0.2.1", "-m", "Jarvis OS 0.2.1")
+    _git(repo, "push", "-q", "origin", "refs/tags/jarvis-0.2.1")
+    _git(repo, "checkout", "-q", "main")
+    r = _dry_run(repo, tmp_path / "prod", "--cherry-pick", fix)
+    assert r.returncode != 0
+    assert "already released in jarvis-0.2.1" in r.stderr
+    assert "cherry-pick -x" not in r.stdout
+
+
 def test_a_commit_without_a_pr_number_is_refused(tmp_path):
     repo, _ = _landed_after_a_release(tmp_path)
     _commit(repo, "pushed straight to main")
