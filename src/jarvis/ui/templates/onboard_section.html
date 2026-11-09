@@ -73,12 +73,11 @@
       </form>
       {% endif %}
     </td>
-    <td class="badges">
-      <span class="badge" title="default">default {{ k.default|tojson }}</span>
+    <td><div class="badges">
       <span class="badge" title="where this value comes from">{{ k.source }}</span>
       {% if k.safety %}<span class="badge outside" title="changes what a worker may do: applying needs a reason">safety</span>{% endif %}
       {% if k.apply %}<span class="badge" title="when a change takes effect">{{ k.apply }}</span>{% endif %}
-    </td>
+    </div><div class="line mono">default: {{ k.default|tojson }}</div></td>
     <td>{{ help_form(k.path, '?', 'ask for help on ' ~ k.path) }}</td>
   </tr>
 {%- endmacro %}
