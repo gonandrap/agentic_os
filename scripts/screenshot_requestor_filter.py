@@ -1,4 +1,4 @@
-"""Screenshot the requestor filter on /project and /inbox against a throwaway fleet, for a PR's UI evidence"""
+"""Screenshot the requestor filter on /project and /inbox against a throwaway fleet"""
 
 from __future__ import annotations
 
