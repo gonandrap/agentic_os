@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{# Review and apply: §5 of docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md #}
+{% block title %}Review · onboard {{ name }} — Jarvis{% endblock %}
+{% block style %}
+  .ob-pane .lede { color: var(--ink-2); max-width: 80ch; }
+  .ob-diff td { vertical-align: top; }
+  .ob-diff .line { color: var(--ink-2); font-size: 12.5px; }
+  .ob-diff .grp td { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em;
+                     text-transform: uppercase; color: var(--ink-3); padding-top: 14px; }
+  .ob-diff .val { font-family: var(--mono); font-size: 12px; word-break: break-word; }
+  .ob-apply textarea { width: 100%; max-width: 80ch; }
+  .ob-step { display: flex; justify-content: space-between; margin: 24px 0; }
+{% endblock %}
+{% block content %}
+<div class="ob">
+{% include "_onboard_rail.html" %}
+<div class="ob-pane">
+  <div class="page-head">
+    <h1>Review and apply</h1>
+    <span class="meta">onboard {{ name }} · {{ view.review.rows|length }} changes</span>
+  </div>
+  {% if error %}<div class="error-flash" role="alert" id="ob-error">{{ error }}</div>{% endif %}
+  {% if view.problems %}
+  <div class="error-flash" id="ob-problems">This draft does not validate yet:
+    <ul>{% for p in view.problems %}<li>{{ p }}</li>{% endfor %}</ul></div>
+  {% endif %}
+
+  <h3>Decide first, still open</h3>
+  {% if view.review.must_have_missing %}
+  <p class="lede">Apply is refused until each of these has an answer — a posture, accept
+    defaults, or keep these, on its own section.</p>
+  <ul id="ob-missing">{% for key in view.review.must_have_missing %}
+    {% set s = view.sections|selectattr('key', 'equalto', key)|first %}
+    <li><a href="/onboard/{{ name|urlencode }}/{{ key }}">{{ s.title if s else key }}</a></li>
+  {% endfor %}</ul>
+  {% else %}<p class="lede">Nothing: every must-have area has an answer.</p>{% endif %}
+
+  <h3>What will change</h3>
+  <div class="panel table-wrap">
+    <table class="ob-diff" id="ob-diff">
+      {% for g in groups %}
+      <tr class="grp"><td colspan="4"><a href="/onboard/{{ name|urlencode }}/{{ g.key }}">{{ g.title }}</a>
+        · {{ g.rows|length }}</td></tr>
+      {% for r in g.rows %}
+      <tr>
+        <td><a class="mono" href="{{ r.href }}">{{ r.path }}</a>
+          {% if r.line %}<div class="line">{{ r.line }}</div>{% endif %}</td>
+        <td class="val">{{ r.old|tojson if r.kind != 'added' else '—' }} → {{ r.new|tojson if r.kind != 'removed' else '—' }}</td>
+        <td><span class="badge" title="when a change takes effect">{{ r.apply }}</span></td>
+        <td>{% if r.safety %}<span class="badge outside" title="changes what a worker may do: applying needs a reason">safety</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+      {% else %}
+      <tr><td class="empty">Nothing: applying this draft changes no setting.</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <h3>What happens next</h3>
+  {% if dry %}
+    {% if dry.restart_needed %}
+    <p class="lede" id="ob-next">After applying you must run <code>jarvis start --catalog {{ dry.catalog }}</code>
+      yourself — the dashboard never restarts: {{ dry.restart_why }}.</p>
+    {% else %}
+    <p class="lede" id="ob-next">No restart: every change takes effect while the OS runs.</p>
+    {% endif %}
+  {% else %}
+  <div class="error-flash" id="ob-refusal">Applying now is refused: {{ refusal }}</div>
+  {% endif %}
+
+  <form class="ob-apply" method="post" action="/onboard/{{ name|urlencode }}/apply">
+    <input type="hidden" name="rev" value="{{ view.rev }}">
+    <h3>Why</h3>
+    <p class="lede">Your own words for why these settings are what they are; it goes on the
+      config version{% if view.review.reason_needed %}, and is required: a safety setting changes{% endif %}.</p>
+    <textarea name="reason" rows="3" aria-label="reason">{{ reason }}</textarea>
+    <p><button class="primary">Apply</button></p>
+  </form>
+
+  <div class="ob-step">
+    {% if prev %}<a rel="prev" href="/onboard/{{ name|urlencode }}/{{ prev.key }}">← {{ prev.title }} <kbd>[</kbd></a>{% endif %}
+  </div>
+</div>
+</div>
+{% endblock %}
