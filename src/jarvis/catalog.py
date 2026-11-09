@@ -1113,6 +1113,9 @@ class MorpheusConfig:
     on_failed: str = "investigate"
     on_timeout: str = "neo"
     turn_timeout_seconds: int = 900
+    #: An unverified row's script reruns this often, script only, until the cap (wo-e4f3ab58)
+    dormant_every_hours: float = 24.0
+    dormant_cap_days: float = 30.0
 
 
 def _parse_morpheus(raw: Any, where: str = "os.morpheus") -> MorpheusConfig:
@@ -1137,11 +1140,14 @@ def _parse_morpheus(raw: Any, where: str = "os.morpheus") -> MorpheusConfig:
             on_timeout=str(raw.get("on_timeout", base.on_timeout)),
             turn_timeout_seconds=int(raw.get("turn_timeout_seconds",
                                              base.turn_timeout_seconds)),
+            dormant_every_hours=float(raw.get("dormant_every_hours", base.dormant_every_hours)),
+            dormant_cap_days=float(raw.get("dormant_cap_days", base.dormant_cap_days)),
         )
     except (TypeError, ValueError) as e:
         raise _err(f"{where}: {e}") from e
-    if cfg.timeout_days <= 0:
-        raise _err(f"{where}.timeout_days must be > 0")
+    for name in ("timeout_days", "dormant_every_hours", "dormant_cap_days"):
+        if getattr(cfg, name) <= 0:
+            raise _err(f"{where}.{name} must be > 0")
     for name in ("check_every_minutes", "script_timeout_seconds", "turn_timeout_seconds"):
         if getattr(cfg, name) < 1:
             raise _err(f"{where}.{name} must be >= 1")

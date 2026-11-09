@@ -473,13 +473,117 @@ def test_a_not_exercised_timeout_settles_unverified_with_no_model_call(central, 
                            run=_said("UNKNOWN no event yet\nREASON not_exercised"))
     after = central.morpheus_item(item["id"])
     assert after["state"] == "unverified" and moved["unverified"] == 1
-    assert after["next_check_ts"] is None and "never exercised" in after["resolution"]
+    assert after["next_check_ts"] == TEST_EPOCH + 4 * DAY + 1 and "never exercised" in after["resolution"]
+    assert after["deadline_ts"] == TEST_EPOCH + 33 * DAY + 1
+    assert morpheus.state_label(after) == "unverified, dormant"
     assert morpheus.owed_actions(central) == []
 
     def no_model(*a, **kw):
         raise AssertionError("a settled order made a model call")
     assert morpheus.act(central, catalog(), after, cwd=tmp_path, call=no_model,
                         ask_neo=no_model, investigate=no_model) == ""
+
+
+# -- an unverified row stays dormant until production exercises it (wo-e4f3ab58)
+
+
+def dormant(central, cfg, tmp_path) -> dict:
+    item = monitoring(central)
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 3 * DAY + 1,
+                   run=_said("REASON not_exercised"))
+    return central.morpheus_item(item["id"])
+
+
+def test_a_dormant_check_that_exits_0_validates(central, cfg, tmp_path):
+    item = dormant(central, cfg, tmp_path)
+    moved = morpheus.sweep(central, cfg, tmp_path, now=item["next_check_ts"], run=_said("", 0))
+    after = central.morpheus_item(item["id"])
+    assert moved["validated"] == 1 and after["state"] == "validated"
+    assert after["resolution"] == "script exited 0 on a dormant check"
+
+
+def test_a_dormant_row_fails_only_on_a_second_exit_1(central, cfg, tmp_path):
+    item = dormant(central, cfg, tmp_path)
+    morpheus.sweep(central, cfg, tmp_path, now=item["next_check_ts"], run=_said("FAIL x", 1))
+    once = central.morpheus_item(item["id"])
+    assert once["state"] == "unverified" and once["next_check_ts"] == item["next_check_ts"] + DAY
+    morpheus.sweep(central, cfg, tmp_path, now=once["next_check_ts"], run=_said("FAIL x", 1))
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "failed" and after["next_check_ts"] is None
+    assert after["state"] in morpheus.ACTION_STATES
+
+
+def test_a_dormant_exit_75_stays_dormant_and_is_not_rerun_before_due(central, cfg, tmp_path):
+    item = dormant(central, cfg, tmp_path)
+    ran = []
+
+    def counting(script, cwd, timeout):
+        ran.append(script)
+        return morpheus.CheckResult(75, "REASON not_exercised")
+    morpheus.sweep(central, cfg, tmp_path, now=item["next_check_ts"] - 1, run=counting)
+    assert ran == []
+    morpheus.sweep(central, cfg, tmp_path, now=item["next_check_ts"], run=counting)
+    after = central.morpheus_item(item["id"])
+    assert ran and after["state"] == "unverified"
+    assert after["next_check_ts"] == item["next_check_ts"] + DAY
+
+
+def test_a_dormant_row_at_its_cap_is_unverified_for_good_and_says_so(central, cfg, tmp_path):
+    item = dormant(central, cfg, tmp_path)
+    central.update_morpheus_item(item["id"], next_check_ts=item["deadline_ts"])
+    morpheus.sweep(central, cfg, tmp_path, now=item["deadline_ts"], run=_said("REASON not_exercised"))
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "unverified" and after["next_check_ts"] is None
+    assert after["resolution"].startswith(morpheus.DORMANT_CAP_REACHED)
+    assert morpheus.state_label(after) == morpheus.DORMANT_CAP_REACHED
+    assert central.dormant_morpheus_items() == []
+
+
+def _with_files(n: int, *files: str) -> morpheus.PullRequestBody:
+    return morpheus.PullRequestBody(number=n, url=f"https://github.com/o/r/pull/{n}",
+                                    title=f"[wo-0000000{n}] x", body=HINTS_BODY, files=files)
+
+
+def test_a_later_pr_changing_the_same_files_supersedes_a_dormant_row(central, cfg, tmp_path):
+    item = dormant(central, cfg, tmp_path)  # PR 7, queued before files were stored
+    asked = []
+
+    def files_of(repo, n):
+        asked.append((repo, n))
+        return ("src/a.py", "src/b.py")
+    morpheus.enqueue(central, cfg, _with_files(8, "src/c.py"), project="proj_a", repo="o/r",
+                     files_of=files_of)
+    assert central.morpheus_item(item["id"])["next_check_ts"] is not None
+    later = morpheus.enqueue(central, cfg, _with_files(9, "src/b.py"), project="proj_a",
+                             repo="o/r", files_of=files_of)
+    after = central.morpheus_item(item["id"])
+    assert asked == [("o/r", 7)]  # fetched once, then stored
+    assert after["state"] == "unverified" and after["next_check_ts"] is None
+    assert after["resolution"].startswith(f"superseded by {later['id']}:")
+    assert morpheus.state_label(after) == f"unverified, superseded by {later['id']}"
+
+
+def test_legacy_unverified_rows_revive_once_unless_they_ever_failed(central, cfg, tmp_path):
+    clean, failed = monitoring(central, n=7), monitoring(central, n=8)
+    for it, fail in ((clean, 0), (failed, 1)):
+        central.update_morpheus_item(it["id"], state="unverified", next_check_ts=None,
+                                     saw_fail=fail, last_check_ts=TEST_EPOCH)
+    morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + DAY, run=_said("REASON not_exercised"))
+    revived = central.morpheus_item(clean["id"])
+    assert revived["next_check_ts"] == TEST_EPOCH + 2 * DAY
+    assert revived["deadline_ts"] == TEST_EPOCH + 30 * DAY
+    assert central.morpheus_item(failed["id"])["next_check_ts"] is None
+    central.update_morpheus_item(clean["id"], next_check_ts=None)
+    assert morpheus.revive_unverified(central, cfg, TEST_EPOCH + 3 * DAY) == 0
+
+
+def test_a_settled_row_is_not_watched_dormant_and_says_why(central, tmp_path):
+    item = monitoring(central)
+    central.update_morpheus_item(item["id"], state="failed", next_check_ts=None)
+    morpheus.settle_unverified(central, item["id"], "inv-1234abcd", "behaviour is correct")
+    after = central.morpheus_item(item["id"])
+    assert after["state"] == "unverified" and after["next_check_ts"] is None
+    assert after["resolution"].endswith("not watched dormant: settled from failed")
 
 
 def test_unverified_is_terminal_and_never_counted_as_passed():

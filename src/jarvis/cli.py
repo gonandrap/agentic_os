@@ -4365,12 +4365,14 @@ MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "unve
 
 
 def _morpheus_line(item: dict) -> str:
+    from .morpheus import state_label
+
     action = f" → {item['action']}" if item.get("action") else ""
     what = f"PR #{item['pr_number']} " if item.get("pr_number") else ""
     owner = f" · owed by {item['owed_by']}" if item.get("owed_by") else ""
     return (f"{MORPHEUS_ICON.get(item['state'], '•')} {item['id']} "
             f"[{item.get('project') or '?'}] {what}"
-            f"{item['state']}{action}{owner} — {(item.get('pr_title') or item.get('title') or '')[:70]}")
+            f"{state_label(item)}{action}{owner} — {(item.get('pr_title') or item.get('title') or '')[:70]}")
 
 
 def _fix_lines(fix: dict | None, dispatch: str) -> list[str]:
