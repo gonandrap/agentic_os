@@ -939,6 +939,7 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--all", action="store_true", help="include closed work orders")
     l.add_argument("--include-hidden", action="store_true",
                    help="include work orders you've hidden")
+    l.add_argument("--mine", action="store_true", help="only orders you asked for")
 
     s = wo.add_parser("show", help="show one work order: what was said (the "
                                    "conversation), what happened (the timeline), and "
@@ -1190,6 +1191,7 @@ def build_parser() -> argparse.ArgumentParser:
     f = fo.add_parser("list", help="feature orders and how far along they are")
     f.add_argument("project", nargs="?")
     f.add_argument("--all", action="store_true", help="include settled feature orders")
+    f.add_argument("--mine", action="store_true", help="only orders you asked for")
 
     f = fo.add_parser("show", help="one feature order: its plan and its children")
     f.add_argument("fo_id")
@@ -1280,6 +1282,7 @@ def build_parser() -> argparse.ArgumentParser:
     i = io.add_parser("list", help="improvement orders and where each one stands")
     i.add_argument("project", nargs="?")
     i.add_argument("--all", action="store_true", help="include settled ones")
+    i.add_argument("--mine", action="store_true", help="only orders you asked for")
 
     i = io.add_parser("show", help="one improvement order: the counts, the observation "
                                    "and the evidence it was filed with")
@@ -3795,34 +3798,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                                       project_name=args.project), args.json)
 
     elif args.wo_cmd == "list":
-        paths = ops.registered_project_paths()
-        if args.project:
-            if args.project not in paths:
-                raise ops.OpsError(f"project {args.project!r} not registered")
-            paths = {args.project: paths[args.project]}
-        out = []
-        for name, path in sorted(paths.items()):
-            if not path.is_dir():
-                continue
-            store = ProjectStore(path)
-            try:
-                wos = store.list_work_orders(
-                    statuses=None if args.all else OPEN_STATUSES,
-                    include_hidden=args.include_hidden,
-                )
-                # Derived inside the store's lifetime: the label reads the dependencies' rows (#714)
-                account = ops.fleet_if_held(wos)
-                labels = {wo["id"]: invariants.status_label(store, wo, account)
-                          for wo in wos}
-            finally:
-                store.close()
-            for wo in wos:
-                out.append({"project": name, **{k: wo[k] for k in (
-                    "id", "title", "status", "origin", "needs_attention",
-                    "attention_reason", "created_at", "hidden", "pr_url")},
-                    # WHY IT IS SITTING THERE, once the flag is down
-                    "seen_blockers": invariants.acknowledged(wo),
-                    "status_label": labels[wo["id"]]})
+        out = ops.list_work_orders(args.project, include_closed=args.all,
+                                   include_hidden=args.include_hidden, mine=args.mine)
         # Running first, then the PRs waiting to be merged
         out.sort(key=lambda wo: LIST_PRIORITY.get(wo["status"], 9))
         if args.json:
@@ -3830,7 +3807,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
         else:
             for wo in out:
                 icon = STATUS_ICON.get(wo["status"], "•")
-                badge = ORIGIN_BADGE.get(wo["origin"], wo["origin"])
+                badge = wo["requestor_view"]
                 att = " ⚠" if wo["needs_attention"] else ""
                 hid = " 🙈" if wo["hidden"] else ""
                 pr = f"\n    → merge {wo['pr_url']}" if wo["status"] == "waiting_pr_merge" \
@@ -4137,7 +4114,8 @@ def cmd_fo(args: argparse.Namespace) -> int:
             _print(ops.set_feature_budget(args.fo_id, amount, args.project), args.json)
 
     elif args.fo_cmd == "list":
-        rows = ops.list_feature_orders(args.project, include_settled=args.all)
+        rows = ops.list_feature_orders(args.project, include_settled=args.all,
+                                       mine=args.mine)
         if args.json:
             _print(rows, True)
         elif not rows:
@@ -4146,7 +4124,7 @@ def cmd_fo(args: argparse.Namespace) -> int:
             for fo in rows:
                 icon = FO_ICON.get(fo["status"], "•")
                 att = " ⚠" if fo["needs_attention"] else ""
-                print(f"{icon} {fo['id']} [{fo['project']}] {fo['title']} "
+                print(f"{icon} {fo['id']} [{fo['project']}] [{fo['requestor_view']}] {fo['title']} "
                       f"({fo['status']}, {fo['progress']['label']}, "
                       f"{_age(fo['created_at'])}){att}")
 
@@ -4270,7 +4248,8 @@ def cmd_io(args: argparse.Namespace) -> int:
                         "on its findings"}, args.json)
 
     elif args.io_cmd == "list":
-        rows = ops.list_improvement_orders(args.project, include_settled=args.all)
+        rows = ops.list_improvement_orders(args.project, include_settled=args.all,
+                                           mine=args.mine)
         if args.json:
             _print(rows, True)
         elif not rows:
@@ -4279,7 +4258,7 @@ def cmd_io(args: argparse.Namespace) -> int:
             for io in rows:
                 icon = FO_ICON.get(io["status"], "•")
                 att = " ⚠" if io["needs_attention"] else ""
-                print(f"{icon} {io['id']} [{io['project']}] {io['title']} "
+                print(f"{icon} {io['id']} [{io['project']}] [{io['requestor_view']}] {io['title']} "
                       f"({io['status_label']}, {_age(io['created_at'])}){att}")
 
     elif args.io_cmd == "show":
@@ -6165,6 +6144,10 @@ def cmd_validation(args: argparse.Namespace) -> int:
         print(f"\n{ops.round_line(rnd)}")
         if rnd["evidence"]:
             print(f"  evidence: {rnd['evidence']}")
+        for miss in view.get("images_unchecked") or []:
+            if miss.get("round") == rnd.get("round"):
+                for img in miss.get("images") or []:
+                    print(f"  image NOT checked: {img.get('target')} — {img.get('why')}")
         # THE ISSUE BESIDE THE FINDING THAT CAUSED IT
         filed = {i["title"]: i
                  for i in (rnd.get("follow_ups") or {}).get("filed") or []}

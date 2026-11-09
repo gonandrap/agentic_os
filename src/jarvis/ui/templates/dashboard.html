@@ -58,7 +58,7 @@
 <h2>Open orders</h2>
 {{ ui.filter_bar("/", filters, options, shown | length, total,
                  labels={"type": "every type", "project": "every project",
-                         "status": "every status"}) }}
+                         "status": "every status", "requestor": "any"}) }}
 {# The decisions you owe first, then what is running, then what waits for a merge. Only the
    statuses the OS has not started yet collapse into a count: they wait on the OS, not you. #}
 {% if rest_counts %}

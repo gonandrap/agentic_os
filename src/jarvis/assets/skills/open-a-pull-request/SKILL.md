@@ -139,7 +139,7 @@ If production has nothing to show (docs, tests or comments only), write
 
 The hook denies a body without the section, or with only the template comment.
 
-## 3. Link every image by raw URL at the commit SHA
+## 3. Link every image by an absolute URL at the commit SHA
 
 `gh` cannot upload an image, so the PNGs are committed (`docs/screenshots/`) and linked.
 GitHub resolves a repo-relative path for a **link** and not for an **image**, so
@@ -148,18 +148,30 @@ works — which is why this survives being written and fails in front of the rev
 (`kn-72cec521`, PR 173). **The hook denies any image target that is not an absolute
 `http(s)` URL.**
 
+The form depends on the repository's visibility (`gh repo view --json isPrivate`):
+
 ```
+# PRIVATE repo — rendered through the reader's github.com session
+https://github.com/<owner>/<repo>/blob/<COMMIT-SHA>/docs/screenshots/<name>.png?raw=true
+# public repo — either form works
 https://raw.githubusercontent.com/<owner>/<repo>/<COMMIT-SHA>/docs/screenshots/<name>.png
 ```
+
+raw.githubusercontent.com carries no github.com session, so on a private repo it 404s
+for every reader, members included (shared_schedule PR 7). **The hook denies a
+raw.githubusercontent image on a private repo**, and the validation round fetches every
+body image and sends the work back when one is not an image.
 
 Pin the SHA, not the branch: a branch URL 404s the moment the branch is deleted after
 merge, and the merged record is the one anybody reads later.
 
-Push the branch first — raw.githubusercontent serves from the remote — then verify each
-URL before you post the body:
+Push the branch first, then verify each image as a member — this exits non-zero on a
+missing file, and an unauthenticated `curl` cannot tell private from missing:
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' <url>   # 200 image/png
+gh api -H 'Accept: application/vnd.github.raw' \
+  'repos/<owner>/<repo>/contents/docs/screenshots/<name>.png?ref=<COMMIT-SHA>' | file -
+# /dev/stdin: PNG image data, ...
 ```
 
 ## 4. Never write a bare `#N`
