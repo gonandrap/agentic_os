@@ -6143,6 +6143,10 @@ def cmd_validation(args: argparse.Namespace) -> int:
         print(f"\n{ops.round_line(rnd)}")
         if rnd["evidence"]:
             print(f"  evidence: {rnd['evidence']}")
+        for miss in view.get("images_unchecked") or []:
+            if miss.get("round") == rnd.get("round"):
+                for img in miss.get("images") or []:
+                    print(f"  image NOT checked: {img.get('target')} — {img.get('why')}")
         # THE ISSUE BESIDE THE FINDING THAT CAUSED IT
         filed = {i["title"]: i
                  for i in (rnd.get("follow_ups") or {}).get("filed") or []}
