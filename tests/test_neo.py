@@ -179,6 +179,22 @@ def test_escalation_reaches_the_user(asked, project):
     assert st["neo"]["escalated"] == 1
 
 
+def test_an_escalation_is_on_the_work_order_record(asked, project):
+    """io-7bed6603: Neo's hand-back is a WO event, with the reason, not only a Neo-store row"""
+    daemon, wo, _ = asked
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the production key?")
+    drain(daemon)
+    store = ProjectStore(project)
+    try:
+        events = store.list_events(wo["id"])
+    finally:
+        store.close()
+    esc = [json.loads(e["payload"]) if isinstance(e["payload"], str) else e["payload"]
+           for e in events if e["kind"] == "question_escalated"]
+    assert len(esc) == 1
+    assert esc[0]["neo_question_id"] == 2 and esc[0]["reason"] and not esc[0]["failed"]
+
+
 def test_garbage_output_is_re_asked_not_delivered(asked, project):
     """Unparseable model output must never reach a worker as an answer, and is re-asked (#1401)"""
     daemon, wo, _ = asked

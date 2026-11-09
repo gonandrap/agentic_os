@@ -106,6 +106,13 @@ def _neo_question_id(p: dict[str, Any]) -> int | None:
         return None
 
 
+#: Neo handed a worker's question back to the user, or could not answer it (io-7bed6603)
+QUESTION_ESCALATED = "question_escalated"
+
+#: `neo_store.USER_HELD_Q_STATUSES`; this module imports no store
+USER_HELD = ("escalated", "failed")
+
+
 #: The kinds carrying one alarm's life (docs/superpowers/specs/2026-08-31-the-supervisor.md)
 ALARM_KINDS = frozenset({"cost_alarm", "alarm_reviewed", "alarm_escalated",
                          "alarm_advice", "health_finding", "health_reviewed",
@@ -118,7 +125,7 @@ NO_TURN = -1
 
 def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
     """The record this entry points at, or None"""
-    if kind == "question_asked":
+    if kind in ("question_asked", QUESTION_ESCALATED):
         qid = _neo_question_id(p)
         if qid is not None:
             return {"kind": "neo_question", "id": qid, "label": f"question #{qid}"}
@@ -360,6 +367,10 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "question_asked":
         # Never the text, with or without an id: the conversation renders the ask from this same payload
         return "Worker asked a question", ""
+    if kind == QUESTION_ESCALATED:
+        if p.get("failed"):
+            return "Neo could not answer the question — it is yours", p.get("reason") or ""
+        return "Neo escalated the question to you", p.get("reason") or ""
     if kind == "question_lapsed":
         return f"Neo question {p.get('question_id')} lapsed", p.get("reason") or ""
     # Debug (see DEBUG_KINDS); they still render, with no detail, when asked for
@@ -939,12 +950,39 @@ def _voided(events: list[dict[str, Any]]) -> dict[Any, str]:
     return void
 
 
+def _escalation_turn(ts: float, qid: int, reason: str, failed: bool,
+                     status: str) -> dict[str, Any]:
+    """Neo's hand-back as the user's ask; `#esc-<id>` is what the attention banner links to"""
+    return {
+        "ts": ts, "kind": "escalation",
+        "who": "os → you" if failed else "Neo → you", "void": "",
+        "content": (f"Neo could not answer question #{qid}: {reason}" if failed
+                    else f"Neo escalated question #{qid} to you: {reason}"),
+        "anchor": f"esc-{qid}", "ref": _ref(QUESTION_ESCALATED, {"neo_question_id": qid}),
+        "msg_id": None, "source": "neo", "status": status, "inbound": False,
+    }
+
+
 def build_conversation(events: list[dict[str, Any]],
-                       messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Everything that was SAID about this work order, in the order it was said"""
+                       messages: list[dict[str, Any]],
+                       questions: dict[int, dict[str, Any]] | None = None
+                       ) -> list[dict[str, Any]]:
+    """What was SAID about this work order, in order; `questions` = Neo's live rows by id"""
+    questions = questions or {}
     turns: list[dict[str, Any]] = []
+    escalated = {_neo_question_id(_payload(e)) for e in events
+                 if e.get("kind") == QUESTION_ESCALATED}
     for e in events:
         kind = e.get("kind")
+        if kind == QUESTION_ESCALATED:
+            p = _payload(e)
+            qid = _neo_question_id(p)
+            if qid is not None:
+                live = questions.get(qid) or {}
+                turns.append(_escalation_turn(
+                    e.get("ts") or 0.0, qid, str(p.get("reason") or ""),
+                    bool(p.get("failed")), live.get("status") or ""))
+            continue
         if kind not in ("question_asked", "alarm_reviewed", "alarm_advice"):
             continue
         p = _payload(e)
@@ -955,13 +993,20 @@ def build_conversation(events: list[dict[str, Any]],
             continue
         if kind == "question_asked":
             qid = _neo_question_id(p)
+            live = (questions.get(qid) or {}) if qid is not None else {}
+            ts = e.get("ts") or 0.0
             turns.append({
-                "ts": e.get("ts") or 0.0, "kind": "question", "who": "worker → Neo",
+                "ts": ts, "kind": "question", "who": "worker → Neo",
                 "void": "", "content": text,
                 "anchor": f"q-{qid}" if qid is not None else "",
                 "ref": _ref(kind, p), "msg_id": None,
-                "source": "neo", "status": "", "inbound": False,
+                "source": "neo", "status": live.get("status") or "", "inbound": False,
             })
+            if qid is not None and qid not in escalated and live.get("status") in USER_HELD:
+                # No event to place it by: right after the ask, the only moment the record proves
+                turns.append(_escalation_turn(
+                    ts + 0.001, qid, str(live.get("answer_reason") or ""),
+                    live["status"] == "failed", live["status"]))
             continue
         turns.append({
             "ts": e.get("ts") or 0.0,

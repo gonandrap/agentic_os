@@ -27,6 +27,7 @@ from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE, invariant_title
 from .neo import ANSWER_PREFIX, is_delegated
 from .neo_store import ESCALATION_CAUSES_FAILED, MAX_ANSWER_ATTEMPTS, QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
+from .timeline import QUESTION_ESCALATED
 # The `os_state` keys the dashboard's self-heal keeps
 from .uilog import (UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS,
                     register_stack_signal)
@@ -3726,6 +3727,11 @@ class Daemon:
         if ppath and ppath.is_dir():
             pstore = ProjectStore(ppath)
             try:
+                if q.get("wo_id"):
+                    pstore.add_event(q["wo_id"], QUESTION_ESCALATED,
+                                     {"neo_question_id": q["id"],
+                                      "reason": f"its model call failed every time ({detail[:200]})",
+                                      "failed": True})
                 pstore.flag_attention(
                     q["wo_id"],
                     invariants.neo_question_blocker({**q, "status": "failed"}))
@@ -3874,6 +3880,11 @@ class Daemon:
                         wo_id=q["wo_id"],
                     )
                     if pstore:
+                        # On the order's own record, not only Neo's store (io-7bed6603)
+                        pstore.add_event(q["wo_id"], QUESTION_ESCALATED,
+                                         {"neo_question_id": q["id"],
+                                          "reason": verdict.get("reason") or "",
+                                          "failed": bool(verdict.get("failed"))})
                         # The reason `invariants.true_blockers` re-derives for this question
                         pstore.flag_attention(
                             q["wo_id"],
