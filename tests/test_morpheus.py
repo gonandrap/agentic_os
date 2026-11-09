@@ -1257,6 +1257,54 @@ def test_a_release_of_three_beside_fifteen_monitoring_makes_exactly_three_calls(
     assert [tuple(r) for r in rows] == [("morpheus", "arm", i["id"], "proj_b") for i in new]
 
 
+def test_the_arming_brief_carries_kept_follow_ups_as_failure_shapes(central, tmp_path):
+    """io-b42dfb75: what every seat kept is what production watches; no follow-ups, same brief"""
+    from jarvis.catalog import ProjectSpec
+    from jarvis.project_store import ProjectStore
+
+    store = ProjectStore(tmp_path / "proj_a")
+    kept = [("d1", "a", "major", "supersession: unrelated base commit counts", "passed work lost"),
+            ("d2", "b", "major", "supersession: unrelated base commit counts", "same, other seat"),
+            ("d3", "a", "minor", "rename a variable", "never"),
+            ("d4", "a", "", "legacy row without a level", "old shape"),
+            ("d5", "a", "medium", "third shape", "third"),
+            ("d6", "a", "critical", "fourth shape", "outranks the mediums")]
+    for digest, seat, level, title, failure in kept:
+        store.record_internal_follow_up(digest, "wo-1234abcd", seat=seat, title=title,
+                                        failure=failure, file="src/x.py", level=level)
+    store.close()
+    cat = Catalog(os=OsConfig(morpheus=MorpheusConfig()),
+                  projects=[ProjectSpec(name="proj_a", path=tmp_path / "proj_a", description="")])
+    item = queued(central, 1)
+    bare = queued(central, 2, title="[wo-99999999] other")
+    call = FakeCall()
+    assert morpheus.arm(central, cat, tmp_path, now=TEST_EPOCH, call=call)["armed"] == 2
+    prompt, other = (c["prompt"] for c in call.calls)
+    assert item["id"] in prompt and "print a FAIL line" in prompt
+    assert prompt.count("supersession: unrelated base commit counts") == 1
+    assert "passed work lost" in prompt and "(src/x.py)" in prompt
+    # Most severe first: the critical one is kept and the cap drops the last medium
+    assert "fourth shape" in prompt and "legacy row without a level" in prompt
+    assert "rename a variable" not in prompt and "third shape" not in prompt
+    assert other == morpheus._arm_prompt(bare) and "FAIL line" not in other
+
+
+def test_an_unreadable_follow_up_store_still_arms_the_order(central, tmp_path, monkeypatch):
+    from jarvis.catalog import ProjectSpec
+    from jarvis.project_store import ProjectStore
+
+    def broken(*_a, **_k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(ProjectStore, "internal_follow_ups", broken)
+    cat = Catalog(os=OsConfig(morpheus=MorpheusConfig()),
+                  projects=[ProjectSpec(name="proj_a", path=tmp_path / "proj_a", description="")])
+    item = queued(central, 1)
+    call = FakeCall()
+    assert morpheus.arm(central, cat, tmp_path, now=TEST_EPOCH, call=call)["armed"] == 1
+    assert call.calls[0]["prompt"] == morpheus._arm_prompt(item)
+
+
 @pytest.mark.parametrize("call", [FakeCall(reply="I wrote it to /tmp, done."),
                                   FakeCall(error=claude_cli.ClaudeCliError("boom"))],
                          ids=["unparseable", "cli-error"])

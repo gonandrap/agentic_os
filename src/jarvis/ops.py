@@ -2967,7 +2967,8 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
                 detail=str(finding.get("detail") or ""),
                 file=str(finding.get("file") or ""),
                 symbol=str(finding.get("symbol") or ""),
-                failure=str(finding.get("failure") or ""))
+                failure=str(finding.get("failure") or ""),
+                level=str(finding.get("level") or ""))
             payload["withheld"].append({"digest": digest, "title": key, "seat": seat})
         if payload["withheld"]:
             payload["reason"] = (f"{repo or 'the project'} is not a repository this OS "
@@ -3021,6 +3022,13 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
         store.record_issue(url, number=issues.issue_number(url), repo=repo, title=title,
                            state="OPEN")
         store.link_issue(url, unit_id, "raised", round_no=n, seat=seat, announced=True)
+        # The full finding too, so Morpheus arms it as a failure shape (io-b42dfb75)
+        store.record_internal_follow_up(
+            follow_up_digest_of(finding), unit_id, round=n, seat=seat, title=key,
+            detail=str(finding.get("detail") or ""), file=str(finding.get("file") or ""),
+            symbol=str(finding.get("symbol") or ""),
+            failure=str(finding.get("failure") or ""),
+            level=str(finding.get("level") or ""), issue_url=url)
     return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
 
