@@ -5354,6 +5354,17 @@ class Daemon:
             except Exception:  # noqa: BLE001 — same isolation as the sweep above
                 log.exception("[%s] settling %s failed", project.name, wo["id"])
 
+    @staticmethod
+    def _land_deferred(store: ProjectStore, wo: dict) -> None:
+        """The deferred landing, unless the user wrote after the last finish: then the user decides (wo-f7ef5098)"""
+        from . import ops as ops_mod
+
+        if not ops_mod.user_message_unanswered(store, wo["id"]):
+            ops_mod.land_when_cleared(store, wo)
+            return
+        store.set_status(wo["id"], "needs_review")
+        store.flag_attention(wo["id"], invariants_mod.USER_MESSAGE_UNANSWERED_BLOCKER)
+
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
         # `user_facing_wait` is NOT read here any more: it decides eligibility
@@ -5381,7 +5392,7 @@ class Daemon:
                     and worker_session.busy(store, wo["id"]) is None
                     and not store.queued_messages(wo["id"])):
                 fresh = store.get_work_order(wo["id"])
-                ops_mod.land_when_cleared(store, fresh)
+                self._land_deferred(store, fresh)
                 store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
 
@@ -5486,7 +5497,7 @@ class Daemon:
         # THE LANDING THE ROUND MACHINE DEFERRED (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
         deferred = _landing_deferred(store, wo["id"]) if round_open == "passed" else None
         if deferred is not None:
-            ops_mod.land_when_cleared(store, fresh)
+            self._land_deferred(store, fresh)
             store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
         if fresh.get("result_summary"):
@@ -5500,6 +5511,7 @@ class Daemon:
                 # `resumed_from` is the same rule as `pr_repair_origin` for the other way the OS takes a work order... (#259)
                 back = ("needs_review"
                         if invariants_mod.validation_escalated(store, fresh)
+                        or ops_mod.user_message_unanswered(store, wo["id"])
                         else ops_mod.pr_repair_origin(store, wo["id"])
                         or ops_mod.resumed_from(store, wo["id"], turn["seq"])
                         or "waiting_pr_merge")
@@ -6249,10 +6261,13 @@ class Daemon:
         # #1063
         drift = self._drift_hold(store, wo)
         no_ci = self._repo_has_no_ci(project, pr)
+        # Only this call needs it: every re-decide below follows a code this hold outranks (wo-f7ef5098)
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
-            pending_assumptions=pending, plan_assumptions=plan_assumptions,
+            pending_assumptions=pending,
+            user_message=ops.user_message_unanswered(store, wo_id),
+            plan_assumptions=plan_assumptions,
                     spec_unmerged=spec_unmerged,
             drift=drift, base_red=base_red, base_behind=base_behind, no_ci=no_ci)
         if not decision.armed:
@@ -6367,6 +6382,9 @@ class Daemon:
             # #1513: an unspent lapsed grant authorised nothing; the decision goes back to Neo
             self._note_automerge_held(store, wo_id,
                                       automerge.held_grant_lapsed(approval, decision))
+            approval = None
+        if approval is not None and automerge.withdrawn(approval):
+            # Authorised nothing and refused nothing: the armed decision is asked afresh (wo-f7ef5098)
             approval = None
         if approval is None:
             # #1459, #1608: one merge request in flight per base tip, in queue order

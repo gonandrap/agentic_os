@@ -1275,6 +1275,8 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
         store.add_event(wo_id, "message_queued",
                         {"msg_id": msg_id, "source": source,
                          "authored_by": authored_by})
+        if authored_by:
+            withdraw_merge_requests(store, wo_id)
         # A reply IS the response to whatever flagged the user
         if wo["needs_attention"]:
             store.clear_attention(wo_id)
@@ -4698,6 +4700,44 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
         return "validating"
     # `escalated` lands
     return land_finished(store, wo, pr_url)
+
+
+#: Why a user message withdraws a merge request (wo-f7ef5098)
+USER_MESSAGE_WITHDRAWS = ("the user wrote to this work order after the request was "
+                          "filed; the OS asks again once the worker finishes again")
+
+
+def user_message_unanswered(store: ProjectStore, wo_id: str) -> bool:
+    """Is the user's newest message newer than the worker's last finish and the user's last accept? (wo-f7ef5098)"""
+    newest = store.user_messages(wo_id, limit=1)
+    if not newest:
+        return False
+    said = float(newest[0]["ts"])
+    answers = store.events_of_kind(wo_id, "finished") + [
+        e for e in store.events_of_kind(wo_id, "reviewed")
+        if db.from_json(e["payload"], {}).get("accepted", True)]
+    return not any(float(e["ts"]) > said for e in answers)
+
+
+def withdraw_merge_requests(store: ProjectStore, wo_id: str) -> int:
+    """Close this order's open or unspent auto_merge requests: a user message re-opens the question (wo-f7ef5098)"""
+    from . import automerge
+    from .neo_store import NeoStore
+
+    closed = store.supersede_grants(wo_id, automerge.GATE_KIND, "", USER_MESSAGE_WITHDRAWS)
+    for a in store.open_approvals(wo_id):
+        if a["kind"] != automerge.GATE_KIND:
+            continue
+        store.supersede_approval(a["id"], USER_MESSAGE_WITHDRAWS)
+        closed += 1
+        if a["neo_question_id"]:
+            neo = NeoStore()
+            try:
+                neo.supersede(a["neo_question_id"], "SUPERSEDED — the user wrote to it",
+                              USER_MESSAGE_WITHDRAWS)
+            finally:
+                neo.close()
+    return closed
 
 
 def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
