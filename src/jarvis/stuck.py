@@ -34,6 +34,27 @@ BASE_RED_CAUSE = "the default branch is red"
 #: §1 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md
 AUTOMERGE_CHECKS_CAUSE = "GitHub's checks on the merge commit"
 
+#: Issue 1655: every other turn-keeping hold, keyed by its `automerge.HELD_*` code
+MERGE_QUEUED_CAUSE = "its turn in the merge queue"
+BASE_MOVED_CAUSE = "a catch-up with the moved default branch"
+SHA_MOVED_CAUSE = "the panel's verdict following its moved head"
+NOT_MERGEABLE_CAUSE = "GitHub's mergeability check"
+CHECKS_NONE_CAUSE = "the first check to report on its head"
+MERGE_STATE_UNCLEAN_CAUSE = "GitHub's merge state settling to CLEAN"
+GRANT_LAPSED_CAUSE = "a fresh merge grant"
+
+#: `automerge.TURN_KEEPING_HOLDS`, each to its cause; a test holds the keys equal
+AUTOMERGE_HOLD_CAUSES: Mapping[str, str] = {
+    "checks_running": AUTOMERGE_CHECKS_CAUSE,
+    "merge_queued": MERGE_QUEUED_CAUSE,
+    "base_moved": BASE_MOVED_CAUSE,
+    "sha_moved": SHA_MOVED_CAUSE,
+    "not_mergeable": NOT_MERGEABLE_CAUSE,
+    "checks_none": CHECKS_NONE_CAUSE,
+    "merge_state_unclean": MERGE_STATE_UNCLEAN_CAUSE,
+    "grant_lapsed": GRANT_LAPSED_CAUSE,
+}
+
 #: §2.1 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-...
 PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
 
@@ -73,6 +94,32 @@ EXCLUSION_REASON: Mapping[str, str] = {
                              "nothing merges a commit whose checks have not reported — it "
                              "clears when they do, with no decision from you, so nothing "
                              "is judged while that is true"),
+    MERGE_QUEUED_CAUSE: ("the OS is holding this merge itself: another order in this "
+                         "project is ahead of it in the merge queue, and merges go one "
+                         "at a time — it clears when its turn comes, with no decision "
+                         "from you, so nothing is judged while that is true"),
+    BASE_MOVED_CAUSE: ("the OS is holding this merge itself: the default branch moved "
+                       "and the OS is catching this branch up with it — it clears when "
+                       "the caught-up head's checks report, with no decision from you, "
+                       "so nothing is judged while that is true"),
+    SHA_MOVED_CAUSE: ("the OS is holding this merge itself: the head moved after the "
+                      "panel judged it, and the OS re-binds or re-judges the new head — "
+                      "it clears when that settles, with no decision from you, so "
+                      "nothing is judged while that is true"),
+    NOT_MERGEABLE_CAUSE: ("the OS is holding this merge itself: GitHub has not yet said "
+                          "this branch merges cleanly — it clears when GitHub reports it "
+                          "mergeable, with no decision from you, so nothing is judged "
+                          "while that is true"),
+    CHECKS_NONE_CAUSE: ("the OS is holding this merge itself: no check has reported on "
+                        "this head yet — it clears when CI reports, with no decision from "
+                        "you, so nothing is judged while that is true"),
+    MERGE_STATE_UNCLEAN_CAUSE: ("the OS is holding this merge itself: GitHub reports the "
+                                "merge state as not CLEAN yet — it clears when GitHub "
+                                "does, with no decision from you, so nothing is judged "
+                                "while that is true"),
+    GRANT_LAPSED_CAUSE: ("the OS is holding this merge itself: its merge grant expired "
+                         "unspent and a fresh request is filed — it clears when that "
+                         "request is decided, so nothing is judged while that is true"),
     # §2.1: the shipped sentence is FALSE here
     PLAN_ASSUMPTION_CAUSE: ("this child is withheld from dispatch until its feature's "
                             "plan is ratified, and only you can ratify it — "
