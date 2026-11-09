@@ -8939,7 +8939,7 @@ def apply_findings_verdict(q: Mapping[str, Any], verdict: Mapping[str, Any]
         return review_findings(io_id, reject={key: f"Neo: {reason or 'rejected'}"},
                                decided_by="neo", project_name=name)
     if not f.get("proposed_orders") or _io_user_rooted(fo):
-        # No work to file spends nothing; a user's io is user spend, not the bug ledger (kn user ruling, wo-7559ffad)
+        # Nothing to spend, or a user's io whose findings are user spend (kn-ccd3bce7)
         _store_report(path, io_id, report)
         return review_findings(io_id, accept=[key], feedback=f"Neo: {reason}",
                                decided_by="neo", project_name=name)
