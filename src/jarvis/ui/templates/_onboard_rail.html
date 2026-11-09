@@ -1,0 +1,89 @@
+{# The onboarding rail: progress, filter, every section (§3 of docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md).
+   Standalone: needs only `view` and `here` (the current section key), so §5 includes it as is. #}
+{% set base = '/onboard/' ~ (view.project.name|urlencode) %}
+{% set ns = namespace(index=[], group='') %}
+{% for s in view.sections %}{% for k in s.knobs %}
+  {% set _ = ns.index.append({'path': k.path, 'tail': k.tail, 'line': k.line or '',
+                               'section': s.key, 'title': s.title,
+                               'href': base ~ '/' ~ s.key ~ '?focus=' ~ (k.path|urlencode)}) %}
+{% endfor %}{% endfor %}
+<style>
+  .ob { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 24px; align-items: start; }
+  .ob-rail { position: sticky; top: 56px; max-height: calc(100vh - 70px); overflow-y: auto;
+             font-size: 13px; padding-bottom: 16px; }
+  .ob-rail .progress { color: var(--ink-2); font-family: var(--mono); font-size: 12px; margin: 4px 0 8px; }
+  .ob-rail input[type=text] { padding: 5px 9px; font-size: 13px; }
+  .ob-rail .grp { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.16em;
+                  text-transform: uppercase; color: var(--ink-3); padding: 12px 0 4px; }
+  .ob-rail a.sec { display: flex; gap: 6px; align-items: center; padding: 3px 8px;
+                   color: var(--ink-2); border-left: 2px solid var(--line); }
+  .ob-rail a.sec:hover { color: var(--ink); text-decoration: none; }
+  .ob-rail a.sec[aria-current] { color: var(--ink); border-left-color: var(--amber);
+                                 background: color-mix(in srgb, var(--amber) 8%, transparent); }
+  .ob-rail a.sec .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ob-rail .hits { list-style: none; margin: 6px 0; padding: 0; }
+  .ob-rail .hits a { display: block; padding: 3px 8px; }
+  .ob-rail .hits .mono { font-size: 11.5px; }
+  .ob-rail .hits .sub { color: var(--ink-3); font-size: 11.5px; }
+  @media (max-width: 900px) { .ob { grid-template-columns: minmax(0, 1fr); }
+                              .ob-rail { position: static; max-height: none; } }
+</style>
+<nav class="ob-rail" aria-label="onboarding sections">
+  <div class="progress">{{ view.progress.answered }} of {{ view.progress.total }} answered
+    · {{ view.progress.must_have_missing|length }} to decide first</div>
+  <input type="text" id="ob-filter" placeholder="filter sections and settings — f"
+         aria-label="filter sections and settings" autocomplete="off">
+  <ul class="hits" id="ob-hits" hidden></ul>
+  <div id="ob-sections">
+  {% for s in view.sections %}
+    {% if s.group != ns.group %}{% set ns.group = s.group %}<div class="grp">{{ s.group }}</div>{% endif %}
+    <a class="sec" href="{{ base }}/{{ s.key }}" data-key="{{ s.key }}" data-title="{{ s.title|lower }}"
+       {% if s.key == here %}aria-current="page"{% endif %}>
+      <span class="t">{{ s.title }}</span>
+      {% if s.group == 'Whole fleet' and not view.fleet_acked %}<span class="tone-warn" title="a whole-fleet setting: acknowledge the fleet warning first">⚑</span>{% endif %}
+      {% if s.changed %}<span class="badge" title="settings this draft changes">{{ s.changed }} changed</span>{% endif %}
+      <span class="badge">{{ s.status.split(':', 1)[1] if s.status.startswith('preset:') else s.status }}</span>
+    </a>
+  {% endfor %}
+  </div>
+</nav>
+<script type="application/json" id="ob-index">{{ ns.index|tojson }}</script>
+<script>
+(function () {
+  var index = JSON.parse(document.getElementById('ob-index').textContent);
+  var box = document.getElementById('ob-filter'), hits = document.getElementById('ob-hits');
+  var secs = document.querySelectorAll('#ob-sections a.sec');
+  function slug(p) { return p.replace(/[^A-Za-z0-9_-]/g, '-'); }
+  function esc(t) { var d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+  box.addEventListener('input', function () {
+    var q = box.value.trim().toLowerCase();
+    secs.forEach(function (a) {
+      a.hidden = !!q && a.dataset.title.indexOf(q) < 0 && a.dataset.key.indexOf(q) < 0;
+    });
+    if (!q) { hits.hidden = true; hits.innerHTML = ''; return; }
+    var found = index.filter(function (k) {
+      return (k.path + ' ' + k.tail + ' ' + k.line).toLowerCase().indexOf(q) >= 0;
+    }).slice(0, 40);
+    hits.innerHTML = found.map(function (k) {
+      return '<li><a href="' + esc(k.href) + '#k-' + slug(k.path) + '"><span class="mono">' + esc(k.tail) +
+             '</span> <span class="sub">' + esc(k.title) + '</span></a></li>';
+    }).join('');
+    hits.hidden = !found.length;
+  });
+  box.addEventListener('keydown', function (e) {
+    var first = hits.querySelector('a');
+    if (e.key === 'Enter' && first) { e.preventDefault(); location.href = first.href; }
+    if (e.key === 'Escape') { box.value = ''; box.dispatchEvent(new Event('input')); box.blur(); }
+  });
+  // Capture phase: these keys mean "section", not the shell's "heading on this page"
+  window.addEventListener('keydown', function (e) {
+    var el = document.activeElement;
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    var to = e.key === '[' ? document.querySelector('a[rel=prev]')
+           : e.key === ']' ? document.querySelector('a[rel=next]') : null;
+    if (to) { e.stopImmediatePropagation(); location.href = to.href; }
+    else if (e.key === 'f') { e.preventDefault(); e.stopImmediatePropagation(); box.focus(); }
+  }, true);
+})();
+</script>
