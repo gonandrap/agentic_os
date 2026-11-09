@@ -6278,6 +6278,8 @@ CATCH_UP_DEFER_IN_FLIGHT = "in_flight"
 CATCH_UP_DEFER_HEAD_MOVED = "head_moved"
 #: The head moved off the judged commit AND no carry could be proven onto it
 CATCH_UP_DEFER_CARRY_UNPROVEN = "carry_unproven"
+#: The passed round bound no commit, so there is no head to carry: it re-judges first (#1634)
+CATCH_UP_DEFER_UNRECORDED = "unrecorded"
 #: The last catch-up was too recent: `catch_up_backoff` has not run out
 CATCH_UP_DEFER_BACKOFF = "backoff"
 #: `CatchUp.cause` on an EXHAUSTED outcome: the laps are losing to the base (#1512)

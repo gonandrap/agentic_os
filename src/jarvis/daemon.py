@@ -7418,6 +7418,12 @@ class Daemon:
         judged = ProjectStore.validated_head(
             store.latest_validation_round(wo_id=wo_id)) or ""
         head_before = fresh.head_oid
+        if not judged:
+            # #1634: no commit was judged, so nothing moved off one — the re-judge binds it
+            return ops.CatchUp(fresh, ops.CATCH_UP_DEFERRED,
+                               "the re-judge of a passed round that recorded no commit",
+                               base_tip=base_oid,
+                               cause=ops.CATCH_UP_DEFER_UNRECORDED)
         if not head_before or head_before != judged:
             return ops.CatchUp(fresh, ops.CATCH_UP_DEFERRED,
                                "the push that moved the head off the judged commit",
