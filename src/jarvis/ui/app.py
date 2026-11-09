@@ -1261,6 +1261,9 @@ def create_app() -> FastAPI:
             return HTMLResponse(f"<h1>Something went wrong</h1><p>{message}</p>",
                                 status_code=500)
 
+    from . import onboard_help
+    onboard_help.register(app, render)
+
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
         """Error page for a followed link; /api/* and the review's JSON calls keep the 422"""
@@ -3033,7 +3036,8 @@ def create_app() -> FastAPI:
         return RedirectResponse(f"/wo/{result['project']}/{result['wo_id']}", status_code=303)
 
     # Last: its `{section}` catch-all must not shadow `/onboard/{name}/review` (spec 2026-11-09 §0.3)
-    from . import onboard_pages
+    from . import onboard_index, onboard_pages
+    onboard_index.register(app, render)
     onboard_pages.register(app, render)
 
     return app

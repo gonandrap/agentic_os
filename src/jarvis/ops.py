@@ -14785,6 +14785,88 @@ def onboard_view(name: str, *, catalog_path: str | None = None) -> dict[str, Any
     }
 
 
+#: The persona the dashboard's help button opens (docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md §4)
+ONBOARD_HELPER = "onboard_helper"
+
+
+def _onboard_help_prompt(view: dict[str, Any], sec: dict[str, Any], focus: str,
+                         url: str) -> str:
+    project = view["project"]
+    name = project["name"]
+    if project["adopted"]:
+        kind = f"{name} is already in the catalog: this onboarding revises its live settings."
+    else:
+        kind = f"{name} is a new project" + (
+            f", started from {project['like']}'s settings." if project["like"] else ".")
+    lines = [f"The user is onboarding {name} ({project['path']}) in the Jarvis dashboard "
+             f"and asked for help with the section `{sec['key']}`.", kind,
+             f"Section URL: {url} (append ?focus=<setting path> to point at one setting)",
+             f"Title: {sec['title']}", f"Scope: {sec['scope']}", f"Status: {sec['status']}",
+             f"Summary: {sec['summary'] or '(none)'}"]
+    if view["fleet_warning"] and not view["fleet_acked"]:
+        lines.append(f"Fleet warning, not yet acknowledged: {view['fleet_warning']}")
+    lines.append("Settings in this section:")
+    # Stable sort: the focused knob first, the rest in the view's order
+    for k in sorted(sec["knobs"], key=lambda k: k["path"] != focus):
+        mark = "  <- the user is asking about this one" if focus and k["path"] == focus else ""
+        lines.append(
+            f"  {k['path']} = {json.dumps(k['value'], default=str)} "
+            f"(default {json.dumps(k['default'], default=str)}, source {k['source']}, "
+            f"{'safety key' if k['safety'] else 'not a safety key'}, "
+            f"applies {k['apply']}){mark}")
+    if not sec["knobs"]:
+        lines.append("  (none)")
+    lines += [f"Problems: {'; '.join(view['problems']) or 'none'}",
+              f"Draft: {view['draft_path']}",
+              "Open by explaining " + (f"`{focus}`" if focus else "this section")
+              + " from `jarvis onboard explain`, then answer the user's questions. "
+              "You are read-only: the user changes values in the page."]
+    return "\n".join(lines)
+
+
+def onboard_help(name: str, section: str, focus: str = "", *,
+                 catalog_path: str | None = None) -> dict[str, Any]:
+    """Open a read-only help session on one section of a draft (docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md §4)"""
+    import urllib.parse
+
+    from . import bootstrap, claude_cli, notify, paths
+    from .catalog import parse_catalog
+
+    view = onboard_view(name, catalog_path=catalog_path)
+    sec = next((s for s in view["sections"] if s["key"] == section), None)
+    if sec is None:
+        raise OpsError(f"{name}'s onboarding has no section {section!r} — one of: "
+                       f"{', '.join(s['key'] for s in view['sections'])}")
+    try:
+        base = notify.ui_base_url(parse_catalog(_read_document(_catalog_file(catalog_path))))
+    except CatalogError as e:
+        raise OpsError(str(e)) from e
+    url = f"{base}/onboard/{urllib.parse.quote(name)}/{urllib.parse.quote(section)}"
+    prompt = _onboard_help_prompt(view, sec, focus, url)
+    root = bootstrap._rebuild(bootstrap.ASSETS / "onboard-helper",
+                              paths.onboarding_dir() / "helper", "agents")
+    add_dirs = [root, Path(view["project"]["path"])]
+    # Never `[WO …`: `jarvis doctor` reports those as orphans
+    session_name = f"[onboard] {name} · {section}"
+    out = {"session_name": session_name, "job_id": None, "attach": "claude agents",
+           "prompt": prompt, "error": "",
+           "argv": [claude_cli.claude_bin(), "--bg", "--name", session_name,
+                    "--agent", ONBOARD_HELPER,
+                    *(a for d in add_dirs for a in ("--add-dir", str(d))), "--", prompt]}
+    try:
+        # cwd is not the project: its workspace trust is written only by the bootstrap
+        job_id = claude_cli.spawn_background(prompt, cwd=paths.jarvis_home(),
+                                             name=session_name, agent=ONBOARD_HELPER,
+                                             add_dirs=add_dirs)
+    except claude_cli.ClaudeCliError as e:
+        out["error"] = str(e)
+        return out
+    out["job_id"] = job_id
+    if job_id:
+        out["attach"] = f"claude attach {job_id}"
+    return out
+
+
 def _onboard_flag(value: Any) -> bool:
     return value is True or str(value or "").strip().lower() in ("1", "true", "on", "yes")
 
