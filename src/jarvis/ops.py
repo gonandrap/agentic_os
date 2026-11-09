@@ -18142,7 +18142,104 @@ def morpheus_confirm(item_id: str, fix: str) -> dict[str, Any]:
         central.close()
     _close_validation_questions(item_id, f"The user confirmed {item_id} failed; fix: {order}",
                                 f"decided by the user on {item_id} itself")
+    tell_monitor_issues([item])
     return {**item, "fix_order": order}
+
+
+#: One per row and transition on the order whose issue heard it (io-b42dfb75)
+MONITOR_ISSUE_EVENT = "monitor_issue_told"
+
+
+def _monitor_transition(item: Mapping[str, Any]) -> tuple[str, str]:
+    """(transition, fix order) a row owes its issue; ('', '') when it owes nothing"""
+    from . import morpheus
+
+    if item["state"] == "unverified":
+        return "unverified", ""
+    found = morpheus._FIX_ORDER.search(item.get("resolution") or "")
+    if (item["state"] in morpheus.ACTION_STATES and found
+            and (item.get("resolution") or "").startswith(morpheus.CONFIRMED)):
+        return "confirmed", found.group(1)
+    return "", ""
+
+
+def _tell_monitor_issue(item: Mapping[str, Any], transition: str, fix: str) -> str:
+    """Comment or reopen the issue `item`'s order fixed, once; '' when nothing was owed"""
+    from . import issues
+
+    wo_id = str(item.get("wo_id") or "")
+    if not wo_id:
+        return ""
+    try:
+        _name, path, wo = find_work_order(wo_id, item.get("project") or None)
+    except OpsError:
+        return ""
+    url = str(wo.get("issue_url") or "")
+    if not url:
+        return ""
+    store = ProjectStore(path)
+    try:
+        for event in store.events_of_kind(wo_id, MONITOR_ISSUE_EVENT):
+            told = db.from_json(event["payload"], {})
+            if (told.get("item"), told.get("transition"), told.get("fix", "")) == (
+                    item["id"], transition, fix):
+                return ""
+        show = f"`jarvis mo show {item['id']}`"
+        payload: dict[str, Any] = {"item": item["id"], "transition": transition,
+                                   "fix": fix, "issue_url": url}
+        try:
+            if transition == "unverified":
+                issues.comment(url, f"Landed in {item.get('release_tag') or 'production'}, "
+                                    f"not exercised in production, so not proven fixed: {show}")
+                payload["act"] = "commented"
+            else:
+                output = str(item.get("last_output") or "—")[-1500:]
+                repo = "/".join(issues.checked_issue_url(url).split("/")[3:5])
+                # Check output only on a private tracker: the private-repo rule, per Q3822
+                private = issues.repo_is_private(repo)
+                body = (f"Production validation failed and the user confirmed it; the fix "
+                        f"is {fix}. {show}"
+                        + (f"\n\nLast check output:\n```\n{output}\n```" if private else
+                           f"\n\nThe check output stays on {wo_id}: this tracker is not "
+                           f"known to be private."))
+                if not private:
+                    payload["output"] = output
+                if issues.view(url).closed:
+                    issues.reopen(url, body)
+                    payload["act"] = "reopened"
+                else:
+                    issues.comment(url, body)
+                    payload["act"] = "commented"
+        except GitHubError as e:
+            if e.reason != GitHubError.URL_REFUSED:
+                # Not recorded, so the next pass tries again (kn-40db1828)
+                log.info("%s: could not tell %s it %s: %s", item["id"], url, transition, e)
+                return ""
+            # A tracker the OS never writes to: the order carries the note instead
+            payload.update(act="kept on the order", why=str(e),
+                           output=str(item.get("last_output") or "")[-1500:])
+        store.add_event(wo_id, MONITOR_ISSUE_EVENT, payload)
+        return f"{payload['act']} {url}"
+    finally:
+        store.close()
+
+
+def tell_monitor_issues(items: Sequence[Mapping[str, Any]] | None = None) -> list[str]:
+    """Level-triggered: each unverified or confirmed row reaches its order's issue once"""
+    from . import morpheus
+
+    if items is None:
+        central = CentralStore()
+        try:
+            items = central.morpheus_items(("unverified", *morpheus.ACTION_STATES))
+        finally:
+            central.close()
+    told = []
+    for item in items:
+        transition, fix = _monitor_transition(item)
+        if transition and (note := _tell_monitor_issue(item, transition, fix)):
+            told.append(f"{item['id']}: {note}")
+    return told
 
 
 def morpheus_pause(mode: str | None, reason: str = "") -> dict[str, Any]:

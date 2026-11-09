@@ -3571,6 +3571,13 @@ class Daemon:
             moved = morpheus.sweep(central, cfg, cwd_for, skip=skip)
             if any(moved.values()):
                 log.info("morpheus sweep: %s", {k: v for k, v in moved.items() if v})
+            try:
+                from .ops import tell_monitor_issues
+
+                for note in tell_monitor_issues():
+                    log.info("morpheus %s", note)
+            except Exception:  # noqa: BLE001 — the rest of the pass still runs
+                log.exception("morpheus: could not tell issues their rows' outcome")
             # One short judging session per failed order, where it runs (§4)
             for item in morpheus.owed_actions(central):
                 if (item["project"] or "") in skip:
