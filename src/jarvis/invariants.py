@@ -611,6 +611,9 @@ def carry_unproven_hold(store: ProjectStore, wo_id: str) -> dict[str, Any] | Non
             or str(newest.get("catch_up_cause") or "")
             != ops_mod.CATCH_UP_DEFER_CARRY_UNPROVEN):
         return None
+    # #1634: with no commit judged the hold contradicts the record; the daemon re-judges it instead
+    if not store.validated_head(store.latest_validation_round(wo_id=wo_id)):
+        return None
     return newest
 
 

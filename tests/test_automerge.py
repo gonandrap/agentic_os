@@ -292,6 +292,23 @@ def test_a_moved_base_outranks_every_fact_about_the_pull_request(over, code):
                   base_behind=BASE_BEHIND).code == automerge.HELD_BASE_MOVED
 
 
+def test_a_passed_round_bound_to_no_commit_outranks_a_moved_base():
+    """#1634: the re-judge arm must stay reachable while `main` keeps moving"""
+    assert decide(rnd(head_sha=""),
+                  base_behind=BASE_BEHIND).code == automerge.HELD_SHA_UNRECORDED
+    assert decide(rnd(head_sha="", outcome="failed"),
+                  base_behind=BASE_BEHIND).code == automerge.HELD_BASE_MOVED
+
+
+def test_a_catch_up_deferred_for_no_judged_commit_never_claims_one():
+    """#1634: no hold says 'not the commit the panel judged' when none was judged"""
+    caught = ops.CatchUp(pr(), ops.CATCH_UP_DEFERRED, "x", base_tip=BASE_MOVED,
+                         cause=ops.CATCH_UP_DEFER_UNRECORDED)
+    held = automerge.held_base_moved(caught, pr(), BASE_MOVED)
+    assert "recorded no commit" in held.reason
+    assert "not the commit the panel judged" not in held.reason
+
+
 def test_a_red_default_branch_outranks_a_moved_base():
     """Spec §3.2: both are facts about the world and `base_red` stays first"""
     assert decide(rnd(), base_red=BASE_RED,

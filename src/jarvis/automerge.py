@@ -276,6 +276,10 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
         f"catch this branch up. Merge it by hand, re-judge it "
         f"(`jarvis validation force`), or `jarvis wo send` the worker"
         if cause == ops.CATCH_UP_DEFER_CARRY_UNPROVEN else
+        # #1634: no commit was judged, so never "not the commit the panel judged"
+        f"{moved}; the panel's last round recorded no commit, so the OS binds a verdict "
+        f"to the head before it catches this branch up — it retries every tick"
+        if cause == ops.CATCH_UP_DEFER_UNRECORDED else
         f"{moved}; the branch is caught up again once {catch_up.reason} runs out"
         if cause == ops.CATCH_UP_DEFER_BACKOFF else
         f"{moved}; the branch is being caught up as soon as "
@@ -489,8 +493,10 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"{base_red.head_sha[:10] or 'an unknown commit'}{blamed}, and "
                      f"{fixing}. Nothing merges onto a broken default "
                      f"branch.{rider}")
-    # Spec 2026-09-28 §3.2: after `base_red`, before the sha checks
-    if base_behind is not None:
+    # Spec 2026-09-28 §3.2, after `base_red`; #1634: an unbound pass re-judges first
+    unbound_pass = (not validated_head and round_row is not None
+                    and str(round_row.get("outcome") or "") == "passed")
+    if base_behind is not None and not unbound_pass:
         return _held(HELD_BASE_MOVED,
                      f"`{base_behind.base}` has moved to "
                      f"{base_behind.base_oid[:10] or 'an unknown commit'} and this "

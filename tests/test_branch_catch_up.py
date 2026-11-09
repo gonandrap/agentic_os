@@ -6,7 +6,7 @@ import dataclasses
 
 import pytest
 
-from jarvis import branchproof, db, gates, github, invariants, ops
+from jarvis import automerge, branchproof, db, gates, github, invariants, ops
 from jarvis.catalog import PullRequestsConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
@@ -696,6 +696,35 @@ def test_a_head_the_os_cannot_prove_asks_the_user_instead_of_deferring(
     fresh = store.get_work_order(wo["id"])
     assert fresh["needs_attention"] == 1
     assert fresh["attention_reason"] == invariants.CARRY_UNPROVEN_BLOCKER
+
+
+def test_a_passed_round_bound_to_no_commit_re_judges_while_the_base_moves(
+        started, project, fake_gh, local_proof):
+    """#1634: an empty judged sha is not a moved head — re-judge, never a carry it cannot prove"""
+    opt_in(started)
+    store, wo = parked(project, judged="")
+    behind_pr(fake_gh)
+    local_proof["tip"] = BASE_OID2
+
+    poll(started, store)
+
+    assert fake_gh.updates == []
+    rows = held(store, wo)
+    assert rows[0]["code"] == automerge.HELD_SHA_UNRECORDED
+    assert all("not the commit the panel judged" not in r["reason"] for r in rows)
+    assert store.get_work_order(wo["id"])["status"] == "validating"
+    assert invariants.CARRY_UNPROVEN_BLOCKER not in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))
+
+
+def test_a_stored_carry_unproven_hold_with_no_judged_commit_raises_no_blocker(started,
+                                                                              project):
+    """#1634's detector: the hold contradicts the record, so it is not the user's to answer"""
+    store, wo = parked(project, judged="")
+    store.add_event(wo["id"], "automerge_held", {
+        "code": automerge.HELD_BASE_MOVED, "catch_up": ops.CATCH_UP_DEFERRED,
+        "catch_up_cause": ops.CATCH_UP_DEFER_CARRY_UNPROVEN})
+    assert invariants.carry_unproven_hold(store, wo["id"]) is None
 
 
 def test_the_exhausted_hold_is_not_overwritten_by_a_lesser_reading(started, project,
