@@ -3290,7 +3290,7 @@ AUTOMERGE_TERMINAL = "automerge_merged"
 
 def automerge_hold_spans(events: Iterable[Any], since: float, now: float,
                          open_end: float) -> list[tuple[float, float]]:
-    """Every interval inside `[since, now]` the OS held a merge on a turn-keeping hold (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4, issue 1655)"""
+    """Every interval inside `[since, now]` the OS held a merge on a turn-keeping hold (issue 1655)"""
     from . import db
     from .automerge import keeps_turn
 
@@ -9594,7 +9594,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                                 and release.is_release_order(wo)))
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
                           if held_by_red_base else [])
-        # A MERGE THE OS IS ITSELF HOLDING ON A TURN-KEEPING HOLD IS NOT STUCK (§2 and §3 of the 2026-10-20 spec, issue 1655)
+        # A MERGE THE OS HOLDS ON A TURN-KEEPING HOLD IS NOT STUCK (issue 1655)
         merge_hold_cause, automerge_spans, am_note = "", [], ""
         if wo["status"] == "waiting_pr_merge":
             am_state = automerge_state(pstore, wo)

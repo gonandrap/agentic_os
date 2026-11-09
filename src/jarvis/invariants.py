@@ -4698,7 +4698,7 @@ INV_RED_RELEASE_UNDISCOUNTED = "INV-RED-RELEASE-UNDISCOUNTED"
 
 
 def check_red_release_hold_is_discounted(store: ProjectStore) -> Iterator[Violation]:
-    """INV-RED-RELEASE-UNDISCOUNTED — a release held by a red base, AND a merge on a live turn-keeping auto-merge hold (issue 1655), must be excluded and discounted (docs/superpowers/specs/2026-11-04-a-release-held-by-a-red-base-is-not-stuck.md)"""
+    """INV-RED-RELEASE-UNDISCOUNTED — a red-base release or a turn-keeping merge hold, undiscounted"""
     from . import ops, release, stuck
     from .central_store import CentralStore
 
