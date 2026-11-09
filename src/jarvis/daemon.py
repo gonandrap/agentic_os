@@ -7870,16 +7870,19 @@ class Daemon:
 
         wo_id = wo["id"]
         try:
-            jobless = ci_rerun.jobless_runs(ci_rerun.head_runs(head, cwd=project.path),
-                                            cwd=project.path)
+            runs = ci_rerun.head_runs(head, cwd=project.path)
+            jobless = ci_rerun.jobless_runs(runs, cwd=project.path)
         except github.GitHubError as e:
-            # Unread is not unrecoverable: no attempt is spent, next tick asks again
+            # Unread: spend nothing, and let the required-check arm still name the head
             log.info("[%s] could not read the runs of %s for %s: %s", project.name,
                      head[:10], wo_id, e)
-            return True
-        if not jobless:
             return False
         ep = ci_rerun.episode(store, wo_id, head)
+        ours = {int(i) for e in ep.reruns if e.get("jobless") for i in e.get("run_ids") or []}
+        if ep.stuck is None and any(r.run_id in ours and not r.completed for r in runs):
+            return True     # our re-run is in flight: judge nothing until it settles
+        if not jobless:
+            return bool(ours)
         if ep.stuck is not None:
             return True
         repo = github.origin_repo(project.path)

@@ -240,7 +240,8 @@ def stuck_blocker(pr_url: str, head: str, cause: str, checks: str,
     what = {
         CAUSE_CANCELLED_AGAIN: f"CI was cancelled again after the OS's one re-run ({checks})",
         CAUSE_NO_RUN: f"CI was cancelled ({checks}) and the OS found no run to re-run",
-        CAUSE_REFUSED: f"CI was cancelled ({checks}) and GitHub refused the OS's re-run",
+        CAUSE_REFUSED: (f"CI ran but produced no job ({checks})" if jobless else
+                        f"CI was cancelled ({checks})") + " and GitHub refused the OS's re-run",
         CAUSE_NEVER_RAN: (f"CI ran but produced no job, so no check ever reported "
                           f"({checks}), again after the OS's one re-run" if jobless else
                           f"required check(s) never reported ({checks}) — the branch's "
