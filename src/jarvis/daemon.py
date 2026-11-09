@@ -6165,16 +6165,15 @@ class Daemon:
         """Ask GitHub what became of the pull request each COMPLETED order recorded"""
         from . import github, landing
 
-        candidates = [wo for wo in store.list_work_orders(
+        candidates = [(wo, url) for wo in store.list_work_orders(
             statuses=("completed",), include_hidden=True)
-            if wo.get("pr_url") and not (
-                store.work_abandoned(wo["id"])
-                or store.work_unlanded_open(wo["id"], closed_by="marked_done"))]
-        stale = [wo for wo in candidates if self._needs_landing_refresh(store, wo["id"])]
-        for wo in stale[:landing.REFRESH_PER_SWEEP]:
+            if (url := self._landing_url(store, wo))]
+        stale = [(wo, url) for wo, url in candidates
+                 if self._needs_landing_refresh(store, wo["id"])]
+        for wo, url in stale[:landing.REFRESH_PER_SWEEP]:
             wo_id = wo["id"]
             try:
-                pr = github.pr_view(str(wo["pr_url"]), cwd=project.path)
+                pr = github.pr_view(url, cwd=project.path)
             except github.GitHubError as e:
                 log.debug("[%s] could not read the pull request of %s: %s", project.name,
                           wo_id, e)
@@ -6185,14 +6184,32 @@ class Daemon:
                 log.exception("[%s] refreshing the landing of %s failed", project.name,
                               wo_id)
                 continue
-            found = landing.judge(wo_id, str(wo["pr_url"]), pr.state)
+            found = landing.judge(wo_id, url, pr.state)
             store.add_event(wo_id, "landing_seen", found.record())
             # THE MERGE ITSELF, as an event and never as `pr_state`
             if pr.state == "MERGED" and not store.events_of_kind(wo_id, "pr_merged"):
                 store.add_event(wo_id, "pr_merged", {
-                    "pr_url": str(wo["pr_url"]), "head_oid": pr.head_oid,
+                    "pr_url": url, "head_oid": pr.head_oid,
                     "merged_at": pr.merged_at, "source": "landing_sweep"})
             log.debug("[%s] %s: %s", project.name, wo_id, found.detail)
+
+    @staticmethod
+    def _landing_url(store: ProjectStore, wo: dict[str, Any]) -> str:
+        """The pull request to ask GitHub about for this completed order, or "" to skip it"""
+        wo_id = wo["id"]
+        if store.work_abandoned(wo_id):
+            return ""
+        if not store.work_unlanded_open(wo_id, closed_by="marked_done"):
+            return str(wo.get("pr_url") or "")
+        # `wo done` can beat the merge poll; ask until GitHub settles it (io-b42dfb75)
+        parked = [e for e in store.events_of_kind(wo_id, "work_unlanded")
+                  if (db.from_json(e["payload"], {}) or {}).get("closed_by") == "marked_done"][-1]
+        url = str((db.from_json(parked["payload"], {}) or {}).get("pr_url") or "")
+        settled = any(
+            float(e["ts"]) > float(parked["ts"])
+            and (db.from_json(e["payload"], {}) or {}).get("pr_state") in ("CLOSED", "MERGED")
+            for e in store.events_of_kind(wo_id, "landing_seen"))
+        return "" if settled else url
 
     def _needs_landing_refresh(self, store: ProjectStore, wo_id: str) -> bool:
         """Is this completed order's landing record missing or old enough to re-ask?"""

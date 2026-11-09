@@ -425,6 +425,35 @@ def test_a_merged_pull_request_with_a_tail_on_its_branch_is_no_longer_reported(
     assert _violations(project) == []
 
 
+def test_a_pull_request_merged_just_before_wo_done_still_closes_the_issue(
+        started, project, fake_gh):
+    """io-b42dfb75: wo-352c402c, PR #1604 merged 8s before `wo done`, issue #1603 stranded"""
+    from jarvis import issues
+
+    merged = _order(project, "merged by hand", code="merged")
+    refused = _order(project, "closed unmerged", code="refused")
+    ops.finish(merged["id"], "opened a PR", pr_url=PR)
+    ops.finish(refused["id"], "opened a PR", pr_url=OTHER_PR)
+    ops.mark_done(merged["id"])
+    ops.mark_done(refused["id"])
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-11-05T09:18:44Z")
+    fake_gh.set_pr(OTHER_PR, "CLOSED")
+
+    _refresh(started, project)
+    _refresh(started, project)
+
+    store = ProjectStore(project)
+    try:
+        assert len(store.events_of_kind(merged["id"], "pr_merged")) == 1
+        assert issues.desired_state(store, store.get_work_order(merged["id"])) == issues.CLOSED
+        assert store.events_of_kind(refused["id"], "pr_merged") == []
+        assert issues.desired_state(
+            store, store.get_work_order(refused["id"])) == issues.RELEASED
+    finally:
+        store.close()
+    assert _pr_reads(fake_gh).count(OTHER_PR) == 1    # a closed answer stops the asking
+
+
 def test_complete_merged_writes_the_sha_that_merged_onto_the_event(started, project):
     """WHICH COMMIT merged, on the record, because the event IS the record"""
     wo = _order(project, "launcher contract", code="launcher")
