@@ -434,6 +434,8 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
                                                        reason=decision.reason))
     stamp: dict[str, Any] = {"metadata": steward.stamped({}, decision),
                              "budget_usd": decision.budget_usd} if decision else {}
+    # Explicit: apply may run in the daemon, where rule 5 would guess (requestor spec §2.2)
+    stamp["requestor"] = "os" if intent.alarm_id is not None else "user"
     reason = intent.reason.strip()
     # §11: the alarm brief sends the worker to `jarvis alarms show`
     if intent.alarm_id is not None:

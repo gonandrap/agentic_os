@@ -3031,7 +3031,8 @@ class Daemon:
                 f"WHAT NOT TO CONCLUDE: that a retry is the answer. The round IS "
                 f"re-judged already (`validation.killed_retries` bounds it). A retry "
                 f"cannot name what killed these processes and cannot stop it recurring; "
-                f"naming the cause is this order's whole job. GitHub issue #1039."))
+                f"naming the cause is this order's whole job. GitHub issue #1039."),
+                requestor="os")
             return str(order["id"])
         except ops.OpsError as e:
             # NEVER PROPAGATES: a lost race between two ticks must not cost the round its own record (spec §4a)
@@ -4656,7 +4657,7 @@ class Daemon:
                     status_age=f"{(now - candidate['since']) / 3600:.1f}h",
                     activity_age=f"{(now - candidate['activity']) / 3600:.1f}h",
                     reason=verdict.reason, blocker=candidate["blocker"]),
-                origin="fleet_health", fingerprint=fingerprint)
+                origin="fleet_health", fingerprint=fingerprint, requestor="os")
             run["opened"] += 1
             log.info("[%s] %s is stuck: %s — %s", project, wo["id"], verdict.reason,
                      inv["id"])
@@ -4744,7 +4745,7 @@ class Daemon:
             ctx = schedule.JobContext(project=project.name,
                                       owns_os=owner == project.name)
             wo = store.create_work_order(title=spec.title, description=spec.describe(ctx),
-                                         origin=schedule.ORIGIN)
+                                         origin=schedule.ORIGIN, requestor="os")
             self._retire_previous(store, state)
             store.record_schedule_fire(job_id, wo["id"], now)
             log.info("scheduled job %s filed %s in %s", job_id, wo["id"], project.name)
@@ -8323,7 +8324,7 @@ conflicts, shipit refuses: report its reason and stop. Never fall back to releas
         fresh = store.create_work_order(
             title=(f"Ship {wo.get('title') or url} alone" if alone
                    else f"Ship the fix for {wo.get('title') or url}"),
-            description="", origin="os",
+            description="", origin="os", requestor="os",
             metadata=steward.stamped(meta, decision))
         steward.linked(decision, fresh["id"])
         brief = self.HOTFIX_BRIEF if alone else self.RELEASE_BRIEF
