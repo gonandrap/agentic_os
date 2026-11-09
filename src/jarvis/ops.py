@@ -702,7 +702,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          "kind": fo.get("kind") or "feature",
                          "status_label": feature_status_label(fo.get("kind"),
                                                               fo["status"]),
-                         "progress": feature_progress(store, fo)}
+                         "progress": feature_progress(store, fo),
+                         "requestor_view": requestor_view(store, fo)}
                         for fo in features
                     ],
                     "open_work_orders": [
@@ -718,8 +719,10 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          "paused_until": (pauses[wo["id"]] or {}).get("until"),
                          # And the whole answer in one string
                          "status_label": invariants.status_label(store, wo, fleet_state),
-                         "tags": wo_tags(wo, p["name"])}
+                         "requestor_view": view,
+                         "tags": wo_tags({**wo, "requestor_view": view}, p["name"])}
                         for wo in open_wos
+                        for view in (requestor_view(store, wo),)
                     ],
                     "settings_drift": drift,
                     # ONLY THE HELD ONES
@@ -1279,6 +1282,8 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
         store.add_event(wo_id, "message_queued",
                         {"msg_id": msg_id, "source": source,
                          "authored_by": authored_by})
+        if authored_by:
+            withdraw_merge_requests(store, wo_id)
         # A reply IS the response to whatever flagged the user
         if wo["needs_attention"]:
             store.clear_attention(wo_id)
@@ -4340,11 +4345,15 @@ def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, 
         detail = validation_detail(store, **subject)  # type: ignore[arg-type]
         # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5
         owed = review_state(store, row) if unit == "work_order" else None
+        # Body images the OS could not reach, by round (io-87fe02be)
+        unchecked = [db.from_json(e["payload"], {}) for e in store.events_of_kind(
+            unit_id, "validation_images_unchecked")] if unit == "work_order" else []
     finally:
         store.close()
     return {"project": name, "unit": unit, "id": unit_id,
             "title": row["title"], "status": row["status"], **detail,
-            **({"review": owed} if owed else {})}
+            **({"review": owed} if owed else {}),
+            **({"images_unchecked": unchecked} if unchecked else {})}
 
 
 def current_config_version() -> str | None:
@@ -4702,6 +4711,44 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
         return "validating"
     # `escalated` lands
     return land_finished(store, wo, pr_url)
+
+
+#: Why a user message withdraws a merge request (wo-f7ef5098)
+USER_MESSAGE_WITHDRAWS = ("the user wrote to this work order after the request was "
+                          "filed; the OS asks again once the worker finishes again")
+
+
+def user_message_unanswered(store: ProjectStore, wo_id: str) -> bool:
+    """Is the user's newest message newer than every finish and accepting review? (wo-f7ef5098)"""
+    newest = store.user_messages(wo_id, limit=1)
+    if not newest:
+        return False
+    said = float(newest[0]["ts"])
+    answers = store.events_of_kind(wo_id, "finished") + [
+        e for e in store.events_of_kind(wo_id, "reviewed")
+        if db.from_json(e["payload"], {}).get("accepted", True)]
+    return not any(float(e["ts"]) > said for e in answers)
+
+
+def withdraw_merge_requests(store: ProjectStore, wo_id: str) -> int:
+    """Close this order's open or unspent auto_merge requests (wo-f7ef5098)"""
+    from . import automerge
+    from .neo_store import NeoStore
+
+    closed = store.supersede_grants(wo_id, automerge.GATE_KIND, "", USER_MESSAGE_WITHDRAWS)
+    for a in store.open_approvals(wo_id):
+        if a["kind"] != automerge.GATE_KIND:
+            continue
+        store.supersede_approval(a["id"], USER_MESSAGE_WITHDRAWS)
+        closed += 1
+        if a["neo_question_id"]:
+            neo = NeoStore()
+            try:
+                neo.supersede(a["neo_question_id"], "SUPERSEDED — the user wrote to it",
+                              USER_MESSAGE_WITHDRAWS)
+            finally:
+                neo.close()
+    return closed
 
 
 def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
@@ -7624,9 +7671,45 @@ def feature_progress(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def list_work_orders(project_name: str | None = None, *, include_closed: bool = False,
+                     include_hidden: bool = False, mine: bool = False) -> list[dict[str, Any]]:
+    """`jarvis wo list`; `mine` keeps only user-requested rows (§5.2)"""
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered")
+        paths = {project_name: paths[project_name]}
+    out = []
+    for name, path in sorted(paths.items()):
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            wos = store.list_work_orders(
+                statuses=None if include_closed else OPEN_STATUSES,
+                include_hidden=include_hidden,
+            )
+            # Derived inside the store's lifetime: the label reads the dependencies' rows (#714)
+            account = fleet_if_held(wos)
+            for wo in wos:
+                view = requestor_view(store, wo)
+                if mine and view != "you":
+                    continue
+                out.append({"project": name, **{k: wo[k] for k in (
+                    "id", "title", "status", "origin", "needs_attention",
+                    "attention_reason", "created_at", "hidden", "pr_url")},
+                    "requestor_view": view,
+                    # WHY IT IS SITTING THERE, once the flag is down
+                    "seen_blockers": invariants.acknowledged(wo),
+                    "status_label": invariants.status_label(store, wo, account)})
+        finally:
+            store.close()
+    return out
+
+
 def list_feature_orders(project_name: str | None = None,
                         include_settled: bool = False,
-                        kind: str = "feature") -> list[dict[str, Any]]:
+                        kind: str = "feature", mine: bool = False) -> list[dict[str, Any]]:
     paths = registered_project_paths()
     if project_name:
         if project_name not in paths:
@@ -7648,7 +7731,10 @@ def list_feature_orders(project_name: str | None = None,
                          and (kind is None or (fo.get("kind") or "feature") == kind)]
                 rows.sort(key=lambda fo: fo["created_at"], reverse=True)
             for fo in rows:
-                out.append({"project": name, **fo,
+                view = requestor_view(store, fo)
+                if mine and view != "you":
+                    continue
+                out.append({"project": name, **fo, "requestor_view": view,
                             "status_label": (investigation_status_label(fo)
                                              if fo.get("kind") == "investigation"
                                              else feature_status_label(kind, fo["status"])),
@@ -7978,10 +8064,11 @@ def reoffer_bug_filing(row: Mapping[str, Any], candidate: Any, decision: Any) ->
 
 
 def list_improvement_orders(project_name: str | None = None,
-                            include_settled: bool = False) -> list[dict[str, Any]]:
+                            include_settled: bool = False,
+                            mine: bool = False) -> list[dict[str, Any]]:
     """`jarvis io list`"""
     return list_feature_orders(project_name, include_settled=include_settled,
-                               kind="improvement")
+                               kind="improvement", mine=mine)
 
 
 def show_improvement_order(io_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -12715,6 +12802,55 @@ def requestor(store: Any, wo: dict[str, Any]) -> Requestor:
     return walked
 
 
+def is_user_requested(store: Any, row: dict[str, Any]) -> bool:
+    """The one classifier every requestor filter uses (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §5.1)"""
+    stamped = row.get("requestor")
+    if stamped:
+        return stamped == "user"
+    return requestor(store, row).kind == "user"
+
+
+def requestor_view(store: Any, row: dict[str, Any]) -> str:
+    """The `requestor_view` row key a filter matches: `you` or `os`"""
+    return "you" if is_user_requested(store, row) else "os"
+
+
+def with_requestor_view(store: Any, row: dict[str, Any]) -> dict[str, Any]:
+    return {**row, "requestor_view": requestor_view(store, row)}
+
+
+def inbox_with_requestor(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Inbox rows keyed by their order's requestor; no `wo_id` or no such order reads `os` (§5.2)"""
+    paths = registered_project_paths(include_archived=True)
+    stores: dict[str, ProjectStore] = {}
+    out = []
+    try:
+        for it in items:
+            view = "os"
+            path = paths.get(it.get("project") or "")
+            if it.get("wo_id") and path is not None and path.is_dir():
+                store = stores.get(it["project"]) or stores.setdefault(
+                    it["project"], ProjectStore(path))
+                row = _order_row(store, it["wo_id"])
+                if row is not None:
+                    view = requestor_view(store, row)
+            out.append({**it, "requestor_view": view})
+    finally:
+        for store in stores.values():
+            store.close()
+    return out
+
+
+def _order_row(store: ProjectStore, order_id: str) -> dict[str, Any] | None:
+    """Either table: ids are unique across both"""
+    for get in (store.get_work_order, store.get_feature_order):
+        try:
+            return get(order_id)
+        except KeyError:
+            continue
+    return None
+
+
 def _walked_requestor(store: Any, wo: dict[str, Any]) -> Requestor:
     """The pre-stamp answer, for a NULL row and for an `os` row's label (fo-eaf1a59a spec §2.1)"""
     from . import steward
@@ -12813,7 +12949,7 @@ def resolve_requestor(store: Any, *, parent_id: str | None,
 
 
 def wo_tags(wo: dict[str, Any], project: str) -> list[str]:
-    """The chips on an order's row: project, bug, expedite, automatic|manual"""
+    """The chips on an order's row: project, bug, expedite, you|os"""
     from . import issues
 
     tags = [project]
@@ -12821,7 +12957,9 @@ def wo_tags(wo: dict[str, Any], project: str) -> list[str]:
         tags.append("bug")
     if issues.was_expedited(wo):
         tags.append("expedite")
-    tags.append("automatic" if launched_by_os(wo) else "manual")
+    # No store here (templates call it): the stamp, else `launched_by_os` for a NULL row only (§5.2)
+    view = wo.get("requestor_view") or {"user": "you", "os": "os"}.get(wo.get("requestor") or "")
+    tags.append(view or ("os" if launched_by_os(wo) else "you"))
     return tags
 
 #: A chain longer than this is cut, never looped: `seen` stops cycles, this stops depth

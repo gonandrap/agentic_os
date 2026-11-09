@@ -259,6 +259,22 @@ def filter_rows(rows: Iterable[dict], filters: Mapping[str, str],
             and (not q or any(q in str(r.get(k) or "").lower() for k in text_keys))]
 
 
+#: The `requestor` filter's values; `any` is the empty choice (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §5.1)
+REQUESTOR_OPTIONS = ["you", "os"]
+
+
+def requestor_query(request: Request) -> dict[str, str]:
+    """`requestor=any` dropped here, or `query_filters` keeps it to match nothing"""
+    filters = query_filters(request, {"requestor": REQUESTOR_OPTIONS})
+    return {} if filters.get("requestor") == "any" else filters
+
+
+def requestor_rows(rows: Iterable[dict], filters: Mapping[str, str]) -> list[dict]:
+    """Matches the derived `requestor_view`, never the raw column (which says `user`)"""
+    want = filters.get("requestor")
+    return [r for r in rows if not want or r.get("requestor_view") == want]
+
+
 def filter_options(rows: Iterable[dict], key: str) -> list[str]:
     """Sorted distinct non-empty values of one column — a filter select's options"""
     return sorted({str(r[key]) for r in rows if r.get(key)})
@@ -1308,8 +1324,10 @@ def create_app() -> FastAPI:
                    "project": filter_options(every, "project"),
                    "status": filter_options(every, "status")}
         filters = query_filters(request, options)
-        families = filter_rows(families, filters)
-        rows = filter_rows(wos, filters)
+        families = requestor_rows(filter_rows(families, filters), requestor_query(request))
+        rows = requestor_rows(filter_rows(wos, filters), requestor_query(request))
+        filters.update(requestor_query(request))
+        options["requestor"] = REQUESTOR_OPTIONS
         # A status filter reveals that status even when it is one that collapses into a count
         show = show or filters.get("status", "")
         revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
@@ -1354,6 +1372,8 @@ def create_app() -> FastAPI:
         show_hidden = hidden not in ("", "0", "false")
         filters = query_filters(request, {"type": (), "status": ()})
         kind, status = filters.get("type", ""), filters.get("status", "")
+        who = requestor_query(request)
+        filters.update(who)
         # No status filter means open; an unknown one matches nothing (Q2361)
         if status == "all":
             wo_statuses, fo_statuses = None, None
@@ -1372,12 +1392,17 @@ def create_app() -> FastAPI:
                       **{k: store.feature_status_counts(kind=k) for k in FO_KINDS}}
             total = sum(n for by_status in counts.values() for n in by_status.values())
             cap = orders_cap(limit, total)
-            wos = (store.list_work_orders(statuses=wo_statuses, limit=cap,
+            # The requestor is not a column filter: read every row so the cap and `matched` count only matches
+            fetch = -1 if who else cap
+            wos = (store.list_work_orders(statuses=wo_statuses, limit=fetch,
                                           include_hidden=show_hidden)
                    if kind in ("", "work") else [])
-            fos = (store.list_feature_orders(statuses=fo_statuses, limit=cap,
+            fos = (store.list_feature_orders(statuses=fo_statuses, limit=fetch,
                                              kind=kind or None)
                    if kind != "work" else [])
+            # Classified inside the store's lifetime: a NULL row walks its parents (§5.1)
+            wos = requestor_rows([ops.with_requestor_view(store, wo) for wo in wos], who)
+            fos = requestor_rows([ops.with_requestor_view(store, fo) for fo in fos], who)
             families = [
                 {**fo, "type": fo["kind"],
                  # A feature prints its status word; the other kinds relabel theirs
@@ -1421,11 +1446,14 @@ def create_app() -> FastAPI:
         matched = sum(n for t, by_status in in_scope.items()
                       for s, n in by_status.items()
                       if wanted[t] is None or s in wanted[t])
+        if who:
+            matched = len(every)
         # Parsed against everything, offered only where a row has it
         options = {"type": [t for t in ("work", *FO_KINDS) if counts[t]],
                    "status": ["past", "all"]
                    + [s for s in dict.fromkeys(WO_STATUSES + FO_STATUSES)
-                      if any(by_status.get(s) for by_status in in_scope.values())]}
+                      if any(by_status.get(s) for by_status in in_scope.values())],
+                   "requestor": REQUESTOR_OPTIONS}
         return render(request, "project.html", project_name=name, path=paths[name],
                       rows=rows, total=total, matched=matched,
                       next_limit=cap + ORDERS_PAGE, filters=filters, options=options,
@@ -1864,14 +1892,19 @@ def create_app() -> FastAPI:
         every = ops.unacked_inbox()
         # "priority" is the default, so it is the select's empty choice rather than an option
         options = {"level": list(ops.INBOX_LEVELS), "project": filter_options(every, "project"),
+                   "requestor": REQUESTOR_OPTIONS,
                    "q": [], "sort": [s for s in ops.INBOX_SORTS if s != "priority"]}
-        filters = query_filters(request, options)
+        filters = {k: v for k, v in query_filters(request, options).items()
+                   if k != "requestor"}
+        filters.update(requestor_query(request))
         sort = filters.get("sort", "priority")
         items = ops.select_inbox(every, level=filters.get("level", ""),
                                  project=filters.get("project", ""), q=filters.get("q", ""),
                                  sort=sort if sort in ops.INBOX_SORTS else "priority")
-        # A sort is not a filter: only the other three narrow what "Ack shown" acks
-        filtered = any(k in filters for k in ("level", "project", "q"))
+        if "requestor" in filters:
+            items = requestor_rows(ops.inbox_with_requestor(items), filters)
+        # A sort is not a filter: only the other four narrow what "Ack shown" acks
+        filtered = any(k in filters for k in ("level", "project", "q", "requestor"))
         return render(request, "inbox.html", active="inbox",
                       critical=[it for it in items if it["level"] == "critical"],
                       rest=[it for it in items if it["level"] != "critical"],
