@@ -155,6 +155,20 @@ def test_a_tag_containing_the_whole_batch_is_found_and_half_a_batch_is_not(proje
     assert release.tags_containing(project, [first]) == ([TAG, LATER_TAG], "")
 
 
+def test_a_cherry_picked_copy_counts_as_carrying_the_fix(project):
+    """Issue 1651: an expedited release carries `cherry-pick -x` of the fix, not the fix"""
+    land(project, "base.txt")
+    tag(project, OLD_TAG)
+    fix = land(project, "fix-one.txt")
+    git = ["git", "-C", str(project), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "checkout", "-q", "-b", "release", OLD_TAG], check=True)
+    subprocess.run([*git, "cherry-pick", "-x", fix], check=True, capture_output=True)
+    tag(project, TAG)
+    subprocess.run([*git, "checkout", "-q", "main"], check=True)
+
+    assert release.tags_containing(project, [fix]) == ([TAG], "")
+
+
 def test_the_squash_trap_a_branch_tip_is_in_no_tag(project):
     """`automerge._merge_args` merges with `--squash`, so `headRefOid` is NEVER an ancestor of `main`"""
     head_ref_oid = on_a_branch(project, "feature")

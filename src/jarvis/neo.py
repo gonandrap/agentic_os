@@ -78,8 +78,8 @@ Output STRICT JSON, nothing else:
   {"escalate": false, "answer": "<the decision, addressed to the worker — 1 line of explanation if you agree with its recommendation, 50 words max if you override it>", "reason": "<one line why>"}
   or
   {"escalate": true, "answer": "", "reason": "<one line why the user must decide>"}
-  or, when the question bundles independent claims or is too big to rule on:
-  {"escalate": false, "refine": true, "answer": "", "reason": "<one line: what to split or narrow>"}
+  or, when the question bundles independent claims, is too big to rule on, or cannot be ruled on until its author restates it self-contained:
+  {"escalate": false, "refine": true, "answer": "", "reason": "<one line: what to split, narrow or restate>"}
 An escalation may carry one optional label, which is grouped and reported:
   "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
 high-stakes | no-learning-applies>"
@@ -101,8 +101,10 @@ REFINE_PREFIX = ("[Neo returned this unanswered — split or narrow it, then fil
                  "claim as its own question or assumption]")
 
 #: The third outcome, in the words every packet that offers it uses (wo-ea3c6f0c)
-REFINE_INSTRUCTION = ("Bundles independent claims, or too big to rule on? Set `refine` "
-                      "true; `reason` says what to split or narrow, and goes to the asker.")
+REFINE_INSTRUCTION = ("Bundles independent claims, too big to rule on, or not ruleable until "
+                      "its author restates it self-contained or quotes what only it has? "
+                      "Set `refine` true, never `deny`; `reason` says what to split, narrow "
+                      "or restate, and goes to the asker.")
 
 
 # The learnings block is the one part of Neo's prompt that grows without limit
