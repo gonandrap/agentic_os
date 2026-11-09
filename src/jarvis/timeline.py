@@ -109,7 +109,7 @@ def _neo_question_id(p: dict[str, Any]) -> int | None:
 #: Neo handed a worker's question back to the user, or could not answer it (io-7bed6603)
 QUESTION_ESCALATED = "question_escalated"
 
-#: Neo-question statuses the user holds: `neo_store.USER_HELD_Q_STATUSES`, duplicated for `NO_TURN`'s reason
+#: `neo_store.USER_HELD_Q_STATUSES`; this module imports no store
 USER_HELD = ("escalated", "failed")
 
 
@@ -967,11 +967,7 @@ def build_conversation(events: list[dict[str, Any]],
                        messages: list[dict[str, Any]],
                        questions: dict[int, dict[str, Any]] | None = None
                        ) -> list[dict[str, Any]]:
-    """Everything that was SAID about this work order, in the order it was said
-
-    `questions` is Neo's live rows by id: each ask then shows its live status, and an
-    escalation recorded before `question_escalated` existed is still shown (io-7bed6603).
-    """
+    """What was SAID about this work order, in order; `questions` = Neo's live rows by id"""
     questions = questions or {}
     turns: list[dict[str, Any]] = []
     escalated = {_neo_question_id(_payload(e)) for e in events
