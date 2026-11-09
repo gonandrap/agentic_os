@@ -15,6 +15,20 @@ tr.rides td { background: color-mix(in srgb, var(--cyan) 8%, transparent); }
 {{ ui.page_head("Release — " ~ report.project, report.pending | length ~ " pending since " ~ (report.newest or "the first commit")
                 ~ " · " ~ report.releases | length ~ " releases · " ~ report.main_ref) }}
 
+{% set prov = report.provenance %}
+<p class="kv">checked origin <span class="when mono" title="{{ fmt_ts(prov.checked_at) }}">{{ fmt_age(prov.checked_at) }}</span> ·
+  {% if prov.error %}<span class="tone-bad">origin could not be read</span>
+    <span class="sub">{{ prov.error }}</span> — newest here is
+    <span class="mono">{{ (report.newest or "no tag") ~ " (local)" }}</span>
+  {%- else %}newest on origin <span class="mono">{{ prov.origin_newest }}</span>
+    {%- if prov.origin_newest != report.newest %} — this checkout has only
+      <span class="mono">{{ report.newest or "no tag" }}</span>, so a cut here would re-ship released work{% endif %}
+  {%- endif %}
+  {%- if report.is_os %} · production runs
+    {% if prov.production %}<span class="mono">{{ prov.production }}</span>
+    {%- else %}<span class="tone-bad">an unknown version</span> <span class="sub">{{ prov.production_error }}</span>{% endif %}
+  {%- endif %}</p>
+
 {% if report.in_flight %}
 <section class="attention needs-you">
   <div class="strip-head"><span class="n">{{ report.in_flight | length }}</span>release in flight — no new cut until it settles</div>
