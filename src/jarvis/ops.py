@@ -11026,7 +11026,8 @@ def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | Non
         except (OpsError, KeyError) as e:
             errors.append({"key": key, "error": str(e)})
             continue
-        mark = {"id": row["id"], "as": kind, "at": db.now()}
+        # `project`: ops.request_tree follows a follow-up filed into another project
+        mark = {"id": row["id"], "as": kind, "at": db.now(), "project": target}
         p.setdefault("filed", []).append(mark)
         filed.append({"key": key, "project": target, "title": title, **mark})
     if filed:
@@ -12786,6 +12787,116 @@ def _requestor_in(project_name: str, order_id: str) -> str | None:
         return None
     finally:
         store.close()
+
+
+@dataclass
+class RequestNode:
+    """One order of a request tree (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §3.2)"""
+    id: str
+    project: str
+    kind: str
+    title: str
+    status: str
+    terminal: bool
+    pr_url: str | None
+    needs_attention: bool
+    children: list["RequestNode"]
+
+
+@dataclass
+class RequestTree:
+    root: RequestNode
+    settled: bool  # root and every descendant terminal
+
+    def nodes(self) -> list[RequestNode]:
+        """Pre-order, root first"""
+        out: list[RequestNode] = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            out.append(node)
+            stack.extend(reversed(node.children))
+        return out
+
+
+def _order_row(store: ProjectStore, order_id: str) -> tuple[dict[str, Any], bool] | None:
+    """(row, is_feature_table), or None: ids are unique across both tables"""
+    try:
+        return store.get_feature_order(order_id), True
+    except KeyError:
+        pass
+    try:
+        return store.get_work_order(order_id), False
+    except KeyError:
+        return None
+
+
+def _request_edges(store: ProjectStore, project: str, row: Mapping[str, Any]
+                   ) -> list[tuple[str, str]]:
+    """(project, id) of every order this one led to (§3.2)"""
+    oid, kind = row["id"], row.get("kind")
+    edges = [(project, c["id"]) for c in store.feature_children(oid, kinds=None)]
+    if kind == "improvement":
+        for finding in decision_report(row).get("findings") or []:
+            if isinstance(finding, dict):
+                edges += [((o.get("project") or "").strip() or project, str(o["id"]))
+                          for o in finding.get("created_orders") or []
+                          if isinstance(o, dict) and o.get("id")]
+        edges += [(project, o["id"]) for o in store.orders_with_origin(ORIGIN_IO_KEY, oid)]
+    elif kind == "decision":
+        for p in decision_report(row).get("proposed_orders") or []:
+            if isinstance(p, dict):
+                # A legacy mark carries no project: only the do's own is searched
+                edges += [((m.get("project") or "").strip() or project, str(m["id"]))
+                          for m in p.get("filed") or []
+                          if isinstance(m, dict) and m.get("id") and m.get("as") != "backlog"]
+        edges += [(project, o["id"]) for o in store.orders_with_origin(ORIGIN_DO_KEY, oid)]
+    return edges
+
+
+def request_tree(project: str, root_id: str) -> RequestTree:
+    """The root and every order it led to, in any project; reads only (§3.2)"""
+    paths = registered_project_paths(include_archived=True)
+    stores: dict[str, ProjectStore] = {}
+
+    def store_of(name: str) -> ProjectStore | None:
+        if name not in stores and name in paths:
+            stores[name] = ProjectStore(paths[name])
+        return stores.get(name)
+
+    def missing(name: str, oid: str) -> RequestNode:
+        # Terminal: a vanished child must never hold the tree open forever
+        log.warning("request tree %s: %s not found in %s", root_id, oid, name)
+        return RequestNode(oid, name, "", "", "missing", True, None, False, [])
+
+    seen = {root_id}
+
+    def walk(name: str, oid: str) -> RequestNode:
+        store = store_of(name)
+        found = _order_row(store, oid) if store is not None else None
+        if found is None:
+            return missing(name, oid)
+        row, is_fo = found
+        terminal = row["status"] in (FO_TERMINAL_STATUSES if is_fo else TERMINAL_STATUSES)
+        node = RequestNode(oid, name, str(row.get("kind") or ""), row.get("title") or "",
+                           row["status"], terminal, row.get("pr_url") or None,
+                           bool(row.get("needs_attention")), [])
+        for child_project, child_id in _request_edges(store, name, row):
+            if child_id not in seen:
+                seen.add(child_id)
+                node.children.append(walk(child_project, child_id))
+        return node
+
+    try:
+        if store_of(project) is None or _order_row(stores[project], root_id) is None:
+            raise OpsError(f"no order {root_id} in project {project!r}")
+        root = walk(project, root_id)
+    finally:
+        for s in stores.values():
+            s.close()
+    tree = RequestTree(root, False)
+    tree.settled = all(n.terminal for n in tree.nodes())
+    return tree
 
 
 def resolve_requestor(store: Any, *, parent_id: str | None,
