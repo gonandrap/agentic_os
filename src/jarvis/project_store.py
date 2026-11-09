@@ -1039,7 +1039,9 @@ CREATE TABLE IF NOT EXISTS issue_links (
 -- the text withheld carries nothing a reader can act on, so none is opened at all. The
 -- finding lives here instead, in full, and the surfaces mark it internal-only.
 -- UNIQUE on (digest, unit_id): the same dedupe key the tracker half uses, so a repeat
--- settle files nothing twice.
+-- settle files nothing twice. A row with `issue_url` set is one the tracker DOES carry,
+-- kept here only so Morpheus can arm it as a failure shape (io-b42dfb75); every
+-- withheld-only reader skips it.
 CREATE TABLE IF NOT EXISTS internal_follow_ups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     digest TEXT NOT NULL,
@@ -1052,6 +1054,7 @@ CREATE TABLE IF NOT EXISTS internal_follow_ups (
     symbol TEXT NOT NULL DEFAULT '',
     failure TEXT NOT NULL DEFAULT '',
     level TEXT NOT NULL DEFAULT '',
+    issue_url TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     UNIQUE (digest, unit_id)
 );
@@ -1093,6 +1096,8 @@ ADDED_COLUMNS = {
     "internal_follow_ups": {
         # The seat's severity: Morpheus arms only medium and up as failure shapes (io-b42dfb75)
         "level": "TEXT NOT NULL DEFAULT ''",
+        # Set when the tracker carries it: a failure shape, never a withheld follow-up
+        "issue_url": "TEXT NOT NULL DEFAULT ''",
     },
     "notifications": {
         # The attention reason raised WITH this notification, carried to the central inbox (io-d2a5dd69)
@@ -1852,23 +1857,27 @@ class ProjectStore:
     def record_internal_follow_up(self, digest: str, unit_id: str, *, round: int = 0,
                                   seat: str = "", title: str = "", detail: str = "",
                                   file: str = "", symbol: str = "",
-                                  failure: str = "", level: str = "") -> bool:
-        """Keep a follow-up whose text may not be published"""
+                                  failure: str = "", level: str = "",
+                                  issue_url: str = "") -> bool:
+        """Keep a follow-up in full; `issue_url` when the tracker carries it"""
         with db.write_transaction(self.conn):
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO internal_follow_ups "
                 "(digest, unit_id, round, seat, title, detail, file, symbol, failure, "
-                " level, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " level, issue_url, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (digest, unit_id, round, seat, title, detail, file, symbol, failure,
-                 level, db.now()))
+                 level, issue_url, db.now()))
             return cur.rowcount > 0
 
-    def internal_follow_ups(self, unit_id: str | None = None) -> list[dict[str, Any]]:
-        """Withheld follow-ups — one unit's, or the whole project's, oldest first"""
-        sql = "SELECT * FROM internal_follow_ups"
+    def internal_follow_ups(self, unit_id: str | None = None, *,
+                            published: bool = False) -> list[dict[str, Any]]:
+        """Withheld follow-ups, oldest first; `published` adds the filed ones"""
+        sql = "SELECT * FROM internal_follow_ups WHERE 1=1"
         args: tuple[Any, ...] = ()
+        if not published:
+            sql += " AND issue_url=''"
         if unit_id:
-            sql += " WHERE unit_id=?"
+            sql += " AND unit_id=?"
             args = (unit_id,)
         return db.rows_to_dicts(self.conn.execute(sql + " ORDER BY id", args).fetchall())
 

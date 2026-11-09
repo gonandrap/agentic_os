@@ -1273,15 +1273,17 @@ def kept_failure_shapes(catalog: Catalog, item: dict[str, Any]) -> list[dict[str
         return []
     try:
         store = ProjectStore(catalog.project(project).path)
+        try:
+            # Withheld and filed alike: both are what the panel kept
+            rows = store.internal_follow_ups(wo_id, published=True)
+        finally:
+            store.close()
     except Exception:  # noqa: BLE001 — a brief without shapes still arms the order
         log.warning("morpheus arm %s: could not read %s's kept follow-ups", item["id"], project)
         return []
-    try:
-        rows = store.internal_follow_ups(wo_id)
-    finally:
-        store.close()
     medium, out, seen = severity_rank("medium"), [], set()
-    for row in rows:
+    # Most severe first, so the cap never drops a critical risk for a medium one
+    for row in sorted(rows, key=lambda r: -severity_rank(r["level"] or "")):
         title = " ".join(str(row["title"] or "").split())
         # An empty level predates the column: counted as medium (Q3821)
         if not title or title.lower() in seen or severity_rank(row["level"] or "") < medium:

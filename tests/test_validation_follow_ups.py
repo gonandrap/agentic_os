@@ -854,6 +854,37 @@ def test_a_private_tracker_still_gets_the_finding_in_full(fleet, tracker):
     assert kept_rows(fleet, wo["id"]) == [], "it was both filed and kept"
 
 
+@pytest.mark.parametrize("private", [True, False], ids=["filed", "withheld"])
+def test_morpheus_arms_the_kept_follow_up_whichever_sink_took_it(fleet, tracker, private):
+    """io-b42dfb75: a filed follow-up is a failure shape too, with its level"""
+    from jarvis import morpheus
+    from jarvis.catalog import Catalog, OsConfig
+
+    tracker.set_private(private)
+    fleet.daemon.validator = Validator(
+        {"outcome": "passed", "reason": "", "seats": _seats("pass"),
+         "follow_ups": [{**follow_up("Supersession accepts any base commit",
+                                     failure="a self-reverted branch is closed as landed"),
+                         "level": "major"}]})
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    assert len(filed(tracker)) == (1 if private else 0)
+    store = fleet.store()
+    try:
+        [row] = store.internal_follow_ups(wo["id"], published=True)
+    finally:
+        store.close()
+    assert row["level"] == "major" and bool(row["issue_url"]) is private
+    item = {"id": "mo-1", "wo_id": wo["id"], "project": fleet.spec.name, "hints": "x"}
+    shapes = morpheus.kept_failure_shapes(Catalog(os=OsConfig(), projects=[fleet.spec]), item)
+    brief = morpheus._arm_prompt({**item, "failure_shapes": shapes})
+    assert "Supersession accepts any base commit" in brief
+    assert "a self-reverted branch is closed as landed" in brief and "FAIL line" in brief
+
+
 def test_the_issue_body_carries_the_failure_scenario_and_the_code(fleet, tracker):
     """What makes a filed issue actionable"""
     judged(fleet, "passed", "Name the retry budget")
