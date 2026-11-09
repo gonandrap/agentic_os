@@ -3848,7 +3848,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "timeline": build_timeline(wo, events, messages,
                                            include_debug=args.debug),
                 # What was said, in order, whoever spoke
-                "conversation": build_conversation(events, messages),
+                "conversation": build_conversation(events, messages,
+                                                   ops.asked_questions(events)),
                 # Every assumption, each with its `n`, its `status` and what the OS did with it (`os_ruling`) (#712)
                 "assumptions": ops.assumptions_with_rulings(store, args.wo_id),
                 # What this work order was allowed (or refused) permission to ship
