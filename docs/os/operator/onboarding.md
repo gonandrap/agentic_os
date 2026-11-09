@@ -58,6 +58,34 @@ running daemon until `jarvis start` — `Daemon.reload_catalog` refuses to reloa
 set of project names changes, and freezes every other setting change in the file until
 then. `apply` prints the exact `jarvis start --catalog <file>` to run.
 
+## Onboarding from the dashboard
+
+The same draft, as pages: `jarvis ui`, then **onboard** in the sidebar (`/onboard`).
+Spec: `docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md`.
+
+- **The index** lists drafts in progress (answered of 27, the project copied from, last
+  edit; a draft that does not load shows its error) and a form: repository path, optional
+  name, and **start from** — shipped defaults, or "copy settings from <project>" (the
+  `--like` of the terminal; identity is never copied). "Start over" is `--fresh`. Each
+  onboarded project without a draft has a **revise** button that opens its re-run draft.
+  A refusal (not a git repository, a draft that already exists) shows its error with what
+  you typed kept.
+- **The rail** on every draft page lists every section with its status and progress. Its
+  **filter** (`f`) matches section titles and every setting's path and line across all
+  sections; a match is a link straight to that row (`/onboard/<name>/<section>?focus=<path>`).
+  `[` and `]` step through sections. Each section offers its postures, "accept defaults",
+  "keep these" when pre-filled, and per-setting editors; every edit saves the draft.
+- **Help** ("Ask for help", or "?" on a row) opens a background `onboard_helper` Claude
+  session about that section. It reads, it never writes: it tells you which value and
+  links to where to set it.
+- **Review** is the last section: what still needs deciding, the real diff with each row
+  linked to its setting, the reason the safety keys require, and **apply** — the same one
+  write as `jarvis onboard apply`.
+- A **new** project needs `jarvis start --catalog <file>` after apply; the applied page
+  prints it. The dashboard never restarts anything.
+
+The terminal and the dashboard share one draft: start in one, continue in the other.
+
 ## Revising a project
 
 Run `jarvis onboard start <path>` again on an onboarded project. The draft arrives

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}help · {{ project }} — Jarvis{% endblock %}
+{% block head %}<style>.help-pre { white-space: pre-wrap; overflow-wrap: anywhere; }</style>{% endblock %}
+{% block content %}
+{% set back = "/onboard/" ~ project|urlencode ~ "/" ~ section|urlencode ~ ("?focus=" ~ focus|urlencode if focus else "") %}
+{% if res.error %}
+<h2>Help could not start</h2>
+<div class="error-flash" id="help-error">The help session for {{ section }} did not start: {{ res.error }}</div>
+<p>Start it by hand from a terminal, in <span class="mono">$JARVIS_HOME</span>:</p>
+<pre class="mono help-pre" id="help-command">{{ command }}</pre>
+<p class="sub">The prompt it opens with:</p>
+<pre class="mono help-pre" id="help-prompt">{{ res.prompt }}</pre>
+{% else %}
+<h2>Help is open</h2>
+<p id="help-session">Help is open in a new Claude session <strong class="mono">{{ res.session_name }}</strong>.</p>
+<p>Attach to it from a terminal:</p>
+<pre class="mono help-pre" id="help-attach">{{ res.attach }}</pre>
+<p class="sub">It also appears in the Claude desktop app's session list. It reads the draft
+  and answers questions; it never changes anything — you make each change on the page.</p>
+{% endif %}
+<p><a id="help-back" href="{{ back }}">← back to the {{ section }} section</a></p>
+{% endblock %}
