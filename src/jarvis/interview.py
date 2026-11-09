@@ -283,6 +283,28 @@ def set_value(draft: Draft, path: str, value: Any, *, document: dict[str, Any]) 
     return _commit(draft, before, document)
 
 
+def unset_value(draft: Draft, path: str, *, document: dict[str, Any]) -> Draft:
+    """Back to the default: the path leaves `values`, and the area becomes `custom`"""
+    hit = area_of(path)
+    if hit is None:
+        raise InterviewError(f"{path} is not a path any behaviour area owns")
+    if path not in draft.values:
+        raise InterviewError(f"{path} is not set in this draft — it already reads its "
+                             f"default")
+    before = copy.deepcopy(draft)
+    del draft.values[path]
+    _record(draft, hit[0], CUSTOM)
+    return _commit(draft, before, document)
+
+
+def confirm(draft: Draft, area: Area, *, document: dict[str, Any]) -> Draft:
+    """Keep what is shown: answered, values untouched — what a pre-filled area needs"""
+    before = copy.deepcopy(draft)
+    resolved = _resolved(onboard_draft.candidate_document(draft, document))
+    _record(draft, area.key, _mode(match_posture(area, resolved, draft.project.name)))
+    return _commit(draft, before, document)
+
+
 def accept_defaults(draft: Draft, area_key: str, *, document: dict[str, Any]) -> Draft:
     """Answered, and NO values: the document stays silent so the default can still move"""
     before = copy.deepcopy(draft)
@@ -324,17 +346,24 @@ def wiring_choices(draft: Draft, *, document: dict[str, Any]) -> dict[str, Any]:
 
 def wire(draft: Draft, lever: str, wired: bool, *, document: dict[str, Any]) -> Draft:
     """Wiring is the user's real inventory, so a lever, not a posture (§2)"""
+    from . import wiring
+
+    tail, value = wiring.lever_setting(lever, wired, wiring_config(draft, document=document))
+    return set_value(draft, f"projects.{draft.project.name}.{tail}", value,
+                     document=document)
+
+
+def wiring_config(draft: Draft, *, document: dict[str, Any]) -> Any:
+    """The `WiringConfig` this draft would run under"""
     import dataclasses
 
-    from . import ops, wiring
+    from . import ops
 
     live = ops.wiring_config(_wiring_scope(draft, document))
     prefix = f"projects.{draft.project.name}.wiring."
     # Levers already in the draft overlay the live config, so two levers compose
     pending = {p[len(prefix):]: v for p, v in draft.values.items() if p.startswith(prefix)}
-    tail, value = wiring.lever_setting(lever, wired, dataclasses.replace(live, **pending))
-    return set_value(draft, f"projects.{draft.project.name}.{tail}", value,
-                     document=document)
+    return dataclasses.replace(live, **pending)
 
 
 def summary(draft: Draft, document: dict[str, Any], *,
