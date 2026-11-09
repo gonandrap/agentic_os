@@ -380,6 +380,13 @@ if [ -n "$PICKS" ]; then
     || die "--cherry-pick needs a previous release tag to pick onto; $PREV_TAG does not exist"
   SHIP_SHA="$(git rev-parse "refs/tags/$PREV_TAG^{commit}")"
   RANGE_END="$TAG"
+  # Issue 1651: the fix may already ride the latest tag, as itself or as a `cherry-pick -x` copy
+  for p in "${PICK_LIST[@]}"; do
+    if git merge-base --is-ancestor "$p" "$SHIP_SHA" \
+       || [ -n "$(git log --format=%H --fixed-strings --grep="(cherry picked from commit $p)" "$SHIP_SHA")" ]; then
+      die "--cherry-pick $p is already released in $PREV_TAG — nothing to ship. Nothing was cut, tagged or pushed"
+    fi
+  done
 fi
 
 # >>> steps 2-4a CUT a new release; --deploy jumps straight to step 5 (issue 1348)
@@ -448,7 +455,14 @@ for p in ${PICK_LIST[@]+"${PICK_LIST[@]}"}; do
   if [ "$DRY_RUN" = 1 ]; then
     printf "  [dry-run] git -C '%s' cherry-pick -x %s\n" "$WT" "$p"
   elif ! git -C "$WT" cherry-pick -x "$p"; then
+    # No conflicted path: the pick came out empty — its change is already in $PREV_TAG
+    conflicted="$(git -C "$WT" diff --name-only --diff-filter=U)"
     git -C "$WT" cherry-pick --abort 2>/dev/null || true
+    [ -n "$conflicted" ] || {
+      git worktree remove --force "$WT" 2>/dev/null || true
+      git branch -D "$REL_BRANCH" >/dev/null 2>&1 || true
+      die "cherry-picking $p onto $PREV_TAG is empty — its change is already released. Nothing was tagged or pushed"
+    }
     git worktree remove --force "$WT" 2>/dev/null || true
     git branch -D "$REL_BRANCH" >/dev/null 2>&1 || true
     die "cherry-picking $p onto $PREV_TAG conflicts — it needs something main has not released yet. Nothing was tagged or pushed"

@@ -418,19 +418,36 @@ def tags_containing(root: Path, shas: Sequence[str]) -> tuple[list[str], str]:
 
     common: set[str] | None = None
     for sha in shas:
-        try:
-            out = subprocess.run(
-                ["git", "-C", str(root), "tag", "--list", RELEASE_TAG_GLOB,
-                 "--contains", sha],
-                capture_output=True, text=True, timeout=20, check=False)
-        except (OSError, subprocess.SubprocessError) as e:
-            return [], f"git could not be run in {root}: {type(e).__name__}: {e}"
-        names = set(out.stdout.split())
-        if out.returncode != 0 or (not names and out.stderr.strip()):
-            detail = (out.stderr or out.stdout).strip().replace("\n", " ")[:200]
-            return [], f"`git tag --contains {sha}` failed: {detail}"
+        names: set[str] = set()
+        # A cherry-pick release carries a COPY of the commit, never the commit itself (issue 1651)
+        for commit in [sha, *_picked_copies(root, sha)]:
+            try:
+                out = subprocess.run(
+                    ["git", "-C", str(root), "tag", "--list", RELEASE_TAG_GLOB,
+                     "--contains", commit],
+                    capture_output=True, text=True, timeout=20, check=False)
+            except (OSError, subprocess.SubprocessError) as e:
+                return [], f"git could not be run in {root}: {type(e).__name__}: {e}"
+            found = set(out.stdout.split())
+            if out.returncode != 0 or (not found and out.stderr.strip()):
+                detail = (out.stderr or out.stdout).strip().replace("\n", " ")[:200]
+                return [], f"`git tag --contains {commit}` failed: {detail}"
+            names |= found
         common = names if common is None else common & names
     return sorted(common or set(), key=_tag_version), ""
+
+
+def _picked_copies(root: Path, sha: str) -> list[str]:
+    """Commits in any `jarvis-*` tag that `git cherry-pick -x` made from `sha`; best-effort"""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "log", f"--tags={RELEASE_TAG_GLOB}", "--format=%H",
+             "--fixed-strings", f"--grep=(cherry picked from commit {sha})"],
+            capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("could not look for cherry-picked copies of %s: %s", sha, e)
+        return []
+    return out.stdout.split() if out.returncode == 0 else []
 
 
 @dataclass(frozen=True)
