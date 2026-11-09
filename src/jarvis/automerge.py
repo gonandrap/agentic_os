@@ -44,6 +44,8 @@ MERGE_TIMEOUT = 60
 HELD_DISABLED = "disabled"
 HELD_STATUS = "status"
 HELD_ASSUMPTIONS = "assumptions"
+#: The user wrote to the order after its last `wo finish` (wo-f7ef5098, io-87fe02be)
+HELD_USER_MESSAGE = "user_message"
 #: ITS OWN CODE, never folded into `HELD_ASSUMPTIONS`: the dedupe key above would drop the second of... (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.4)
 HELD_PLAN_ASSUMPTIONS = "plan_assumptions"
 #: A feature child waits for its feature's spec pull request to merge (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2)
@@ -303,6 +305,12 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
                  catch_up=str(catch_up.outcome or ""), catch_up_cause=cause)
 
 
+def withdrawn(approval: dict[str, Any] | None) -> bool:
+    """A request superseded before any use: no answer, so the next armed decision asks again (wo-f7ef5098)"""
+    return (approval is not None and approval.get("status") == "expired"
+            and approval.get("closed_as") == "superseded" and not approval.get("uses"))
+
+
 def lapsed_unspent(approval: dict[str, Any] | None) -> bool:
     """A grant whose clock ran out with no use: it authorised nothing, so it is no live grant (#1513)"""
     return (approval is not None and approval.get("status") == "expired"
@@ -437,6 +445,7 @@ def merge_queued(store: Any, wo: dict[str, Any], pr: Any) -> Decision | None:
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
            *, validated_head: str | None,
            pending_assumptions: bool = False,
+           user_message: bool = False,
            plan_assumptions: str = "",
            spec_unmerged: str = "",
            drift: DriftAlarm | None = None,
@@ -457,6 +466,11 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
         return _held(HELD_ASSUMPTIONS,
                      "an assumption is still waiting for the user, and the machine does "
                      "not merge over a decision a person owes")
+    if user_message:
+        return _held(HELD_USER_MESSAGE,
+                     "the user wrote to this work order after its last delivery, and "
+                     "the machine does not merge until the worker finishes again or "
+                     "the user accepts it")
     # Directly after the order's OWN decision, which is the more specific fact about the artifact in hand
     if plan_assumptions:
         return _held(HELD_PLAN_ASSUMPTIONS,
@@ -723,7 +737,7 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
     pr_url = str(wo.get("pr_url") or "")
     command = merge_command(pr_url, decision.judged_sha)
     prior = store.latest_approval_for(wo["id"], GATE_KIND, command)
-    if prior is not None and not lapsed_unspent(prior):
+    if prior is not None and not lapsed_unspent(prior) and not withdrawn(prior):
         return None
     # Spec 2026-09-28 §3.5: the base this request was filed against, ON the request
     base = str(getattr(pr, "base_ref", "") or "the base")

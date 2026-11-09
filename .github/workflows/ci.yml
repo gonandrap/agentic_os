@@ -63,12 +63,30 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Only to cancel this run when the shards reached no verdict (issue #1649)
+    permissions:
+      actions: write
     strategy:
       matrix:
         python-version: ["3.13"]
     steps:
+      # A shard GitHub lost (`abandoned`, `cancelled`, `skipped`) judged nothing. Failing here
+      # would read as red code and spend the OS's one failed-run re-run; cancelling makes the
+      # run `cancelled`, which the OS re-runs on main (#1193) and on pull requests (#1123).
       - name: Every shard must have passed
-        run: test "${{ needs.unit-shard.result }}" = "success"
+        env:
+          RESULT: ${{ needs.unit-shard.result }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$RESULT" in
+            success) exit 0 ;;
+            failure) echo "::error::a unit shard failed"; exit 1 ;;
+          esac
+          echo "::error::unit shards ended '$RESULT', not 'failure': no verdict, cancelling this run"
+          gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
+          # The cancel lands asynchronously; exiting first would conclude `failure`
+          sleep 120
+          exit 1
 
   evals:
     # Deterministic behavioral scorecard for Jarvis + Neo (evals/README.md).
