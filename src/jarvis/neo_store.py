@@ -28,7 +28,7 @@ USER_HELD_Q_STATUSES = ("escalated", "failed")
 OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 #: Not `answering`: Neo's reply would overwrite the row, so it lapses once Neo has settled it
 LAPSABLE_Q_STATUSES = ("queued", "escalated", "failed")
-#: Kinds about their order alone, so they lapse when it ends; the rest have a subject of their own (io-7bed6603)
+#: Kinds whose subject is their order, so they lapse when it ends (io-7bed6603)
 LAPSABLE_Q_KINDS = ("question", "alarm")
 
 # What Neo is being asked for (docs/superpowers/specs/2026-08-31-the-supervisor.md)

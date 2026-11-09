@@ -2301,7 +2301,7 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_open_questions_lapse(store: ProjectStore) -> Iterator[Violation]:
-    """INV-NEO-QUESTION-LAPSED — an ended order's worker question or alarm must not stay open (io-d5e62d4d, io-7bed6603)"""
+    """INV-NEO-QUESTION-LAPSED — an ended order's question or alarm must not stay open (io-7bed6603)"""
     from .neo_store import LAPSABLE_Q_KINDS, LAPSABLE_Q_STATUSES, NeoStore
     from .project_store import lapsing_question_kinds
 
