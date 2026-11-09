@@ -211,7 +211,7 @@ def test_an_agreement_is_recorded_as_provisional_and_settles_nothing(
 
 def test_a_disagreement_is_recorded_as_an_objection_and_nothing_else(
         started, no_settling):
-    """§5.3's seam: the verdict is written down and this section STOPS"""
+    """§5.3: the verdict is written down and its carrier filed, nothing settled"""
     store, wo = running(started, assumptions=(f"FORCE_DENY — {ROUTINE}",))
 
     ask(started, store)
@@ -227,9 +227,9 @@ def test_a_disagreement_is_recorded_as_an_objection_and_nothing_else(
     # NOT the user's problem: Neo disagreed with a worker that is still typing
     assert questions()[0]["status"] != "escalated"
     assert events(store, wo["id"], "autoreview_escalated") == []
-    # §6 files and sends
-    assert row["objection_envelope_id"] is None
-    assert row["objection_transport"] == ""
+    # Filed in the same step (issue 1541); sending is the bus's job
+    assert row["objection_envelope_id"] is not None
+    assert row["objection_transport"] == "queue"
     assert store.list_messages(wo["id"]) == []
     nothing_settled(store, wo["id"])
     assert q["id"] == row["neo_question_id"]

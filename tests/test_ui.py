@@ -298,6 +298,36 @@ def test_a_question_on_the_timeline_is_a_link_to_the_question(client, daemon, pr
     assert "worker → Neo" in said
 
 
+def test_an_escalated_question_is_an_ask_on_its_work_order(client, daemon, project):
+    """io-7bed6603: Neo → you, the reason, the shared form; answering there clears it"""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    qid = ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the production key?")[
+        "question_id"]
+    daemon._neo_drain()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    said = page.split('id="tab-timeline"', 1)[0]
+    assert f'href="#esc-{qid}"' in said              # the banner points at the ask
+    assert f'id="esc-{qid}"' in said
+    assert "Neo → you" in said
+    assert f'action="/neo/{qid}/answer"' in said
+    assert f'value="/wo/proj_a/{wo["id"]}#esc-{qid}"' in said
+
+    r = client.post(f"/neo/{qid}/answer",
+                    data={"text": "yes, in the window",
+                          "next": f"/wo/proj_a/{wo['id']}#esc-{qid}"})
+    assert r.status_code == 303 and r.headers["location"].endswith(f"#esc-{qid}")
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert f'action="/neo/{qid}/answer"' not in page
+    assert f'href="#esc-{qid}"' not in page
+    store = ProjectStore(project)
+    try:
+        assert not store.get_work_order(wo["id"])["needs_attention"]
+    finally:
+        store.close()
+
+
 def test_an_alarm_on_the_timeline_is_a_link_to_that_alarm(client, daemon, project):
     """§4 of docs/superpowers/specs/2026-08-31-the-supervisor.md"""
     wo = ops.create_work_order("proj_a", "export citations")

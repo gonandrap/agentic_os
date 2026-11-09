@@ -167,6 +167,44 @@ def test_a_row_that_predates_the_columns_is_left_alone(started):
     assert store.get_assumption(aid)["status"] == "pending"
 
 
+# -- issue 1541: the early verdict files its own carrier
+
+
+DENY = {"escalate": False, "verdict": "denied", "reason": REASON, "stakes": "routine",
+        "model": "opus"}
+
+
+@pytest.mark.parametrize("finish_to", ["needs_review", "completed"])
+def test_an_order_finishing_before_the_next_poll_still_has_its_objection(started,
+                                                                         finish_to):
+    """Recorded and filed in one step; §6.6 withdrawal is the only way it goes away"""
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo, a = running_order(store, verdict="")
+
+    started._record_early_assumption_verdict(None, store, wo, a, {"id": 77}, DENY)
+    store.set_status(wo["id"], finish_to)            # sooner than any poll
+    started.withdraw_stale_objections(project, store)
+
+    [ev] = events(store, wo["id"], "autoreview_objected")
+    assert ev["question_id"] == 77
+    row = store.get_assumption(a["id"])
+    assert row["provisional_verdict"] == "object"
+    assert row["objection_envelope_id"] and row["objection_withdrawn_ts"]
+
+
+def test_an_early_objection_on_a_stopped_order_is_recorded_but_never_filed(started):
+    """§2 still holds at the new filing point"""
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo, a = running_order(store, verdict="", status="needs_review")
+
+    started._record_early_assumption_verdict(None, store, wo, a, {"id": 77}, DENY)
+
+    assert store.get_assumption(a["id"])["provisional_verdict"] == "object"
+    assert store.envelopes(subject_wo_id=wo["id"]) == []
+
+
 # -- §6.6 withdrawal
 
 

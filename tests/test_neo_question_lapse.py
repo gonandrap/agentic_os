@@ -64,6 +64,20 @@ def test_a_failed_order_keeps_its_question_open(store, neo):
     assert [v for v in violations if v.invariant == "INV-NEO-QUESTION-LAPSED"] == []
 
 
+def test_the_sweep_lapses_an_alarm_on_an_already_failed_order(store, neo):
+    wo = store.create_work_order(title="t")
+    qid = escalated(neo, wo["id"])
+    alarm = escalated(neo, wo["id"], kind="alarm")
+    store.update_work_order(wo["id"], status="failed")
+
+    repaired = [v for v in check_project(store, repair=True)
+                if v.invariant == "INV-NEO-QUESTION-LAPSED"]
+
+    assert [v.context["question_id"] for v in repaired] == [alarm]
+    assert neo.get(alarm)["status"] == "lapsed"
+    assert neo.get(qid)["status"] == "escalated"
+
+
 def test_a_late_answer_is_refused_plainly_and_teaches_nothing(store, neo):
     wo = store.create_work_order(title="t")
     qid = escalated(neo, wo["id"])
@@ -83,15 +97,42 @@ def test_kinds_with_their_own_subject_stay_open(store, neo):
     triage = escalated(neo, "", kind="triage")
     validation = escalated(neo, "", kind="validation")
     unattached = escalated(neo, "")
-    alarm = escalated(neo, wo["id"], kind="alarm")
+    empty_alarm = escalated(neo, "", kind="alarm")
 
     store.set_status(wo["id"], "completed")
     violations = check_project(store, repair=True)
 
     assert [v for v in violations if v.invariant == "INV-NEO-QUESTION-LAPSED"] == []
     assert neo.get(triage)["status"] == neo.get(validation)["status"] == "escalated"
-    assert neo.get(unattached)["status"] == "escalated"
-    assert neo.get(alarm)["status"] != "lapsed"
+    assert neo.get(unattached)["status"] == neo.get(empty_alarm)["status"] == "escalated"
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled", "failed"])
+def test_an_alarm_about_an_ended_order_lapses_on_close(store, neo, status):
+    wo = store.create_work_order(title="t")
+    alarm = escalated(neo, wo["id"], kind="alarm")
+
+    store.set_status(wo["id"], status)
+
+    q = neo.get(alarm)
+    assert (q["status"], q["answer"], q["answered_by"]) == ("lapsed", None, None)
+    assert status in q["lapsed_reason"]
+    assert neo.learnings("proj_a") == []
+
+
+def test_a_stale_alarm_on_an_already_closed_order_lapses_on_the_next_sweep(store, neo):
+    """The Q1997 shape: an alarm escalated, its order completed before this release"""
+    wo = store.create_work_order(title="t")
+    alarm = escalated(neo, wo["id"], kind="alarm")
+    store.update_work_order(wo["id"], status="completed")
+
+    repaired = [v for v in check_project(store, repair=True)
+                if v.invariant == "INV-NEO-QUESTION-LAPSED"]
+
+    assert [v.context["question_id"] for v in repaired] == [alarm]
+    q = neo.get(alarm)
+    assert (q["status"], q["answer"]) == ("lapsed", None)
+    assert wo["id"] in q["lapsed_reason"]
 
 
 def test_a_row_neo_is_answering_is_left_until_neo_settles_it(store, neo):

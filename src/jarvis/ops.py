@@ -3568,7 +3568,7 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
         [a for a in assumptions_with_rulings(store, wo["id"])
          if str(a.get("status") or "") == "pending"]
         if any(str(a.get("provisional_verdict") or "") == "object"
-               and a.get("objection_envelope_id") for a in pending_rows) else [])
+               for a in pending_rows) else [])
     # The same row the boolean came from (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md)
     latest = store.last_judged_round(wo_id=wo["id"]) if escalated else None
     # WHY THE PANEL HANDED IT OVER, and the command this order's shape accepts (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §3)
@@ -3623,10 +3623,11 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
 
 
 #: What happened to the objection on an objected row
-OBJECTION_DELIVERY_STATES = ("delivered", "handed_back", "withdrawn", "in_flight")
+OBJECTION_DELIVERY_STATES = ("delivered", "handed_back", "withdrawn", "in_flight",
+                             "never_sent")
 
 #: The delivery states that mean the worker never read the objection
-OBJECTION_UNTOLD_STATES = ("handed_back", "withdrawn", "in_flight")
+OBJECTION_UNTOLD_STATES = ("handed_back", "withdrawn", "in_flight", "never_sent")
 
 
 def objected_rows(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3636,8 +3637,9 @@ def objected_rows(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if str(a.get("provisional_verdict") or "") != "object":
             continue
         if not a.get("objection_envelope_id"):
-            continue
-        if a.get("objection_delivered_ts"):
+            # The order had stopped before Neo answered, so nothing was filed (issue 1541)
+            delivery = "never_sent"
+        elif a.get("objection_delivered_ts"):
             delivery = "delivered"
         elif a.get("objection_withdrawn_ts"):
             # WHICH withdrawal, which is the fact the user cannot otherwise get: taken back because the order...
@@ -3656,19 +3658,30 @@ def objected_note(objected: list[dict[str, Any]]) -> str:
     def which(rows: list[dict[str, Any]]) -> str:
         return ", ".join(f"#{o['n']}" for o in rows)
 
-    untold = [o for o in objected if o["delivery"] in OBJECTION_UNTOLD_STATES]
+    def noun(rows: list[dict[str, Any]]) -> str:
+        return "assumption" if len(rows) == 1 else "assumptions"
+
+    unsent = [o for o in objected if o["delivery"] == "never_sent"]
+    untold = [o for o in objected if o["delivery"] in OBJECTION_UNTOLD_STATES
+              and o["delivery"] != "never_sent"]
     told = [o for o in objected if o["delivery"] == "delivered"]
-    noun = "assumption" if len(objected) == 1 else "assumptions"
-    tail = "decide it against the result this order delivered"
+    sent = untold + told
+    clauses = []
     if untold and told:
-        return (f"the OS objected to {noun} {which(untold)}, which the worker was never "
-                f"told, and to {which(told)}, which it was told and left as it is — "
-                f"{tail}")
-    if told:
-        return (f"the OS objected to {noun} {which(told)} and the worker was told and "
-                f"left it as it is — {tail}")
-    return (f"the OS objected to {noun} {which(untold)} and the worker was never told "
-            f"— {tail}")
+        clauses.append(f"the OS objected to {noun(sent)} {which(untold)}, which the worker "
+                       f"was never told, and to {which(told)}, which it was told and left "
+                       f"as it is")
+    elif told:
+        clauses.append(f"the OS objected to {noun(told)} {which(told)} and the worker was "
+                       f"told and left it as it is")
+    elif untold:
+        clauses.append(f"the OS objected to {noun(untold)} {which(untold)} and the worker "
+                       f"was never told")
+    if unsent:
+        # Neo's text may be addressed to the worker, so it is not presented as a ruling
+        clauses.append(f"Neo's early reply on {noun(unsent)} {which(unsent)} never reached "
+                       f"the worker, which had already stopped, so nothing was ruled")
+    return f"{'; '.join(clauses)} — decide it against the result this order delivered"
 
 
 def escalation_next(wo: dict[str, Any], family: str) -> list[str]:
@@ -4177,7 +4190,8 @@ def provisional_line(a: dict[str, Any]) -> str:
     model = a.get("provisional_model") or "model not recorded"
     when = f" at {_stamp(a['provisional_ts'])}" if a.get("provisional_ts") else ""
     verb = ("provisionally accepted by the OS" if verdict == "accept"
-            else "objected to by the OS")
+            else "objected to by the OS" if a.get("objection_envelope_id")
+            else "early reply never sent to the worker, nothing ruled")
     return (f"{verb} (Neo, {model}){when}"
             f"{' — ' + reason if reason else ''}")
 
@@ -7757,6 +7771,8 @@ def evidence_refs(fo: dict[str, Any]) -> list[str]:
 
 #: `work_orders.metadata`/`feature_orders.metadata` key on an order FILED FROM a finding: the...
 ORIGIN_IO_KEY = "origin_io"
+#: Its share of the user's io budget and why that amount (`_io_budget_share`)
+IO_BUDGET_KEY = "io_budget"
 #: The same back-link on an order filed from a decision report's proposal (docs/superpowers/specs/2026-10-31-decision-orders.md §6)
 ORIGIN_DO_KEY = "origin_do"
 
@@ -8553,6 +8569,44 @@ def _sequence_holds(target: str, io_id: str, f: Mapping[str, Any],
     return list(dict.fromkeys(depends)), list(dict.fromkeys(holds))
 
 
+def _io_user_rooted(io: Mapping[str, Any]) -> bool:
+    """A person filed this io: no steward stamp (worker_io) and no OS origin (morpheus…)"""
+    from . import steward
+
+    return not (io.get("origin") in _SELF_ORIGINS or steward.stamp_of(io))
+
+
+def _io_budget_share(name: str, io_id: str, f: Mapping[str, Any],
+                     report: Mapping[str, Any] | None, count: int) -> dict[str, Any]:
+    """Each order's equal slice of the io's unspent, unallotted budget; None share = project default"""
+    _, path, io = find_feature_order(io_id, name)
+    io_budget = io.get("budget_usd")
+    findings_ = (report or {}).get("findings") or [f]
+    allotted = sum(float(o.get("budget_usd") or 0) for x in findings_ if isinstance(x, dict)
+                   for o in x.get("created_orders") or [])
+    note: dict[str, Any] = {"io_id": io_id, "io_budget_usd": io_budget,
+                            "allotted_before_usd": round(allotted, 4), "share_usd": None}
+    if not io_budget:
+        note["reason"] = f"{io_id} has no budget: project default"
+        return note
+    store, central = ProjectStore(path), CentralStore()
+    try:
+        spent = budget.feature_spent(store, central, io).total_usd
+    finally:
+        central.close()
+        store.close()
+    left = float(io_budget) - spent - allotted
+    note["spent_usd"] = round(spent, 4)
+    if left <= 0:
+        note["reason"] = (f"{io_id} budget ${float(io_budget):.2f} used up (spent ${spent:.2f}, "
+                          f"${allotted:.2f} allotted to earlier orders): project default")
+        return note
+    note["share_usd"] = round(left / count, 4)
+    note["reason"] = (f"1/{count} of the ${left:.2f} left of {io_id} budget "
+                      f"${float(io_budget):.2f} (spent ${spent:.2f}, ${allotted:.2f} allotted earlier)")
+    return note
+
+
 def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
                          decision: Any = None,
                          report: Mapping[str, Any] | None = None
@@ -8564,6 +8618,9 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
     done = {o.get("index") for o in filed}
     created: list[dict[str, Any]] = []
     error = ""
+    todo = [i for i in range(len(f.get("proposed_orders") or [])) if i not in done]
+    inherited = (_io_budget_share(name, io_id, f, report, len(todo))
+                 if decision is None and todo else None)
     # Read here, in the io's project: `target` may be another one (requestor spec §2.2 rule 3)
     stamp = _requestor_in(name, io_id)
     for i, order in enumerate(f.get("proposed_orders") or []):
@@ -8582,6 +8639,9 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             # Work nobody typed: on the evolution ledger, under the budget the steward set
             metadata = steward.stamped(metadata, decision)
             budget_usd = decision.budget_usd
+        elif inherited is not None:
+            metadata[IO_BUDGET_KEY] = inherited
+            budget_usd = inherited["share_usd"]
         try:
             depends, holds = _sequence_holds(target, io_id, f, report or {}, order)
             if order_type == "feature":
@@ -8604,6 +8664,8 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             steward.linked(decision, row["id"])
         filed.append({"index": i, "id": row["id"], "type": order_type,
                       "title": order.get("title", ""), "project": target})
+        if inherited is not None and inherited["share_usd"] is not None:
+            filed[-1]["budget_usd"] = inherited["share_usd"]
         created.append({"id": row["id"], "type": order_type,
                         "title": order.get("title", "")})
     if error:
@@ -8890,8 +8952,8 @@ def apply_findings_verdict(q: Mapping[str, Any], verdict: Mapping[str, Any]
         _store_report(path, io_id, report)
         return review_findings(io_id, reject={key: f"Neo: {reason or 'rejected'}"},
                                decided_by="neo", project_name=name)
-    if not f.get("proposed_orders"):
-        # A diagnosis with no work to file spends nothing, so nothing is the steward's to decide
+    if not f.get("proposed_orders") or _io_user_rooted(fo):
+        # Nothing to spend, or a user's io whose findings are user spend (kn-ccd3bce7)
         _store_report(path, io_id, report)
         return review_findings(io_id, accept=[key], feedback=f"Neo: {reason}",
                                decided_by="neo", project_name=name)
@@ -11679,6 +11741,22 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
     except OpsError:
         pass
     return {"question_id": question_id, "delivery": delivery}
+
+
+def asked_questions(events: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Neo's live row for every question these events name, by id (io-7bed6603)"""
+    from .neo_store import NeoStore
+    from .timeline import QUESTION_ESCALATED, _neo_question_id, _payload
+
+    ids = {_neo_question_id(_payload(e)) for e in events
+           if e.get("kind") in ("question_asked", QUESTION_ESCALATED)} - {None}
+    if not ids:
+        return {}
+    neo = NeoStore()
+    try:
+        return {i: row for i in ids if (row := neo.get(i))}
+    finally:
+        neo.close()
 
 
 # -- gates (privileged-action approvals)

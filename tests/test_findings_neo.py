@@ -47,6 +47,13 @@ def central(jarvis_home):
     c.close()
 
 
+@pytest.fixture()
+def os_io(store, improvement_order):
+    """An io the OS filed (Morpheus): its findings stay steward work on the bug ledger"""
+    store.update_feature_order(improvement_order["id"], origin="morpheus")
+    return store.get_feature_order(improvement_order["id"])
+
+
 def submitted(store, io, report):
     """The analyst reports: `io` in `plan_review`, every finding asked of Neo"""
     analyst = store.create_work_order("analyse it", description="the observation",
@@ -157,55 +164,55 @@ def test_a_finding_with_no_orders_is_accepted_without_asking_the_steward(
 
 
 def test_with_self_dispatch_off_neo_accepts_and_the_user_says_yes_to_the_spend(
-        boot, store, improvement_order, central):
+        boot, store, os_io, central):
     """The master switch holds: the OS files nothing nobody typed"""
     daemon = boot()
-    submitted(store, improvement_order, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
+    submitted(store, os_io, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
 
     daemon._neo_drain()
 
-    f = finding(store, improvement_order["id"])
+    f = finding(store, os_io["id"])
     assert f["status"] == "pending" and f["neo_verdict"]["verdict"] == "accept"
     assert f["steward"]["decision_id"]
     assert filed_orders(store) == []
-    row = store.get_feature_order(improvement_order["id"])
+    row = store.get_feature_order(os_io["id"])
     assert row["needs_attention"] and "self_dispatch" in row["attention_reason"]
     assert any("needs your decision" in r["title"] for r in central.unacked_inbox())
 
     # One command from the user: `--accept-all` takes what Neo left them
-    out = ops.review_findings(improvement_order["id"], accept_all=True)
+    out = ops.review_findings(os_io["id"], accept_all=True)
     assert out["status"] == "completed" and len(out["created"]) == 1
     # The user accepted it, so it is the user's work (A8): never stamped
     assert not steward.stamp_of(filed_orders(store)[0])
 
 
 def test_with_self_dispatch_on_the_steward_files_the_orders_as_os_work(
-        boot, store, improvement_order, central, self_dispatch_on):
+        boot, store, os_io, central, self_dispatch_on):
     daemon = boot()
-    submitted(store, improvement_order, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
+    submitted(store, os_io, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
 
     daemon._neo_drain()
 
-    f = finding(store, improvement_order["id"])
+    f = finding(store, os_io["id"])
     assert (f["status"], f["decided_by"]) == ("accepted", "neo")
     [wo] = filed_orders(store)
     stamp = steward.stamp_of(wo)
     assert (stamp["origin_kind"], stamp["severity"]) == ("io_finding", "major")
     [row] = central.steward_decisions()
     assert row["wo_id"] == wo["id"]
-    assert store.get_feature_order(improvement_order["id"])["status"] == "completed"
-    assert not store.get_feature_order(improvement_order["id"])["needs_attention"]
+    assert store.get_feature_order(os_io["id"])["status"] == "completed"
+    assert not store.get_feature_order(os_io["id"])["needs_attention"]
 
 
 def test_enforced_a_spent_follow_up_ledger_never_holds_a_finding(
-        boot, store, improvement_order, central, self_dispatch_on):
+        boot, store, os_io, central, self_dispatch_on):
     """wo-5b96c9da: an io finding is a reported bug, on its own ledger"""
     daemon = boot(evolution={"mode": "enforce", "weekly_usd": 0.0, "order_budget_usd": 10.0})
-    submitted(store, improvement_order, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
+    submitted(store, os_io, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
 
     daemon._neo_drain()
 
-    f = finding(store, improvement_order["id"])
+    f = finding(store, os_io["id"])
     assert f["status"] == "accepted" and "orders_held" not in f
     [wo] = filed_orders(store)
     assert steward.stamp_of(wo)["origin_kind"] == "io_finding"
@@ -216,16 +223,53 @@ def test_enforced_a_spent_follow_up_ledger_never_holds_a_finding(
 
 
 def test_enforced_a_minor_finding_is_dropped_by_the_steward(
-        boot, store, improvement_order, central, self_dispatch_on):
+        boot, store, os_io, central, self_dispatch_on):
     daemon = boot(evolution={"mode": "enforce"})
-    submitted(store, improvement_order, one_finding("FORCE_FINDING_ACCEPT_MINOR"))
+    submitted(store, os_io, one_finding("FORCE_FINDING_ACCEPT_MINOR"))
+
+    daemon._neo_drain()
+
+    f = finding(store, os_io["id"])
+    assert (f["status"], f["decided_by"]) == ("rejected", "steward")
+    assert "never worth an order" in f["feedback"]
+    assert filed_orders(store) == []
+
+
+def test_a_users_io_finding_is_user_spend_with_a_slice_of_the_io_budget(
+        boot, store, improvement_order, central):
+    """User ruling, wo-7559ffad: no steward, no bug ledger, even with self_dispatch off"""
+    daemon = boot()
+    store.update_feature_order(improvement_order["id"], budget_usd=10.0)
+    proposed = [{**a_finding()["proposed_orders"][0], "title": t} for t in ("one", "two")]
+    submitted(store, improvement_order,
+              one_finding("FORCE_FINDING_ACCEPT_MAJOR", proposed_orders=proposed))
 
     daemon._neo_drain()
 
     f = finding(store, improvement_order["id"])
-    assert (f["status"], f["decided_by"]) == ("rejected", "steward")
-    assert "never worth an order" in f["feedback"]
-    assert filed_orders(store) == []
+    assert (f["status"], f["decided_by"]) == ("accepted", "neo")
+    assert central.steward_decisions() == []
+    wos = filed_orders(store)
+    assert len(wos) == 2 and not any(steward.stamp_of(wo) for wo in wos)
+    # The analyst's own spend comes off the top first
+    assert [wo["budget_usd"] for wo in wos] == pytest.approx([5.0, 5.0], abs=0.05)
+    note = db.from_json(wos[0]["metadata"], {})[ops.IO_BUDGET_KEY]
+    assert note["share_usd"] == wos[0]["budget_usd"]
+    assert "1/2 of the $" in note["reason"] and "budget $10.00" in note["reason"]
+
+
+def test_a_used_up_io_budget_files_with_the_project_default_and_says_why(
+        boot, store, improvement_order):
+    boot()
+    store.update_feature_order(improvement_order["id"], budget_usd=4.0)
+    report = {"findings": [{"key": "a", "created_orders": [{"budget_usd": 4.0}]}]}
+    f = {"key": "b", "proposed_orders": [{"title": "t"}]}
+    report["findings"].append(f)
+
+    note = ops._io_budget_share("proj_a", improvement_order["id"], f, report, 1)
+
+    assert note["share_usd"] is None
+    assert "$4.00 allotted to earlier orders): project default" in note["reason"]
 
 
 def test_an_escalated_finding_is_the_users_with_neos_reason(boot, store,
@@ -465,14 +509,14 @@ def test_ask_neo_re_asks_a_finding_neo_escalated(boot, store, improvement_order)
         f["neo_question_id"]
 
 
-def test_ask_neo_skips_a_finding_neo_accepted(boot, store, improvement_order):
+def test_ask_neo_skips_a_finding_neo_accepted(boot, store, os_io):
     """Its spend waits on the user's yes; asking Neo again changes nothing"""
     daemon = boot()
-    submitted(store, improvement_order, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
+    submitted(store, os_io, one_finding("FORCE_FINDING_ACCEPT_MAJOR"))
     daemon._neo_drain()
     before = len(neo_questions())
 
-    out = ops.ask_neo_about_findings(improvement_order["id"])
+    out = ops.ask_neo_about_findings(os_io["id"])
 
     assert out["asked"] == [] and "nothing to ask" in out["note"]
     assert len(neo_questions()) == before
