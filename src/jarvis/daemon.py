@@ -7251,6 +7251,11 @@ class Daemon:
         log.info("early review judged assumption #%s of %s provisionally %s — %s",
                  assumption.get("n"), wo["id"],
                  "accept" if ruling.accept else "object", ruling.reason)
+        # Filed in this step, not the next poll: an order finishing sooner loses it (issue 1541)
+        if objected and str(pstore.get_work_order(wo["id"])["status"] or "") == "running":
+            ops.file_assumption_objection(
+                pstore, pstore.project_path, wo, assumption, reason=ruling.reason,
+                model=ruling.model, question_id=int(q["id"]))
 
     def _carry_catch_up(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                         pr: Any, *, judged: str, head: str,
