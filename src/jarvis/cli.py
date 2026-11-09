@@ -1709,6 +1709,10 @@ def build_parser() -> argparse.ArgumentParser:
                                     "session in this terminal")
     c.add_argument("path", help="the project's git repository")
     c.add_argument("--name", help="project name (default: directory name)")
+    c.add_argument("--like", help="a new project's draft starts from what this catalog "
+                                  "project sets, never its identity")
+    c.add_argument("--fresh", action="store_true",
+                   help="discard the existing draft and start over (default: resume it)")
     c.add_argument("--print-prompt", dest="print_prompt", action="store_true",
                    help="print the persona root and the opening prompt instead of "
                         "launching claude")
@@ -5430,7 +5434,9 @@ def cmd_onboard_start(args: argparse.Namespace) -> int:
     """`jarvis onboard start` — §5 of the onboarding-interview spec"""
     from . import ops
 
-    data = ops.onboard_session(args.path, args.name)
+    data = ops.onboard_session(args.path, args.name, like=args.like, fresh=args.fresh)
+    if data["rebuilt"]:
+        print(f"draft rebuilt: {data['rebuilt']}", file=sys.stderr)
     if args.print_prompt:
         print(f"persona root: {data['persona_root']}\n\n{data['prompt']}")
         return 0
