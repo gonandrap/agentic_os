@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{# One onboarding section: §3 of docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md #}
+{% block title %}{{ section.title }} · onboard {{ name }} — Jarvis{% endblock %}
+{% block style %}
+  .ob-pane .lede { color: var(--ink-2); max-width: 80ch; }
+  .ob-pane .costs { color: var(--ink-2); font-size: 13.5px; max-width: 80ch; }
+  .ob-acts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 0; }
+  .ob-acts details { font-size: 12.5px; color: var(--ink-2); flex-basis: 100%; }
+  .ob-knobs td { vertical-align: middle; }
+  .ob-knobs tr[aria-current] td { background: color-mix(in srgb, var(--amber) 10%, transparent); }
+  .ob-knobs .line { color: var(--ink-2); font-size: 12.5px; }
+  .ob-knobs form { display: flex; gap: 6px; align-items: center; }
+  .ob-knobs form.inline { display: inline-flex; }
+  .ob-knobs input[type=text], .ob-knobs input[type=number] { min-width: 16ch; padding: 5px 8px; }
+  .ob-knobs .badges { display: flex; flex-wrap: wrap; gap: 4px; }
+  .ob-step { display: flex; justify-content: space-between; margin: 24px 0; }
+{% endblock %}
+{% macro hidden() -%}
+  <input type="hidden" name="rev" value="{{ view.rev }}">
+  <input type="hidden" name="section" value="{{ section.key }}">
+{%- endmacro %}
+{% macro help_form(focus, label, title) -%}
+  <form class="inline" method="post" action="/onboard/{{ name|urlencode }}/help">
+    <input type="hidden" name="section" value="{{ section.key }}">
+    <input type="hidden" name="focus" value="{{ focus }}">
+    <button title="{{ title }}">{{ label }}</button>
+  </form>
+{%- endmacro %}
+{% macro knob_row(k) -%}
+  {% if error and k.path == error_path %}
+  <tr><td colspan="4"><div class="error-flash" role="alert">{{ error }}</div></td></tr>
+  {% endif %}
+  <tr id="k-{{ k.slug }}" {% if focus and k.path == focus %}aria-current="true"{% endif %}>
+    <td><a class="mono" href="?focus={{ k.path|urlencode }}#k-{{ k.slug }}">{{ k.path }}</a>
+      {% if k.line %}<div class="line">{{ k.line }}</div>{% endif %}
+      {% if k.example %}<div class="line">e.g. {{ k.example }}</div>{% endif %}</td>
+    <td>
+      <form method="post" action="/onboard/{{ name|urlencode }}/edit">
+        {{ hidden() }}
+        {% if k.kind == 'identity' %}
+          <input type="hidden" name="verb" value="identity">
+          <input type="hidden" name="field" value="{{ k.tail }}">
+          <input type="text" name="value" value="{{ k.text }}" aria-label="{{ k.path }}">
+          <button>Save</button>
+        {% elif k.kind == 'lever' %}
+          <input type="hidden" name="verb" value="wire">
+          <input type="hidden" name="lever" value="{{ k.path }}">
+          <input type="hidden" name="wired" value="{{ '' if k.value else '1' }}">
+          <span class="mono">{{ 'wired' if k.value else 'not wired' }}</span>
+          <button>{{ 'unwire' if k.value else 'wire' }}</button>
+        {% else %}
+          <input type="hidden" name="verb" value="set">
+          <input type="hidden" name="path" value="{{ k.path }}">
+          {% if k.widget == 'bool' %}
+            <span class="mono">{{ k.value|tojson }}</span>
+            <input type="hidden" name="value" value="{{ 'false' if k.value else 'true' }}">
+            <button>{{ 'turn off' if k.value else 'turn on' }}</button>
+          {% elif k.widget == 'json' %}
+            <textarea class="mono" name="value" rows="2" aria-label="{{ k.path }}">{{ k.text }}</textarea>
+            <button>Save</button>
+          {% else %}
+            <input type="text" name="value" value="{{ k.text }}" aria-label="{{ k.path }}">
+            <button>Save</button>
+          {% endif %}
+        {% endif %}
+      </form>
+      {% if k.source == 'draft' and k.kind in ('asked', 'classified') %}
+      <form class="inline" method="post" action="/onboard/{{ name|urlencode }}/edit">
+        {{ hidden() }}
+        <input type="hidden" name="verb" value="unset">
+        <input type="hidden" name="path" value="{{ k.path }}">
+        <button title="drop this from the draft: back to the default">unset</button>
+      </form>
+      {% endif %}
+    </td>
+    <td class="badges">
+      <span class="badge" title="default">default {{ k.default|tojson }}</span>
+      <span class="badge" title="where this value comes from">{{ k.source }}</span>
+      {% if k.safety %}<span class="badge outside" title="changes what a worker may do: applying needs a reason">safety</span>{% endif %}
+      {% if k.apply %}<span class="badge" title="when a change takes effect">{{ k.apply }}</span>{% endif %}
+    </td>
+    <td>{{ help_form(k.path, '?', 'ask for help on ' ~ k.path) }}</td>
+  </tr>
+{%- endmacro %}
+{% block content %}
+<div class="ob">
+{% include "_onboard_rail.html" %}
+<div class="ob-pane">
+  <div class="page-head">
+    <h1>{{ section.title }}</h1>
+    <span class="meta">onboard {{ name }} · {{ section.scope }} · {{ section.status }}</span>
+  </div>
+  {% if view.problems %}
+  <div class="error-flash">This draft does not validate yet: {{ view.problems|join('; ') }}</div>
+  {% endif %}
+  {% if error and not error_path %}<div class="error-flash" role="alert">{{ error }}</div>{% endif %}
+  {% if section.summary %}<p class="lede">{{ section.summary }}</p>{% endif %}
+  {% if section.on_costs %}<p class="costs"><b>On:</b> {{ section.on_costs }}</p>{% endif %}
+  {% if section.off_costs %}<p class="costs"><b>Off:</b> {{ section.off_costs }}</p>{% endif %}
+
+  {% if section.scope in ('os', 'both') and view.fleet_warning and not view.fleet_acked %}
+  <div class="brake" role="status">
+    <div class="grow">{{ view.fleet_warning }}</div>
+    <form class="inline" method="post" action="/onboard/{{ name|urlencode }}/edit">
+      {{ hidden() }}<input type="hidden" name="verb" value="fleet_ack">
+      <button>I understand — let me change fleet settings</button>
+    </form>
+  </div>
+  {% endif %}
+
+  <div class="ob-acts">
+    {% for posture, values in section.postures.items() %}
+    <form class="inline" method="post" action="/onboard/{{ name|urlencode }}/edit">
+      {{ hidden() }}
+      <input type="hidden" name="verb" value="answer">
+      <input type="hidden" name="mode" value="preset:{{ posture }}">
+      <button title="{% for p, v in values.items() %}{{ p }} = {{ v|tojson }}&#10;{% endfor %}"
+              {% if section.status == 'preset:' ~ posture %}class="primary"{% endif %}>{{ posture }}</button>
+    </form>
+    {% endfor %}
+    {% if section.key != 'identity' %}
+    <form class="inline" method="post" action="/onboard/{{ name|urlencode }}/edit">
+      {{ hidden() }}<input type="hidden" name="verb" value="defaults">
+      <button>accept defaults</button>
+    </form>
+    {% endif %}
+    {% if prefilled %}
+    <form class="inline" method="post" action="/onboard/{{ name|urlencode }}/edit">
+      {{ hidden() }}<input type="hidden" name="verb" value="confirm">
+      <button class="accept" title="answer this section with the values shown, changing none">keep these</button>
+    </form>
+    {% endif %}
+    {{ help_form('', 'Ask for help', 'open a help session on this section') }}
+    {% if section.postures %}
+    <details><summary>what each posture sets</summary>
+      <ul>{% for posture, values in section.postures.items() %}
+        <li><b>{{ posture }}</b>: {% for p, v in values.items() %}<a class="mono" href="?focus={{ p|urlencode }}#k-{{ slug(p) }}">{{ p }}</a> = {{ v|tojson }}{{ ', ' if not loop.last }}{% endfor %}</li>
+      {% endfor %}</ul>
+    </details>
+    {% endif %}
+  </div>
+
+  <div class="panel table-wrap">
+    <table class="ob-knobs">
+      {% for k in asked %}{{ knob_row(k) }}{% else %}
+      <tr><td class="empty">No settings asked here.</td></tr>{% endfor %}
+    </table>
+  </div>
+  {% if classified %}
+  <details open>
+    <summary>More settings in this area ({{ classified|length }})</summary>
+    <div class="panel table-wrap">
+      <table class="ob-knobs">{% for k in classified %}{{ knob_row(k) }}{% endfor %}</table>
+    </div>
+  </details>
+  {% endif %}
+
+  <div class="ob-step">
+    {% if prev %}<a rel="prev" href="/onboard/{{ name|urlencode }}/{{ prev.key }}">← {{ prev.title }} <kbd>[</kbd></a>{% else %}<span></span>{% endif %}
+    {% if next %}<a rel="next" href="/onboard/{{ name|urlencode }}/{{ next.key }}"><kbd>]</kbd> {{ next.title }} →</a>{% endif %}
+  </div>
+</div>
+</div>
+<script>
+(function () {
+  var row = document.querySelector('.ob-knobs tr[aria-current]');
+  if (row) row.scrollIntoView({block: 'center'});
+})();
+</script>
+{% endblock %}

@@ -2320,3 +2320,25 @@ def test_the_work_order_card_and_asks_stack_full_width(page, server, project, re
         assert abs(asks["width"] - card["width"]) < 2, "both span the same full width"
         readable(page, _ROWS)
         _shot(page, f"work-order-{size['width']}")
+
+
+def test_onboarding_filter_jumps_to_a_setting_in_another_section(page, server, tmp_path,
+                                                                 monkeypatch):
+    """§3 of docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md"""
+    from jarvis import interview, wiring
+    from jarvis.testing import make_git_project
+    item = wiring.Item(kind="skill", name="s", source="user", lever=f"{wiring.LEVER_SKILL}s")
+    monkeypatch.setattr(interview, "wiring_choices",
+                        lambda draft, *, document: {"items": [item]})
+    interview.new_draft(make_git_project(tmp_path / "work", "newproj"), "newproj")
+    path = "projects.newproj.evolution.mode"
+
+    page.goto(f"{server}/onboard/newproj/identity")
+    page.keyboard.press("f")
+    page.keyboard.type("evolution.mode")
+    page.locator("#ob-hits a").first.click()
+
+    page.wait_for_url("**/onboard/newproj/evolution?focus=*")
+    focused = page.locator('tr[aria-current="true"]')
+    assert focused.count() == 1
+    assert path in focused.inner_text()
