@@ -1245,6 +1245,9 @@ def create_app() -> FastAPI:
             return HTMLResponse(f"<h1>Something went wrong</h1><p>{message}</p>",
                                 status_code=500)
 
+    from . import onboard_help
+    onboard_help.register(app, render)
+
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
         """Error page for a followed link; /api/* and the review's JSON calls keep the 422"""
