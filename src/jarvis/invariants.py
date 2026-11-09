@@ -1483,25 +1483,27 @@ def precondition_note(rows: list[dict[str, Any]]) -> str:
 
 #: §5 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md
 AUTOMERGE_CHECKS_NOTE = "waiting for GitHub's checks on {sha} — {reason}"
+AUTOMERGE_HOLD_NOTE = "merge held by the OS ({code}) — {reason}"
 
 #: The STORED reason, clamped to one line for the sweep's blocker column, which renders it verbatim
 AUTOMERGE_CHECKS_REASON_CHARS = 120
 
 
-def automerge_checks_note(state: dict[str, Any] | None) -> str:
-    """One sentence for a `checks_running` auto-merge hold, `""` for anything else"""
-    from .automerge import HELD_CHECKS_RUNNING, hold_is_live
+def automerge_hold_note(state: dict[str, Any] | None) -> str:
+    """One sentence for a live turn-keeping auto-merge hold, `""` for anything else (issue 1655)"""
+    from .automerge import HELD_CHECKS_RUNNING, hold_is_live, keeps_turn
 
-    if not hold_is_live(state) or state is None:
-        return ""
-    if str(state.get("code") or "") != HELD_CHECKS_RUNNING:
+    if not hold_is_live(state) or state is None or not keeps_turn(state):
         return ""
     reason = " ".join(str(state.get("reason") or "").split())
     if len(reason) > AUTOMERGE_CHECKS_REASON_CHARS:
         reason = reason[:AUTOMERGE_CHECKS_REASON_CHARS - 1] + "…"
+    reason = reason or "no reason recorded"
+    code = str(state.get("code") or "")
+    if code != HELD_CHECKS_RUNNING:
+        return AUTOMERGE_HOLD_NOTE.format(code=code, reason=reason)
     return AUTOMERGE_CHECKS_NOTE.format(
-        sha=str(state.get("head_sha") or "")[:10] or "the merge commit",
-        reason=reason or "no reason recorded")
+        sha=str(state.get("head_sha") or "")[:10] or "the merge commit", reason=reason)
 
 
 def status_label(store: ProjectStore, wo: dict[str, Any],
@@ -4696,13 +4698,16 @@ INV_RED_RELEASE_UNDISCOUNTED = "INV-RED-RELEASE-UNDISCOUNTED"
 
 
 def check_red_release_hold_is_discounted(store: ProjectStore) -> Iterator[Violation]:
-    """INV-RED-RELEASE-UNDISCOUNTED — a release held by a red base must be excluded and discounted (docs/superpowers/specs/2026-11-04-a-release-held-by-a-red-base-is-not-stuck.md)"""
+    """INV-RED-RELEASE-UNDISCOUNTED — a red-base release or a turn-keeping merge hold, undiscounted"""
     from . import ops, release, stuck
     from .central_store import CentralStore
 
     held = [wo for wo in store.list_work_orders(statuses=("pending",))
             if release.is_release_order(wo)]
-    if not held:
+    merging = [wo for wo in store.list_work_orders(statuses=("waiting_pr_merge",))
+               if automerge_hold_note(ops.automerge_state(store, wo))
+               and not rejudge_exhausted(store, wo) and not rebind_exhausted(store, wo)]
+    if not held and not merging:
         return
     central = None
     try:
@@ -4716,10 +4721,34 @@ def check_red_release_hold_is_discounted(store: ProjectStore) -> Iterator[Violat
     now = db.now()
     catalog = ops.resolve_catalog()
     spec = next((p for p in catalog.projects if p.name == name), None)
-    if spec is None or not ops._base_is_red(spec, now):
+    if spec is None:
+        return
+    if not ops._base_is_red(spec, now):
+        held = []
+    # A stale base-health fact un-excludes on purpose (§3 of the 2026-10-20 spec): no claim then
+    if not (spec.validation.enabled and spec.validation.auto_merge) or ops._base_red_until(
+            ops._stored_base_health(name), now) < now:
+        merging = []
+    if not held and not merging:
         return
     # The sweep's own reader, so this judges what the sweep does and not a copy of its rule
     rows = {row["id"]: row for row in ops.stuck_report(name, now)}
+    for wo in merging:
+        row = rows.get(wo["id"])
+        if row is None or (row["excluded"] and not row["stuck"]
+                           and row["discounted_seconds"] > 0):
+            continue
+        yield Violation(
+            invariant=INV_RED_RELEASE_UNDISCOUNTED,
+            wo_id=wo["id"],
+            detail=(f"a merge on a live turn-keeping auto-merge hold, judged with excluded "
+                    f"cause {row['excluded']!r} and {row['discounted_seconds']:.0f}s "
+                    f"discounted: the sweep would buy an investigation for a designed "
+                    f"wait"),
+            repaired=False,
+            context={"excluded": row["excluded"],
+                     "discounted_seconds": row["discounted_seconds"]},
+        )
     for wo in held:
         row = rows.get(wo["id"])
         if row is None or (row["excluded"] == stuck.BASE_RED_CAUSE
