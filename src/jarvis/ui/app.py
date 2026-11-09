@@ -1676,6 +1676,12 @@ def create_app() -> FastAPI:
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
+        # Live status and the answer form for each ask (io-7bed6603)
+        questions = ops.asked_questions(events_page)
+        conversation = build_conversation(events_page, messages, questions)
+        open_ask = next((t["ref"]["id"] for t in reversed(conversation)
+                         if t["kind"] == "escalation"
+                         and t["status"] in ("escalated", "failed")), None)
         bill = wo_bill(wo_id, pname)
         # The ceiling, what has gone against it
         cap = ops.work_order_budget(wo_id, pname, include_archived=True)
@@ -1704,7 +1710,7 @@ def create_app() -> FastAPI:
                       events_hidden=events_hidden, events_all=every,
                       debug=show_debug, debug_count=count_debug(events_page),
                       # What was said, and what happened — two readings of one record, neither derivable from the other
-                      conversation=build_conversation(events_page, messages),
+                      conversation=conversation, questions=questions, open_ask=open_ask,
                       assumptions=assumptions, unreviewed=unreviewed, review=review,
                       approvals=approvals, bill=bill, states=states,
                       turn_lines=turn_lines_by_message(bill))
