@@ -1873,10 +1873,13 @@ def under_review_decision(payload: dict[str, Any],
     if ctx is None:
         return None
     root, wo_id = ctx
+    from .gate_rules import AUTO_MERGE
+
     try:
         store = ProjectStore(root)
         try:
-            pending = store.pending_approvals(wo_id)
+            # The OS's own merge request is no attempt by this worker to narrow (io-87fe02be)
+            pending = [a for a in store.pending_approvals(wo_id) if a["kind"] != AUTO_MERGE]
         finally:
             store.close()
     except Exception:  # noqa: BLE001 — see the docstring
