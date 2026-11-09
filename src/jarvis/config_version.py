@@ -12,8 +12,56 @@ from . import catalog
 from .gates import GateConfig
 
 __all__ = [
-    "canonicalise", "diff", "resolve", "validation_config_from_resolved", "version_id",
+    "canonicalise", "config_type_name", "config_type_ok", "config_value_of", "diff",
+    "parse_config_value", "resolve", "validation_config_from_resolved", "version_id",
 ]
+
+
+# -- typing a form or CLI string against a setting (here, not ui.app, so ops can use it too)
+
+CONFIG_TYPE_NAMES = [
+    (bool, "true or false"), (int, "a whole number"), (float, "a number"),
+    (str, "text"), (list, "a JSON list"), (dict, "a JSON object"),
+]
+
+
+def parse_config_value(text: str) -> Any:
+    """The CLI hands values in as text"""
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def config_type_name(value: object) -> str:
+    for kind, name in CONFIG_TYPE_NAMES:
+        if isinstance(value, kind):
+            return name
+    return "a value"
+
+
+def config_value_of(current: object, text: str) -> object:
+    """What the page will write for `text`, given the value already there"""
+    if isinstance(current, str):
+        return text
+    if current is None and not text.strip():
+        return None
+    return parse_config_value(text)
+
+
+def config_type_ok(current: object, new: object) -> bool:
+    """May `new` be written where `current` is?"""
+    if current is None:
+        return True
+    if new is None:
+        return False
+    if isinstance(current, bool):
+        return isinstance(new, bool)
+    if isinstance(current, int):
+        return isinstance(new, int) and not isinstance(new, bool)
+    if isinstance(current, float):
+        return isinstance(new, (int, float)) and not isinstance(new, bool)
+    return isinstance(new, type(current))
 
 # Dataclass field name -> the dotted path the catalog DOCUMENT spells it with, where the two differ
 _RENAMES: dict[type, dict[str, str]] = {
