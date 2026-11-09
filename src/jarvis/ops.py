@@ -12790,7 +12790,7 @@ def _requestor_in(project_name: str, order_id: str) -> str | None:
 
 def resolve_requestor(store: Any, *, parent_id: str | None,
                       metadata: Mapping[str, Any] | None, origin: str) -> str:
-    """Who asked, decided ONCE at create (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2.2); rule 1, an explicit stamp, is the caller's"""
+    """Who asked, rules 2-5, decided ONCE at create (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2.2)"""
     from . import steward
 
     meta = metadata or {}

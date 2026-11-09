@@ -1697,7 +1697,7 @@ class ProjectStore:
             self.get_work_order(dep)  # KeyError names the id that does not exist
         if parent_id:
             parent = self.get_feature_order(parent_id)  # same: KeyError names it
-            # Store cannot import ops: only the plain copy lives here (spec 2026-11-09-yours-requestor-stamp-and-tree-notice.md §2.1)
+            # Store cannot import ops: only the plain copy lives here (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2.1)
             requestor = requestor or parent.get("requestor")
         ts = db.now()
         self.conn.execute(
