@@ -892,6 +892,47 @@ def test_once_approved_the_next_poll_merges_it_and_closes_the_work_order(
     assert store.get_work_order(wo["id"])["status"] == "completed"
 
 
+def test_a_user_message_after_the_finish_holds_the_merge():
+    """wo-f7ef5098: outranks every fact about the world, like an owed assumption"""
+    decision = decide(rnd(), user_message=True, base_red=BASE_RED)
+    assert not decision.armed and decision.code == automerge.HELD_USER_MESSAGE
+
+
+@pytest.mark.parametrize("granted_first", [False, True])
+def test_a_user_message_after_the_gate_was_filed_runs_no_merge(
+        started, project, fake_gh, granted_first):
+    """wo-198fb3f0 / PR 7: gate filed, user writes 3s later, Neo grants — nothing merges"""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    poll(started, store)
+    [approval] = store.list_approvals(wo["id"])
+    if granted_first:
+        gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
+                             project="proj_a")
+
+    sent = ops.send_message(wo["id"], "I don't see the screenshots in the PR", relay=True)
+    store.claim_message(sent["msg_id"])  # the worker's turn took it
+
+    # The request is withdrawn either way, so a late grant authorises nothing
+    assert store.get_approval(approval["id"])["status"] == "expired"
+    assert store.get_approval(approval["id"])["closed_as"] == "superseded"
+    poll(started, store)
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+    held = db.from_json(store.events_of_kind(wo["id"], "automerge_held")[-1]["payload"], {})
+    assert held["code"] == automerge.HELD_USER_MESSAGE
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+    # A fresh finish releases it, and the OS asks again
+    ops.finish(wo["id"], "fixed the screenshots", pr_url=PR)
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if row["outcome"] != "passed":
+        store.set_validation_head(row["id"], JUDGED)
+        store.close_validation_round(row["id"], "passed", "")
+    store.set_status(wo["id"], "waiting_pr_merge")
+    poll(started, store)
+    assert len(store.list_approvals(wo["id"])) == 2
+
+
 def test_the_record_never_reads_as_though_a_person_merged_it(started, project, fake_gh):
     """`complete_merged`'s own rule, cutting the other way: the same `gh pr view` reports a merge by the..."""
     store, wo = arm(started, project, auto_merge=True)

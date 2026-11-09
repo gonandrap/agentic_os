@@ -504,3 +504,103 @@ def pr_artifact(url: str, cwd: Path | None = None) -> PullRequestArtifact:
         checks=read_checks(payload),
         diff=diff,
     )
+
+
+# -- the images in a PR body, fetched as a repo member's browser would (io-87fe02be)
+
+#: `(owner, repo, sha, path)` of a blob/raw page target, with `?raw=true` when present
+_BLOB_IMAGE = re.compile(r"^https://github\.com/([\w.-]+)/([\w.-]+)/(blob|raw)/([^/?#]+)/"
+                         r"([^?#]+)(\?raw=true)?$")
+#: The leading bytes of the image formats a PR body carries
+_IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"<svg", b"<?xml")
+IMAGE_TIMEOUT = 15
+MAX_IMAGES = 20
+
+
+@dataclass(frozen=True)
+class ImageCheck:
+    """Images that will render broken, and images the OS could not reach to tell"""
+    broken: tuple[tuple[str, str], ...] = ()     # (target, why)
+    unchecked: tuple[tuple[str, str], ...] = ()  # (target, why)
+
+
+def _anonymous_fetch(url: str) -> tuple[int, str]:
+    """`(status, content type)` of an unauthenticated GET; `(0, why)` when unreachable"""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "jarvis-os"})
+    try:
+        with urllib.request.urlopen(req, timeout=IMAGE_TIMEOUT) as resp:  # noqa: S310 — http(s) only, matched by the caller
+            return int(resp.status), str(resp.headers.get("Content-Type") or "")
+    except urllib.error.HTTPError as e:
+        return int(e.code), ""
+    except Exception as e:  # noqa: BLE001 — unreachable is "unchecked", never "broken"
+        return 0, f"{type(e).__name__}: {e}"
+
+
+def _member_fetch(owner: str, repo: str, sha: str, path: str) -> tuple[bool | None, str]:
+    """Whether `path` at `sha` is an image, read as a repo member; None when gh could not answer"""
+    api = f"repos/{owner}/{repo}/contents/{path}?ref={sha}"
+    try:
+        proc = subprocess.run(
+            [gh_bin(), "api", "--method", "GET", "-H", "Accept: application/vnd.github.raw",
+             api], capture_output=True, timeout=GH_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"`gh api {api}` did not run: {type(e).__name__}"
+    if proc.returncode != 0:
+        detail = proc.stderr.decode(errors="replace").strip()[:200]
+        if "HTTP 404" in detail or "Not Found" in detail:
+            return False, f"no such file at that commit ({detail})"
+        return None, f"`gh api {api}` failed: {detail}"
+    if proc.stdout.lstrip()[:5].startswith(_IMAGE_MAGIC) or proc.stdout[8:12] == b"WEBP":
+        return True, ""
+    return False, "the file at that commit is not an image"
+
+
+def check_image(target: str) -> tuple[bool | None, str]:
+    """`(True, "")` renders, `(False, why)` renders broken, `(None, why)` could not tell"""
+    from .hooks import RAW_IMAGE
+
+    if not re.match(r"https?://", target, re.IGNORECASE):
+        return False, "a relative path GitHub does not resolve for an image"
+    raw = RAW_IMAGE.match(target)
+    if raw:
+        # A browser sends no credentials here, so the anonymous answer IS the render
+        status, info = _anonymous_fetch(target)
+        if status == 0:
+            return None, info
+        if status == 200 and info.startswith("image/"):
+            return True, ""
+        return False, (f"HTTP {status} {info}".strip() + " to a browser — a private repo "
+                       "needs `https://github.com/<owner>/<repo>/blob/<sha>/<path>?raw=true`")
+    blob = _BLOB_IMAGE.match(target)
+    if blob:
+        owner, repo, kind, sha, path, raw_flag = blob.groups()
+        if kind == "blob" and not raw_flag:
+            return False, "a blob page is HTML, not an image — append `?raw=true`"
+        return _member_fetch(owner, repo, sha, path)
+    if re.match(r"https://github\.com/", target):
+        return None, "a github.com URL the OS cannot fetch as a signed-in member"
+    status, info = _anonymous_fetch(target)
+    if status == 0:
+        return None, info
+    if 200 <= status < 300 and info.startswith("image/"):
+        return True, ""
+    return False, f"HTTP {status} {info}".strip()
+
+
+def body_image_check(body: str) -> ImageCheck:
+    """Every image in a PR body, fetched as a repo member's browser would"""
+    from .hooks import image_targets
+
+    broken, unchecked = [], []
+    targets = list(dict.fromkeys(image_targets(body or "")))
+    for target in targets[:MAX_IMAGES]:
+        ok, why = check_image(target)
+        if ok is False:
+            broken.append((target, why))
+        elif ok is None:
+            unchecked.append((target, why))
+    unchecked += [(t, f"over the {MAX_IMAGES}-image limit") for t in targets[MAX_IMAGES:]]
+    return ImageCheck(tuple(broken), tuple(unchecked))

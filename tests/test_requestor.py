@@ -172,3 +172,120 @@ def test_a_label_adds_one_block_after_the_work_order_and_nothing_else():
             (GOLDEN_CONFIRM, autoreview._confirm_question(   # noqa: SLF001
                 "p", GOLD_WO, GOLD_A, sib, requestor_label="morpheus"))):
         assert out == gold.replace(anchor, block + anchor, 1)
+
+
+# -- the column, stamped once at create (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2)
+
+
+@pytest.fixture
+def two(jarvis_home, tmp_path, monkeypatch):
+    """Two registered projects, so a finding can be filed across them"""
+    paths = {"proj_a": tmp_path / "a", "proj_b": tmp_path / "b"}
+    monkeypatch.setattr(ops, "registered_project_paths", lambda **_: paths)
+    return paths
+
+
+def col(path, order_id):
+    s = ProjectStore(path)
+    try:
+        try:
+            return s.get_feature_order(order_id)["requestor"]
+        except KeyError:
+            return s.get_work_order(order_id)["requestor"]
+    finally:
+        s.close()
+
+
+def test_a_cli_shaped_create_is_the_users(two):
+    wo = ops.create_work_order("proj_a", "t")
+    fo = ops.create_feature_order("proj_a", "f", description="d")
+    do = ops.create_decision_order("proj_a", "which", "compare")
+    io = ops.create_improvement_order("proj_a", "slow", description="d", refs=["wo-1"])
+    for row in (wo, fo, do, io):
+        assert col(two["proj_a"], row["id"]) == "user"
+
+
+def test_the_same_create_inside_a_worker_session_is_the_os(two, monkeypatch):
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-worker")
+    wo = ops.create_work_order("proj_a", "t")
+    fo = ops.create_feature_order("proj_a", "f", description="d")
+    assert col(two["proj_a"], wo["id"]) == col(two["proj_a"], fo["id"]) == "os"
+
+
+def test_an_explicit_stamp_wins_and_a_stray_value_is_refused(two, monkeypatch):
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-worker")
+    wo = ops.create_work_order("proj_a", "t", requestor="user")
+    assert col(two["proj_a"], wo["id"]) == "user"
+    with pytest.raises(ops.OpsError, match="requestor"):
+        ops.create_work_order("proj_a", "t", requestor="jarvis")
+    s = ProjectStore(two["proj_a"])
+    try:
+        with pytest.raises(ValueError, match="requestor"):
+            s.create_feature_order("f", requestor="you")
+    finally:
+        s.close()
+
+
+def test_plan_children_and_the_manager_inherit_a_user_feature(two, monkeypatch):
+    fo = ops.create_feature_order("proj_a", "f", description="d")
+    # The daemon has no JARVIS_WO_ID either, but its rows copy the parent, never guess
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-planner")
+    s = ProjectStore(two["proj_a"])
+    try:
+        kids = s.create_plan_children(fo["id"], [
+            {"key": "a", "title": "A", "description": "d", "needs": []}], manager=True)
+        rows = s.feature_children(fo["id"], kinds=("worker", "manager"))
+    finally:
+        s.close()
+    assert len(kids) == 1 and len(rows) == 2
+    assert {r["requestor"] for r in rows} == {"user"}
+
+
+def test_a_steward_stamped_root_is_the_os(two):
+    wo = ops.create_work_order("proj_a", "t", metadata=STAMP)
+    assert col(two["proj_a"], wo["id"]) == "os"
+
+
+@pytest.mark.parametrize("target", ["proj_a", "proj_b"])
+def test_a_finding_order_of_a_user_io_is_the_users_even_stamped(two, target):
+    from types import SimpleNamespace
+
+    io = ops.create_improvement_order("proj_a", "slow", description="d", refs=["wo-1"])
+    decision = SimpleNamespace(stamp=STAMP[steward.STAMP_KEY], budget_usd=None,
+                               decision_id=0)
+    f = {"key": "k", "proposed_orders": [
+        {"title": "fix it", "description": "d", "project": target},
+        {"title": "big fix", "description": "d", "project": target, "type": "feature"}]}
+    made, error = ops._file_finding_orders("proj_a", io["id"], f, decision)  # noqa: SLF001
+    assert not error and len(made) == 2
+    assert [col(two[target], m["id"]) for m in made] == ["user", "user"]
+
+
+def test_a_morpheus_shaped_investigation_is_the_os(two):
+    """`origin='jarvis'` like morpheus files it, in a process with no JARVIS_WO_ID"""
+    wo = ops.create_work_order("proj_a", "stuck one")
+    inv = ops.create_investigation_order("proj_a", wo["id"], "it is stuck", origin="jarvis",
+                                         stamp=STAMP[steward.STAMP_KEY])
+    assert col(two["proj_a"], inv["id"]) == "os"
+    bare = ops.create_investigation_order("proj_b", ops.create_work_order("proj_b", "x")["id"],
+                                          "stuck", origin="jarvis", requestor="os")
+    assert col(two["proj_b"], bare["id"]) == "os"
+
+
+def test_the_column_is_read_first(store):
+    """A stamped row is never re-derived from origin or a steward stamp"""
+    user = store.create_work_order("t", origin="schedule", metadata=STAMP, requestor="user")
+    assert who(store, user) == ops.Requestor("user", "you")
+    os_ = store.create_work_order("t", origin="schedule", requestor="os")
+    assert who(store, os_) == ops.Requestor("os", "schedule")
+    typed = store.create_work_order("t", requestor="os")
+    assert who(store, typed) == ops.Requestor("os", "os")
+
+
+def test_a_null_legacy_finding_order_follows_its_io(store):
+    io = store.create_feature_order("slow", kind="improvement")
+    found = store.create_work_order("fix", metadata={ops.ORIGIN_IO_KEY: io["id"], **STAMP})
+    assert found["requestor"] is None
+    assert who(store, found) == ops.Requestor("user", "you")
+    lost = store.create_work_order("fix", metadata={ops.ORIGIN_IO_KEY: "io-gone"})
+    assert who(store, lost) == ops.Requestor("os", "os")

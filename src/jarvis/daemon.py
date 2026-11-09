@@ -654,6 +654,15 @@ ABANDONED_VOID_REASON = (
     "decision owed to the user: {why}"
 )
 
+#: Why a round went back unjudged: an image in the PR body will not render (io-87fe02be)
+BROKEN_IMAGES_REASON = (
+    "these images in the pull-request body render broken for a reviewer, and the panel "
+    "cannot see pictures, so nobody has judged the work:{images}\n"
+    "Fix the links (the `open-a-pull-request` skill, section 3), edit the PR body, then "
+    "finish again.")
+#: The event naming body images the OS could not reach to check — said, never silently skipped
+VALIDATION_IMAGES_UNCHECKED = "validation_images_unchecked"
+
 #: The pair that records a landing the round machine could not take because a worker turn was in... (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
 VALIDATION_LANDING_DEFERRED = "validation_landing_deferred"
 VALIDATION_LANDED = "validation_landed"
@@ -2556,6 +2565,19 @@ class Daemon:
                          project.name, wo_id, n, refusal)
                 return
 
+            # A BODY IMAGE THAT RENDERS BROKEN is sent back before the panel
+            images = self._image_check(store, wo_id, n, packet)
+            if images is not None and images.broken:
+                self._reject(store, wo, round_id, n, max_rounds,
+                             BROKEN_IMAGES_REASON.format(images="".join(
+                                 f"\n- {t} — {why}" for t, why in images.broken)),
+                             budget_round=pos,
+                             rebind=(rebinds, ops.REBIND_MAX) if as_rebind else None,
+                             uncounted_cause=cause)
+                log.info("[%s] %s: round %d refused before the panel — %d broken "
+                         "image(s)", project.name, wo_id, n, len(images.broken))
+                return
+
             # A REPEAT of the IMMEDIATELY PRECEDING round only
             previous = self._preceding_round(store, n, wo_id=wo_id)
             # A SUBMISSION SENT BACK FOR RED CI MAY COME BACK UNCHANGED (#1023)
@@ -2714,6 +2736,23 @@ class Daemon:
             if int(row["round"]) == n - 1:
                 return row
         return None
+
+    @staticmethod
+    def _image_check(store: ProjectStore, wo_id: str, n: int, packet: Any) -> Any:
+        """The PR body's images fetched, the unreachable ones recorded; None with no PR body"""
+        from . import github
+
+        body = str((packet.pr or {}).get("body") or "")
+        if not body:
+            return None
+        images = github.body_image_check(body)
+        if images.unchecked:
+            store.add_event(wo_id, VALIDATION_IMAGES_UNCHECKED, {
+                "round": n, "images": [{"target": t, "why": why}
+                                       for t, why in images.unchecked]})
+            log.info("%s: round %d — %d body image(s) could not be checked",
+                     wo_id, n, len(images.unchecked))
+        return images
 
     @staticmethod
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
@@ -3031,7 +3070,8 @@ class Daemon:
                 f"WHAT NOT TO CONCLUDE: that a retry is the answer. The round IS "
                 f"re-judged already (`validation.killed_retries` bounds it). A retry "
                 f"cannot name what killed these processes and cannot stop it recurring; "
-                f"naming the cause is this order's whole job. GitHub issue #1039."))
+                f"naming the cause is this order's whole job. GitHub issue #1039."),
+                requestor="os")
             return str(order["id"])
         except ops.OpsError as e:
             # NEVER PROPAGATES: a lost race between two ticks must not cost the round its own record (spec §4a)
@@ -4656,7 +4696,7 @@ class Daemon:
                     status_age=f"{(now - candidate['since']) / 3600:.1f}h",
                     activity_age=f"{(now - candidate['activity']) / 3600:.1f}h",
                     reason=verdict.reason, blocker=candidate["blocker"]),
-                origin="fleet_health", fingerprint=fingerprint)
+                origin="fleet_health", fingerprint=fingerprint, requestor="os")
             run["opened"] += 1
             log.info("[%s] %s is stuck: %s — %s", project, wo["id"], verdict.reason,
                      inv["id"])
@@ -4744,7 +4784,7 @@ class Daemon:
             ctx = schedule.JobContext(project=project.name,
                                       owns_os=owner == project.name)
             wo = store.create_work_order(title=spec.title, description=spec.describe(ctx),
-                                         origin=schedule.ORIGIN)
+                                         origin=schedule.ORIGIN, requestor="os")
             self._retire_previous(store, state)
             store.record_schedule_fire(job_id, wo["id"], now)
             log.info("scheduled job %s filed %s in %s", job_id, wo["id"], project.name)
@@ -5354,6 +5394,17 @@ class Daemon:
             except Exception:  # noqa: BLE001 — same isolation as the sweep above
                 log.exception("[%s] settling %s failed", project.name, wo["id"])
 
+    @staticmethod
+    def _land_deferred(store: ProjectStore, wo: dict) -> None:
+        """The deferred landing, unless a user message postdates the finish (wo-f7ef5098)"""
+        from . import ops as ops_mod
+
+        if not ops_mod.user_message_unanswered(store, wo["id"]):
+            ops_mod.land_when_cleared(store, wo)
+            return
+        store.set_status(wo["id"], "needs_review")
+        store.flag_attention(wo["id"], invariants_mod.USER_MESSAGE_UNANSWERED_BLOCKER)
+
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
         # `user_facing_wait` is NOT read here any more: it decides eligibility
@@ -5381,7 +5432,7 @@ class Daemon:
                     and worker_session.busy(store, wo["id"]) is None
                     and not store.queued_messages(wo["id"])):
                 fresh = store.get_work_order(wo["id"])
-                ops_mod.land_when_cleared(store, fresh)
+                self._land_deferred(store, fresh)
                 store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
 
@@ -5486,7 +5537,7 @@ class Daemon:
         # THE LANDING THE ROUND MACHINE DEFERRED (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
         deferred = _landing_deferred(store, wo["id"]) if round_open == "passed" else None
         if deferred is not None:
-            ops_mod.land_when_cleared(store, fresh)
+            self._land_deferred(store, fresh)
             store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
         if fresh.get("result_summary"):
@@ -5500,6 +5551,7 @@ class Daemon:
                 # `resumed_from` is the same rule as `pr_repair_origin` for the other way the OS takes a work order... (#259)
                 back = ("needs_review"
                         if invariants_mod.validation_escalated(store, fresh)
+                        or ops_mod.user_message_unanswered(store, wo["id"])
                         else ops_mod.pr_repair_origin(store, wo["id"])
                         or ops_mod.resumed_from(store, wo["id"], turn["seq"])
                         or "waiting_pr_merge")
@@ -6249,10 +6301,13 @@ class Daemon:
         # #1063
         drift = self._drift_hold(store, wo)
         no_ci = self._repo_has_no_ci(project, pr)
+        # Only this call needs it: every re-decide below follows a code this hold outranks (wo-f7ef5098)
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
-            pending_assumptions=pending, plan_assumptions=plan_assumptions,
+            pending_assumptions=pending,
+            user_message=ops.user_message_unanswered(store, wo_id),
+            plan_assumptions=plan_assumptions,
                     spec_unmerged=spec_unmerged,
             drift=drift, base_red=base_red, base_behind=base_behind, no_ci=no_ci)
         if not decision.armed:
@@ -6367,6 +6422,9 @@ class Daemon:
             # #1513: an unspent lapsed grant authorised nothing; the decision goes back to Neo
             self._note_automerge_held(store, wo_id,
                                       automerge.held_grant_lapsed(approval, decision))
+            approval = None
+        if approval is not None and automerge.withdrawn(approval):
+            # Authorised nothing and refused nothing: the armed decision is asked afresh (wo-f7ef5098)
             approval = None
         if approval is None:
             # #1459, #1608: one merge request in flight per base tip, in queue order
@@ -8323,7 +8381,7 @@ conflicts, shipit refuses: report its reason and stop. Never fall back to releas
         fresh = store.create_work_order(
             title=(f"Ship {wo.get('title') or url} alone" if alone
                    else f"Ship the fix for {wo.get('title') or url}"),
-            description="", origin="os",
+            description="", origin="os", requestor="os",
             metadata=steward.stamped(meta, decision))
         steward.linked(decision, fresh["id"])
         brief = self.HOTFIX_BRIEF if alone else self.RELEASE_BRIEF

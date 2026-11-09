@@ -38,6 +38,13 @@ from .. import (
     uilog,
     wiring,
 )
+# Re-exported: /config and the onboarding pages type a form string the same way ops does
+from ..config_version import (  # noqa: F401
+    CONFIG_TYPE_NAMES,
+    config_type_name,
+    config_type_ok,
+    config_value_of,
+)
 from ..bill import OWN_LABEL
 from ..central_store import KB_LINK_RELS, SETTLED_BACKLOG_STATUSES, CentralStore
 from ..daemon import daemon_running
@@ -250,6 +257,22 @@ def filter_rows(rows: Iterable[dict], filters: Mapping[str, str],
     return [r for r in rows
             if all(str(r.get(k) or "") == v for k, v in exact.items())
             and (not q or any(q in str(r.get(k) or "").lower() for k in text_keys))]
+
+
+#: The `requestor` filter's values; `any` is the empty choice (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §5.1)
+REQUESTOR_OPTIONS = ["you", "os"]
+
+
+def requestor_query(request: Request) -> dict[str, str]:
+    """`requestor=any` dropped here, or `query_filters` keeps it to match nothing"""
+    filters = query_filters(request, {"requestor": REQUESTOR_OPTIONS})
+    return {} if filters.get("requestor") == "any" else filters
+
+
+def requestor_rows(rows: Iterable[dict], filters: Mapping[str, str]) -> list[dict]:
+    """Matches the derived `requestor_view`, never the raw column (which says `user`)"""
+    want = filters.get("requestor")
+    return [r for r in rows if not want or r.get("requestor_view") == want]
 
 
 def filter_options(rows: Iterable[dict], key: str) -> list[str]:
@@ -967,19 +990,6 @@ def config_tree(labels: list[str], node: str = "") -> list[dict]:
     return build("", labels)
 
 
-CONFIG_TYPE_NAMES = [
-    (bool, "true or false"), (int, "a whole number"), (float, "a number"),
-    (str, "text"), (list, "a JSON list"), (dict, "a JSON object"),
-]
-
-
-def config_type_name(value: object) -> str:
-    for kind, name in CONFIG_TYPE_NAMES:
-        if isinstance(value, kind):
-            return name
-    return "a value"
-
-
 def config_widget(value: object) -> str:
     """Which input a setting is edited with — the whole of the page's type awareness"""
     if isinstance(value, bool):
@@ -998,30 +1008,6 @@ def config_input_text(value: object) -> str:
     if value is None:
         return ""
     return json.dumps(value)
-
-
-def config_value_of(current: object, text: str) -> object:
-    """What the page will write for `text`, given the value already there"""
-    if isinstance(current, str):
-        return text
-    if current is None and not text.strip():
-        return None
-    return ops.parse_config_value(text)
-
-
-def config_type_ok(current: object, new: object) -> bool:
-    """May `new` be written where `current` is?"""
-    if current is None:
-        return True
-    if new is None:
-        return False
-    if isinstance(current, bool):
-        return isinstance(new, bool)
-    if isinstance(current, int):
-        return isinstance(new, int) and not isinstance(new, bool)
-    if isinstance(current, float):
-        return isinstance(new, (int, float)) and not isinstance(new, bool)
-    return isinstance(new, type(current))
 
 
 def _config_nodes(label: str) -> list[str]:
@@ -1335,8 +1321,10 @@ def create_app() -> FastAPI:
                    "project": filter_options(every, "project"),
                    "status": filter_options(every, "status")}
         filters = query_filters(request, options)
-        families = filter_rows(families, filters)
-        rows = filter_rows(wos, filters)
+        families = requestor_rows(filter_rows(families, filters), requestor_query(request))
+        rows = requestor_rows(filter_rows(wos, filters), requestor_query(request))
+        filters.update(requestor_query(request))
+        options["requestor"] = REQUESTOR_OPTIONS
         # A status filter reveals that status even when it is one that collapses into a count
         show = show or filters.get("status", "")
         revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
@@ -1381,6 +1369,8 @@ def create_app() -> FastAPI:
         show_hidden = hidden not in ("", "0", "false")
         filters = query_filters(request, {"type": (), "status": ()})
         kind, status = filters.get("type", ""), filters.get("status", "")
+        who = requestor_query(request)
+        filters.update(who)
         # No status filter means open; an unknown one matches nothing (Q2361)
         if status == "all":
             wo_statuses, fo_statuses = None, None
@@ -1399,12 +1389,17 @@ def create_app() -> FastAPI:
                       **{k: store.feature_status_counts(kind=k) for k in FO_KINDS}}
             total = sum(n for by_status in counts.values() for n in by_status.values())
             cap = orders_cap(limit, total)
-            wos = (store.list_work_orders(statuses=wo_statuses, limit=cap,
+            # The requestor is not a column filter: read every row so the cap and `matched` count only matches
+            fetch = -1 if who else cap
+            wos = (store.list_work_orders(statuses=wo_statuses, limit=fetch,
                                           include_hidden=show_hidden)
                    if kind in ("", "work") else [])
-            fos = (store.list_feature_orders(statuses=fo_statuses, limit=cap,
+            fos = (store.list_feature_orders(statuses=fo_statuses, limit=fetch,
                                              kind=kind or None)
                    if kind != "work" else [])
+            # Classified inside the store's lifetime: a NULL row walks its parents (§5.1)
+            wos = requestor_rows([ops.with_requestor_view(store, wo) for wo in wos], who)
+            fos = requestor_rows([ops.with_requestor_view(store, fo) for fo in fos], who)
             families = [
                 {**fo, "type": fo["kind"],
                  # A feature prints its status word; the other kinds relabel theirs
@@ -1448,11 +1443,14 @@ def create_app() -> FastAPI:
         matched = sum(n for t, by_status in in_scope.items()
                       for s, n in by_status.items()
                       if wanted[t] is None or s in wanted[t])
+        if who:
+            matched = len(every)
         # Parsed against everything, offered only where a row has it
         options = {"type": [t for t in ("work", *FO_KINDS) if counts[t]],
                    "status": ["past", "all"]
                    + [s for s in dict.fromkeys(WO_STATUSES + FO_STATUSES)
-                      if any(by_status.get(s) for by_status in in_scope.values())]}
+                      if any(by_status.get(s) for by_status in in_scope.values())],
+                   "requestor": REQUESTOR_OPTIONS}
         return render(request, "project.html", project_name=name, path=paths[name],
                       rows=rows, total=total, matched=matched,
                       next_limit=cap + ORDERS_PAGE, filters=filters, options=options,
@@ -1891,14 +1889,19 @@ def create_app() -> FastAPI:
         every = ops.unacked_inbox()
         # "priority" is the default, so it is the select's empty choice rather than an option
         options = {"level": list(ops.INBOX_LEVELS), "project": filter_options(every, "project"),
+                   "requestor": REQUESTOR_OPTIONS,
                    "q": [], "sort": [s for s in ops.INBOX_SORTS if s != "priority"]}
-        filters = query_filters(request, options)
+        filters = {k: v for k, v in query_filters(request, options).items()
+                   if k != "requestor"}
+        filters.update(requestor_query(request))
         sort = filters.get("sort", "priority")
         items = ops.select_inbox(every, level=filters.get("level", ""),
                                  project=filters.get("project", ""), q=filters.get("q", ""),
                                  sort=sort if sort in ops.INBOX_SORTS else "priority")
-        # A sort is not a filter: only the other three narrow what "Ack shown" acks
-        filtered = any(k in filters for k in ("level", "project", "q"))
+        if "requestor" in filters:
+            items = requestor_rows(ops.inbox_with_requestor(items), filters)
+        # A sort is not a filter: only the other four narrow what "Ack shown" acks
+        filtered = any(k in filters for k in ("level", "project", "q", "requestor"))
         return render(request, "inbox.html", active="inbox",
                       critical=[it for it in items if it["level"] == "critical"],
                       rest=[it for it in items if it["level"] != "critical"],
@@ -2559,7 +2562,7 @@ def create_app() -> FastAPI:
         try:
             wo = ops.create_work_order(
                 project, title, description=description, model=model or None,
-                origin="ui",
+                origin="ui", requestor="user",
                 # Empty means "whatever the project's default is", which is usually no ceiling — never zero
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
         except (ValueError, ops.OpsError) as e:
@@ -2750,7 +2753,7 @@ def create_app() -> FastAPI:
 
         try:
             fo = ops.create_feature_order(
-                project, title, description=description, origin="ui",
+                project, title, description=description, origin="ui", requestor="user",
                 # A FAMILY budget: the whole rollup, not the planner alone
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
         except (ValueError, ops.OpsError) as e:
@@ -2765,7 +2768,7 @@ def create_app() -> FastAPI:
 
         try:
             io = ops.create_improvement_order(
-                project, title, description=description, origin="ui",
+                project, title, description=description, origin="ui", requestor="user",
                 # One per line: a free-text ref may hold commas or spaces
                 refs=refs.splitlines(),
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
@@ -2781,7 +2784,7 @@ def create_app() -> FastAPI:
 
         try:
             do = ops.create_decision_order(
-                project, title, description, origin="ui",
+                project, title, description, origin="ui", requestor="user",
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/?{urlencode({'error': str(e)}, quote_via=quote)}",
@@ -2795,7 +2798,7 @@ def create_app() -> FastAPI:
 
         try:
             inv = ops.create_investigation_order(
-                None, subject, why, origin="ui",
+                None, subject, why, origin="ui", requestor="user",
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
             # The subject decides the project, so the form never asks for one
             project = ops.show_investigation_order(inv["id"])["project"]

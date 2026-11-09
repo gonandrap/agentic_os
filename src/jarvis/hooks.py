@@ -244,14 +244,36 @@ _MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*(<[^>\n]+>|[^)\s]+)")
 _ABSOLUTE_URL = re.compile(r"https?://", re.IGNORECASE)
 
 
+#: `(owner, repo, sha, path)` of a raw.githubusercontent target
+RAW_IMAGE = re.compile(
+    r"^https://raw\.githubusercontent\.com/([\w.-]+)/([\w.-]+)/([^/?#]+)/([^?#]+)$")
+
+
+def image_targets(body: str) -> list[str]:
+    """Every markdown image target GitHub would render from `body`, in order"""
+    scannable = _blank_out(_CODE_SPAN, _blank_out(_HTML_COMMENT, body))
+    return [m.group(1).strip("<>") for m in _MARKDOWN_IMAGE.finditer(scannable)]
+
+
 def unrenderable_image(body: str) -> str | None:
     """The first markdown image target in `body` that GitHub will not render, or None"""
-    scannable = _blank_out(_CODE_SPAN, _blank_out(_HTML_COMMENT, body))
-    for m in _MARKDOWN_IMAGE.finditer(scannable):
-        target = m.group(1).strip("<>")
-        if not _ABSOLUTE_URL.match(target):
+    return next((t for t in image_targets(body) if not _ABSOLUTE_URL.match(t)), None)
+
+
+def private_raw_image(body: str) -> str | None:
+    """The first raw.githubusercontent image on a PRIVATE repo: no session reaches it"""
+    from . import issues
+
+    for target in image_targets(body):
+        m = RAW_IMAGE.match(target)
+        if m and issues.repo_is_private(f"{m.group(1)}/{m.group(2)}"):
             return target
     return None
+
+
+def private_image_url(owner: str, repo: str, sha: str, path: str) -> str:
+    """The image form a signed-in repo member's browser renders on a private repo"""
+    return f"https://github.com/{owner}/{repo}/blob/{sha}/{path}?raw=true"
 
 
 def _section_is_empty(text: str) -> bool:
@@ -297,7 +319,16 @@ def pr_body_problems(body: str) -> list[str]:
             f"`![…]({image})` renders broken — GitHub resolves a relative path for a "
             f"link, not for an image. Link it by raw URL at the commit SHA: "
             f"`https://raw.githubusercontent.com/<owner>/<repo>/<sha>/{image}` "
-            f"(the SHA from `git rev-parse HEAD`, and push before you post the body)")
+            f"(the SHA from `git rev-parse HEAD`, and push before you post the body); "
+            f"on a PRIVATE repo use `https://github.com/<owner>/<repo>/blob/<sha>/"
+            f"{image}?raw=true` instead")
+    raw = private_raw_image(body)
+    if raw is not None:
+        fixed = private_image_url(*RAW_IMAGE.match(raw).groups())  # type: ignore[union-attr]
+        problems.append(
+            f"`![…]({raw})` renders broken — the repository is private and "
+            f"raw.githubusercontent.com carries no github.com session. Link it as "
+            f"`{fixed}`")
     return problems
 
 
@@ -1873,10 +1904,13 @@ def under_review_decision(payload: dict[str, Any],
     if ctx is None:
         return None
     root, wo_id = ctx
+    from .gate_rules import AUTO_MERGE
+
     try:
         store = ProjectStore(root)
         try:
-            pending = store.pending_approvals(wo_id)
+            # The OS's own merge request is no attempt by this worker to narrow (io-87fe02be)
+            pending = [a for a in store.pending_approvals(wo_id) if a["kind"] != AUTO_MERGE]
         finally:
             store.close()
     except Exception:  # noqa: BLE001 — see the docstring

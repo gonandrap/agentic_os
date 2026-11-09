@@ -12,12 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, ops, validation
+from jarvis import claude_cli, invariants, ops, validation
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import VALIDATION_REASON_CHARS, VALIDATION_REASON_CUT, Daemon
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER, true_blockers
-from jarvis.project_store import VALIDATOR_SEATS, ProjectStore
+from jarvis.project_store import MESSAGE_AUTHOR_USER, VALIDATOR_SEATS, ProjectStore
 from jarvis.testing import make_git_project
 
 
@@ -1518,6 +1518,36 @@ def test_a_passed_round_does_not_land_an_order_whose_worker_is_typing(fleet,
         assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
         assert [e["kind"] for e in store.list_events(wo["id"])].count(
             "validation_landed") == 1
+    finally:
+        store.close()
+
+
+def test_a_user_message_after_the_finish_lands_the_deferral_in_needs_review(
+        fleet, fake_claude):
+    """wo-198fb3f0's order: finish, user writes, round passes, turn ends with no new finish"""
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.daemon.validator = Validator(passed())
+    gate = fake_claude.hold_turns()
+
+    store = fleet.store()
+    try:
+        store.queue_message(wo["id"], "I don't see the screenshots in the PR",
+                            authored_by=MESSAGE_AUTHOR_USER)
+        fleet.drain()
+        assert "validation_landing_deferred" in [e["kind"]
+                                                 for e in store.list_events(wo["id"])]
+
+        gate.unlink()
+        assert _settle(store, wo["id"])
+        fleet.tick()
+
+        row = store.get_work_order(wo["id"])
+        assert row["status"] == "needs_review"
+        assert row["attention_reason"] == invariants.USER_MESSAGE_UNANSWERED_BLOCKER
+        assert invariants.USER_MESSAGE_UNANSWERED_BLOCKER in invariants.true_blockers(
+            store, row)
     finally:
         store.close()
 

@@ -1657,20 +1657,24 @@ def test_an_expedited_order_records_that_it_was_expedited(fleet):
     plain = issues.start_work(third_url)
     _name, _path, other = ops.find_work_order(plain["wo_id"])
     assert not issues.was_expedited(other)
-    # wo-776ac037: both were asked for by the user, so both are `manual`
-    assert ops.wo_tags(wo, "p")[1:] == ["bug", "expedite", "manual"]
-    assert ops.wo_tags(other, "p")[1:] == ["bug", "manual"]
+    # Both were asked for by the user, so both read `you` (fo-8786a1b6 §5.2)
+    assert ops.wo_tags(wo, "p")[1:] == ["bug", "expedite", "you"]
+    assert ops.wo_tags(other, "p")[1:] == ["bug", "you"]
 
 
-def test_tags_name_the_project_and_who_launched_the_order():
-    """wo-776ac037: `os` is exact; a legacy `jarvis` row is read from its provenance"""
+def test_tags_name_the_project_and_who_asked_for_the_order():
+    """fo-8786a1b6 §5.2: the stamp wins; only a NULL (legacy) row reads its provenance"""
     from jarvis import ops
-    assert ops.wo_tags({"origin": "os"}, "painforwisdom") == ["painforwisdom", "automatic"]
-    assert ops.wo_tags({"origin": "jarvis"}, "p") == ["p", "manual"]
-    assert ops.wo_tags({"origin": "ui"}, "p") == ["p", "manual"]
-    assert ops.wo_tags({"origin": "jarvis", "parent_id": "fo-1"}, "p")[-1] == "automatic"
-    assert ops.wo_tags({"origin": "jarvis", "kind": "planner"}, "p")[-1] == "automatic"
-    assert ops.wo_tags({"origin": "ui", "parent_id": "fo-1"}, "p")[-1] == "manual"
+    assert ops.wo_tags({"origin": "jarvis", "requestor": "os"}, "p") == ["p", "os"]
+    assert ops.wo_tags({"origin": "os", "requestor": "user"}, "p") == ["p", "you"]
+    assert ops.wo_tags({"requestor": "user", "requestor_view": "os"}, "p")[-1] == "os"
+    # NULL rows: `launched_by_os`, as before the stamp
+    assert ops.wo_tags({"origin": "os"}, "painforwisdom") == ["painforwisdom", "os"]
+    assert ops.wo_tags({"origin": "jarvis"}, "p") == ["p", "you"]
+    assert ops.wo_tags({"origin": "ui"}, "p") == ["p", "you"]
+    assert ops.wo_tags({"origin": "jarvis", "parent_id": "fo-1"}, "p")[-1] == "os"
+    assert ops.wo_tags({"origin": "jarvis", "kind": "planner"}, "p")[-1] == "os"
+    assert ops.wo_tags({"origin": "ui", "parent_id": "fo-1"}, "p")[-1] == "you"
 
 
 def test_the_issue_survives_a_work_order_that_could_not_be_created(monkeypatch, fleet):
