@@ -14199,10 +14199,10 @@ def _onboard_prompt(name: str, project_path: Path, draft: Path, adopted: bool,
         f"Start with the first unanswered area.")
 
 
-def onboard_session(path: str | Path, name: str | None = None, *,
-                    catalog_path: str | None = None) -> dict[str, Any]:
-    """Everything `jarvis onboard start` launches with; runs nothing (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §5)"""
-    from . import bootstrap, interview, onboard_knobs, onboard_prose, paths
+def _onboard_draft(path: str | Path, name: str | None, *, like: str | None, fresh: bool,
+                   catalog_path: str | None) -> tuple[Any, Path, bool, str | None]:
+    """Resume or build the draft: (draft, path, adopted, why rebuilt) — 2026-11-09 spec §1"""
+    from . import interview, onboard_draft, onboard_prose
 
     project_path = Path(path).expanduser().resolve()
     if not (project_path / ".git").exists():
@@ -14210,14 +14210,73 @@ def onboard_session(path: str | Path, name: str | None = None, *,
                        f"first, then onboard it")
     name = name or project_path.name
     document = _read_document(_catalog_file(catalog_path))
+    probe = onboard_draft.Draft(project=onboard_draft.DraftProject(name=name,
+                                                                   path=str(project_path)))
+    problems = onboard_draft.validate(probe, document)
+    if problems:
+        raise OpsError("\n".join(problems))
     adopted = any(isinstance(p, dict) and p.get("name") == name
                   for p in document.get("projects", []))
-    if adopted:
-        current = config_show(name, catalog_path=catalog_path)["resolved"]
-        draft = interview.new_draft(project_path, name, current,
-                                    areas=onboard_prose.AREAS, document=document)
-    else:
-        draft = interview.new_draft(project_path, name)
+    if like and adopted:
+        raise OpsError(f"{name} is already in the catalog — its draft comes from its live "
+                       f"settings; --like is only for a new project")
+    file = interview.draft_file(name)
+    rebuilt = None
+    if file.exists() and not fresh:
+        if like:
+            raise OpsError(f"a draft for {name} already exists — continue it, or start "
+                           f"over with fresh")
+        if adopted:
+            central = CentralStore()
+            try:
+                head = central.head_config_version()
+            finally:
+                central.close()
+            # Applying a draft older than the live settings would silently revert them
+            if head and head["ts"] > file.stat().st_mtime:
+                rebuilt = (f"config version {head['id']} changed {name}'s settings after "
+                           f"this draft was saved; rebuilt it from the live settings so "
+                           f"applying it cannot revert them")
+        if not rebuilt:
+            try:
+                return onboard_draft.load(file), project_path, adopted, None
+            except onboard_draft.DraftError as e:
+                raise OpsError(str(e)) from e
+    try:
+        if adopted:
+            current = config_show(name, catalog_path=catalog_path)["resolved"]
+            draft = interview.new_draft(project_path, name, current,
+                                        areas=onboard_prose.AREAS, document=document)
+        elif like:
+            draft = interview.like_draft(project_path, name, like, document=document,
+                                         areas=onboard_prose.AREAS)
+        else:
+            draft = interview.new_draft(project_path, name)
+    except (interview.InterviewError, onboard_draft.DraftError) as e:
+        raise OpsError(str(e)) from e
+    return draft, project_path, adopted, rebuilt
+
+
+def onboard_open(path: str | Path, name: str | None = None, *, like: str | None = None,
+                 fresh: bool = False, catalog_path: str | None = None) -> dict[str, Any]:
+    """Open or resume a project's onboarding draft; the page's view of it (spec 2026-11-09 §1)"""
+    draft, _, _, rebuilt = _onboard_draft(path, name, like=like, fresh=fresh,
+                                          catalog_path=catalog_path)
+    # §2 adds `onboard_view` in parallel; looked up at call time
+    view = globals()["onboard_view"](draft.project.name, catalog_path=catalog_path)
+    if rebuilt:
+        view["rebuilt"] = rebuilt
+    return view
+
+
+def onboard_session(path: str | Path, name: str | None = None, *, like: str | None = None,
+                    fresh: bool = False, catalog_path: str | None = None) -> dict[str, Any]:
+    """Everything `jarvis onboard start` launches with; runs nothing (docs/superpowers/specs/2026-10-28-greeting-agent-onboarding-interview.md §5)"""
+    from . import bootstrap, interview, onboard_knobs, paths
+
+    draft, project_path, adopted, rebuilt = _onboard_draft(
+        path, name, like=like, fresh=fresh, catalog_path=catalog_path)
+    name = draft.project.name
     draft_path = interview.draft_file(name)
     answered = {a.get("area") for a in draft.answers}
     unanswered = [k for k in onboard_knobs.AREA_KEYS if k not in answered]
@@ -14225,7 +14284,7 @@ def onboard_session(path: str | Path, name: str | None = None, *,
                                       paths.onboarding_dir() / "agent", "agents")
     prompt = _onboard_prompt(name, project_path, draft_path, adopted, unanswered)
     return {"project": name, "path": str(project_path), "adopted": adopted,
-            "draft": str(draft_path), "unanswered": unanswered,
+            "rebuilt": rebuilt, "draft": str(draft_path), "unanswered": unanswered,
             "persona_root": str(persona_root),
             # Not the project: its workspace trust is written only by the bootstrap, after
             "cwd": str(paths.jarvis_home()),

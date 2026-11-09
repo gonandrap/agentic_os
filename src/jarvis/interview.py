@@ -201,6 +201,47 @@ def new_draft(path: str | Path, name: str | None = None,
     return draft
 
 
+# The source's own repo, deploy copy, tracker, wrapper (2026-11-09 dashboard spec §1)
+_IDENTITY_TAILS = frozenset({"path", "description", "production.path", "bugs.repo",
+                             "worker.launcher", "model"})
+
+
+def like_draft(path: str | Path, name: str, source: str, *, document: dict[str, Any],
+               areas: Iterable[Area]) -> Draft:
+    """A new draft copying what `source`'s catalog entry sets, never its identity"""
+    from .onboard_knobs import MUST_HAVE
+    from .ops import _written_paths
+
+    entries = {p["name"]: p for p in document.get("projects", [])
+               if isinstance(p, dict) and isinstance(p.get("name"), str)}
+    if source not in entries:
+        raise InterviewError(f"no project {source!r} to copy — the catalog has "
+                             f"{', '.join(sorted(entries)) or 'no projects'}")
+    project_path = Path(path).expanduser().resolve()
+    draft = Draft(project=DraftProject(name=name, path=str(project_path)))
+    before = copy.deepcopy(draft)
+    resolved = _resolved(document)
+    prefix = f"projects.{source}."
+    # Only what the document SETS: an accepted default stays silent
+    for p in _written_paths(document, resolved):
+        tail = p[len(prefix):]
+        if p.startswith(prefix) and not any(tail == t or tail.startswith(f"{t}.")
+                                            for t in _IDENTITY_TAILS):
+            draft.values[f"projects.{name}.{tail}"] = resolved[p]
+    draft.project.model = str(entries[source].get("model") or "")
+    problems = onboard_draft.validate(draft, document)
+    if problems:
+        raise InterviewError("\n".join(problems))
+    candidate = _resolved(onboard_draft.candidate_document(draft, document))
+    # Must-haves stay unanswered: the user still confirms each one
+    for area in areas:
+        if area.key not in MUST_HAVE:
+            draft.answers.append({"area": area.key,
+                                  "mode": _mode(match_posture(area, candidate, name))})
+    draft.answers.append({"area": "like", "mode": source})
+    return _commit(draft, before, document)
+
+
 def _mode(posture: str) -> str:
     return posture if posture == CUSTOM else f"{PRESET}{posture}"
 

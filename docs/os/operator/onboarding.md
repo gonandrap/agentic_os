@@ -18,6 +18,9 @@ configuration version. Spec: `docs/superpowers/specs/2026-10-28-greeting-agent-o
   interactive Claude session in this terminal, run by the `greeting_agent` persona.
   `--print-prompt` prints the persona root and the opening prompt instead, for when
   `claude` is not on `PATH` or you want to paste it into a session already open.
+  An existing draft is resumed; `--fresh` starts over. `--like <project>` starts a new
+  project's draft from what that project sets, never its path, description, deploy copy,
+  tracker or launcher, and leaves every must-have area for you to confirm.
 - `jarvis onboard questions [--area a] [--json]` — the whole interview as data: every area,
   its postures, the knobs it asks about. No model needed.
 - `jarvis onboard explain <area|path> [--project p]` — what an area or one setting does,
