@@ -130,6 +130,15 @@ GAP_CLASSES: dict[str, GapClass] = {
         issue_url="https://github.com/gonandrap/agentic_os/issues/1610",
         since="",
     ),
+    "jobless-run-unseen": GapClass(
+        id="jobless-run-unseen",
+        headline="a run that produced no job reports no check, so every CI remedy is blind",
+        symptom="`waiting_pr_merge`, empty check rollup on the head, no blocker named",
+        detector="Daemon.rerun_aborted_checks",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1657",
+        since="",
+    ),
 }
 
 #: Asserted equal to `tuple(GAP_CLASSES)`, on `remedies.SHIPPED_REMEDIES`' precedent
@@ -139,7 +148,7 @@ SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
                                         "blocker-contradicts-record",
                                         "designed-wait-undiscounted",
                                         "superseded-delivery", "base-chase-livelock",
-                                        "mention-held-as-act")
+                                        "mention-held-as-act", "jobless-run-unseen")
 
 
 def checked_slug(raw: str) -> str:

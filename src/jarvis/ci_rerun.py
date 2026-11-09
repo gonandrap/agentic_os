@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .bugreport import gh_bin, gh_missing_message
-from .ci import RUN_FIELDS, SHA_RE, Run, parse_ts
+from .ci import RED_RUN_CONCLUSIONS, RUN_FIELDS, SHA_RE, Run, parse_ts
 from .github import GhUnavailable, GitHubError
 
 log = logging.getLogger("jarvis.ci_rerun")
@@ -30,6 +30,9 @@ CI_WAIT_STATUSES = ("waiting_pr_merge", "validating")
 
 #: A WORKFLOW RUN conclusion that judged nothing, lower case as `gh run list` answers it
 ABORTED_RUN_CONCLUSIONS = frozenset({"cancelled", "startup_failure", "stale"})
+
+#: A run conclusion that, on a run with no job, judged nothing and reported no check (#1657)
+JOBLESS_RUN_CONCLUSIONS = RED_RUN_CONCLUSIONS | ABORTED_RUN_CONCLUSIONS
 
 #: How many runs of one head are read
 HEAD_RUN_LIMIT = 30
@@ -141,6 +144,30 @@ def runs_to_rerun(aborted: tuple[dict[str, str], ...],
     return tuple(picked.values())
 
 
+def job_count(run_id: int, cwd: Path | None = None) -> int:
+    """How many jobs the latest attempt of this run has"""
+    shown = f"`gh run view {int(run_id)}`"
+    stdout = _run(["run", "view", str(int(run_id)), "--json", "jobs"], cwd=cwd,
+                  missing_hint="so Jarvis cannot re-run a run that produced no job")
+    try:
+        jobs = json.loads(stdout)["jobs"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise GitHubError(f"{shown} returned no job list", GitHubError.UNREADABLE) from e
+    if not isinstance(jobs, list):
+        raise GitHubError(f"{shown} returned no job list", GitHubError.UNREADABLE)
+    return len(jobs)
+
+
+def jobless_runs(runs: tuple[Run, ...], cwd: Path | None = None) -> tuple[Run, ...]:
+    """Each workflow's newest run on this head that ended unsuccessful with no job (#1657)"""
+    newest: dict[str, Run] = {}
+    for r in runs:
+        newest.setdefault(r.workflow, r)
+    return tuple(r for r in newest.values()
+                 if r.completed and r.run_id > 0 and r.conclusion in JOBLESS_RUN_CONCLUSIONS
+                 and job_count(r.run_id, cwd) == 0)
+
+
 def failed_runs_to_rerun(red: tuple[dict[str, str], ...],
                          runs: tuple[Run, ...]) -> tuple[Run, ...]:
     """The newest red run of each workflow a failing check belongs to (#1465)"""
@@ -208,14 +235,16 @@ def episode(store: Any, wo_id: str, head: str) -> Episode:
 
 
 def stuck_blocker(pr_url: str, head: str, cause: str, checks: str,
-                  commands: tuple[str, ...]) -> str:
+                  commands: tuple[str, ...], jobless: bool = False) -> str:
     """The one attention line, naming the pull request and what to type"""
     what = {
         CAUSE_CANCELLED_AGAIN: f"CI was cancelled again after the OS's one re-run ({checks})",
         CAUSE_NO_RUN: f"CI was cancelled ({checks}) and the OS found no run to re-run",
         CAUSE_REFUSED: f"CI was cancelled ({checks}) and GitHub refused the OS's re-run",
-        CAUSE_NEVER_RAN: f"required check(s) never reported ({checks}) — the branch's "
-                         f"workflow may predate its base's",
+        CAUSE_NEVER_RAN: (f"CI ran but produced no job, so no check ever reported "
+                          f"({checks}), again after the OS's one re-run" if jobless else
+                          f"required check(s) never reported ({checks}) — the branch's "
+                          f"workflow may predate its base's"),
     }.get(cause, f"CI did not finish ({checks})")
     return (f"{pr_url} at {head[:10]}: {what}. The OS will not re-run it again on this "
             f"commit — run {' or '.join(f'`{c}`' for c in commands)}")
