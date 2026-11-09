@@ -279,6 +279,91 @@ def test_a_required_check_that_never_reported_is_handed_over(started, project,
     assert len([c for c in fake_gh.calls if "protection" in " ".join(c["argv"])]) == 1
 
 
+def test_a_jobless_run_under_an_empty_rollup_is_re_run_once_then_handed_over(
+        started, project, fake_gh, parked):
+    """Issue 1657: runs that ended `failure` with no job left the head with zero checks"""
+    pr(fake_gh, [])
+    fake_gh.set_runs(HEAD, [run(555, HEAD, conclusion="failure"),
+                            run(556, HEAD, conclusion="failure", workflow="pr-body")])
+    fake_gh.set_run_jobs(555, {})
+    fake_gh.set_run_jobs(556, {})
+    store = ProjectStore(project)
+
+    poll(started, store)
+    assert fake_gh.reruns == ["run rerun 555 --failed", "run rerun 556 --failed"]
+    [event] = kinds(store, parked["id"], ci_rerun.RERUN_EVENT)
+    assert event["run_ids"] == [555, 556] and event["jobless"]
+
+    # In flight: no required-check give-up while our re-run runs
+    fake_gh.set_runs(HEAD, [{**run(555, HEAD), "status": "in_progress", "conclusion": ""},
+                            run(556, HEAD, conclusion="failure", workflow="pr-body")])
+    poll(started, store)
+    assert kinds(store, parked["id"], ci_rerun.STUCK_EVENT) == []
+
+    fake_gh.set_runs(HEAD, [run(555, HEAD, conclusion="failure"),
+                            run(556, HEAD, conclusion="failure", workflow="pr-body")])
+    poll(started, store)     # the re-run produced no job either
+    poll(started, store)
+    assert len(fake_gh.reruns) == 2
+    [stuck] = kinds(store, parked["id"], ci_rerun.STUCK_EVENT)
+    assert stuck["cause"] == ci_rerun.CAUSE_NEVER_RAN
+    row = store.get_work_order(parked["id"])
+    assert row["pr_checks_stuck_head"] == HEAD
+    [line] = [b for b in true_blockers(store, row) if PR in b]
+    assert "produced no job" in line and "`gh run rerun 556 --failed`" in line
+
+
+def test_a_refused_jobless_re_run_stays_named_on_later_polls(started, project, fake_gh,
+                                                             parked):
+    pr(fake_gh, [])
+    fake_gh.set_runs(HEAD, [run(555, HEAD, conclusion="failure")])
+    fake_gh.set_run_jobs(555, {})
+    fake_gh.refuse_rerun()
+    store = ProjectStore(project)
+
+    poll(started, store)
+    [stuck] = kinds(store, parked["id"], ci_rerun.STUCK_EVENT)
+    assert stuck["cause"] == ci_rerun.CAUSE_REFUSED and stuck["jobless"] is True
+    assert store.get_work_order(parked["id"])["pr_checks_stuck_head"] == HEAD
+
+    poll(started, store)
+    poll(started, store)
+
+    row = store.get_work_order(parked["id"])
+    assert row["pr_checks_stuck_head"] == HEAD
+    assert kinds(store, parked["id"], ci_rerun.RECOVERED_EVENT) == []
+    [line] = [b for b in true_blockers(store, row) if PR in b]
+    assert "produced no job" in line and "`gh run rerun 555 --failed`" in line
+
+
+def test_an_unreadable_run_list_still_reaches_the_required_check_arm(started, project,
+                                                                     fake_gh, parked):
+    sp.run(["git", "-C", str(project), "remote", "add", "origin",
+            "https://github.com/acme/proj.git"], check=True)
+    fake_gh.set_protection("main", ["unit (3.13)"])
+    pr(fake_gh, [])
+    fake_gh.set_runs(HEAD, [run(555, HEAD, conclusion="failure")])   # no jobs registered
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    [stuck] = kinds(store, parked["id"], ci_rerun.STUCK_EVENT)
+    assert stuck["cause"] == ci_rerun.CAUSE_NEVER_RAN and not stuck.get("jobless")
+
+
+def test_a_failed_run_with_jobs_under_an_empty_rollup_is_not_re_run(started, project,
+                                                                    fake_gh, parked):
+    pr(fake_gh, [])
+    fake_gh.set_runs(HEAD, [run(555, HEAD, conclusion="failure")])
+    fake_gh.set_run_jobs(555, {"unit": "failure"})
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert fake_gh.reruns == []
+    assert kinds(store, parked["id"], ci_rerun.RERUN_EVENT) == []
+
+
 def test_wo_why_names_a_cancelled_check_as_cancelled(started, project, fake_gh, parked):
     pr(fake_gh, CANCELLED)
     fake_gh.set_runs(HEAD, [run(555, HEAD)])

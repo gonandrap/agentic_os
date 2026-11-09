@@ -7786,10 +7786,11 @@ class Daemon:
         aborted = pr.aborted if waiting and not running else ()
         stuck = str(wo.get("pr_checks_stuck_head") or "")
         if stuck:
-            cause = str((ci_rerun.episode(store, wo_id, stuck).stuck or {}).get("cause")
-                        or "")
+            found = ci_rerun.episode(store, wo_id, stuck).stuck or {}
+            cause = str(found.get("cause") or "")
             if (stuck == head and waiting and not running
-                    and (aborted or cause == ci_rerun.CAUSE_NEVER_RAN)):
+                    and (aborted or cause == ci_rerun.CAUSE_NEVER_RAN
+                         or (found.get("jobless") and not pr.checks))):
                 return      # still stuck, and already said so
             store.update_work_order(wo_id, pr_checks_stuck_head=None)
             store.add_event(wo_id, ci_rerun.RECOVERED_EVENT,
@@ -7837,6 +7838,8 @@ class Daemon:
             log.info("[%s] re-ran cancelled CI on %s for %s (runs %s)", project.name,
                      head[:10], wo_id, ", ".join(str(r.run_id) for r in targets))
             return
+        if not pr.checks and self._rerun_jobless_runs(project, store, wo, head):
+            return
         # A REQUIRED CHECK THAT NEVER REPORTED: one protection read per head per process
         seen = self.__dict__.setdefault("_ci_required_read", set())
         if wo["status"] != "waiting_pr_merge" or (wo_id, head) in seen:
@@ -7860,6 +7863,54 @@ class Daemon:
                 store, wo, head, ci_rerun.CAUSE_NEVER_RAN, ", ".join(missing),
                 (ci_rerun.update_branch_command(str(wo.get("pr_url") or "")),))
 
+    def _rerun_jobless_runs(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                            head: str) -> bool:
+        """An empty rollup over a run that produced no job: re-run once per head, then hand over (#1657)"""
+        from . import ci, ci_rerun, github
+
+        wo_id = wo["id"]
+        try:
+            runs = ci_rerun.head_runs(head, cwd=project.path)
+            jobless = ci_rerun.jobless_runs(runs, cwd=project.path)
+        except github.GitHubError as e:
+            # Unread: spend nothing, and let the required-check arm still name the head
+            log.info("[%s] could not read the runs of %s for %s: %s", project.name,
+                     head[:10], wo_id, e)
+            return False
+        ep = ci_rerun.episode(store, wo_id, head)
+        ours = {int(i) for e in ep.reruns if e.get("jobless") for i in e.get("run_ids") or []}
+        if ep.stuck is None and any(r.run_id in ours and not r.completed for r in runs):
+            return True     # our re-run is in flight: judge nothing until it settles
+        if not jobless:
+            return bool(ours)
+        if ep.stuck is not None:
+            return True
+        repo = github.origin_repo(project.path)
+        checks = ", ".join(
+            f"{r.workflow or '(unnamed workflow)'}: "
+            f"{ci.run_url(*repo, r.run_id) if repo else f'run {r.run_id}'} {r.conclusion}"
+            for r in jobless)
+        commands = tuple(ci_rerun.rerun_command(r.run_id) for r in jobless)
+        if ep.reruns:
+            self._ci_rerun_gave_up(store, wo, head, ci_rerun.CAUSE_NEVER_RAN, checks,
+                                   commands, jobless=True)
+            return True
+        for r in jobless:
+            try:
+                ci_rerun.rerun(r.run_id, cwd=project.path)
+            except github.GitHubError as e:
+                self._ci_rerun_gave_up(store, wo, head, ci_rerun.CAUSE_REFUSED, checks,
+                                       (ci_rerun.rerun_command(r.run_id),),
+                                       error=str(e)[:300], jobless=True)
+                return True
+        store.add_event(wo_id, ci_rerun.RERUN_EVENT, {
+            "head_sha": head, "pr_url": wo.get("pr_url"), "checks": checks,
+            "run_ids": [r.run_id for r in jobless],
+            "workflows": [r.workflow for r in jobless], "jobless": True})
+        log.info("[%s] re-ran jobless CI on %s for %s (runs %s)", project.name, head[:10],
+                 wo_id, ", ".join(str(r.run_id) for r in jobless))
+        return True
+
     def _ci_rerun_gave_up(self, store: ProjectStore, wo: dict, head: str, cause: str,
                           checks: str, commands: tuple[str, ...], **extra: Any) -> None:
         """Record the ONE give-up for this head; `invariants.true_blockers` raises it (#1123)"""
@@ -7869,7 +7920,8 @@ class Daemon:
         store.add_event(wo["id"], ci_rerun.STUCK_EVENT, {
             "head_sha": head, "pr_url": pr_url, "cause": cause, "checks": checks,
             "commands": list(commands),
-            "blocker": ci_rerun.stuck_blocker(pr_url, head, cause, checks, commands),
+            "blocker": ci_rerun.stuck_blocker(pr_url, head, cause, checks, commands,
+                                              jobless=bool(extra.get("jobless"))),
             **extra})
         store.update_work_order(wo["id"], pr_checks_stuck_head=head)
         log.info("%s: cancelled CI on %s needs the user (%s)", wo["id"], head[:10],

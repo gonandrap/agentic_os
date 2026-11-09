@@ -50,7 +50,7 @@ def test_the_classes_with_a_detector_are_named():
     assert armed == {"unwired-precondition", "background-task-silence",
                      "blocker-contradicts-record", "designed-wait-undiscounted",
                      "superseded-delivery", "base-chase-livelock",
-                     "mention-held-as-act"}
+                     "mention-held-as-act", "jobless-run-unseen"}
     assert (gaps.by_invariant()["INV-BLOCKER-CONTRADICTS-RECORD"]
             == "blocker-contradicts-record")
     assert (gaps.by_invariant()["INV-RED-RELEASE-UNDISCOUNTED"]
