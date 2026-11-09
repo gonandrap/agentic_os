@@ -23,7 +23,7 @@
         {% else %}<a href="/onboard/{{ d.name|urlencode }}"><strong>{{ d.name }}</strong></a>
         — <a href="/onboard/{{ d.name|urlencode }}">continue</a>{% if d.adopted %} (revising a live project){% endif %}{% endif %}</td>
       <td class="mono">{{ d.answered if d.answered is not none else '—' }}/{{ d.total }}</td>
-      <td class="mono">{% if d.like %}<a href="/project/{{ d.like }}">{{ d.like }}</a>{% else %}shipped defaults{% endif %}</td>
+      <td class="mono">{% if d.error %}—{% elif d.like %}<a href="/project/{{ d.like }}">{{ d.like }}</a>{% else %}shipped defaults{% endif %}</td>
       <td class="when mono">{{ fmt_age(d.mtime) }}</td>
       <td class="mono">{{ d.path }}</td>
     </tr>
