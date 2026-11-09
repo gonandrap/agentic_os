@@ -12951,7 +12951,7 @@ class RequestTree:
         return out
 
 
-def _order_row(store: ProjectStore, order_id: str) -> tuple[dict[str, Any], bool] | None:
+def _request_row(store: ProjectStore, order_id: str) -> tuple[dict[str, Any], bool] | None:
     """(row, is_feature_table), or None: ids are unique across both tables"""
     try:
         return store.get_feature_order(order_id), True
@@ -13005,7 +13005,7 @@ def request_tree(project: str, root_id: str) -> RequestTree:
 
     def walk(name: str, oid: str) -> RequestNode:
         store = store_of(name)
-        found = _order_row(store, oid) if store is not None else None
+        found = _request_row(store, oid) if store is not None else None
         if found is None:
             return missing(name, oid)
         row, is_fo = found
@@ -13020,7 +13020,7 @@ def request_tree(project: str, root_id: str) -> RequestTree:
         return node
 
     try:
-        if store_of(project) is None or _order_row(stores[project], root_id) is None:
+        if store_of(project) is None or _request_row(stores[project], root_id) is None:
             raise OpsError(f"no order {root_id} in project {project!r}")
         root = walk(project, root_id)
     finally:
