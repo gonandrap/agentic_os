@@ -3568,7 +3568,7 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
         [a for a in assumptions_with_rulings(store, wo["id"])
          if str(a.get("status") or "") == "pending"]
         if any(str(a.get("provisional_verdict") or "") == "object"
-               and a.get("objection_envelope_id") for a in pending_rows) else [])
+               for a in pending_rows) else [])
     # The same row the boolean came from (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md)
     latest = store.last_judged_round(wo_id=wo["id"]) if escalated else None
     # WHY THE PANEL HANDED IT OVER, and the command this order's shape accepts (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §3)
@@ -3623,10 +3623,11 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
 
 
 #: What happened to the objection on an objected row
-OBJECTION_DELIVERY_STATES = ("delivered", "handed_back", "withdrawn", "in_flight")
+OBJECTION_DELIVERY_STATES = ("delivered", "handed_back", "withdrawn", "in_flight",
+                             "never_sent")
 
 #: The delivery states that mean the worker never read the objection
-OBJECTION_UNTOLD_STATES = ("handed_back", "withdrawn", "in_flight")
+OBJECTION_UNTOLD_STATES = ("handed_back", "withdrawn", "in_flight", "never_sent")
 
 
 def objected_rows(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3636,8 +3637,9 @@ def objected_rows(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if str(a.get("provisional_verdict") or "") != "object":
             continue
         if not a.get("objection_envelope_id"):
-            continue
-        if a.get("objection_delivered_ts"):
+            # The order had stopped before Neo answered, so nothing was filed (issue 1541)
+            delivery = "never_sent"
+        elif a.get("objection_delivered_ts"):
             delivery = "delivered"
         elif a.get("objection_withdrawn_ts"):
             # WHICH withdrawal, which is the fact the user cannot otherwise get: taken back because the order...
@@ -3656,19 +3658,30 @@ def objected_note(objected: list[dict[str, Any]]) -> str:
     def which(rows: list[dict[str, Any]]) -> str:
         return ", ".join(f"#{o['n']}" for o in rows)
 
-    untold = [o for o in objected if o["delivery"] in OBJECTION_UNTOLD_STATES]
+    def noun(rows: list[dict[str, Any]]) -> str:
+        return "assumption" if len(rows) == 1 else "assumptions"
+
+    unsent = [o for o in objected if o["delivery"] == "never_sent"]
+    untold = [o for o in objected if o["delivery"] in OBJECTION_UNTOLD_STATES
+              and o["delivery"] != "never_sent"]
     told = [o for o in objected if o["delivery"] == "delivered"]
-    noun = "assumption" if len(objected) == 1 else "assumptions"
-    tail = "decide it against the result this order delivered"
+    sent = untold + told
+    clauses = []
     if untold and told:
-        return (f"the OS objected to {noun} {which(untold)}, which the worker was never "
-                f"told, and to {which(told)}, which it was told and left as it is — "
-                f"{tail}")
-    if told:
-        return (f"the OS objected to {noun} {which(told)} and the worker was told and "
-                f"left it as it is — {tail}")
-    return (f"the OS objected to {noun} {which(untold)} and the worker was never told "
-            f"— {tail}")
+        clauses.append(f"the OS objected to {noun(sent)} {which(untold)}, which the worker "
+                       f"was never told, and to {which(told)}, which it was told and left "
+                       f"as it is")
+    elif told:
+        clauses.append(f"the OS objected to {noun(told)} {which(told)} and the worker was "
+                       f"told and left it as it is")
+    elif untold:
+        clauses.append(f"the OS objected to {noun(untold)} {which(untold)} and the worker "
+                       f"was never told")
+    if unsent:
+        # Neo's text may be addressed to the worker, so it is not presented as a ruling
+        clauses.append(f"Neo's early reply on {noun(unsent)} {which(unsent)} never reached "
+                       f"the worker, which had already stopped, so nothing was ruled")
+    return f"{'; '.join(clauses)} — decide it against the result this order delivered"
 
 
 def escalation_next(wo: dict[str, Any], family: str) -> list[str]:
@@ -4177,7 +4190,8 @@ def provisional_line(a: dict[str, Any]) -> str:
     model = a.get("provisional_model") or "model not recorded"
     when = f" at {_stamp(a['provisional_ts'])}" if a.get("provisional_ts") else ""
     verb = ("provisionally accepted by the OS" if verdict == "accept"
-            else "objected to by the OS")
+            else "objected to by the OS" if a.get("objection_envelope_id")
+            else "early reply never sent to the worker, nothing ruled")
     return (f"{verb} (Neo, {model}){when}"
             f"{' — ' + reason if reason else ''}")
 

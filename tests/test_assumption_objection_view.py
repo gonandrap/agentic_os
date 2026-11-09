@@ -10,7 +10,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from jarvis import cli, invariants, ops  # noqa: E402
+from jarvis import autoreview, cli, invariants, ops  # noqa: E402
 from jarvis.project_store import (ADDED_COLUMNS, ASSUMPTION_DECIDER_OS,  # noqa: E402
                                   ProjectStore)
 from jarvis.ui.app import create_app  # noqa: E402
@@ -210,6 +210,31 @@ def test_a_delivered_objection_does_not_say_the_worker_was_never_told(project):
     assert review["objected"][0]["delivery"] == "delivered"
     assert "never told" not in review["objected_note"]
     assert "left it as it is" in review["objected_note"]
+
+
+def test_an_early_reply_never_sent_says_nothing_was_ruled(client, project):
+    """Issue 1541: the order stopped before Neo answered, so no objection was filed"""
+    store = ProjectStore(project)
+    wo = store.create_work_order(title="an order that stopped", description="d")
+    aid = store.add_assumption(wo["id"], "the API is idempotent")
+    store.record_provisional(aid, verdict="object", reason=REASON, model="opus",
+                             stakes="routine")
+    store.set_status(wo["id"], "needs_review")
+    row = row_of(store, wo["id"], aid)
+
+    review = ops.review_state(store, store.get_work_order(wo["id"]))
+
+    assert review["objected"] == [{"n": 1, "reason": REASON, "delivery": "never_sent"}]
+    note = review["objected_note"]
+    assert "never reached the worker" in note and "nothing was ruled" in note
+    assert "decide it against the result" in note
+    assert "objected" not in note and REASON not in note
+    assert note in page_of(client, wo["id"])
+    line = ops.assumption_line(row)
+    assert "nothing ruled" in line and "objected to by the OS" not in line
+    held = autoreview.decide_confirm(row, store.get_work_order(wo["id"]), None)
+    assert held.code == autoreview.HELD_OBJECTED
+    assert "nothing was ruled" in held.reason and "objected" not in held.reason
 
 
 @pytest.mark.parametrize("kwargs,expected", [

@@ -640,6 +640,12 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
         return _held(HELD_UNJUDGED,
                      f"assumption #{n} carries no early verdict — there is nothing to "
                      f"confirm", **fields)
+    if verdict != PROVISIONAL_ACCEPT and not assumption.get("objection_envelope_id"):
+        # Issue 1541: the order stopped before Neo answered, so no objection was ever sent
+        return _held(HELD_OBJECTED,
+                     f"Neo's early reply on assumption #{n} never reached the worker, "
+                     f"which had already stopped — nothing was ruled, so it is yours to "
+                     f"decide against the delivered result", **fields)
     if verdict != PROVISIONAL_ACCEPT:
         return _held(HELD_OBJECTED,
                      f"Neo objected to assumption #{n} while the work ran — it approved "
