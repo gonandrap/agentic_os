@@ -338,7 +338,7 @@ class QueueEntry:
     last_behind: str = ""
 
 
-def _keeps_turn(hold: dict[str, Any]) -> bool:
+def keeps_turn(hold: dict[str, Any]) -> bool:
     from . import ops
 
     if hold.get("code") != HELD_BASE_MOVED:
@@ -368,7 +368,7 @@ def queue_entry(store: Any, wo: dict[str, Any]) -> QueueEntry | None:
         hold = db.from_json(event.get("payload"), {}) or {}
         last_code, last_ts = str(hold.get("code") or ""), ts
         last_behind = str(hold.get("queued_behind") or "")
-        if not _keeps_turn(hold):
+        if not keeps_turn(hold):
             entered, base = 0.0, ""
         elif not entered and last_code == HELD_MERGE_QUEUED and hold.get("base"):
             entered, base = ts, str(hold["base"])

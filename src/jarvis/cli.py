@@ -3848,7 +3848,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "timeline": build_timeline(wo, events, messages,
                                            include_debug=args.debug),
                 # What was said, in order, whoever spoke
-                "conversation": build_conversation(events, messages),
+                "conversation": build_conversation(events, messages,
+                                                   ops.asked_questions(events)),
                 # Every assumption, each with its `n`, its `status` and what the OS did with it (`os_ruling`) (#712)
                 "assumptions": ops.assumptions_with_rulings(store, args.wo_id),
                 # What this work order was allowed (or refused) permission to ship
@@ -6143,6 +6144,10 @@ def cmd_validation(args: argparse.Namespace) -> int:
         print(f"\n{ops.round_line(rnd)}")
         if rnd["evidence"]:
             print(f"  evidence: {rnd['evidence']}")
+        for miss in view.get("images_unchecked") or []:
+            if miss.get("round") == rnd.get("round"):
+                for img in miss.get("images") or []:
+                    print(f"  image NOT checked: {img.get('target')} — {img.get('why')}")
         # THE ISSUE BESIDE THE FINDING THAT CAUSED IT
         filed = {i["title"]: i
                  for i in (rnd.get("follow_ups") or {}).get("filed") or []}

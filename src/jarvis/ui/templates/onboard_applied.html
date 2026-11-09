@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{# Applied: §5 of docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md #}
+{% block title %}Applied · onboard {{ name }} — Jarvis{% endblock %}
+{% block style %}
+  .ob-pane .lede { color: var(--ink-2); max-width: 80ch; }
+{% endblock %}
+{% block content %}
+<div class="ob">
+{% include "_onboard_rail.html" %}
+<div class="ob-pane">
+  <div class="page-head">
+    <h1>Applied</h1>
+    <span class="meta">onboard {{ name }}</span>
+  </div>
+  <p class="lede" id="ob-version">Config version
+    <a class="mono" href="{{ config_url }}">{{ result.version.id }}</a>
+    · {{ result.changes|length }} changes{% if not result.changed %} (the catalog already said all this){% endif %}.</p>
+
+  {% if result.restart_needed %}
+  <div class="brake" role="status" id="ob-restart"><div class="grow">
+    <b>You must restart the OS yourself</b> — the dashboard never does: {{ result.restart_why }}.
+    <div>Run <code>jarvis start --catalog {{ result.catalog }}</code></div>
+  </div></div>
+  {% else %}
+  <p class="lede">No restart needed: every change takes effect while the OS runs.</p>
+  {% endif %}
+
+  {% if result.bootstrap %}
+  <h3>Bootstrap</h3>
+  <ul id="ob-actions">{% for a in result.bootstrap.actions %}<li>{{ a }}</li>{% else %}<li>nothing to do</li>{% endfor %}</ul>
+  {% if result.bootstrap.warnings %}
+  <div class="error-flash" id="ob-warnings"><ul>{% for w in result.bootstrap.warnings %}<li>{{ w }}</li>{% endfor %}</ul></div>
+  {% endif %}
+  {% endif %}
+</div>
+</div>
+{% endblock %}

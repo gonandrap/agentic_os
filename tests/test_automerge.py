@@ -2485,7 +2485,7 @@ def test_a_hold_is_a_span_to_the_next_automerge_event_of_any_kind():
     rows = [a_running_hold(T0 + MINUTE),
             am_event("automerge_proposed", T0 + 6 * MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+    assert ops.automerge_hold_spans(rows, T0, NOW, FRESH) == \
         [(T0 + MINUTE, T0 + 6 * MINUTE)]
 
 
@@ -2495,7 +2495,7 @@ def test_a_later_hold_of_another_code_closes_the_span_too():
             a_hold_event(T0 + 4 * MINUTE, code=automerge.HELD_CHECKS_FAILED,
                          reason="CI failed: unit")]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+    assert ops.automerge_hold_spans(rows, T0, NOW, FRESH) == \
         [(T0 + MINUTE, T0 + 4 * MINUTE)]
 
 
@@ -2505,7 +2505,7 @@ def test_two_holds_in_sequence_are_two_spans():
             a_running_hold(T0 + 10 * MINUTE),
             am_event("automerge_failed", T0 + 12 * MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+    assert ops.automerge_hold_spans(rows, T0, NOW, FRESH) == \
         [(T0 + MINUTE, T0 + 3 * MINUTE), (T0 + 10 * MINUTE, T0 + 12 * MINUTE)]
 
 
@@ -2514,7 +2514,7 @@ def test_a_hold_with_no_successor_ends_at_the_horizon():
     rows = [a_running_hold(T0 + MINUTE)]
     horizon = T0 + 40 * MINUTE
 
-    assert ops.automerge_checks_hold_spans(rows, T0, NOW, horizon) == \
+    assert ops.automerge_hold_spans(rows, T0, NOW, horizon) == \
         [(T0 + MINUTE, horizon)]
 
 
@@ -2523,7 +2523,7 @@ def test_a_successor_after_the_horizon_is_clipped_at_the_horizon():
     rows = [a_running_hold(T0 + MINUTE), am_event("automerge_proposed", T0 + 55 * MINUTE)]
     horizon = T0 + 20 * MINUTE
 
-    assert ops.automerge_checks_hold_spans(rows, T0, NOW, horizon) == \
+    assert ops.automerge_hold_spans(rows, T0, NOW, horizon) == \
         [(T0 + MINUTE, horizon)]
 
 
@@ -2531,14 +2531,14 @@ def test_a_horizon_of_zero_yields_no_span_at_all():
     """§3's degradation, both of its cases: no `checked_at` on the fact"""
     rows = [a_running_hold(T0 + MINUTE), am_event("automerge_proposed", T0 + 6 * MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, NOW, 0.0) == []
+    assert ops.automerge_hold_spans(rows, T0, NOW, 0.0) == []
 
 
 def test_a_span_wholly_before_the_status_began_contributes_nothing():
     rows = [a_running_hold(T0 - 20 * MINUTE),
             am_event("automerge_proposed", T0 - 10 * MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == []
+    assert ops.automerge_hold_spans(rows, T0, NOW, FRESH) == []
 
 
 def test_the_spans_are_clipped_and_never_the_rows():
@@ -2548,7 +2548,7 @@ def test_the_spans_are_clipped_and_never_the_rows():
             a_running_hold(T0 + 20 * MINUTE),
             am_event("automerge_decided", T0 + 90 * MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+    assert ops.automerge_hold_spans(rows, T0, NOW, FRESH) == \
         [(T0, T0 + 5 * MINUTE), (T0 + 20 * MINUTE, NOW)]
 
 
@@ -2556,7 +2556,7 @@ def test_rows_handed_over_out_of_order_are_still_walked_in_ts_order():
     """The caller concatenates one `events_of_kind` read per kind, so the rows arrive grouped by kind"""
     rows = [am_event("automerge_proposed", T0 + 6 * MINUTE), a_running_hold(T0 + MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+    assert ops.automerge_hold_spans(rows, T0, NOW, FRESH) == \
         [(T0 + MINUTE, T0 + 6 * MINUTE)]
 
 
@@ -2571,7 +2571,7 @@ def live_hold_state(**over) -> dict:
 
 def test_the_note_names_the_commit_and_quotes_the_stored_reason():
     """§5: the sentence the sweep's blocker column prints, built from what the poll wrote down"""
-    note = invariants.automerge_checks_note(live_hold_state())
+    note = invariants.automerge_hold_note(live_hold_state())
 
     assert note == (f"waiting for GitHub's checks on {JUDGED[:10]} — {RUNNING_REASON}")
 
@@ -2581,21 +2581,48 @@ def test_the_note_names_the_commit_and_quotes_the_stored_reason():
     {"kind": "automerge_proposed", "approval_id": 1},
     live_hold_state(stale=True),
     live_hold_state(code=automerge.HELD_CHECKS_FAILED),
-    live_hold_state(code=automerge.HELD_CHECKS_NONE),
     live_hold_state(code=automerge.HELD_BASE_RED),
-    live_hold_state(code=automerge.HELD_MERGE_STATE_UNCLEAN),
-    live_hold_state(code=automerge.HELD_SHA_MOVED),
     live_hold_state(code=automerge.HELD_NOT_PASSED),
     live_hold_state(code=automerge.HELD_ASSUMPTIONS),
+    live_hold_state(code=automerge.HELD_BASE_MOVED, catch_up=ops.CATCH_UP_EXHAUSTED),
 ])
-def test_only_a_live_checks_running_hold_gets_a_note(state):
-    """§3's triple test, performed by the helper itself: every other code names something a person or a..."""
-    assert invariants.automerge_checks_note(state) == ""
+def test_only_a_live_turn_keeping_hold_gets_a_note(state):
+    """Issue 1655: every other code names something a person or a red base owes"""
+    assert invariants.automerge_hold_note(state) == ""
+
+
+@pytest.mark.parametrize("code", sorted(automerge.TURN_KEEPING_HOLDS
+                                        - {automerge.HELD_CHECKS_RUNNING}))
+def test_every_other_turn_keeping_hold_gets_a_note_naming_its_code(code):
+    """Issue 1655"""
+    note = invariants.automerge_hold_note(live_hold_state(code=code, reason="why"))
+
+    assert note == f"merge held by the OS ({code}) — why"
+
+
+def test_every_turn_keeping_hold_has_a_named_cause_and_its_own_sentence():
+    """Issue 1655: the map in `stuck` is keyed by `automerge`'s codes"""
+    from jarvis import stuck
+
+    assert set(stuck.AUTOMERGE_HOLD_CAUSES) == set(automerge.TURN_KEEPING_HOLDS)
+    for cause in stuck.AUTOMERGE_HOLD_CAUSES.values():
+        assert cause in stuck.EXCLUSION_REASON
+
+
+def test_a_queue_hold_and_its_catch_up_are_discounted_too():
+    """Issue 1655, wo-f392b761's shape: merge_queued, base_moved, then a hold that gives up the turn"""
+    rows = [a_hold_event(T0 + MINUTE, code=automerge.HELD_MERGE_QUEUED, reason="queued"),
+            a_hold_event(T0 + 5 * MINUTE, code=automerge.HELD_NOT_MERGEABLE, reason="x"),
+            a_hold_event(T0 + 9 * MINUTE, code=automerge.HELD_CHECKS_FAILED, reason="red"),
+            am_event("automerge_proposed", T0 + 12 * MINUTE)]
+
+    assert ops.automerge_hold_spans(rows, T0, NOW, FRESH) == \
+        [(T0 + MINUTE, T0 + 5 * MINUTE), (T0 + 5 * MINUTE, T0 + 9 * MINUTE)]
 
 
 def test_the_stored_reason_is_flattened_and_clamped_for_the_column():
     """The sweep's blocker COLUMN renders this verbatim"""
-    note = invariants.automerge_checks_note(
+    note = invariants.automerge_hold_note(
         live_hold_state(reason="CI has not finished\non this commit — " + "x" * 300))
 
     assert "\n" not in note
@@ -2613,6 +2640,6 @@ def test_the_note_arms_no_flag_and_names_no_blocker(started, project):
 
     row = store.get_work_order(wo["id"])
 
-    assert invariants.automerge_checks_note(ops.automerge_state(store, row))
+    assert invariants.automerge_hold_note(ops.automerge_state(store, row))
     assert invariants.true_blockers(store, row) == before
     assert list(invariants.check_blocked_work_is_surfaced(store)) == []

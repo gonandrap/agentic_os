@@ -19,6 +19,15 @@ log = logging.getLogger(__name__)
 
 #: Not `failed`: `wo retry` can resume that order, and its question with it (io-d5e62d4d)
 QUESTION_LAPSING_STATUSES = ("completed", "cancelled")
+#: An alarm also lapses on `failed`: a retried order that still trips it gets a fresh row (io-7bed6603)
+ALARM_LAPSING_STATUSES = QUESTION_LAPSING_STATUSES + ("failed",)
+
+
+def lapsing_question_kinds(status: str) -> tuple[str, ...]:
+    """The Neo question kinds an order reaching `status` lapses"""
+    if status in QUESTION_LAPSING_STATUSES:
+        return ("question", "alarm")
+    return ("alarm",) if status in ALARM_LAPSING_STATUSES else ()
 
 # Work order lifecycle
 WO_STATUSES = (
@@ -2281,7 +2290,7 @@ class ProjectStore:
                 "order_kind='wo' ORDER BY ts DESC, id DESC LIMIT 1", (wo_id,)).fetchone()
             assert tail is not None and tail["to_status"] == status, (
                 f"{wo_id} moved to {status!r} without a span beside it")
-        if status in QUESTION_LAPSING_STATUSES:
+        if lapsing_question_kinds(status):
             try:
                 self.lapse_open_questions(wo_id, status)
             except Exception:  # noqa: BLE001 — a close never fails on Neo's DB; INV-NEO-QUESTION-LAPSED repairs it
@@ -2295,7 +2304,7 @@ class ProjectStore:
                f"nobody ruled on it")
         neo = NeoStore()
         try:
-            lapsed = neo.lapse_worker_questions(wo_id, why)
+            lapsed = neo.lapse_worker_questions(wo_id, why, lapsing_question_kinds(status))
         finally:
             neo.close()
         for question_id in lapsed:

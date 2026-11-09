@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{# The way in: §6 of docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md #}
+{% block title %}Onboard — Jarvis{% endblock %}
+{% block style %}
+  .ob-new { display: grid; gap: 10px; max-width: 80ch; }
+  .ob-new label { display: grid; gap: 4px; }
+  .ob-new input[type=text], .ob-new select { padding: 5px 8px; }
+  .ob-new .note { color: var(--ink-2); font-size: 12.5px; }
+{% endblock %}
+{% block content %}
+
+{{ ui.page_head("Onboard", (drafts | length) ~ " drafts in progress") }}
+
+<h2>Drafts in progress</h2>
+<div class="panel table-wrap">
+  <table class="ob-drafts">
+    <tr><th>project</th><th>answered</th><th>copied from</th><th>last edited</th><th>draft file</th></tr>
+    {% for d in drafts %}
+    <tr id="draft-{{ d.name }}">
+      <td>{% if d.error %}<strong>{{ d.name }}</strong>
+        <div class="error-flash" role="alert">does not load: {{ d.error }}</div>
+        {% else %}<a href="/onboard/{{ d.name|urlencode }}"><strong>{{ d.name }}</strong></a>
+        — <a href="/onboard/{{ d.name|urlencode }}">continue</a>{% if d.adopted %} (revising a live project){% endif %}{% endif %}</td>
+      <td class="mono">{{ d.answered if d.answered is not none else '—' }}/{{ d.total }}</td>
+      <td class="mono">{% if d.error %}—{% elif d.like %}<a href="/project/{{ d.like }}">{{ d.like }}</a>{% else %}shipped defaults{% endif %}</td>
+      <td class="when mono">{{ fmt_age(d.mtime) }}</td>
+      <td class="mono">{{ d.path }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="empty">no onboarding in progress</td></tr>
+    {% endfor %}
+  </table>
+</div>
+<p class="note">The terminal interview, <code>jarvis onboard start &lt;path&gt;</code>, continues
+  the same draft: switch between it and this page whenever you like.</p>
+
+<h2>Onboard a project</h2>
+{% if error %}<div class="error-flash" role="alert">{{ error }}</div>{% endif %}
+<form class="panel ob-new" method="post" action="/onboard">
+  <label>repository path
+    <input type="text" name="path" required value="{{ form.path }}" placeholder="/home/you/workspace/project"></label>
+  <label>name <span class="note">(optional; defaults to the directory name)</span>
+    <input type="text" name="name" value="{{ form.name }}"></label>
+  <label>start from
+    <select name="like">
+      <option value=""{{ ' selected' if not form.like }}>shipped defaults</option>
+      {% for p in projects %}
+      <option value="{{ p }}"{{ ' selected' if form.like == p }}>copy settings from {{ p }}</option>
+      {% endfor %}
+    </select></label>
+  <p class="note">Copying takes what that project sets; its identity (path, production path,
+    tracker, launcher) is never copied.</p>
+  {% if drafts or form.fresh or error %}
+  <label><span><input type="checkbox" name="fresh" value="1"{{ ' checked' if form.fresh }}>
+    start over — only matters when a draft of that name exists: it is discarded</span></label>
+  {% endif %}
+  <div><button type="submit">open the draft</button></div>
+</form>
+
+{% if revise %}
+<h2>Revise an onboarded project</h2>
+<div class="panel table-wrap">
+  <table class="ob-revise">
+    <tr><th>project</th><th>path</th><th></th></tr>
+    {% for name, path in revise %}
+    <tr>
+      <td><a href="/project/{{ name }}">{{ name }}</a></td>
+      <td class="mono">{{ path }}</td>
+      <td><form method="post" action="/onboard">
+        <input type="hidden" name="path" value="{{ path }}">
+        <input type="hidden" name="name" value="{{ name }}">
+        <button type="submit">revise</button></form></td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+{% endblock %}

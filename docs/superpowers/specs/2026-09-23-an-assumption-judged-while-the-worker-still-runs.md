@@ -291,6 +291,13 @@ Read through `autoreview.read_ruling` exactly as today, with both nets armed.
   recorded `object` verdict into a filed, sent objection is §6's, hook and all — see §6.1.
   **The seam is the recorded verdict, not a function call**, so the two sections meet in
   the database rather than in an import, and each can be tested without the other.
+
+  > **Amended by issue 1541 (wo-e2c54451).** The two-step seam lost every objection whose
+  > order stopped within one poll of the verdict. `Daemon._record_early_assumption_verdict`
+  > now calls `ops.file_assumption_objection` in the same step, while the order is still
+  > `running` (§2 still bars filing on a stopped order). The §6.1 drain stays, as a retry.
+  > A verdict recorded after the order stopped is never filed; the review payload calls it
+  > an early reply that never reached the worker, with nothing ruled — not an objection.
 * **Anything else** (escalate, unparseable, non-routine stakes, transport failure) →
   exactly today's behaviour: no provisional verdict, the assumption stays pending, and the
   user decides at `needs_review`. An early pass that cannot form a verdict costs nothing
@@ -319,6 +326,9 @@ question_id) -> dict` returning `{"envelope_id", "transport", "sent_ts"}`.
 recorded, and files one for each. One hook, in one section: if §5 called the filer
 directly and §6 also installed a hook, the drain would file twice, and the two children
 would collide on the same lines of `daemon.py`.
+
+> **Amended by issue 1541:** §5 now files directly too (see the §5.3 note); the drain
+> skips any row that already has `objection_envelope_id`, so nothing is filed twice.
 
 Order of operations, and it is not negotiable: the timeline event and the envelope row
 exist in the database BEFORE anything touches a wire. **The objection must never exist

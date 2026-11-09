@@ -3288,11 +3288,11 @@ AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed
 AUTOMERGE_TERMINAL = "automerge_merged"
 
 
-def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
-                                open_end: float) -> list[tuple[float, float]]:
-    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
+def automerge_hold_spans(events: Iterable[Any], since: float, now: float,
+                         open_end: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` the OS held a merge on a turn-keeping hold (issue 1655)"""
     from . import db
-    from .automerge import HELD_CHECKS_RUNNING
+    from .automerge import keeps_turn
 
     rows = sorted(events, key=lambda e: float(e["ts"]))
     spans: list[tuple[float, float]] = []
@@ -3300,7 +3300,7 @@ def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
         if str(e["kind"]) != "automerge_held":
             continue
         payload = db.from_json(e["payload"], {}) or {}
-        if str(payload.get("code") or "") != HELD_CHECKS_RUNNING:
+        if not keeps_turn(payload):
             continue
         nxt = next((r for r in rows[n + 1:] if str(r["kind"]) in AUTOMERGE_EVENTS), None)
         # Nothing dates the end of an open hold but the horizon (§4)
@@ -3568,7 +3568,7 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
         [a for a in assumptions_with_rulings(store, wo["id"])
          if str(a.get("status") or "") == "pending"]
         if any(str(a.get("provisional_verdict") or "") == "object"
-               and a.get("objection_envelope_id") for a in pending_rows) else [])
+               for a in pending_rows) else [])
     # The same row the boolean came from (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md)
     latest = store.last_judged_round(wo_id=wo["id"]) if escalated else None
     # WHY THE PANEL HANDED IT OVER, and the command this order's shape accepts (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §3)
@@ -3623,10 +3623,11 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
 
 
 #: What happened to the objection on an objected row
-OBJECTION_DELIVERY_STATES = ("delivered", "handed_back", "withdrawn", "in_flight")
+OBJECTION_DELIVERY_STATES = ("delivered", "handed_back", "withdrawn", "in_flight",
+                             "never_sent")
 
 #: The delivery states that mean the worker never read the objection
-OBJECTION_UNTOLD_STATES = ("handed_back", "withdrawn", "in_flight")
+OBJECTION_UNTOLD_STATES = ("handed_back", "withdrawn", "in_flight", "never_sent")
 
 
 def objected_rows(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3636,8 +3637,9 @@ def objected_rows(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if str(a.get("provisional_verdict") or "") != "object":
             continue
         if not a.get("objection_envelope_id"):
-            continue
-        if a.get("objection_delivered_ts"):
+            # The order had stopped before Neo answered, so nothing was filed (issue 1541)
+            delivery = "never_sent"
+        elif a.get("objection_delivered_ts"):
             delivery = "delivered"
         elif a.get("objection_withdrawn_ts"):
             # WHICH withdrawal, which is the fact the user cannot otherwise get: taken back because the order...
@@ -3656,19 +3658,30 @@ def objected_note(objected: list[dict[str, Any]]) -> str:
     def which(rows: list[dict[str, Any]]) -> str:
         return ", ".join(f"#{o['n']}" for o in rows)
 
-    untold = [o for o in objected if o["delivery"] in OBJECTION_UNTOLD_STATES]
+    def noun(rows: list[dict[str, Any]]) -> str:
+        return "assumption" if len(rows) == 1 else "assumptions"
+
+    unsent = [o for o in objected if o["delivery"] == "never_sent"]
+    untold = [o for o in objected if o["delivery"] in OBJECTION_UNTOLD_STATES
+              and o["delivery"] != "never_sent"]
     told = [o for o in objected if o["delivery"] == "delivered"]
-    noun = "assumption" if len(objected) == 1 else "assumptions"
-    tail = "decide it against the result this order delivered"
+    sent = untold + told
+    clauses = []
     if untold and told:
-        return (f"the OS objected to {noun} {which(untold)}, which the worker was never "
-                f"told, and to {which(told)}, which it was told and left as it is — "
-                f"{tail}")
-    if told:
-        return (f"the OS objected to {noun} {which(told)} and the worker was told and "
-                f"left it as it is — {tail}")
-    return (f"the OS objected to {noun} {which(untold)} and the worker was never told "
-            f"— {tail}")
+        clauses.append(f"the OS objected to {noun(sent)} {which(untold)}, which the worker "
+                       f"was never told, and to {which(told)}, which it was told and left "
+                       f"as it is")
+    elif told:
+        clauses.append(f"the OS objected to {noun(told)} {which(told)} and the worker was "
+                       f"told and left it as it is")
+    elif untold:
+        clauses.append(f"the OS objected to {noun(untold)} {which(untold)} and the worker "
+                       f"was never told")
+    if unsent:
+        # Neo's text may be addressed to the worker, so it is not presented as a ruling
+        clauses.append(f"Neo's early reply on {noun(unsent)} {which(unsent)} never reached "
+                       f"the worker, which had already stopped, so nothing was ruled")
+    return f"{'; '.join(clauses)} — decide it against the result this order delivered"
 
 
 def escalation_next(wo: dict[str, Any], family: str) -> list[str]:
@@ -4177,7 +4190,8 @@ def provisional_line(a: dict[str, Any]) -> str:
     model = a.get("provisional_model") or "model not recorded"
     when = f" at {_stamp(a['provisional_ts'])}" if a.get("provisional_ts") else ""
     verb = ("provisionally accepted by the OS" if verdict == "accept"
-            else "objected to by the OS")
+            else "objected to by the OS" if a.get("objection_envelope_id")
+            else "early reply never sent to the worker, nothing ruled")
     return (f"{verb} (Neo, {model}){when}"
             f"{' — ' + reason if reason else ''}")
 
@@ -4345,11 +4359,15 @@ def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, 
         detail = validation_detail(store, **subject)  # type: ignore[arg-type]
         # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5
         owed = review_state(store, row) if unit == "work_order" else None
+        # Body images the OS could not reach, by round (io-87fe02be)
+        unchecked = [db.from_json(e["payload"], {}) for e in store.events_of_kind(
+            unit_id, "validation_images_unchecked")] if unit == "work_order" else []
     finally:
         store.close()
     return {"project": name, "unit": unit, "id": unit_id,
             "title": row["title"], "status": row["status"], **detail,
-            **({"review": owed} if owed else {})}
+            **({"review": owed} if owed else {}),
+            **({"images_unchecked": unchecked} if unchecked else {})}
 
 
 def current_config_version() -> str | None:
@@ -7753,6 +7771,8 @@ def evidence_refs(fo: dict[str, Any]) -> list[str]:
 
 #: `work_orders.metadata`/`feature_orders.metadata` key on an order FILED FROM a finding: the...
 ORIGIN_IO_KEY = "origin_io"
+#: Its share of the user's io budget and why that amount (`_io_budget_share`)
+IO_BUDGET_KEY = "io_budget"
 #: The same back-link on an order filed from a decision report's proposal (docs/superpowers/specs/2026-10-31-decision-orders.md §6)
 ORIGIN_DO_KEY = "origin_do"
 
@@ -8549,6 +8569,44 @@ def _sequence_holds(target: str, io_id: str, f: Mapping[str, Any],
     return list(dict.fromkeys(depends)), list(dict.fromkeys(holds))
 
 
+def _io_user_rooted(io: Mapping[str, Any]) -> bool:
+    """A person filed this io: no steward stamp (worker_io) and no OS origin (morpheus…)"""
+    from . import steward
+
+    return not (io.get("origin") in _SELF_ORIGINS or steward.stamp_of(io))
+
+
+def _io_budget_share(name: str, io_id: str, f: Mapping[str, Any],
+                     report: Mapping[str, Any] | None, count: int) -> dict[str, Any]:
+    """Each order's equal slice of the io's unspent, unallotted budget; None share = project default"""
+    _, path, io = find_feature_order(io_id, name)
+    io_budget = io.get("budget_usd")
+    findings_ = (report or {}).get("findings") or [f]
+    allotted = sum(float(o.get("budget_usd") or 0) for x in findings_ if isinstance(x, dict)
+                   for o in x.get("created_orders") or [])
+    note: dict[str, Any] = {"io_id": io_id, "io_budget_usd": io_budget,
+                            "allotted_before_usd": round(allotted, 4), "share_usd": None}
+    if not io_budget:
+        note["reason"] = f"{io_id} has no budget: project default"
+        return note
+    store, central = ProjectStore(path), CentralStore()
+    try:
+        spent = budget.feature_spent(store, central, io).total_usd
+    finally:
+        central.close()
+        store.close()
+    left = float(io_budget) - spent - allotted
+    note["spent_usd"] = round(spent, 4)
+    if left <= 0:
+        note["reason"] = (f"{io_id} budget ${float(io_budget):.2f} used up (spent ${spent:.2f}, "
+                          f"${allotted:.2f} allotted to earlier orders): project default")
+        return note
+    note["share_usd"] = round(left / count, 4)
+    note["reason"] = (f"1/{count} of the ${left:.2f} left of {io_id} budget "
+                      f"${float(io_budget):.2f} (spent ${spent:.2f}, ${allotted:.2f} allotted earlier)")
+    return note
+
+
 def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
                          decision: Any = None,
                          report: Mapping[str, Any] | None = None
@@ -8560,6 +8618,9 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
     done = {o.get("index") for o in filed}
     created: list[dict[str, Any]] = []
     error = ""
+    todo = [i for i in range(len(f.get("proposed_orders") or [])) if i not in done]
+    inherited = (_io_budget_share(name, io_id, f, report, len(todo))
+                 if decision is None and todo else None)
     # Read here, in the io's project: `target` may be another one (requestor spec §2.2 rule 3)
     stamp = _requestor_in(name, io_id)
     for i, order in enumerate(f.get("proposed_orders") or []):
@@ -8578,6 +8639,9 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             # Work nobody typed: on the evolution ledger, under the budget the steward set
             metadata = steward.stamped(metadata, decision)
             budget_usd = decision.budget_usd
+        elif inherited is not None:
+            metadata[IO_BUDGET_KEY] = inherited
+            budget_usd = inherited["share_usd"]
         try:
             depends, holds = _sequence_holds(target, io_id, f, report or {}, order)
             if order_type == "feature":
@@ -8600,6 +8664,8 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             steward.linked(decision, row["id"])
         filed.append({"index": i, "id": row["id"], "type": order_type,
                       "title": order.get("title", ""), "project": target})
+        if inherited is not None and inherited["share_usd"] is not None:
+            filed[-1]["budget_usd"] = inherited["share_usd"]
         created.append({"id": row["id"], "type": order_type,
                         "title": order.get("title", "")})
     if error:
@@ -8886,8 +8952,8 @@ def apply_findings_verdict(q: Mapping[str, Any], verdict: Mapping[str, Any]
         _store_report(path, io_id, report)
         return review_findings(io_id, reject={key: f"Neo: {reason or 'rejected'}"},
                                decided_by="neo", project_name=name)
-    if not f.get("proposed_orders"):
-        # A diagnosis with no work to file spends nothing, so nothing is the steward's to decide
+    if not f.get("proposed_orders") or _io_user_rooted(fo):
+        # Nothing to spend, or a user's io whose findings are user spend (kn-ccd3bce7)
         _store_report(path, io_id, report)
         return review_findings(io_id, accept=[key], feedback=f"Neo: {reason}",
                                decided_by="neo", project_name=name)
@@ -9528,13 +9594,19 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                                 and release.is_release_order(wo)))
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
                           if held_by_red_base else [])
-        # A MERGE THE OS IS ITSELF HOLDING FOR GITHUB'S RUNNING CHECKS IS NOT STUCK (§2 and §3 of...
-        automerge_checks_held, automerge_spans, am_note = False, [], ""
+        # A MERGE THE OS HOLDS ON A TURN-KEEPING HOLD IS NOT STUCK (issue 1655)
+        merge_hold_cause, automerge_spans, am_note = "", [], ""
         if wo["status"] == "waiting_pr_merge":
-            am_note = invariants.automerge_checks_note(automerge_state(pstore, wo))
-            automerge_checks_held = bool(am_note) and base_red_until >= now
+            am_state = automerge_state(pstore, wo)
+            am_note = invariants.automerge_hold_note(am_state)
+            # A moved head the OS declined to re-judge is the user's call, not a designed wait
+            if (am_note and base_red_until >= now
+                    and not invariants.rejudge_exhausted(pstore, wo)
+                    and not invariants.rebind_exhausted(pstore, wo)):
+                merge_hold_cause = stuck.AUTOMERGE_HOLD_CAUSES.get(
+                    str((am_state or {}).get("code") or ""), "")
             # `events_of_kind` takes ONE kind
-            automerge_spans = automerge_checks_hold_spans(
+            automerge_spans = automerge_hold_spans(
                 [e for k in AUTOMERGE_EVENTS
                  for e in pstore.events_of_kind(wo["id"], k)],
                 since, now, base_red_until)
@@ -9611,7 +9683,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else stuck.BASE_RED_CAUSE
                             if base_red and held_by_red_base
                             # AFTER the red base and BEFORE the dependency: the first two CAN co-occur
-                            else stuck.AUTOMERGE_CHECKS_CAUSE if automerge_checks_held
+                            else merge_hold_cause if merge_hold_cause
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE
                             if wo["status"] == budget.EXHAUSTED
@@ -11676,6 +11748,22 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
     except OpsError:
         pass
     return {"question_id": question_id, "delivery": delivery}
+
+
+def asked_questions(events: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Neo's live row for every question these events name, by id (io-7bed6603)"""
+    from .neo_store import NeoStore
+    from .timeline import QUESTION_ESCALATED, _neo_question_id, _payload
+
+    ids = {_neo_question_id(_payload(e)) for e in events
+           if e.get("kind") in ("question_asked", QUESTION_ESCALATED)} - {None}
+    if not ids:
+        return {}
+    neo = NeoStore()
+    try:
+        return {i: row for i in ids if (row := neo.get(i))}
+    finally:
+        neo.close()
 
 
 # -- gates (privileged-action approvals)
@@ -14812,6 +14900,88 @@ def onboard_view(name: str, *, catalog_path: str | None = None) -> dict[str, Any
         "review": {"rows": rows, "must_have_missing": missing,
                    "reason_needed": any(r["safety"] for r in rows)},
     }
+
+
+#: The persona the dashboard's help button opens (docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md §4)
+ONBOARD_HELPER = "onboard_helper"
+
+
+def _onboard_help_prompt(view: dict[str, Any], sec: dict[str, Any], focus: str,
+                         url: str) -> str:
+    project = view["project"]
+    name = project["name"]
+    if project["adopted"]:
+        kind = f"{name} is already in the catalog: this onboarding revises its live settings."
+    else:
+        kind = f"{name} is a new project" + (
+            f", started from {project['like']}'s settings." if project["like"] else ".")
+    lines = [f"The user is onboarding {name} ({project['path']}) in the Jarvis dashboard "
+             f"and asked for help with the section `{sec['key']}`.", kind,
+             f"Section URL: {url} (append ?focus=<setting path> to point at one setting)",
+             f"Title: {sec['title']}", f"Scope: {sec['scope']}", f"Status: {sec['status']}",
+             f"Summary: {sec['summary'] or '(none)'}"]
+    if view["fleet_warning"] and not view["fleet_acked"]:
+        lines.append(f"Fleet warning, not yet acknowledged: {view['fleet_warning']}")
+    lines.append("Settings in this section:")
+    # Stable sort: the focused knob first, the rest in the view's order
+    for k in sorted(sec["knobs"], key=lambda k: k["path"] != focus):
+        mark = "  <- the user is asking about this one" if focus and k["path"] == focus else ""
+        lines.append(
+            f"  {k['path']} = {json.dumps(k['value'], default=str)} "
+            f"(default {json.dumps(k['default'], default=str)}, source {k['source']}, "
+            f"{'safety key' if k['safety'] else 'not a safety key'}, "
+            f"applies {k['apply']}){mark}")
+    if not sec["knobs"]:
+        lines.append("  (none)")
+    lines += [f"Problems: {'; '.join(view['problems']) or 'none'}",
+              f"Draft: {view['draft_path']}",
+              "Open by explaining " + (f"`{focus}`" if focus else "this section")
+              + " from `jarvis onboard explain`, then answer the user's questions. "
+              "You are read-only: the user changes values in the page."]
+    return "\n".join(lines)
+
+
+def onboard_help(name: str, section: str, focus: str = "", *,
+                 catalog_path: str | None = None) -> dict[str, Any]:
+    """Open a read-only help session on one section of a draft (docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md §4)"""
+    import urllib.parse
+
+    from . import bootstrap, claude_cli, notify, paths
+    from .catalog import parse_catalog
+
+    view = onboard_view(name, catalog_path=catalog_path)
+    sec = next((s for s in view["sections"] if s["key"] == section), None)
+    if sec is None:
+        raise OpsError(f"{name}'s onboarding has no section {section!r} — one of: "
+                       f"{', '.join(s['key'] for s in view['sections'])}")
+    try:
+        base = notify.ui_base_url(parse_catalog(_read_document(_catalog_file(catalog_path))))
+    except CatalogError as e:
+        raise OpsError(str(e)) from e
+    url = f"{base}/onboard/{urllib.parse.quote(name)}/{urllib.parse.quote(section)}"
+    prompt = _onboard_help_prompt(view, sec, focus, url)
+    root = bootstrap._rebuild(bootstrap.ASSETS / "onboard-helper",
+                              paths.onboarding_dir() / "helper", "agents")
+    add_dirs = [root, Path(view["project"]["path"])]
+    # Never `[WO …`: `jarvis doctor` reports those as orphans
+    session_name = f"[onboard] {name} · {section}"
+    out = {"session_name": session_name, "job_id": None, "attach": "claude agents",
+           "prompt": prompt, "error": "",
+           "argv": [claude_cli.claude_bin(), "--bg", "--name", session_name,
+                    "--agent", ONBOARD_HELPER,
+                    *(a for d in add_dirs for a in ("--add-dir", str(d))), "--", prompt]}
+    try:
+        # cwd is not the project: its workspace trust is written only by the bootstrap
+        job_id = claude_cli.spawn_background(prompt, cwd=paths.jarvis_home(),
+                                             name=session_name, agent=ONBOARD_HELPER,
+                                             add_dirs=add_dirs)
+    except claude_cli.ClaudeCliError as e:
+        out["error"] = str(e)
+        return out
+    out["job_id"] = job_id
+    if job_id:
+        out["attach"] = f"claude attach {job_id}"
+    return out
 
 
 def _onboard_flag(value: Any) -> bool:
