@@ -28,6 +28,8 @@ USER_HELD_Q_STATUSES = ("escalated", "failed")
 OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 #: Not `answering`: Neo's reply would overwrite the row, so it lapses once Neo has settled it
 LAPSABLE_Q_STATUSES = ("queued", "escalated", "failed")
+#: Kinds about their order alone, so they lapse when it ends; the rest have a subject of their own (io-7bed6603)
+LAPSABLE_Q_KINDS = ("question", "alarm")
 
 # What Neo is being asked for (docs/superpowers/specs/2026-08-31-the-supervisor.md)
 #: `validation` is Morpheus asking about a shipped PR; `backlog` a quarantined proposal
@@ -410,11 +412,12 @@ class NeoStore:
     def lapse_worker_questions(self, wo_id: str, reason: str) -> list[int]:
         """Settle an ended order's open worker questions as nobody's ruling (kn-40db1828)"""
         marks = ",".join("?" for _ in LAPSABLE_Q_STATUSES)
+        kinds = ",".join("?" for _ in LAPSABLE_Q_KINDS)
         return [int(r["id"]) for r in self.conn.execute(
             f"""UPDATE questions SET status='lapsed', lapsed_at=?, lapsed_reason=?
-                 WHERE wo_id=? AND kind='question' AND status IN ({marks})
+                 WHERE wo_id=? AND kind IN ({kinds}) AND status IN ({marks})
              RETURNING id""",
-            (db.now(), reason, wo_id, *LAPSABLE_Q_STATUSES)).fetchall()]
+            (db.now(), reason, wo_id, *LAPSABLE_Q_KINDS, *LAPSABLE_Q_STATUSES)).fetchall()]
 
     def lapse_questions(self, question_ids: list[int], reason: str) -> list[int]:
         """Settle these open questions as nobody's ruling (issue 1572, kn-40db1828)"""

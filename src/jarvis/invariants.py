@@ -2301,8 +2301,8 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_open_questions_lapse(store: ProjectStore) -> Iterator[Violation]:
-    """INV-NEO-QUESTION-LAPSED — an ended order's worker question must not stay open (io-d5e62d4d)"""
-    from .neo_store import LAPSABLE_Q_STATUSES, NeoStore
+    """INV-NEO-QUESTION-LAPSED — an ended order's worker question or alarm must not stay open (io-d5e62d4d, io-7bed6603)"""
+    from .neo_store import LAPSABLE_Q_KINDS, LAPSABLE_Q_STATUSES, NeoStore
     from .project_store import QUESTION_LAPSING_STATUSES
 
     readonly = getattr(store, "readonly", False)
@@ -2310,7 +2310,7 @@ def check_open_questions_lapse(store: ProjectStore) -> Iterator[Violation]:
     try:
         # An empty `wo_id` has a subject of its own, and no order to end
         rows = [q for q in neo.list_questions(statuses=LAPSABLE_Q_STATUSES, limit=-1)
-                if q["kind"] == "question" and q["wo_id"]]
+                if q["kind"] in LAPSABLE_Q_KINDS and q["wo_id"]]
     finally:
         neo.close()
     for q in rows:
