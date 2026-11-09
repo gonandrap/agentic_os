@@ -256,6 +256,12 @@ IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish
                           "nothing it started is still running; read its last message, "
                           "then `jarvis wo send` or `jarvis wo done`")
 
+#: The user wrote after the delivery and the worker has not finished again (wo-f7ef5098)
+USER_MESSAGE_UNANSWERED_BLOCKER = (
+    "you wrote to the worker after it delivered and it has not finished again, so the OS "
+    "will not merge — `jarvis wo send` to follow up, or `jarvis wo review` to accept the "
+    "delivery as it stands")
+
 #: The idle line's premise is false here: `finished` stands and nothing above it claimed the order (#1591)
 DELIVERED_UNSETTLED_BLOCKER = ("the worker finished and nothing will judge or close it — "
                                "its summary is on the record; read it, then `jarvis wo done` "
@@ -966,7 +972,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         blockers.append(PARKED_GIVE_UP_BLOCKER)
     if governed and wo["status"] == "needs_review":
         # In the body, the pattern `auto_review_at` above already uses: `ops` imports this module
-        from .ops import refusal_answered
+        from .ops import refusal_answered, user_message_unanswered
 
         # Above the triage and unguarded by `pending`, like PR_CLOSED_BLOCKER (docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md §5)
         pr_pending = store.pr_pending_open(wo["id"])
@@ -1002,6 +1008,9 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(REFUSAL_UNANSWERED_DOC_BLOCKER
                             if wo.get("kind") in DOCUMENT_DELIVERY_KINDS
                             else REFUSAL_UNANSWERED_BLOCKER)
+        # 3c (wo-f7ef5098)
+        elif not pending and user_message_unanswered(store, wo["id"]):
+            blockers.append(USER_MESSAGE_UNANSWERED_BLOCKER)
         # 4; a pushed-branch park always follows `finished`
         elif not pending and pr_pending is None and owed_action is None:
             blockers.append(DELIVERED_UNSETTLED_BLOCKER if finish_stands(store, wo)
