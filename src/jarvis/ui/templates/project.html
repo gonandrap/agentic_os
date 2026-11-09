@@ -35,7 +35,7 @@
 {%- endmacro %}
 <h2 id="proj-orders">Orders</h2>
 {{ ui.filter_bar("/project/" ~ project_name, filters, options, rows | length, total,
-                 labels={"type": "every type", "status": "open"},
+                 labels={"type": "every type", "status": "open", "requestor": "any"},
                  hidden={"hidden": "1"} if show_hidden else {}) }}
 <p class="sub">
   {% if show_hidden %}
