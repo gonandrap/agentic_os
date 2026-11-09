@@ -2559,7 +2559,7 @@ def create_app() -> FastAPI:
         try:
             wo = ops.create_work_order(
                 project, title, description=description, model=model or None,
-                origin="ui",
+                origin="ui", requestor="user",
                 # Empty means "whatever the project's default is", which is usually no ceiling — never zero
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
         except (ValueError, ops.OpsError) as e:
@@ -2750,7 +2750,7 @@ def create_app() -> FastAPI:
 
         try:
             fo = ops.create_feature_order(
-                project, title, description=description, origin="ui",
+                project, title, description=description, origin="ui", requestor="user",
                 # A FAMILY budget: the whole rollup, not the planner alone
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
         except (ValueError, ops.OpsError) as e:
@@ -2765,7 +2765,7 @@ def create_app() -> FastAPI:
 
         try:
             io = ops.create_improvement_order(
-                project, title, description=description, origin="ui",
+                project, title, description=description, origin="ui", requestor="user",
                 # One per line: a free-text ref may hold commas or spaces
                 refs=refs.splitlines(),
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
@@ -2781,7 +2781,7 @@ def create_app() -> FastAPI:
 
         try:
             do = ops.create_decision_order(
-                project, title, description, origin="ui",
+                project, title, description, origin="ui", requestor="user",
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/?{urlencode({'error': str(e)}, quote_via=quote)}",
@@ -2795,7 +2795,7 @@ def create_app() -> FastAPI:
 
         try:
             inv = ops.create_investigation_order(
-                None, subject, why, origin="ui",
+                None, subject, why, origin="ui", requestor="user",
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
             # The subject decides the project, so the form never asks for one
             project = ops.show_investigation_order(inv["id"])["project"]

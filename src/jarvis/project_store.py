@@ -221,6 +221,14 @@ VALIDATION_OPINION_STATUSES = ("ok", "abstained", "failed")
 WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo", "schedule",
               "fleet_health", "os")
 
+# Who asked for an order; NULL marks a legacy row (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2)
+REQUESTORS = ("user", "os")
+
+
+def _check_requestor(requestor: str | None) -> None:
+    if requestor is not None and requestor not in REQUESTORS:
+        raise ValueError(f"requestor {requestor!r} not in {list(REQUESTORS)} or None")
+
 # Origins whose session Jarvis did not dispatch: it belongs to the user
 UNGOVERNED_ORIGINS = ("adhoc", "injected")
 
@@ -1162,8 +1170,12 @@ ADDED_COLUMNS = {
         "detector_id": "TEXT",
         "remedy_rule_id": "TEXT",
         "trigger_wo_id": "TEXT",
+        # WHO ASKED: 'user'|'os', stamped once at create; NULL on legacy rows (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2)
+        "requestor": "TEXT",
     },
     "feature_orders": {
+        # As on work_orders (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2)
+        "requestor": "TEXT",
         # Same, one level up: a feature's bill is its children's, and children can be deleted
         "bill_json": "TEXT",
         "bill_sealed_at": "REAL",
@@ -1664,9 +1676,11 @@ class ProjectStore:
         detector_id: str | None = None,
         remedy_rule_id: str | None = None,
         trigger_wo_id: str | None = None,
+        requestor: str | None = None,
     ) -> dict[str, Any]:
         """Create a work order"""
         assert origin in WO_ORIGINS, origin
+        _check_requestor(requestor)
         assert status in WO_STATUSES, status
         assert kind in WO_KINDS, kind
         if observability is not None:
@@ -1682,7 +1696,9 @@ class ProjectStore:
         for dep in deps:
             self.get_work_order(dep)  # KeyError names the id that does not exist
         if parent_id:
-            self.get_feature_order(parent_id)  # same: KeyError names it
+            parent = self.get_feature_order(parent_id)  # same: KeyError names it
+            # Store cannot import ops: only the plain copy lives here (spec 2026-11-09-yours-requestor-stamp-and-tree-notice.md §2.1)
+            requestor = requestor or parent.get("requestor")
         ts = db.now()
         self.conn.execute(
             """INSERT INTO work_orders (id, title, description, status, origin,
@@ -1690,8 +1706,8 @@ class ProjectStore:
                    append_system_prompt, backlog_id, metadata, session_id, depends_on,
                    parent_id, kind, spec_section, issue_url, issue_priority,
                    budget_usd, observability, gap_class, detector_id, remedy_rule_id,
-                   trigger_wo_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   trigger_wo_id, requestor)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
@@ -1700,7 +1716,7 @@ class ProjectStore:
                 issue_priority or None, budget_usd, observability,
                 # `or None` as `spec_section` and `issue_url` do: "" and NULL would otherwise be two spellings of... (docs/superpowers/specs/2026-09-27-self-evolution.md)
                 gap_class or None, detector_id or None, remedy_rule_id or None,
-                trigger_wo_id or None,
+                trigger_wo_id or None, requestor,
             ),
         )
         self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,
@@ -2547,9 +2563,11 @@ class ProjectStore:
                              fo_id: str | None = None,
                              max_parallel: int | None = None,
                              budget_usd: float | None = None,
-                             kind: str = "feature") -> dict[str, Any]:
+                             kind: str = "feature",
+                             requestor: str | None = None) -> dict[str, Any]:
         assert origin in WO_ORIGINS, origin
         assert kind in FO_KINDS, kind
+        _check_requestor(requestor)
         assert max_parallel is None or max_parallel >= 1, max_parallel
         # Every kind carries its own prefix so that every id in the OS still says what it names on sight (docs/superpowers/specs/2026-09-27-investigation-orders.md)
         fo_id = fo_id or db.new_id(FO_ID_PREFIXES.get(kind, "fo"))
@@ -2557,10 +2575,10 @@ class ProjectStore:
         self.conn.execute(
             """INSERT INTO feature_orders (id, title, description, status, kind, origin,
                    created_at, updated_at, backlog_id, metadata, max_parallel,
-                   budget_usd)
-               VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?)""",
+                   budget_usd, requestor)
+               VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?)""",
             (fo_id, title, description, kind, origin, ts, ts, backlog_id,
-             db.to_json(metadata or {}), max_parallel, budget_usd),
+             db.to_json(metadata or {}), max_parallel, budget_usd, requestor),
         )
         # As above: the span a transition cannot supply
         self._record_span(fo_id, "fo", "", "pending", ts=ts)
