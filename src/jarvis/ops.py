@@ -4708,7 +4708,7 @@ USER_MESSAGE_WITHDRAWS = ("the user wrote to this work order after the request w
 
 
 def user_message_unanswered(store: ProjectStore, wo_id: str) -> bool:
-    """Is the user's newest message newer than the worker's last finish and the user's last accept? (wo-f7ef5098)"""
+    """Is the user's newest message newer than every finish and accepting review? (wo-f7ef5098)"""
     newest = store.user_messages(wo_id, limit=1)
     if not newest:
         return False
@@ -4720,7 +4720,7 @@ def user_message_unanswered(store: ProjectStore, wo_id: str) -> bool:
 
 
 def withdraw_merge_requests(store: ProjectStore, wo_id: str) -> int:
-    """Close this order's open or unspent auto_merge requests: a user message re-opens the question (wo-f7ef5098)"""
+    """Close this order's open or unspent auto_merge requests (wo-f7ef5098)"""
     from . import automerge
     from .neo_store import NeoStore
 

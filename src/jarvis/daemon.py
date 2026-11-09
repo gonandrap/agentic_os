@@ -5356,7 +5356,7 @@ class Daemon:
 
     @staticmethod
     def _land_deferred(store: ProjectStore, wo: dict) -> None:
-        """The deferred landing, unless the user wrote after the last finish: then the user decides (wo-f7ef5098)"""
+        """The deferred landing, unless a user message postdates the finish (wo-f7ef5098)"""
         from . import ops as ops_mod
 
         if not ops_mod.user_message_unanswered(store, wo["id"]):
