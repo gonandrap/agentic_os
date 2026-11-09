@@ -3114,10 +3114,10 @@ def test_the_blocker_column_names_the_hold_the_record_already_carries(red_base_o
     assert row["blocker"] != "nothing the record can name"
 
 
-@pytest.mark.parametrize("code", ["checks_none", "checks_failed",
-                                  "merge_state_unclean", "sha_moved"])
-def test_every_other_hold_code_is_still_judged(red_base_os, code):
-    """§7(3) and §3's boundary — the part a later change will widen by accident"""
+@pytest.mark.parametrize("code", ["checks_failed", "checks_cancelled", "draft",
+                                  "pr_closed"])
+def test_a_hold_that_gives_up_the_queue_turn_is_still_judged(red_base_os, code):
+    """§7(3) and §3's boundary, widened by issue 1655 to `automerge.TURN_KEEPING_HOLDS` only"""
     store = red_base_os["store"]
     now = db.now()
     wo, at = _parked(store, hours=61 / 60, title="held on something somebody owes")
@@ -3128,6 +3128,67 @@ def test_every_other_hold_code_is_still_judged(red_base_os, code):
 
     assert row["excluded"] == ""
     assert row["stuck"] is True, row["reason"]
+
+
+@pytest.mark.parametrize("code", ["merge_queued", "base_moved", "not_mergeable",
+                                  "sha_moved", "checks_none", "merge_state_unclean",
+                                  "grant_lapsed"])
+def test_every_turn_keeping_hold_is_excluded_discounted_and_named(red_base_os, code):
+    """Issue 1655: wo-f392b761 waited correctly in these holds and bought inv-0488f6aa"""
+    from jarvis import invariants, stuck
+
+    store = red_base_os["store"]
+    now = db.now()
+    wo, at = _parked(store, hours=61 / 60, title="waiting its turn")
+    store.update_work_order(wo["id"], pr_url="https://github.com/o/r/pull/1")  # the poll's row
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 60.0, code=code,
+                reason="queued behind wo-ahead")
+    base_fact(red=False)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["stuck"] is False, row["reason"]
+    assert row["excluded"] == stuck.AUTOMERGE_HOLD_CAUSES[code]
+    assert row["reason"] == stuck.EXCLUSION_REASON[row["excluded"]]
+    assert row["discounted_seconds"] > 0
+    assert row["blocker"] == invariants.AUTOMERGE_HOLD_NOTE.format(
+        code=code, reason="queued behind wo-ahead")
+
+
+def test_a_moved_head_the_os_declined_to_re_judge_is_still_judged(red_base_os):
+    """Issue 1655: a turn-keeping code the user owes a decision on names no OS hold; its flag is the alarm"""
+    from jarvis import invariants
+
+    store = red_base_os["store"]
+    now = db.now()
+    wo, at = _parked(store, hours=61 / 60, title="re-judge spent")
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 60.0, code="sha_moved")
+    store.add_event(wo["id"], invariants.REJUDGE_DECLINED_EVENT, {"head_sha": JUDGED_SHA})
+    base_fact(red=False)
+    assert invariants.rejudge_exhausted(store, store.get_work_order(wo["id"]))
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == ""
+    assert row["blocker"] == invariants.SHA_MOVED_BLOCKER
+
+
+@pytest.mark.parametrize("unnamed", [False, True])
+def test_the_invariant_names_a_queue_hold_the_sweep_does_not_discount(red_base_os,
+                                                                      monkeypatch, unnamed):
+    """Issue 1655's detector, folded into INV-RED-RELEASE-UNDISCOUNTED (Neo Q4043)"""
+    from jarvis import invariants, stuck
+
+    store = red_base_os["store"]
+    wo, at = _parked(store, hours=61 / 60, title="queued")
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 60.0, code="merge_queued")
+    base_fact(red=False)
+    if unnamed:  # the sweep as it was before this fix
+        monkeypatch.setattr(stuck, "AUTOMERGE_HOLD_CAUSES", {})
+
+    found = list(invariants.check_red_release_hold_is_discounted(store))
+
+    assert [v.wo_id for v in found] == ([wo["id"]] if unnamed else [])
 
 
 def test_a_stale_hold_is_no_hold(red_base_os):
