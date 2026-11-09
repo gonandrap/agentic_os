@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -162,11 +161,10 @@ def _adopted_with_edit(tmp_path, catalog) -> Path:
 def test_a_draft_older_than_the_head_version_is_rebuilt(tmp_path, catalog, view):
     src = _adopted_with_edit(tmp_path, catalog)
     file = interview.draft_file("src")
-    past = time.time() - 3600
-    os.utime(file, (past, past))
     store = CentralStore()
-    store.add_config_version({"moved": True}, {}, actor="test")
+    past = store.add_config_version({"moved": True}, {}, actor="test")["ts"] - 3600
     store.close()
+    os.utime(file, (past, past))
 
     out = ops.onboard_open(src)
 
@@ -176,10 +174,9 @@ def test_a_draft_older_than_the_head_version_is_rebuilt(tmp_path, catalog, view)
 
 def test_a_draft_newer_than_the_head_version_is_resumed(tmp_path, catalog, view):
     store = CentralStore()
-    store.add_config_version({"moved": True}, {}, actor="test")
+    future = store.add_config_version({"moved": True}, {}, actor="test")["ts"] + 3600
     store.close()
     src = _adopted_with_edit(tmp_path, catalog)
-    future = time.time() + 3600
     os.utime(interview.draft_file("src"), (future, future))
 
     out = ops.onboard_open(src)
