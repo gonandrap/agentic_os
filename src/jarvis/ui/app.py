@@ -38,6 +38,13 @@ from .. import (
     uilog,
     wiring,
 )
+# Re-exported: /config and the onboarding pages type a form string the same way ops does
+from ..config_version import (  # noqa: F401
+    CONFIG_TYPE_NAMES,
+    config_type_name,
+    config_type_ok,
+    config_value_of,
+)
 from ..bill import OWN_LABEL
 from ..central_store import KB_LINK_RELS, SETTLED_BACKLOG_STATUSES, CentralStore
 from ..daemon import daemon_running
@@ -983,19 +990,6 @@ def config_tree(labels: list[str], node: str = "") -> list[dict]:
     return build("", labels)
 
 
-CONFIG_TYPE_NAMES = [
-    (bool, "true or false"), (int, "a whole number"), (float, "a number"),
-    (str, "text"), (list, "a JSON list"), (dict, "a JSON object"),
-]
-
-
-def config_type_name(value: object) -> str:
-    for kind, name in CONFIG_TYPE_NAMES:
-        if isinstance(value, kind):
-            return name
-    return "a value"
-
-
 def config_widget(value: object) -> str:
     """Which input a setting is edited with — the whole of the page's type awareness"""
     if isinstance(value, bool):
@@ -1014,30 +1008,6 @@ def config_input_text(value: object) -> str:
     if value is None:
         return ""
     return json.dumps(value)
-
-
-def config_value_of(current: object, text: str) -> object:
-    """What the page will write for `text`, given the value already there"""
-    if isinstance(current, str):
-        return text
-    if current is None and not text.strip():
-        return None
-    return ops.parse_config_value(text)
-
-
-def config_type_ok(current: object, new: object) -> bool:
-    """May `new` be written where `current` is?"""
-    if current is None:
-        return True
-    if new is None:
-        return False
-    if isinstance(current, bool):
-        return isinstance(new, bool)
-    if isinstance(current, int):
-        return isinstance(new, int) and not isinstance(new, bool)
-    if isinstance(current, float):
-        return isinstance(new, (int, float)) and not isinstance(new, bool)
-    return isinstance(new, type(current))
 
 
 def _config_nodes(label: str) -> list[str]:

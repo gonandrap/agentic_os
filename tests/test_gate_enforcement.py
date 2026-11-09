@@ -191,6 +191,19 @@ def test_a_live_grant_still_runs_while_another_request_is_under_review(worker):
     assert "approved by neo" in _reason(result)
 
 
+def test_the_os_own_auto_merge_request_does_not_narrow_the_worker(worker):
+    """io-87fe02be: the worker answering a user message keeps its tools"""
+    worker.store.add_approval(worker.wo["id"], "auto_merge",
+                              "gh pr merge 31 --squash --match-head-commit abc123")
+
+    assert worker.attempt("uv run pytest tests/test_x.py -q") is None
+    write = preflight_decision(
+        {"tool_name": "Write", "cwd": str(worker.project),
+         "tool_input": {"file_path": str(worker.project / "x.py"), "content": "x = 1"}},
+        worker.env)
+    assert _decision(write) != "deny"
+
+
 def test_a_held_request_leaves_the_session_open(worker):
     """The mirror image of the Stop hold"""
     worker.attempt(MERGE)
