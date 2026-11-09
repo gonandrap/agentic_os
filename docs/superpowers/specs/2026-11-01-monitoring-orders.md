@@ -389,6 +389,27 @@ Arming prefers a read-only probe over waiting for traffic and replies `trigger: 
 stored in `trigger_kind` (`''` when unsaid). No model call enters a script, and
 `timeout_days` does not move.
 
+## 10. An unverified row stays dormant (io-b42dfb75, wo-e4f3ab58, Q3819, Q3823)
+
+A `not_exercised` timeout settles `unverified` but dormant: `next_check_ts` set means dormant,
+NULL means settled for good. `sweep` reruns its script every `os.morpheus.dormant_every_hours`
+(24) until `deadline_ts`, reset to `dormant_cap_days` (30) ahead. No model call.
+
+| dormant check | moves to |
+|---|---|
+| exit 0 | `validated`, the only way there (PR 1259) |
+| exit 1 twice in a row | `failed`, the usual judge route |
+| exit 75 | stays dormant |
+| at the cap | `next_check_ts` NULL; resolution and list say `unverified for good, dormant cap reached` |
+
+A later PR whose changed files (`files_json`, from `gh pr view --json files`) overlap a dormant
+row's retires it: `superseded by <mo-id>`. A row with no stored files fetches them once.
+
+Rows settled `unverified` by an investigation or Neo came from `failed`/`timedout`; rerunning
+them would loop through a paid investigation, so they stay undormant and say `not watched
+dormant: settled from <state>`. Rows settled before this release revive once
+(`morpheus.dormant_revived`), unless they ever saw a FAIL.
+
 ## Agent profile
 
 You are a Jarvis OS developer working on ONE section of the monitoring-orders feature, in

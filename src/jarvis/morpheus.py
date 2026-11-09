@@ -43,6 +43,11 @@ AMBIGUOUS = "ambiguous"
 REASONS = (NOT_DEPLOYED, NOT_EXERCISED, "unreadable", AMBIGUOUS)
 #: How long `not_deployed` may hold a deadline, from the first check that said it
 NOT_DEPLOYED_CAP_DAYS = 14
+#: An unverified row with next_check_ts set is dormant; NULL settles it for good (wo-e4f3ab58)
+DORMANT_CAP_REACHED = "unverified for good, dormant cap reached"
+#: One shot: rows settled unverified before dormancy existed were revived (Q3823)
+DORMANT_REVIVED_KEY = "morpheus.dormant_revived"
+_SUPERSEDED = re.compile(r"^superseded by (\S+?):")
 #: How an arming session says its script gets its evidence
 TRIGGERS = ("probe", "ambient")
 _REASON_LINE = re.compile(r"^REASON[ \t]+(\S+)[ \t]*$", re.MULTILINE)
@@ -215,6 +220,7 @@ class PullRequestBody:
     title: str
     body: str
     merge_sha: str = ""
+    files: tuple[str, ...] = ()
 
 
 def fetch_pr(repo_slug: str, number: int, cwd: Path | None = None) -> PullRequestBody:
@@ -223,7 +229,7 @@ def fetch_pr(repo_slug: str, number: int, cwd: Path | None = None) -> PullReques
 
     url = f"https://github.com/{repo_slug}/pull/{number}"
     out = subprocess.run([gh_bin(), "pr", "view", url, "--json",
-                          "number,title,body,url,mergeCommit"],
+                          "number,title,body,url,mergeCommit,files"],
                          capture_output=True, text=True, timeout=60,
                          cwd=str(cwd) if cwd else None)
     if out.returncode != 0:
@@ -234,7 +240,9 @@ def fetch_pr(repo_slug: str, number: int, cwd: Path | None = None) -> PullReques
                            url=str(data.get("url") or url),
                            title=str(data.get("title") or ""),
                            body=str(data.get("body") or ""),
-                           merge_sha=str((data.get("mergeCommit") or {}).get("oid") or ""))
+                           merge_sha=str((data.get("mergeCommit") or {}).get("oid") or ""),
+                           files=tuple(str(f.get("path") or "") for f in data.get("files") or []
+                                       if f.get("path")))
 
 
 def repo_slug(repo: Path) -> str:
@@ -248,14 +256,15 @@ def repo_slug(repo: Path) -> str:
 # -- the queue
 
 def enqueue(central: CentralStore, cfg: MorpheusConfig, pr: PullRequestBody, *,
-            project: str, repo: str, release_tag: str = "", now: float | None = None
+            project: str, repo: str, release_tag: str = "", now: float | None = None,
+            files_of: Callable[[str, int], tuple[str, ...] | None] | None = None
             ) -> dict[str, Any] | None:
     """Queue one PR; None when it was already queued (one item per PR, ever)"""
     now = db.now() if now is None else now
     raw = find_section(pr.body)
     section = parse_section(raw or "")
     waived = raw is not None and bool(section.waived)
-    return central.add_morpheus_item(
+    item = central.add_morpheus_item(
         project=project, repo=repo, pr_number=pr.number, pr_url=pr.url,
         pr_title=pr.title[:300], wo_id=wo_of_title(pr.title), release_tag=release_tag,
         hints=section.text[:8000], script="", script_source="",
@@ -263,6 +272,44 @@ def enqueue(central: CentralStore, cfg: MorpheusConfig, pr: PullRequestBody, *,
         deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY,
         resolution=f"waived by the PR: {section.waived}" if waived else "",
         origin="release" if release_tag else "merge", now=now)
+    if item and pr.files:
+        central.update_morpheus_item(item["id"], files_json=json.dumps(sorted(pr.files)))
+        retire_superseded(central, item["id"], repo, pr.number, set(pr.files),
+                          files_of or _pr_files)
+    return item
+
+
+def _pr_files(repo: str, number: int) -> tuple[str, ...] | None:
+    """A PR's changed paths over `gh`; None when GitHub cannot say now"""
+    try:
+        return fetch_pr(repo, number).files
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        log.warning("no changed files for %s#%s: %s", repo, number, e)
+        return None
+
+
+def retire_superseded(central: CentralStore, item_id: str, repo: str, pr_number: int,
+                      files: set[str], files_of: Callable[[str, int], tuple[str, ...] | None]
+                      ) -> list[str]:
+    """A later PR changing a dormant row's files retires it (wo-e4f3ab58); returns retired ids"""
+    retired = []
+    for other in central.dormant_morpheus_items(repo=repo):
+        if other["id"] == item_id or not other["pr_number"]:
+            continue
+        theirs = other["files_json"]
+        if not theirs:  # rows queued before files were stored: fetched once, lazily
+            fetched = files_of(repo, int(other["pr_number"]))
+            if fetched is None:
+                continue
+            theirs = json.dumps(sorted(fetched))
+            central.update_morpheus_item(other["id"], files_json=theirs)
+        if files & set(json.loads(theirs)):
+            central.update_morpheus_item(
+                other["id"], next_check_ts=None,
+                resolution=f"superseded by {item_id}: PR #{pr_number} changes the same files; "
+                           f"{other['resolution']}")
+            retired.append(other["id"])
+    return retired
 
 
 def is_monitoring_order_id(x: object) -> bool:
@@ -602,13 +649,19 @@ def rewrite_from_investigation(central: CentralStore, cfg: MorpheusConfig, item_
     return True, f"{item_id} sent back to Morpheus for a new script"
 
 
+def _not_dormant(item: dict[str, Any]) -> str:
+    # A dormant rerun of a once-failing script would loop it through a paid investigation (Q3823)
+    return f"not watched dormant: settled from {item['state']}"
+
+
 def settle_unverified(central: CentralStore, item_id: str, inv_id: str, why: str) -> str:
     """An investigation says nothing is wrong: settled, not passed, nothing on the user (io-5cc7a40d)"""
     item = _item_or_raise(central, item_id)
     if item["state"] not in ACTION_STATES:
         return f"nothing settled: {item_id} is {item['state']}, decided elsewhere"
     central.update_morpheus_item(item_id, state="unverified", next_check_ts=None,
-                                 resolution=f"unverified, {inv_id}: {why[:600]}")
+                                 resolution=f"unverified, {inv_id}: {why[:600]}; "
+                                            f"{_not_dormant(item)}")
     central.add_inbox(
         project=item.get("project") or "os", level="info",
         title=f"PR #{item['pr_number']} — {inv_id} found nothing wrong; its validation "
@@ -695,6 +748,7 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
     where = _cwd(cwd, item)
     result = run(item["script"], where, cfg.script_timeout_seconds)
     reason = exit_reason(result)
+    dormant = item["state"] == "unverified"
     # Output cut to its tail may have lost a FAIL line, so a full tail cannot count as clean
     saw_fail = bool(item.get("saw_fail") or result.exit == EXIT_FAILED
                     or _FAIL_LINE.search(result.output) or len(result.output) >= OUTPUT_TAIL)
@@ -706,12 +760,22 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
                                                          or cfg.check_every_minutes) * 60}
     held_since = float(item.get("held_since_ts") or now)
     hold_cap = held_since + NOT_DEPLOYED_CAP_DAYS * SECONDS_PER_DAY
+    dormant_next = now + cfg.dormant_every_hours * 3600
     if result.exit == EXIT_VALIDATED:
-        fields.update(state="validated", next_check_ts=None, resolution="script exited 0")
+        fields.update(state="validated", next_check_ts=None,
+                      resolution="script exited 0" + (" on a dormant check" if dormant else ""))
     # One exit 1 may be the environment, not the PR, so `failed` needs a second in a row (#1255)
     elif result.exit == EXIT_FAILED and item.get("last_exit") == EXIT_FAILED:
         fields.update(state="failed", next_check_ts=None,
-                      resolution="script exited 1 twice in a row")
+                      resolution="script exited 1 twice in a row"
+                                 + (" on dormant checks" if dormant else ""))
+    elif dormant:
+        if now >= float(item["deadline_ts"]):
+            fields.update(next_check_ts=None,
+                          resolution=f"{DORMANT_CAP_REACHED}: no dormant check saw production "
+                                     f"exercise it; {item['resolution']}")
+        else:
+            fields["next_check_ts"] = dormant_next
     elif reason == NOT_DEPLOYED and now < hold_cap:
         # Not deployed starts no clock: the whole window stays for once it is (§9)
         fields.update(held_since_ts=held_since,
@@ -719,10 +783,14 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
                                       min(now + cfg.timeout_days * SECONDS_PER_DAY, hold_cap)))
     elif now >= float(item["deadline_ts"]):
         if reason == NOT_EXERCISED and not saw_fail:
-            fields.update(state="unverified", next_check_ts=None,
+            # Dormant, not dead: the same script reruns until the cap (wo-e4f3ab58)
+            fields.update(state="unverified", next_check_ts=dormant_next,
+                          deadline_ts=now + cfg.dormant_cap_days * SECONDS_PER_DAY,
                           resolution=f"production never exercised the change within "
                                      f"{cfg.timeout_days:g} day(s) and no check saw a FAIL: "
-                                     f"not proof it works")
+                                     f"not proof it works; dormant, its script reruns every "
+                                     f"{cfg.dormant_every_hours:g}h for {cfg.dormant_cap_days:g} "
+                                     f"day(s)")
         else:
             fields.update(state="timedout", next_check_ts=None,
                           resolution=_timeout_reason(item, cfg, result.exit, reason))
@@ -754,6 +822,7 @@ def sweep(central: CentralStore, cfg: MorpheusConfig, cwd: CwdFor, *,
     """Run every due script and expire every overdue item — no model, ever"""
     now = db.now() if now is None else now
     moved = {s: 0 for s in STATES}
+    revive_unverified(central, cfg, now)
     for item in central.morpheus_items(OPEN_STATES):
         if (item["project"] or "") in skip:
             # Offboarded: left as it is, never failed (docs/superpowers/specs/2026-10-28-offboard-a-project.md §6.2)
@@ -766,7 +835,41 @@ def sweep(central: CentralStore, cfg: MorpheusConfig, cwd: CwdFor, *,
             central.update_morpheus_item(item["id"], state="timedout", next_check_ts=None,
                                          resolution=_timeout_reason(item, cfg))
             moved["timedout"] += 1
+    for item in central.dormant_morpheus_items(due_by=now):
+        if item["script"] and (item["project"] or "") not in skip:
+            moved[check(central, cfg, item, cwd, now=now, run=run)] += 1
     return moved
+
+
+def revive_unverified(central: CentralStore, cfg: MorpheusConfig, now: float) -> int:
+    """Once: rows settled unverified before dormancy existed go dormant, unless they ever failed (Q3823)"""
+    if central.get_state(DORMANT_REVIVED_KEY):
+        return 0
+    n = 0
+    with db.write_transaction(central.conn):
+        for item in central.morpheus_items(("unverified",), limit=1_000_000):
+            if (item["script"] and item["next_check_ts"] is None and not item["saw_fail"]
+                    and item["last_exit"] != EXIT_FAILED):
+                since = float(item["last_check_ts"] or item["updated_ts"])
+                central.update_morpheus_item(
+                    item["id"], next_check_ts=now,
+                    deadline_ts=since + cfg.dormant_cap_days * SECONDS_PER_DAY)
+                n += 1
+        central.set_state(DORMANT_REVIVED_KEY, str(now))
+    return n
+
+
+def state_label(item: dict[str, Any]) -> str:
+    """The state as list and show print it: an unverified row says whether it is still watched"""
+    if item["state"] != "unverified":
+        return str(item["state"])
+    if item.get("next_check_ts") is not None:
+        return "unverified, dormant"
+    resolution = item.get("resolution") or ""
+    if resolution.startswith(DORMANT_CAP_REACHED):
+        return DORMANT_CAP_REACHED
+    m = _SUPERSEDED.match(resolution)
+    return f"unverified, superseded by {m.group(1)}" if m else "unverified"
 
 
 # -- failed and timed out hand off: Morpheus never diagnoses
@@ -1155,7 +1258,8 @@ def record_neo_verdict(central: CentralStore, cfg: MorpheusConfig, q: dict[str, 
         requeue(central, cfg, item_id, resolution=f"re-watched by Neo: {resolution}")
     elif settled:
         central.update_morpheus_item(item_id, state="unverified", next_check_ts=None,
-                                     resolution=f"unverified by Neo: {resolution}")
+                                     resolution=f"unverified by Neo: {resolution}; "
+                                                f"{_not_dormant(item)}")
     elif rewritten:
         rewrite(central, cfg, item_id, reading,
                 resolution=f"script sent back to be rewritten by Neo: {resolution}")

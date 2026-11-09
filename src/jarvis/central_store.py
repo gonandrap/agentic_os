@@ -674,7 +674,8 @@ CREATE TABLE IF NOT EXISTS monitoring_orders (
     last_reason TEXT NOT NULL DEFAULT '',   -- what the last exit 75 named
     saw_fail INTEGER NOT NULL DEFAULT 0,    -- this watch ran an exit 1 or printed a FAIL line
     held_since_ts REAL,                     -- the first not_deployed check of this watch
-    trigger_kind TEXT NOT NULL DEFAULT ''   -- probe | ambient; '' = not said
+    trigger_kind TEXT NOT NULL DEFAULT '',  -- probe | ambient; '' = not said
+    files_json TEXT NOT NULL DEFAULT ''     -- the PR's changed paths, JSON list; '' = not fetched
 );
 CREATE INDEX IF NOT EXISTS idx_monitoring_orders_state ON monitoring_orders(state);
 -- One order per PR, ever; an order with no PR is never a duplicate
@@ -743,6 +744,7 @@ ADDED_COLUMNS = {
         "saw_fail": "INTEGER NOT NULL DEFAULT 0",  # this watch ran an exit 1 or printed a FAIL line
         "held_since_ts": "REAL",  # the first not_deployed check of this watch
         "trigger_kind": "TEXT NOT NULL DEFAULT ''",  # probe | ambient; '' = not said
+        "files_json": "TEXT NOT NULL DEFAULT ''",  # the PR's changed paths; '' = not fetched (wo-e4f3ab58)
     },
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
@@ -2661,6 +2663,20 @@ class CentralStore:
         q.append("ORDER BY _score DESC, created_ts DESC LIMIT ?")
         return db.rows_to_dicts(self.conn.execute(" ".join(q), (*params, limit)).fetchall())
 
+    def dormant_morpheus_items(self, *, due_by: float | None = None,
+                               repo: str | None = None) -> list[dict[str, Any]]:
+        """Unverified rows still watched: next_check_ts set (wo-e4f3ab58)"""
+        q = "SELECT * FROM monitoring_orders WHERE state='unverified' AND next_check_ts IS NOT NULL"
+        params: list[Any] = []
+        if due_by is not None:
+            q += " AND next_check_ts<=?"
+            params.append(due_by)
+        if repo is not None:
+            q += " AND repo=?"
+            params.append(repo)
+        return db.rows_to_dicts(self.conn.execute(q + " ORDER BY next_check_ts",
+                                                  params).fetchall())
+
     def morpheus_counts(self) -> dict[str, int]:
         return {r["state"]: r["n"] for r in self.conn.execute(
             "SELECT state, COUNT(*) AS n FROM monitoring_orders GROUP BY state").fetchall()}
@@ -2670,7 +2686,7 @@ class CentralStore:
         allowed = {"script", "script_source", "state", "deadline_ts", "last_check_ts",
                    "next_check_ts", "checks", "last_exit", "last_output", "resolution",
                    "last_check_version", "rewrite_brief",
-                   "last_reason", "saw_fail", "held_since_ts", "trigger_kind",
+                   "last_reason", "saw_fail", "held_since_ts", "trigger_kind", "files_json",
                    "action", "action_ts", "hints",
                    "attempts", "kills", "last_attempt_ts", "last_session_id"}
         bad = set(fields) - allowed
