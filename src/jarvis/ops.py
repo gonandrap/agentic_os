@@ -948,7 +948,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       detector_id: str | None = None,
                       remedy_rule_id: str | None = None,
                       trigger_wo_id: str | None = None,
-                      metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+                      metadata: dict[str, Any] | None = None,
+                      requestor: str | None = None) -> dict[str, Any]:
     """File a work order (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
     from . import preconditions
 
@@ -1018,6 +1019,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
             observability=observability,
             gap_class=gap_class, detector_id=detector_id,
             remedy_rule_id=remedy_rule_id, trigger_wo_id=trigger_wo_id,
+            requestor=requestor or resolve_requestor(
+                store, parent_id=parent_id, metadata=metadata, origin=origin),
         )
         # AT CREATION with the store still open
         for ref in holds:
@@ -1225,6 +1228,7 @@ def inject_session(session_id: str, project_name: str | None = None,
             origin="injected",
             status=status,
             session_id=match.session_id,
+            requestor="user",  # the user handed over their own session
         )
         store.add_event(wo["id"], "session_injected", {
             "session_id": match.session_id, "bg_id": match.id, "cwd": match.cwd,
@@ -7432,7 +7436,8 @@ def create_feature_order(project_name: str, title: str, description: str = "",
                          backlog_id: str | None = None,
                          max_parallel: int | None = None,
                          budget_usd: float | None = None,
-                         metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+                         metadata: dict[str, Any] | None = None,
+                         requestor: str | None = None) -> dict[str, Any]:
     """File the coarse ask"""
     paths = registered_project_paths()
     if project_name not in paths:
@@ -7452,6 +7457,8 @@ def create_feature_order(project_name: str, title: str, description: str = "",
         return store.create_feature_order(
             title=title, description=description, origin=origin, backlog_id=backlog_id,
             max_parallel=max_parallel, metadata=metadata,
+            requestor=requestor or resolve_requestor(
+                store, parent_id=None, metadata=metadata, origin=origin),
             # A FAMILY budget, so it takes the family default and never the per-work-order one
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.feature_default_for(_spec_or_none(project_name))))
@@ -7778,7 +7785,8 @@ def _gate_improvement_order(project_name: str, title: str, refs: Sequence[str],
 def create_improvement_order(project_name: str, title: str, description: str = "",
                              refs: Sequence[str] = (),
                              budget_usd: float | None = None,
-                             origin: str = "jarvis") -> dict[str, Any]:
+                             origin: str = "jarvis",
+                             requestor: str | None = None) -> dict[str, Any]:
     """File an observation for an analyst to investigate"""
     paths = registered_project_paths()
     if project_name not in paths:
@@ -7803,7 +7811,7 @@ def create_improvement_order(project_name: str, title: str, description: str = "
                                            description=description, origin=origin,
                                            budget_usd=budget_usd)
         return _file_improvement_order(store, project_name, title, description, refs,
-                                       budget_usd, origin, decision)
+                                       budget_usd, origin, decision, requestor=requestor)
     finally:
         store.close()
 
@@ -7811,7 +7819,8 @@ def create_improvement_order(project_name: str, title: str, description: str = "
 def _file_improvement_order(store: ProjectStore, project_name: str, title: str,
                             description: str, refs: Sequence[str],
                             budget_usd: float | None, origin: str,
-                            decision: Any) -> dict[str, Any]:
+                            decision: Any, *,
+                            requestor: str | None = None) -> dict[str, Any]:
     """Create the io — now, or when the steward re-offers a queued one (#61)"""
     from . import steward
 
@@ -7824,6 +7833,9 @@ def _file_improvement_order(store: ProjectStore, project_name: str, title: str,
         title=title, description=description, origin=origin,
         kind="improvement",
         metadata=metadata,
+        # A steward stamp (worker filing, or the daemon's re-offer) resolves `os`
+        requestor=requestor or resolve_requestor(
+            store, parent_id=None, metadata=metadata, origin=origin),
         # The family here is the order plus its analyst
         budget_usd=(budget_usd if budget_usd is not None
                     else budget.feature_default_for(_spec_or_none(project_name))))
@@ -7873,7 +7885,7 @@ def file_neo_cleanup(store: ProjectStore, rider: Mapping[str, Any],
             "scope": "correcting the recorded ledger entries this work order names",
             "neo_question_id": question_id,
             "from_wo": from_wo,
-        }}, decision), budget_usd=decision.budget_usd,
+        }}, decision), budget_usd=decision.budget_usd, requestor="os",
     )
     steward.linked(decision, wo["id"], store=store)
     try:
@@ -8465,6 +8477,8 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
     done = {o.get("index") for o in filed}
     created: list[dict[str, Any]] = []
     error = ""
+    # Read here, in the io's project: `target` may be another one (requestor spec §2.2 rule 3)
+    stamp = _requestor_in(name, io_id)
     for i, order in enumerate(f.get("proposed_orders") or []):
         if i in done:
             continue
@@ -8486,13 +8500,15 @@ def _file_finding_orders(name: str, io_id: str, f: dict[str, Any],
             if order_type == "feature":
                 row = create_feature_order(target, order.get("title", ""),
                                            description=description,
-                                           metadata=metadata, budget_usd=budget_usd)
+                                           metadata=metadata, budget_usd=budget_usd,
+                                           requestor=stamp)
             else:
                 row = create_work_order(target, order.get("title", ""),
                                         description=description, parent_id=None,
                                         depends_on=depends or None,
                                         blocked_by=holds or None,
-                                        metadata=metadata, budget_usd=budget_usd)
+                                        metadata=metadata, budget_usd=budget_usd,
+                                        requestor=stamp)
         except OpsError as e:
             error = str(e)
             break
@@ -8896,7 +8912,8 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
                                origin: str = "jarvis",
                                fingerprint: str = "",
                                stamp: Mapping[str, Any] | None = None,
-                               morpheus_item: str = "") -> dict[str, Any]:
+                               morpheus_item: str = "",
+                               requestor: str | None = None) -> dict[str, Any]:
     """Open an investigation into one stuck order; `stamp` is the steward's provenance, when it decided"""
     from . import steward
     paths = registered_project_paths()
@@ -8928,13 +8945,16 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
         )
     store = ProjectStore(paths[project_name])
     try:
+        metadata = {SUBJECT_KEY: subject,
+                    **({STUCK_FINGERPRINT_KEY: fingerprint} if fingerprint else {}),
+                    **({MORPHEUS_ITEM_KEY: morpheus_item} if morpheus_item else {}),
+                    **({steward.STAMP_KEY: dict(stamp)} if stamp else {})}
         return store.create_feature_order(
             title=f"investigate {subject}: {title}"[:200], description=why,
             origin=origin, kind="investigation",
-            metadata={SUBJECT_KEY: subject,
-                      **({STUCK_FINGERPRINT_KEY: fingerprint} if fingerprint else {}),
-                      **({MORPHEUS_ITEM_KEY: morpheus_item} if morpheus_item else {}),
-                      **({steward.STAMP_KEY: dict(stamp)} if stamp else {})},
+            metadata=metadata,
+            requestor=requestor or resolve_requestor(
+                store, parent_id=None, metadata=metadata, origin=origin),
             # The family is this order plus its one investigator, so the family arithmetic is already correct
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.investigation_default_for(
@@ -10715,7 +10735,8 @@ def _stop_family(name: str, path: Path, fo: dict[str, Any], *, status: str = "ca
 
 def create_decision_order(project_name: str, title: str, description: str,
                           budget_usd: float | None = None,
-                          origin: str = "jarvis") -> dict[str, Any]:
+                          origin: str = "jarvis",
+                          requestor: str | None = None) -> dict[str, Any]:
     """`jarvis do create` — the researcher sees only `description`"""
     paths = registered_project_paths()
     if project_name not in paths:
@@ -10732,7 +10753,10 @@ def create_decision_order(project_name: str, title: str, description: str,
     try:
         return store.create_feature_order(title=title, description=description,
                                           origin=origin, kind="decision",
-                                          budget_usd=budget_usd)
+                                          budget_usd=budget_usd,
+                                          requestor=requestor or resolve_requestor(
+                                              store, parent_id=None, metadata=None,
+                                              origin=origin))
     finally:
         store.close()
 
@@ -10963,6 +10987,8 @@ def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | Non
     paths = registered_project_paths()
     filed: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    # From the do's own project: `target` may be another one (requestor spec §2.2 rule 3)
+    stamp = _requestor_in(name, do_id)
     for key in (k for k in wanted if k not in skipped):
         p = by_key[key]
         kind = as_ or p.get("as") or "wo"
@@ -10977,7 +11003,8 @@ def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | Non
                                f"{'|'.join(_FOLLOWUP_AS)}")
             if kind == "fo":
                 row = create_feature_order(target, title, description=description,
-                                           metadata={ORIGIN_DO_KEY: do_id})
+                                           metadata={ORIGIN_DO_KEY: do_id},
+                                           requestor=stamp)
             elif kind == "backlog":
                 if target not in paths:
                     raise OpsError(f"project {target!r} not registered (known: "
@@ -10994,7 +11021,8 @@ def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | Non
                     central.close()
             else:
                 row = create_work_order(target, title, description=description,
-                                        parent_id=None, metadata={ORIGIN_DO_KEY: do_id})
+                                        parent_id=None, metadata={ORIGIN_DO_KEY: do_id},
+                                        requestor=stamp)
         except (OpsError, KeyError) as e:
             errors.append({"key": key, "error": str(e)})
             continue
@@ -11155,6 +11183,8 @@ def resume_feature_order(fo_id: str, fix: str = "",
             child = store.create_work_order(
                 title=title, description=fix, origin="jarvis", kind="worker",
                 parent_id=fo_id,
+                requestor=resolve_requestor(store, parent_id=fo_id, metadata=None,
+                                            origin="jarvis"),
             )
         return {"project": name, "fo_id": fo_id, "title": fo["title"],
                 "status": "executing",
@@ -12675,12 +12705,30 @@ _REQUESTOR_LABELS = {"fleet_health": "fleet health", "neo": "neo rider"}
 
 
 def requestor(store: Any, wo: dict[str, Any]) -> Requestor:
-    """Whether a person asked for this work; the ROOT decides (fo-eaf1a59a spec §2.1)"""
+    """Whether a person asked for this work: the stamped column, else the ROOT (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2.3)"""
+    stamped = wo.get("requestor")
+    if stamped == "user":
+        return Requestor("user", "you")
+    walked = _walked_requestor(store, wo)
+    if stamped == "os" and walked.kind != "os":
+        return Requestor("os", "os")
+    return walked
+
+
+def _walked_requestor(store: Any, wo: dict[str, Any]) -> Requestor:
+    """The pre-stamp answer, for a NULL row and for an `os` row's label (fo-eaf1a59a spec §2.1)"""
     from . import steward
 
     row, is_wo, seen = wo, True, {wo.get("id")}
-    while row.get("parent_id"):
-        pid = row["parent_id"]
+    while True:
+        pid = row.get("parent_id")
+        via_io = not pid
+        if via_io:
+            # A legacy finding order has no parent: its io is its root (requestor spec §2.3)
+            meta = db.from_json(row.get("metadata"), {}) or {}
+            pid = meta.get(ORIGIN_IO_KEY) if isinstance(meta, dict) else None
+            if not pid:
+                break
         if pid in seen:
             log.warning("requestor: parent cycle at %s under %s; reads as os", pid, wo.get("id"))
             return Requestor("os", "os")
@@ -12689,6 +12737,10 @@ def requestor(store: Any, wo: dict[str, Any]) -> Requestor:
         try:
             row, is_wo = store.get_feature_order(pid), False
         except KeyError:
+            if via_io:
+                log.warning("requestor: origin io %s of %s not in this project; reads as os",
+                            pid, wo.get("id"))
+                return Requestor("os", "os")
             try:
                 row, is_wo = store.get_work_order(pid), True
             except KeyError:
@@ -12708,6 +12760,56 @@ def requestor(store: Any, wo: dict[str, Any]) -> Requestor:
     origin = row.get("origin")
     return Requestor("os", _REQUESTOR_LABELS.get(origin, origin)
                      if origin in _SELF_ORIGINS else "os")
+
+
+def interactive_requestor() -> str:
+    """`os` inside a worker session, else `user`: a person's terminal or browser has no JARVIS_WO_ID"""
+    return "os" if os.environ.get(WORKER_SESSION_ENV) else "user"
+
+
+def _stamp_of_row(store: Any, row: dict[str, Any]) -> str:
+    """A row's column, or the walk's verdict for a NULL (legacy) row"""
+    return row.get("requestor") or requestor(store, row).kind
+
+
+def _requestor_in(project_name: str, order_id: str) -> str | None:
+    """The stamp of `order_id` read in its OWN project, or None when it is not there"""
+    path = registered_project_paths().get(project_name)
+    if path is None:
+        return None
+    store = ProjectStore(path)
+    try:
+        return _stamp_of_row(store, store.get_feature_order(order_id))
+    except KeyError:
+        log.warning("requestor: %s not in %s; the order filed from it resolves alone",
+                    order_id, project_name)
+        return None
+    finally:
+        store.close()
+
+
+def resolve_requestor(store: Any, *, parent_id: str | None,
+                      metadata: Mapping[str, Any] | None, origin: str) -> str:
+    """Who asked, rules 2-5, decided ONCE at create (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2.2)"""
+    from . import steward
+
+    meta = metadata or {}
+    linked = [(parent_id, True)] if parent_id else []
+    linked += [(meta.get(k), False) for k in (ORIGIN_IO_KEY, ORIGIN_DO_KEY) if meta.get(k)]
+    for ref, may_be_wo in linked:
+        try:
+            row = store.get_feature_order(ref)
+        except KeyError:
+            if not may_be_wo:
+                continue  # another project's io: its caller passes the stamp explicitly
+            try:
+                row = store.get_work_order(ref)
+            except KeyError:
+                continue
+        return _stamp_of_row(store, row)
+    if origin in _SELF_ORIGINS or meta.get(steward.STAMP_KEY):
+        return "os"
+    return interactive_requestor()
 
 
 def wo_tags(wo: dict[str, Any], project: str) -> list[str]:
@@ -18678,7 +18780,7 @@ def release_cut(base: str, project: str = "") -> dict[str, Any]:
     wo = create_work_order(
         project, f"Ship a release: {len(shipped)} commit(s) up to {base[:8]}",
         description=_release_brief(overview, lines, "<your work-order id>", base),
-        origin="ui", metadata=meta)
+        origin="ui", metadata=meta, requestor="user")  # only the /release page cuts one
     store = ProjectStore(registered_project_paths()[project])
     try:
         store.update_work_order(wo["id"], description=_release_brief(overview, lines,
