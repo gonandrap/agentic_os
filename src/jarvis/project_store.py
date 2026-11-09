@@ -1051,6 +1051,7 @@ CREATE TABLE IF NOT EXISTS internal_follow_ups (
     file TEXT NOT NULL DEFAULT '',
     symbol TEXT NOT NULL DEFAULT '',
     failure TEXT NOT NULL DEFAULT '',
+    level TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     UNIQUE (digest, unit_id)
 );
@@ -1089,6 +1090,10 @@ CREATE INDEX IF NOT EXISTS idx_preconditions_open ON preconditions(wo_id, status
 
 # Columns added after the first release
 ADDED_COLUMNS = {
+    "internal_follow_ups": {
+        # The seat's severity: Morpheus arms only medium and up as failure shapes (io-b42dfb75)
+        "level": "TEXT NOT NULL DEFAULT ''",
+    },
     "notifications": {
         # The attention reason raised WITH this notification, carried to the central inbox (io-d2a5dd69)
         "paired_reason": "TEXT",
@@ -1847,15 +1852,15 @@ class ProjectStore:
     def record_internal_follow_up(self, digest: str, unit_id: str, *, round: int = 0,
                                   seat: str = "", title: str = "", detail: str = "",
                                   file: str = "", symbol: str = "",
-                                  failure: str = "") -> bool:
+                                  failure: str = "", level: str = "") -> bool:
         """Keep a follow-up whose text may not be published"""
         with db.write_transaction(self.conn):
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO internal_follow_ups "
                 "(digest, unit_id, round, seat, title, detail, file, symbol, failure, "
-                " created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " level, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (digest, unit_id, round, seat, title, detail, file, symbol, failure,
-                 db.now()))
+                 level, db.now()))
             return cur.rowcount > 0
 
     def internal_follow_ups(self, unit_id: str | None = None) -> list[dict[str, Any]]:

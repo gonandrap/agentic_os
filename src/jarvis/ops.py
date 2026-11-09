@@ -2967,7 +2967,8 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
                 detail=str(finding.get("detail") or ""),
                 file=str(finding.get("file") or ""),
                 symbol=str(finding.get("symbol") or ""),
-                failure=str(finding.get("failure") or ""))
+                failure=str(finding.get("failure") or ""),
+                level=str(finding.get("level") or ""))
             payload["withheld"].append({"digest": digest, "title": key, "seat": seat})
         if payload["withheld"]:
             payload["reason"] = (f"{repo or 'the project'} is not a repository this OS "

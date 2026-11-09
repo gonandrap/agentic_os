@@ -1241,6 +1241,15 @@ def _arm_prompt(item: dict[str, Any]) -> str:
              f"## Order {item['id']} — {item.get('project') or '?'}: {title}"
              + (f"\n{item['pr_url']}" if item.get("pr_url") else ""),
              f"What to watch:\n{what[:4000]}"]
+    shapes = item.get("failure_shapes") or ()
+    if shapes:
+        parts.append(
+            "Every reviewer of this change kept these risks as its own failure signatures. "
+            "Check each too: when production shows one, print a FAIL line naming it and "
+            "exit 1:\n" + "\n".join(
+                f"- {s['title']}" + (f" ({s['file']})" if s.get("file") else "")
+                + (f": {s['failure'][:600]}" if s.get("failure") else "")
+                for s in shapes))
     if item.get("rewrite_brief"):
         parts.append("A REWRITE: its previous script was ruled wrong, not the change. Write one "
                      f"that avoids this:\n{item['rewrite_brief']}")
@@ -1248,6 +1257,38 @@ def _arm_prompt(item: dict[str, Any]) -> str:
         parts.append("The user wrote this script. Return it unchanged if it keeps the contract; "
                      f"change it only where it does not:\n{item['script'][:4000]}")
     return "\n\n".join(parts)
+
+
+#: Most kept follow-ups one arming brief carries as failure shapes (io-b42dfb75)
+MAX_FAILURE_SHAPES = 3
+
+
+def kept_failure_shapes(catalog: Catalog, item: dict[str, Any]) -> list[dict[str, Any]]:
+    """The order's kept panel follow-ups, medium and up, one per title, at most 3"""
+    from .project_store import ProjectStore
+    from .steward import severity_rank
+
+    wo_id, project = item.get("wo_id") or "", item.get("project") or ""
+    if not wo_id or not project:
+        return []
+    try:
+        store = ProjectStore(catalog.project(project).path)
+    except Exception:  # noqa: BLE001 — a brief without shapes still arms the order
+        log.warning("morpheus arm %s: could not read %s's kept follow-ups", item["id"], project)
+        return []
+    try:
+        rows = store.internal_follow_ups(wo_id)
+    finally:
+        store.close()
+    medium, out, seen = severity_rank("medium"), [], set()
+    for row in rows:
+        title = " ".join(str(row["title"] or "").split())
+        # An empty level predates the column: counted as medium (Q3821)
+        if not title or title.lower() in seen or severity_rank(row["level"] or "") < medium:
+            continue
+        seen.add(title.lower())
+        out.append({"title": title, "file": row["file"] or "", "failure": row["failure"] or ""})
+    return out[:MAX_FAILURE_SHAPES]
 
 
 def _arm_reply(data: dict[str, Any]) -> dict[str, str]:
@@ -1407,6 +1448,7 @@ def arm(central: CentralStore, catalog: Catalog, cwd_for: CwdFor, *,
         return {"usage_held": 1}
     out = {"armed": 0, "refused": 0, "failed": 0, "killed": 0}
     for item in owed_arming(central, now=now, skip=skip):
+        item = {**item, "failure_shapes": kept_failure_shapes(catalog, item)}
         try:
             reply = run_session(central, catalog, item, purpose="arm",
                                 cwd=_cwd(cwd_for, item), call=call)
