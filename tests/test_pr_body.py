@@ -17,6 +17,14 @@ SKILL_TEMPLATE = SKILL / "pull_request_template.md"
 WO = {"JARVIS_WO_ID": "wo-1234abcd"}
 
 
+@pytest.fixture(autouse=True)
+def _public_repos(monkeypatch):
+    """Every repo public unless a test says otherwise: no `gh` call from a unit test"""
+    from jarvis import issues
+
+    monkeypatch.setattr(issues, "repo_is_private", lambda repo: False)
+
+
 def _body(**sections: str) -> str:
     """A body with every required section, overriding the ones named"""
     filled = {
@@ -66,9 +74,12 @@ def test_the_skill_names_the_hook_and_the_bare_ref_rule():
     assert "item 2 of the work order" in skill
     for section in hooks.PR_BODY_SECTIONS:
         assert section in skill
-    # ...and the URL form the image rule demands, with the check that proves it resolves
+    # ...and the URL form the image rule demands, per visibility, with a check that fails loudly
     assert "raw.githubusercontent.com" in skill
-    assert "curl" in skill
+    assert "blob/<COMMIT-SHA>/" in skill and "?raw=true" in skill
+    assert "gh api" in skill
+    template = SKILL_TEMPLATE.read_text()
+    assert "?raw=true" in template
 
 
 def test_the_skill_and_its_template_reach_a_worker(tmp_path):
@@ -184,6 +195,29 @@ def test_a_relative_image_is_denied_with_the_raw_url_named(target):
 ])
 def test_a_renderable_or_unrendered_image_passes(text):
     assert hooks.pr_body_problems(_body(Screenshots=text)) == []
+
+
+def test_a_raw_image_on_a_private_repo_is_denied_with_the_blob_form_named(monkeypatch):
+    """PR 7 on shared_schedule: every raw.githubusercontent image 404'd for its own members"""
+    from jarvis import issues
+
+    asked = []
+    monkeypatch.setattr(issues, "repo_is_private", lambda repo: asked.append(repo) or True)
+    shot = "![a](https://raw.githubusercontent.com/o/r/abc123/docs/screenshots/a.png)"
+
+    [problem] = hooks.pr_body_problems(_body(Screenshots=shot))
+
+    assert asked == ["o/r"]
+    assert "https://github.com/o/r/blob/abc123/docs/screenshots/a.png?raw=true" in problem
+
+
+def test_a_private_repo_image_in_the_blob_form_passes(monkeypatch):
+    from jarvis import issues
+
+    monkeypatch.setattr(issues, "repo_is_private", lambda repo: True)
+    shot = "![a](https://github.com/o/r/blob/abc123/docs/screenshots/a.png?raw=true)"
+
+    assert hooks.pr_body_problems(_body(Screenshots=shot)) == []
 
 
 def test_the_first_broken_image_is_the_one_reported():
