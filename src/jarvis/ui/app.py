@@ -3036,7 +3036,8 @@ def create_app() -> FastAPI:
         return RedirectResponse(f"/wo/{result['project']}/{result['wo_id']}", status_code=303)
 
     # Last: its `{section}` catch-all must not shadow `/onboard/{name}/review` (spec 2026-11-09 §0.3)
-    from . import onboard_pages
+    from . import onboard_index, onboard_pages
+    onboard_index.register(app, render)
     onboard_pages.register(app, render)
 
     return app
