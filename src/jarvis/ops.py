@@ -3288,11 +3288,11 @@ AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed
 AUTOMERGE_TERMINAL = "automerge_merged"
 
 
-def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
-                                open_end: float) -> list[tuple[float, float]]:
-    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
+def automerge_hold_spans(events: Iterable[Any], since: float, now: float,
+                         open_end: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` the OS held a merge on a turn-keeping hold (issue 1655)"""
     from . import db
-    from .automerge import HELD_CHECKS_RUNNING
+    from .automerge import keeps_turn
 
     rows = sorted(events, key=lambda e: float(e["ts"]))
     spans: list[tuple[float, float]] = []
@@ -3300,7 +3300,7 @@ def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
         if str(e["kind"]) != "automerge_held":
             continue
         payload = db.from_json(e["payload"], {}) or {}
-        if str(payload.get("code") or "") != HELD_CHECKS_RUNNING:
+        if not keeps_turn(payload):
             continue
         nxt = next((r for r in rows[n + 1:] if str(r["kind"]) in AUTOMERGE_EVENTS), None)
         # Nothing dates the end of an open hold but the horizon (§4)
@@ -9594,13 +9594,19 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                                 and release.is_release_order(wo)))
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
                           if held_by_red_base else [])
-        # A MERGE THE OS IS ITSELF HOLDING FOR GITHUB'S RUNNING CHECKS IS NOT STUCK (§2 and §3 of...
-        automerge_checks_held, automerge_spans, am_note = False, [], ""
+        # A MERGE THE OS HOLDS ON A TURN-KEEPING HOLD IS NOT STUCK (issue 1655)
+        merge_hold_cause, automerge_spans, am_note = "", [], ""
         if wo["status"] == "waiting_pr_merge":
-            am_note = invariants.automerge_checks_note(automerge_state(pstore, wo))
-            automerge_checks_held = bool(am_note) and base_red_until >= now
+            am_state = automerge_state(pstore, wo)
+            am_note = invariants.automerge_hold_note(am_state)
+            # A moved head the OS declined to re-judge is the user's call, not a designed wait
+            if (am_note and base_red_until >= now
+                    and not invariants.rejudge_exhausted(pstore, wo)
+                    and not invariants.rebind_exhausted(pstore, wo)):
+                merge_hold_cause = stuck.AUTOMERGE_HOLD_CAUSES.get(
+                    str((am_state or {}).get("code") or ""), "")
             # `events_of_kind` takes ONE kind
-            automerge_spans = automerge_checks_hold_spans(
+            automerge_spans = automerge_hold_spans(
                 [e for k in AUTOMERGE_EVENTS
                  for e in pstore.events_of_kind(wo["id"], k)],
                 since, now, base_red_until)
@@ -9677,7 +9683,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else stuck.BASE_RED_CAUSE
                             if base_red and held_by_red_base
                             # AFTER the red base and BEFORE the dependency: the first two CAN co-occur
-                            else stuck.AUTOMERGE_CHECKS_CAUSE if automerge_checks_held
+                            else merge_hold_cause if merge_hold_cause
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE
                             if wo["status"] == budget.EXHAUSTED
