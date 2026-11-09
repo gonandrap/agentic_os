@@ -11729,6 +11729,22 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
     return {"question_id": question_id, "delivery": delivery}
 
 
+def asked_questions(events: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Neo's live row for every question these events name, by id (io-7bed6603)"""
+    from .neo_store import NeoStore
+    from .timeline import QUESTION_ESCALATED, _neo_question_id, _payload
+
+    ids = {_neo_question_id(_payload(e)) for e in events
+           if e.get("kind") in ("question_asked", QUESTION_ESCALATED)} - {None}
+    if not ids:
+        return {}
+    neo = NeoStore()
+    try:
+        return {i: row for i in ids if (row := neo.get(i))}
+    finally:
+        neo.close()
+
+
 # -- gates (privileged-action approvals)
 
 def _project_gate_config(project_name: str):

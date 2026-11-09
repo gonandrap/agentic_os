@@ -372,6 +372,29 @@ def test_the_conversation_carries_the_question_the_worker_asked():
     assert convo[0]["ref"] == {"kind": "neo_question", "id": 7, "label": "question #7"}
 
 
+def test_an_escalation_with_no_event_is_synthesised_from_the_live_row():
+    """io-7bed6603: pre-change escalations carry no event; the live row still shows the ask"""
+    ask = ev("question_asked", 1.0, neo_question_id=7, question="rotate the key?")
+    later = {"id": 3, "ts": 2.0, "direction": "user_to_agent", "source": "neo",
+             "content": "later", "status": "delivered"}
+    live = {7: {"status": "escalated", "answer_reason": "r"}}
+
+    convo = build_conversation([ask], [later], live)
+    assert [c["kind"] for c in convo] == ["question", "escalation", "message"]
+    esc = convo[1]
+    assert (esc["who"], esc["anchor"], esc["status"]) == ("Neo → you", "esc-7", "escalated")
+    assert "r" in esc["content"]
+
+    # (a) the event wins: one escalation turn, not two
+    event = ev("question_escalated", 1.5, neo_question_id=7, reason="r", failed=False)
+    assert [c["kind"] for c in build_conversation([ask, event], [], live)].count(
+        "escalation") == 1
+    # (b) an answered question asks nothing
+    answered = {7: {"status": "answered", "answer_reason": "r"}}
+    assert not [c for c in build_conversation([ask], [], answered)
+                if c["kind"] == "escalation"]
+
+
 def test_the_conversation_is_ordered_by_when_it_was_said():
     """Questions and messages interleave — they are turns in one exchange"""
     events = [ev("question_asked", 3.0, neo_question_id=7, question="second"),
