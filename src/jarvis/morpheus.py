@@ -1061,7 +1061,8 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
     if live:
         return live, ""
     inv =ops.create_investigation_order(project, wo_id, why=_why(item), origin="jarvis",
-                                         stamp=decision.stamp, morpheus_item=item["id"])
+                                         stamp=decision.stamp, morpheus_item=item["id"],
+                                         requestor="os")
     return str(inv["id"]), ""
 
 
@@ -1080,7 +1081,8 @@ def _improve(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
         return "", f"the steward did not dispatch it ({decision.outcome}: {decision.reason})"
     try:
         io = ops.create_improvement_order(project, title, description=_why(item),
-                                          refs=(item["pr_url"],), origin="morpheus")
+                                          refs=(item["pr_url"],), origin="morpheus",
+                                          requestor="os")
     except Exception as e:  # noqa: BLE001 — Neo still gets the item
         return "", f"the improvement order could not be filed ({e})"
     return str(io["id"]), ""
