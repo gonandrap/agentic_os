@@ -394,7 +394,7 @@ DECISION_EXPERIMENT_STARTED_EVENT = "decision_experiment_started"
 DECISION_FORECAST_EVENT = "decision_forecast_submitted"
 DECISION_EXPERIMENT_GO_EVENT = "decision_experiment_go"
 DECISION_ATTACHED_EVENT = "decision_attached"
-#: `feature_orders.metadata` key, never `plan`: a report submission replaces `plan` whole (same spec §2)
+#: Lives in `metadata`, never `plan`: a report submission replaces `plan` whole
 EXPERIMENTS_KEY = "experiments"
 
 
