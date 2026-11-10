@@ -20,7 +20,7 @@ SYNTH_HOME = "/tmp/jarvis-spikeart-home"
 CATALOG = os.environ.get("SPIKE_CATALOG", "/home/gonzalo/workspace/production/config/catalog.json")  # read only
 CWD = Path(os.environ.get("SPIKE_CWD") or os.getcwd()).resolve()
 STATE = CWD / ".jarvis" / "scratch" / "spikeart-state.json"
-POLL_MODEL = "haiku"
+POLL_MODEL = os.environ.get("SPIKE_POLL_MODEL", "haiku") or None  # "" = CLI default
 
 
 def _scrub_env() -> None:
