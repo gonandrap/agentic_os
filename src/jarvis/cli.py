@@ -4652,6 +4652,9 @@ def cmd_do(args: argparse.Namespace) -> int:
             from . import decision_report
 
             print(f"\n{decision_report.render_report(detail['report'])}")
+            if detail["experiments"]:
+                print("\n" + decision_report.render_experiments(detail["id"],
+                                                               detail["experiments"]))
             for f in detail["followups"]:
                 print(f"filed: {f['key']} as {f['as']} {f['id']} ({_age(f['at'])})")
 
