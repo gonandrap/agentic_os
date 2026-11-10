@@ -486,6 +486,12 @@ def test_os_status_carries_every_kind_in_one_list(started, store):
     # A kind-aware label, through the one mapping: `planning` means "analysing" here
     assert by_id[io["id"]]["status_label"] == "analysing"
     assert by_id[fo["id"]]["status_label"] == "pending"
+    # Newest entry into its status first (docs/superpowers/specs/2026-11-09-filtered-views-newest-first.md §3)
+    assert [r["id"] for r in rows] == [io["id"], fo["id"]]
+    assert by_id[io["id"]]["status_since"] >= by_id[fo["id"]]["status_since"] > 0
+    wo = ops.create_work_order("proj_a", "a work order")
+    open_wos = ops.os_status()["projects"][0]["open_work_orders"]
+    assert {r["id"]: r["status_since"] for r in open_wos}[wo["id"]] > 0
 
 
 def test_the_two_settle_passes_name_their_kind_explicitly():

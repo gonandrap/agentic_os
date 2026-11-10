@@ -1468,6 +1468,27 @@ def claim_sql_selects(store: ProjectStore, wo: dict[str, Any],
     return refusal is None or refusal.delayed
 
 
+def _status_since(table: str) -> str:
+    """When the row entered its status (docs/superpowers/specs/2026-11-09-filtered-views-newest-first.md §2)"""
+    # Correlated on order_id so it stays a seek on idx_state_spans_order
+    return (f"COALESCE((SELECT MAX(s.ts) FROM wo_state_spans s WHERE s.order_id = {table}.id),"
+            f" {table}.created_at) AS status_since")
+
+
+# A closed set: the value is interpolated into SQL
+_ORDER_CLAUSES = {
+    "created_at": "created_at DESC",
+    "status_since": "status_since DESC, created_at DESC, id DESC",
+}
+
+
+def _order_clause(order_by: str) -> str:
+    try:
+        return _ORDER_CLAUSES[order_by]
+    except KeyError:
+        raise ValueError(f"order_by must be one of {sorted(_ORDER_CLAUSES)}: {order_by!r}") from None
+
+
 class ProjectStore:
     def __init__(self, project_path: str | Path):
         self.project_path = Path(project_path)
@@ -2014,6 +2035,7 @@ class ProjectStore:
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,
         include_hidden: bool = False,
         active_between: tuple[float, float] | None = None,
+        order_by: str = "created_at",
     ) -> list[dict[str, Any]]:
         """Work orders, newest first (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
         conds, params = [], []
@@ -2029,7 +2051,8 @@ class ProjectStore:
             params.extend(active_between)
         where = f" WHERE {' AND '.join(conds)}" if conds else ""
         rows = self.conn.execute(
-            f"SELECT * FROM work_orders{where} ORDER BY created_at DESC LIMIT ?",
+            f"SELECT *, {_status_since('work_orders')} FROM work_orders{where}"
+            f" ORDER BY {_order_clause(order_by)} LIMIT ?",
             (*params, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
@@ -2608,7 +2631,8 @@ class ProjectStore:
 
     def list_feature_orders(self, statuses: tuple[str, ...] | None = None,
                             limit: int = 200,
-                            kind: str | None = "feature") -> list[dict[str, Any]]:
+                            kind: str | None = "feature",
+                            order_by: str = "created_at") -> list[dict[str, Any]]:
         """`kind` DEFAULTS to 'feature', and that default is the whole point: nothing read this column before..."""
         clauses, params = [], []
         if statuses:
@@ -2619,7 +2643,8 @@ class ProjectStore:
             params.append(kind)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.conn.execute(
-            f"SELECT * FROM feature_orders{where} ORDER BY created_at DESC LIMIT ?",
+            f"SELECT *, {_status_since('feature_orders')} FROM feature_orders{where}"
+            f" ORDER BY {_order_clause(order_by)} LIMIT ?",
             (*params, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)

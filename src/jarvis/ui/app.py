@@ -304,6 +304,14 @@ def attention_first(rows: Iterable[dict], needs_you: Callable[[dict], bool]) -> 
     return sorted(rows, key=lambda r: not needs_you(r))
 
 
+def newest_first(rows: Iterable[dict], key: Callable[[dict], float | None],
+                 pins: Sequence[Callable[[dict], bool]] = ()) -> list[dict]:
+    """Newest first; `pins` lead in tiers on an open view (docs/superpowers/specs/2026-11-09-filtered-views-newest-first.md §2)"""
+    # reverse=True is still stable; a None/0 key reads as 0 and so sorts last
+    by_time = sorted(rows, key=lambda r: key(r) or 0, reverse=True)
+    return sorted(by_time, key=lambda r: tuple(not p(r) for p in pins))
+
+
 def _offset_param(raw: str) -> int:
     """`?offset=` as an int, refused in the OS's own vocabulary rather than by FastAPI (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
     if not raw:

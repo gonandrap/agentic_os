@@ -306,6 +306,31 @@ def test_status_counts_are_not_capped_by_the_listing_limit(project):
     assert len(store.list_work_orders(limit=2)) == 2  # the listing still pages
 
 
+def test_status_since_orders_by_entry_into_the_status_before_the_limit(project):
+    """docs/superpowers/specs/2026-11-09-filtered-views-newest-first.md §3"""
+    store = ProjectStore(project)
+    old = store.create_work_order("created long ago, settled just now")["id"]
+    young = store.create_work_order("created yesterday, settled yesterday")["id"]
+    bare = store.create_work_order("no spans")["id"]
+    for oid, created, settled in ((old, 100.0, 900.0), (young, 500.0, 600.0), (bare, 700.0, None)):
+        store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?", (created, oid))
+        store.conn.execute("DELETE FROM wo_state_spans WHERE order_id=?", (oid,))
+        if settled:
+            store.conn.execute("INSERT INTO wo_state_spans (order_id, order_kind, to_status, ts)"
+                               " VALUES (?, 'wo', 'completed', ?)", (oid, settled))
+    fo = store.create_feature_order("a feature")["id"]
+    store.conn.commit()
+
+    rows = store.list_work_orders(order_by="status_since")
+    assert [r["id"] for r in rows] == [old, bare, young]
+    assert [r["status_since"] for r in rows] == [900.0, 700.0, 600.0]
+    assert [r["id"] for r in store.list_work_orders(order_by="status_since", limit=1)] == [old]
+    assert [r["id"] for r in store.list_work_orders()] == [bare, young, old]
+    assert store.list_feature_orders(order_by="status_since")[0]["id"] == fo
+    with pytest.raises(ValueError):
+        store.list_work_orders(order_by="updated_at")
+
+
 # -- the validation panel's storage
 
 
