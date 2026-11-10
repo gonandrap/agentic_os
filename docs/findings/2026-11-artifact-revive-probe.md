@@ -61,4 +61,7 @@ Removal: **2026-11-10T14:46:45Z**. Watch dies with the process; no session holds
 
 ## Q2-Q4
 
-Pending the user's comment (order parked). Filled in below once measured.
+Pending the user's comment. Park path: `jarvis wo finish --needs-user` (with or without
+`--pr`) landed the order in `validating`, not parked (bug wo-733e6ae2); per Neo
+question 4201 the step was raised to the user in the turn's final message (a push
+notification was refused: `Not sent — this terminal is active`).
