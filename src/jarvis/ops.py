@@ -9583,9 +9583,10 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .central_store import base_red_hold_spans
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
-                                UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                dependency_hold_spans, manager_idle_hold_spans,
-                                plan_hold_spans, precondition_hold_spans,
+                                SPEC_PR_EVENT_KINDS, UNGOVERNED_ORIGINS,
+                                VALIDATION_CI_CAUSE, dependency_hold_spans,
+                                manager_idle_hold_spans, plan_hold_spans,
+                                precondition_hold_spans, spec_pr_hold_spans,
                                 validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -9642,20 +9643,29 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 since, now, base_red_until)
         # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of...
         plan_held, plan_spans = False, []
+        # ... AND NEITHER IS ONE HELD BY ITS FEATURE'S UNMERGED SPEC PR (issue 1681, kn-0a222b38)
+        spec_held, spec_spans = False, []
         if (wo["status"] == "pending" and wo.get("parent_id")
                 and wo.get("kind") == "worker"):
             plan_held = bool(pstore.plan_hold(wo))
+            spec_held = bool(pstore.spec_hold(wo))
             try:
                 planner_id = pstore.get_feature_order(
                     str(wo["parent_id"])).get("plan_wo_id")
+                planner = pstore.get_work_order(str(planner_id)) if planner_id else None
             except KeyError:
-                planner_id = None  # the feature was deleted out from under the child
-            if planner_id:
+                planner = None  # the feature or planner was deleted out from under the child
+            if planner:
                 # `events_of_kind` takes ONE kind
                 plan_spans = plan_hold_spans(
                     sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
                             for e in pstore.events_of_kind(str(planner_id), k)),
                            key=lambda e: float(e["ts"])), since, now)
+                spec_spans = spec_pr_hold_spans(
+                    [e for k in SPEC_PR_EVENT_KINDS
+                     for e in pstore.events_of_kind(str(planner_id), k)],
+                    pstore.state_spans(str(planner_id)), str(planner["status"]),
+                    since, now)
         # AN ORDER HELD BY AN OPEN PRECONDITION IS NOT STUCK (§2
         pre_held, pre_spans = False, []
         if wo["status"] == "pending":
@@ -9681,7 +9691,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans + automerge_spans
+            + ci_spans + base_red_spans + plan_spans + spec_spans + automerge_spans
             + budget_spans + pre_spans + dep_spans + idle_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
@@ -9733,6 +9743,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact about one feature's plan
                             else stuck.PLAN_ASSUMPTION_CAUSE if plan_held
+                            # Below the plan hold: that one names a ruling only the user can give
+                            else stuck.SPEC_PR_CAUSE if spec_held
                             # `running`-only, so it collides with nothing but the usage window above
                             else stuck.BACKGROUND_TASK_CAUSE if awaits_task else ""),
             kind=str(wo.get("kind") or "worker"),
