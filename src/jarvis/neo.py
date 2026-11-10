@@ -92,7 +92,8 @@ RESEARCHER_RULE = (
     "RULE FOR THIS QUESTION: the asker is the RESEARCHER of a decision order — it gathers "
     "data for a decision the USER takes. A question asking which option to take, whether "
     "to proceed, or to approve anything on the user's behalf MUST be escalated "
-    "(\"escalate\": true), never answered. Answer only questions about how to gather or "
+    "(\"escalate\": true), never answered. Whether to run an experiment, or how big to "
+    "make it, is the user's call too. Answer only questions about how to gather or "
     "present the data.")
 
 
