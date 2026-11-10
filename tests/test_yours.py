@@ -82,9 +82,9 @@ def test_a_pending_user_assumption_or_owed_action_needs_you(store):
     owed = store.create_work_order("deploy", requestor="user", status="needs_review")
     store.add_event(owed["id"], "finished", {"needs_user": "jarvis wo done x"})
     assert ops.request_state("proj_a", owed["id"]) == "needs_you"
-    # Carried out and closed: the old declaration owes nothing now
+    # Closed is not carried out: a completed node's owed action still needs you
     store.set_status(owed["id"], "completed")
-    assert ops.request_state("proj_a", owed["id"]) == "done_unseen"
+    assert ops.request_state("proj_a", owed["id"]) == "needs_you"
 
 
 def test_mark_seen_moves_only_a_user_row(store):

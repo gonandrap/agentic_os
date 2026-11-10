@@ -13165,8 +13165,8 @@ def _request_state(tree: RequestTree, stores: _Stores) -> str:
         store, wo = found
         if invariants.reviewable_assumptions(store, wo):
             return "needs_you"
-        # A finished order's old declaration was the user's to run and is history now
-        if not node.terminal and declared_user_action(store, node.id):
+        # Any node, terminal too: a merged order can still owe a deploy (spec §6.2)
+        if declared_user_action(store, node.id):
             return "needs_you"
     if not tree.settled:
         return "running"
