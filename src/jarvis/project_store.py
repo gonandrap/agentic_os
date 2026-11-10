@@ -2862,7 +2862,11 @@ class ProjectStore:
             "SELECT wo_id, CASE WHEN json_valid(payload) "
             "THEN json_extract(payload, '$.root_id') END AS root_id "
             "FROM wo_events WHERE kind='request_settled'").fetchall()
-        return {r["root_id"] or r["wo_id"] for r in rows}
+        # A tree with no work order to hold the event is marked by its notice alone (Q4068)
+        told = self.conn.execute(
+            "SELECT wo_id FROM notifications WHERE source='request' AND wo_id IS NOT NULL"
+        ).fetchall()
+        return {r["root_id"] or r["wo_id"] for r in rows} | {r["wo_id"] for r in told}
 
     def orders_with_origin(self, key: str, value: str) -> list[dict[str, Any]]:
         """Rows of both tables whose `metadata[key]` is `value`, oldest first"""

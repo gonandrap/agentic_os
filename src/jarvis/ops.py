@@ -5972,16 +5972,9 @@ def settle_in_session(store: ProjectStore, wo: dict[str, Any], event: str, *,
 COMPLETED_TAIL_CHARS = 1200
 
 
-def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int | None:
-    """Tell the user an order THEY opened settled, with its result and final-message tail (issue 1385)"""
-    from .project_store import UNGOVERNED_ORIGINS
-
-    if launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS:
-        return None
-    fresh = store.get_work_order(wo["id"]) or wo
-    said = [str(fresh.get("result_summary") or "No summary on record.")]
-    if fresh.get("pr_url"):
-        said.append(f"Pull request: {fresh['pr_url']}")
+def completion_lines(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
+    """Summary, owed user action, final-message tail of one settled work order"""
+    said = [str(wo.get("result_summary") or "No summary on record.")]
     owed = declared_user_action(store, wo["id"])
     if owed:
         said.append(f"Still yours to run: `{owed}`")
@@ -5991,6 +5984,21 @@ def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int |
         tail = last if len(last) <= COMPLETED_TAIL_CHARS else "…" + last[-COMPLETED_TAIL_CHARS:]
         # Open offers and gaps in the final message die with the session unless they reach the user
         said.append(f"Worker's final message (end):\n{tail}")
+    return said
+
+
+def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int | None:
+    """Tell the user an order THEY opened settled, with its result and final-message tail (issue 1385)"""
+    from .project_store import UNGOVERNED_ORIGINS
+
+    # A stamped row is told by its tree's notice, or never (requestor spec §4.3)
+    if wo.get("requestor") or launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS:
+        return None
+    fresh = store.get_work_order(wo["id"]) or wo
+    said = completion_lines(store, fresh)
+    if fresh.get("pr_url"):
+        said.insert(1, f"Pull request: {fresh['pr_url']}")
+    owed = declared_user_action(store, wo["id"])
     return store.add_notification(
         title=f"{wo['id']} completed ({how}): {fresh.get('title') or 'untitled'}",
         body="\n\n".join(said), level="warning" if owed else "info",
@@ -13117,6 +13125,89 @@ def request_tree(project: str, root_id: str) -> RequestTree:
     tree = RequestTree(root, False)
     tree.settled = all(n.terminal for n in tree.nodes())
     return tree
+
+
+@dataclass
+class RequestNotice:
+    """What `Daemon.settle_request_trees` writes for one settled root (requestor spec §4)"""
+    anchor_wo_id: str | None  # the event's row: wo_events cannot hold a feature id (Q4068)
+    statuses: dict[str, str]
+    notify: bool  # False: a do with no follow-ups, already told by its own delivery (§4.1)
+    title: str = ""
+    body: str = ""
+    level: str = "info"
+
+
+def request_notice(tree: RequestTree, base_url: str) -> RequestNotice:
+    """The tree-settled notice of one settled tree; raises rather than send a partial one (§4.2)"""
+    from . import steward
+
+    paths = registered_project_paths(include_archived=True)
+    stores: dict[str, ProjectStore] = {}
+    root = tree.root
+    try:
+        rows: dict[str, tuple[dict[str, Any], bool] | None] = {}
+        for n in tree.nodes():
+            if n.project not in stores and n.project in paths:
+                stores[n.project] = ProjectStore(paths[n.project])
+            store = stores.get(n.project)
+            found = _request_row(store, n.id) if store is not None else None
+            rows[n.id] = (found[0], not found[1]) if found else None  # (row, is_wo)
+        others = tree.nodes()[1:]
+        anchor = next((n.id for n in tree.nodes()
+                       if n.project == root.project and rows[n.id] and rows[n.id][1]), None)
+        statuses = {n.id: n.status for n in tree.nodes()}
+        if root.kind == "decision" and all(n.kind == "researcher" for n in others):
+            return RequestNotice(anchor, statuses, notify=False)
+
+        root_row, root_is_wo = rows[root.id] or ({}, False)
+        ended = [f"{n.id} ended {n.status}" for n in tree.nodes() if n.status != "completed"]
+        body = [f"Outcome: {'; '.join(ended) if ended else 'completed'}"]
+        if root_is_wo:
+            body += completion_lines(stores[root.project], root_row)
+        else:
+            report = decision_report(root_row)
+            said = report.get("summary") or report.get("classification")
+            body.append(str(said) if said else "No report on record.")
+        if others:
+            body.append("Orders run:\n" + "\n".join(f"{n.id} {n.status} {n.title}"
+                                                   for n in others))
+        decided, uncosted, owed, cost = [], [], False, 0.0
+        for n in tree.nodes():
+            found = rows[n.id]
+            if not found:
+                continue
+            row, is_wo = found
+            decision = steward.stamp_of(row).get("decision_id")
+            if decision:
+                decided.append(f"{n.id}: steward decision #{decision}")
+            if not is_wo:
+                continue
+            store = stores[n.project]
+            decided += [f"{n.id} #{a['n']} {a['status']} by {a['decided_by']}: {a['content']}"
+                        for a in store.all_assumptions(n.id)
+                        if a.get("decided_by") and a["decided_by"] != "user"
+                        and a["status"] in ("accepted", "rejected", "refined")]
+            owed = owed or bool(declared_user_action(store, n.id))
+            try:
+                cost += cost_report(n.project, target=n.id)["totals"]["total_cost_usd"]
+            except OpsError:
+                uncosted.append(n.id)  # e.g. an archived project: said, never read as $0
+        if decided:
+            body.append("Decided for you:\n" + "\n".join(decided))
+        prs = [n.pr_url for n in tree.nodes() if n.pr_url]
+        body.append("Pull requests:\n" + "\n".join(prs) if prs else "Pull requests: none")
+        body.append(f"Cost: ${cost:.2f}"
+                    + (f" (not counted: {', '.join(uncosted)})" if uncosted else ""))
+        body.append(f"{base_url.rstrip('/')}/yours#{root.id}")
+        failed = any(n.status == "failed" for n in tree.nodes())
+        return RequestNotice(anchor, statuses, notify=True,
+                             title=f"{root.id} done: {root.title}",
+                             body="\n\n".join(body),
+                             level="warning" if failed or owed else "info")
+    finally:
+        for s in stores.values():
+            s.close()
 
 
 def resolve_requestor(store: Any, *, parent_id: str | None,

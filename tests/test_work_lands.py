@@ -481,7 +481,7 @@ def _completions(project: Path, wo_id: str) -> list[dict]:
 
 
 def test_a_user_order_that_merges_tells_the_user_with_its_final_message(started, project):
-    """Issue 1385: wo-d83e989e's final message offered two follow-ups and nobody heard"""
+    """Issue 1385, now via the tree notice: a stamped order skips `notify_completed` (requestor spec §4.3)"""
     wo = _order(project, "launcher contract", code="launcher")
     ops.finish(wo["id"], "opened a PR", pr_url=PR)
     store = ProjectStore(project)
@@ -491,8 +491,15 @@ def test_a_user_order_that_merges_tells_the_user_with_its_final_message(started,
     finally:
         store.close()
 
-    [note] = _completions(project, wo["id"])
-    assert "pull request merged" in note["title"]
+    assert _completions(project, wo["id"]) == []
+    started.settle_request_trees()
+    store = ProjectStore(project)
+    try:
+        [note] = [n for n in store.unrouted_notifications()
+                  if n["wo_id"] == wo["id"] and n["source"] == "request"]
+    finally:
+        store.close()
+    assert note["title"].startswith(f"{wo['id']} done:")
     assert "opened a PR" in note["body"] and PR in note["body"]
     assert "want me to file them?" in note["body"]
 
