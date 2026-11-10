@@ -797,6 +797,65 @@ def test_window_filters_os_calls_and_transcripts(store, transcripts):
     assert rows[asked["id"]]["os_calls"] == 1
 
 
+def test_a_window_rolls_up_in_window_members_and_root_own_calls_once(store, transcripts):
+    """io-2641fe05: a root's own call reaches it in a window; idle members stay out"""
+    picked = ops.cost_window(since=SINCE, until=UNTIL)
+    busy = store.create_feature_order("a busy feature", "")
+    member = store.create_work_order("ran in the window", "", parent_id=busy["id"])
+    give_session(store, member["id"], "sess-member")
+    turn_at(store, member["id"], INSIDE)
+    transcripts("sess-member", [assistant_row("m1", write=100_000, at=INSIDE)])
+    idle = store.create_work_order("ran after it", "", parent_id=busy["id"])
+    turn_at(store, idle["id"], UNTIL + 7_200)
+    quiet = store.create_feature_order("only reviewed", "", kind="improvement")
+    asleep = store.create_work_order("its analyst, later", "", parent_id=quiet["id"])
+    turn_at(store, asleep["id"], UNTIL + 7_200)
+    for order in (busy, quiet, member, ""):
+        os_call_at(order["id"] if order else "", INSIDE)
+    os_call_at(quiet["id"], UNTIL + 10)            # outside: not counted
+
+    res = ops.cost_report(project="proj_a", window=picked)
+    rows = {u["id"]: u for u in res["units"]}
+
+    assert set(rows) == {busy["id"], quiet["id"]}
+    assert [c["id"] for c in rows[busy["id"]]["children"]] == [member["id"]]
+    assert rows[busy["id"]]["os_calls"] == 2       # its own + its member's
+    assert rows[quiet["id"]]["children"] == []
+    assert rows[quiet["id"]]["os_cost_usd"] > 0
+    listed = sum(u["total_cost_usd"] for u in res["units"])
+    # Within a cent: `_rollup` rounds the worker and OS halves each to cents
+    assert listed + res["os_unattributed"]["os_cost_usd"] == pytest.approx(
+        res["totals"]["total_cost_usd"], abs=0.01)
+    assert res["totals"]["os_calls"] == 4
+    assert res["os_unattributed"]["os_calls"] == 1
+
+
+@pytest.mark.parametrize("windowed", [True, False])
+def test_a_monitoring_orders_calls_are_its_own_root_row(store, windowed):
+    """Morpheus keys its calls by the mo id: one 'monitoring' row, never also unattributed"""
+    from jarvis import morpheus
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        mo = morpheus.create(central, project="proj_a", title="watch it", prompt="look")
+    finally:
+        central.close()
+    os_call_at(mo["id"], INSIDE)
+
+    res = ops.cost_report(project="proj_a",
+                          window=ops.cost_window(since=SINCE, until=UNTIL)
+                          if windowed else None)
+    (row,) = [u for u in res["units"] if u["id"] == mo["id"]]
+
+    assert row["order_kind"] == "monitoring"
+    assert row["os_calls"] == 1
+    assert res["totals"]["os_calls"] == 1
+    assert not res["os_unattributed"]["os_calls"]
+    assert round(sum(u["total_cost_usd"] for u in res["units"]), 2) == \
+        res["totals"]["total_cost_usd"]
+
+
 def test_undated_transcript_message_is_excluded_and_counted(store, transcripts):
     """A message that cannot be PLACED is excluded and disclosed, never counted in"""
     wo = store.create_work_order("a transcript with unreadable stamps", "")

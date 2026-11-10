@@ -16005,10 +16005,11 @@ def cost_report(project: str | None = None, target: str | None = None,
                     else store.list_work_orders(limit=limit, include_hidden=True))
             # An order whose only in-window activity is an `agent_call`
             seen = {wo["id"] for wo in rows}
-            parents: list[str] = []
+            # A root order whose only spend is its own calls is still a row, in both modes
+            parents = [i for i in _os_only_ids(os_groups, name, seen)
+                       if is_feature_order_id(i)]
             for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
                 if is_feature_order_id(wo_id):
-                    parents.append(wo_id)
                     continue
                 try:
                     rows.append(store.get_work_order(wo_id))
