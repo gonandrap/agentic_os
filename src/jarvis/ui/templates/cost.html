@@ -183,9 +183,15 @@
     {% endif %}
   </div>
   {% endif %}
+  {# Collapsed until asked for, one page per request; the slice comes from `cost_page`
+     (docs/superpowers/specs/2026-11-09-cost-overview-first.md §4). #}
+  <details class="cost-orders"{{ ' open' if listing.open }}>
+  <summary style="padding: 10px 16px; cursor: pointer;">
+    {{ units|length }} order{{ 's' if units|length != 1 }}, dearest first
+  </summary>
   <table class="cost-list">
   <tr><th>id</th><th>cost</th><th>order</th><th>state</th></tr>
-  {% for u in units %}
+  {% for u in listing.units %}
   <tr>
     <td>{{ ui.row_id(u.id, order_path(u.project, u.id)) }}</td>
     <td class="mono num" style="text-align: right; color: var(--ink);"
@@ -244,7 +250,7 @@
   <tr><td colspan="4" class="empty">no work orders to measure</td></tr>
   {% endfor %}
   {# Not an order, so no link and no state; here so the rows sum to the headline (io-82bcb830). #}
-  {% if un %}
+  {% if un and listing.page == listing.pages %}
   <tr class="no-work-order">
     <td class="mono">—</td>
     <td class="mono num" style="text-align: right; color: var(--ink);">${{ '%.2f'|format(un.os_cost_usd) }}</td>
@@ -259,6 +265,14 @@
   </tr>
   {% endif %}
   </table>
+  {% if listing.pages > 1 %}
+  <p class="kv cost-pager" style="padding: 8px 16px; margin: 0;">
+    {% if listing.prev %}<a href="{{ listing.prev }}">‹ previous</a> · {% endif -%}
+    page {{ listing.page }} of {{ listing.pages }}
+    {%- if listing.next %} · <a href="{{ listing.next }}">next ›</a>{% endif %}
+  </p>
+  {% endif %}
+  </details>
 </div>
 
 {# Absent rather than faked when it could not be built — see `cost_page`. #}

@@ -183,6 +183,7 @@ REFRESH_SECONDS = 15
 
 # The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
 ORDERS_PAGE = 200  # rows of the project page's order list before "show more"
+COST_PAGE_SIZE = 50  # /cost order-list rows per page (docs/superpowers/specs/2026-11-09-cost-overview-first.md §4)
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
                      "validating", "waiting_pr_merge")
 # The work-order statuses that sort to the top of a list: each waits on the user
@@ -1844,7 +1845,7 @@ def create_app() -> FastAPI:
     @app.get("/cost", response_class=HTMLResponse)
     def cost_page(request: Request, project: str = "", window: str = "",
                   offset: str = "", since: str = "", until: str = "",
-                  tz: str = ""):
+                  tz: str = "", page: str = ""):
         """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost` (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
         try:
             # The zone FIRST: the custom form's naive datetimes are parsed in the same zone they are rendered in
@@ -1876,9 +1877,20 @@ def create_app() -> FastAPI:
             return render(request, "error.html", message=str(e))
         report, fleet, meter = entry["report"], entry["fleet"], entry["meter"]
         cached_at = entry["computed_at"]
+        # Sliced from the cached entry: `page` is no window bound (cost-overview-first spec §4)
+        page = query_int(page, 0)
+        units = report["units"]
+        pages = max(1, -(-len(units) // COST_PAGE_SIZE))
+        shown = min(max(page, 1), pages)
+        keep = {k: v for k, v in (("project", project), ("window", window), ("offset", offset),
+                                  ("since", since), ("until", until), ("tz", tz)) if v}
+        listing = {"units": units[(shown - 1) * COST_PAGE_SIZE:shown * COST_PAGE_SIZE],
+                   "open": page >= 1, "page": shown, "pages": pages,
+                   "prev": f"/cost?{urlencode({**keep, 'page': shown - 1})}" if shown > 1 else "",
+                   "next": f"/cost?{urlencode({**keep, 'page': shown + 1})}" if shown < pages else ""}
         # Its own variable and never read out of `fleet`: losing the section must not lose the window the...
         return render(request, "cost.html", active="cost", report=report,
-                      units=report["units"], totals=report["totals"],
+                      units=units, listing=listing, totals=report["totals"],
                       project=project, fleet=fleet, meter=meter, window=picked,
                       meter_max_span=ops.METER_TIMELINE_MAX_SECONDS,
                       cached_at=cached_at, now=time.time(),

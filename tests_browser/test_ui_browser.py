@@ -1662,7 +1662,7 @@ def test_cost_and_bill_read_at_desktop_and_phone_width(page, server, project, re
     wo = _cost_rows(project)
     for size in _WIDTHS:
         page.set_viewport_size(size)
-        page.goto(f"{server}/cost?project=proj_a")   # scoped: the fleet entry is cached across tests
+        page.goto(f"{server}/cost?project=proj_a&page=1")   # scoped: the fleet entry is cached across tests
         page.wait_for_selector(f"table.cost-list a.rowid:has-text('{wo['id']}')")
         _shot(page, f"cost-{size['width']}")
         readable(page)
@@ -1673,7 +1673,7 @@ def test_cost_and_bill_read_at_desktop_and_phone_width(page, server, project, re
 
 def test_a_cost_project_filter_in_the_url_scopes_the_listing(page, server, project):
     wo = _cost_rows(project)
-    page.goto(f"{server}/cost?project=proj_a")
+    page.goto(f"{server}/cost?project=proj_a&page=1")
     page.wait_for_selector("table.cost-list")
     assert "project: proj_a" in page.locator(".filter-bar").inner_text()
     assert wo["id"] in page.locator("table.cost-list").inner_text()
@@ -1683,7 +1683,7 @@ def test_a_cost_project_filter_in_the_url_scopes_the_listing(page, server, proje
 
 def test_clicking_a_cost_row_id_opens_its_order(page, server, project):
     wo = _cost_rows(project)
-    page.goto(f"{server}/cost?project=proj_a")   # scoped: never a fleet entry cached by another test
+    page.goto(f"{server}/cost?project=proj_a&page=1")   # scoped: never a fleet entry cached by another test
     page.wait_for_selector("table.cost-list")
     page.click(f"table.cost-list a.rowid:has-text('{wo['id']}')")
     page.wait_for_url(f"**/wo/proj_a/{wo['id']}")
