@@ -20,7 +20,7 @@ MAX_OPTIONS = 10
 MAX_PROPOSED_ORDERS = 10
 
 #: What a proposed order may become when the user files it
-ORDER_TYPES = ("wo", "fo", "backlog")
+ORDER_TYPES = ("wo", "fo", "backlog", "experiment")
 
 KEY_RE = plans.KEY_RE
 
@@ -33,6 +33,24 @@ SCHEMA_TEXT = """{
   "proposed_orders": [{"key": "p1", "as": "wo|fo|backlog", "project": "", "title": "...",
                        "description": "..."}]
 }"""
+
+#: The researcher's `forecast.json`; `experiment_forecast` parses exactly this (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §5)
+FORECAST_SCHEMA_TEXT = """State what you know about the batch; the OS computes tokens, dollars and the
+share of the 5-hour window. `runs` >= 1 (at most 10000), `model` non-empty, every token
+count >= 0, `notes` at most 1000 characters:
+{"runs": 24, "model": "claude-…", "per_run": {"input_tokens": 40000, "output_tokens": 3000,
+ "minutes": 2.5}, "notes": "4 fixtures x 2 engines x 3 repeats"}"""
+
+
+def experiment_phase(entry: Mapping[str, Any]) -> str:
+    """Where one experiment stands, from its stamps alone (same spec §2)"""
+    if entry.get("reported_at") is not None:
+        return "reported"
+    if entry.get("go_at") is not None:
+        return "running"
+    if entry.get("forecast") is not None:
+        return "awaiting_go"
+    return "forecast_due"
 
 
 class DecisionReportError(ValueError):
