@@ -1458,3 +1458,60 @@ def test_an_on_demand_compute_that_raises_renders_the_error_and_keeps_the_last_e
     assert page.status_code == 200
     assert "could not be computed" in page.text and "no transcripts" in page.text
     assert cache.on_demand == good
+
+
+# docs/superpowers/specs/2026-11-09-cost-overview-first.md §4: collapsed, paginated list
+def paged_fleet(client, project, monkeypatch, n=3, size=2):
+    """`n` orders with distinct costs, `size` rows a page, one no-work-order call, all cached"""
+    from jarvis import agent_usage
+    from jarvis.ui import app as ui_app
+
+    monkeypatch.setattr(ui_app, "COST_PAGE_SIZE", size)
+    for i in range(n):
+        wo = ops.create_work_order("proj_a", f"paged order {i}")
+        add_recorded_turn(project, wo["id"], 0.01 * (i + 1), 1_000)
+    agent_usage.record("digest", project="proj_a", wo_id="", label="d", model="claude-opus-5",
+                       usage={"total_cost_usd": 0.5, "input": 10, "cache_write": 0,
+                              "cache_read": 0, "output": 1_000})
+    cache = client.app.state.cost_cache
+    cache.entries["week"] = cache.compute("week")
+
+
+def _rows(text):
+    return re.findall(r'<a class="title" href="[^"]*" title="(paged order \d)"', text)
+
+
+def _tally(text):
+    found = re.search(r"below add to\s*\$([0-9.]+)", text)
+    return found and found.group(1)
+
+
+def test_the_order_list_is_collapsed_and_paged_from_the_cached_entry(client, project,
+                                                                     monkeypatch):
+    paged_fleet(client, project, monkeypatch)
+    calls = count_live(monkeypatch)
+
+    first = client.get("/cost").text
+    one = client.get("/cost?page=1").text
+    two = client.get("/cost?page=2").text
+    past = client.get("/cost?page=9").text
+
+    assert calls == []
+    assert '<details class="cost-orders">' in first
+    assert '<details class="cost-orders" open>' in one
+    assert "3 orders, dearest first" in first
+    assert _rows(first) == _rows(one) == ["paged order 2", "paged order 1"]
+    assert _rows(two) == ["paged order 0"] and _rows(past) == _rows(two)
+    assert "page 1 of 2" in one and "page 2 of 2" in two
+    assert 'class="no-work-order"' in two and 'class="no-work-order"' not in one
+    # The tally sums every unit, not the page; skipped once section 3 deletes it
+    if _tally(first):
+        assert _tally(first) == _tally(one) == _tally(two)
+
+
+def test_page_links_keep_the_window_project_and_zone(client, project, monkeypatch):
+    paged_fleet(client, project, monkeypatch)
+
+    page = cost_page(client, "/cost?window=week&project=proj_a&tz=UTC&page=1").text
+
+    assert 'href="/cost?project=proj_a&amp;window=week&amp;tz=UTC&amp;page=2"' in page
