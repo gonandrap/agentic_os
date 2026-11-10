@@ -82,6 +82,8 @@ from .project_store import (
     ASSUMPTION_LAPSED,
     COUNTED_VALIDATION_OUTCOMES,
     DECISION_CLOSED_EVENT,
+    DECISION_EXPERIMENT_GO_EVENT,
+    DECISION_EXPERIMENT_STARTED_EVENT,
     FAMILY_CHILD_KINDS,
     FORCEABLE_STATUSES,
     FO_OPEN_STATUSES,
@@ -11127,6 +11129,186 @@ def set_decision_budget(do_id: str, amount: float | None,
     return set_feature_budget(do_id, amount, project_name)
 
 
+# -- experiments under a decision order (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §4)
+
+
+def _refuse_agent_experiment(do_id: str, verb: str) -> None:
+    if os.environ.get("JARVIS_WO_ID"):
+        raise OpsError(
+            f"refusing `jarvis do experiment {do_id} {verb}` from inside a work-order "
+            f"session ({os.environ['JARVIS_WO_ID']}): an experiment spends quota and "
+            f"reopens the order, the user's verb. Tell the user — they run "
+            f"`jarvis do experiment {do_id} {verb}`.")
+
+
+def _researcher_worktree(path: Path, wo: Mapping[str, Any]) -> Path | None:
+    """The researcher's checkout, None once `disk.sweep` reclaimed it"""
+    wt = wo.get("worktree")
+    candidate = path / ".claude" / "worktrees" / wt if wt else None
+    return candidate if candidate is not None and candidate.is_dir() else None
+
+
+def start_decision_experiment(do_id: str, key: str | None = None, brief: str = "",
+                              project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do experiment <do> <key>|-d` — reopen the do and run one experiment under it (§4.1)"""
+    from . import decision_report as dr
+
+    _refuse_agent_experiment(do_id, key or '-d "…"')
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", show_verb(fo.get("kind")))
+    status = fo["status"]
+    if status == "planning":
+        raise OpsError(f"{do_id}: an experiment or the research is already running — "
+                       f"jarvis do show {do_id}")
+    if status == "cancelled":
+        raise OpsError(f"{do_id} is cancelled — file a new do: `jarvis do create {name} "
+                       f"\"<question>\" -d \"...\"`")
+    if status == "budget_exhausted":
+        raise OpsError(f"{do_id} has spent its budget, so its researcher would only queue "
+                       f"the experiment — raise it first: `jarvis do budget {do_id} <usd>`")
+    if status not in ("awaiting_decision", "completed"):
+        raise OpsError(f"{do_id} is {feature_status_label('decision', status)}: an "
+                       f"experiment starts from a delivered report — jarvis do show {do_id}")
+    if bool(key) == bool(brief.strip()):
+        raise OpsError(f"name a proposal OR describe the experiment, not both: "
+                       f"`jarvis do experiment {do_id} <key>` or "
+                       f"`jarvis do experiment {do_id} -d \"…\"`")
+    proposal = None
+    if key:
+        by_key = {p.get("key"): p for p in decision_report(fo).get("proposed_orders") or []
+                  if isinstance(p, dict)}
+        if key not in by_key:
+            raise OpsError(f"{do_id} has no proposal {key} (known: "
+                           f"{', '.join(map(str, by_key)) or 'none'}) — "
+                           f"`jarvis do experiment {do_id} -d \"…\"` runs an ad-hoc one")
+        proposal = by_key[key]
+    store = ProjectStore(path)
+    try:
+        open_ = store.open_experiment(do_id)
+        if open_ is not None and status != "completed":
+            raise OpsError(f"one experiment at a time: experiment {open_['n']} of {do_id} "
+                           f"is still open — jarvis do show {do_id}")
+        old = None
+        if fo.get("plan_wo_id"):
+            try:
+                old = store.get_work_order(fo["plan_wo_id"])
+            except KeyError:
+                old = None
+        # Neo Q4202: a researcher still answering `do send` would leave two live researchers
+        if old is not None and old["status"] in OPEN_STATUSES:
+            raise OpsError(f"{do_id}'s researcher {old['id']} is still working on your last "
+                           f"message — wait for its reply (jarvis do show {do_id}), then "
+                           f"run the experiment again")
+        revive = (old is not None and old["status"] == "completed"
+                  and _researcher_worktree(path, old) is not None)
+        title = (str(proposal.get("title") or "") if proposal
+                 else brief.strip().splitlines()[0])
+        entry: dict[str, Any] = {
+            "key": key or "", "title": title, "brief": "" if proposal else brief.strip(),
+            "researcher_id": None, "started_at": db.now(), "reopened_from": status,
+            "forecast": None, "go_at": None, "attachments": [], "reported_at": None}
+        with db.write_transaction(store.conn):
+            if open_ is not None:
+                # `do done` mid-experiment abandoned it (Neo Q4210): stamped at that close
+                closes = [s["ts"] for s in store.state_spans(do_id)
+                          if s["to_status"] == "completed"
+                          and s["trigger"] == DECISION_CLOSED_EVENT]
+                store.update_experiment(do_id, open_["n"],
+                                        abandoned_at=closes[-1] if closes else db.now(),
+                                        reported_at=db.now())
+            # Status BEFORE any child: a settled do with a live child trips the orphan-child invariant
+            store.set_feature_status(do_id, "planning",
+                                     trigger=DECISION_EXPERIMENT_STARTED_EVENT)
+            store.clear_feature_attention(do_id)
+            n = store.append_experiment(do_id, entry)
+            text = dr.experiment_brief(fo, {**entry, "n": n}, proposal)
+            if revive:
+                researcher_id = old["id"]
+            else:
+                # `ops.create_work_order` refuses a settled parent, as in `resume_feature_order`
+                child = store.create_work_order(
+                    title=f"Experiment {n}: {title}"[:200],
+                    description=f"{fo['description']}\n\n{text}",
+                    origin="os", kind="researcher", parent_id=do_id,
+                    requestor=resolve_requestor(store, parent_id=do_id, metadata=None,
+                                                origin="os"))
+                researcher_id = child["id"]
+                store.update_feature_order(do_id, plan_wo_id=researcher_id)
+            store.update_experiment(do_id, n, researcher_id=researcher_id)
+            store.add_event(researcher_id, DECISION_EXPERIMENT_STARTED_EVENT,
+                            {"do_id": do_id, "n": n, "key": key or "",
+                             "reopened_from": status})
+    finally:
+        store.close()
+    if revive:
+        # After the commit: `send_message` writes through its own connection
+        send_message(researcher_id, text, source="jarvis", project_name=name)
+    return {"do_id": do_id, "n": n, "researcher_id": researcher_id, "revived": revive,
+            "status": "planning"}
+
+
+def approve_decision_experiment(do_id: str,
+                                project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do experiment <do> --go` — the user accepts the forecast (§4.3)"""
+    from . import decision_report as dr
+
+    _refuse_agent_experiment(do_id, "--go")
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", show_verb(fo.get("kind")))
+    store = ProjectStore(path)
+    try:
+        entry = store.open_experiment(do_id)
+        phase = dr.experiment_phase(entry) if entry else None
+        if entry is None or phase != "awaiting_go" or fo["status"] != "planning":
+            raise OpsError(
+                f"{do_id} has no forecast awaiting your go"
+                + (f" (experiment {entry['n']} is {phase})" if entry else "")
+                + f" — jarvis do show {do_id}")
+        n, researcher_id = entry["n"], entry.get("researcher_id") or fo.get("plan_wo_id")
+        with db.write_transaction(store.conn):
+            store.update_experiment(do_id, n, go_at=db.now())
+            store.clear_feature_attention(do_id)
+            if researcher_id:
+                store.add_event(researcher_id, DECISION_EXPERIMENT_GO_EVENT,
+                                {"do_id": do_id, "n": n})
+    finally:
+        store.close()
+    if researcher_id:
+        send_message(researcher_id, f"go: run experiment {n} as forecast; attach raw "
+                                    f"outputs; then resubmit the report",
+                     source="jarvis", project_name=name)
+    return {"do_id": do_id, "n": n, "researcher_id": researcher_id, "status": "planning"}
+
+
+def _experiment_results_refusal(store: ProjectStore, do_id: str, plan: str) -> str | None:
+    """Why a report cannot close the open experiment yet, naming the missing step (§4.4)"""
+    from . import decision_report as dr
+    from .project_store import decision_report_sha
+
+    entry = store.open_experiment(do_id)
+    if entry is None:
+        return None
+    n = entry["n"]
+    phase = dr.experiment_phase(entry)
+    if phase == "forecast_due":
+        return (f"experiment {n} of {do_id} has no forecast yet: submit it first with "
+                f"`jarvis do forecast {do_id} --from-file forecast.json`, then end your "
+                f"turn")
+    if phase == "awaiting_go":
+        return (f"experiment {n} of {do_id} is waiting for the user's go: end your turn; "
+                f"the user runs `jarvis do experiment {do_id} --go`")
+    if not entry.get("attachments"):
+        return (f"experiment {n} of {do_id} has no raw outputs on record: attach the files "
+                f"your findings rest on with `jarvis do attach {do_id} <file>…`, then "
+                f"resubmit")
+    last = store.last_decision_delivery_of(do_id)
+    if last is not None and last.get("sha") == decision_report_sha(plan):
+        return (f"this report is identical to the one the user already has, so it would "
+                f"never be delivered: put experiment {n}'s results in `findings` and "
+                f"resubmit with `jarvis do report {do_id} --from-file report.json`")
+    return None
+
+
 #: On the researcher's timeline: a report was stored (§1.3)
 DECISION_REPORT_EVENT = "decision_report_submitted"
 
@@ -11155,8 +11337,13 @@ def submit_decision_report(do_id: str, doc: Any, project_name: str | None = None
     researcher_open = False
     store = ProjectStore(path)
     try:
-        # The WHOLE document, replacing any earlier one; status stays put — delivery moves it after validation
-        store.update_feature_order(do_id, plan=plan)
+        if (why := _experiment_results_refusal(store, do_id, plan)) is not None:
+            raise OpsError(f"the report was not accepted, and nothing was stored: {why}")
+        with db.write_transaction(store.conn):
+            if (entry := store.open_experiment(do_id)) is not None:
+                store.update_experiment(do_id, entry["n"], reported_at=db.now())
+            # The WHOLE document, replacing any earlier one; status stays put — delivery moves it after validation
+            store.update_feature_order(do_id, plan=plan)
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], DECISION_REPORT_EVENT,
                             {"do_id": do_id, "sha": sha})
@@ -11274,7 +11461,7 @@ def submit_decision_forecast(do_id: str, doc: Any,
 DECISION_FOLLOWUP_EVENT = "decision_followup_filed"
 #: Where filing is allowed: a delivered report, before or after the user decided (§6)
 _FOLLOWUP_STATUSES = ("awaiting_decision", "completed")
-_FOLLOWUP_AS = ("wo", "fo", "backlog")
+_FOLLOWUP_AS = ("wo", "fo", "backlog", "experiment")
 
 
 def decision_origin(row: Mapping[str, Any]) -> str:
@@ -11317,12 +11504,24 @@ def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | Non
                        f"to file another")
     paths = registered_project_paths()
     filed: list[dict[str, Any]] = []
+    started: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     # From the do's own project: `target` may be another one (requestor spec §2.2 rule 3)
     stamp = _requestor_in(name, do_id)
     for key in (k for k in wanted if k not in skipped):
         p = by_key[key]
         kind = as_ or p.get("as") or "wo"
+        if kind == "experiment":
+            # Not filed: `experiments[]` is its record (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §4.2)
+            if started:
+                errors.append({"key": key, "error": "one experiment at a time"})
+                continue
+            try:
+                started.append({"key": key, **start_decision_experiment(
+                    do_id, key, project_name=name)})
+            except OpsError as e:
+                errors.append({"key": key, "error": str(e)})
+            continue
         target = (p.get("project") or "").strip() or name
         # FIRST LINE names the decision order: the worker sees this description and nothing else
         description = (f"Filed from decision order {do_id} — run `jarvis do show {do_id}` "
@@ -11372,8 +11571,9 @@ def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | Non
                                     {"do_id": do_id, "key": f["key"], "order_id": f["id"]})
         finally:
             store.close()
-    return {"project": name, "do_id": do_id, "status": fo["status"], "filed": filed,
-            "skipped": skipped, "errors": errors}
+    return {"project": name, "do_id": do_id,
+            "status": "planning" if started else fo["status"], "filed": filed,
+            "started": started, "skipped": skipped, "errors": errors}
 
 
 #: Raw-output caps (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §6)

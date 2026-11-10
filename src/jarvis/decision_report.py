@@ -53,6 +53,29 @@ def experiment_phase(entry: Mapping[str, Any]) -> str:
     return "forecast_due"
 
 
+def experiment_brief(fo: Mapping[str, Any], entry: Mapping[str, Any],
+                     proposal: Mapping[str, Any] | None) -> str:
+    """What the researcher is told to run, forecast FIRST (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §4.1)"""
+    do_id, n = fo["id"], entry["n"]
+    what = (str((proposal or {}).get("description") or "").strip()
+            or str(entry.get("brief") or "").strip())
+    return "\n\n".join([
+        f"You are running experiment {n} of decision order {do_id}, for the user's "
+        f"decision: {fo['title']}.",
+        f"The experiment:\n{what}",
+        f"FIRST, forecast it and submit `jarvis do forecast {do_id} --from-file "
+        f"forecast.json`. {FORECAST_SCHEMA_TEXT}\nThat ends your turn. Do NOT start the "
+        f"batch: the user says go.",
+        f"On go: run it. Keep raw outputs in your temp dir, then `jarvis do attach "
+        f"{do_id} <file>…` every raw output the findings rest on.",
+        f"Resubmit the WHOLE report with `jarvis do report {do_id} --from-file "
+        f"report.json`: the results go in `findings`, each with evidence naming the "
+        f"attached files, and an updated `summary` / `recommendation`. Keep the earlier "
+        f"findings that still hold.",
+        "Never file orders, never decide: the user does both.",
+    ])
+
+
 class DecisionReportError(ValueError):
     """A submitted decision report that cannot be accepted"""
 

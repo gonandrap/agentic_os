@@ -2777,10 +2777,14 @@ class ProjectStore:
                                   wo_id=do_id, source="decision")
         return True
 
-    def last_decision_delivery(self, researcher_id: str) -> dict[str, Any] | None:
-        """The payload of the newest `decision_delivered` event, None before the first"""
-        rows = self.events_of_kind(researcher_id, DECISION_DELIVERED_EVENT)
-        return db.from_json(rows[-1]["payload"], {}) if rows else None
+    def last_decision_delivery_of(self, do_id: str) -> dict[str, Any] | None:
+        """The newest `decision_delivered` payload across EVERY researcher of the do, None before the first (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §4.5)"""
+        row = self.conn.execute(
+            """SELECT e.payload FROM wo_events e JOIN work_orders w ON w.id=e.wo_id
+               WHERE w.parent_id=? AND w.kind='researcher' AND e.kind=?
+               ORDER BY e.ts DESC, e.id DESC LIMIT 1""",
+            (do_id, DECISION_DELIVERED_EVENT)).fetchone()
+        return db.from_json(row["payload"], {}) if row else None
 
     def decisions_closed_without_user(self) -> list[dict[str, Any]]:
         """Terminal decision orders the user's verb did not close: neither event nor span trigger (docs/superpowers/specs/2026-10-31-decision-orders.md)"""

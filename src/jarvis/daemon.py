@@ -1575,7 +1575,7 @@ class Daemon:
         report = stored_report(fo)
         if wo is not None and wo["status"] == "completed" and report:
             sha = decision_report_sha(fo["plan"])
-            last = store.last_decision_delivery(wo["id"])
+            last = store.last_decision_delivery_of(fo["id"])
             if last is not None and last.get("sha") == sha:
                 return  # delivery-once by construction: this report already reached the user
             revised = last is not None

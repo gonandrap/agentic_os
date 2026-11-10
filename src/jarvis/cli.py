@@ -1488,9 +1488,20 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("do_id")
     d.add_argument("keys", nargs="*", help="proposal keys from `jarvis do show`")
     d.add_argument("--all", action="store_true", help="every proposal not filed yet")
-    d.add_argument("--as", dest="as_", choices=["wo", "fo", "backlog"],
-                   help="file as this instead of each proposal's own `as`")
+    d.add_argument("--as", dest="as_", choices=["wo", "fo", "backlog", "experiment"],
+                   help="file as this instead of each proposal's own `as`; `experiment` "
+                        "runs it under the order (`jarvis do experiment`)")
     d.add_argument("--again", action="store_true", help="file a proposal already filed")
+    d.add_argument("--project")
+
+    d = dec.add_parser("experiment", help="run a proposal UNDER the order; its results come "
+                                          "back as a report revision. --go accepts the "
+                                          "forecast")
+    d.add_argument("do_id")
+    d.add_argument("key", nargs="?", help="a proposal key from `jarvis do show`")
+    d.add_argument("-d", "--description", default="", help="an ad-hoc experiment instead")
+    d.add_argument("--go", action="store_true",
+                   help="you accept the forecast: the researcher runs the batch")
     d.add_argument("--project")
 
     for d in dec.choices.values():
@@ -4647,6 +4658,16 @@ def cmd_do(args: argparse.Namespace) -> int:
     elif args.do_cmd == "follow-up":
         _print(ops.file_decision_followups(args.do_id, args.keys, args.as_, args.project,
                                            all_=args.all, again=args.again), args.json)
+
+    elif args.do_cmd == "experiment":
+        if args.go:
+            if args.key or args.description:
+                raise ops.OpsError(f"--go takes no proposal: `jarvis do experiment "
+                                   f"{args.do_id} --go`")
+            _print(ops.approve_decision_experiment(args.do_id, args.project), args.json)
+        else:
+            _print(ops.start_decision_experiment(args.do_id, args.key, args.description,
+                                                 args.project), args.json)
 
     elif args.do_cmd == "report":
         source = None
