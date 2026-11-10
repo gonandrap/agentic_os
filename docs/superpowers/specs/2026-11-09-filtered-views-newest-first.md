@@ -116,7 +116,10 @@ row carries a status-change time, prefer it over a creation time:
 | `steward_page` | each tab list | `ts` | none (the `asks` tab IS the attention) |
 | `_evolution` | `shown` | `last_fired` (None last) | `not r["readable"]` |
 
-`requestor_query` is a helper, not a route: it filters and orders nothing.
+`requestor_query` is the 16th `query_filters()` call site and is not a route: a
+module-level helper that returns a filter dict and lists no rows, so there is nothing to
+order. The 16 call sites are therefore these 13 routes, the 2 order views of section 5,
+and this helper (excluded by name in section 6).
 
 Settled detection per route follows section 2 "Open view vs settled view": compute it from
 that route's own filter value and pass `pins=()` when settled. `knowledge`, `search_page`,
@@ -170,17 +173,25 @@ sort and text relevance are not the stale time orders this feature removes.
 One table-driven test (tests/test_ui.py or a new tests/test_ui_ordering.py) over every
 route in app.py that calls `query_filters()`: dashboard, search_page, project, inbox,
 backlog, knowledge, neo_page, gates_page, alarms_page, stuck_page, morpheus_page,
-release_page, release_item_page, steward_page, _evolution (15 routes). `requestor_query`
-is a module-level helper outside `create_app` that orders nothing: name it in a separate
-explicit exclusion, not in the route table.
+release_page, release_item_page, steward_page, _evolution (15 routes).
+
+The "16 query_filters() routes" of io-f2617e9d are 16 CALL SITES in app.py: these 15
+route functions plus `requestor_query`, a module-level helper that reads only the
+`requestor` param for dashboard, project and inbox, returns a filter dict and lists no
+rows. It is excluded from the ordering table on that ground (it has no rows to order; the
+three routes that call it are each in the table), and named in an explicit
+`EXCLUDED = {"requestor_query": "helper, lists no rows"}` beside the table.
 
 - For each route: seed at least two rows with distinct times, request a SETTLED filter (or
   the route's default view where it has no settled filter), and assert rows render newest
   first by that route's key from section 4/5. For routes with a pin, also request an OPEN
   view and assert the pinned group comes first and each group is newest first.
-- **Drift guard:** assert the test's route list equals the set of nested functions in
-  `inspect.getsource(create_app)` that call `query_filters(` (names, and 15 of them), so a
-  new filtered route fails CI until it is added to the table with its key.
+- **Drift guard:** parse `inspect.getsource(jarvis.ui.app)` with `ast`, collect every
+  function (module-level or nested in `create_app`) whose body calls `query_filters`, and
+  assert that set equals `set(TABLE) | set(EXCLUDED)` — today 15 + 1 = 16 call sites. The
+  expected number is derived from the two named sets, never written as a bare literal, so
+  a new call site fails CI until it is either added to the table with its key or added to
+  `EXCLUDED` with a reason.
 - This file (tests/test_ui_ordering.py) is owned here alone; the per-route tests of
   section 4 live beside each page's existing suite.
 - Seed timestamps with `backdate(store, id, *ts)` from tests/test_time_in_state.py.
