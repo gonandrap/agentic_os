@@ -11135,7 +11135,8 @@ def start_decision_experiment(do_id: str, key: str | None = None, brief: str = "
         proposal = by_key[key]
     store = ProjectStore(path)
     try:
-        if (open_ := store.open_experiment(do_id)) is not None:
+        open_ = store.open_experiment(do_id)
+        if open_ is not None and status != "completed":
             raise OpsError(f"one experiment at a time: experiment {open_['n']} of {do_id} "
                            f"is still open — jarvis do show {do_id}")
         old = None
@@ -11158,6 +11159,14 @@ def start_decision_experiment(do_id: str, key: str | None = None, brief: str = "
             "researcher_id": None, "started_at": db.now(), "reopened_from": status,
             "forecast": None, "go_at": None, "attachments": [], "reported_at": None}
         with db.write_transaction(store.conn):
+            if open_ is not None:
+                # `do done` mid-experiment abandoned it (Neo Q4210): stamped at that close
+                closes = [s["ts"] for s in store.state_spans(do_id)
+                          if s["to_status"] == "completed"
+                          and s["trigger"] == DECISION_CLOSED_EVENT]
+                store.update_experiment(do_id, open_["n"],
+                                        abandoned_at=closes[-1] if closes else db.now(),
+                                        reported_at=db.now())
             # Status BEFORE any child: a settled do with a live child trips the orphan-child invariant
             store.set_feature_status(do_id, "planning",
                                      trigger=DECISION_EXPERIMENT_STARTED_EVENT)

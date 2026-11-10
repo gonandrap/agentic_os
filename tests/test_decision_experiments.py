@@ -243,3 +243,9 @@ def test_done_mid_experiment_closes_and_ticks_never_settle(started, store, catal
         assert store.get_feature_order(do["id"])["status"] == "planning"
     ops.complete_decision_order(do["id"], note="enough")
     assert store.get_feature_order(do["id"])["status"] == "completed"
+    closed_at = store.state_spans(do["id"])[-1]["ts"]
+    # The abandoned one never blocks the next (Neo Q4210)
+    assert ops.start_decision_experiment(do["id"], "p1")["status"] == "planning"
+    first, second = store.experiments_of(do["id"])
+    assert first["abandoned_at"] == closed_at and first["reported_at"] is not None
+    assert store.open_experiment(do["id"])["n"] == second["n"] == 2
