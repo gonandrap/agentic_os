@@ -481,9 +481,7 @@ def _completions(project: Path, wo_id: str) -> list[dict]:
 
 
 def test_a_user_order_that_merges_tells_the_user_with_its_final_message(started, project):
-    """Issue 1385: wo-d83e989e's final message offered two follow-ups and nobody heard
-
-    A stamped user order is now told by its tree notice, not `notify_completed` (requestor spec §4.3)"""
+    """Issue 1385, now via the tree notice: a stamped order skips `notify_completed` (requestor spec §4.3)"""
     wo = _order(project, "launcher contract", code="launcher")
     ops.finish(wo["id"], "opened a PR", pr_url=PR)
     store = ProjectStore(project)
