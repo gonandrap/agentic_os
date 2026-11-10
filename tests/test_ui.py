@@ -1852,8 +1852,6 @@ def test_a_decision_you_owe_gets_a_row_not_a_count(client, daemon, project):
         assert "decide this please" in page, url
         assert "worker is stuck" in page, url
         assert "show=needs_review" not in page, url  # a row, so never a count line
-        # a review the user owes comes before a worker merely blocked on them
-        assert page.index("decide this please") < page.index("worker is stuck"), url
 
     dashboard = client.get("/").text
     assert "not started yet" not in dashboard  # started by nobody, needs nobody
@@ -1861,6 +1859,53 @@ def test_a_decision_you_owe_gets_a_row_not_a_count(client, daemon, project):
     assert "not started yet" in client.get("/?show=pending").text
     project_page = client.get("/project/proj_a").text
     assert project_page.index("worker is stuck") < project_page.index("not started yet")
+
+
+def test_project_page_lists_by_status_time_and_pins_only_open_views(client, project,
+                                                                    monkeypatch):
+    """Spec 2026-11-09-filtered-views-newest-first §5: the reported type=feature&status=completed URL"""
+    from jarvis import db
+    from jarvis.ui import app as ui_app
+    clock = [1_000_000.0]
+    monkeypatch.setattr(db, "now", lambda: clock[0])
+
+    def at(t):
+        clock[0] = 1_000_000.0 + t
+
+    store = ProjectStore(project)
+    old = store.create_feature_order("old feature, done last")
+    flagged = store.create_feature_order("newer feature, done first")
+    at(10)
+    wo = ops.create_work_order("proj_a", "old work, settled lately")
+    at(20)
+    early = ops.create_work_order("proj_a", "newer work, settled early")
+    at(50)
+    store.set_status(early["id"], "completed")
+    at(100)
+    store.set_feature_status(flagged["id"], "completed")
+    store.flag_feature_attention(flagged["id"], "look at this one")
+    at(200)
+    store.set_status(wo["id"], "completed")
+    at(300)
+    store.set_feature_status(old["id"], "completed")
+    store.close()
+    at(400)
+
+    page = client.get("/project/proj_a?type=feature&status=completed").text
+    assert page.index("old feature, done last") < page.index("newer feature, done first")
+    assert "◭ look at this one" in page  # badge, not position
+    assert ">5m</span>" in page and ">6m</span>" not in page  # age since completion, not creation
+
+    every = client.get("/project/proj_a?status=completed").text  # kinds interleave by time
+    assert every.index("old feature, done last") < every.index("old work, settled lately") \
+        < every.index("newer feature, done first")
+
+    open_view = client.get("/project/proj_a?status=all").text  # open view still pins
+    assert open_view.index("newer feature, done first") < open_view.index("old feature, done last")
+
+    monkeypatch.setattr(ui_app, "ORDERS_PAGE", 1)  # the SQL LIMIT keeps the recent settle
+    first = client.get("/project/proj_a?type=work&status=completed").text
+    assert "old work, settled lately" in first and "newer work, settled early" not in first
 
 
 def test_a_project_whose_only_open_work_needs_review_is_not_an_empty_panel(client,

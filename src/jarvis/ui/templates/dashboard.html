@@ -92,6 +92,7 @@
         {% if wo.needs_attention and wo.attention_reason %}<div class="sub">⚑ {{ wo.attention_reason }}</div>{% endif %}
       </div>
       <span><span class="badge">{{ wo.type }}</span></span>
+      <span class="sub mono" title="in this status since {{ fmt_ts(wo.status_since) }}">{{ fmt_age(wo.status_since) }}</span>
     </div>
     {% else %}
     {% set m =status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
@@ -119,6 +120,7 @@
         {% endif %}
       </div>
       <span>{{ ui.wo_tags(wo.tags) }}</span>
+      <span class="sub mono" title="in this status since {{ fmt_ts(wo.status_since) }}">{{ fmt_age(wo.status_since) }}</span>
     </div>
     {% endif %}
   {% else %}
