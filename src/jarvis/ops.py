@@ -16144,8 +16144,11 @@ def cost_report(project: str | None = None, target: str | None = None,
                                if wo_id not in listed for g in group])
                     if window else _os_unattributed(os_groups))
     # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/ `totals` keys...
+    rollup = _rollup(leaves, unattributed, owns)
     return {"scope": project or "fleet", "units": roots, "window": window,
-            **_rollup(leaves, unattributed, owns), "os_unattributed": unattributed,
+            **rollup, "os_unattributed": unattributed,
+            "aggregates": cost_aggregates(roots, unattributed,
+                                          rollup["totals"]["total_cost_usd"]),
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 
@@ -16153,7 +16156,9 @@ def cost_report(project: str | None = None, target: str | None = None,
 _ROOT_SUMMED = ("total_cost_usd", "total_recorded_cost_usd", "list_cost_usd",
                 "os_cost_usd", "os_calls", "subproc_cost_usd", "subproc_calls",
                 "subagent_count", "subagent_cost_usd", "turns", "recorded_turns",
-                "billed_input", "output", "rewrite_excess", "rewrite_cost_usd")
+                "billed_input", "output", "rewrite_excess", "rewrite_cost_usd",
+                # _rollup and cost_aggregates read these off a root (spec 2026-11-09-cost-overview-first §2)
+                "resume_boundaries", "boundaries_ttl", "rewrite_ttl_excess")
 
 
 def _root_row(name: str, order: dict[str, Any], kind: str,
@@ -16298,6 +16303,52 @@ def _os_only_ids(groups: dict[str, list[dict[str, Any]]], project: str,
 def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     """OS spend that no work order caused (`agent_calls.wo_id = ''`)"""
     return _os_spend(groups.get("", []))
+
+
+def _order_kind(order_id: str) -> str:
+    return order_id.split("-", 1)[0]
+
+
+def cost_aggregates(units: list[dict[str, Any]],
+                    unattributed: dict[str, Any] | None = None,
+                    fleet_cost_usd: float | None = None) -> dict[str, Any]:
+    """Per-project and per-order-kind figures over the top-level units (docs/superpowers/specs/2026-11-09-cost-overview-first.md §1.4)"""
+    # The report's headline rolls up leaves, not roots; take it as given so the two never drift
+    fleet = (_rollup(units, unattributed)["totals"]["total_cost_usd"]
+             if fleet_cost_usd is None else fleet_cost_usd)
+    by_project: dict[str, list[dict[str, Any]]] = {}
+    for u in units:
+        by_project.setdefault(u["project"], []).append(u)
+    projects = []
+    for name, own in by_project.items():
+        kinds: dict[str, list[dict[str, Any]]] = {}
+        for u in own:
+            kinds.setdefault(_order_kind(u["id"]), []).append(u)
+        found = [u for u in own if u["found"]]
+        projects.append({
+            "project": name,
+            "cost_usd": _rollup(own)["totals"]["total_cost_usd"],
+            "orders": len(own),
+            "by_order_kind": {k: {"orders": len(us),
+                                  "cost_usd": _rollup(us)["totals"]["total_cost_usd"]}
+                              for k, us in sorted(kinds.items())},
+            "ttl_misses": sum(u.get("boundaries_ttl") or 0 for u in found),
+            "ttl_rewrite_tokens": sum(u.get("rewrite_ttl_excess") or 0 for u in found),
+        })
+    projects.sort(key=lambda p: (-p["cost_usd"], p["project"]))
+    by_kind: dict[str, int] = {}
+    for u in units:
+        by_kind[_order_kind(u["id"])] = by_kind.get(_order_kind(u["id"]), 0) + 1
+    unattributed_cost = (unattributed or {}).get("os_cost_usd") or 0.0
+    return {
+        "fleet_cost_usd": fleet,
+        "orders": len(units),
+        "by_order_kind": dict(sorted(by_kind.items())),
+        "projects": projects,
+        "unattributed_cost_usd": unattributed_cost,
+        # _rollup rounds parts before adding: report the residual, never fudge a slice
+        "rounding_usd": fleet - (sum(p["cost_usd"] for p in projects) + unattributed_cost),
+    }
 
 
 def _rollup(units: list[dict[str, Any]],

@@ -590,7 +590,7 @@ def _cost_payloads(picked: dict, project: str) -> dict:
 REFRESH_SECONDS = 60
 
 #: Bumped whenever an entry's shape changes, which makes every older snapshot unreadable
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 
 
 def cost_snapshot_path() -> Path:
