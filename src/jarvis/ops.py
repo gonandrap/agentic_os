@@ -9567,7 +9567,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
                                 UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                dependency_hold_spans, plan_hold_spans, precondition_hold_spans,
+                                dependency_hold_spans, manager_idle_hold_spans,
+                                plan_hold_spans, precondition_hold_spans,
                                 validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -9649,11 +9650,22 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             [pstore.state_spans(d) for d in pstore.dependencies(wo)],
             float(wo.get("created_at") or 0.0), since, now)
             if wo["status"] == "pending" else [])
+        # AN IDLE MANAGER'S WAIT ON ITS LIVE FEATURE IS NOT STUCK (issue 1674, kn-0a222b38)
+        idle_spans: list[tuple[float, float]] = []
+        if (wo["status"] == "idle" and wo.get("kind") == "manager"
+                and wo.get("parent_id")):
+            try:
+                feature = pstore.get_feature_order(str(wo["parent_id"]))
+                idle_spans = manager_idle_hold_spans(
+                    pstore.state_spans(str(wo["parent_id"])),
+                    str(feature["status"]), since, now)
+            except KeyError:
+                pass  # deleted feature: nothing left to wake it, so judged
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
             + ci_spans + base_red_spans + plan_spans + automerge_spans
-            + budget_spans + pre_spans + dep_spans)
+            + budget_spans + pre_spans + dep_spans + idle_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9719,7 +9731,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             "project": project_name, "wo": wo, "verdict": verdict,
             # The outstanding-child note before the empty answer: one formatter shared with `status_label` The...
             "blocker": (blocker[0] if blocker
-                        else invariants.outstanding_children_note(pstore, wo)
+                        else invariants.idle_manager_note(pstore, wo)
                         or invariants.precondition_note(
                             pstore.open_preconditions(wo["id"]) if pre_held else [])
                         or invariants.plan_hold_note(
