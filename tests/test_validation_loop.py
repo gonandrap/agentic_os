@@ -1432,6 +1432,29 @@ def test_an_abandonment_that_produced_nothing_is_voided_not_escalated(fleet):
         store.close()
 
 
+def test_the_exit_an_empty_abandon_is_refused_toward_escalates_not_voids(fleet):
+    """io-d173b6f1: the plain finish the refusal names must reach the user"""
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    wo = fleet.dispatch("read-only A/B")
+    fleet.worktree(wo["id"])  # a worktree, and not one byte changed in it
+    with pytest.raises(ops.OpsError):
+        ops.finish(wo["id"], "results in /tmp", abandon="read-only experiment")
+    ops.finish(wo["id"], "results in /tmp")
+    fleet.drain()
+
+    rows = _outbox(fleet)
+    assert len(rows) == 1
+    assert rows[0]["title"] == ops.ESCALATION_TITLE.format(
+        unit=wo["id"], n=1, verb=ops.ESCALATION_VERB["not_reviewed"])
+    store = fleet.store()
+    try:
+        assert store.latest_validation_round(wo_id=wo["id"])["outcome"] != "void"
+        assert store.events_of_kind(wo["id"], "validation_escalated")
+    finally:
+        store.close()
+
+
 def test_three_outages_ping_the_user_once_not_once_per_attempt(fleet):
     """The outage path writes a `validation_failed` event per attempt and escalates on the third"""
     fleet.daemon.validator = Validator(claude_cli.ClaudeCliError("connection reset"))
