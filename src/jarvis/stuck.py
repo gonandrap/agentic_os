@@ -58,6 +58,9 @@ AUTOMERGE_HOLD_CAUSES: Mapping[str, str] = {
 #: §2.1 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-...
 PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
 
+#: Issue 1681: `ProjectStore.spec_hold` (docs/superpowers/specs/2026-10-29-a-feature-spec-pull-request-lands-first.md §2)
+SPEC_PR_CAUSE = "its feature's unmerged spec pull request"
+
 #: §2.1 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-not-stuck.md
 PRECONDITION_CAUSE = "an open precondition"
 
@@ -125,6 +128,10 @@ EXCLUSION_REASON: Mapping[str, str] = {
                             "plan is ratified, and only you can ratify it — "
                             "`jarvis wo review <planner-id>` on the feature's planner "
                             "is what clears it, so nothing is judged while it stands"),
+    SPEC_PR_CAUSE: ("the OS is holding this child itself: its feature's spec pull request "
+                    "has not merged, and no child is dispatched before the spec it builds "
+                    "on lands — the OS drives that merge on the planner, which is judged "
+                    "on its own, so nothing is judged here while that is true"),
     # §2.1: the shipped sentence is FALSE here too; both parties clear it
     PRECONDITION_CAUSE: ("this order was created held until its precondition clears and "
                          "the row is still open — the OS clears it when it resolves the "
