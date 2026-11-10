@@ -959,6 +959,18 @@ def test_the_list_page_primitives_filter_and_order_rows():
     assert [r["id"] for r in attention_first(rows, lambda r: r["level"] == "crit")] == [2, 4, 1, 3]
 
 
+def test_newest_first_sorts_descending_none_last_stable_and_pins_only_when_given():
+    from jarvis.ui.app import newest_first
+    rows = [{"id": 1, "t": 5}, {"id": 2, "t": None}, {"id": 3, "t": 9},
+            {"id": 4, "t": 5}, {"id": 5, "t": 1}]
+    by_t = lambda r: r["t"]  # noqa: E731
+    assert [r["id"] for r in newest_first(rows, by_t)] == [3, 1, 4, 5, 2]
+    odd = lambda r: r["id"] % 2 == 1  # noqa: E731
+    assert [r["id"] for r in newest_first(rows, by_t, pins=(odd,))] == [3, 1, 5, 4, 2]
+    assert [r["id"] for r in newest_first(rows, by_t, pins=(lambda r: r["id"] == 5, odd))] \
+        == [5, 3, 1, 4, 2]
+
+
 def test_dashboard_clears_unacked_banner_after_ack(client, daemon, project):
     """Acking every inbox item must clear the "unacked notification" banner on the main dashboard"""
     store = ProjectStore(project)

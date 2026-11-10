@@ -603,7 +603,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
             store = ProjectStore(path)
             try:
                 summary = store.summary()
-                open_wos = store.list_work_orders(statuses=OPEN_STATUSES)
+                open_wos = store.list_work_orders(statuses=OPEN_STATUSES,
+                                                  order_by="status_since")
                 pauses = {wo["id"]: invariants.pause_state(store, wo) for wo in open_wos}
                 _count_paused(summary, open_wos, pauses)
                 # Attention isn't limited to open work orders: a FAILED worker (e.g. session disappeared) still needs...
@@ -646,7 +647,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     attention.append(item)
                 # `kind=None`: KIND-AGNOSTIC PATH (docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md)
                 features = store.list_feature_orders(statuses=FO_OPEN_STATUSES,
-                                                     kind=None)
+                                                     kind=None, order_by="status_since")
                 # Which feature orders get a line: the open ones
                 by_id = {fo["id"]: fo for fo in features}
                 for fo in store.flagged_feature_orders():
@@ -698,7 +699,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     # ONE MERGED LIST WITH A `kind` LABEL
                     "feature_orders": [
                         {**{k: fo[k] for k in ("id", "title", "status",
-                                               "needs_attention", "attention_reason")},
+                                               "needs_attention", "attention_reason",
+                                               "status_since")},
                          "kind": fo.get("kind") or "feature",
                          "status_label": feature_status_label(fo.get("kind"),
                                                               fo["status"]),
@@ -709,7 +711,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     "open_work_orders": [
                         {**{k: wo[k] for k in ("id", "title", "status", "origin",
                                                "needs_attention", "attention_reason",
-                                               "pr_url")},
+                                               "pr_url", "status_since")},
                          # Why a pending work order is not starting
                          "blocked_by": blocked_by(store, wo),
                          # Same rule for the other kind of hold — §2.7
@@ -9770,6 +9772,7 @@ def stuck_report(project_name: str | None = None,
             rows.append({
                 "id": wo["id"], "project": spec.name, "title": wo["title"],
                 "status": wo["status"], "status_label": row["status_label"],
+                "status_since": row["since"],
                 "seconds_in_status": row["seconds_in_status"],
                 "seconds_since_activity": row["seconds_since_activity"],
                 "discounted_seconds": row["discounted"],
