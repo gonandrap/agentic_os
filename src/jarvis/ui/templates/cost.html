@@ -1,6 +1,5 @@
 {% extends "base.html" %}
 {% import "_layout.html" as ui %}
-{% import "_pie.html" as charts %}
 {% set agg = report.aggregates %}
 {% block title %}cost — Jarvis{% endblock %}
 {% block style %}
@@ -10,6 +9,18 @@
                                 white-space: nowrap; }
 {% endblock %}
 {% block content %}
+{# A slot for `JarvisChart.pie`, which draws it below; slices from `pie_slices` (cost-overview-first spec §3.1) #}
+{% macro pie(title, slices) -%}
+<figure class="cost-pie" style="margin: 0;">
+  <figcaption class="kv">{{ title }}</figcaption>
+  {% if slices %}
+  <svg width="340" height="{{ [124, slices|length * 16 + 20]|max }}" role="img" aria-label="{{ title }}"></svg>
+  <script type="application/json" class="pie-data">{{ slices|tojson }}</script>
+  {% else %}
+  <p class="kv sub" style="margin: 4px 0 0;">nothing in this window</p>
+  {% endif %}
+</figure>
+{%- endmacro %}
 
 {# §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md #}
 {{ ui.page_head("What the work cost", report.scope) }}
@@ -106,8 +117,8 @@
   {% set ns = namespace(dollars=[]) %}
   {% for p in agg.projects %}{% set ns.dollars = ns.dollars + [(p.project, p.cost_usd)] %}{% endfor %}
   <div class="cost-overview-fleet" style="margin: 12px 0 0; display: flex; gap: 22px; flex-wrap: wrap;">
-    {{ charts.pie("$ by project", pie_slices(ns.dollars + [("no order", agg.unattributed_cost_usd)], money=True)) }}
-    {{ charts.pie("orders by kind", pie_slices(agg.by_order_kind)) }}
+    {{ pie("$ by project", pie_slices(ns.dollars + [("no order", agg.unattributed_cost_usd)], money=True)) }}
+    {{ pie("orders by kind", pie_slices(agg.by_order_kind)) }}
   </div>
   {% endif %}
   <div class="cost-overview-projects" style="margin: 12px 0 0; display: flex; gap: 22px; flex-wrap: wrap;">
@@ -118,7 +129,7 @@
       <p class="kv mono sub" style="margin: 0;">
         {{ p.ttl_misses }} TTL miss{{ 'es' if p.ttl_misses != 1 }} ·
         {{ fmt_tok(p.ttl_rewrite_tokens) }} TTL re-write tokens</p>
-      {{ charts.pie("orders by kind", pie_slices(p.by_order_kind, field="orders")) }}
+      {{ pie("orders by kind", pie_slices(p.by_order_kind, field="orders")) }}
     </div>
     {% endfor %}
   </div>
@@ -141,7 +152,16 @@
     (${{ '%.2f'|format(outside.total_usd) }}, listed under the meter).
   </p>
   {% endif %}
-  {% if agg %}{{ charts.pie_script() }}{% endif %}
+  {% if agg %}
+  <script src="/static/chart.js?v={{ static_v['chart.js'] }}"></script>
+  <script>
+    document.querySelectorAll('figure.cost-pie').forEach(function (f) {
+      var data = f.querySelector('script.pie-data');
+      if (data) window.JarvisChart.pie(f.querySelector('svg'), JSON.parse(data.textContent),
+                                       { cx: 56, cy: 60, r: 50 });
+    });
+  </script>
+  {% endif %}
   <details class="cost-prose" style="margin: 10px 0 0;">
   <summary class="kv" style="cursor: pointer;">How this total is made</summary>
   {# The split, stated right under the headline: the workers' own conversations, what the
