@@ -205,6 +205,25 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "decision_closed_by_user":
         return (f"You {'decided' if p.get('status') == 'completed' else 'cancelled'} "
                 f"{p.get('do_id') or 'the decision order'}", p.get("note") or "")
+    # The experiment phase's four (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §2)
+    if kind == "decision_experiment_started":
+        what = f"proposal {p['key']}" if p.get("key") else "an ad-hoc brief"
+        return (f"Experiment {p.get('n') or '?'} started for "
+                f"{p.get('do_id') or 'the decision order'}",
+                f"{what}; reopened from {p.get('reopened_from') or '?'}")
+    if kind == "decision_forecast_submitted":
+        share = ("usage meter unavailable" if p.get("window_share_pct") is None
+                 else f"~{p['window_share_pct']:g}% of the 5h window")
+        return (f"Experiment {p.get('n') or '?'} "
+                f"{'re-forecast' if p.get('replaced') else 'forecast'}: "
+                f"{p.get('runs') or '?'} runs",
+                f"~${float(p.get('est_usd') or 0):.2f}, {share}")
+    if kind == "decision_experiment_go":
+        return (f"You said go on experiment {p.get('n') or '?'}",
+                p.get("do_id") or "")
+    if kind == "decision_attached":
+        return (f"Attached {p.get('name') or 'a file'} to experiment {p.get('n') or '?'}",
+                f"{p.get('size') or 0:,} bytes, sha256 {str(p.get('sha256') or '')[:12]}")
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
     # docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §1

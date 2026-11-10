@@ -63,8 +63,9 @@ jarvis io ask-neo <id>                     # put findings awaiting you (back) to
 jarvis io cancel <id>                      # filed orders from accepted findings stay
 jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settles itself; a GAP files an issue, dispatches nothing
 jarvis investigate list / show <inv-id> / cancel <inv-id>
-jarvis do create <project> "title" -d "<the decision; what data settles it>"  # decision order: data for YOUR call; never self-closes
+jarvis do create <project> "title" -d "<what data settles it>"
 jarvis do show|send|follow-up|done|cancel <id>
+jarvis do experiment <id> <key>|-d "…" [--go]  # run it under the do
 jarvis mo create <project> "title" --prompt "…"|--script f [--every 15m] [--deadline 3d]
 jarvis mo list|show|cancel|waive|requeue|rewrite|confirm / pause|unpause|follow-fleet   # `jarvis morpheus` = alias
 jarvis backlog promote <id> --as feature   # intake -> feature order
@@ -128,6 +129,8 @@ Rules that cost the user if forgotten:
 - An ask whose deliverable is information for the user's own decision ("find out…",
   "compare…", "gather data so I can decide") goes to `jarvis do create`, never
   `jarvis wo create`. Only the user's `jarvis do done|cancel` closes it.
+- A decision order's experiment follow-up goes to `jarvis do experiment`, never
+  `jarvis wo create`.
 - When the user reverses an earlier ruling, retract the old one (`neo retract` /
   `learn retract`) so both do not stay in every prompt.
 

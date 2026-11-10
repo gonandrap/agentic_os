@@ -1661,6 +1661,15 @@ def create_app() -> FastAPI:
             return _back_to_decision(name, do_id, error=str(e))
         return _back_to_decision(name, do_id, note=f"sent — {out['delivery']}")
 
+    @app.post("/do/{name}/{do_id}/go")
+    def decision_go(name: str, do_id: str):
+        """`jarvis do experiment <do> --go`"""
+        try:
+            out = ops.approve_decision_experiment(do_id, project_name=name)
+        except ops.OpsError as e:
+            return _back_to_decision(name, do_id, error=str(e))
+        return _back_to_decision(name, do_id, note=f"go given on experiment {out['n']}")
+
     @app.post("/io/{name}/{io_id}/review")
     def review_findings(name: str, io_id: str, key: str = Form(...),
                         decision: str = Form(...), reason: str = Form("")):

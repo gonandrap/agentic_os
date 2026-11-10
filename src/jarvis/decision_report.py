@@ -273,6 +273,30 @@ def render_report(report: Mapping[str, Any]) -> str:
     return "\n".join(lines).rstrip()
 
 
+PHASE_LABEL = {"forecast_due": "forecast due", "awaiting_go": "awaiting your go",
+               "running": "running", "reported": "reported"}
+
+
+def render_experiments(do_id: str, experiments: list[Mapping[str, Any]]) -> str:
+    """One block per experiment for `jarvis do show` (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §7)"""
+    from . import experiment_forecast
+
+    lines: list[str] = []
+    for e in experiments:
+        phase = e.get("phase") or experiment_phase(e)
+        lines.append(f"Experiment {e.get('n')}: {e.get('title') or e.get('key') or 'ad hoc'} "
+                     f"({PHASE_LABEL.get(phase, phase)})")
+        if e.get("forecast"):
+            lines += [f"  {line}" for line in
+                      experiment_forecast.render(e["forecast"]).splitlines()]
+        for a in e.get("attachments") or []:
+            lines.append(f"  - {a.get('abs_path') or a.get('path')} ({a.get('size', 0):,} bytes)")
+        if phase == "awaiting_go":
+            lines.append(f"  go: jarvis do experiment {do_id} --go")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def headline(fo: Mapping[str, Any], report: Mapping[str, Any]) -> str:
     """One line: counts plus the recommended option's title"""
     n_f = len(report.get("findings") or [])

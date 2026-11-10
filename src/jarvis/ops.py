@@ -11024,6 +11024,8 @@ def decision_report(fo: Mapping[str, Any]) -> dict[str, Any]:
 
 def show_decision_order(do_id: str, project_name: str | None = None) -> dict[str, Any]:
     """`jarvis do show` — the row, its researcher and the report as stored"""
+    from .decision_report import experiment_phase
+
     name, path, fo = find_feature_order(do_id, project_name)
     _require_kind(fo, "decision", show_verb(fo.get("kind")))
     store = ProjectStore(path)
@@ -11035,6 +11037,12 @@ def show_decision_order(do_id: str, project_name: str | None = None) -> dict[str
                 researcher = {k: row[k] for k in ("id", "status", "result_summary")}
             except KeyError:
                 researcher = None  # deleted out from under it; the link was released
+        # docs/superpowers/specs/2026-11-10-decision-order-experiments.md §7
+        experiments = [
+            {**e, "phase": experiment_phase(e),
+             "attachments": [{**a, "abs_path": str(Path(path) / a["path"])}
+                             for a in e.get("attachments") or []]}
+            for e in store.experiments_of(do_id)]
     finally:
         store.close()
     report = decision_report(fo)
@@ -11043,7 +11051,7 @@ def show_decision_order(do_id: str, project_name: str | None = None) -> dict[str
                  for p in report.get("proposed_orders") or [] if isinstance(p, dict)
                  for mark in p.get("filed") or [] if isinstance(mark, dict)]
     return {"project": name, **fo, "researcher": researcher,
-            "report": report, "followups": followups,
+            "report": report, "followups": followups, "experiments": experiments,
             "status_label": feature_status_label("decision", fo["status"])}
 
 

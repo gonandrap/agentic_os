@@ -81,13 +81,25 @@ an INVESTIGATION order: one order is not moving and you want the cause. A read-o
 
 (no further notes)
 
-## `jarvis do create <project> "title" -d "<the decision; what data settles it>"`
+## `jarvis do create <project> "title" -d "<what data settles it>"`
 
 a DECISION order ("do"): the deliverable is information for YOUR decision, not code. Route here, never to `jarvis wo create`, any ask like "find out…", "compare…", "gather data so I can decide". A read-only researcher gathers the data into a report on the record — summary, findings with evidence, options, a recommendation, proposed orders — and you are notified once it is validated. It NEVER COMPLETES ON ITS OWN: no daemon pass, budget path, Neo verdict or gate settles it, and Neo never picks an option. It waits, flagged, in `awaiting your decision` until you run `jarvis do done` or `jarvis do cancel`. -d is REQUIRED: the researcher sees only that text.
 
 ## `jarvis do show|send|follow-up|done|cancel <id>`
 
 show renders the report and the orders already filed from it. send asks the researcher for more; the order stays open and flagged. follow-up <id> <key>|--all files proposed orders as ordinary independent orders with a back-link, and leaves the order open. done [--note "what you decided"] and cancel are the only two closes, and only from your own session — an agent session is refused. The dashboard page `/do/<project>/<id>` has the same buttons, calling the same functions.
+
+## `jarvis do experiment <id> <key>|-d "…" [--go]`
+
+### Experiments
+
+When a report's answer needs a measurement, run it UNDER the same do, never as a `jarvis wo create`: the results come back to you as a revision of the same report. Spec: `docs/superpowers/specs/2026-11-10-decision-order-experiments.md`.
+
+1. You: `jarvis do experiment <do> <key>` runs proposal `<key>` (one whose `as` is `experiment`), or `-d "…"` an ad-hoc brief. Allowed from `awaiting your decision` or `completed`; the do goes back to researching and its flag drops. `jarvis do follow-up <do> <key> --as experiment` does the same.
+2. Researcher: `jarvis do forecast <do> --from-file forecast.json` states runs, model and per-run tokens; the OS adds tokens, dollars and the share of the 5-hour usage window ("meter unavailable" without an OAuth sample). The do is flagged with the forecast. Nothing runs yet.
+3. You: `jarvis do experiment <do> --go` accepts it (the Go button on the dashboard page does the same). Required on every experiment.
+4. Researcher: runs the batch, `jarvis do attach <do> <file>…` copies each raw output into the project's feature directory with a sha256 (caps: 50MB a file, 500MB and 200 files an experiment), then `jarvis do report <do> --from-file report.json` resubmits the whole report. Results are refused without a forecast, a go and at least one attachment.
+5. The report is validated and delivered as "revised"; `jarvis do show` lists each experiment with its phase, forecast and attachments (absolute paths). You decide with `jarvis do done|cancel`, which abandon any experiment still open.
 
 ## `jarvis backlog promote <id> [--as feature] [--yes]`
 

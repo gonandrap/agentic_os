@@ -107,6 +107,36 @@
 </div></div>
 {% endif %}
 
+{% if do.experiments %}
+{# §7 of docs/superpowers/specs/2026-11-10-decision-order-experiments.md #}
+<h3>Experiments</h3>
+<div class="panel">
+  {% for e in do.experiments %}
+  {% set f = e.forecast %}
+  <div class="row" id="experiment-{{ e.n }}">
+    <div class="grow">
+      <strong>{{ e.n }} — {{ e.title or e.key or 'ad hoc' }}</strong>
+      <span class="sub mono">{{ e.phase | replace('_', ' ') }}</span>
+      {% if f %}
+      <div class="sub">forecast: {{ f.runs }} runs of {{ f.model }}, {{ '{:,}'.format(f.total_tokens) }} tokens, ~${{ '%.2f' | format(f.est_usd) }}
+        {% if f.meter == 'unavailable' %}· usage meter unavailable
+        {% elif f.window_share_pct is not none %}· ~{{ f.window_share_pct }}% of the 5h window ({{ f.window_used_pct }}% used)
+          {% if f.fits_now is not none %}· {{ 'fits now' if f.fits_now else 'does NOT fit now' }}{% endif %}
+        {% endif %}
+      </div>
+      {% endif %}
+      {% for a in e.attachments %}<div class="sub mono">{{ a.abs_path }} ({{ '{:,}'.format(a.size) }} bytes)</div>{% endfor %}
+    </div>
+    {% if e.phase == 'awaiting_go' and do.status == 'planning' %}
+    <form class="inline" method="post" action="/do/{{ project }}/{{ do.id }}/go">
+      <button>Go</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 {% if open %}
 <h3>Your decision</h3>
 <div class="panel">

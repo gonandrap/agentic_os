@@ -2621,6 +2621,44 @@ def test_the_decision_buttons_go_through_ops(decision):
     assert f'action="/do/proj_a/{do["id"]}/done"' not in page   # nothing left to close
 
 
+def test_the_decision_page_shows_each_experiment_phase_and_go_calls_the_op(decision,
+                                                                          tmp_path):
+    """§7 of docs/superpowers/specs/2026-11-10-decision-order-experiments.md"""
+    client, do = decision
+    url, go = f"/do/proj_a/{do['id']}", f'action="/do/proj_a/{do["id"]}/go"'
+    assert "Experiments" not in client.get(url).text
+    rid = ops.start_decision_experiment(do["id"], "p1")["researcher_id"]
+    store = ProjectStore(ops.find_feature_order(do["id"])[1])
+    try:
+        store.set_status(rid, "running")
+        page = client.get(url).text
+        assert "forecast due" in page and go not in page
+        ops.submit_decision_forecast(do["id"], {
+            "runs": 24, "model": "m", "per_run": {"input_tokens": 1000,
+                                                  "output_tokens": 100, "minutes": 2}})
+        page = client.get(url).text
+        assert "awaiting go" in page and "24 runs of m" in page and go in page
+        res = client.post(f"/do/proj_a/{do['id']}/go")
+        assert res.status_code == 303 and "note=go%20given" in res.headers["location"]
+        assert ops.show_decision_order(do["id"])["experiments"][0]["phase"] == "running"
+        page = client.get(url).text
+        assert "running" in page and go not in page
+        # A second Go is refused by ops, and the refusal reaches the page
+        res = client.post(f"/do/proj_a/{do['id']}/go")
+        assert "no%20forecast%20awaiting" in res.headers["location"]
+        raw = tmp_path / "raw.json"
+        raw.write_text("{}")
+        ops.attach_decision_outputs(do["id"], [raw])
+        store.update_experiment(do["id"], 1, reported_at=1.0)
+        page = client.get(url).text
+        assert "reported" in page and go not in page
+        abs_path = ops.show_decision_order(do["id"])["experiments"][0]["attachments"][0][
+            "abs_path"]
+        assert html.escape(abs_path) in page and "(2 bytes)" in page
+    finally:
+        store.close()
+
+
 def test_the_project_page_and_api_status_list_decision_orders(decision):
     client, do = decision
     page = client.get("/project/proj_a").text
