@@ -95,7 +95,7 @@ def test_a_draft_waiting_on_the_user_parks_before_ci_and_the_panel(fleet, fake_g
 
 
 def test_a_ready_pull_request_waiting_on_the_user_is_judged_and_says_so(fleet, fake_gh):
-    """#1506's post-merge park stays; the finish names the command and the path (#1684)"""
+    """#1506's post-merge park stays; the finish names the command and the path"""
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch()

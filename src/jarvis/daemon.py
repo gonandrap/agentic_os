@@ -2473,7 +2473,7 @@ class Daemon:
             # Beside the head and for its reason: what the NEXT submission has to diff itself against to learn... (docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §3)
             store.set_validation_file_shas(round_id, packet.file_shas)
 
-            # A DECLARED USER STEP ON NOTHING OR ON A DRAFT parks before CI and the panel (#1352, #1684); a ready PR is judged and parks after merge (#1506)
+            # A DECLARED USER STEP ON NOTHING OR ON A DRAFT parks before CI and the panel (#1684)
             empty = evidence_mod.nothing_to_judge(packet)
             needs_user = ops.declared_user_action(store, wo_id)
             draft = bool(packet.pr and packet.pr.get("draft"))
@@ -2540,7 +2540,6 @@ class Daemon:
                          project.name, wo_id, n)
                 return
 
-            # A SUBMISSION WITH NOTHING FOR A REVIEWER never reaches the validator (docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §3); `empty` read above
             # A DECLARED ABANDONMENT THAT PRODUCED NOTHING is a decision, not a delivery (wo-3fa65445)
             if empty == "escalate" and store.work_abandoned(wo_id):
                 dropped = store.events_of_kind(wo_id, "abandoned")[-1]
