@@ -1371,11 +1371,12 @@ def create_app() -> FastAPI:
         show = show or filters.get("status", "")
         revealed = show if show == "all" or any(wo["status"] == show for wo in rows) \
             else ""
+        # group_open is the filter here (collapsed statuses stay counted), not the order
         featured, rest = group_open(rows, revealed)
         # Same predicate as project(); a family never collapses into the count (not a WO status)
-        shown = attention_first(families + featured + rest,
-                                lambda wo: wo["status"] in NEEDS_YOU_STATUSES
-                                or bool(wo.get("needs_attention")))
+        shown = newest_first(families + featured + rest, lambda wo: wo["status_since"],
+                             pins=(lambda wo: wo["status"] in NEEDS_YOU_STATUSES
+                                   or bool(wo.get("needs_attention")),))
         rest_counts = _counts_by_status(
             wo["status"] for wo in rows if wo["status"] not in FEATURED_STATUSES)
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
@@ -1434,10 +1435,11 @@ def create_app() -> FastAPI:
             # The requestor is not a column filter: read every row so the cap and `matched` count only matches
             fetch = -1 if who else cap
             wos = (store.list_work_orders(statuses=wo_statuses, limit=fetch,
-                                          include_hidden=show_hidden)
+                                          include_hidden=show_hidden,
+                                          order_by="status_since")
                    if kind in ("", "work") else [])
             fos = (store.list_feature_orders(statuses=fo_statuses, limit=fetch,
-                                             kind=kind or None)
+                                             kind=kind or None, order_by="status_since")
                    if kind != "work" else [])
             # Classified inside the store's lifetime: a NULL row walks its parents (§5.1)
             wos = requestor_rows([ops.with_requestor_view(store, wo) for wo in wos], who)
@@ -1472,14 +1474,14 @@ def create_app() -> FastAPI:
         finally:
             central.close()
         backlog = [i for i in every_backlog if i["status"] == "open"]
-        featured, rest = group_open([{**wo, "type": "work"} for wo in wos], "all")
-        every = families + featured + rest
-        past = sorted((r for r in every if r["status"] in TERMINAL_STATUSES),
-                      key=lambda r: r["created_at"], reverse=True)
-        rows = attention_first([r for r in every if r["status"] not in TERMINAL_STATUSES]
-                               + past,
-                               lambda r: r["status"] in NEEDS_YOU_STATUSES
-                               or bool(r.get("needs_attention")))[:cap]
+        every = families + [{**wo, "type": "work"} for wo in wos]
+        # Settled view: no pin, attention is a badge (filtered-views-newest-first spec §2)
+        settled = status == "past" or status in TERMINAL_STATUSES \
+            or status in FO_TERMINAL_STATUSES
+        needs_you = (lambda r: r["status"] in NEEDS_YOU_STATUSES
+                     or bool(r.get("needs_attention")))
+        rows = newest_first(every, lambda r: r["status_since"],
+                            pins=() if settled else (needs_you,))[:cap]
         in_scope = {t: by_status for t, by_status in counts.items() if kind in ("", t)}
         wanted = {t: wo_statuses if t == "work" else fo_statuses for t in in_scope}
         matched = sum(n for t, by_status in in_scope.items()

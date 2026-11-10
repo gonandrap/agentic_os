@@ -72,7 +72,7 @@
         {% if o.needs_attention %}<div class="sub tone-warn">◭ {{ o.attention_reason }}</div>{% endif %}
       </div>
       <span><span class="badge">{{ o.type }}</span>{% if work %} {{ ui.wo_tags(wo_tags(o, project_name)) }}{% endif %}</span>
-      <span class="sub mono">{{ fmt_age(o.created_at) }}</span>
+      <span class="sub mono" title="in this status since {{ fmt_ts(o.status_since) }} · created {{ fmt_ts(o.created_at) }}">{{ fmt_age(o.status_since) }}</span>
     </div>
   {% else %}
     <div class="empty">
