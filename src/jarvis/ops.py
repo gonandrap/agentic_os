@@ -9583,9 +9583,10 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .central_store import base_red_hold_spans
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
-                                UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                dependency_hold_spans, manager_idle_hold_spans,
-                                plan_hold_spans, precondition_hold_spans,
+                                SPEC_PR_EVENT_KINDS, UNGOVERNED_ORIGINS,
+                                VALIDATION_CI_CAUSE, dependency_hold_spans,
+                                manager_idle_hold_spans, plan_hold_spans,
+                                precondition_hold_spans, spec_pr_hold_spans,
                                 validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -9642,20 +9643,29 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 since, now, base_red_until)
         # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of...
         plan_held, plan_spans = False, []
+        # NOR IS ONE HELD BY ITS FEATURE'S UNMERGED SPEC PR (issue 1681, kn-0a222b38)
+        spec_held, spec_spans = False, []
         if (wo["status"] == "pending" and wo.get("parent_id")
                 and wo.get("kind") == "worker"):
             plan_held = bool(pstore.plan_hold(wo))
+            spec_held = bool(pstore.spec_hold(wo))
             try:
                 planner_id = pstore.get_feature_order(
                     str(wo["parent_id"])).get("plan_wo_id")
+                planner = pstore.get_work_order(str(planner_id)) if planner_id else None
             except KeyError:
-                planner_id = None  # the feature was deleted out from under the child
-            if planner_id:
+                planner = None  # the feature or planner was deleted out from under the child
+            if planner:
                 # `events_of_kind` takes ONE kind
                 plan_spans = plan_hold_spans(
                     sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
                             for e in pstore.events_of_kind(str(planner_id), k)),
                            key=lambda e: float(e["ts"])), since, now)
+                spec_spans = spec_pr_hold_spans(
+                    [e for k in SPEC_PR_EVENT_KINDS
+                     for e in pstore.events_of_kind(str(planner_id), k)],
+                    pstore.state_spans(str(planner_id)), str(planner["status"]),
+                    since, now)
         # AN ORDER HELD BY AN OPEN PRECONDITION IS NOT STUCK (§2
         pre_held, pre_spans = False, []
         if wo["status"] == "pending":
@@ -9681,7 +9691,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans + automerge_spans
+            + ci_spans + base_red_spans + plan_spans + spec_spans + automerge_spans
             + budget_spans + pre_spans + dep_spans + idle_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
@@ -9733,6 +9743,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact about one feature's plan
                             else stuck.PLAN_ASSUMPTION_CAUSE if plan_held
+                            # Below the plan hold: that one names a ruling only the user can give
+                            else stuck.SPEC_PR_CAUSE if spec_held
                             # `running`-only, so it collides with nothing but the usage window above
                             else stuck.BACKGROUND_TASK_CAUSE if awaits_task else ""),
             kind=str(wo.get("kind") or "worker"),
@@ -11325,6 +11337,101 @@ def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | Non
             store.close()
     return {"project": name, "do_id": do_id, "status": fo["status"], "filed": filed,
             "skipped": skipped, "errors": errors}
+
+
+#: Raw-output caps (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §6)
+ATTACH_MAX_FILE_BYTES = 50 * 1024 * 1024
+ATTACH_MAX_EXPERIMENT_BYTES = 500 * 1024 * 1024
+ATTACH_MAX_FILES = 200
+_ATTACH_PHASES = ("awaiting_go", "running")
+
+
+def _copy_hashed(src: Path, dest_dir: Path) -> tuple[Path, int, str]:
+    """Copy `src` into `dest_dir` under a free name, returning (dest, size, sha256)"""
+    stem, suffix = Path(src.name).stem, Path(src.name).suffix
+    k = 1
+    while True:
+        dest = dest_dir / (src.name if k == 1 else f"{stem}-{k}{suffix}")
+        try:
+            out = open(dest, "xb")  # exclusive create: never overwrite a stored output
+        except FileExistsError:
+            k += 1
+            continue
+        break
+    digest, size = hashlib.sha256(), 0
+    with out, open(src, "rb") as inp:
+        while chunk := inp.read(1 << 20):
+            digest.update(chunk)
+            size += len(chunk)
+            out.write(chunk)
+    return dest, size, digest.hexdigest()
+
+
+def attach_decision_outputs(do_id: str, paths: Sequence[str | Path],
+                            project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do attach` — copy raw outputs onto the project, with a sha256 manifest (§6)"""
+    from . import specs
+    from .decision_report import experiment_phase
+    from .project_store import DECISION_ATTACHED_EVENT
+
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", show_verb(fo.get("kind")))
+    if not paths:
+        raise OpsError(f"nothing to attach: `jarvis do attach {do_id} <file>...`")
+    store = ProjectStore(path)
+    try:
+        entry = store.open_experiment(do_id)
+        phase = experiment_phase(entry) if entry else None
+        if phase not in _ATTACH_PHASES:
+            why = ("has no open experiment" if entry is None else
+                   f"has experiment {entry['n']} still awaiting its forecast")
+            raise OpsError(
+                f"{do_id} {why}, so there is nowhere to attach outputs: attaching is for an "
+                f"experiment awaiting the go-ahead or running. See where it stands with "
+                f"`jarvis do show {do_id}`.")
+        files: list[Path] = []
+        for raw in paths:
+            src = Path(raw).expanduser().resolve()
+            if src.is_dir():
+                raise OpsError(f"{raw} is a directory: pass the files, or tar them first "
+                               f"(`jarvis do attach {do_id} <file>...`). Nothing was attached.")
+            if not src.is_file():
+                raise OpsError(f"{raw} is not an existing regular file. Nothing was "
+                               f"attached; fix the path and rerun `jarvis do attach {do_id} "
+                               f"<file>...`.")
+            files.append(src)
+        sizes = [f.stat().st_size for f in files]
+        held = entry.get("attachments") or []
+        retry = f"Nothing was attached; rerun `jarvis do attach {do_id} <file>...` within it."
+        for f, size in zip(files, sizes):
+            if size > ATTACH_MAX_FILE_BYTES:
+                raise OpsError(f"{f} is {size} bytes, over the per-file cap of "
+                               f"{ATTACH_MAX_FILE_BYTES} bytes (50 MB). {retry}")
+        total = sum(int(a.get("size") or 0) for a in held) + sum(sizes)
+        if total > ATTACH_MAX_EXPERIMENT_BYTES:
+            raise OpsError(f"experiment {entry['n']} would hold {total} bytes, over the "
+                           f"per-experiment cap of {ATTACH_MAX_EXPERIMENT_BYTES} bytes "
+                           f"(500 MB). {retry}")
+        if len(held) + len(files) > ATTACH_MAX_FILES:
+            raise OpsError(f"experiment {entry['n']} would hold {len(held) + len(files)} "
+                           f"files, over the per-experiment cap of {ATTACH_MAX_FILES}. {retry}")
+        dest_dir = specs.experiment_dir(path, do_id, entry["n"], entry.get("key") or "")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        attached = []
+        for src in files:
+            dest, size, sha = _copy_hashed(src, dest_dir)
+            mark = {"name": dest.name, "size": size, "sha256": sha,
+                    "path": str(dest.relative_to(path)), "at": db.now()}
+            store.add_experiment_attachment(do_id, entry["n"], mark)
+            if entry.get("researcher_id"):
+                store.add_event(entry["researcher_id"], DECISION_ATTACHED_EVENT,
+                                {"do_id": do_id, "n": entry["n"], "name": dest.name,
+                                 "size": size, "sha256": sha})
+            attached.append({**mark, "path": str(dest)})
+    finally:
+        store.close()
+    return {"project": name, "do_id": do_id, "n": entry["n"], "attached": attached,
+            "note": "stored on the project; cite these paths as evidence in the report"}
 
 
 OFFBOARDED_EVENT = "offboarded"

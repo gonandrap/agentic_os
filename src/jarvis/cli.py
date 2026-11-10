@@ -1454,6 +1454,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the forecast, as JSON (forecast.json); `-` reads stdin")
     d.add_argument("--project")
 
+    d = dec.add_parser("attach", help="(researchers) copy an experiment's raw outputs onto "
+                                      "the project, with a sha256 manifest")
+    d.add_argument("do_id")
+    d.add_argument("paths", nargs="+", metavar="PATH", help="files to keep; not directories")
+    d.add_argument("--project")
+
     d = dec.add_parser("send", help="message the researcher (revives it); the order stays "
                                     "open until `jarvis do done`")
     d.add_argument("do_id")
@@ -4662,6 +4668,9 @@ def cmd_do(args: argparse.Namespace) -> int:
             raise ops.OpsError(f"{args.from_file} is not valid JSON: {e}") from e
         _print(ops.submit_decision_forecast(args.do_id, doc, project_name=args.project),
                args.json)
+
+    elif args.do_cmd == "attach":
+        _print(ops.attach_decision_outputs(args.do_id, args.paths, args.project), args.json)
 
     elif args.do_cmd == "send":
         _print(ops.send_decision_message(args.do_id, args.message, args.project,
