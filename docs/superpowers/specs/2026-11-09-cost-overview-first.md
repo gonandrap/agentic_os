@@ -118,23 +118,30 @@ Tests (a new tests/test_cost_aggregates.py, synthetic unit dicts):
 
 ## 3. Overview section of the cost page, with its pie chart
 
-### 3.1 Pie macro
+### 3.1 Pies: reuse the shared chart helper
 
-A Jinja macro file src/jarvis/ui/templates/_pie.html exporting
-`pie(slices, title, fmt)` where `slices` is a list of `{"label": str, "value": number}`
-and `fmt` is `'usd'` or `'count'`. Server-rendered: one `<svg>` element, no `<script>`,
-no external asset.
+Draw every pie with `JarvisChart.pie` from src/jarvis/ui/static/chart.js, the shared
+SVG chart helper (kn-4f4e829b). It lands with work order wo-089540e3, open as PR #1661
+when this spec was written; it is a local file served by the dashboard, not a CDN. Do
+not write a second pie renderer (no Jinja SVG macro, no Python arc maths): two
+renderers is the drift kn-965509c1 records.
 
-- Slices sorted largest first; beyond 6 slices the tail collapses into one "other".
-- The legend is SVG content beside the pie in the same `<svg>`: a swatch `<rect>` and a
-  `<text>` per slice (label, value by `fmt`, percentage). Not a caption, not HTML.
-- Colours: a fixed palette of CSS custom properties with dark-mode values (follow how
-  base.html defines its tokens); "other" and "no order" use the muted ink.
-- A single slice is a `<circle>` (a 360-degree arc renders nothing). A zero total draws
-  the title and "nothing in this window".
-- Each slice has a `<title>` for hover.
-- Arc maths in a small Python helper (e.g. `pie_arcs(values)` returning path `d`
-  strings) registered as a Jinja global, so it is testable without rendering.
+- If src/jarvis/ui/static/chart.js is not on main when you start, stop and
+  `jarvis wo ask` Neo; do not vendor or copy it.
+- Load it as the meter does on that branch:
+  `<script src="/static/chart.js?v={{ static_v['chart.js'] }}"></script>`, data passed
+  in a `<script type="application/json">` block through `| tojson`.
+- API: `JarvisChart.pie(svgParent, slices, {cx, cy, r})`, slices
+  `{key, label, value, color}`; it draws a `<circle>` for a single slice, skips zero
+  slices, and draws the legend inside the SVG to the right with each share in percent.
+  Put the value (`~$x` or a count) into `label`: the helper prints only the share.
+- Slices largest first; beyond 6 slices collapse the tail into one "other" in the
+  caller, not in the helper. "other" and "no order" use the muted ink colour; the rest
+  a fixed palette of CSS custom properties with dark-mode values (follow base.html's
+  tokens).
+- A zero total draws no pie, just the title and "nothing in this window".
+- If the helper truly cannot do something this section needs, extend chart.js in a
+  backward-compatible way (the meter uses it) rather than working around it.
 
 ### 3.2 The overview
 
@@ -158,11 +165,13 @@ In src/jarvis/ui/templates/cost.html, the headline panel (~86-155) becomes:
 Do not touch the order-list table, the route, the meter include or the
 fleet-distribution include.
 
-Tests: `pie_arcs` (one slice is a `<circle>`, two equal slices, zero total, a 7+ slice
-tail); the macro renders one `<svg`, one legend `<text>` per slice, no `<script`; in
-tests/test_ui_cost.py the page renders pies and per-project TTL figures, the prose sits
+Tests: in tests/test_ui_cost.py the page includes `/static/chart.js` and a JSON block
+whose slices match `aggregates` (tail collapsed past 6, zero total gives no slices),
+the page renders per-project TTL figures, the prose sits
 in a closed `<details>`, the reconciliation line shows the headline figure, the old
-"below add to" tally is gone, and an entry without `aggregates` still renders.
+"below add to" tally is gone, and an entry without `aggregates` still renders. In
+tests_browser/test_ui_browser.py (the meter's legend test on PR #1661 is the shape)
+each pie's legend shows one `g.legend-item[data-key]` per slice.
 
 Existing tests this section breaks, to rewrite against `aggregates` (not delete
 silently): `test_the_order_list_comes_first_and_its_tally_adds_to_the_headline`,
@@ -207,8 +216,8 @@ check when the tally is absent: section 3 deletes it). Existing tests stay green
 
 ## 5. What stays out
 
-- The usage-meter legend (finding `chart-legend-in-prose`) is a separate order; it may
-  later reuse §3.1's macro or replace it with a shared helper.
+- The usage-meter legend and the shared chart helper (finding `chart-legend-in-prose`)
+  are wo-089540e3's, not this feature's; section 3 only consumes the helper.
 - Re-write units on rows vs headline (finding `rewrite-units-mismatch`) is a separate
   order.
 - The text output of `jarvis cost` gains no overview.
@@ -234,8 +243,10 @@ What you must know:
   src/jarvis/ui/app.py precomputes `{report, fleet, meter}` per window; routes read
   entries. A new query parameter that is not a window bound must not change the cache
   key or the matching rule.
-- Templates live in src/jarvis/ui/templates; there is no static asset directory and no
-  CDN. Charts are inline SVG rendered server-side.
+- Templates live in src/jarvis/ui/templates. Charts are SVG drawn by the shared
+  helper src/jarvis/ui/static/chart.js (`window.JarvisChart`: el, line, legend, pie),
+  served at `/static/<name>?v={{ static_v[name] }}`. No CDN, and never a second
+  hand-rolled chart renderer.
 - Navigate code with Serena symbol tools (`find_symbol`, `find_referencing_symbols`);
   the Bash hook refuses grep over Python.
 
@@ -255,9 +266,10 @@ Traps:
 - `kind` on a unit is the worker role; the order kind is `order_kind`, from the id
   prefix.
 - The snapshot file survives restarts; a shape change needs `SNAPSHOT_VERSION` bumped.
-- An SVG arc of 360 degrees draws nothing; a single slice is a `<circle>`.
+- `JarvisChart.pie`'s legend prints only the share; put the value in the slice label.
 - Do not touch `_meter.html`, `_fleet_distribution.html`, pricing maths, or
-  `_cost_for_target`. Those belong to other orders.
+  `_cost_for_target`. Those belong to other orders. A change to chart.js must keep the
+  meter working.
 
 Never: poke the SQLite databases or the production checkout; run the full test suite;
 merge your own PR without the gate; widen your section because a neighbour's looks
