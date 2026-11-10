@@ -76,6 +76,10 @@ VENDORED = frozenset(p.name for p in VENDOR.glob("*.js"))
 # `?v=<content hash>` on every vendored URL: `/vendor/` is cached for an hour
 VENDOR_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
                   for p in VENDOR.glob("*.js")}
+# The dashboard's OWN browser code (the shared chart helper), served the same way
+STATIC = Path(__file__).parent / "static"
+STATIC_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+                  for p in STATIC.glob("*.js")}
 
 
 # -- the knowledge review's JSON bodies (`/knowledge/review/*`)
@@ -1157,8 +1161,8 @@ def create_app() -> FastAPI:
         # Every page reflects live OS state (inbox acks, work order status)
         response = await call_next(request)
         # Except the vendored libraries: they change only with a release
-        response.headers["Cache-Control"] = ("max-age=3600" if request.url.path.startswith("/vendor/")
-                                             else "no-store")
+        response.headers["Cache-Control"] = (
+            "max-age=3600" if request.url.path.startswith(("/vendor/", "/static/")) else "no-store")
         return response
 
     # Inside the factory, like every other same-tier import in this file: `cli` and `ui` are one tier and...
@@ -1188,6 +1192,8 @@ def create_app() -> FastAPI:
         placeholder_zero=bill.PLACEHOLDER_ZERO,
         # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason the partial already...
         tool_table=fleetcost.tool_table,
+        # `/static/<file>?v=<hash>`: the dashboard's own scripts, cache-busted like /vendor/
+        static_v=STATIC_VERSION,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must not be able to disagree...
         assumption_decider=ops.assumption_decider,
         # And the OS's RULING on one, same reason one authority along: the page and `jarvis wo show` must not... (#712)
@@ -2053,6 +2059,13 @@ def create_app() -> FastAPI:
         if name not in VENDORED:
             return JSONResponse({"error": f"no vendored file {name}"}, status_code=404)
         return FileResponse(VENDOR / name, media_type="text/javascript")
+
+    @app.get("/static/{name}")
+    def static(name: str):
+        """The dashboard's own scripts — listed, never a path walk, as `/vendor/`"""
+        if name not in STATIC_VERSION:
+            return JSONResponse({"error": f"no static file {name}"}, status_code=404)
+        return FileResponse(STATIC / name, media_type="text/javascript")
 
     # after every fixed /knowledge/... route: this one matches any segment
     @app.get("/knowledge/{kn_id}", response_class=HTMLResponse)

@@ -68,6 +68,17 @@ def write_rate(cache_write: int, cache_1h: int = 0, cache_5m: int = 0) -> float:
     return CACHE_WRITE_RATE + share_1h * (CACHE_WRITE_1H_RATE - CACHE_WRITE_RATE)
 
 
+def fmt_tok(n: int | None) -> str:
+    """Token counts, at the magnitude a reader actually compares — 1.3M, 47k, 812"""
+    if not n:
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
 def class_costs(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int = 0,
                 output: int = 0, cache_1h: int = 0, cache_5m: int = 0) -> dict[str, float]:
     """What each class of token cost, at list — the line items of a bill"""

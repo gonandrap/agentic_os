@@ -2171,11 +2171,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def _tok(n: int) -> str:
     """Token counts, at the magnitude a reader can hold in their head"""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.0f}k"
-    return str(n)
+    from .usage import fmt_tok
+
+    return fmt_tok(n)
 
 
 def _dur(seconds: float | None) -> str:
@@ -3454,11 +3452,8 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"  re-write tax  ~${totals['rewrite_cost_usd']:.2f} — "
               f"{_tok(totals['rewrite_excess'])} tokens re-sent across "
               f"{totals['resume_boundaries']} turn boundaries")
-        cause = _rewrite_cause(totals.get("rewrite_ttl_share"),
-                               totals.get("boundaries_ttl") or 0,
-                               totals["resume_boundaries"])
-        if cause:
-            print(f"               {cause.strip()}")
+        if totals.get("rewrite_note"):
+            print(f"               {totals['rewrite_note']}")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
     # Silence when zero: nothing was excluded (docs/superpowers/specs/2026-10-07-cost-window-selector.md)

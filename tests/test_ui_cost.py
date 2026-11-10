@@ -198,6 +198,35 @@ def test_cost_page_lists_work_orders_dearest_first(client, project, transcript):
     assert "not a bill" in page.text
 
 
+def test_the_rewrite_is_dollars_then_tokens_on_rows_and_headline(client, project,
+                                                                 transcript):
+    """io-2641fe05: one unit on both, and the headline says it is the rows' sum"""
+    import os
+    from pathlib import Path
+
+    wo = ops.create_work_order("proj_a", "resumed twice")
+    transcript("sess-rw", at=db.now())
+    session = Path(os.environ[usage.TRANSCRIPT_ROOT_ENV]) / "-proj" / "sess-rw.jsonl"
+    first = json.loads(session.read_text())
+    rows = []
+    for i in range(3):
+        row = json.loads(json.dumps(first))
+        row["message"]["id"] = f"m{i}"
+        row["message"]["usage"]["cache_creation_input_tokens"] = 1_000_000
+        rows.append(json.dumps(row))
+    session.write_text("\n".join(rows) + "\n")
+    give_session(project, wo["id"], "sess-rw")
+    add_recorded_turn(project, wo["id"], 0.0, 1_000)
+
+    text = cost_page(client, "/cost").text
+    totals = ops.cost_report()["totals"]
+    row_usd = f"${totals['rewrite_cost_usd']:.2f}"
+
+    assert f"re-write {row_usd} (2.0M tokens)" in text
+    assert f"Re-write tax ~{row_usd}</strong>" in text
+    assert "sum of each order&#39;s re-write" in text or "sum of each order's re-write" in text
+
+
 def test_cost_page_says_when_a_transcript_is_gone_instead_of_saying_zero(
         client, project, transcript):
     """An unmeasurable cost and a zero cost are different answers"""
@@ -1064,6 +1093,22 @@ def test_the_meter_chart_endpoint_serves_any_span_and_refuses_a_bad_one(client, 
     assert 'data-calc="five_hour" checked' in page.text
     assert 'data-calc="seven_day" checked' in page.text
     assert "five_hour_calc_jarvis" in embedded["timeline"][0]
+
+
+def test_the_meter_loads_the_shared_chart_helper_and_drops_the_prose_legend(client, project):
+    """The series are named in the chart (static/chart.js), not in the caption (io-2641fe05)"""
+    from jarvis.ui.app import STATIC_VERSION
+
+    meter_samples_in_the_current_5h_window()
+    page = cost_page(client, "/cost?window=5h")
+    src = f"/static/chart.js?v={STATIC_VERSION['chart.js']}"
+    assert src in page.text
+    assert "shaded: calculated" not in page.text
+    assert "<noscript>5h solid · 7d dashed" in page.text   # the static fallback keeps its key
+    got = client.get(src)
+    assert got.status_code == 200 and "JarvisChart" in got.text
+    assert got.headers["cache-control"] == "max-age=3600"
+    assert client.get("/static/app.py").status_code == 404
 
 
 def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, project):

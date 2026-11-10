@@ -2838,6 +2838,42 @@ class ProjectStore:
         ).fetchone()["c"]
         return {"by_status": by_status, "needs_attention": int(attention)}
 
+    def user_roots(self, include_settled: bool = False) -> list[dict[str, Any]]:
+        """Stamped `user` orders of both tables that start a request tree (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §3.1)"""
+        rows = db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM work_orders WHERE requestor='user' AND parent_id IS NULL "
+            "ORDER BY created_at").fetchall())
+        rows += db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM feature_orders WHERE requestor='user' ORDER BY created_at").fetchall())
+        # ops.ORIGIN_IO_KEY / ORIGIN_DO_KEY: a filed finding or follow-up belongs to its source's tree
+        roots = []
+        for r in rows:
+            meta = db.from_json(r.get("metadata"), {})
+            if not (isinstance(meta, dict) and (meta.get("origin_io") or meta.get("origin_do"))):
+                roots.append(r)
+        if not include_settled:
+            settled = self.settled_request_roots()
+            roots = [r for r in roots if r["id"] not in settled]
+        return sorted(roots, key=lambda r: r["created_at"])
+
+    def settled_request_roots(self) -> set[str]:
+        """Roots with a `request_settled` event, by payload `root_id`: a feature row cannot hold events"""
+        rows = self.conn.execute(
+            "SELECT wo_id, CASE WHEN json_valid(payload) "
+            "THEN json_extract(payload, '$.root_id') END AS root_id "
+            "FROM wo_events WHERE kind='request_settled'").fetchall()
+        return {r["root_id"] or r["wo_id"] for r in rows}
+
+    def orders_with_origin(self, key: str, value: str) -> list[dict[str, Any]]:
+        """Rows of both tables whose `metadata[key]` is `value`, oldest first"""
+        extract = (f"CASE WHEN json_valid(metadata) "
+                   f"THEN json_extract(metadata, '$.{key}') END = ?")
+        rows = db.rows_to_dicts(self.conn.execute(
+            f"SELECT * FROM work_orders WHERE {extract}", (value,)).fetchall())
+        rows += db.rows_to_dicts(self.conn.execute(
+            f"SELECT * FROM feature_orders WHERE {extract}", (value,)).fetchall())
+        return sorted(rows, key=lambda r: r["created_at"])
+
     # -- events
 
     def add_event(self, wo_id: str, kind: str, payload: dict[str, Any] | None = None,

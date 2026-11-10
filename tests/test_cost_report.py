@@ -436,6 +436,48 @@ def test_the_rewrite_tax_survives_into_the_rollup(store, transcripts):
     assert report["totals"]["rewrite_cost_usd"] == pytest.approx(11.5)
 
 
+def test_the_rewrite_tax_splits_by_cause_and_only_the_prefix_is_unfixable():
+    """io-2641fe05: TTL part, prefix part, and orders with no classified boundary"""
+    split = ops._rewrite_split([
+        {"rewrite_excess": 100_000, "rewrite_cost_usd": 4.0,
+         "rewrite_ttl_share": 0.25, "rewrite_ttl_excess": 25_000},
+        {"rewrite_excess": 50_000, "rewrite_cost_usd": 2.0,
+         "rewrite_ttl_share": None, "rewrite_ttl_excess": 0},
+    ])
+
+    assert (split["rewrite_ttl_excess"], split["rewrite_ttl_cost_usd"]) == (25_000, 1.0)
+    assert (split["rewrite_prefix_excess"], split["rewrite_prefix_cost_usd"]) == (75_000, 3.0)
+    assert (split["rewrite_undecided_excess"],
+            split["rewrite_undecided_cost_usd"]) == (50_000, 2.0)
+    note = split["rewrite_note"]
+    assert "sum of each order's re-write" in note
+    assert "~$1.00 (25k tokens) was the cache entry EXPIRING" in note
+    assert "~$3.00 (75k tokens) was the prompt PREFIX moving, which is upstream and " \
+           "Jarvis cannot fix" in note
+    assert "~$2.00 (50k tokens) is undecided" in note
+    assert note.count("cannot fix") == 1
+
+
+def test_no_rewrite_tax_no_note():
+    assert ops._rewrite_split([])["rewrite_note"] == ""
+
+
+def test_the_cli_prints_the_same_rewrite_sentence_as_the_page(store, transcripts, capsys,
+                                                             monkeypatch):
+    from jarvis import cli
+
+    wo = store.create_work_order("resumed twice", "")
+    give_session(store, wo["id"], "sess-resumed")
+    transcripts("sess-resumed", [assistant_row(f"m{i}", write=1_000_000) for i in range(3)])
+    report = ops.cost_report(project="proj_a")
+    note = report["totals"]["rewrite_note"]
+    monkeypatch.setattr(ops, "cost_report", lambda **_k: report)
+
+    assert cli.main(["cost", "proj_a"]) == 0
+
+    assert note and note in capsys.readouterr().out
+
+
 # -- the rate the cache write was actually paid at
 
 
