@@ -100,7 +100,8 @@ def compute(forecast: Mapping[str, Any],
                window_share_pct=round(runs * points, 2),
                window_used_pct=used, resets_at=meter.get("resets_at"),
                max_safe_runs_now=safe,
-               fits_now=(runs <= safe) if safe is not None else free >= 0)
+               # A zero per-run price measures nothing, so the fit is unknown, not "fits"
+               fits_now=(runs <= safe) if safe is not None else None)
     return out
 
 
@@ -127,6 +128,9 @@ def render(computed: Mapping[str, Any]) -> str:
     ]
     if computed.get("meter") == UNAVAILABLE:
         lines.append("5h window: usage meter unavailable (no sample or no OAuth token)")
+    elif computed["max_safe_runs_now"] is None:
+        lines.append(f"5h window: {computed['window_used_pct']:g}% used; a run prices at "
+                     f"$0, so its share and fit are unknown")
     else:
         fits = "fits now" if computed["fits_now"] else "does NOT fit now"
         lines.append(

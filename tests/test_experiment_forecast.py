@@ -89,6 +89,60 @@ def test_compute_with_the_meter_unavailable():
     assert "unavailable" in experiment_forecast.render(got)
 
 
+def test_a_zero_priced_run_has_an_unknown_fit():
+    free = {**DOC, "per_run": {"input_tokens": 0, "output_tokens": 0, "minutes": 1}}
+    got = experiment_forecast.compute(free, METER)
+    assert got["max_safe_runs_now"] is None and got["fits_now"] is None
+    text = experiment_forecast.render(got)
+    assert "unknown" in text and "None" not in text
+
+
+# -- ops.forecast_meter reads the real usage_meter surface
+
+
+def _meter(monkeypatch, *, token=lambda: "tok", sample=None, rate=None):
+    from jarvis import usage_meter
+
+    monkeypatch.setattr(usage_meter, "token", token)
+    monkeypatch.setattr(usage_meter, "latest_sample", lambda **_: sample)
+    monkeypatch.setattr(usage_meter, "dollars_per_point", lambda **_: rate)
+
+
+def _rate(value=0.5):
+    return {"value": value, "low": value, "high": value, "spread_low": None,
+            "spread_high": None, "spread_spans": 0, "spread_widened": False,
+            "source": "measured", "basis_spans": 3, "basis_points": 9.0, "basis_usd": 4.5}
+
+
+def test_forecast_meter_returns_the_reading(jarvis_home, monkeypatch):
+    from jarvis.usage_meter import Sample
+
+    _meter(monkeypatch, sample=Sample(ts=1.0, five_hour_pct=30.0,
+                                      five_hour_resets_at=1_000.0), rate=_rate())
+    assert ops.forecast_meter() == METER
+
+
+def _raise():
+    from jarvis.usage_meter import MeterError
+
+    raise MeterError("credentials file has no claudeAiOauth.accessToken")
+
+
+@pytest.mark.parametrize("case", ["no_token", "no_sample", "no_pct", "bad_rate"])
+def test_forecast_meter_is_unavailable_never_a_refusal(started, store, monkeypatch, case):
+    from jarvis.usage_meter import Sample
+
+    sample = Sample(ts=1.0, five_hour_pct=None if case == "no_pct" else 30.0,
+                    five_hour_resets_at=1_000.0)
+    _meter(monkeypatch, token=_raise if case == "no_token" else (lambda: "tok"),
+           sample=None if case == "no_sample" else sample,
+           rate={} if case == "bad_rate" else _rate())
+    assert ops.forecast_meter() is None
+    do_id, _ = _experiment(store)
+    out = ops.submit_decision_forecast(do_id, DOC)
+    assert out["forecast"]["meter"] == "unavailable" and out["flagged"]
+
+
 # -- ops.submit_decision_forecast
 
 

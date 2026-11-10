@@ -11154,10 +11154,11 @@ def forecast_meter(now: float | None = None) -> dict[str, Any] | None:
             return None
         rate = usage_meter.dollars_per_point(now=now, cfg=cfg,
                                              home=paths.jarvis_home())
+        return {"used_pct": float(sample.five_hour_pct),
+                "resets_at": sample.five_hour_resets_at,
+                "dollars_per_point": float(rate["value"])}
     except Exception:  # noqa: BLE001 — an unreadable meter is "unavailable", never a refusal (§5)
         return None
-    return {"used_pct": sample.five_hour_pct, "resets_at": sample.five_hour_resets_at,
-            "dollars_per_point": rate["value"]}
 
 
 def submit_decision_forecast(do_id: str, doc: Any,
