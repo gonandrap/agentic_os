@@ -907,9 +907,13 @@ def _digest_credit() -> str:
 
 def fmt_tok(n: int | None) -> str:
     """Token counts, at the magnitude a reader actually compares — 1.3M, 47k, 812"""
-    from ..usage import fmt_tok as shared
-
-    return shared(n)
+    if not n:
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
 
 
 def fmt_dur(seconds: float | None) -> str:
