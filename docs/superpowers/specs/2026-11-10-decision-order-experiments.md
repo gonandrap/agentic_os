@@ -105,6 +105,10 @@ no policy. They use the same read-modify-write the other metadata keys use (see
 derived from `forecast` / `go_at` / `reported_at`. §4, §5 and §7 all read it, so it is
 defined once.
 
+**The forecast schema text** `decision_report.FORECAST_SCHEMA_TEXT`: the §5 `forecast.json`
+shape, as prose plus the JSON example. It lives here, not in `experiment_forecast.py`, so §4's
+brief can embed it without waiting for §5; §5's parser must accept exactly what it shows.
+
 **The proposal type.** `decision_report.ORDER_TYPES` gains `"experiment"`, so a report may
 propose `{"as": "experiment"}`. Until §4 lands, `file_decision_followups` already refuses an
 `as` outside `_FOLLOWUP_AS` with a clear message, so this widening is safe on its own.
@@ -185,7 +189,7 @@ leave `planning` decision orders with no live path forward.
   1. You are running experiment n of decision order <do>, for the user's decision.
   2. The experiment: the proposal's description verbatim, or the ad-hoc brief.
   3. FIRST, forecast it and submit `jarvis do forecast <do> --from-file forecast.json`
-     (embed §5's schema text). That ends your turn. Do NOT start the batch; the user says
+     (embed `decision_report.FORECAST_SCHEMA_TEXT`, §2). That ends your turn. Do NOT start the batch; the user says
      go.
   4. On go: run it. Keep raw outputs in your temp dir, then
      `jarvis do attach <do> <file>…` every raw output the findings rest on.
@@ -249,6 +253,8 @@ Add `last_decision_delivery_of(do_id)`, which scans the `decision_delivered` eve
 * Each refusal: env set, a wrong status, budget_exhausted, a second experiment, report
   before go, report with no attachment, report with an unchanged sha.
 * `do follow-up --as experiment` starts rather than files.
+* `experiment_brief` puts the forecast step before any run instruction (index-order
+  assertion) and says not to start the batch before go.
 * `do done` from `planning` mid-experiment closes the order. Repeated ticks never write a
   terminal status; extend the never-auto-complete suite with an experiment phase.
 
@@ -267,8 +273,8 @@ what it can measure:
 Parse it in a pure module, `src/jarvis/experiment_forecast.py`. It has no database and no
 LLM. `parse_forecast(doc)` raises `ForecastError(problems)` listing every problem: `runs`
 ≥ 1; token counts ≥ 0; `model` non-empty; caps of `runs` ≤ 10000 and `notes` ≤ 1000 chars.
-It also exposes `SCHEMA_TEXT` (embedded by §4's brief) and
-`compute(forecast, meter) -> dict`, which adds:
+It parses exactly the shape `decision_report.FORECAST_SCHEMA_TEXT` (§2) shows (a test
+parses the example embedded in that text) and exposes `compute(forecast, meter) -> dict`, which adds:
 
 * `total_tokens` and `minutes_total`;
 * `est_usd` at the per-model token pricing `jarvis cost` already uses (find it; do not add
@@ -338,7 +344,8 @@ hook (`hooks.researcher_write_decision`) needs NO change. That hook only allows
 `/tmp`. The directory lives under the project's `.jarvis/features/<do>/`. It is not in the
 worktree, so `disk.sweep` never reclaims it. Do not add it to any cleanup.
 
-**Tests:** copy plus manifest plus sha256; every cap refusal files nothing; a clash gets a
+**Tests:** copy plus manifest plus sha256; a symlink is resolved and its target copied;
+`researcher_bash_decision` allows `jarvis do attach`; every cap refusal files nothing; a clash gets a
 suffix; refused with no open experiment; the files survive `do done`.
 
 ## 7. Surfaces: show, dashboard, timeline, operator docs
@@ -358,8 +365,10 @@ This section owns every read surface. It changes no state.
   subsection covering the flow in §1.3 and the five commands. In the repo `CLAUDE.md`
   command crib sheet, ONE line after the `jarvis do` line:
   `jarvis do experiment <id> <key>|-d "…" [--go]   # run a proposal UNDER the do; results come back as a revision`.
-  `evals/llm/test_jarvis_judgment.py` loads `CLAUDE.md`; run that eval file's offline
-  tests.
+  `evals/llm/test_jarvis_judgment.py` loads `CLAUDE.md` but is skipped offline. The
+  offline guards are `tests/test_persona.py` and `tests/test_one_claude_md.py`.
+  `test_decision_order_block_is_shorter_than_the_investigation_order_block` must stay
+  green: keep the line short, or trim within the `jarvis do` block.
 * The rule that costs the user if forgotten, added to the `CLAUDE.md` rules list in one
   sentence: a decision order's experiment follow-up goes to `jarvis do experiment`, never
   `jarvis wo create`.
@@ -367,6 +376,13 @@ This section owns every read surface. It changes no state.
 **Tests:** `do show` text and json with no experiment, a forecast awaiting go, and a
 reported experiment with attachments; the ui page renders each phase; the Go route calls
 the op; the timeline labels.
+
+Plus ONE end-to-end test through the REAL verbs: start from `completed`, then
+`submit_decision_forecast`, `approve_decision_experiment`, `attach_decision_outputs`,
+`submit_decision_report` and `daemon.tick()`. It asserts that the researcher never lands in
+`needs_review`, and that the do ends `awaiting_decision` with one "revised" notification.
+§4's own end-to-end test seeds the forecast and attachments through §2's helpers, so this is
+the only test that proves the sections compose.
 
 ## 8. Out of scope
 
@@ -436,8 +452,8 @@ Conventions:
   `jarvis spec toc|section`; never read one whole.
 * Every refusal message names the exact command that fixes the situation. A test asserts
   that the named command is accepted.
-* Put new events' constants in `project_store.py`, and give each a `timeline._describe`
-  label.
+* New event constants live in `project_store.py` (§2). Their `timeline._describe` labels
+  belong to §7 only.
 * Run only the targeted tests: `uv run pytest tests/<file> -q`. Never run the full suite
   locally; CI does.
 * Comments say only the why the code cannot show, in one line. House style for PR text and
