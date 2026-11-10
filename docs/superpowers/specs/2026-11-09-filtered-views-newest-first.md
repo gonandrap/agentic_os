@@ -52,12 +52,16 @@ over every `query_filters()` route. **What counts as attention does not change**
   is no pin: rows are strictly newest first, and a row that matches `needs_you` shows a
   badge (the existing attention styling on the row, e.g. the `needs you` / reason chip the
   open view already renders) instead of a position.
-- **The primitive** — `newest_first(rows, key, needs_you=None) -> list[dict]` in app.py,
+- **The primitive** — `newest_first(rows, key, pins=()) -> list[dict]` in app.py,
   next to `attention_first`:
   - sorts descending by `key(row)`; a row whose key is `None`/0 sorts LAST; ties keep
     incoming order (stable sort);
-  - then, only when `needs_you` is given, applies `attention_first(rows, needs_you)`;
-  - callers pass `needs_you=None` on a SETTLED view.
+  - `pins` is a sequence of `Callable[[dict], bool]`, most urgent first. Rows matching
+    `pins[0]` lead, then rows matching `pins[1]`, and so on; each group stays newest
+    first (stable sort on `tuple(not p(r) for p in pins)` over the time order). One
+    predicate is the common case (`pins=(needs_you,)`); gates and morpheus need two or
+    three tiers;
+  - callers pass `pins=()` on a SETTLED view.
   `attention_first` itself is unchanged (tests/test_ui.py
   `test_the_list_page_primitives_filter_and_order_rows` covers it). After this feature, no
   route in app.py that reads `query_filters()` sorts its list rows any other way.
@@ -103,10 +107,10 @@ row carries a status-change time, prefer it over a creation time:
 | `backlog` | `rows` | status-change time if the row has one, else `created_at` | `bool(i["blockers"])` |
 | `knowledge` | `rows` | `ts` | none |
 | `neo_page` | `history` only (in_flight/escalated/unreviewed are queues, untouched) | `answered_at` else `ts` | none |
-| `gates_page` | `every` | `ts` | today's state rank: escalated, with neo, awaiting_case (replace the `rank` sort with the pin; keep the grouping of those three open states) |
+| `gates_page` | `every` | `ts` | three tiers, today's state rank: `pins=(escalated, with neo, awaiting_case)` (replaces the `rank` sort) |
 | `alarms_page` | `history` | decision time if present, else `ts` | `state == "escalated"` |
 | `stuck_page` | `rows` | `status_since` (from section 3) | `r["stuck"]` |
-| `morpheus_page` | `rows` | `updated_ts` | owed_by user, then failed/timedout — open views only |
+| `morpheus_page` | `rows` | `updated_ts` | two tiers: `pins=(owed_by == "user", state in (failed, timedout))` — open views only |
 | `release_page` | `shown_pending`, `shown_releases` | `ts` | releases: `status == "failed"` |
 | `release_item_page` | `rows` | the row's time field | `validation == "failed"` |
 | `steward_page` | each tab list | `ts` | none (the `asks` tab IS the attention) |
@@ -115,16 +119,21 @@ row carries a status-change time, prefer it over a creation time:
 `requestor_query` is a helper, not a route: it filters and orders nothing.
 
 Settled detection per route follows section 2 "Open view vs settled view": compute it from
-that route's own filter value and pass `needs_you=None` when settled.
+that route's own filter value and pass `pins=()` when settled. `knowledge`, `search_page`,
+`neo_page` history and `_evolution` have no settled filter: they are always ordered by
+time and pin only what the table says.
+
+State the key chosen for every route in the PR body: several keys above depend on what
+the row actually carries.
 
 ### 4.1 Views that already rank by something other than time
 
-Pending a ruling recorded on wo-eead75ce (Neo): `inbox` has `?sort=` with
-`ops.INBOX_SORTS = ("priority", "newest", "oldest")`, default `priority`; `search_page`
-ranks hits by relevance to `q`. Planner's recommendation: inbox DEFAULT becomes `newest`
-(priority stays selectable; the separate `critical` section remains the pin); search keeps
-relevance when `q` is non-empty and is newest first when `q` is empty. Follow the ruling
-recorded on fo-eace4762 / wo-eead75ce if it differs.
+Ruled by Neo (question 4111, wo-eead75ce): `inbox` has `?sort=` with
+`ops.INBOX_SORTS = ("priority", "newest", "oldest")`, default `priority` today. Its DEFAULT
+becomes `newest`; `priority` and `oldest` stay selectable; the separate `critical` section
+remains the pin. `search_page` ranks hits by relevance to `q`: it keeps relevance when `q`
+is non-empty and lists newest first (by `ts`) when `q` is empty. An explicit user-chosen
+sort and text relevance are not the stale time orders this feature removes.
 
 ## 5. The order views: dashboard and project page
 
@@ -143,7 +152,7 @@ recorded on fo-eace4762 / wo-eead75ce if it differs.
   `past = sorted(..., key=created_at)` re-sort.
 - **Pin only on open views.** The pin predicate stays
   `status in NEEDS_YOU_STATUSES or needs_attention`. `project()` is SETTLED when its
-  `status` filter is `past` or a terminal status; then `needs_you=None` and settled rows
+  `status` filter is `past` or a terminal status; then `pins=()` and settled rows
   carrying `needs_attention` render a badge. `status=all` is OPEN (pin applies). The
   dashboard lists only open orders, so it always pins.
 - **Age column = sort key.** `project.html` shows `fmt_age(o.status_since)` where it shows
@@ -161,16 +170,20 @@ recorded on fo-eace4762 / wo-eead75ce if it differs.
 One table-driven test (tests/test_ui.py or a new tests/test_ui_ordering.py) over every
 route in app.py that calls `query_filters()`: dashboard, search_page, project, inbox,
 backlog, knowledge, neo_page, gates_page, alarms_page, stuck_page, morpheus_page,
-release_page, release_item_page, steward_page, _evolution — plus `requestor_query` listed
-explicitly as a helper that orders nothing.
+release_page, release_item_page, steward_page, _evolution (15 routes). `requestor_query`
+is a module-level helper outside `create_app` that orders nothing: name it in a separate
+explicit exclusion, not in the route table.
 
 - For each route: seed at least two rows with distinct times, request a SETTLED filter (or
   the route's default view where it has no settled filter), and assert rows render newest
   first by that route's key from section 4/5. For routes with a pin, also request an OPEN
   view and assert the pinned group comes first and each group is newest first.
-- **Drift guard:** assert the test's route list equals the set of functions in
-  `inspect.getsource(create_app)` that call `query_filters(` (count and names), so a new
-  filtered route fails CI until it is added to the table with its key.
+- **Drift guard:** assert the test's route list equals the set of nested functions in
+  `inspect.getsource(create_app)` that call `query_filters(` (names, and 15 of them), so a
+  new filtered route fails CI until it is added to the table with its key.
+- This file (tests/test_ui_ordering.py) is owned here alone; the per-route tests of
+  section 4 live beside each page's existing suite.
+- Seed timestamps with `backdate(store, id, *ts)` from tests/test_time_in_state.py.
 - Seeding uses the existing UI test fixtures and stores; never the real `JARVIS_HOME`.
 
 ## 7. Out of scope
@@ -199,7 +212,7 @@ What you must know:
   `order_by="status_since"`. Never sort orders by `updated_at`: it moves on unrelated writes.
 - The ordering primitive is `newest_first(rows, key, needs_you=None)` in
   `src/jarvis/ui/app.py`. Use it; do not write another `sorted(...)` for list rows in a
-  route. Pass `needs_you=None` on a settled view.
+  route. Pass `pins=()` on a settled view.
 - Never change WHAT counts as attention. Each route's existing `needs_you` lambda is kept
   verbatim; you only decide whether it is applied (open view) or shown as a badge
   (settled view).
