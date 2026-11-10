@@ -5830,7 +5830,7 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         if (stranding.produced and not abandon
                 and not (stranding.pushed and kind_contract(_wo).lands_code)):
             raise OpsError(unlanded_refusal(_wo, summary, stranding))
-        # A carrier-less abandon of NOTHING voids the round silently (io-d173b6f1); `base` unset means unreadable
+        # A carrier-less abandon of NOTHING voids the round silently (io-d173b6f1)
         if (abandon and not superseded_by and stranding.base and not stranding.produced
                 and _wo["status"] not in TERMINAL_STATUSES):
             raise OpsError(empty_abandon_refusal(wo_id))
