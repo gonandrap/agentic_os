@@ -11254,6 +11254,101 @@ def file_decision_followups(do_id: str, keys: Sequence[str] = (), as_: str | Non
             "skipped": skipped, "errors": errors}
 
 
+#: Raw-output caps (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §6)
+ATTACH_MAX_FILE_BYTES = 50 * 1024 * 1024
+ATTACH_MAX_EXPERIMENT_BYTES = 500 * 1024 * 1024
+ATTACH_MAX_FILES = 200
+_ATTACH_PHASES = ("awaiting_go", "running")
+
+
+def _copy_hashed(src: Path, dest_dir: Path) -> tuple[Path, int, str]:
+    """Copy `src` into `dest_dir` under a free name, returning (dest, size, sha256)"""
+    stem, suffix = Path(src.name).stem, Path(src.name).suffix
+    k = 1
+    while True:
+        dest = dest_dir / (src.name if k == 1 else f"{stem}-{k}{suffix}")
+        try:
+            out = open(dest, "xb")  # exclusive create: never overwrite a stored output
+        except FileExistsError:
+            k += 1
+            continue
+        break
+    digest, size = hashlib.sha256(), 0
+    with out, open(src, "rb") as inp:
+        while chunk := inp.read(1 << 20):
+            digest.update(chunk)
+            size += len(chunk)
+            out.write(chunk)
+    return dest, size, digest.hexdigest()
+
+
+def attach_decision_outputs(do_id: str, paths: Sequence[str | Path],
+                            project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do attach` — copy raw outputs onto the project, with a sha256 manifest (§6)"""
+    from . import specs
+    from .decision_report import experiment_phase
+    from .project_store import DECISION_ATTACHED_EVENT
+
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", show_verb(fo.get("kind")))
+    if not paths:
+        raise OpsError(f"nothing to attach: `jarvis do attach {do_id} <file>...`")
+    store = ProjectStore(path)
+    try:
+        entry = store.open_experiment(do_id)
+        phase = experiment_phase(entry) if entry else None
+        if phase not in _ATTACH_PHASES:
+            why = ("has no open experiment" if entry is None else
+                   f"has experiment {entry['n']} still awaiting its forecast")
+            raise OpsError(
+                f"{do_id} {why}, so there is nowhere to attach outputs: attaching is for an "
+                f"experiment awaiting the go-ahead or running. See where it stands with "
+                f"`jarvis do show {do_id}`.")
+        files: list[Path] = []
+        for raw in paths:
+            src = Path(raw).expanduser().resolve()
+            if src.is_dir():
+                raise OpsError(f"{raw} is a directory: pass the files, or tar them first "
+                               f"(`jarvis do attach {do_id} <file>...`). Nothing was attached.")
+            if not src.is_file():
+                raise OpsError(f"{raw} is not an existing regular file. Nothing was "
+                               f"attached; fix the path and rerun `jarvis do attach {do_id} "
+                               f"<file>...`.")
+            files.append(src)
+        sizes = [f.stat().st_size for f in files]
+        held = entry.get("attachments") or []
+        retry = f"Nothing was attached; rerun `jarvis do attach {do_id} <file>...` within it."
+        for f, size in zip(files, sizes):
+            if size > ATTACH_MAX_FILE_BYTES:
+                raise OpsError(f"{f} is {size} bytes, over the per-file cap of "
+                               f"{ATTACH_MAX_FILE_BYTES} bytes (50 MB). {retry}")
+        total = sum(int(a.get("size") or 0) for a in held) + sum(sizes)
+        if total > ATTACH_MAX_EXPERIMENT_BYTES:
+            raise OpsError(f"experiment {entry['n']} would hold {total} bytes, over the "
+                           f"per-experiment cap of {ATTACH_MAX_EXPERIMENT_BYTES} bytes "
+                           f"(500 MB). {retry}")
+        if len(held) + len(files) > ATTACH_MAX_FILES:
+            raise OpsError(f"experiment {entry['n']} would hold {len(held) + len(files)} "
+                           f"files, over the per-experiment cap of {ATTACH_MAX_FILES}. {retry}")
+        dest_dir = specs.experiment_dir(path, do_id, entry["n"], entry.get("key") or "")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        attached = []
+        for src in files:
+            dest, size, sha = _copy_hashed(src, dest_dir)
+            mark = {"name": dest.name, "size": size, "sha256": sha,
+                    "path": str(dest.relative_to(path)), "at": db.now()}
+            store.add_experiment_attachment(do_id, entry["n"], mark)
+            if entry.get("researcher_id"):
+                store.add_event(entry["researcher_id"], DECISION_ATTACHED_EVENT,
+                                {"do_id": do_id, "n": entry["n"], "name": dest.name,
+                                 "size": size, "sha256": sha})
+            attached.append({**mark, "path": str(dest)})
+    finally:
+        store.close()
+    return {"project": name, "do_id": do_id, "n": entry["n"], "attached": attached,
+            "note": "stored on the project; cite these paths as evidence in the report"}
+
+
 OFFBOARDED_EVENT = "offboarded"
 
 
