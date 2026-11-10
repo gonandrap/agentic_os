@@ -37,8 +37,7 @@ def ids(rows):
     return [r["id"] for r in rows]
 
 
-# Each case seeds rows and returns (url, rows the route handed its template, expected ids).
-# Real stores where seeding is cheap; the one ops reader stubbed for deep reports (Q4141).
+# A case seeds, then returns (url, rows picker, expected ids); deep reports stub ops (Q4141)
 
 def dashboard(mp, clock):
     store = ProjectStore(ops.registered_project_paths()["proj_a"])
