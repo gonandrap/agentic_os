@@ -444,6 +444,16 @@ def outstanding_children_note(store: ProjectStore, wo: dict[str, Any]) -> str:
             f"({named}{f', +{more} more' if more > 0 else ''})")
 
 
+IDLE_MANAGER_NOTE = "waiting for a message from its feature"
+
+
+def idle_manager_note(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """`status_label`'s idle phrase for the sweep's blocker — `""` if not an idle manager (#1674)"""
+    if wo.get("kind") != "manager" or wo["status"] != "idle":
+        return ""
+    return outstanding_children_note(store, wo) or IDLE_MANAGER_NOTE
+
+
 def _event_stands(store: ProjectStore, wo: dict[str, Any], kind: str) -> bool:
     """`kind` is on the record and no worker turn has started since (#1591): a compaction is not work"""
     events = store.events_of_kind(wo["id"], kind)
@@ -1555,9 +1565,7 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     # Below the pause note above, which names a moment this one cannot: a manager whose turn was refused...
     if wo["status"] == "idle":
         # Naming the children when there are any (spec §5): "waiting for a message" is true of a manager...
-        note = outstanding_children_note(store, wo)
-        return f"idle — {note}" if note else \
-            "idle — waiting for a message from its feature"
+        return f"idle — {outstanding_children_note(store, wo) or IDLE_MANAGER_NOTE}"
     # `needs_review` no longer means the panel is waiting for the user: since issue 212 the round runs in...
     if wo["status"] == "needs_review":
         note = parallel_round_note(store, wo["id"])
@@ -4698,7 +4706,7 @@ INV_RED_RELEASE_UNDISCOUNTED = "INV-RED-RELEASE-UNDISCOUNTED"
 
 
 def check_red_release_hold_is_discounted(store: ProjectStore) -> Iterator[Violation]:
-    """INV-RED-RELEASE-UNDISCOUNTED — a red-base release or a turn-keeping merge hold, undiscounted"""
+    """INV-RED-RELEASE-UNDISCOUNTED — a designed wait the sweep judges as lost time"""
     from . import ops, release, stuck
     from .central_store import CentralStore
 
@@ -4707,7 +4715,10 @@ def check_red_release_hold_is_discounted(store: ProjectStore) -> Iterator[Violat
     merging = [wo for wo in store.list_work_orders(statuses=("waiting_pr_merge",))
                if automerge_hold_note(ops.automerge_state(store, wo))
                and not rejudge_exhausted(store, wo) and not rebind_exhausted(store, wo)]
-    if not held and not merging:
+    # Issue 1674: a manager idle while its feature is live
+    managers = [wo for wo in store.list_work_orders(statuses=("idle",))
+                if ops.manager_awaiting_feature(store, wo)]
+    if not held and not merging and not managers:
         return
     central = None
     try:
@@ -4729,10 +4740,24 @@ def check_red_release_hold_is_discounted(store: ProjectStore) -> Iterator[Violat
     if not (spec.validation.enabled and spec.validation.auto_merge) or ops._base_red_until(
             ops._stored_base_health(name), now) < now:
         merging = []
-    if not held and not merging:
+    if not held and not merging and not managers:
         return
     # The sweep's own reader, so this judges what the sweep does and not a copy of its rule
     rows = {row["id"]: row for row in ops.stuck_report(name, now)}
+    for wo in managers:
+        row = rows.get(wo["id"])
+        if row is None or not row["stuck"]:
+            continue
+        yield Violation(
+            invariant=INV_RED_RELEASE_UNDISCOUNTED,
+            wo_id=wo["id"],
+            detail=(f"a manager idle while its feature is live, judged stuck with "
+                    f"{row['discounted_seconds']:.0f}s discounted: the sweep would buy "
+                    f"an investigation for a designed wait"),
+            repaired=False,
+            context={"excluded": row["excluded"],
+                     "discounted_seconds": row["discounted_seconds"]},
+        )
     for wo in merging:
         row = rows.get(wo["id"])
         if row is None or (row["excluded"] and not row["stuck"]

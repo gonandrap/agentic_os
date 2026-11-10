@@ -1855,21 +1855,18 @@ def test_a_manager_wedged_in_a_live_status_is_still_judged(stuck_os):
         assert row["stuck"] is True, status
 
 
-def test_a_stranded_manager_is_a_candidate_once_over_threshold_and_not_before(stuck_os):
-    """Neo 1603 (1): the by-design test NARROWS candidacy"""
+def test_a_stranded_manager_of_a_live_feature_is_discounted_not_stuck(stuck_os):
+    """Issue 1674 supersedes Neo 1603 (1): stranding belongs to the feature, not the manager"""
     import jarvis.catalog as catalog_mod
 
     store = stuck_os["store"]
     _fo, manager_id, _kids = a_manager(store)
     fallback = catalog_mod.DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES / 60.0
 
-    park_order(store, manager_id, "idle", hours=fallback / 2)
-    assert stuck_row(manager_id)["stuck"] is False, "inside its threshold"
-    assert stuck_row(manager_id)["excluded"] == ""
-
     park_order(store, manager_id, "idle", hours=fallback * 2)
     row = stuck_row(manager_id)
-    assert row["stuck"] is True and row["excluded"] == ""
+    assert row["stuck"] is False and row["excluded"] == ""
+    assert row["active_seconds"] < 1
 
 
 def test_either_queued_reading_holds_a_manager_back(stuck_os):
@@ -1879,14 +1876,14 @@ def test_either_queued_reading_holds_a_manager_back(stuck_os):
     store = stuck_os["store"]
     fo_id, manager_id, _kids = a_manager(store)
     park_order(store, manager_id, "idle", hours=76.8)
-    assert stuck_row(manager_id)["stuck"] is True, "nothing queued yet: stranded"
+    assert stuck_row(manager_id)["excluded"] == "", "nothing queued yet"
     store.queue_message(manager_id, "your feature needs this")
     assert not bus.nothing_queued_to_manager(store, fo_id, manager_id)
     assert stuck_row(manager_id)["excluded"] == stuck.IDLE_MANAGER_CAUSE
 
     other_fo, other_manager, _ = a_manager(store)
     park_order(store, other_manager, "idle", hours=76.8)
-    assert stuck_row(other_manager)["stuck"] is True
+    assert stuck_row(other_manager)["excluded"] == ""
     bus.post(store, subject=bus.Subject(fo_id=other_fo), from_role="reconciler",
              to_role="manager",
              payload=bus.ChildrenLanded(round=1, children=("wo-x",), note="landed"))
@@ -1903,7 +1900,7 @@ def test_a_superseded_child_does_not_hold_a_manager_but_an_exhausted_one_does(st
     park_order(store, manager_id, "idle", hours=76.8)
     store.supersede_children(fo_id, kids, note="the user answered for it")
     row = stuck_row(manager_id)
-    assert row["excluded"] == "" and row["stuck"] is True
+    assert row["excluded"] == ""
 
     _fo2, broke_id, _k2 = a_manager(store, ("out of money", "budget_exhausted"))
     park_order(store, broke_id, "idle", hours=76.8)
@@ -2307,7 +2304,10 @@ def _manager(store, fo_status: str = "executing", hours: float = 5.0,
              status: str = "idle", kind: str = "manager") -> dict:
     fo_id = _feature(store, status=fo_status, carrier=False)
     wo = store.create_work_order("manage it", parent_id=fo_id, kind=kind)
-    park_order(store, wo["id"], status, hours=hours)
+    at = park_order(store, wo["id"], status, hours=hours)
+    # The feature reached `fo_status` before the manager idled (issue 1674 reads its spans)
+    store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE order_id=?", (at - 60, fo_id))
+    store.conn.commit()
     return store.get_work_order(wo["id"])
 
 
@@ -2328,14 +2328,46 @@ def test_an_idle_manager_of_an_open_feature_is_excluded(stuck_os):
     assert _scan(store, stuck_only=True) == (2, [])
 
 
-def test_an_idle_manager_with_nothing_outstanding_is_still_a_candidate(stuck_os):
-    """Neo q1603: a live feature with nothing outstanding and nothing queued STRANDS its manager"""
-    store = stuck_os["store"]
-    manager = _manager(store)
+def test_an_idle_manager_with_nothing_outstanding_is_discounted_not_stuck(stuck_os):
+    """Issue 1674: the exclusion lapses with the last child, the discount behind it does not"""
+    from jarvis import invariants
 
-    rows = {r["wo"]["id"]: r for r in _scan(store)[1]}
-    assert rows[manager["id"]]["verdict"].excluded == ""
-    assert rows[manager["id"]]["verdict"].stuck is True
+    store = stuck_os["store"]
+    manager = _manager(store, fo_status="validating")
+
+    row = {r["wo"]["id"]: r for r in _scan(store)[1]}[manager["id"]]
+    assert row["verdict"].excluded == ""
+    assert row["verdict"].stuck is False
+    assert row["discounted"] >= row["seconds_in_status"] - 1
+    assert row["blocker"] == invariants.IDLE_MANAGER_NOTE
+
+
+def test_an_idle_manager_is_judged_only_on_time_after_its_feature_settled(stuck_os):
+    """Issue 1674: the discount stops at the feature's terminal transition"""
+    store = stuck_os["store"]
+    manager = _manager(store, hours=5.0)
+    store.set_feature_status(manager["parent_id"], "completed")
+    settled = db.now() - 2 * HOUR
+    store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE order_id=? AND to_status=?",
+                       (settled, manager["parent_id"], "completed"))
+    store.conn.commit()
+
+    row = {r["wo"]["id"]: r for r in _scan(store)[1]}[manager["id"]]
+    assert abs(row["discounted"] - 3 * HOUR) < 5, row["discounted"]
+    assert row["verdict"].stuck is True
+
+
+def test_manager_idle_hold_spans_clips_to_the_live_feature():
+    from jarvis.project_store import manager_idle_hold_spans
+
+    rows = [{"from_status": "", "to_status": "pending", "ts": 10.0},
+            {"from_status": "pending", "to_status": "validating", "ts": 20.0},
+            {"from_status": "validating", "to_status": "completed", "ts": 50.0},
+            {"from_status": "completed", "to_status": "executing", "ts": 70.0}]
+    assert manager_idle_hold_spans(rows, "executing", 15.0, 100.0) == [
+        (15.0, 20.0), (20.0, 50.0), (70.0, 100.0)]
+    assert manager_idle_hold_spans([], "executing", 15.0, 100.0) == [(15.0, 100.0)]
+    assert manager_idle_hold_spans([], "cancelled", 15.0, 100.0) == []
 
 
 def test_an_idle_manager_of_a_settled_feature_is_still_a_candidate(stuck_os):
@@ -2989,6 +3021,20 @@ def test_the_invariant_is_quiet_on_a_discounted_hold(red_base_os):
     red_episodes([[at, None]])
 
     assert list(invariants.check_red_release_hold_is_discounted(store)) == []
+
+
+def test_the_invariant_names_an_idle_manager_the_sweep_would_judge_stuck(red_base_os,
+                                                                         monkeypatch):
+    """Issue 1674's detector: quiet with the discount, a violation without it"""
+    from jarvis import invariants, project_store
+
+    store = red_base_os["store"]
+    manager = _manager(store, fo_status="validating")
+    assert list(invariants.check_red_release_hold_is_discounted(store)) == []
+
+    monkeypatch.setattr(project_store, "manager_idle_hold_spans", lambda *a: [])
+    found = list(invariants.check_red_release_hold_is_discounted(store))
+    assert [v.wo_id for v in found] == [manager["id"]]
 
 
 def test_the_invariant_names_a_hold_with_no_episode_behind_it(red_base_os):

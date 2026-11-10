@@ -221,6 +221,21 @@ def dependency_hold_spans(dep_transitions: Iterable[Iterable[Any]], created_at: 
     return sorted(spans)
 
 
+def manager_idle_hold_spans(feature_transitions: Sequence[Any], feature_status: str,
+                            since: float, now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` an idle manager's feature was not terminal (issue 1674)"""
+    rows = list(feature_transitions)
+    status = str(rows[0]["from_status"] if rows else feature_status)
+    segments, start = [], float("-inf")
+    for r in rows:
+        segments.append((start, float(r["ts"]), status))
+        start, status = float(r["ts"]), str(r["to_status"])
+    segments.append((start, now, status))
+    spans = [(max(a, since), min(b, now)) for a, b, s in segments
+             if s not in FO_TERMINAL_STATUSES]
+    return [(a, b) for a, b in spans if b > a]
+
+
 # What one seat proposed
 VALIDATION_VERDICTS = ("pass", "reject", "")
 # ...and whether that seat's opinion is usable at all
