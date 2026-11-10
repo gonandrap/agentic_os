@@ -1308,6 +1308,9 @@ class Daemon:
             except Exception:  # noqa: BLE001
                 log.exception("project %s tick failed", project.name)
 
+        # After EVERY project settled this pass: a tree's last child may land in another project
+        if reconcile:
+            self.settle_request_trees()
         # After the project loop, so `running_turns` reflects the turns settlement just reaped: the...
         self.release_tick()
 
@@ -4881,6 +4884,45 @@ class Daemon:
                                 wo_id: str | None) -> None:
         """A violation no longer standing acks the inbox row that raised it (issue #1357)"""
         self.central.revise_inbox(project.name, invariant_title(invariant), wo_id, ack=True)
+
+    def settle_request_trees(self) -> None:
+        """One notice per user ask once its whole tree is terminal (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §4)"""
+        from . import ops as ops_mod
+
+        base = notify.ui_base_url(self.catalog)
+        for project in self.catalog.projects:
+            if not project.path.is_dir():
+                continue
+            store = self.store_for(project)
+            try:
+                roots = store.user_roots()
+            except Exception:  # noqa: BLE001 — one bad project must not stop the rest
+                log.exception("[%s] could not list request roots", project.name)
+                continue
+            for root in roots:
+                if root["status"] not in TERMINAL_STATUSES + FO_TERMINAL_STATUSES:
+                    continue
+                try:
+                    tree = ops_mod.request_tree(project.name, root["id"])
+                    if not tree.settled:
+                        continue
+                    notice = ops_mod.request_notice(tree, base)
+                except Exception:  # noqa: BLE001 — unsettled, retried next pass (kn-40db1828)
+                    log.exception("[%s] request notice for %s failed", project.name, root["id"])
+                    continue
+                if notice.anchor_wo_id is None and not notice.notify:
+                    continue  # nothing ran, nothing to tell, nothing to hold the mark
+                with db.write_transaction(store.conn):
+                    if root["id"] in store.settled_request_roots():
+                        continue
+                    inbox_id = (store.add_notification(
+                        title=notice.title, body=notice.body, level=notice.level,
+                        wo_id=root["id"], source="request") if notice.notify else None)
+                    if notice.anchor_wo_id is not None:
+                        store.add_event(notice.anchor_wo_id, "request_settled",
+                                        {"root_id": root["id"], "statuses": notice.statuses,
+                                         "inbox_id": inbox_id})
+                log.info("[%s] request %s settled", project.name, root["id"])
 
     def settle_review_pings(self, project: ProjectSpec, store: ProjectStore) -> None:
         """A review ping whose order owes the user nothing more acks itself (io-ed253c2b)"""

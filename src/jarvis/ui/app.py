@@ -76,6 +76,10 @@ VENDORED = frozenset(p.name for p in VENDOR.glob("*.js"))
 # `?v=<content hash>` on every vendored URL: `/vendor/` is cached for an hour
 VENDOR_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
                   for p in VENDOR.glob("*.js")}
+# The dashboard's OWN browser code (the shared chart helper), served the same way
+STATIC = Path(__file__).parent / "static"
+STATIC_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+                  for p in STATIC.glob("*.js")}
 
 
 # -- the knowledge review's JSON bodies (`/knowledge/review/*`)
@@ -179,6 +183,7 @@ REFRESH_SECONDS = 15
 
 # The open statuses worth a row of their own; `validating` too, since a "blocked by" can name it
 ORDERS_PAGE = 200  # rows of the project page's order list before "show more"
+COST_PAGE_SIZE = 50  # /cost order-list rows per page (docs/superpowers/specs/2026-11-09-cost-overview-first.md §4)
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
                      "validating", "waiting_pr_merge")
 # The work-order statuses that sort to the top of a list: each waits on the user
@@ -585,7 +590,7 @@ def _cost_payloads(picked: dict, project: str) -> dict:
 REFRESH_SECONDS = 60
 
 #: Bumped whenever an entry's shape changes, which makes every older snapshot unreadable
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 
 
 def cost_snapshot_path() -> Path:
@@ -916,6 +921,28 @@ def fmt_tok(n: int | None) -> str:
     return str(n)
 
 
+PIE_MUTED = ("other", "no order")
+
+
+def pie_slices(pairs: Mapping | Iterable, *, field: str | None = None, money: bool = False,
+               limit: int = 6) -> list[dict]:
+    """`JarvisChart.pie` slices, largest first, tail as "other" (cost-overview-first spec §3.1)"""
+    items = pairs.items() if hasattr(pairs, "items") else pairs
+    live = sorted(((k, v[field] if field else v) for k, v in items), key=lambda kv: -kv[1])
+    live = [(k, v) for k, v in live if v > 0]
+    if len(live) > limit:
+        live = live[:limit - 1] + [("other", sum(v for _, v in live[limit - 1:]))]
+    out, colour = [], 0
+    for key, value in live:
+        muted = key in PIE_MUTED
+        out.append({"key": key, "value": value,
+                    # the helper prints only the share, so the value rides in the label
+                    "label": f"{key} " + (f"~${value:.2f}" if money else str(value)),
+                    "color": "var(--ink-3)" if muted else f"var(--pie-{colour + 1})"})
+        colour += not muted
+    return out
+
+
 def fmt_dur(seconds: float | None) -> str:
     """Turn durations at a readable magnitude — 1.2h, 4m, 15s"""
     if seconds is None:
@@ -1157,8 +1184,8 @@ def create_app() -> FastAPI:
         # Every page reflects live OS state (inbox acks, work order status)
         response = await call_next(request)
         # Except the vendored libraries: they change only with a release
-        response.headers["Cache-Control"] = ("max-age=3600" if request.url.path.startswith("/vendor/")
-                                             else "no-store")
+        response.headers["Cache-Control"] = (
+            "max-age=3600" if request.url.path.startswith(("/vendor/", "/static/")) else "no-store")
         return response
 
     # Inside the factory, like every other same-tier import in this file: `cli` and `ui` are one tier and...
@@ -1188,6 +1215,8 @@ def create_app() -> FastAPI:
         placeholder_zero=bill.PLACEHOLDER_ZERO,
         # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason the partial already...
         tool_table=fleetcost.tool_table,
+        # `/static/<file>?v=<hash>`: the dashboard's own scripts, cache-busted like /vendor/
+        static_v=STATIC_VERSION,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must not be able to disagree...
         assumption_decider=ops.assumption_decider,
         # And the OS's RULING on one, same reason one authority along: the page and `jarvis wo show` must not... (#712)
@@ -1205,7 +1234,7 @@ def create_app() -> FastAPI:
         # The statuses the user's brake can hold — where a "let this order through" button means something
         fleet_held_statuses=invariants.FLEET_HELD_STATUSES,
         instance=instance_badge(),
-        fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
+        fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts, pie_slices=pie_slices,
         filter_rows=filter_rows, filter_options=filter_options, attention_first=attention_first,
         # The bill's two explanations, taken from the module that computes the numbers rather than written...
         rate_note=bill.rate_note, tokens_mean=bill.TOKENS_MEAN,
@@ -1844,7 +1873,7 @@ def create_app() -> FastAPI:
     @app.get("/cost", response_class=HTMLResponse)
     def cost_page(request: Request, project: str = "", window: str = "",
                   offset: str = "", since: str = "", until: str = "",
-                  tz: str = ""):
+                  tz: str = "", page: str = ""):
         """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost` (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
         try:
             # The zone FIRST: the custom form's naive datetimes are parsed in the same zone they are rendered in
@@ -1876,9 +1905,20 @@ def create_app() -> FastAPI:
             return render(request, "error.html", message=str(e))
         report, fleet, meter = entry["report"], entry["fleet"], entry["meter"]
         cached_at = entry["computed_at"]
+        # Sliced from the cached entry: `page` is no window bound (cost-overview-first spec §4)
+        page = query_int(page, 0)
+        units = report["units"]
+        pages = max(1, -(-len(units) // COST_PAGE_SIZE))
+        shown = min(max(page, 1), pages)
+        keep = {k: v for k, v in (("project", project), ("window", window), ("offset", offset),
+                                  ("since", since), ("until", until), ("tz", tz)) if v}
+        listing = {"units": units[(shown - 1) * COST_PAGE_SIZE:shown * COST_PAGE_SIZE],
+                   "open": page >= 1, "page": shown, "pages": pages,
+                   "prev": f"/cost?{urlencode({**keep, 'page': shown - 1})}" if shown > 1 else "",
+                   "next": f"/cost?{urlencode({**keep, 'page': shown + 1})}" if shown < pages else ""}
         # Its own variable and never read out of `fleet`: losing the section must not lose the window the...
         return render(request, "cost.html", active="cost", report=report,
-                      units=report["units"], totals=report["totals"],
+                      units=units, listing=listing, totals=report["totals"],
                       project=project, fleet=fleet, meter=meter, window=picked,
                       meter_max_span=ops.METER_TIMELINE_MAX_SECONDS,
                       cached_at=cached_at, now=time.time(),
@@ -2059,6 +2099,13 @@ def create_app() -> FastAPI:
         if name not in VENDORED:
             return JSONResponse({"error": f"no vendored file {name}"}, status_code=404)
         return FileResponse(VENDOR / name, media_type="text/javascript")
+
+    @app.get("/static/{name}")
+    def static(name: str):
+        """The dashboard's own scripts — listed, never a path walk, as `/vendor/`"""
+        if name not in STATIC_VERSION:
+            return JSONResponse({"error": f"no static file {name}"}, status_code=404)
+        return FileResponse(STATIC / name, media_type="text/javascript")
 
     # after every fixed /knowledge/... route: this one matches any segment
     @app.get("/knowledge/{kn_id}", response_class=HTMLResponse)

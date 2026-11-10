@@ -198,6 +198,35 @@ def test_cost_page_lists_work_orders_dearest_first(client, project, transcript):
     assert "not a bill" in page.text
 
 
+def test_the_rewrite_is_dollars_then_tokens_on_rows_and_headline(client, project,
+                                                                 transcript):
+    """io-2641fe05: one unit on both, and the headline says it is the rows' sum"""
+    import os
+    from pathlib import Path
+
+    wo = ops.create_work_order("proj_a", "resumed twice")
+    transcript("sess-rw", at=db.now())
+    session = Path(os.environ[usage.TRANSCRIPT_ROOT_ENV]) / "-proj" / "sess-rw.jsonl"
+    first = json.loads(session.read_text())
+    rows = []
+    for i in range(3):
+        row = json.loads(json.dumps(first))
+        row["message"]["id"] = f"m{i}"
+        row["message"]["usage"]["cache_creation_input_tokens"] = 1_000_000
+        rows.append(json.dumps(row))
+    session.write_text("\n".join(rows) + "\n")
+    give_session(project, wo["id"], "sess-rw")
+    add_recorded_turn(project, wo["id"], 0.0, 1_000)
+
+    text = cost_page(client, "/cost").text
+    totals = ops.cost_report()["totals"]
+    row_usd = f"${totals['rewrite_cost_usd']:.2f}"
+
+    assert f"re-write {row_usd} (2.0M tokens)" in text
+    assert f"Re-write tax ~{row_usd}</strong>" in text
+    assert "sum of each order&#39;s re-write" in text or "sum of each order's re-write" in text
+
+
 def test_cost_page_says_when_a_transcript_is_gone_instead_of_saying_zero(
         client, project, transcript):
     """An unmeasurable cost and a zero cost are different answers"""
@@ -309,7 +338,7 @@ def test_calls_no_work_order_caused_get_a_row_and_a_true_sentence(client, projec
     assert f"~${report['totals']['total_cost_usd']:.2f}</p>" in page
     assert 'class="no-work-order"' in page
     assert f"${un:.2f}</td>" in page
-    assert "the no-work-order row below add to" in page
+    assert f"no order ${un:.2f}" in page and "below add to" not in page
     assert f"= ~${un:.2f}, the headline above." in page
     assert "from rounding" not in page
     assert "of those calls" in page and "of them" not in page
@@ -649,8 +678,8 @@ def _listed_cents(html: str) -> float:
     return round(sum(float(c) for c in cells), 2)
 
 
-def test_the_order_list_comes_first_and_its_tally_adds_to_the_headline(client, project):
-    """The headline's dollars are all in rows, including a row whose transcript is gone"""
+def test_the_order_list_comes_first_and_the_overview_adds_to_the_headline(client, project):
+    """The headline's dollars are all in rows and in the project slices (§3.2 of the overview spec)"""
     worker = ops.create_work_order("proj_a", "the dear one")
     add_recorded_turn(project, worker["id"], 0.05, 48_000)
     add_os_calls(worker["id"], neo_calls=2)
@@ -660,17 +689,19 @@ def test_the_order_list_comes_first_and_its_tally_adds_to_the_headline(client, p
 
     headline = float(re.search(r'font-size: 22px;" class="mono">\s*~\$([0-9.]+)', html)[1])
     assert headline > 0 and _listed_cents(html) == headline
-    assert f"2 orders below add to\n      ${headline:.2f}" in html
+    assert f"proj_a ${headline:.2f}" in html
     assert f"= ~${headline:.2f}, the headline above." in html
-    assert "from rounding" not in html
+    assert "from rounding" not in html and "below add to" not in html
     assert html.index("the headline above") < html.index("What a typical order costs")
 
 
-def test_the_tally_names_the_rounding_between_rows_and_headline(client, project, monkeypatch):
+def test_the_reconciliation_names_the_rounding_between_slices_and_headline(
+        client, project, monkeypatch):
     def change(report):
         report["totals"]["total_cost_usd"] = 2.01
-        for unit, cost in zip(report["units"], (1.004, 1.003), strict=True):
-            unit.update(total_cost_usd=cost, found=True)
+        agg = report["aggregates"]
+        agg["projects"][0]["cost_usd"] = 2.00
+        agg.update(fleet_cost_usd=2.01, unattributed_cost_usd=0.0, rounding_usd=0.01)
 
     for title in ("one", "two"):
         add_recorded_turn(project, ops.create_work_order("proj_a", title)["id"], 0.05, 48_000)
@@ -678,7 +709,7 @@ def test_the_tally_names_the_rounding_between_rows_and_headline(client, project,
 
     html = cost_page(client, "/cost").text
 
-    assert "add to\n      $2.00" in html
+    assert "proj_a $2.00" in html
     assert "+ $0.01 from rounding" in html and "= ~$2.01, the headline" in html
 
 
@@ -1066,6 +1097,22 @@ def test_the_meter_chart_endpoint_serves_any_span_and_refuses_a_bad_one(client, 
     assert "five_hour_calc_jarvis" in embedded["timeline"][0]
 
 
+def test_the_meter_loads_the_shared_chart_helper_and_drops_the_prose_legend(client, project):
+    """The series are named in the chart (static/chart.js), not in the caption (io-2641fe05)"""
+    from jarvis.ui.app import STATIC_VERSION
+
+    meter_samples_in_the_current_5h_window()
+    page = cost_page(client, "/cost?window=5h")
+    src = f"/static/chart.js?v={STATIC_VERSION['chart.js']}"
+    assert src in page.text
+    assert "shaded: calculated" not in page.text
+    assert "<noscript>5h solid · 7d dashed" in page.text   # the static fallback keeps its key
+    got = client.get(src)
+    assert got.status_code == 200 and "JarvisChart" in got.text
+    assert got.headers["cache-control"] == "max-age=3600"
+    assert client.get("/static/app.py").status_code == 404
+
+
 def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, project):
     """12 readings in a 5h window: the page says so and prints no $/point figure"""
     wo = ops.create_work_order("proj_a", "an order in this window")
@@ -1413,3 +1460,122 @@ def test_an_on_demand_compute_that_raises_renders_the_error_and_keeps_the_last_e
     assert page.status_code == 200
     assert "could not be computed" in page.text and "no transcripts" in page.text
     assert cache.on_demand == good
+
+
+# docs/superpowers/specs/2026-11-09-cost-overview-first.md §4: collapsed, paginated list
+def paged_fleet(client, project, monkeypatch, n=3, size=2):
+    """`n` orders with distinct costs, `size` rows a page, one no-work-order call, all cached"""
+    from jarvis import agent_usage
+    from jarvis.ui import app as ui_app
+
+    monkeypatch.setattr(ui_app, "COST_PAGE_SIZE", size)
+    for i in range(n):
+        wo = ops.create_work_order("proj_a", f"paged order {i}")
+        add_recorded_turn(project, wo["id"], 0.01 * (i + 1), 1_000)
+    agent_usage.record("digest", project="proj_a", wo_id="", label="d", model="claude-opus-5",
+                       usage={"total_cost_usd": 0.5, "input": 10, "cache_write": 0,
+                              "cache_read": 0, "output": 1_000})
+    cache = client.app.state.cost_cache
+    cache.entries["week"] = cache.compute("week")
+
+
+def _rows(text):
+    return re.findall(r'<a class="title" href="[^"]*" title="(paged order \d)"', text)
+
+
+def test_the_order_list_is_collapsed_and_paged_from_the_cached_entry(client, project,
+                                                                     monkeypatch):
+    paged_fleet(client, project, monkeypatch)
+    calls = count_live(monkeypatch)
+
+    first = client.get("/cost").text
+    one = client.get("/cost?page=1").text
+    two = client.get("/cost?page=2").text
+    past = client.get("/cost?page=9").text
+
+    assert calls == []
+    assert '<details class="cost-orders">' in first
+    assert '<details class="cost-orders" open>' in one
+    assert "3 orders, dearest first" in first
+    assert _rows(first) == _rows(one) == ["paged order 2", "paged order 1"]
+    assert _rows(two) == ["paged order 0"] and _rows(past) == _rows(two)
+    assert "page 1 of 2" in one and "page 2 of 2" in two
+    assert 'class="no-work-order"' in two and 'class="no-work-order"' not in one
+
+
+def test_page_links_keep_the_window_project_and_zone(client, project, monkeypatch):
+    paged_fleet(client, project, monkeypatch)
+
+    page = cost_page(client, "/cost?window=week&project=proj_a&tz=UTC&page=1").text
+
+    assert 'href="/cost?project=proj_a&amp;window=week&amp;tz=UTC&amp;page=2"' in page
+
+
+# The overview: docs/superpowers/specs/2026-11-09-cost-overview-first.md §3
+
+def _pies(html: str) -> list[list[dict]]:
+    import json
+    return [json.loads(b) for b in re.findall(
+        r'<script type="application/json" class="pie-data">(.*?)</script>', html, re.DOTALL)]
+
+
+def test_pie_slices_fold_the_tail_past_six_and_drop_zero():
+    from jarvis.ui.app import pie_slices
+
+    slices = pie_slices([(f"p{i}", float(i)) for i in range(9)], money=True)
+
+    assert [s["key"] for s in slices] == ["p8", "p7", "p6", "p5", "p4", "other"]
+    assert slices[-1]["value"] == 0 + 1 + 2 + 3 and slices[-1]["color"] == "var(--ink-3)"
+    assert slices[0]["label"] == "p8 ~$8.00"
+    assert pie_slices({"wo": {"orders": 3}, "fo": {"orders": 1}}, field="orders")[1]["label"] == "fo 1"
+    assert pie_slices([("a", 0.0), ("no order", 0.0)]) == []
+
+
+def test_the_overview_draws_its_pies_from_the_aggregates(client, project):
+    for title in ("one", "two"):
+        add_os_calls(ops.create_work_order("proj_a", title)["id"], neo_calls=1)
+    add_os_calls("", neo_calls=1)
+
+    html = cost_page(client, "/cost").text
+    agg = ops.cost_report(window=ops.cost_window())["aggregates"]
+
+    assert "/static/chart.js?v=" in html
+    dollars, kinds, project_kinds = _pies(html)
+    assert {s["key"]: s["value"] for s in dollars} == {
+        "proj_a": agg["projects"][0]["cost_usd"], "no order": agg["unattributed_cost_usd"]}
+    assert kinds == project_kinds and [(s["key"], s["value"]) for s in kinds] == [("wo", 2)]
+
+
+def test_a_zero_total_draws_no_pie(client, project):
+    ops.create_work_order("proj_a", "never ran")
+
+    html = cost_page(client, "/cost").text
+
+    assert "$ by project" in html and "nothing in this window" in html
+    assert all(s["key"] != "proj_a" for pie in _pies(html) for s in pie)
+
+
+def test_each_project_shows_its_ttl_figures_and_the_prose_is_closed(client, project, monkeypatch):
+    def change(report):
+        report["aggregates"]["projects"][0].update(ttl_misses=3, ttl_rewrite_tokens=48_000)
+
+    add_recorded_turn(project, ops.create_work_order("proj_a", "one")["id"], 0.05, 48_000)
+    _wrap(monkeypatch, "cost_report", change)
+
+    html = cost_page(client, "/cost?project=proj_a").text
+
+    assert "3 TTL misses ·\n        48k TTL re-write tokens" in html
+    assert "$ by project" not in html, "a one-project page draws no fleet row"
+    prose = html.split('<details class="cost-prose"', 1)[1].split("</details>", 1)[0]
+    assert prose.startswith(' style') and "How this total is made" in prose
+    assert "the sessions Jarvis dispatched" in prose
+
+
+def test_an_entry_without_aggregates_renders_the_headline(client, project, monkeypatch):
+    add_recorded_turn(project, ops.create_work_order("proj_a", "one")["id"], 0.05, 48_000)
+    _wrap(monkeypatch, "cost_report", lambda report: report.pop("aggregates"))
+
+    html = cost_page(client, "/cost").text
+
+    assert 'font-size: 22px;" class="mono">' in html
+    assert "pie-data" not in html and "the headline above" not in html

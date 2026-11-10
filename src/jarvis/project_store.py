@@ -450,6 +450,8 @@ ORDER_SEGMENTS = {"wo", "fo", *FO_ID_PREFIXES.values()}
 def order_path(project: str, order_id: str) -> str:
     """The page that renders this order, from its id PREFIX (#997)"""
     prefix = order_id.split("-", 1)[0]
+    if prefix in ("mo", "mv"):
+        return f"/mo/{order_id}"            # central, so no project segment
     # Unknown prefix: the FEATURE page, never `/wo/`
     segment = prefix if prefix in ORDER_SEGMENTS else "fo"
     return f"/{segment}/{project}/{order_id}"
@@ -2737,6 +2739,18 @@ class ProjectStore:
         return [{**c, "superseded": c["id"] in answered}
                 for c in db.rows_to_dicts(rows)]
 
+    def family_members(self, fo: dict[str, Any]) -> list[dict[str, Any]]:
+        """Every work order a family's cost counts: its planner, then each child of ANY kind (io-2641fe05)"""
+        members: list[dict[str, Any]] = []
+        if fo.get("plan_wo_id"):
+            try:
+                members.append(self.get_work_order(fo["plan_wo_id"]))
+            except KeyError:
+                pass
+        ids = {m["id"] for m in members}
+        return members + [c for c in self.feature_children(fo["id"], kinds=None)
+                          if c["id"] not in ids]
+
     def superseded_children(self, fo_id: str) -> list[dict[str, Any]]:
         """Which of this feature's children the user has answered for, and why"""
         row = self.conn.execute(
@@ -2851,7 +2865,11 @@ class ProjectStore:
             "SELECT wo_id, CASE WHEN json_valid(payload) "
             "THEN json_extract(payload, '$.root_id') END AS root_id "
             "FROM wo_events WHERE kind='request_settled'").fetchall()
-        return {r["root_id"] or r["wo_id"] for r in rows}
+        # A tree with no work order to hold the event is marked by its notice alone (Q4068)
+        told = self.conn.execute(
+            "SELECT wo_id FROM notifications WHERE source='request' AND wo_id IS NOT NULL"
+        ).fetchall()
+        return {r["root_id"] or r["wo_id"] for r in rows} | {r["wo_id"] for r in told}
 
     def request_settled_at(self, root_id: str) -> float | None:
         """Newest `request_settled` of this root, matched as `settled_request_roots` does"""

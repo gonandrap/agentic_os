@@ -5972,16 +5972,9 @@ def settle_in_session(store: ProjectStore, wo: dict[str, Any], event: str, *,
 COMPLETED_TAIL_CHARS = 1200
 
 
-def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int | None:
-    """Tell the user an order THEY opened settled, with its result and final-message tail (issue 1385)"""
-    from .project_store import UNGOVERNED_ORIGINS
-
-    if launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS:
-        return None
-    fresh = store.get_work_order(wo["id"]) or wo
-    said = [str(fresh.get("result_summary") or "No summary on record.")]
-    if fresh.get("pr_url"):
-        said.append(f"Pull request: {fresh['pr_url']}")
+def completion_lines(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
+    """Summary, owed user action, final-message tail of one settled work order"""
+    said = [str(wo.get("result_summary") or "No summary on record.")]
     owed = declared_user_action(store, wo["id"])
     if owed:
         said.append(f"Still yours to run: `{owed}`")
@@ -5991,6 +5984,21 @@ def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int |
         tail = last if len(last) <= COMPLETED_TAIL_CHARS else "…" + last[-COMPLETED_TAIL_CHARS:]
         # Open offers and gaps in the final message die with the session unless they reach the user
         said.append(f"Worker's final message (end):\n{tail}")
+    return said
+
+
+def notify_completed(store: ProjectStore, wo: dict[str, Any], how: str) -> int | None:
+    """Tell the user an order THEY opened settled, with its result and final-message tail (issue 1385)"""
+    from .project_store import UNGOVERNED_ORIGINS
+
+    # A stamped row is told by its tree's notice, or never (requestor spec §4.3)
+    if wo.get("requestor") or launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS:
+        return None
+    fresh = store.get_work_order(wo["id"]) or wo
+    said = completion_lines(store, fresh)
+    if fresh.get("pr_url"):
+        said.insert(1, f"Pull request: {fresh['pr_url']}")
+    owed = declared_user_action(store, wo["id"])
     return store.add_notification(
         title=f"{wo['id']} completed ({how}): {fresh.get('title') or 'untitled'}",
         body="\n\n".join(said), level="warning" if owed else "info",
@@ -13250,6 +13258,89 @@ def yours_report(project: str | None = None, older: bool = False) -> dict[str, A
             "total": sum(len(v) for v in groups.values()) + hidden}
 
 
+@dataclass
+class RequestNotice:
+    """What `Daemon.settle_request_trees` writes for one settled root (requestor spec §4)"""
+    anchor_wo_id: str | None  # the event's row: wo_events cannot hold a feature id (Q4068)
+    statuses: dict[str, str]
+    notify: bool  # False: a do with no follow-ups, already told by its own delivery (§4.1)
+    title: str = ""
+    body: str = ""
+    level: str = "info"
+
+
+def request_notice(tree: RequestTree, base_url: str) -> RequestNotice:
+    """The tree-settled notice of one settled tree; raises rather than send a partial one (§4.2)"""
+    from . import steward
+
+    paths = registered_project_paths(include_archived=True)
+    stores: dict[str, ProjectStore] = {}
+    root = tree.root
+    try:
+        rows: dict[str, tuple[dict[str, Any], bool] | None] = {}
+        for n in tree.nodes():
+            if n.project not in stores and n.project in paths:
+                stores[n.project] = ProjectStore(paths[n.project])
+            store = stores.get(n.project)
+            found = _request_row(store, n.id) if store is not None else None
+            rows[n.id] = (found[0], not found[1]) if found else None  # (row, is_wo)
+        others = tree.nodes()[1:]
+        anchor = next((n.id for n in tree.nodes()
+                       if n.project == root.project and rows[n.id] and rows[n.id][1]), None)
+        statuses = {n.id: n.status for n in tree.nodes()}
+        if root.kind == "decision" and all(n.kind == "researcher" for n in others):
+            return RequestNotice(anchor, statuses, notify=False)
+
+        root_row, root_is_wo = rows[root.id] or ({}, False)
+        ended = [f"{n.id} ended {n.status}" for n in tree.nodes() if n.status != "completed"]
+        body = [f"Outcome: {'; '.join(ended) if ended else 'completed'}"]
+        if root_is_wo:
+            body += completion_lines(stores[root.project], root_row)
+        else:
+            report = decision_report(root_row)
+            said = report.get("summary") or report.get("classification")
+            body.append(str(said) if said else "No report on record.")
+        if others:
+            body.append("Orders run:\n" + "\n".join(f"{n.id} {n.status} {n.title}"
+                                                   for n in others))
+        decided, uncosted, owed, cost = [], [], False, 0.0
+        for n in tree.nodes():
+            found = rows[n.id]
+            if not found:
+                continue
+            row, is_wo = found
+            decision = steward.stamp_of(row).get("decision_id")
+            if decision:
+                decided.append(f"{n.id}: steward decision #{decision}")
+            if not is_wo:
+                continue
+            store = stores[n.project]
+            decided += [f"{n.id} #{a['n']} {a['status']} by {a['decided_by']}: {a['content']}"
+                        for a in store.all_assumptions(n.id)
+                        if a.get("decided_by") and a["decided_by"] != "user"
+                        and a["status"] in ("accepted", "rejected", "refined")]
+            owed = owed or bool(declared_user_action(store, n.id))
+            try:
+                cost += cost_report(n.project, target=n.id)["totals"]["total_cost_usd"]
+            except OpsError:
+                uncosted.append(n.id)  # e.g. an archived project: said, never read as $0
+        if decided:
+            body.append("Decided for you:\n" + "\n".join(decided))
+        prs = [n.pr_url for n in tree.nodes() if n.pr_url]
+        body.append("Pull requests:\n" + "\n".join(prs) if prs else "Pull requests: none")
+        body.append(f"Cost: ${cost:.2f}"
+                    + (f" (not counted: {', '.join(uncosted)})" if uncosted else ""))
+        body.append(f"{base_url.rstrip('/')}/yours#{root.id}")
+        failed = any(n.status == "failed" for n in tree.nodes())
+        return RequestNotice(anchor, statuses, notify=True,
+                             title=f"{root.id} done: {root.title}",
+                             body="\n\n".join(body),
+                             level="warning" if failed or owed else "info")
+    finally:
+        for s in stores.values():
+            s.close()
+
+
 def resolve_requestor(store: Any, *, parent_id: str | None,
                       metadata: Mapping[str, Any] | None, origin: str) -> str:
     """Who asked, rules 2-5, decided ONCE at create (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2.2)"""
@@ -16234,7 +16325,9 @@ def cost_report(project: str | None = None, target: str | None = None,
     until = window["until"] if window else None
     os_groups = _os_groups(project, since=since, until=until)
     scope = {project: paths[project]} if project else paths
-    units: list[dict[str, Any]] = []
+    roots: list[dict[str, Any]] = []
+    leaves: list[dict[str, Any]] = []       # every work order, once: what the totals sum
+    owns: list[dict[str, Any]] = []         # calls on a root order itself
     for name, path in sorted(scope.items()):
         if not path.is_dir():
             continue
@@ -16245,28 +16338,153 @@ def cost_report(project: str | None = None, target: str | None = None,
                     else store.list_work_orders(limit=limit, include_hidden=True))
             # An order whose only in-window activity is an `agent_call`
             seen = {wo["id"] for wo in rows}
+            # A root order whose only spend is its own calls is still a row, in both modes
+            parents = [i for i in _os_only_ids(os_groups, name, seen)
+                       if is_feature_order_id(i)]
             for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
+                if is_feature_order_id(wo_id):
+                    continue
                 try:
                     rows.append(store.get_work_order(wo_id))
                 except KeyError:
                     continue            # a legacy row naming no project: not this one's
-            for wo in rows:
-                units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
-                                       os_groups.get(wo["id"], ()),
-                                       since=since, until=until))
+            fam = _family_roots(name, store, rows, parents, index, os_groups,
+                                since=since, until=until, complete=not window)
+            roots += fam[0]
+            leaves += fam[1]
+            owns += fam[2]
         finally:
             store.close()
+    mo_roots, mo_owns = _monitoring_roots(project, os_groups)
+    roots += mo_roots
+    owns += mo_owns
     # Dearest first, counting what Jarvis spent on the order as part of what it cost
-    units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
-    listed = {u["id"] for u in units}
+    roots.sort(key=lambda u: u["total_cost_usd"], reverse=True)
+    listed = {u["id"] for u in leaves} | {o["id"] for o in owns}
     # A call naming an order no store holds is declared too, or the meter outruns the list
     unattributed = (_os_spend([g for wo_id, group in os_groups.items()
                                if wo_id not in listed for g in group])
                     if window else _os_unattributed(os_groups))
     # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/ `totals` keys...
-    return {"scope": project or "fleet", "units": units, "window": window,
-            **_rollup(units, unattributed), "os_unattributed": unattributed,
+    rollup = _rollup(leaves, unattributed, owns)
+    return {"scope": project or "fleet", "units": roots, "window": window,
+            **rollup, "os_unattributed": unattributed,
+            "aggregates": cost_aggregates(roots, unattributed,
+                                          rollup["totals"]["total_cost_usd"]),
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
+
+
+#: Summed from the members onto a root row: what the list and the CLI print
+_ROOT_SUMMED = ("total_cost_usd", "total_recorded_cost_usd", "list_cost_usd",
+                "os_cost_usd", "os_calls", "subproc_cost_usd", "subproc_calls",
+                "subagent_count", "subagent_cost_usd", "turns", "recorded_turns",
+                "billed_input", "output", "rewrite_excess", "rewrite_cost_usd",
+                # _rollup and cost_aggregates read these off a root (spec 2026-11-09-cost-overview-first §2)
+                "resume_boundaries", "boundaries_ttl", "rewrite_ttl_excess")
+
+
+def _root_row(name: str, order: dict[str, Any], kind: str,
+              children: list[dict[str, Any]],
+              own: dict[str, Any] | None) -> dict[str, Any]:
+    """One root order: its own calls plus every member, members kept for the expand (io-2641fe05)"""
+    members = [*children, *([own] if own else [])]
+    by_kind: dict[str, dict[str, Any]] = {}
+    for m in members:
+        for k in m.get("os_by_kind") or ():
+            e = by_kind.setdefault(k["kind"], {**k, "calls": 0, "cost_usd": 0.0})
+            e["calls"] += k["calls"]
+            e["cost_usd"] = round(e["cost_usd"] + k["cost_usd"], 4)
+    row: dict[str, Any] = {
+        "id": order["id"], "project": name, "title": order.get("title") or order["id"],
+        "status": order.get("status") or order.get("state") or "", "kind": kind,
+        "order_kind": kind,
+        "found": any(c["found"] for c in children),
+        "measurable": any(m.get("measurable", True) for m in members),
+        "context_peak": max([c.get("context_peak") or 0 for c in children], default=0),
+        "os_by_kind": sorted(by_kind.values(), key=lambda k: -k["cost_usd"]),
+        "children": sorted(children, key=lambda c: c["total_cost_usd"], reverse=True),
+    }
+    for key in _ROOT_SUMMED:
+        row[key] = round(sum(m.get(key) or 0 for m in members), 4)
+    return row
+
+
+def _own_spend(order_id: str, groups: list[dict[str, Any]]) -> dict[str, Any]:
+    """Calls Jarvis made on a root order itself, shaped to sum beside its members"""
+    spend = _os_spend(groups)
+    return {"id": order_id, **spend, "total_cost_usd": spend["os_cost_usd"],
+            "total_recorded_cost_usd": spend["os_recorded_cost_usd"]}
+
+
+def _family_roots(name: str, store: ProjectStore, rows: list[dict[str, Any]],
+                  parents: list[str], index: dict[str, list[Path]],
+                  os_groups: dict[str, list[dict[str, Any]]], *,
+                  since: float | None, until: float | None, complete: bool
+                  ) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
+                             list[dict[str, Any]]]:
+    """One project's roots, its work-order leaves and its root-own spends; no order twice"""
+    def leaf(wo: dict[str, Any]) -> dict[str, Any]:
+        return _unit_row(name, wo, index, _turn_rows(store, wo["id"]),
+                         os_groups.get(wo["id"], ()), since=since, until=until)
+
+    families: dict[str, dict[str, Any]] = {}
+    for pid in [*(wo.get("parent_id") or "" for wo in rows), *parents]:
+        if pid and pid not in families and is_feature_order_id(pid):
+            try:
+                families[pid] = store.get_feature_order(pid)
+            except KeyError:
+                continue                # a dangling parent: its children stand alone
+    roots, leaves, owns = [], [], []
+    members: dict[str, list[dict[str, Any]]] = {fid: [] for fid in families}
+    listed = set()
+    for wo in rows:
+        row = leaf(wo)
+        listed.add(wo["id"])
+        leaves.append(row)
+        pid = wo.get("parent_id") or ""
+        if pid in families:
+            members[pid].append(row)
+        else:
+            roots.append({**row, "order_kind": "work", "children": []})
+    for fid, fo in families.items():
+        if complete:
+            # A limit-cut listing still bills a family whole, as `jarvis cost <id>` does
+            for wo in store.family_members(fo):
+                if wo["id"] not in listed:
+                    listed.add(wo["id"])
+                    leaves.append(leaf(wo))
+                    members[fid].append(leaves[-1])
+        own = _own_spend(fid, os_groups[fid]) if os_groups.get(fid) else None
+        if own:
+            owns.append(own)
+        roots.append(_root_row(name, fo, fo.get("kind") or "feature", members[fid], own))
+    return roots, leaves, owns
+
+
+def _monitoring_roots(project: str | None,
+                      os_groups: dict[str, list[dict[str, Any]]]
+                      ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Morpheus's calls are keyed by its monitoring order: that order is their root"""
+    from .morpheus import is_monitoring_order_id
+
+    ids = [i for i in os_groups if is_monitoring_order_id(i)]
+    if not ids:
+        return [], []
+    central = CentralStore()
+    try:
+        orders = {i: central.morpheus_item(i) for i in ids}
+    finally:
+        central.close()
+    roots, owns = [], []
+    for mo_id, mo in orders.items():
+        if mo is None or (project and (mo.get("project") or project) != project):
+            continue                    # no such order, or another project's
+        own = _own_spend(mo_id, os_groups[mo_id])
+        owns.append(own)
+        roots.append(_root_row(mo.get("project") or "",
+                               {**mo, "title": mo.get("title") or mo.get("pr_title")},
+                               "monitoring", [], own))
+    return roots, owns
 
 
 def _orders_in_window(store: ProjectStore, index: dict[str, list[Path]], since: float,
@@ -16309,13 +16527,60 @@ def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     return _os_spend(groups.get("", []))
 
 
+def _order_kind(order_id: str) -> str:
+    return order_id.split("-", 1)[0]
+
+
+def cost_aggregates(units: list[dict[str, Any]],
+                    unattributed: dict[str, Any] | None = None,
+                    fleet_cost_usd: float | None = None) -> dict[str, Any]:
+    """Per-project and per-order-kind figures over the top-level units (docs/superpowers/specs/2026-11-09-cost-overview-first.md §1.4)"""
+    # The report's headline rolls up leaves, not roots; take it as given so the two never drift
+    fleet = (_rollup(units, unattributed)["totals"]["total_cost_usd"]
+             if fleet_cost_usd is None else fleet_cost_usd)
+    by_project: dict[str, list[dict[str, Any]]] = {}
+    for u in units:
+        by_project.setdefault(u["project"], []).append(u)
+    projects = []
+    for name, own in by_project.items():
+        kinds: dict[str, list[dict[str, Any]]] = {}
+        for u in own:
+            kinds.setdefault(_order_kind(u["id"]), []).append(u)
+        found = [u for u in own if u["found"]]
+        projects.append({
+            "project": name,
+            "cost_usd": _rollup(own)["totals"]["total_cost_usd"],
+            "orders": len(own),
+            "by_order_kind": {k: {"orders": len(us),
+                                  "cost_usd": _rollup(us)["totals"]["total_cost_usd"]}
+                              for k, us in sorted(kinds.items())},
+            "ttl_misses": sum(u.get("boundaries_ttl") or 0 for u in found),
+            "ttl_rewrite_tokens": sum(u.get("rewrite_ttl_excess") or 0 for u in found),
+        })
+    projects.sort(key=lambda p: (-p["cost_usd"], p["project"]))
+    by_kind: dict[str, int] = {}
+    for u in units:
+        by_kind[_order_kind(u["id"])] = by_kind.get(_order_kind(u["id"]), 0) + 1
+    unattributed_cost = (unattributed or {}).get("os_cost_usd") or 0.0
+    return {
+        "fleet_cost_usd": fleet,
+        "orders": len(units),
+        "by_order_kind": dict(sorted(by_kind.items())),
+        "projects": projects,
+        "unattributed_cost_usd": unattributed_cost,
+        # _rollup rounds parts before adding: report the residual, never fudge a slice
+        "rounding_usd": fleet - (sum(p["cost_usd"] for p in projects) + unattributed_cost),
+    }
+
+
 def _rollup(units: list[dict[str, Any]],
-            unattributed: dict[str, Any] | None = None) -> dict[str, Any]:
+            unattributed: dict[str, Any] | None = None,
+            owns: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
     """Totals over the units that could actually be measured, plus OS calls no unit owns"""
     measured = [u for u in units if u["found"]]
     worker_cost = round(sum(u["list_cost_usd"] for u in measured), 2)
-    # The `os_*` figures only: OS calls no work order caused are spend, not a unit (io-82bcb830)
-    os_spenders = [*units, *([unattributed] if unattributed else [])]
+    # Unowned and root-own OS calls are spend, not units (io-82bcb830, io-2641fe05)
+    os_spenders = [*units, *owns, *([unattributed] if unattributed else [])]
     # Over ALL units, not just measured ones
     os_cost = round(sum(u.get("os_cost_usd") or 0 for u in os_spenders), 2)
     subproc_cost = round(sum(u.get("subproc_cost_usd") or 0 for u in units), 2)
@@ -16348,6 +16613,7 @@ def _rollup(units: list[dict[str, Any]],
             "rewrite_cost_usd": round(sum(u["rewrite_cost_usd"] for u in measured), 2),
             "rewrite_excess": sum(u["rewrite_excess"] for u in measured),
             "resume_boundaries": sum(u["resume_boundaries"] for u in measured),
+            **_rewrite_split(measured),
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
@@ -16376,6 +16642,40 @@ def _unpriced_models(spends: Sequence[dict[str, float] | None]) -> dict[str, Any
     return {"unpriced_models": rows,
             "unpriced_note": f"Guessed at a fallback price, no list price known: {named}."
             if rows else ""}
+
+
+def _rewrite_split(measured: list[dict[str, Any]]) -> dict[str, Any]:
+    """The re-write tax by cause, summed per order, and the one sentence both renderers print (io-2641fe05)"""
+    from .usage import fmt_tok
+
+    parts = {"ttl": [0, 0.0], "prefix": [0, 0.0], "undecided": [0, 0.0]}
+    for u in measured:
+        excess, usd = u.get("rewrite_excess") or 0, u.get("rewrite_cost_usd") or 0.0
+        share = u.get("rewrite_ttl_share")
+        if share is None:
+            parts["undecided"][0] += excess
+            parts["undecided"][1] += usd
+            continue
+        ttl = u.get("rewrite_ttl_excess") or 0
+        parts["ttl"][0] += ttl
+        parts["ttl"][1] += usd * share
+        parts["prefix"][0] += excess - ttl
+        parts["prefix"][1] += usd * (1 - share)
+    says = {"ttl": "was the cache entry EXPIRING between turns, which a longer cache TTL "
+                   "buys back",
+            "prefix": "was the prompt PREFIX moving, which is upstream and Jarvis cannot fix",
+            "undecided": "is undecided: no boundary's cause was recorded"}
+    clauses = [f"~${usd:.2f} ({fmt_tok(tok)} tokens) {says[k]}"
+               for k, (tok, usd) in parts.items() if tok]
+    out: dict[str, Any] = {}
+    for k, (tok, usd) in parts.items():
+        out[f"rewrite_{k}_excess"] = tok
+        out[f"rewrite_{k}_cost_usd"] = round(usd, 2)
+    out["rewrite_note"] = (
+        "It is the sum of each order's re-write. Of it, " + "; ".join(clauses)
+        + ". Fewer turn boundaries cost less of every part, which is why batching "
+          "feedback into one message is cheaper than three." if clauses else "")
+    return out
 
 
 def _write_ttl(measured: list[dict[str, Any]], units: list[dict[str, Any]]
@@ -16417,22 +16717,14 @@ def _cost_for_target(target: str, project: str | None,
     os_groups = _os_groups()
     store = ProjectStore(path)
     try:
-        units = []
-        planner_id = fo.get("plan_wo_id")
-        if planner_id:
-            try:
-                units.append(_unit_row(name, store.get_work_order(planner_id), index,
-                                       _turn_rows(store, planner_id),
-                                       os_groups.get(planner_id, ())))
-            except KeyError:
-                pass
-        units.extend(_unit_row(name, child, index, _turn_rows(store, child["id"]),
-                               os_groups.get(child["id"], ()))
-                     for child in store.feature_children(fo["id"], kinds=WORKER_CHILDREN))
+        units = [_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
+                           os_groups.get(wo["id"], ()))
+                 for wo in store.family_members(fo)]
     finally:
         store.close()
+    own = _own_spend(fo["id"], os_groups[fo["id"]]) if os_groups.get(fo["id"]) else None
     return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
-            "units": units, **_rollup(units),
+            "units": units, **_rollup(units, owns=[own] if own else []), "own": own,
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 

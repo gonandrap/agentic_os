@@ -1,11 +1,26 @@
 {% extends "base.html" %}
 {% import "_layout.html" as ui %}
+{% set agg = report.aggregates %}
 {% block title %}cost — Jarvis{% endblock %}
 {% block style %}
+  :root { --pie-1: #56c8e8; --pie-2: #46d69a; --pie-3: #f2a33c; --pie-4: #c792ea;
+          --pie-5: #f78fb3; --pie-6: #8fa8ff; }
   .cost-list td.prose a.title { display: block; overflow: hidden; text-overflow: ellipsis;
                                 white-space: nowrap; }
 {% endblock %}
 {% block content %}
+{# A slot for `JarvisChart.pie`, which draws it below; slices from `pie_slices` (cost-overview-first spec §3.1) #}
+{% macro pie(title, slices) -%}
+<figure class="cost-pie" style="margin: 0;">
+  <figcaption class="kv">{{ title }}</figcaption>
+  {% if slices %}
+  <svg width="340" height="{{ [124, slices|length * 16 + 20]|max }}" role="img" aria-label="{{ title }}"></svg>
+  <script type="application/json" class="pie-data">{{ slices|tojson }}</script>
+  {% else %}
+  <p class="kv sub" style="margin: 4px 0 0;">nothing in this window</p>
+  {% endif %}
+</figure>
+{%- endmacro %}
 
 {# §8 of docs/superpowers/specs/2026-10-29-dashboard-full-width-failures-first-row-details.md #}
 {{ ui.page_head("What the work cost", report.scope) }}
@@ -89,12 +104,66 @@
   {# Tokens for BOTH halves, because the figure above them is both halves. Quoting the
      workers' tokens under a total that includes the OS's would not add up. #}
   <p class="kv mono" style="margin: 0;">
+    {%- if agg %}{{ agg.orders }} order{{ 's' if agg.orders != 1 }} · {% endif %}
     {{ fmt_tok(totals.billed_input + totals.os_billed_input + totals.subproc_billed_input) }} in ·
     {{ fmt_tok(totals.output + totals.os_output + totals.subproc_output) }} out ·
     {{ report.measured }} work order{{ 's' if report.measured != 1 }} measured
     {%- if report.unmeasured %}, {{ report.unmeasured }} whose transcript Claude Code has
       already pruned{% endif %}
   </p>
+  {% if agg %}
+  {# The aggregate overview (docs/superpowers/specs/2026-11-09-cost-overview-first.md §3.2) #}
+  {% if not project %}
+  {% set ns = namespace(dollars=[]) %}
+  {% for p in agg.projects %}{% set ns.dollars = ns.dollars + [(p.project, p.cost_usd)] %}{% endfor %}
+  <div class="cost-overview-fleet" style="margin: 12px 0 0; display: flex; gap: 22px; flex-wrap: wrap;">
+    {{ pie("$ by project", pie_slices(ns.dollars + [("no order", agg.unattributed_cost_usd)], money=True)) }}
+    {{ pie("orders by kind", pie_slices(agg.by_order_kind)) }}
+  </div>
+  {% endif %}
+  <div class="cost-overview-projects" style="margin: 12px 0 0; display: flex; gap: 22px; flex-wrap: wrap;">
+    {% for p in agg.projects %}
+    <div class="cost-project" data-project="{{ p.project }}">
+      <p class="kv mono" style="margin: 0;"><strong>{{ p.project }}</strong>
+        ~${{ '%.2f'|format(p.cost_usd) }} · {{ p.orders }} order{{ 's' if p.orders != 1 }}</p>
+      <p class="kv mono sub" style="margin: 0;">
+        {{ p.ttl_misses }} TTL miss{{ 'es' if p.ttl_misses != 1 }} ·
+        {{ fmt_tok(p.ttl_rewrite_tokens) }} TTL re-write tokens</p>
+      {{ pie("orders by kind", pie_slices(p.by_order_kind, field="orders")) }}
+    </div>
+    {% endfor %}
+  </div>
+  {# Replaces the shown-rows tally: every headline dollar is in a slice, the only gap is rounding #}
+  <p class="kv mono cost-reconcile" style="margin: 10px 0 0;">
+    {%- for p in agg.projects %}{{ ' + ' if not loop.first }}{{ p.project }} ${{ '%.2f'|format(p.cost_usd) }}{% endfor %}
+    {%- if agg.unattributed_cost_usd %}{{ ' + ' if agg.projects }}no order ${{ '%.2f'|format(agg.unattributed_cost_usd) }}{% endif %}
+    {%- if '%.2f'|format(agg.rounding_usd|abs) != '0.00' %}
+      {{ '+' if agg.rounding_usd > 0 else '−' }} ${{ '%.2f'|format(agg.rounding_usd|abs) }} from rounding
+      each slice to cents
+    {%- endif %}
+    = ~${{ '%.2f'|format(agg.fleet_cost_usd) }}, the headline above.
+  </p>
+  {% endif %}
+  {% set outside = meter.outside if meter and meter.outside.sessions %}
+  {% if outside %}
+  <p class="kv sub" style="margin: 4px 0 0;">
+    Not in that total:
+    {{ outside.n }} session{{ 's' if outside.n != 1 }} Jarvis did not dispatch
+    (${{ '%.2f'|format(outside.total_usd) }}, listed under the meter).
+  </p>
+  {% endif %}
+  {% if agg %}
+  <script src="/static/chart.js?v={{ static_v['chart.js'] }}"></script>
+  <script>
+    document.querySelectorAll('figure.cost-pie').forEach(function (f) {
+      var data = f.querySelector('script.pie-data');
+      if (data) window.JarvisChart.pie(f.querySelector('svg'), JSON.parse(data.textContent),
+                                       { cx: 56, cy: 60, r: 50 });
+    });
+  </script>
+  {% endif %}
+  <details class="cost-prose" style="margin: 10px 0 0;">
+  <summary class="kv" style="cursor: pointer;">How this total is made</summary>
   {# The split, stated right under the headline: the workers' own conversations, what the
      OS spent answering for them, and what they spent below themselves. All three are
      list-priced, so they add up. #}
@@ -143,8 +212,7 @@
     {{ fmt_tok(totals.rewrite_excess) }} tokens re-sent across
     {{ totals.resume_boundaries }} turn boundar{{ 'ies' if totals.resume_boundaries != 1 else 'y' }}.
     Every worker turn after the first re-sends the whole conversation at the cache-write
-    rate. The cause is upstream and Jarvis cannot fix it — what it can do is cost fewer
-    boundaries, which is why batching feedback into one message is cheaper than three.
+    rate. {{ totals.rewrite_note }}
   </p>
   {% endif %}
   {% if totals.subagent_cost_usd %}
@@ -152,41 +220,21 @@
     Subagents ~${{ '%.2f'|format(totals.subagent_cost_usd) }} of that.
   </p>
   {% endif %}
+  </details>
 </div>
 
 {# The orders FIRST: "where did it go" is this page's first question (io-82bcb830). #}
 <div class="panel table-wrap" style="margin-top: 14px;">
   {% set un = report.os_unattributed if report.os_unattributed and report.os_unattributed.os_calls %}
-  {% if units or un %}
-  {# Sums the cents the rows SHOW, so a reader's own addition lands here. Every headline
-     dollar is in a row, so the only gap possible is rounding. #}
-  {% set listed = (units|map(attribute='total_cost_usd')|map('round', 2)|sum)
-                  + (un.os_cost_usd|round(2) if un else 0) %}
-  {% set rounding = totals.total_cost_usd - listed %}
-  <div style="padding: 10px 16px;">
-    <p class="kv mono" style="margin: 0;">
-      <strong>{{ units|length }} order{{ 's' if units|length != 1 }}
-      {{- ' and the no-work-order row' if un }} below add to
-      ${{ '%.2f'|format(listed) }}</strong>
-      {%- if '%.2f'|format(rounding|abs) != '0.00' %}
-        {{ '+' if rounding > 0 else '−' }} ${{ '%.2f'|format(rounding|abs) }} from rounding
-        each row to cents
-      {%- endif %}
-      = ~${{ '%.2f'|format(totals.total_cost_usd) }}, the headline above.
-    </p>
-    {% set outside = meter.outside if meter and meter.outside.sessions %}
-    {% if outside %}
-    <p class="kv sub" style="margin: 4px 0 0;">
-      Not in that total:
-      {{ outside.n }} session{{ 's' if outside.n != 1 }} Jarvis did not dispatch
-      (${{ '%.2f'|format(outside.total_usd) }}, listed under the meter).
-    </p>
-    {% endif %}
-  </div>
-  {% endif %}
+  {# Collapsed until asked for, one page per request; the slice comes from `cost_page`
+     (docs/superpowers/specs/2026-11-09-cost-overview-first.md §4). #}
+  <details class="cost-orders"{{ ' open' if listing.open }}>
+  <summary style="padding: 10px 16px; cursor: pointer;">
+    {{ units|length }} order{{ 's' if units|length != 1 }}, dearest first
+  </summary>
   <table class="cost-list">
   <tr><th>id</th><th>cost</th><th>order</th><th>state</th></tr>
-  {% for u in units %}
+  {% for u in listing.units %}
   <tr>
     <td>{{ ui.row_id(u.id, order_path(u.project, u.id)) }}</td>
     <td class="mono num" style="text-align: right; color: var(--ink);"
@@ -204,7 +252,7 @@
           {{ u.turns }} turn{{ 's' if u.turns != 1 }} ·
           {{ fmt_tok(u.billed_input) }} in / {{ fmt_tok(u.output) }} out ·
           peak context {{ fmt_tok(u.context_peak) }}
-          {%- if u.rewrite_excess %} · re-write {{ fmt_tok(u.rewrite_excess) }}{% endif %}
+          {%- if u.rewrite_excess %} · re-write ${{ '%.2f'|format(u.rewrite_cost_usd) }} ({{ fmt_tok(u.rewrite_excess) }} tokens){% endif %}
           {%- if u.subagent_count %} · {{ u.subagent_count }} subagent{{ 's' if u.subagent_count != 1 }}{% endif %}
         {%- else %}
           no transcript left to measure
@@ -226,6 +274,17 @@
         · <a href="/cost/{{ u.project }}/{{ u.id }}"
           >bill{% if u.recorded_turns %} ({{ u.recorded_turns }} turns recorded){% endif %} →</a>
       </div>
+      {# A root order of any kind: its members on demand, already inside the cost above (io-2641fe05) #}
+      {% if u.children %}
+      <details class="children sub mono">
+        <summary>{{ u.order_kind }} · {{ u.children|length }} order{{ 's' if u.children|length != 1 }} inside</summary>
+        {% for c in u.children %}
+        <div>{{ ui.row_id(c.id, order_path(c.project, c.id)) }}
+          {% if c.found or c.total_cost_usd %}${{ '%.2f'|format(c.total_cost_usd) }}{% else %}—{% endif %}
+          · {{ c.title }}</div>
+        {% endfor %}
+      </details>
+      {% endif %}
     </td>
     {% set m = status_meta.get(u.status, {'word': u.status, 'icon': '•', 'tone': 'muted'}) %}
     <td class="when"><span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span></td>
@@ -234,7 +293,7 @@
   <tr><td colspan="4" class="empty">no work orders to measure</td></tr>
   {% endfor %}
   {# Not an order, so no link and no state; here so the rows sum to the headline (io-82bcb830). #}
-  {% if un %}
+  {% if un and listing.page == listing.pages %}
   <tr class="no-work-order">
     <td class="mono">—</td>
     <td class="mono num" style="text-align: right; color: var(--ink);">${{ '%.2f'|format(un.os_cost_usd) }}</td>
@@ -249,6 +308,14 @@
   </tr>
   {% endif %}
   </table>
+  {% if listing.pages > 1 %}
+  <p class="kv cost-pager" style="padding: 8px 16px; margin: 0;">
+    {% if listing.prev %}<a href="{{ listing.prev }}">‹ previous</a> · {% endif -%}
+    page {{ listing.page }} of {{ listing.pages }}
+    {%- if listing.next %} · <a href="{{ listing.next }}">next ›</a>{% endif %}
+  </p>
+  {% endif %}
+  </details>
 </div>
 
 {# Absent rather than faked when it could not be built — see `cost_page`. #}
