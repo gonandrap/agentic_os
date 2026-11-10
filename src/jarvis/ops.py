@@ -11372,6 +11372,91 @@ def submit_decision_report(do_id: str, doc: Any, project_name: str | None = None
     return out
 
 
+def forecast_meter(now: float | None = None) -> dict[str, Any] | None:
+    """The 5h meter reading a forecast is priced against, None when unavailable (API-key fleet, no sample)"""
+    from . import paths, usage_meter
+    from .catalog import CostConfig
+
+    now = db.now() if now is None else now
+    try:
+        catalog = resolve_catalog()
+    except Exception:  # noqa: BLE001 — no catalog still prices against the defaults
+        catalog = None
+    cfg = getattr(getattr(catalog, "os", None), "cost", None) or CostConfig()
+    try:
+        usage_meter.token()
+        sample = usage_meter.latest_sample(now=now, within=cfg.meter_nearest_seconds)
+        if sample is None or sample.five_hour_pct is None:
+            return None
+        rate = usage_meter.dollars_per_point(now=now, cfg=cfg,
+                                             home=paths.jarvis_home())
+        return {"used_pct": float(sample.five_hour_pct),
+                "resets_at": sample.five_hour_resets_at,
+                "dollars_per_point": float(rate["value"])}
+    except Exception:  # noqa: BLE001 — an unreadable meter is "unavailable", never a refusal (§5)
+        return None
+
+
+def submit_decision_forecast(do_id: str, doc: Any,
+                             project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis do forecast` — record the open experiment's forecast (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §5)"""
+    from . import decision_report, experiment_forecast
+    from .project_store import DECISION_FORECAST_EVENT
+
+    name, path, fo = find_feature_order(do_id, project_name)
+    _require_kind(fo, "decision", show_verb(fo.get("kind")))
+    store = ProjectStore(path)
+    try:
+        entry = store.open_experiment(do_id)
+        phase = decision_report.experiment_phase(entry) if entry else None
+        if phase not in ("forecast_due", "awaiting_go"):
+            raise OpsError(
+                f"{do_id} has no experiment waiting for a forecast"
+                + (f" (experiment {entry['n']} is {phase}: the go is given, so run it, "
+                   f"attach the raw outputs, and resubmit with "
+                   f"`jarvis do report {do_id} --from-file report.json`)" if entry else
+                   f": only the user starts one. See `jarvis do show {do_id}`."))
+        try:
+            parsed = experiment_forecast.parse_forecast(doc)
+        except experiment_forecast.ForecastError as e:
+            raise OpsError(
+                "the forecast was not accepted, and nothing was stored. Fix all of these "
+                f"and resubmit with `jarvis do forecast {do_id} --from-file forecast.json`:"
+                "\n  - " + "\n  - ".join(e.problems)) from e
+        n = int(entry["n"])
+        computed = {**experiment_forecast.compute(parsed, forecast_meter()),
+                    "at": db.now()}
+        store.update_experiment(do_id, n, forecast=computed)
+        reason = experiment_forecast.reason(do_id, n, computed)
+        payload = {"do_id": do_id, "n": n, "runs": computed["runs"],
+                   "est_usd": computed["est_usd"],
+                   "window_share_pct": computed["window_share_pct"],
+                   "meter": computed["meter"], "replaced": phase == "awaiting_go"}
+        researcher: dict[str, Any] | None = None
+        wo_id = fo.get("plan_wo_id")
+        try:
+            wo = store.get_work_order(wo_id) if wo_id else None
+        except KeyError:
+            wo = None  # deleted; the link was released
+        if wo is not None and wo["status"] in OPEN_STATUSES:
+            # A forecast is not a deliverable: no validation round, whatever the kind's route
+            store.update_work_order(wo["id"], result_summary=reason)
+            settle_in_session(store, wo, DECISION_FORECAST_EVENT, payload=payload)
+            researcher = {"wo_id": wo["id"], "status": "completed", "session_stopped": False}
+        elif wo is not None:
+            store.add_event(wo["id"], DECISION_FORECAST_EVENT, payload)
+        flagged = store.raise_decision(
+            do_id, "planning", reason,
+            title=f"{do_id} experiment {n}: forecast ready for your go",
+            body=experiment_forecast.render(computed))
+    finally:
+        store.close()
+    return {"project": name, "do_id": do_id, "n": n, "forecast": computed,
+            "flagged": flagged, "researcher": researcher,
+            "note": "recorded — the user decides `jarvis do experiment "
+                    f"{do_id} --go`. End your turn; do NOT start the batch."}
+
+
 #: On the researcher's timeline: one order filed from a proposal (§6)
 DECISION_FOLLOWUP_EVENT = "decision_followup_filed"
 #: Where filing is allowed: a delivered report, before or after the user decided (§6)
@@ -20164,32 +20249,29 @@ def _open_release_orders(project: str) -> list[dict[str, Any]]:
 
 def _release_scope(project: str) -> tuple[str, Path, bool, str]:
     """Name, checkout, is-it-the-OS, and the tag glob its releases use (spec §3)"""
-    from . import release, release_view
+    from . import release
 
     os_name, _ = _release_repo()
     name, repo = _release_repo(project)
     if not project or name == os_name:
         return name, repo, True, release.RELEASE_TAG_GLOB
-    own = f"{name}-*"
-    try:
-        return name, repo, False, own if release_view.tags(repo, own) else "*"
-    except (OSError, subprocess.SubprocessError) as e:
-        raise OpsError(f"cannot read the tags in {repo}: {e}") from e
+    return name, repo, False, "*"  # every stream: released is decided by ancestry, not name
 
 
 def release_overview(project: str = "") -> dict[str, Any]:
-    """Pending work since the newest tag, and every release with its validation verdict"""
+    """Pending work no tag reaches, and every release with its validation verdict (spec §3)"""
     from . import release_view
 
     project, repo, is_os, glob = _release_scope(project)
     try:
-        tags = release_view.tags(repo, glob)
         ref = release_view.main_ref(repo)
+        tags = release_view.tags(repo, glob, ref)
         newest = tags[0]["tag"] if tags else ""
-        pending = _release_rows(release_view.commits(repo, newest, ref), project, repo)
+        pending = _release_rows(release_view.commits(repo, ref, [t["tag"] for t in tags]),
+                                project, repo)
         for i, r in enumerate(pending):
             r["rides"] = len(pending) - i  # what a cut at this commit ships (Q2850)
-        contents = [release_view.release_commits(repo, t["tag"], t["previous"]) for t in tags]
+        contents = [release_view.release_commits(repo, t["tag"], t["follows"]) for t in tags]
         # One join over every release: a store opened per tag costs a page load seconds
         _release_rows([r for rows in contents for r in rows], project, repo)
         releases = []
@@ -20216,7 +20298,7 @@ def release_detail(tag: str, project: str = "") -> dict[str, Any]:
         known = {t["tag"]: t for t in release_view.tags(repo, glob)}
         if tag not in known:
             raise OpsError(f"no release {tag!r} in {repo} — /release lists them")
-        rows = release_view.release_commits(repo, tag, known[tag]["previous"])
+        rows = release_view.release_commits(repo, tag, known[tag]["follows"])
     except (OSError, subprocess.SubprocessError) as e:
         raise OpsError(f"cannot read {tag} in {repo}: {e}") from e
     return {**known[tag], "project": project, "rows": _release_rows(rows, project, repo)}
@@ -20244,8 +20326,8 @@ the pending commits on `main` up to and including the base below — the user ch
 
 {lines}
 
-Tag `{base}` as the next `{project}-X.Y.Z` (newest tag so far: {newest}) and release it the \
-way this project documents its releases. Tagging, pushing and deploying are PRIVILEGED \
+Tag `{base}` and release it the way this project documents its releases, with the tag name \
+its own scheme gives (newest tag so far: {newest}). Tagging, pushing and deploying are PRIVILEGED \
 ACTIONS and will be gated — correct and expected. Read `jarvis brief gates` and make your \
 case first (`jarvis gate request`). Do not move the base to a newer commit. If CI on {base} \
 is red, a tag already contains it, or the project documents no release process, stop and \
