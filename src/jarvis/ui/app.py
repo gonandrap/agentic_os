@@ -921,6 +921,28 @@ def fmt_tok(n: int | None) -> str:
     return str(n)
 
 
+PIE_MUTED = ("other", "no order")
+
+
+def pie_slices(pairs: Mapping | Iterable, *, field: str | None = None, money: bool = False,
+               limit: int = 6) -> list[dict]:
+    """`JarvisChart.pie` slices, largest first, tail as "other" (cost-overview-first spec §3.1)"""
+    items = pairs.items() if hasattr(pairs, "items") else pairs
+    live = sorted(((k, v[field] if field else v) for k, v in items), key=lambda kv: -kv[1])
+    live = [(k, v) for k, v in live if v > 0]
+    if len(live) > limit:
+        live = live[:limit - 1] + [("other", sum(v for _, v in live[limit - 1:]))]
+    out, colour = [], 0
+    for key, value in live:
+        muted = key in PIE_MUTED
+        out.append({"key": key, "value": value,
+                    # the helper prints only the share, so the value rides in the label
+                    "label": f"{key} " + (f"~${value:.2f}" if money else str(value)),
+                    "color": "var(--ink-3)" if muted else f"var(--pie-{colour + 1})"})
+        colour += not muted
+    return out
+
+
 def fmt_dur(seconds: float | None) -> str:
     """Turn durations at a readable magnitude — 1.2h, 4m, 15s"""
     if seconds is None:
@@ -1212,7 +1234,7 @@ def create_app() -> FastAPI:
         # The statuses the user's brake can hold — where a "let this order through" button means something
         fleet_held_statuses=invariants.FLEET_HELD_STATUSES,
         instance=instance_badge(),
-        fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
+        fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts, pie_slices=pie_slices,
         filter_rows=filter_rows, filter_options=filter_options, attention_first=attention_first,
         # The bill's two explanations, taken from the module that computes the numbers rather than written...
         rate_note=bill.rate_note, tokens_mean=bill.TOKENS_MEAN,

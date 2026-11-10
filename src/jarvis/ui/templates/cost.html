@@ -1,7 +1,11 @@
 {% extends "base.html" %}
 {% import "_layout.html" as ui %}
+{% import "_pie.html" as charts %}
+{% set agg = report.aggregates %}
 {% block title %}cost — Jarvis{% endblock %}
 {% block style %}
+  :root { --pie-1: #56c8e8; --pie-2: #46d69a; --pie-3: #f2a33c; --pie-4: #c792ea;
+          --pie-5: #f78fb3; --pie-6: #8fa8ff; }
   .cost-list td.prose a.title { display: block; overflow: hidden; text-overflow: ellipsis;
                                 white-space: nowrap; }
 {% endblock %}
@@ -89,12 +93,57 @@
   {# Tokens for BOTH halves, because the figure above them is both halves. Quoting the
      workers' tokens under a total that includes the OS's would not add up. #}
   <p class="kv mono" style="margin: 0;">
+    {%- if agg %}{{ agg.orders }} order{{ 's' if agg.orders != 1 }} · {% endif %}
     {{ fmt_tok(totals.billed_input + totals.os_billed_input + totals.subproc_billed_input) }} in ·
     {{ fmt_tok(totals.output + totals.os_output + totals.subproc_output) }} out ·
     {{ report.measured }} work order{{ 's' if report.measured != 1 }} measured
     {%- if report.unmeasured %}, {{ report.unmeasured }} whose transcript Claude Code has
       already pruned{% endif %}
   </p>
+  {% if agg %}
+  {# The aggregate overview (docs/superpowers/specs/2026-11-09-cost-overview-first.md §3.2) #}
+  {% if not project %}
+  {% set ns = namespace(dollars=[]) %}
+  {% for p in agg.projects %}{% set ns.dollars = ns.dollars + [(p.project, p.cost_usd)] %}{% endfor %}
+  <div class="cost-overview-fleet" style="margin: 12px 0 0; display: flex; gap: 22px; flex-wrap: wrap;">
+    {{ charts.pie("$ by project", pie_slices(ns.dollars + [("no order", agg.unattributed_cost_usd)], money=True)) }}
+    {{ charts.pie("orders by kind", pie_slices(agg.by_order_kind)) }}
+  </div>
+  {% endif %}
+  <div class="cost-overview-projects" style="margin: 12px 0 0; display: flex; gap: 22px; flex-wrap: wrap;">
+    {% for p in agg.projects %}
+    <div class="cost-project" data-project="{{ p.project }}">
+      <p class="kv mono" style="margin: 0;"><strong>{{ p.project }}</strong>
+        ~${{ '%.2f'|format(p.cost_usd) }} · {{ p.orders }} order{{ 's' if p.orders != 1 }}</p>
+      <p class="kv mono sub" style="margin: 0;">
+        {{ p.ttl_misses }} TTL miss{{ 'es' if p.ttl_misses != 1 }} ·
+        {{ fmt_tok(p.ttl_rewrite_tokens) }} TTL re-write tokens</p>
+      {{ charts.pie("orders by kind", pie_slices(p.by_order_kind, field="orders")) }}
+    </div>
+    {% endfor %}
+  </div>
+  {# Replaces the shown-rows tally: every headline dollar is in a slice, the only gap is rounding #}
+  <p class="kv mono cost-reconcile" style="margin: 10px 0 0;">
+    {%- for p in agg.projects %}{{ ' + ' if not loop.first }}{{ p.project }} ${{ '%.2f'|format(p.cost_usd) }}{% endfor %}
+    {%- if agg.unattributed_cost_usd %}{{ ' + ' if agg.projects }}no order ${{ '%.2f'|format(agg.unattributed_cost_usd) }}{% endif %}
+    {%- if '%.2f'|format(agg.rounding_usd|abs) != '0.00' %}
+      {{ '+' if agg.rounding_usd > 0 else '−' }} ${{ '%.2f'|format(agg.rounding_usd|abs) }} from rounding
+      each slice to cents
+    {%- endif %}
+    = ~${{ '%.2f'|format(agg.fleet_cost_usd) }}, the headline above.
+  </p>
+  {% endif %}
+  {% set outside = meter.outside if meter and meter.outside.sessions %}
+  {% if outside %}
+  <p class="kv sub" style="margin: 4px 0 0;">
+    Not in that total:
+    {{ outside.n }} session{{ 's' if outside.n != 1 }} Jarvis did not dispatch
+    (${{ '%.2f'|format(outside.total_usd) }}, listed under the meter).
+  </p>
+  {% endif %}
+  {% if agg %}{{ charts.pie_script() }}{% endif %}
+  <details class="cost-prose" style="margin: 10px 0 0;">
+  <summary class="kv" style="cursor: pointer;">How this total is made</summary>
   {# The split, stated right under the headline: the workers' own conversations, what the
      OS spent answering for them, and what they spent below themselves. All three are
      list-priced, so they add up. #}
@@ -151,38 +200,12 @@
     Subagents ~${{ '%.2f'|format(totals.subagent_cost_usd) }} of that.
   </p>
   {% endif %}
+  </details>
 </div>
 
 {# The orders FIRST: "where did it go" is this page's first question (io-82bcb830). #}
 <div class="panel table-wrap" style="margin-top: 14px;">
   {% set un = report.os_unattributed if report.os_unattributed and report.os_unattributed.os_calls %}
-  {% if units or un %}
-  {# Sums the cents the rows SHOW, so a reader's own addition lands here. Every headline
-     dollar is in a row, so the only gap possible is rounding. #}
-  {% set listed = (units|map(attribute='total_cost_usd')|map('round', 2)|sum)
-                  + (un.os_cost_usd|round(2) if un else 0) %}
-  {% set rounding = totals.total_cost_usd - listed %}
-  <div style="padding: 10px 16px;">
-    <p class="kv mono" style="margin: 0;">
-      <strong>{{ units|length }} order{{ 's' if units|length != 1 }}
-      {{- ' and the no-work-order row' if un }} below add to
-      ${{ '%.2f'|format(listed) }}</strong>
-      {%- if '%.2f'|format(rounding|abs) != '0.00' %}
-        {{ '+' if rounding > 0 else '−' }} ${{ '%.2f'|format(rounding|abs) }} from rounding
-        each row to cents
-      {%- endif %}
-      = ~${{ '%.2f'|format(totals.total_cost_usd) }}, the headline above.
-    </p>
-    {% set outside = meter.outside if meter and meter.outside.sessions %}
-    {% if outside %}
-    <p class="kv sub" style="margin: 4px 0 0;">
-      Not in that total:
-      {{ outside.n }} session{{ 's' if outside.n != 1 }} Jarvis did not dispatch
-      (${{ '%.2f'|format(outside.total_usd) }}, listed under the meter).
-    </p>
-    {% endif %}
-  </div>
-  {% endif %}
   {# Collapsed until asked for, one page per request; the slice comes from `cost_page`
      (docs/superpowers/specs/2026-11-09-cost-overview-first.md §4). #}
   <details class="cost-orders"{{ ' open' if listing.open }}>

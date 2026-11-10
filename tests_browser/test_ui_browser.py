@@ -1783,6 +1783,24 @@ def test_the_chart_helper_draws_a_pie_with_its_legend(page, server, project):
     assert got == {"wedges": 2, "rows": ["wo 75%", "fo 25%"]}
 
 
+def test_each_overview_pie_has_one_legend_row_per_slice(page, server, project):
+    """docs/superpowers/specs/2026-11-09-cost-overview-first.md §3"""
+    import json
+
+    _cost_rows(project)
+    page.goto(f"{server}/cost?project=proj_a")   # scoped: the fleet entry is cached across tests
+    figures = page.locator("figure.cost-pie:has(svg)")
+    figures.first.locator("g.legend-item").first.wait_for(state="attached")
+    assert figures.count() == 1
+    for i in range(figures.count()):
+        fig = figures.nth(i)
+        slices = json.loads(fig.locator("script.pie-data").text_content())
+        keys = [fig.locator("g.legend-item[data-key]").nth(j).get_attribute("data-key")
+                for j in range(fig.locator("g.legend-item[data-key]").count())]
+        assert keys == [s["key"] for s in slices]
+    _shot_element(page.locator(".panel:has(.cost-overview-projects)"), "cost-overview")
+
+
 def _meter_page(page, url):
     page.goto(url)
     chart = page.locator(".meter-chart svg")
