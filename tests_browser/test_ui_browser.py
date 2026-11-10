@@ -1002,6 +1002,17 @@ def _shot_clip(page, clip, name):
     page.screenshot(path=str(out / f"{name}.png"), clip=clip, full_page=True)
 
 
+def _shot_element(locator, name):
+    """`_shot` for one element: a panel, not the whole page"""
+    import os
+    import pathlib
+
+    where = os.environ.get("JARVIS_UI_SHOTS")
+    if where:
+        pathlib.Path(where).mkdir(parents=True, exist_ok=True)
+        locator.screenshot(path=str(pathlib.Path(where) / f"{name}.png"))
+
+
 def _backdate_spans(store, order_id, stamps):
     """Put an order's spans, its `status` events and its creation on the clock — oldest
     first.
@@ -1715,11 +1726,25 @@ def test_the_meter_chart_hovers_toggles_overlays_and_zooms(page, server, project
     labels = page.locator(".meter-chart g.axis-label text").all_text_contents()
     assert len(labels) == 2 and labels[1].endswith("%"), labels
 
+    # The in-chart legend: one swatch per thing drawn, following the checkboxes (io-2641fe05)
+    def legend():
+        return [chart.locator("g.legend-item").nth(i).get_attribute("data-key")
+                for i in range(chart.locator("g.legend-item").count())]
+    assert legend() == ["five_hour_pct", "seven_day_pct", "calc-jarvis", "calc-outside"]
+    colours = [chart.locator(f"polyline[data-series={k}]").get_attribute("stroke")
+               for k in ("five_hour_pct", "seven_day_pct")]
+    assert colours[0] != colours[1]
+
     # Series toggle
     assert chart.locator("polyline[data-series=five_hour_pct]").count() == 1
     page.uncheck("input[data-series=five_hour_pct]")
     assert chart.locator("polyline[data-series=five_hour_pct]").count() == 0
     assert chart.locator("polyline[data-series=seven_day_pct]").count() == 1
+    page.uncheck("input[data-calc=five_hour]")
+    assert "calc-jarvis" in legend()
+    page.uncheck("input[data-calc=seven_day]")
+    assert legend() == ["seven_day_pct"]
+    page.check("input[data-calc=seven_day]")
 
     # Overlay: one fetch for the span shifted back by one window, one more curve
     with page.expect_request("**/api/cost/meter?*") as asked:
@@ -1727,6 +1752,9 @@ def test_the_meter_chart_hovers_toggles_overlays_and_zooms(page, server, project
     since = float(asked.value.url.split("since=")[1].split("&")[0])
     assert abs(since - (data["since"] - span)) < 1
     chart.locator("polyline[data-overlay=span]").first.wait_for(state="attached")
+    assert legend()[-1] == "overlay-span"
+    assert "previous window" in chart.locator("g.legend-item").last.text_content()
+    _shot_element(page.locator(".meter-chart").locator("xpath=.."), "cost-meter-legend")
 
     # Wheel: live fetch for the new view, and the custom-dates form follows it
     before = page.input_value("form input[name=since]")
@@ -1735,6 +1763,24 @@ def test_the_meter_chart_hovers_toggles_overlays_and_zooms(page, server, project
         page.mouse.wheel(0, -300)
     assert page.input_value("form input[name=since]") != before
     assert page.is_enabled("[data-act=apply]")
+
+
+def test_the_chart_helper_draws_a_pie_with_its_legend(page, server, project):
+    """`static/chart.js` pie: one wedge and one legend row per non-zero slice"""
+    _cost_rows(project)
+    _meter_samples()
+    page.goto(f"{server}/cost?window=5h&project=proj_a")
+    page.locator(".meter-chart svg").wait_for()
+    got = page.evaluate("""() => {
+      const svg = JarvisChart.el('svg', {width: 300, height: 120}, document.body);
+      JarvisChart.pie(svg, [{key: 'a', label: 'wo', value: 3, color: 'red'},
+                            {key: 'b', label: 'fo', value: 1, color: 'blue'},
+                            {key: 'c', label: 'io', value: 0, color: 'green'}],
+                      {cx: 60, cy: 60, r: 50});
+      return {wedges: svg.querySelectorAll('g.pie path').length,
+              rows: [...svg.querySelectorAll('g.legend-item')].map(e => e.textContent)};
+    }""")
+    assert got == {"wedges": 2, "rows": ["wo 75%", "fo 25%"]}
 
 
 def _meter_page(page, url):
