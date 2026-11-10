@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% import "_layout.html" as ui %}
+{% block title %}Yours — Jarvis{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §6 #}
+{% set labels = {"needs_you": "needs you", "running": "running",
+                 "done_unseen": "done, not seen", "done": "done"} %}
+{{ ui.page_head("Yours", shown ~ " of your asks shown · " ~ report.total ~ " on the record") }}
+
+{{ ui.filter_bar("/yours", filters, options, shown, report.total) }}
+
+{% macro tree_node(n) %}
+<li id="node-{{ n.id }}">{{ ui.row_id(n.id, order_path(n.project, n.id)) }}
+  <span class="mono">{{ n.project }}</span>
+  <span class="mono {{ 'tone-warn' if n.needs_attention }}">{{ n.status }}</span>
+  <span class="sub">{{ n.title }}</span>
+  {% if n.children %}<ul>{% for c in n.children %}{{ tree_node(c) }}{% endfor %}</ul>{% endif %}
+</li>
+{% endmacro %}
+
+{% for state, rows in report.groups.items() %}
+<section class="panel yours-{{ state }}" id="state-{{ state }}">
+  <div class="strip-head {{ 'tone-warn' if state == 'needs_you' }}">{{ labels[state] }} · {{ rows | length }}</div>
+  {% if rows %}
+  <div class="table-wrap">
+    <table>
+      <tr><th>ask</th><th>project</th><th>kind</th><th>title</th><th>state</th><th>cost</th></tr>
+      {% for r in rows %}
+      <tr id="{{ r.id }}">
+        <td>{{ ui.row_id(r.id, order_path(r.project, r.id)) }}</td>
+        <td class="mono">{{ r.project }}</td>
+        <td class="mono">{{ r.kind }}</td>
+        <td class="prose">{{ r.title }}
+          {% if r.tree.root.children %}
+          <details><summary class="sub">{{ r.tree.nodes() | length - 1 }} order(s) under it</summary>
+            <ul class="tree">{% for c in r.tree.root.children %}{{ tree_node(c) }}{% endfor %}</ul>
+          </details>
+          {% endif %}
+        </td>
+        <td class="mono">{{ labels[r.state] }}</td>
+        <td class="num mono">${{ '%.2f' % r.cost_usd }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">none</p>
+  {% endif %}
+  {% if state == 'done' and report.older_hidden %}
+  <p class="sub"><a href="/yours?older=1{{ '&project=' ~ filters.project if filters.get('project') }}">show older</a>
+    · {{ report.older_hidden }} done more than 14 days ago</p>
+  {% endif %}
+</section>
+{% endfor %}
+{% endblock %}

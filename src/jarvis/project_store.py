@@ -1183,10 +1183,13 @@ ADDED_COLUMNS = {
         "trigger_wo_id": "TEXT",
         # WHO ASKED: 'user'|'os', stamped once at create; NULL on legacy rows (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2)
         "requestor": "TEXT",
+        # When the user last looked at this ask (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §6.1)
+        "requestor_seen_at": "REAL",
     },
     "feature_orders": {
         # As on work_orders (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §2)
         "requestor": "TEXT",
+        "requestor_seen_at": "REAL",
         # Same, one level up: a feature's bill is its children's, and children can be deleted
         "bill_json": "TEXT",
         "bill_sealed_at": "REAL",
@@ -2867,6 +2870,21 @@ class ProjectStore:
             "SELECT wo_id FROM notifications WHERE source='request' AND wo_id IS NOT NULL"
         ).fetchall()
         return {r["root_id"] or r["wo_id"] for r in rows} | {r["wo_id"] for r in told}
+
+    def request_settled_at(self, root_id: str) -> float | None:
+        """Newest `request_settled` of this root, matched as `settled_request_roots` does"""
+        row = self.conn.execute(
+            "SELECT MAX(ts) AS ts FROM wo_events WHERE kind='request_settled' AND "
+            "COALESCE(CASE WHEN json_valid(payload) THEN json_extract(payload, '$.root_id') END,"
+            " wo_id) = ?", (root_id,)).fetchone()
+        return row["ts"] if row else None
+
+    def mark_request_seen(self, order_id: str) -> None:
+        """Stamp the user's look at their ask; an OS or legacy row is no ask of theirs (§6.1)"""
+        ts = db.now()
+        for table in ("work_orders", "feature_orders"):
+            self.conn.execute(f"UPDATE {table} SET requestor_seen_at=? "
+                              "WHERE id=? AND requestor='user'", (ts, order_id))
 
     def orders_with_origin(self, key: str, value: str) -> list[dict[str, Any]]:
         """Rows of both tables whose `metadata[key]` is `value`, oldest first"""

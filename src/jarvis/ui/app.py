@@ -1507,6 +1507,7 @@ def create_app() -> FastAPI:
         if detail["project"] not in paths:
             return render(request, "error.html",
                           message=f"no project named {detail['project']!r} is registered")
+        ops.mark_request_seen(detail["project"], fo_id)
         store = ProjectStore(paths[detail["project"]])
         try:
             validation = ops.validation_detail(store, fo_id=fo_id)
@@ -1569,6 +1570,7 @@ def create_app() -> FastAPI:
             detail = ops.show_improvement_order(io_id, name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        ops.mark_request_seen(detail["project"], io_id)
         report = detail.get("report") or {}
         if report.get("findings"):
             # Owed a decision first: pending and not held by Neo, or a filing that failed
@@ -1587,6 +1589,7 @@ def create_app() -> FastAPI:
             detail = ops.show_investigation_order(inv_id, name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        ops.mark_request_seen(detail["project"], inv_id)
         return render(request, "investigation_order.html", inv=detail,
                       project=detail["project"], error=error)
 
@@ -1598,6 +1601,7 @@ def create_app() -> FastAPI:
             detail = ops.show_decision_order(do_id, name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        ops.mark_request_seen(detail["project"], do_id)
         return render(request, "decision_order.html", do=detail,
                       project=detail["project"], error=error, note=note)
 
@@ -1677,6 +1681,8 @@ def create_app() -> FastAPI:
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e),
                           hint=_stale_link_hint(name, wo_id), status_code=404)
+        # Viewing the ask is seeing it (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §6.1)
+        ops.mark_request_seen(pname, wo_id)
         store = ProjectStore(path)
         try:
             # THE NEWEST PAGE, and how much is behind it — `jarvis wo show`'s rule (io-12b7d873)
@@ -2317,6 +2323,18 @@ def create_app() -> FastAPI:
         return render(request, "stuck.html", active="stuck", rows=rows, unjudged=unjudged,
                       attention=[r for r in rows if r["stuck"]], filters=filters,
                       options=options, total=len(every))
+
+    @app.get("/yours", response_class=HTMLResponse)
+    def yours_page(request: Request, older: str = ""):
+        """Only the user's asks, each with its tree (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §6.3)"""
+        options = {"project": sorted(ops.registered_project_paths())}
+        filters = query_filters(request, options)
+        project = filters.get("project", "")
+        report = ops.yours_report(project if project in options["project"] else None,
+                                  older=older == "1")
+        shown = sum(len(rows) for rows in report["groups"].values())
+        return render(request, "yours.html", active="yours", report=report, older=older == "1",
+                      filters=filters, options=options, shown=shown)
 
     @app.get("/morpheus")
     @app.get("/morpheus/{item_id}")
