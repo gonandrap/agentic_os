@@ -1473,7 +1473,7 @@ def create_app() -> FastAPI:
             central.close()
         backlog = [i for i in every_backlog if i["status"] == "open"]
         every = families + [{**wo, "type": "work"} for wo in wos]
-        # A settled view has no pin: attention is a badge, not a position (spec 2026-11-09-filtered-views-newest-first §2)
+        # Settled view: no pin, attention is a badge (filtered-views-newest-first spec §2)
         settled = status == "past" or status in TERMINAL_STATUSES \
             or status in FO_TERMINAL_STATUSES
         needs_you = (lambda r: r["status"] in NEEDS_YOU_STATUSES
