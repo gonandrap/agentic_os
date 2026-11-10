@@ -178,6 +178,41 @@ def test_a_feature_order_rolls_up_its_planner_and_its_children(store, transcript
     assert report["totals"]["list_cost_usd"] == pytest.approx(18.75)  # 12.50 + 6.25
 
 
+def test_the_list_rolls_every_order_up_to_its_root_counting_each_dollar_once(
+        store, transcripts):
+    """io-2641fe05: one row per root of any kind; roots + no-order row = headline"""
+    io = store.create_feature_order("an improvement", "", kind="improvement")
+    analyst = store.create_work_order("Analyse: it", "", kind="analyst",
+                                      parent_id=io["id"])
+    store.update_feature_order(io["id"], plan_wo_id=analyst["id"])
+    fix = store.create_work_order("the fix it filed", "", parent_id=io["id"])
+    alone = store.create_work_order("a plain order", "")
+    for wo, tokens in ((analyst, 2_000_000), (fix, 1_000_000), (alone, 500_000)):
+        give_session(store, wo["id"], f"sess-{wo['id']}")
+        transcripts(f"sess-{wo['id']}", [assistant_row("m1", write=tokens)])
+    _os_call(io["id"])          # Neo reviewing the improvement itself
+    _os_call(fix["id"])
+    _os_call("")
+
+    report = ops.cost_report(project="proj_a")
+    rows = {u["id"]: u for u in report["units"]}
+
+    assert set(rows) == {io["id"], alone["id"]}
+    root = rows[io["id"]]
+    assert root["order_kind"] == "improvement"
+    assert {c["id"] for c in root["children"]} == {analyst["id"], fix["id"]}
+    assert root["total_cost_usd"] == pytest.approx(
+        12.5 + 6.25 + 2 * 0.625, abs=0.01)                 # both children + its own call
+    listed = (sum(u["total_cost_usd"] for u in report["units"])
+              + report["os_unattributed"]["os_cost_usd"])
+    assert round(listed, 2) == report["totals"]["total_cost_usd"]
+    assert report["totals"]["os_calls"] == 3                # each call once
+    # The bill of the root is the row's figure
+    target = ops.cost_report(target=io["id"])
+    assert target["totals"]["total_cost_usd"] == pytest.approx(root["total_cost_usd"],
+                                                               abs=0.01)
+
+
 def test_a_work_order_id_reports_only_that_work_order(store, transcripts):
     """The single-unit path, and the control for the rollup above"""
     fo = store.create_feature_order("a feature", "do the thing")
