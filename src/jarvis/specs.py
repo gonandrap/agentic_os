@@ -30,6 +30,11 @@ def feature_dir(project_path: Path, fo_id: str) -> Path:
     return project_path / ".jarvis" / "features" / fo_id
 
 
+def experiment_dir(project_path: Path, do_id: str, n: int, key: str) -> Path:
+    """Where one decision-order experiment's raw outputs live; not created here (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §2)"""
+    return feature_dir(project_path, do_id) / "experiments" / f"{n}-{key or 'adhoc'}"
+
+
 def agent_root(project_path: Path, fo_id: str) -> Path:
     """The directory handed to `--add-dir` so `--add-dir/.claude/agents/` is found"""
     return feature_dir(project_path, fo_id) / "agent"

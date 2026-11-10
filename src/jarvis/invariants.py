@@ -4710,15 +4710,17 @@ def check_red_release_hold_is_discounted(store: ProjectStore) -> Iterator[Violat
     from . import ops, release, stuck
     from .central_store import CentralStore
 
-    held = [wo for wo in store.list_work_orders(statuses=("pending",))
-            if release.is_release_order(wo)]
+    pending = store.list_work_orders(statuses=("pending",))
+    held = [wo for wo in pending if release.is_release_order(wo)]
     merging = [wo for wo in store.list_work_orders(statuses=("waiting_pr_merge",))
                if automerge_hold_note(ops.automerge_state(store, wo))
                and not rejudge_exhausted(store, wo) and not rebind_exhausted(store, wo)]
     # Issue 1674: a manager idle while its feature is live
     managers = [wo for wo in store.list_work_orders(statuses=("idle",))
                 if ops.manager_awaiting_feature(store, wo)]
-    if not held and not merging and not managers:
+    # Issue 1681: a feature child held behind its unmerged spec PR
+    spec_held = [wo for wo in pending if store.spec_hold(wo)]
+    if not held and not merging and not managers and not spec_held:
         return
     central = None
     try:
@@ -4740,10 +4742,27 @@ def check_red_release_hold_is_discounted(store: ProjectStore) -> Iterator[Violat
     if not (spec.validation.enabled and spec.validation.auto_merge) or ops._base_red_until(
             ops._stored_base_health(name), now) < now:
         merging = []
-    if not held and not merging and not managers:
+    if not held and not merging and not managers and not spec_held:
         return
     # The sweep's own reader, so this judges what the sweep does and not a copy of its rule
     rows = {row["id"]: row for row in ops.stuck_report(name, now)}
+    for wo in spec_held:
+        row = rows.get(wo["id"])
+        # A co-occurring hold ranked above it (precondition, live dependency, plan) is excluded too
+        if row is None or (row["excluded"] and not row["stuck"]
+                           and row["discounted_seconds"] > 0):
+            continue
+        yield Violation(
+            invariant=INV_RED_RELEASE_UNDISCOUNTED,
+            wo_id=wo["id"],
+            detail=(f"a feature child held in `pending` by its unmerged spec PR, judged "
+                    f"with excluded cause {row['excluded']!r} and "
+                    f"{row['discounted_seconds']:.0f}s discounted: the sweep would buy "
+                    f"an investigation for a designed wait"),
+            repaired=False,
+            context={"excluded": row["excluded"],
+                     "discounted_seconds": row["discounted_seconds"]},
+        )
     for wo in managers:
         row = rows.get(wo["id"])
         if row is None or not row["stuck"]:

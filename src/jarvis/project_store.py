@@ -224,15 +224,40 @@ def dependency_hold_spans(dep_transitions: Iterable[Iterable[Any]], created_at: 
 def manager_idle_hold_spans(feature_transitions: Sequence[Any], feature_status: str,
                             since: float, now: float) -> list[tuple[float, float]]:
     """Every interval inside `[since, now]` an idle manager's feature was not terminal (issue 1674)"""
-    rows = list(feature_transitions)
-    status = str(rows[0]["from_status"] if rows else feature_status)
+    spans = [(max(a, since), min(b, now))
+             for a, b, s in _status_segments(feature_transitions, feature_status, now)
+             if s not in FO_TERMINAL_STATUSES]
+    return [(a, b) for a, b in spans if b > a]
+
+
+def _status_segments(transitions: Sequence[Any], status: str,
+                     now: float) -> list[tuple[float, float, str]]:
+    """`(start, end, status)` for each stretch of an order's state spans, open-ended before the first"""
+    rows = list(transitions)
+    status = str(rows[0]["from_status"] if rows else status)
     segments, start = [], float("-inf")
     for r in rows:
         segments.append((start, float(r["ts"]), status))
         start, status = float(r["ts"]), str(r["to_status"])
     segments.append((start, now, status))
-    spans = [(max(a, since), min(b, now)) for a, b, s in segments
-             if s not in FO_TERMINAL_STATUSES]
+    return segments
+
+
+#: Planner events that record its spec PR's url (`ops.SPEC_PR_REPARKED_EVENT` is the third)
+SPEC_PR_EVENT_KINDS = ("finished", "pr_url_recorded", "spec_pr_reparked")
+
+
+def spec_pr_hold_spans(pr_events: Iterable[Any], planner_transitions: Sequence[Any],
+                       planner_status: str, since: float,
+                       now: float) -> list[tuple[float, float]]:
+    """`ProjectStore.spec_hold` over time, clipped to `[since, now]` (issue 1681)"""
+    opened = min((float(e["ts"]) for e in pr_events
+                  if db.from_json(e["payload"], {}).get("pr_url")), default=None)
+    if opened is None:
+        return []
+    spans = [(max(a, since, opened), min(b, now))
+             for a, b, s in _status_segments(planner_transitions, planner_status, now)
+             if s in SPEC_PR_OPEN_STATUSES]
     return [(a, b) for a, b in spans if b > a]
 
 
@@ -389,6 +414,13 @@ FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 #: Researcher-timeline events (docs/superpowers/specs/2026-10-31-decision-orders.md §1.3)
 DECISION_CLOSED_EVENT = "decision_closed_by_user"
 DECISION_DELIVERED_EVENT = "decision_delivered"
+#: Experiment events on the researcher's timeline (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §2)
+DECISION_EXPERIMENT_STARTED_EVENT = "decision_experiment_started"
+DECISION_FORECAST_EVENT = "decision_forecast_submitted"
+DECISION_EXPERIMENT_GO_EVENT = "decision_experiment_go"
+DECISION_ATTACHED_EVENT = "decision_attached"
+#: Lives in `metadata`, never `plan`: a report submission replaces `plan` whole
+EXPERIMENTS_KEY = "experiments"
 
 
 class DecisionOrderGuard(RuntimeError):
@@ -2812,6 +2844,55 @@ class ProjectStore:
         meta[SUPERSEDED_CHILDREN_KEY] = current
         self.update_feature_order(fo_id, metadata=db.to_json(meta))
         return current
+
+    def experiments_of(self, do_id: str) -> list[dict[str, Any]]:
+        """A decision order's experiments, in order (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §2)"""
+        row = self.conn.execute(
+            "SELECT metadata FROM feature_orders WHERE id=?", (do_id,)
+        ).fetchone()
+        meta = db.from_json(row["metadata"], {}) if row else {}
+        return list((meta or {}).get(EXPERIMENTS_KEY) or [])
+
+    def open_experiment(self, do_id: str) -> dict[str, Any] | None:
+        """The last experiment whose results are not yet reported"""
+        for entry in reversed(self.experiments_of(do_id)):
+            if entry.get("reported_at") is None:
+                return entry
+        return None
+
+    def _write_experiments(self, do_id: str,
+                           mutate: Callable[[list[dict[str, Any]]], Any]) -> Any:
+        with db.write_transaction(self.conn):
+            meta = db.from_json(self.get_feature_order(do_id).get("metadata"), {}) or {}
+            entries = list(meta.get(EXPERIMENTS_KEY) or [])
+            out = mutate(entries)
+            meta[EXPERIMENTS_KEY] = entries
+            self.update_feature_order(do_id, metadata=db.to_json(meta))
+            return out
+
+    def append_experiment(self, do_id: str, entry: Mapping[str, Any]) -> int:
+        """Record a new experiment and return its `n`"""
+        def add(entries: list[dict[str, Any]]) -> int:
+            n = len(entries) + 1
+            entries.append({**entry, "n": n})
+            return n
+        return self._write_experiments(do_id, add)
+
+    def _experiment(self, entries: list[dict[str, Any]], do_id: str, n: int) -> dict[str, Any]:
+        for entry in entries:
+            if entry.get("n") == n:
+                return entry
+        raise KeyError(f"{do_id} has no experiment {n}")
+
+    def update_experiment(self, do_id: str, n: int, **fields: Any) -> None:
+        self._write_experiments(
+            do_id, lambda entries: self._experiment(entries, do_id, n).update(fields))
+
+    def add_experiment_attachment(self, do_id: str, n: int, mark: Mapping[str, Any]) -> None:
+        def add(entries: list[dict[str, Any]]) -> None:
+            entry = self._experiment(entries, do_id, n)
+            entry["attachments"] = [*(entry.get("attachments") or []), dict(mark)]
+        self._write_experiments(do_id, add)
 
     def feature_order_for_question(self, question_id: int) -> dict[str, Any] | None:
         """The feature order whose plan this Neo question is reviewing, if any"""

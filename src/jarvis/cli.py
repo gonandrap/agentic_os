@@ -1447,6 +1447,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "privileged-action classifier")
     d.add_argument("--project")
 
+    d = dec.add_parser("attach", help="(researchers) copy an experiment's raw outputs onto "
+                                      "the project, with a sha256 manifest")
+    d.add_argument("do_id")
+    d.add_argument("paths", nargs="+", metavar="PATH", help="files to keep; not directories")
+    d.add_argument("--project")
+
     d = dec.add_parser("send", help="message the researcher (revives it); the order stays "
                                     "open until `jarvis do done`")
     d.add_argument("do_id")
@@ -4646,6 +4652,9 @@ def cmd_do(args: argparse.Namespace) -> int:
             doc, source = _read_submission(args.from_file, "researcher", "report")
         _print(ops.submit_decision_report(args.do_id, doc, project_name=args.project,
                                           source=source), args.json)
+
+    elif args.do_cmd == "attach":
+        _print(ops.attach_decision_outputs(args.do_id, args.paths, args.project), args.json)
 
     elif args.do_cmd == "send":
         _print(ops.send_decision_message(args.do_id, args.message, args.project,
