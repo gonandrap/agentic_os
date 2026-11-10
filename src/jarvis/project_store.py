@@ -250,7 +250,7 @@ SPEC_PR_EVENT_KINDS = ("finished", "pr_url_recorded", "spec_pr_reparked")
 def spec_pr_hold_spans(pr_events: Iterable[Any], planner_transitions: Sequence[Any],
                        planner_status: str, since: float,
                        now: float) -> list[tuple[float, float]]:
-    """Every interval inside `[since, now]` the planner had a spec PR and an open status: `ProjectStore.spec_hold`'s predicate over time (issue 1681)"""
+    """`ProjectStore.spec_hold` over time, clipped to `[since, now]` (issue 1681)"""
     opened = min((float(e["ts"]) for e in pr_events
                   if db.from_json(e["payload"], {}).get("pr_url")), default=None)
     if opened is None:

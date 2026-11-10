@@ -9643,7 +9643,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 since, now, base_red_until)
         # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of...
         plan_held, plan_spans = False, []
-        # ... AND NEITHER IS ONE HELD BY ITS FEATURE'S UNMERGED SPEC PR (issue 1681, kn-0a222b38)
+        # NOR IS ONE HELD BY ITS FEATURE'S UNMERGED SPEC PR (issue 1681, kn-0a222b38)
         spec_held, spec_spans = False, []
         if (wo["status"] == "pending" and wo.get("parent_id")
                 and wo.get("kind") == "worker"):
