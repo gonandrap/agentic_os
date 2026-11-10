@@ -61,6 +61,56 @@ def test_a_no_change_submission_waiting_on_the_user_names_the_command(fleet):
         store.close()
 
 
+FILES = [{"path": "app.py", "additions": 1, "deletions": 0}]
+CI_RUNNING = [{"name": "unit (3.11)", "status": "IN_PROGRESS", "conclusion": ""}]
+CI_GREEN = [{"name": "unit (3.11)", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+
+
+def test_a_draft_waiting_on_the_user_parks_before_ci_and_the_panel(fleet, fake_gh):
+    """#1684: wo-d614af29's draft PR sat in `validating` with its `--needs-user` dropped"""
+    seen = Validator(passed())
+    fleet.daemon.validator = seen
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "x = 1")
+    fake_gh.set_pr_artifact(PR, checks=CI_RUNNING, files=FILES, diff="+x = 1",
+                            draft=True)
+    command = "jarvis wo send wo-x 'commented'"
+    result = ops.finish(wo["id"], "probe half done", pr_url=PR,
+                        evidence="ran the probe", needs_user=command)
+    assert command in result["needs_user"] and "draft" in result["needs_user"]
+    fleet.drain()
+
+    assert seen.calls == []
+    rnd = _round(fleet, wo["id"])
+    assert rnd["outcome"] == "escalated"
+    assert command in rnd["reason"]
+    store = fleet.store()
+    try:
+        row = store.get_work_order(wo["id"])
+        assert row["status"] == "needs_review" and command in row["attention_reason"]
+        assert ops.user_action_path(store, row) == \
+            f"`{command}`: parked for you before review"
+    finally:
+        store.close()
+
+
+def test_a_ready_pull_request_waiting_on_the_user_is_judged_and_says_so(fleet, fake_gh):
+    """#1506's post-merge park stays; the finish names the command and the path"""
+    seen = Validator(passed())
+    fleet.daemon.validator = seen
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "x = 1")
+    fake_gh.set_pr_artifact(PR, checks=CI_GREEN, files=FILES, diff="+x = 1")
+    command = "jarvis config set proj_a rules.enabled true"
+    result = ops.finish(wo["id"], "flag it on after merge", pr_url=PR,
+                        evidence="ran pytest", needs_user=command)
+    assert "after it merges" in result["needs_user"] and command in result["needs_user"]
+    fleet.drain()
+
+    assert len(seen.calls) == 1
+    assert _round(fleet, wo["id"])["outcome"] == "passed"
+
+
 def test_a_knowledge_only_submission_reaches_the_panel(fleet):
     """Issue #200's live case, in one test: wo-28405ea1 retracted a fleet-wide instruction"""
     seen = Validator(passed())

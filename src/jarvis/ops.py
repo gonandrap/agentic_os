@@ -4549,6 +4549,31 @@ def declared_user_action(store: ProjectStore, wo_id: str) -> str:
     return str(db.from_json(finished[-1]["payload"], {}).get("needs_user") or "")
 
 
+def user_action_path(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """Which way a declared user step went, naming the command, else "" (#1684)"""
+    finished = store.events_of_kind(wo["id"], "finished")
+    if not finished:
+        return ""
+    payload = db.from_json(finished[-1]["payload"], {})
+    command = str(payload.get("needs_user") or "")
+    if not command:
+        return ""
+    parked = any(
+        int(e["id"]) > int(finished[-1]["id"])
+        and db.from_json(e["payload"], {}).get("cause") == ESCALATION_USER_ACTION
+        for e in store.events_of_kind(wo["id"], "validation_escalated"))
+    if parked or not wo.get("pr_url"):
+        return f"`{command}`: parked for you before review"
+    draft = payload.get("pr_draft")
+    if draft is None:
+        return (f"`{command}`: parks for you before review if the pull request is a "
+                f"draft, else after it merges")
+    return (f"`{command}`: the pull request is a draft, so it parks for you before "
+            f"review" if draft else
+            f"`{command}`: the pull request is ready, so it is reviewed first and "
+            f"parks for you after it merges")
+
+
 def park_user_action(store: ProjectStore, wo: dict[str, Any], command: str) -> str:
     """Hold an order whose result waits on a command only the user may run (GitHub issue #1506)"""
     from .invariants import user_action_owed_blocker
@@ -5836,6 +5861,16 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             raise OpsError(empty_abandon_refusal(wo_id))
         # `stranding` is the REFUSAL's reading and is deliberately empty for an order carrying a pull...
         work = stranding if stranding.base else authorship(store, _wo)
+        needs_user = needs_user.strip()
+        # A draft parks before review, a ready PR after merge (#1684); None when unreadable
+        pr_draft: bool | None = None
+        if needs_user and pr_url:
+            from . import github
+
+            try:
+                pr_draft = github.pr_view(pr_url, cwd=path).draft
+            except Exception:  # noqa: BLE001 — the daemon reads it again per round
+                pr_draft = None
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url
@@ -5846,8 +5881,8 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                         {"summary": summary,
                          **({"pr_url": pr_url} if pr_url else {}),
                          **({"evidence": evidence} if evidence else {}),
-                         **({"needs_user": needs_user.strip()}
-                            if needs_user.strip() else {}),
+                         **({"needs_user": needs_user} if needs_user else {}),
+                         **({"pr_draft": pr_draft} if pr_draft is not None else {}),
                          **({"authored": work.record()} if work.base else {})})
         if superseded_by:
             # Morpheus follows it to the order that carries a confirmed failure's fix (#1307)
@@ -5885,10 +5920,12 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # ...and the status is the JOIN's to decide, not this branch's
             status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced),
                                        panel_cleared=not submits)
+        owed = user_action_path(store, store.get_work_order(wo_id))
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
-            **({"pr_url": pr_url} if pr_url else {})}
+            **({"pr_url": pr_url} if pr_url else {}),
+            **({"needs_user": owed} if owed else {})}
 
 
 def record_pull_request(wo_id: str, url: str, project_name: str | None = None,
@@ -20012,32 +20049,29 @@ def _open_release_orders(project: str) -> list[dict[str, Any]]:
 
 def _release_scope(project: str) -> tuple[str, Path, bool, str]:
     """Name, checkout, is-it-the-OS, and the tag glob its releases use (spec §3)"""
-    from . import release, release_view
+    from . import release
 
     os_name, _ = _release_repo()
     name, repo = _release_repo(project)
     if not project or name == os_name:
         return name, repo, True, release.RELEASE_TAG_GLOB
-    own = f"{name}-*"
-    try:
-        return name, repo, False, own if release_view.tags(repo, own) else "*"
-    except (OSError, subprocess.SubprocessError) as e:
-        raise OpsError(f"cannot read the tags in {repo}: {e}") from e
+    return name, repo, False, "*"  # every stream: released is decided by ancestry, not name
 
 
 def release_overview(project: str = "") -> dict[str, Any]:
-    """Pending work since the newest tag, and every release with its validation verdict"""
+    """Pending work no tag reaches, and every release with its validation verdict (spec §3)"""
     from . import release_view
 
     project, repo, is_os, glob = _release_scope(project)
     try:
-        tags = release_view.tags(repo, glob)
         ref = release_view.main_ref(repo)
+        tags = release_view.tags(repo, glob, ref)
         newest = tags[0]["tag"] if tags else ""
-        pending = _release_rows(release_view.commits(repo, newest, ref), project, repo)
+        pending = _release_rows(release_view.commits(repo, ref, [t["tag"] for t in tags]),
+                                project, repo)
         for i, r in enumerate(pending):
             r["rides"] = len(pending) - i  # what a cut at this commit ships (Q2850)
-        contents = [release_view.release_commits(repo, t["tag"], t["previous"]) for t in tags]
+        contents = [release_view.release_commits(repo, t["tag"], t["follows"]) for t in tags]
         # One join over every release: a store opened per tag costs a page load seconds
         _release_rows([r for rows in contents for r in rows], project, repo)
         releases = []
@@ -20064,7 +20098,7 @@ def release_detail(tag: str, project: str = "") -> dict[str, Any]:
         known = {t["tag"]: t for t in release_view.tags(repo, glob)}
         if tag not in known:
             raise OpsError(f"no release {tag!r} in {repo} — /release lists them")
-        rows = release_view.release_commits(repo, tag, known[tag]["previous"])
+        rows = release_view.release_commits(repo, tag, known[tag]["follows"])
     except (OSError, subprocess.SubprocessError) as e:
         raise OpsError(f"cannot read {tag} in {repo}: {e}") from e
     return {**known[tag], "project": project, "rows": _release_rows(rows, project, repo)}
@@ -20092,8 +20126,8 @@ the pending commits on `main` up to and including the base below — the user ch
 
 {lines}
 
-Tag `{base}` as the next `{project}-X.Y.Z` (newest tag so far: {newest}) and release it the \
-way this project documents its releases. Tagging, pushing and deploying are PRIVILEGED \
+Tag `{base}` and release it the way this project documents its releases, with the tag name \
+its own scheme gives (newest tag so far: {newest}). Tagging, pushing and deploying are PRIVILEGED \
 ACTIONS and will be gated — correct and expected. Read `jarvis brief gates` and make your \
 case first (`jarvis gate request`). Do not move the base to a newer commit. If CI on {base} \
 is red, a tag already contains it, or the project documents no release process, stop and \
