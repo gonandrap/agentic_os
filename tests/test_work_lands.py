@@ -177,6 +177,30 @@ def test_abandon_completes_the_order_and_writes_down_what_was_dropped(started, p
     assert payload["branch"] == f"worktree-{wo['id']}"
 
 
+def test_abandon_with_nothing_produced_is_refused_and_names_the_exits(started, project):
+    """io-d173b6f1: a 0-commit --abandon voided the round and hid an A/B's results"""
+    wo = _order(project, "run the A/B")
+
+    with pytest.raises(ops.OpsError) as e:
+        ops.finish(wo["id"], "results in /tmp", abandon="read-only experiment")
+
+    assert "--needs-user" in str(e.value) and "--superseded-by" in str(e.value)
+    assert _events(project, wo["id"], "finished") == []
+    assert _events(project, wo["id"], "abandoned") == []
+    # The exit it names still works: a plain finish puts the result in front of the user
+    assert ops.finish(wo["id"], "results in /tmp")["status"] == "completed"
+
+
+def test_abandon_with_nothing_produced_is_allowed_when_it_names_its_carrier(started,
+                                                                           project):
+    """A duplicate names the order carrying its work, so its void stays traceable"""
+    real, dup = _order(project), _order(project)
+
+    ops.finish(dup["id"], "duplicate", abandon="duplicate", superseded_by=real["id"])
+
+    assert len(_events(project, dup["id"], "abandoned")) == 1
+
+
 def test_the_remedy_the_sweep_prints_works_on_an_order_already_completed(started,
                                                                           project,
                                                                           fake_gh):
