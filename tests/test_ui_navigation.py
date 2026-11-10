@@ -66,6 +66,10 @@ def test_the_sidebar_lists_the_registered_projects(client):  # noqa: F811
     assert 'href="/project/proj_a"' in client.get("/inbox").text
 
 
+def test_every_page_carries_the_tab_icon(client):  # noqa: F811
+    assert 'rel="icon"' in client.get("/inbox").text
+
+
 # -- §3. a hold links to what held it
 
 def test_a_hold_carries_the_key_it_was_paired_on_through_every_cut():
