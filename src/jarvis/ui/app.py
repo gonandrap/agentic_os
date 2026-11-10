@@ -1952,7 +1952,7 @@ def create_app() -> FastAPI:
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):
         every = ops.unacked_inbox()
-        # "newest" is the default (spec 2026-11-09-filtered-views-newest-first §4.1), so it is the select's empty choice
+        # "newest" is the default (newest-first spec §4.1), so it is the select's empty choice
         options = {"level": list(ops.INBOX_LEVELS), "project": filter_options(every, "project"),
                    "requestor": REQUESTOR_OPTIONS,
                    "q": [], "sort": [s for s in ops.INBOX_SORTS if s != "newest"]}
