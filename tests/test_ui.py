@@ -1017,6 +1017,30 @@ def test_backlog_page_promote_blocked_then_confirmed(client, project):
     assert central.get_backlog(b["id"])["status"] == "promoted"
 
 
+def test_backlog_lists_newest_first_pinning_blocked_only_on_an_open_view(client, project):
+    central = CentralStore()
+    base = central.add_backlog("proj_a", "zz-base")
+    blocked = central.add_backlog("proj_a", "zz-blocked", depends_on=[base["id"]])
+    fresh = central.add_backlog("proj_a", "zz-fresh")
+    early = central.add_backlog("proj_a", "zz-early", status="dropped")
+    mid = central.add_backlog("proj_a", "zz-mid", status="dropped")
+    late = central.add_backlog("proj_a", "zz-late", status="dropped")
+    for item, created, reviewed in ((base, 200, None), (blocked, 100, None), (fresh, 300, None),
+                                    (early, 10, 900), (mid, 15, None), (late, 20, None)):
+        central.conn.execute("UPDATE backlog SET created_at=?, reviewed_at=? WHERE id=?",
+                             (created, reviewed, item["id"]))
+    central.conn.commit()
+
+    def order(text, *titles):
+        return sorted(titles, key=text.index)
+
+    text = client.get("/backlog").text
+    assert order(text, "zz-base", "zz-blocked", "zz-fresh") == ["zz-blocked", "zz-fresh", "zz-base"]
+    # settled: no pin, and a review's status change outranks a later creation
+    text = client.get("/backlog?status=dropped").text
+    assert order(text, "zz-early", "zz-mid", "zz-late") == ["zz-early", "zz-late", "zz-mid"]
+
+
 def test_a_single_member_promotion_needs_no_confirm_and_a_feature_lands_on_its_page(client, project):
     central = CentralStore()
     solo = central.add_backlog("proj_a", "solo")

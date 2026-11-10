@@ -49,9 +49,11 @@ from ..bill import OWN_LABEL
 from ..central_store import KB_LINK_RELS, SETTLED_BACKLOG_STATUSES, CentralStore
 from ..daemon import daemon_running
 from ..inspection import ALARM_KINDS, PARTS
+from ..morpheus import TERMINAL_STATES as MO_TERMINAL_STATES
 from ..paths import PRODUCTION, deployment_env
 from ..project_store import (
     ACTIVE_STATUSES,
+    ALARM_SETTLED_STATUSES,
     FO_KINDS,
     FO_OPEN_STATUSES,
     FO_STATUSES,
@@ -1950,17 +1952,17 @@ def create_app() -> FastAPI:
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):
         every = ops.unacked_inbox()
-        # "priority" is the default, so it is the select's empty choice rather than an option
+        # "newest" is the default (newest-first spec §4.1), so it is the select's empty choice
         options = {"level": list(ops.INBOX_LEVELS), "project": filter_options(every, "project"),
                    "requestor": REQUESTOR_OPTIONS,
-                   "q": [], "sort": [s for s in ops.INBOX_SORTS if s != "priority"]}
+                   "q": [], "sort": [s for s in ops.INBOX_SORTS if s != "newest"]}
         filters = {k: v for k, v in query_filters(request, options).items()
                    if k != "requestor"}
         filters.update(requestor_query(request))
-        sort = filters.get("sort", "priority")
+        sort = filters.get("sort", "newest")
         items = ops.select_inbox(every, level=filters.get("level", ""),
                                  project=filters.get("project", ""), q=filters.get("q", ""),
-                                 sort=sort if sort in ops.INBOX_SORTS else "priority")
+                                 sort=sort if sort in ops.INBOX_SORTS else "newest")
         if "requestor" in filters:
             items = requestor_rows(ops.inbox_with_requestor(items), filters)
         # A sort is not a filter: only the other four narrow what "Ack shown" acks
@@ -1987,7 +1989,10 @@ def create_app() -> FastAPI:
         # No status filter: settled rows stay out (2026-11-03-backlog-operability §6.1)
         if "status" not in filters:
             rows = [r for r in rows if r["status"] not in SETTLED_BACKLOG_STATUSES]
-        rows = attention_first(rows, lambda i: bool(i["blockers"]))
+        settled = filters.get("status") in SETTLED_BACKLOG_STATUSES
+        # reviewed_at is stamped with the review's status change (Neo Q4132)
+        rows = newest_first(rows, lambda i: i["reviewed_at"] or i["created_at"],
+                            pins=() if settled else (lambda i: bool(i["blockers"]),))
         escalated, deciding = ops.split_quarantined(rows)
         return render(request, "backlog.html", active="backlog", rows=rows,
                       attention=[i for i in rows if i["blockers"]],
@@ -2022,6 +2027,9 @@ def create_app() -> FastAPI:
         options["project"] = filter_options(every, "scope")
         rows = filter_rows(every, {"scope": filters.get("project", ""),
                                    "pin": filters.get("pinned", "")})
+        # A word search keeps its relevance rank (Neo Q4132, spec §4.1)
+        if not filters.get("q"):
+            rows = newest_first(rows, lambda r: r["ts"], pins=(lambda r: r["pinned"],))
         return render(request, "knowledge.html", active="knowledge", rows=rows,
                       topics=base["topics"], filters=filters, options=options,
                       total=len(every), usage=ops.knowledge_usage_report(limit=8))
@@ -2164,7 +2172,9 @@ def create_app() -> FastAPI:
         filters = query_filters(request, options)
         return render(request, "neo.html", active="neo",
                       in_flight=in_flight, escalated=escalated,
-                      unreviewed=unreviewed, history=filter_rows(history, filters),
+                      unreviewed=unreviewed,
+                      history=newest_first(filter_rows(history, filters),
+                                           lambda q: q["answered_at"] or q["ts"]),
                       history_total=len(history), filters=filters, options=options,
                       learnings=learnings,
                       opinions=opinions, digest_credit=_digest_credit())
@@ -2213,14 +2223,15 @@ def create_app() -> FastAPI:
         for g in every:
             g["state"] = (("escalated" if g["escalated"] else "with neo")
                           if g["status"] == "pending" else gate_display(g))
-        # pending, then held for a case, then everything settled; newest first inside each
-        rank = {"escalated": 0, "with neo": 1, "awaiting_case": 2}
-        every.sort(key=lambda g: rank.get(g["state"], 3))
         options = {"state": filter_options(every, "state"),
                    "project": filter_options(every, "project"),
                    "kind": filter_options(every, "kind")}
         filters = query_filters(request, options)
-        rows = filter_rows(every, filters)
+        waiting = ("escalated", "with neo", "awaiting_case")
+        # pending, then held for a case, then everything settled; newest first inside each
+        pins = tuple((lambda g, s=s: g["state"] == s) for s in waiting)
+        rows = newest_first(filter_rows(every, filters), lambda g: g["ts"],
+                            pins=() if filters.get("state", "") not in ("", *waiting) else pins)
         return render(request, "gates.html", active="gates", rows=rows,
                       attention=[g for g in rows if g["state"] == "escalated"],
                       filters=filters, options=options, total=len(every),
@@ -2308,9 +2319,11 @@ def create_app() -> FastAPI:
                    "kind": filter_options(every, "kind"),
                    "project": filter_options(every, "project")}
         filters = query_filters(request, options)
+        settled = filters.get("state") in (*ALARM_SETTLED_STATUSES, "reviewed")
         # Gates' order: what a person must decide first, newest first inside each group
-        history = attention_first(filter_rows(every, filters),
-                                  lambda r: r["state"] == "escalated")
+        history = newest_first(filter_rows(every, filters),
+                               lambda r: r.get("decided_at") or r["ts"],
+                               pins=() if settled else (lambda r: r["state"] == "escalated",))
         queue = filter_rows(ops.alarm_review_queue(),
                             {k: filters.get(k, "") for k in ("kind", "project")})
         return render(request, "alarms.html", active="alarms",
@@ -2326,7 +2339,9 @@ def create_app() -> FastAPI:
         options = {"project": filter_options(every, "project"), "kind": ["wo", "fo", "io"],
                    "status": filter_options(every, "status")}
         filters = query_filters(request, options)
-        rows = attention_first(filter_rows(every, filters), lambda r: r["stuck"])
+        # Every row here is an open order, so the view is always open
+        rows = newest_first(filter_rows(every, filters), lambda r: r["status_since"],
+                            pins=(lambda r: r["stuck"],))
         unjudged = ops.stuck_unjudged(filters.get("project") or None)
         return render(request, "stuck.html", active="stuck", rows=rows, unjudged=unjudged,
                       attention=[r for r in rows if r["stuck"]], filters=filters,
@@ -2360,10 +2375,10 @@ def create_app() -> FastAPI:
         options = {"state": list(report["counts"]), "project": filter_options(every, "project")}
         filters = query_filters(request, options)
 
-        newest = sorted(filter_rows(every, filters),
-                        key=lambda i: i.get("updated_ts") or 0, reverse=True)
-        failures_first = attention_first(newest, lambda i: i["state"] in ("failed", "timedout"))
-        rows = attention_first(failures_first, lambda i: i["owed_by"] == "user")
+        pins = (lambda i: i["owed_by"] == "user",
+                lambda i: i["state"] in ("failed", "timedout"))
+        rows = newest_first(filter_rows(every, filters), lambda i: i.get("updated_ts"),
+                            pins=() if filters.get("state") in MO_TERMINAL_STATES else pins)
         handling = [i for i in rows if i["owed_by"] not in ("", "user")]
         return render(request, "morpheus.html", active="morpheus", report=report, rows=rows,
                       attention=[i for i in rows if i["owed_by"] == "user"], handling=handling,
@@ -2450,11 +2465,16 @@ def create_app() -> FastAPI:
                    "status": ["failed", "pending", "unverified", "validated", "unwatched"],
                    "origin": filter_options(pending, "origin"), "q": []}
         filters = query_filters(request, options)
-        shown_pending = filter_rows(pending, {k: v for k, v in filters.items()
-                                              if k in ("origin", "q")},
-                                    text_keys=("subject", "wo_id", "sha"))
-        shown_releases = filter_rows(releases, {k: v for k, v in filters.items()
-                                                if k in ("status", "q")}, text_keys=("tag",))
+        shown_pending = newest_first(filter_rows(pending, {k: v for k, v in filters.items()
+                                                           if k in ("origin", "q")},
+                                                 text_keys=("subject", "wo_id", "sha")),
+                                     lambda r: r["ts"])
+        # Only `pending` is still open (spec 2026-11-09-filtered-views-newest-first §2)
+        settled = filters.get("status", "pending") != "pending"
+        shown_releases = newest_first(
+            filter_rows(releases, {k: v for k, v in filters.items() if k in ("status", "q")},
+                        text_keys=("tag",)),
+            lambda r: r["ts"], pins=() if settled else (lambda r: r["status"] == "failed",))
         return render(request, "release.html", active="release", report=report,
                       pending=shown_pending, releases=shown_releases,
                       attention=[r for r in shown_releases if r["status"] == "failed"],
@@ -2484,8 +2504,10 @@ def create_app() -> FastAPI:
         options = {"validation": ["failed", "pending", "unverified", "validated", "unwatched"],
                    "origin": filter_options(every, "origin"), "q": []}
         filters = query_filters(request, options)
-        rows = attention_first(filter_rows(every, filters, text_keys=("subject", "wo_id", "sha")),
-                               lambda r: r["validation"] == "failed")
+        settled = filters.get("validation", "pending") != "pending"
+        rows = newest_first(filter_rows(every, filters, text_keys=("subject", "wo_id", "sha")),
+                            lambda r: r["ts"],
+                            pins=() if settled else (lambda r: r["validation"] == "failed",))
         return render(request, "release_item.html", active="release", d=d, rows=rows,
                       project=(request.query_params.get("project") or "").strip(),
                       attention=[r for r in rows if r["validation"] == "failed"],
@@ -2504,7 +2526,9 @@ def create_app() -> FastAPI:
                    "tab": ["asks", "waiting", "settled"]}
         filters = query_filters(request, options)
         shown = filter_rows(every, filters)
-        tabs = {t: [i for i in shown if i["tab"] == t] for t in options["tab"]}
+        # queue_ts is when the row entered its queue_state (Neo Q4132)
+        tabs = {t: newest_first([i for i in shown if i["tab"] == t],
+                                lambda i: i["queue_ts"] or i["ts"]) for t in options["tab"]}
         return render(request, "steward.html", active="steward", report=report,
                       tabs=tabs, attention=tabs["asks"], filters=filters,
                       options=options, shown=len(shown), total=len(every),
@@ -2541,8 +2565,8 @@ def create_app() -> FastAPI:
             filters["project"] = project
         if days != 90:
             filters["days"] = str(days)
-        shown = attention_first(filter_rows(every, {"firing": filters.get("firing", "")}),
-                                lambda r: not r["readable"])
+        shown = newest_first(filter_rows(every, {"firing": filters.get("firing", "")}),
+                             lambda r: r["last_fired"], pins=(lambda r: not r["readable"],))
         return render(request, "evolution.html", active="evolution", report=report,
                       rows=[r for r in shown if r["firing"] == "firing"],
                       quiet=[r for r in shown if r["firing"] == "quiet"],

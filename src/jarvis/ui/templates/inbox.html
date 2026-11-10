@@ -34,7 +34,7 @@
 <div class="sub">{{ inbox_list_note }}</div>
 
 {{ ui.filter_bar("/inbox", filters, options, items | length, total,
-                 labels={"sort": "priority first", "requestor": "any", "q": "search title, body or wo id"}) }}
+                 labels={"sort": "newest first", "requestor": "any", "q": "search title, body or wo id"}) }}
 
 {% call(it) ui.needs_you(critical, "critical — needs you") %}{{ item_row(it) }}{% endcall %}
 
