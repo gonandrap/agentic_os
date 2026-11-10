@@ -143,8 +143,7 @@
     {{ fmt_tok(totals.rewrite_excess) }} tokens re-sent across
     {{ totals.resume_boundaries }} turn boundar{{ 'ies' if totals.resume_boundaries != 1 else 'y' }}.
     Every worker turn after the first re-sends the whole conversation at the cache-write
-    rate. The cause is upstream and Jarvis cannot fix it — what it can do is cost fewer
-    boundaries, which is why batching feedback into one message is cheaper than three.
+    rate. {{ totals.rewrite_note }}
   </p>
   {% endif %}
   {% if totals.subagent_cost_usd %}
@@ -210,7 +209,7 @@
           {{ u.turns }} turn{{ 's' if u.turns != 1 }} ·
           {{ fmt_tok(u.billed_input) }} in / {{ fmt_tok(u.output) }} out ·
           peak context {{ fmt_tok(u.context_peak) }}
-          {%- if u.rewrite_excess %} · re-write {{ fmt_tok(u.rewrite_excess) }}{% endif %}
+          {%- if u.rewrite_excess %} · re-write ${{ '%.2f'|format(u.rewrite_cost_usd) }} ({{ fmt_tok(u.rewrite_excess) }} tokens){% endif %}
           {%- if u.subagent_count %} · {{ u.subagent_count }} subagent{{ 's' if u.subagent_count != 1 }}{% endif %}
         {%- else %}
           no transcript left to measure
@@ -232,6 +231,17 @@
         · <a href="/cost/{{ u.project }}/{{ u.id }}"
           >bill{% if u.recorded_turns %} ({{ u.recorded_turns }} turns recorded){% endif %} →</a>
       </div>
+      {# A root order of any kind: its members on demand, already inside the cost above (io-2641fe05) #}
+      {% if u.children %}
+      <details class="children sub mono">
+        <summary>{{ u.order_kind }} · {{ u.children|length }} order{{ 's' if u.children|length != 1 }} inside</summary>
+        {% for c in u.children %}
+        <div>{{ ui.row_id(c.id, order_path(c.project, c.id)) }}
+          {% if c.found or c.total_cost_usd %}${{ '%.2f'|format(c.total_cost_usd) }}{% else %}—{% endif %}
+          · {{ c.title }}</div>
+        {% endfor %}
+      </details>
+      {% endif %}
     </td>
     {% set m = status_meta.get(u.status, {'word': u.status, 'icon': '•', 'tone': 'muted'}) %}
     <td class="when"><span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span></td>

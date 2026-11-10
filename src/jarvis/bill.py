@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import db, usage as usage_mod
-from .project_store import COMPACT_TURN, WORKER_CHILDREN
+from .project_store import COMPACT_TURN
 
 #: How many `agent_calls` rows one order's bill will read
 CALL_LIMIT = 20_000
@@ -931,14 +931,7 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
 
     store = ProjectStore(path)
     try:
-        children: list[dict[str, Any]] = []
-        planner_id = fo.get("plan_wo_id")
-        if planner_id:
-            try:
-                children.append(store.get_work_order(planner_id))
-            except KeyError:
-                pass
-        children.extend(store.feature_children(fo["id"], kinds=WORKER_CHILDREN))
+        children = store.family_members(fo)
     finally:
         store.close()
     # ONE pass over Claude Code's transcript tree for the whole feature
