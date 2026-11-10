@@ -178,6 +178,41 @@ def test_a_feature_order_rolls_up_its_planner_and_its_children(store, transcript
     assert report["totals"]["list_cost_usd"] == pytest.approx(18.75)  # 12.50 + 6.25
 
 
+def test_the_list_rolls_every_order_up_to_its_root_counting_each_dollar_once(
+        store, transcripts):
+    """io-2641fe05: one row per root of any kind; roots + no-order row = headline"""
+    io = store.create_feature_order("an improvement", "", kind="improvement")
+    analyst = store.create_work_order("Analyse: it", "", kind="analyst",
+                                      parent_id=io["id"])
+    store.update_feature_order(io["id"], plan_wo_id=analyst["id"])
+    fix = store.create_work_order("the fix it filed", "", parent_id=io["id"])
+    alone = store.create_work_order("a plain order", "")
+    for wo, tokens in ((analyst, 2_000_000), (fix, 1_000_000), (alone, 500_000)):
+        give_session(store, wo["id"], f"sess-{wo['id']}")
+        transcripts(f"sess-{wo['id']}", [assistant_row("m1", write=tokens)])
+    _os_call(io["id"])          # Neo reviewing the improvement itself
+    _os_call(fix["id"])
+    _os_call("")
+
+    report = ops.cost_report(project="proj_a")
+    rows = {u["id"]: u for u in report["units"]}
+
+    assert set(rows) == {io["id"], alone["id"]}
+    root = rows[io["id"]]
+    assert root["order_kind"] == "improvement"
+    assert {c["id"] for c in root["children"]} == {analyst["id"], fix["id"]}
+    assert root["total_cost_usd"] == pytest.approx(
+        12.5 + 6.25 + 2 * 0.625, abs=0.01)                 # both children + its own call
+    listed = (sum(u["total_cost_usd"] for u in report["units"])
+              + report["os_unattributed"]["os_cost_usd"])
+    assert round(listed, 2) == report["totals"]["total_cost_usd"]
+    assert report["totals"]["os_calls"] == 3                # each call once
+    # The bill of the root is the row's figure
+    target = ops.cost_report(target=io["id"])
+    assert target["totals"]["total_cost_usd"] == pytest.approx(root["total_cost_usd"],
+                                                               abs=0.01)
+
+
 def test_a_work_order_id_reports_only_that_work_order(store, transcripts):
     """The single-unit path, and the control for the rollup above"""
     fo = store.create_feature_order("a feature", "do the thing")
@@ -802,6 +837,65 @@ def test_window_filters_os_calls_and_transcripts(store, transcripts):
     assert rows[inside["id"]]["cache_write"] == 100_000
     assert rows[inside["id"]]["os_calls"] == 1
     assert rows[asked["id"]]["os_calls"] == 1
+
+
+def test_a_window_rolls_up_in_window_members_and_root_own_calls_once(store, transcripts):
+    """io-2641fe05: a root's own call reaches it in a window; idle members stay out"""
+    picked = ops.cost_window(since=SINCE, until=UNTIL)
+    busy = store.create_feature_order("a busy feature", "")
+    member = store.create_work_order("ran in the window", "", parent_id=busy["id"])
+    give_session(store, member["id"], "sess-member")
+    turn_at(store, member["id"], INSIDE)
+    transcripts("sess-member", [assistant_row("m1", write=100_000, at=INSIDE)])
+    idle = store.create_work_order("ran after it", "", parent_id=busy["id"])
+    turn_at(store, idle["id"], UNTIL + 7_200)
+    quiet = store.create_feature_order("only reviewed", "", kind="improvement")
+    asleep = store.create_work_order("its analyst, later", "", parent_id=quiet["id"])
+    turn_at(store, asleep["id"], UNTIL + 7_200)
+    for order in (busy, quiet, member, ""):
+        os_call_at(order["id"] if order else "", INSIDE)
+    os_call_at(quiet["id"], UNTIL + 10)            # outside: not counted
+
+    res = ops.cost_report(project="proj_a", window=picked)
+    rows = {u["id"]: u for u in res["units"]}
+
+    assert set(rows) == {busy["id"], quiet["id"]}
+    assert [c["id"] for c in rows[busy["id"]]["children"]] == [member["id"]]
+    assert rows[busy["id"]]["os_calls"] == 2       # its own + its member's
+    assert rows[quiet["id"]]["children"] == []
+    assert rows[quiet["id"]]["os_cost_usd"] > 0
+    listed = sum(u["total_cost_usd"] for u in res["units"])
+    # Within a cent: `_rollup` rounds the worker and OS halves each to cents
+    assert listed + res["os_unattributed"]["os_cost_usd"] == pytest.approx(
+        res["totals"]["total_cost_usd"], abs=0.01)
+    assert res["totals"]["os_calls"] == 4
+    assert res["os_unattributed"]["os_calls"] == 1
+
+
+@pytest.mark.parametrize("windowed", [True, False])
+def test_a_monitoring_orders_calls_are_its_own_root_row(store, windowed):
+    """Morpheus keys its calls by the mo id: one 'monitoring' row, never also unattributed"""
+    from jarvis import morpheus
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        mo = morpheus.create(central, project="proj_a", title="watch it", prompt="look")
+    finally:
+        central.close()
+    os_call_at(mo["id"], INSIDE)
+
+    res = ops.cost_report(project="proj_a",
+                          window=ops.cost_window(since=SINCE, until=UNTIL)
+                          if windowed else None)
+    (row,) = [u for u in res["units"] if u["id"] == mo["id"]]
+
+    assert row["order_kind"] == "monitoring"
+    assert row["os_calls"] == 1
+    assert res["totals"]["os_calls"] == 1
+    assert not res["os_unattributed"]["os_calls"]
+    assert round(sum(u["total_cost_usd"] for u in res["units"]), 2) == \
+        res["totals"]["total_cost_usd"]
 
 
 def test_undated_transcript_message_is_excluded_and_counted(store, transcripts):

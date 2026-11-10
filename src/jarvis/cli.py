@@ -3402,7 +3402,10 @@ def cmd_cost(args: argparse.Namespace) -> int:
     print(f"{'$':>7} {'jarvis':>7} {'subproc':>8} {'subagent':>9} {'turns':>5} "
           f"{'output':>7} {'re-write':>9}  work order")
     for u in units[:args.limit]:
-        os_cost = f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
+        if u.get("children"):
+            # A root order: its members are inside its row (io-2641fe05)
+            u = {**u, "title": f"[{u['order_kind']} +{len(u['children'])}] {u['title']}"}
+        os_cost =f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
         sub_cost = f"{u['subproc_cost_usd']:.2f}" if u.get("subproc_calls") else "—"
         agent_cost = (f"{u['subagent_cost_usd']:.2f}"
                       if u.get("subagent_count") else "—")

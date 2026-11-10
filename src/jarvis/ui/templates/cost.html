@@ -225,6 +225,17 @@
         · <a href="/cost/{{ u.project }}/{{ u.id }}"
           >bill{% if u.recorded_turns %} ({{ u.recorded_turns }} turns recorded){% endif %} →</a>
       </div>
+      {# A root order of any kind: its members on demand, already inside the cost above (io-2641fe05) #}
+      {% if u.children %}
+      <details class="children sub mono">
+        <summary>{{ u.order_kind }} · {{ u.children|length }} order{{ 's' if u.children|length != 1 }} inside</summary>
+        {% for c in u.children %}
+        <div>{{ ui.row_id(c.id, order_path(c.project, c.id)) }}
+          {% if c.found or c.total_cost_usd %}${{ '%.2f'|format(c.total_cost_usd) }}{% else %}—{% endif %}
+          · {{ c.title }}</div>
+        {% endfor %}
+      </details>
+      {% endif %}
     </td>
     {% set m = status_meta.get(u.status, {'word': u.status, 'icon': '•', 'tone': 'muted'}) %}
     <td class="when"><span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span></td>
