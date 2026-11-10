@@ -1845,7 +1845,7 @@ def create_app() -> FastAPI:
     @app.get("/cost", response_class=HTMLResponse)
     def cost_page(request: Request, project: str = "", window: str = "",
                   offset: str = "", since: str = "", until: str = "",
-                  tz: str = "", page: int = 0):
+                  tz: str = "", page: str = ""):
         """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost` (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
         try:
             # The zone FIRST: the custom form's naive datetimes are parsed in the same zone they are rendered in
@@ -1877,7 +1877,8 @@ def create_app() -> FastAPI:
             return render(request, "error.html", message=str(e))
         report, fleet, meter = entry["report"], entry["fleet"], entry["meter"]
         cached_at = entry["computed_at"]
-        # Sliced from the cached entry, never recomputed: `page` is not a window bound (spec 2026-11-09-cost-overview-first §4)
+        # Sliced from the cached entry: `page` is no window bound (cost-overview-first spec §4)
+        page = query_int(page, 0)
         units = report["units"]
         pages = max(1, -(-len(units) // COST_PAGE_SIZE))
         shown = min(max(page, 1), pages)
