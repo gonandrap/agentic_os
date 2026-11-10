@@ -116,6 +116,25 @@ def test_the_researcher_prompt_is_its_own_branch_and_not_the_worker_contract(
     assert "WHICH OPTION TO TAKE is the user's question" in researcher
 
 
+def test_the_researcher_proposes_runs_as_experiments(store, project_spec, monkeypatch):
+    """docs/superpowers/specs/2026-11-10-decision-order-experiments.md §3"""
+    from jarvis import neo
+
+    researcher = _prompt(store, "researcher", project_spec)
+    assert 'proposed as `"as": "experiment"`, never `"wo"`' in researcher
+    assert "wo|fo|backlog|experiment" in decision_report.SCHEMA_TEXT
+    assert "experiment" in decision_report.ORDER_TYPES
+    assert "Whether to run an experiment, or how big to make it, is the user's call" \
+        in neo.RESEARCHER_RULE
+    # A regular worker prompt reads none of the researcher's text (decision-orders §1.2.1)
+    wo = store.create_work_order("compare caches", description="the ask", kind="worker")
+    before = dispatch.build_worker_prompt(wo, project_spec)
+    monkeypatch.setattr(decision_report, "SCHEMA_TEXT", "")
+    monkeypatch.setattr(neo, "RESEARCHER_RULE", "")
+    assert dispatch.build_worker_prompt(wo, project_spec) == before
+    assert "experiment" not in before
+
+
 def test_the_researcher_is_read_only_and_described_to_the_supervisor():
     assert "researcher" in dispatch.READ_ONLY_KINDS
     said = supervisor._what_it_is({"kind": "researcher", "parent_id": "do-1234abcd"})
