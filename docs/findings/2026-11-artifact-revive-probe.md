@@ -70,6 +70,20 @@ What the user saw on each comment sent to Claude, with no live session (user's w
 `Comment posted, but a conversation with Claude couldn't start here.Open in Claude`.
 Two threads were made, both sent to Claude.
 
+Why (inferred, not measured): Send to Claude hands the comment to a live session whose
+watch on the artifact says `auto-replies armed`. The only such session (`1ff52f19`,
+watch `connected, armed by a publish, auto-replies armed` at 14:46:22Z) had been
+removed at 14:46:45Z, so none existed at 15:12. The comment still posted and the thread
+was still activated: the revive replied and resolved it. The counterfactual (a comment
+while a session holds the watch) was deliberately not run, to keep Q2 clean.
+
+Consequence: under remove-then-revive, every Send to Claude shows this message, because
+no session holds a watch between orders. **User requirement (2026-11-10): the message is
+misleading and must be avoided.** Measured paths do not avoid it: a live watching session
+is ruled out by the spike's own rules and costs a resident process; a plain comment (no
+Send to Claude) is not activated, and the tool refuses reply and resolve on such a
+thread. What "Open in Claude" does was not measured.
+
 ## Timeline (UTC, in required order)
 
 | Step | Time | Source |
