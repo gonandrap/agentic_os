@@ -8,7 +8,7 @@ from typing import Any
 
 from . import morpheus, release
 
-#: (repo, previous tag, tag) to its commits; tags never move, so this never goes stale
+#: (repo, tag, the tags it follows) to its commits; tags never move, so this never goes stale
 _RANGE_CACHE: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
 
 
@@ -28,24 +28,60 @@ def main_ref(repo: Path) -> str:
     return "HEAD"
 
 
-def tags(repo: Path, glob: str = release.RELEASE_TAG_GLOB) -> list[dict[str, Any]]:
-    """Every tag matching `glob`, newest version first, each with its previous one"""
+def _is_ancestor(repo: Path, a: str, b: str) -> bool:
+    return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", a, b],
+                          capture_output=True, timeout=60).returncode == 0
+
+
+def tags(repo: Path, glob: str = release.RELEASE_TAG_GLOB, main: str = "") -> list[dict[str, Any]]:
+    """Every tag matching `glob`, newest anchor on main first; `follows` = the tags it ships after (spec §3)"""
     out = _git(repo, "for-each-ref", "--sort=version:refname",
-               "--format=%(refname:short)%1f%(creatordate:unix)", f"refs/tags/{glob}")
-    rows, previous = [], ""
+               "--format=%(refname:short)%1f%(creatordate:unix)%1f%(*objectname)%1f%(objectname)",
+               f"refs/tags/{glob}")
+    rows = []
     for line in out.splitlines():
-        name, _, ts = line.partition("\x1f")
-        if not name:
-            continue
-        rows.append({"tag": name, "ts": float(ts or 0), "previous": previous})
-        previous = name
-    return rows[::-1]
+        name, ts, peeled, sha = (line.split("\x1f") + ["", "", ""])[:4]
+        if name:
+            rows.append({"tag": name, "ts": float(ts or 0), "sha": peeled or sha})
+    rows.reverse()  # newest version first: the tie-break among tags on one anchor
+    for i, r in enumerate(rows):
+        r["rank"] = i
+    if not rows:
+        return rows
+    main = main or main_ref(repo)
+    spine = {sha: i for i, sha in enumerate(
+        _git(repo, "rev-list", "--first-parent", main).split())}
+    side: dict[str, str] = {}  # release-branch commit to its first parent
+    for line in _git(repo, "log", "--first-parent", "--format=%H %P",
+                     *{r["sha"] for r in rows}, "--not", main).splitlines():
+        sha, *parents = line.split()
+        side[sha] = parents[0] if parents else ""
+    for r in rows:  # the main commit a tag was cut from: itself on main, else where its branch left
+        c = r["sha"]
+        while c in side:
+            c = side[c]
+        r["pos"] = spine.get(c)
+    off = len(spine) + 1
+    rows.sort(key=lambda r: off if r["pos"] is None else r["pos"])
+    for r in rows:
+        r["follows"] = [o["tag"] for o in rows if o is not r and _precedes(repo, o, r)]
+        r["previous"] = r["follows"][0] if r["follows"] else ""
+    for r in rows:
+        del r["pos"], r["sha"], r["rank"]
+    return rows
 
 
-def commits(repo: Path, from_ref: str, to_ref: str) -> list[dict[str, Any]]:
-    """First-parent commits of `from..to`, newest first, release bump commits dropped"""
-    span = f"{from_ref}..{to_ref}" if from_ref else to_ref
-    out = _git(repo, "log", "--first-parent", "--format=%H%x1f%ct%x1f%s", span)
+def _precedes(repo: Path, a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """`a` was released before `b`: an older anchor on main; one anchor, the older version; off main, ancestry"""
+    if a["pos"] is not None and b["pos"] is not None:
+        return a["pos"] > b["pos"] if a["pos"] != b["pos"] else a["rank"] > b["rank"]
+    return a["sha"] != b["sha"] and _is_ancestor(repo, a["sha"], b["sha"])
+
+
+def commits(repo: Path, to_ref: str, exclude: list[str]) -> list[dict[str, Any]]:
+    """First-parent commits of `to_ref` not reachable from `exclude`, newest first, release bump commits dropped"""
+    args = [to_ref, "--not", *exclude] if exclude else [to_ref]
+    out = _git(repo, "log", "--first-parent", "--format=%H%x1f%ct%x1f%s", *args)
     rows = []
     for line in out.splitlines():
         sha, ts, subject = (line.split("\x1f", 2) + ["", ""])[:3]
@@ -58,10 +94,10 @@ def commits(repo: Path, from_ref: str, to_ref: str) -> list[dict[str, Any]]:
     return rows
 
 
-def release_commits(repo: Path, tag: str, previous: str) -> list[dict[str, Any]]:
-    key = (str(repo), previous, tag)
+def release_commits(repo: Path, tag: str, follows: list[str]) -> list[dict[str, Any]]:
+    key = (str(repo), tag, tuple(follows))
     if key not in _RANGE_CACHE:
-        _RANGE_CACHE[key] = commits(repo, previous, tag)
+        _RANGE_CACHE[key] = commits(repo, tag, follows)
     return [dict(r) for r in _RANGE_CACHE[key]]
 
 
