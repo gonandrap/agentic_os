@@ -1170,6 +1170,12 @@ def _researcher_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- Lay out the options and recommend one, with why. Never act on any option.",
         "- `proposed_orders` are PROPOSALS the user may file. You file nothing — no "
         "`jarvis wo create`, `jarvis fo create` or `jarvis backlog propose`.",
+        "- A follow-up that must RUN something to produce data for this decision (an A/B, "
+        "a replay, a benchmark, a batch over fixtures) is proposed as `\"as\": "
+        "\"experiment\"`, never `\"wo\"`. Its `description` states what to run, on which "
+        "inputs, how many runs, and what numbers come back. An experiment is a phase of "
+        "this same decision order: it reports back here, and the user starts it. A `wo` "
+        "is for work that changes code or produces a document.",
         "- If the user asks for more, their message arrives as a new turn: revise and "
         "submit the report again with the same command.",
         "",

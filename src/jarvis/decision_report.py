@@ -30,8 +30,8 @@ SCHEMA_TEXT = """{
   "findings": [{"key": "f1", "title": "...", "detail": "...", "evidence": ["..."]}],
   "options": [{"key": "a", "title": "...", "pros": ["..."], "cons": ["..."], "cost": "..."}],
   "recommendation": {"option": "a", "why": "..."},
-  "proposed_orders": [{"key": "p1", "as": "wo|fo|backlog", "project": "", "title": "...",
-                       "description": "..."}]
+  "proposed_orders": [{"key": "p1", "as": "wo|fo|backlog|experiment (experiment: RUN something for this decision; reports back here, the user starts it)",
+                       "project": "", "title": "...", "description": "..."}]
 }"""
 
 #: The researcher's `forecast.json`; `experiment_forecast` parses exactly this (docs/superpowers/specs/2026-11-10-decision-order-experiments.md §5)
