@@ -6841,6 +6841,8 @@ def ack_attention(wo_id: str | None = None, all_projects: bool = False,
                                     "reason": ack_decision_blocker(blockers) or ""})
                     continue
                 store.ack_attention(wo["id"], blockers)
+                # An ack is a look at the ask (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §6.1)
+                store.mark_request_seen(wo["id"])
                 acknowledged.append(wo["id"])
         finally:
             store.close()
@@ -13117,6 +13119,135 @@ def request_tree(project: str, root_id: str) -> RequestTree:
     tree = RequestTree(root, False)
     tree.settled = all(n.terminal for n in tree.nodes())
     return tree
+
+
+# One per root, first match wins (docs/superpowers/specs/2026-11-09-yours-requestor-stamp-and-tree-notice.md §6.2)
+REQUEST_STATES = ("needs_you", "running", "done_unseen", "done")
+# A done ask older than this sits behind "show older" on /yours (§6.3)
+YOURS_RECENT_DAYS = 14
+
+
+class _Stores:
+    """One connection per project for a whole page, closed together"""
+
+    def __init__(self) -> None:
+        self.paths = registered_project_paths(include_archived=True)
+        self.open: dict[str, ProjectStore] = {}
+
+    def __call__(self, name: str) -> ProjectStore | None:
+        if name not in self.open and name in self.paths:
+            self.open[name] = ProjectStore(self.paths[name])
+        return self.open.get(name)
+
+    def close(self) -> None:
+        for s in self.open.values():
+            s.close()
+
+
+def _tree_wo(stores: _Stores, node: RequestNode) -> tuple[ProjectStore, dict[str, Any]] | None:
+    """The work-order row behind a node; feature-table rows hold no assumptions, finishes or sessions"""
+    store = stores(node.project)
+    if store is None:
+        return None
+    try:
+        return store, store.get_work_order(node.id)
+    except KeyError:
+        return None
+
+
+def _request_state(tree: RequestTree, stores: _Stores) -> str:
+    for node in tree.nodes():
+        if node.needs_attention:
+            return "needs_you"
+        found = _tree_wo(stores, node)
+        if found is None:
+            continue
+        store, wo = found
+        if invariants.reviewable_assumptions(store, wo):
+            return "needs_you"
+        # A finished order's old declaration was the user's to run and is history now
+        if not node.terminal and declared_user_action(store, node.id):
+            return "needs_you"
+    if not tree.settled:
+        return "running"
+    store = stores(tree.root.project)
+    found = _request_row(store, tree.root.id) if store is not None else None
+    seen_at = found[0].get("requestor_seen_at") if found else None
+    settled_at = store.request_settled_at(tree.root.id) if store is not None else None
+    if seen_at is None or (settled_at is not None and seen_at < settled_at):
+        return "done_unseen"
+    return "done"
+
+
+def request_state(project: str, root_id: str) -> str:
+    """`needs_you` | `running` | `done_unseen` | `done` (§6.2)"""
+    tree = request_tree(project, root_id)
+    stores = _Stores()
+    try:
+        return _request_state(tree, stores)
+    finally:
+        stores.close()
+
+
+def mark_request_seen(project: str, root_id: str) -> None:
+    """The user looked at their ask: `done_unseen` becomes `done` (§6.1)"""
+    path = registered_project_paths(include_archived=True).get(project)
+    if path is None:
+        raise OpsError(f"project {project!r} not registered")
+    store = ProjectStore(path)
+    try:
+        store.mark_request_seen(root_id)
+    finally:
+        store.close()
+
+
+def yours_report(project: str | None = None, older: bool = False) -> dict[str, Any]:
+    """Every ask the user made, one row per root, grouped by state (§6.3)"""
+    from . import usage as usage_mod
+
+    roots: list[tuple[str, dict[str, Any]]] = []
+    for name, path in sorted(registered_project_paths().items()):
+        if (project and name != project) or not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            roots += [(name, r) for r in store.user_roots(include_settled=True)]
+        finally:
+            store.close()
+    cutoff = db.now() - YOURS_RECENT_DAYS * 86400
+    groups: dict[str, list[dict[str, Any]]] = {s: [] for s in REQUEST_STATES}
+    hidden = 0
+    index: dict[str, list[Path]] | None = None
+    os_groups: dict[str, Any] = {}
+    stores = _Stores()
+    try:
+        for name, row in roots:
+            tree = request_tree(name, row["id"])
+            state = _request_state(tree, stores)
+            if (state == "done" and not older
+                    and float(row.get("updated_at") or row["created_at"]) < cutoff):
+                hidden += 1
+                continue
+            if index is None:
+                # Read once for the page: each lookup walks every transcript directory
+                index, os_groups = usage_mod.index_sessions(), _os_groups()
+            cost = 0.0
+            for node in tree.nodes():
+                found = _tree_wo(stores, node)
+                if found is not None:
+                    store, wo = found
+                    cost += _unit_row(node.project, wo, index, _turn_rows(store, wo["id"]),
+                                      os_groups.get(wo["id"], ()))["total_cost_usd"]
+            groups[state].append({"id": row["id"], "project": name,
+                                  "kind": row.get("kind") or "work", "title": row["title"],
+                                  "state": state, "cost_usd": round(cost, 2),
+                                  "created_at": row["created_at"], "tree": tree})
+    finally:
+        stores.close()
+    for rows in groups.values():
+        rows.sort(key=lambda r: r["created_at"], reverse=True)
+    return {"groups": groups, "older_hidden": hidden,
+            "total": sum(len(v) for v in groups.values()) + hidden}
 
 
 def resolve_requestor(store: Any, *, parent_id: str | None,
