@@ -3881,6 +3881,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # THE DECISION THIS ORDER OWES THE USER, worded exactly as the dashboard's buttons word it
                 **({"review": owed}
                    if (owed := ops.review_state(store, wo)) else {}),
+                # THE COMMAND THE WORKER LEFT THE USER, and which way it went (#1684)
+                **({"needs_user": owes}
+                   if (owes := ops.user_action_path(store, wo)) else {}),
                 # WHERE THE SPEC CAN BE READ — the feature's document
                 **({"spec": link} if (link := specs.spec_link(store, wo)) else {}),
                 # The rows themselves, on the same always-present rule: this order's own alarms
