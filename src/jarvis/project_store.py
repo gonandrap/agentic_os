@@ -224,15 +224,40 @@ def dependency_hold_spans(dep_transitions: Iterable[Iterable[Any]], created_at: 
 def manager_idle_hold_spans(feature_transitions: Sequence[Any], feature_status: str,
                             since: float, now: float) -> list[tuple[float, float]]:
     """Every interval inside `[since, now]` an idle manager's feature was not terminal (issue 1674)"""
-    rows = list(feature_transitions)
-    status = str(rows[0]["from_status"] if rows else feature_status)
+    spans = [(max(a, since), min(b, now))
+             for a, b, s in _status_segments(feature_transitions, feature_status, now)
+             if s not in FO_TERMINAL_STATUSES]
+    return [(a, b) for a, b in spans if b > a]
+
+
+def _status_segments(transitions: Sequence[Any], status: str,
+                     now: float) -> list[tuple[float, float, str]]:
+    """`(start, end, status)` for each stretch of an order's state spans, open-ended before the first"""
+    rows = list(transitions)
+    status = str(rows[0]["from_status"] if rows else status)
     segments, start = [], float("-inf")
     for r in rows:
         segments.append((start, float(r["ts"]), status))
         start, status = float(r["ts"]), str(r["to_status"])
     segments.append((start, now, status))
-    spans = [(max(a, since), min(b, now)) for a, b, s in segments
-             if s not in FO_TERMINAL_STATUSES]
+    return segments
+
+
+#: Planner events that record its spec PR's url (`ops.SPEC_PR_REPARKED_EVENT` is the third)
+SPEC_PR_EVENT_KINDS = ("finished", "pr_url_recorded", "spec_pr_reparked")
+
+
+def spec_pr_hold_spans(pr_events: Iterable[Any], planner_transitions: Sequence[Any],
+                       planner_status: str, since: float,
+                       now: float) -> list[tuple[float, float]]:
+    """`ProjectStore.spec_hold` over time, clipped to `[since, now]` (issue 1681)"""
+    opened = min((float(e["ts"]) for e in pr_events
+                  if db.from_json(e["payload"], {}).get("pr_url")), default=None)
+    if opened is None:
+        return []
+    spans = [(max(a, since, opened), min(b, now))
+             for a, b, s in _status_segments(planner_transitions, planner_status, now)
+             if s in SPEC_PR_OPEN_STATUSES]
     return [(a, b) for a, b in spans if b > a]
 
 
