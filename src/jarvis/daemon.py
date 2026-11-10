@@ -2473,6 +2473,23 @@ class Daemon:
             # Beside the head and for its reason: what the NEXT submission has to diff itself against to learn... (docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §3)
             store.set_validation_file_shas(round_id, packet.file_shas)
 
+            # A DECLARED USER STEP ON NOTHING OR ON A DRAFT parks before CI and the panel (#1352, #1684); a ready PR is judged and parks after merge (#1506)
+            empty = evidence_mod.nothing_to_judge(packet)
+            needs_user = ops.declared_user_action(store, wo_id)
+            draft = bool(packet.pr and packet.pr.get("draft"))
+            if (needs_user and (empty == "escalate" or draft)
+                    and not store.work_abandoned(wo_id)):
+                self._escalate(store, wo, round_id, n,
+                               (f"this submission changes no files because the rest is "
+                                f"a command only you may run: `{needs_user}`. Nobody "
+                                f"has judged the work.") if empty == "escalate" else
+                               (f"the pull request is a draft waiting on a command only "
+                                f"you may run: `{needs_user}`. Nobody has judged it; "
+                                f"reply with `jarvis wo send {wo_id}` once it has run."),
+                               cause=ops.ESCALATION_USER_ACTION, user_action=needs_user)
+                log.info("[%s] %s: round %d parked on a user step", project.name, wo_id, n)
+                return
+
             # WAIT FOR CI RATHER THAN FOR THE WORKER TO PROVE THE SUITE ITSELF
             pending = evidence_mod.ci_pending(packet)
             if pending and time.time() < float(round_row["ts"]) + CI_HOLD_DEADLINE_SECONDS:
@@ -2523,8 +2540,7 @@ class Daemon:
                          project.name, wo_id, n)
                 return
 
-            # A SUBMISSION WITH NOTHING FOR A REVIEWER never reaches the validator (docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §3)
-            empty = evidence_mod.nothing_to_judge(packet)
+            # A SUBMISSION WITH NOTHING FOR A REVIEWER never reaches the validator (docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §3); `empty` read above
             # A DECLARED ABANDONMENT THAT PRODUCED NOTHING is a decision, not a delivery (wo-3fa65445)
             if empty == "escalate" and store.work_abandoned(wo_id):
                 dropped = store.events_of_kind(wo_id, "abandoned")[-1]
@@ -2532,15 +2548,6 @@ class Daemon:
                 self._void(store, wo, round_id, n, ABANDONED_VOID_REASON.format(why=why))
                 log.info("[%s] %s: round %d voided — abandoned with nothing produced",
                          project.name, wo_id, n)
-                return
-            # NOTHING CHANGED BECAUSE THE REST IS THE USER'S TO RUN: name it (#1352)
-            needs_user = ops.declared_user_action(store, wo_id)
-            if empty == "escalate" and needs_user:
-                self._escalate(store, wo, round_id, n,
-                               f"this submission changes no files because the rest is "
-                               f"a command only you may run: `{needs_user}`. Nobody "
-                               f"has judged the work.",
-                               cause=ops.ESCALATION_USER_ACTION, user_action=needs_user)
                 return
             # NOTHING CHANGED BECAUSE AN EQUIVALENT CHANGE REACHED THE BASE FIRST (#1592)
             if empty == "escalate" and base_red is None and self._settle_superseded(

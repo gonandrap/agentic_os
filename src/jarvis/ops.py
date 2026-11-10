@@ -4549,6 +4549,31 @@ def declared_user_action(store: ProjectStore, wo_id: str) -> str:
     return str(db.from_json(finished[-1]["payload"], {}).get("needs_user") or "")
 
 
+def user_action_path(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """Which way a declared user step went, naming the command, else "" (#1684)"""
+    finished = store.events_of_kind(wo["id"], "finished")
+    if not finished:
+        return ""
+    payload = db.from_json(finished[-1]["payload"], {})
+    command = str(payload.get("needs_user") or "")
+    if not command:
+        return ""
+    parked = any(
+        int(e["id"]) > int(finished[-1]["id"])
+        and db.from_json(e["payload"], {}).get("cause") == ESCALATION_USER_ACTION
+        for e in store.events_of_kind(wo["id"], "validation_escalated"))
+    if parked or not wo.get("pr_url"):
+        return f"`{command}`: parked for you before review"
+    draft = payload.get("pr_draft")
+    if draft is None:
+        return (f"`{command}`: parks for you before review if the pull request is a "
+                f"draft, else after it merges")
+    return (f"`{command}`: the pull request is a draft, so it parks for you before "
+            f"review" if draft else
+            f"`{command}`: the pull request is ready, so it is reviewed first and "
+            f"parks for you after it merges")
+
+
 def park_user_action(store: ProjectStore, wo: dict[str, Any], command: str) -> str:
     """Hold an order whose result waits on a command only the user may run (GitHub issue #1506)"""
     from .invariants import user_action_owed_blocker
@@ -5836,6 +5861,16 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             raise OpsError(empty_abandon_refusal(wo_id))
         # `stranding` is the REFUSAL's reading and is deliberately empty for an order carrying a pull...
         work = stranding if stranding.base else authorship(store, _wo)
+        needs_user = needs_user.strip()
+        # A draft parks before review, a ready PR after merge (#1684); None when unreadable
+        pr_draft: bool | None = None
+        if needs_user and pr_url:
+            from . import github
+
+            try:
+                pr_draft = github.pr_view(pr_url, cwd=path).draft
+            except Exception:  # noqa: BLE001 — the daemon reads it again per round
+                pr_draft = None
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url
@@ -5846,8 +5881,8 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                         {"summary": summary,
                          **({"pr_url": pr_url} if pr_url else {}),
                          **({"evidence": evidence} if evidence else {}),
-                         **({"needs_user": needs_user.strip()}
-                            if needs_user.strip() else {}),
+                         **({"needs_user": needs_user} if needs_user else {}),
+                         **({"pr_draft": pr_draft} if pr_draft is not None else {}),
                          **({"authored": work.record()} if work.base else {})})
         if superseded_by:
             # Morpheus follows it to the order that carries a confirmed failure's fix (#1307)
@@ -5885,10 +5920,12 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # ...and the status is the JOIN's to decide, not this branch's
             status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced),
                                        panel_cleared=not submits)
+        owed = user_action_path(store, store.get_work_order(wo_id))
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
-            **({"pr_url": pr_url} if pr_url else {})}
+            **({"pr_url": pr_url} if pr_url else {}),
+            **({"needs_user": owed} if owed else {})}
 
 
 def record_pull_request(wo_id: str, url: str, project_name: str | None = None,
