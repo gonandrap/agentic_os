@@ -1577,6 +1577,76 @@ def test_a_pending_child_of_a_ratified_plan_is_still_judged(stuck_os):
     assert verdict.excluded == "" and verdict.stuck is True
 
 
+# -- a child held by its feature's unmerged spec PR (issue 1681)
+
+
+def _spec_held_child(store, hours: float = 2.0):
+    """`(planner, child)`: a pending child `hours` behind a planner parked on its spec PR"""
+    from tests.test_feature_orders import a_bare_feature
+
+    _fo, planner, kid = a_bare_feature(store, assumptions=0,
+                                       planner_status="waiting_pr_merge")
+    url = "https://github.com/x/y/pull/9"
+    store.update_work_order(planner["id"], pr_url=url)
+    store.add_event(planner["id"], "finished", {"summary": "spec", "pr_url": url})
+    at = park_order(store, kid["id"], "pending", hours=hours)
+    store.conn.execute("UPDATE wo_events SET ts=? WHERE wo_id=?", (at, planner["id"]))
+    store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE order_id=?", (at, planner["id"]))
+    store.conn.commit()
+    return planner, kid
+
+
+def test_a_child_held_by_an_unmerged_spec_pr_is_excluded_and_discounted(stuck_os):
+    """Issue 1681: the cause AND the discount, kn-0a222b38"""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    _planner, kid = _spec_held_child(store)
+
+    row = [r for r in _judged(store, db.now()) if r["wo"]["id"] == kid["id"]][0]
+
+    assert row["verdict"].excluded == stuck.SPEC_PR_CAUSE
+    assert row["verdict"].stuck is False
+    assert abs(row["discounted"] - 2 * HOUR) < 5, row["discounted"]
+
+
+def test_a_merged_spec_pr_judges_only_the_time_since(stuck_os):
+    """Issue 1681: without the discount the first sweep after the merge buys the investigation"""
+    store = stuck_os["store"]
+    now = db.now()
+    planner, kid = _spec_held_child(store, hours=2)
+    store.set_status(planner["id"], "completed", trigger="merged")
+    store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE order_id=? AND to_status=?",
+                       (now - 60, planner["id"], "completed"))
+    store.conn.commit()
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]][0]
+
+    assert row["verdict"].excluded == ""
+    assert abs(row["verdict"].active_seconds - 60) < 5, row["verdict"].active_seconds
+    assert row["verdict"].stuck is False, row["verdict"].reason
+
+
+def test_spec_pr_hold_spans_clip_to_the_pr_and_the_planners_open_statuses():
+    from jarvis.project_store import spec_pr_hold_spans
+
+    def ev(ts, **payload):
+        return {"ts": ts, "kind": "finished", "payload": json.dumps(payload)}
+
+    def tr(ts, frm, to):
+        return {"ts": ts, "from_status": frm, "to_status": to}
+
+    trs = [tr(10.0, "pending", "running"), tr(120.0, "running", "waiting_pr_merge"),
+           tr(150.0, "waiting_pr_merge", "completed"),
+           tr(170.0, "completed", "waiting_pr_merge")]    # re-parked behind it
+    events = [ev(60.0, summary="no PR yet"), ev(120.0, pr_url="u")]
+
+    assert spec_pr_hold_spans(events, trs, "waiting_pr_merge", 100.0, 200.0) == [
+        (120.0, 150.0), (170.0, 200.0)]
+    assert spec_pr_hold_spans([ev(60.0)], trs, "waiting_pr_merge", 100.0, 200.0) == []
+    assert spec_pr_hold_spans(events, [], "completed", 100.0, 200.0) == []
+
+
 # -- an order held by an open precondition (the 2026-10-19 spec)
 
 
@@ -3035,6 +3105,20 @@ def test_the_invariant_names_an_idle_manager_the_sweep_would_judge_stuck(red_bas
     monkeypatch.setattr(project_store, "manager_idle_hold_spans", lambda *a: [])
     found = list(invariants.check_red_release_hold_is_discounted(store))
     assert [v.wo_id for v in found] == [manager["id"]]
+
+
+def test_the_invariant_names_a_spec_held_child_the_sweep_does_not_discount(red_base_os,
+                                                                          monkeypatch):
+    """Issue 1681's detector, folded into INV-RED-RELEASE-UNDISCOUNTED"""
+    from jarvis import invariants, project_store
+
+    store = red_base_os["store"]
+    _planner, kid = _spec_held_child(store)
+    assert list(invariants.check_red_release_hold_is_discounted(store)) == []
+
+    monkeypatch.setattr(project_store, "spec_pr_hold_spans", lambda *a: [])
+    found = list(invariants.check_red_release_hold_is_discounted(store))
+    assert [v.wo_id for v in found] == [kid["id"]]
 
 
 def test_the_invariant_names_a_hold_with_no_episode_behind_it(red_base_os):
