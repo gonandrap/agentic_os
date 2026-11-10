@@ -34,7 +34,7 @@ def _is_ancestor(repo: Path, a: str, b: str) -> bool:
 
 
 def tags(repo: Path, glob: str = release.RELEASE_TAG_GLOB, main: str = "") -> list[dict[str, Any]]:
-    """Every tag matching `glob`, newest anchor on main first; `follows` = the tags it ships after (spec §3)"""
+    """Tags matching `glob`, newest anchor first, each with the tags it `follows` (spec §3)"""
     out = _git(repo, "for-each-ref", "--sort=version:refname",
                "--format=%(refname:short)%1f%(creatordate:unix)%1f%(*objectname)%1f%(objectname)",
                f"refs/tags/{glob}")
@@ -56,7 +56,7 @@ def tags(repo: Path, glob: str = release.RELEASE_TAG_GLOB, main: str = "") -> li
                      *{r["sha"] for r in rows}, "--not", main).splitlines():
         sha, *parents = line.split()
         side[sha] = parents[0] if parents else ""
-    for r in rows:  # the main commit a tag was cut from: itself on main, else where its branch left
+    for r in rows:  # anchor: the main commit the tag was cut from
         c = r["sha"]
         while c in side:
             c = side[c]
@@ -72,14 +72,14 @@ def tags(repo: Path, glob: str = release.RELEASE_TAG_GLOB, main: str = "") -> li
 
 
 def _precedes(repo: Path, a: dict[str, Any], b: dict[str, Any]) -> bool:
-    """`a` was released before `b`: an older anchor on main; one anchor, the older version; off main, ancestry"""
+    """`a` shipped before `b`: older anchor, else older version, off main real ancestry"""
     if a["pos"] is not None and b["pos"] is not None:
         return a["pos"] > b["pos"] if a["pos"] != b["pos"] else a["rank"] > b["rank"]
     return a["sha"] != b["sha"] and _is_ancestor(repo, a["sha"], b["sha"])
 
 
 def commits(repo: Path, to_ref: str, exclude: list[str]) -> list[dict[str, Any]]:
-    """First-parent commits of `to_ref` not reachable from `exclude`, newest first, release bump commits dropped"""
+    """First-parent commits of `to_ref` no `exclude` reaches, newest first, bumps dropped"""
     args = [to_ref, "--not", *exclude] if exclude else [to_ref]
     out = _git(repo, "log", "--first-parent", "--format=%H%x1f%ct%x1f%s", *args)
     rows = []
