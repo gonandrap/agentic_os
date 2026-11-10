@@ -5790,6 +5790,19 @@ def unlanded_refusal(wo: dict[str, Any], summary: str, work: landing.Authored) -
     )
 
 
+def empty_abandon_refusal(wo_id: str) -> str:
+    """Why `--abandon` is refused on an order that produced nothing (io-d173b6f1)"""
+    return (
+        f"{wo_id} has no commits and no uncommitted files, so there is nothing to "
+        f"abandon. `--abandon` is for code deliberately not landed; on an empty "
+        f"order it voids the review and the user never sees your result.\n\n"
+        f"Finish without it: `jarvis wo finish {wo_id} --summary \"...\"` puts the "
+        f"result in front of the user. If a step only the user can take is owed, add "
+        f"`--needs-user \"<command>\"`. If this order duplicates another, pass "
+        f"`--superseded-by <wo-id>` alongside `--abandon`."
+    )
+
+
 def finish(wo_id: str, summary: str, pr_url: str | None = None,
            evidence: str = "", abandon: str = "", superseded_by: str = "",
            needs_user: str = "") -> dict[str, Any]:
@@ -5817,6 +5830,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         if (stranding.produced and not abandon
                 and not (stranding.pushed and kind_contract(_wo).lands_code)):
             raise OpsError(unlanded_refusal(_wo, summary, stranding))
+        # A carrier-less abandon of NOTHING voids the round silently (io-d173b6f1); `base` unset means unreadable
+        if (abandon and not superseded_by and stranding.base and not stranding.produced
+                and _wo["status"] not in TERMINAL_STATUSES):
+            raise OpsError(empty_abandon_refusal(wo_id))
         # `stranding` is the REFUSAL's reading and is deliberately empty for an order carrying a pull...
         work = stranding if stranding.base else authorship(store, _wo)
         fields: dict[str, Any] = {"result_summary": summary}

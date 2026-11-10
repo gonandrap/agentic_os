@@ -1410,10 +1410,11 @@ def test_an_abandonment_that_produced_nothing_is_voided_not_escalated(fleet):
     """wo-3fa65445: a duplicate, dropped on Neo's ruling, still paged the user"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
+    carrier = ops.create_work_order("proj_a", "the original")
     wo = fleet.dispatch("duplicate")
     fleet.worktree(wo["id"])  # a worktree, and not one byte changed in it
     ops.finish(wo["id"], "duplicate of wo-0d358979; its PR already fixes this",
-               abandon="duplicate of wo-0d358979")
+               abandon="duplicate of wo-0d358979", superseded_by=carrier["id"])
     fleet.drain()
 
     assert _outbox(fleet) == [], "nothing to page the user about"
