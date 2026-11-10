@@ -135,12 +135,13 @@ def test_another_project_is_picked_tagged_and_cut_outside_the_os_machinery(os_re
     assert "app" in ops.release_projects()
     report = ops.release_overview("app")
     assert (report["project"], report["is_os"], len(report["pending"])) == ("app", False, 2)
-    _git(repo, "tag", "v1")  # no app-* tag yet: any tag counts
+    _git(repo, "tag", "v1")
     assert ops.release_overview("app")["newest"] == "v1"
     _git(repo, "commit", "-q", "--allow-empty", "-m", "three")
     _git(repo, "tag", "app-0.1.0")
-    report = ops.release_overview("app")
-    assert (report["tag_glob"], report["newest"]) == ("app-*", "app-0.1.0")
+    report = ops.release_overview("app")  # an app-* tag no longer hides the other streams
+    assert (report["tag_glob"], report["newest"]) == ("*", "app-0.1.0")
+    assert [r["tag"] for r in report["releases"]] == ["app-0.1.0", "v1"]
     _git(repo, "commit", "-q", "--allow-empty", "-m", "four")
     wo = ops.release_cut(_git(repo, "rev-parse", "HEAD"), "app")
     store = ProjectStore(repo)
@@ -150,7 +151,8 @@ def test_another_project_is_picked_tagged_and_cut_outside_the_os_machinery(os_re
         store.close()
     meta = db.from_json(row["metadata"], {})
     assert release.BATCH_KEY not in meta and not release.is_release_order(row)
-    assert "app-X.Y.Z" in row["description"] and "shipit" not in row["description"]
+    assert "app-X.Y.Z" not in row["description"] and "shipit" not in row["description"]
+    assert "its own scheme" in row["description"]
     with pytest.raises(ops.OpsError, match="already shipping a release"):
         ops.release_cut(_git(repo, "rev-parse", "HEAD"), "app")
     with pytest.raises(ops.OpsError, match="no project 'nope'"):
@@ -176,3 +178,61 @@ def test_a_release_page_colours_a_failed_pr(os_repo):
     page = TestClient(create_app()).get("/release/jarvis-0.1.1").text
     assert f'class="mono tone-bad" href="/mo/{os_repo["mv"]}"' in page
     assert "needs-you" in page
+
+
+def _repo(path: Path) -> Path:
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.email", "t@t")
+    _git(path, "config", "user.name", "t")
+    return path
+
+
+def _commit(repo: Path, msg: str, tag: str = "") -> None:
+    _git(repo, "commit", "-q", "--allow-empty", "-m", msg)
+    if tag:
+        _git(repo, "tag", tag)
+
+
+def test_two_streams_whose_name_and_order_disagree_are_decided_by_ancestry(tmp_path):
+    """io-fad638fd: v0.1.17 sorts after pipeline-v0.1.7 by name but is OLDER on main"""
+    from jarvis import release_view
+
+    repo = _repo(tmp_path / "pfw")
+    _commit(repo, "a (#1)", "v0.1.16")
+    _commit(repo, "b (#2)", "v0.1.17")
+    _commit(repo, "c (#3)", "pipeline-v0.1.6")
+    _commit(repo, "d (#4)", "pipeline-v0.1.7")
+    _commit(repo, "e (#5)")
+    rows = release_view.tags(repo, "*")
+    assert [r["tag"] for r in rows] == ["pipeline-v0.1.7", "pipeline-v0.1.6", "v0.1.17", "v0.1.16"]
+    assert [r["previous"] for r in rows] == ["pipeline-v0.1.6", "v0.1.17", "v0.1.16", ""]
+    assert [c["pr"] for c in release_view.commits(repo, "main", [r["tag"] for r in rows])] == [5]
+    by = {r["tag"]: r for r in rows}
+    assert [c["pr"] for c in release_view.commits(
+        repo, "pipeline-v0.1.6", by["pipeline-v0.1.6"]["follows"])] == [3]
+    assert [c["pr"] for c in release_view.commits(repo, "v0.1.16", by["v0.1.16"]["follows"])] == [1]
+
+
+def test_os_tags_on_release_branches_chain_as_before(tmp_path):
+    """jarvis-* tags sit on bump commits off main, so no tag is an ancestor of the next"""
+    from jarvis import release_view
+
+    repo = _repo(tmp_path / "os")
+    _commit(repo, "one (#1)")
+    for n, prs in ((0, (2,)), (1, (3, 4))):
+        for pr in prs:
+            _commit(repo, f"work (#{pr})")
+        _git(repo, "checkout", "-q", "-b", f"release/jarvis-0.1.{n}")
+        _commit(repo, f"Release jarvis-0.1.{n}", f"jarvis-0.1.{n}")
+        _git(repo, "checkout", "-q", "main")
+    _git(repo, "checkout", "-q", "-b", "release/jarvis-0.1.2")  # re-release of 0.1.1's base
+    _commit(repo, "Release jarvis-0.1.2", "jarvis-0.1.2")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "later (#5)")
+    rows = release_view.tags(repo, "jarvis-*")
+    assert [(r["tag"], r["previous"]) for r in rows] == [
+        ("jarvis-0.1.2", "jarvis-0.1.1"), ("jarvis-0.1.1", "jarvis-0.1.0"), ("jarvis-0.1.0", "")]
+    assert release_view.commits(repo, "jarvis-0.1.2", rows[0]["follows"]) == []
+    assert [c["pr"] for c in release_view.commits(repo, "jarvis-0.1.1", rows[1]["follows"])] == [4, 3]
+    assert [c["pr"] for c in release_view.commits(repo, "main", [r["tag"] for r in rows])] == [5]
