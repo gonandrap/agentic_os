@@ -16194,7 +16194,7 @@ def _rollup(units: list[dict[str, Any]],
     """Totals over the units that could actually be measured, plus OS calls no unit owns"""
     measured = [u for u in units if u["found"]]
     worker_cost = round(sum(u["list_cost_usd"] for u in measured), 2)
-    # The `os_*` figures only: OS calls no work order caused, or a root order's own, are spend, not a unit (io-82bcb830)
+    # Unowned and root-own OS calls are spend, not units (io-82bcb830, io-2641fe05)
     os_spenders = [*units, *owns, *([unattributed] if unattributed else [])]
     # Over ALL units, not just measured ones
     os_cost = round(sum(u.get("os_cost_usd") or 0 for u in os_spenders), 2)
