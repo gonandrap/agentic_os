@@ -64,6 +64,19 @@ def test_order_kinds_come_from_the_id_prefix_and_children_are_never_counted():
     assert alpha["cost_usd"] == 3.0 and beta["cost_usd"] == 7.0
 
 
+def test_a_feature_root_carries_its_childrens_ttl_and_rolls_up():
+    kids = [_unit("wo-k1", "alpha", list_cost=1.0, ttl=2, ttl_tokens=100,
+                  total_cost_usd=1.0),
+            _unit("wo-k2", "alpha", list_cost=2.0, ttl=3, ttl_tokens=50,
+                  total_cost_usd=2.0)]
+    root = ops._root_row("alpha", {"id": "fo-1", "title": "f"}, "feature", kids, None)
+    (alpha,) = ops.cost_aggregates([root])["projects"]
+
+    assert (alpha["ttl_misses"], alpha["ttl_rewrite_tokens"]) == (5, 150)
+    assert alpha["cost_usd"] == 3.0
+    assert alpha["by_order_kind"] == {"fo": {"orders": 1, "cost_usd": 3.0}}
+
+
 def test_jarvis_cost_json_carries_the_aggregates(fleet_fixture, capsys):
     wo = fleet_fixture.order("an order")
     fleet_fixture.turn(wo, started_at=db.now() - 60, ended_at=db.now(), cost_usd=1.0)

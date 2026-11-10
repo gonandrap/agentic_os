@@ -2171,11 +2171,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def _tok(n: int) -> str:
     """Token counts, at the magnitude a reader can hold in their head"""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.0f}k"
-    return str(n)
+    from .usage import fmt_tok
+
+    return fmt_tok(n)
 
 
 def _dur(seconds: float | None) -> str:
@@ -3404,7 +3402,10 @@ def cmd_cost(args: argparse.Namespace) -> int:
     print(f"{'$':>7} {'jarvis':>7} {'subproc':>8} {'subagent':>9} {'turns':>5} "
           f"{'output':>7} {'re-write':>9}  work order")
     for u in units[:args.limit]:
-        os_cost = f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
+        if u.get("children"):
+            # A root order: its members are inside its row (io-2641fe05)
+            u = {**u, "title": f"[{u['order_kind']} +{len(u['children'])}] {u['title']}"}
+        os_cost =f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
         sub_cost = f"{u['subproc_cost_usd']:.2f}" if u.get("subproc_calls") else "—"
         agent_cost = (f"{u['subagent_cost_usd']:.2f}"
                       if u.get("subagent_count") else "—")
@@ -3451,11 +3452,8 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"  re-write tax  ~${totals['rewrite_cost_usd']:.2f} — "
               f"{_tok(totals['rewrite_excess'])} tokens re-sent across "
               f"{totals['resume_boundaries']} turn boundaries")
-        cause = _rewrite_cause(totals.get("rewrite_ttl_share"),
-                               totals.get("boundaries_ttl") or 0,
-                               totals["resume_boundaries"])
-        if cause:
-            print(f"               {cause.strip()}")
+        if totals.get("rewrite_note"):
+            print(f"               {totals['rewrite_note']}")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
     # Silence when zero: nothing was excluded (docs/superpowers/specs/2026-10-07-cost-window-selector.md)
