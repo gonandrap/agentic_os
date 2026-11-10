@@ -16217,6 +16217,7 @@ def _rollup(units: list[dict[str, Any]],
             "rewrite_cost_usd": round(sum(u["rewrite_cost_usd"] for u in measured), 2),
             "rewrite_excess": sum(u["rewrite_excess"] for u in measured),
             "resume_boundaries": sum(u["resume_boundaries"] for u in measured),
+            **_rewrite_split(measured),
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
@@ -16245,6 +16246,40 @@ def _unpriced_models(spends: Sequence[dict[str, float] | None]) -> dict[str, Any
     return {"unpriced_models": rows,
             "unpriced_note": f"Guessed at a fallback price, no list price known: {named}."
             if rows else ""}
+
+
+def _rewrite_split(measured: list[dict[str, Any]]) -> dict[str, Any]:
+    """The re-write tax by cause, summed per order, and the one sentence both renderers print (io-2641fe05)"""
+    from .usage import fmt_tok
+
+    parts = {"ttl": [0, 0.0], "prefix": [0, 0.0], "undecided": [0, 0.0]}
+    for u in measured:
+        excess, usd = u.get("rewrite_excess") or 0, u.get("rewrite_cost_usd") or 0.0
+        share = u.get("rewrite_ttl_share")
+        if share is None:
+            parts["undecided"][0] += excess
+            parts["undecided"][1] += usd
+            continue
+        ttl = u.get("rewrite_ttl_excess") or 0
+        parts["ttl"][0] += ttl
+        parts["ttl"][1] += usd * share
+        parts["prefix"][0] += excess - ttl
+        parts["prefix"][1] += usd * (1 - share)
+    says = {"ttl": "was the cache entry EXPIRING between turns, which a longer cache TTL "
+                   "buys back",
+            "prefix": "was the prompt PREFIX moving, which is upstream and Jarvis cannot fix",
+            "undecided": "is undecided: no boundary's cause was recorded"}
+    clauses = [f"~${usd:.2f} ({fmt_tok(tok)} tokens) {says[k]}"
+               for k, (tok, usd) in parts.items() if tok]
+    out: dict[str, Any] = {}
+    for k, (tok, usd) in parts.items():
+        out[f"rewrite_{k}_excess"] = tok
+        out[f"rewrite_{k}_cost_usd"] = round(usd, 2)
+    out["rewrite_note"] = (
+        "It is the sum of each order's re-write. Of it, " + "; ".join(clauses)
+        + ". Fewer turn boundaries cost less of every part, which is why batching "
+          "feedback into one message is cheaper than three." if clauses else "")
+    return out
 
 
 def _write_ttl(measured: list[dict[str, Any]], units: list[dict[str, Any]]

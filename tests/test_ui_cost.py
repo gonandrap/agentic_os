@@ -198,6 +198,35 @@ def test_cost_page_lists_work_orders_dearest_first(client, project, transcript):
     assert "not a bill" in page.text
 
 
+def test_the_rewrite_is_dollars_then_tokens_on_rows_and_headline(client, project,
+                                                                 transcript):
+    """io-2641fe05: one unit on both, and the headline says it is the rows' sum"""
+    import os
+    from pathlib import Path
+
+    wo = ops.create_work_order("proj_a", "resumed twice")
+    transcript("sess-rw", at=db.now())
+    session = Path(os.environ[usage.TRANSCRIPT_ROOT_ENV]) / "-proj" / "sess-rw.jsonl"
+    first = json.loads(session.read_text())
+    rows = []
+    for i in range(3):
+        row = json.loads(json.dumps(first))
+        row["message"]["id"] = f"m{i}"
+        row["message"]["usage"]["cache_creation_input_tokens"] = 1_000_000
+        rows.append(json.dumps(row))
+    session.write_text("\n".join(rows) + "\n")
+    give_session(project, wo["id"], "sess-rw")
+    add_recorded_turn(project, wo["id"], 0.0, 1_000)
+
+    text = cost_page(client, "/cost").text
+    totals = ops.cost_report()["totals"]
+    row_usd = f"${totals['rewrite_cost_usd']:.2f}"
+
+    assert f"re-write {row_usd} (2.0M tokens)" in text
+    assert f"Re-write tax ~{row_usd}</strong>" in text
+    assert "sum of each order&#39;s re-write" in text or "sum of each order's re-write" in text
+
+
 def test_cost_page_says_when_a_transcript_is_gone_instead_of_saying_zero(
         client, project, transcript):
     """An unmeasurable cost and a zero cost are different answers"""
