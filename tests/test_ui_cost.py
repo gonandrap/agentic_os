@@ -1066,6 +1066,22 @@ def test_the_meter_chart_endpoint_serves_any_span_and_refuses_a_bad_one(client, 
     assert "five_hour_calc_jarvis" in embedded["timeline"][0]
 
 
+def test_the_meter_loads_the_shared_chart_helper_and_drops_the_prose_legend(client, project):
+    """The series are named in the chart (static/chart.js), not in the caption (io-2641fe05)"""
+    from jarvis.ui.app import STATIC_VERSION
+
+    meter_samples_in_the_current_5h_window()
+    page = cost_page(client, "/cost?window=5h")
+    src = f"/static/chart.js?v={STATIC_VERSION['chart.js']}"
+    assert src in page.text
+    assert "shaded: calculated" not in page.text
+    assert "<noscript>5h solid · 7d dashed" in page.text   # the static fallback keeps its key
+    got = client.get(src)
+    assert got.status_code == 200 and "JarvisChart" in got.text
+    assert got.headers["cache-control"] == "max-age=3600"
+    assert client.get("/static/app.py").status_code == 404
+
+
 def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, project):
     """12 readings in a 5h window: the page says so and prints no $/point figure"""
     wo = ops.create_work_order("proj_a", "an order in this window")
