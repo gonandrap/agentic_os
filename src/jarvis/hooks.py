@@ -2076,10 +2076,10 @@ def native_question_decision(payload: dict[str, Any],
                  ["the call carried no questions"]))
 
 
-# --- artifacts (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3) ---
+# --- artifacts (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3)
 
 ARTIFACT_TOOL = "Artifact"
-#: The only publish keys: none adds capabilities, data or sharing; a future key stays out until listed (§3.3)
+#: Publish keys allowed; any other, future ones included, is refused (§3.3)
 ARTIFACT_PUBLISH_KEYS = frozenset({"action", "file_path", "title", "description", "icon",
                                    "url", "label"})
 ARTIFACT_ACTIONS = frozenset({"publish", "read", "list", "open", "delete"})
@@ -2258,7 +2258,7 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         return artifact_decision(payload, env)
 
     if tool == "Bash":
-        # First: it never allows, and the `jarvis …` auto-allow below would wave it through (§3.3 item 5 of docs/superpowers/specs/2026-11-10-artifact-session-hold.md)
+        # First, or the `jarvis …` auto-allow waves it through (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.3)
         deciding = artifact_bash_decision(payload, env)
         if deciding is not None:
             return deciding

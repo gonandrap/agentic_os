@@ -2071,7 +2071,7 @@ class ProjectStore:
         ).fetchone()
         return dict(row) if row else None
 
-    # --- artifacts (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.1) ---
+    # --- artifacts (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.1)
 
     def record_artifact(self, wo_id: str, url: str, *, title: str | None,
                         session_id: str | None, via_subagent: bool) -> dict[str, Any]:

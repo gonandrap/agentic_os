@@ -86,7 +86,7 @@ def root(jarvis_home, tmp_path):
     return _project(tmp_path)
 
 
-# --- capture (§3.2) ---
+# --- capture (§3.2)
 
 def test_publish_records_one_row_and_an_event(root):
     wo_id = _order(root)
@@ -170,7 +170,7 @@ def test_bare_resumed_session_resolves_through_find_by_session(root):
     assert len(_rows(root, wo_id)) == 1
 
 
-# --- store (§3.1) ---
+# --- store (§3.1)
 
 def test_session_id_index_exists(root):
     store = ProjectStore(root)
@@ -211,7 +211,7 @@ def test_decisions_held_orders_and_events(root):
     assert len(_events(root, wo_id, "artifact_decision")) == 2
 
 
-# --- deny (§3.3) ---
+# --- deny (§3.3)
 
 def test_publish_denied_for_os_order(root):
     wo_id = _order(root, requestor="os")
@@ -298,7 +298,7 @@ def test_worker_bash_cannot_decide_an_artifact(root, tmp_path):
                           cwd=elsewhere, env={})) != "deny"
 
 
-# --- cap (§3.4) ---
+# --- cap (§3.4)
 
 def test_cap_denies_the_next_new_owner(jarvis_home, tmp_path, monkeypatch):
     monkeypatch.setattr(hooks, "artifact_session_cap", lambda: 2)
@@ -331,7 +331,7 @@ def test_catalog_parses_the_cap():
     assert parse_catalog(base).os.artifacts.max_held_sessions == 3
 
 
-# --- CLI (§3.5) ---
+# --- CLI (§3.5)
 
 def test_cli_list_and_show(root, capsys):
     central = CentralStore()
