@@ -251,3 +251,4 @@ def test_settings_matcher_names_agent():
     assert "Agent" in matcher.split("|")
     assert "Task" in matcher.split("|")
     assert "Bash" in matcher.split("|")
+    assert "Artifact" in matcher.split("|")

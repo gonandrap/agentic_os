@@ -1977,6 +1977,14 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--level", default="info", choices=["info", "warning", "critical"])
     n.add_argument("--wo-id")
 
+    arp = sub.add_parser("artifact", help="claude.ai artifacts orders published (read-only)")
+    ar = arp.add_subparsers(dest="art_cmd", required=True)
+    a = ar.add_parser("list", help="undecided artifacts, counts first")
+    a.add_argument("project", nargs="?")
+    a.add_argument("--all", action="store_true", help="decided ones too")
+    a = ar.add_parser("show", help="one artifact: row, order, link")
+    a.add_argument("art_id")
+
     ibp = sub.add_parser("inbox", help="central notification inbox")
     ib = ibp.add_subparsers(dest="ib_cmd", required=False)
     ibl = ib.add_parser("list")
@@ -6337,6 +6345,37 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_artifact(args: argparse.Namespace) -> int:
+    """`jarvis artifact list|show` (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.5)"""
+    from . import ops
+    if args.art_cmd == "show":
+        row = ops.show_artifact(args.art_id)
+        if args.json:
+            _print(row, True)
+            return 0
+        print(f"{row['id']}  {row['url']}")
+        print(f"  order: {row['wo_id']} [{row['order']['status']}] {row['order']['title']}"
+              f"  ({row['project']})")
+        print(f"  title: {row['title'] or '-'}  published {_age(row['published_at'])}"
+              f", updated {_age(row['updated_at'])}"
+              + ("  via subagent" if row["via_subagent"] else ""))
+        print(f"  decision: {row['decision'] or 'undecided'}"
+              + (f" by {row['decided_by']} {_age(row['decided_at'])}"
+                 if row["decided_at"] else ""))
+        return 0
+    rows = ops.list_artifacts(args.project, include_decided=args.all)
+    if args.json:
+        _print(rows, True)
+        return 0
+    undecided = sum(1 for r in rows if r["decision"] in (None, "delete_requested"))
+    orders = len({(r["project"], r["wo_id"]) for r in rows})
+    print(f"{len(rows)} artifact(s), {undecided} undecided, across {orders} order(s)")
+    for r in rows:
+        print(f"{r['id']}  [{r['project']}] {r['wo_id']}  {r['decision'] or 'undecided'}"
+              f"  {r['url']}  {r['title'] or ''}".rstrip())
+    return 0
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     from . import ops
     port = args.port
@@ -6486,6 +6525,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_notify(args)
         if args.cmd == "inbox":
             return cmd_inbox(args)
+        if args.cmd == "artifact":
+            return cmd_artifact(args)
         if args.cmd == "bug":
             return cmd_bug(args)
         if args.cmd == "ui":

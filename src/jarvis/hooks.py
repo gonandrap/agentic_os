@@ -2076,12 +2076,192 @@ def native_question_decision(payload: dict[str, Any],
                  ["the call carried no questions"]))
 
 
+# --- artifacts (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3)
+
+ARTIFACT_TOOL = "Artifact"
+#: Publish keys allowed; any other, future ones included, is refused (§3.3)
+ARTIFACT_PUBLISH_KEYS = frozenset({"action", "file_path", "title", "description", "icon",
+                                   "url", "label"})
+ARTIFACT_ACTIONS = frozenset({"publish", "read", "list", "open", "delete"})
+ARTIFACT_URL = re.compile(r"(?:https://)?claude\.ai/(?:code/)?artifact/[\w-]+")
+_ARTIFACT_DECIDE = re.compile(r"\bjarvis\b.*\bartifact\s+(?:keep|delete)\b", re.S)
+ARTIFACT_DECIDE_REASON = "Only the user decides an artifact."
+
+
+def artifact_url(value: Any) -> str | None:
+    """The first claude.ai artifact link in a tool result or input, as https"""
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    match = ARTIFACT_URL.search(text or "")
+    if match is None:
+        return None
+    url = match.group(0)
+    return url if url.startswith("https://") else f"https://{url}"
+
+
+def artifact_session_cap() -> int:
+    from .ops import artifact_session_cap as cap
+
+    return cap()
+
+
+def _artifact_root(payload: dict[str, Any], env: dict[str, str]) -> Path | None:
+    root_env = env.get("JARVIS_PROJECT_PATH")
+    root = Path(root_env) if root_env else find_project_root(
+        Path(payload.get("cwd") or env.get("PWD") or "."))
+    return root if root is not None and (root / ".jarvis").is_dir() else None
+
+
+def _artifact_order(payload: dict[str, Any], env: dict[str, str]
+                    ) -> tuple[bool, ProjectStore | None, dict[str, Any] | None]:
+    """(OS-spawned, open store, order) — the store is the caller's to close (§3.3 item 1)"""
+    wo_id = env.get("JARVIS_WO_ID")
+    cwd = str(payload.get("cwd") or "")
+    spawned = bool(wo_id) or "/.claude/worktrees/wo-" in cwd
+    root = _artifact_root(payload, env)
+    if root is None:
+        return spawned, None, None
+    store = ProjectStore(root)
+    wo = None
+    if wo_id:
+        try:
+            wo = store.get_work_order(wo_id)
+        except KeyError:
+            wo = None
+    elif payload.get("session_id"):
+        wo = store.find_by_session(payload["session_id"])
+    return spawned or wo is not None, store, wo
+
+
+def _artifact_requestor(store: ProjectStore, wo: dict[str, Any]) -> str:
+    if wo.get("requestor"):
+        return str(wo["requestor"])
+    from .ops import requestor
+
+    return requestor(store, wo).kind
+
+
+def _held_order_count() -> int:
+    from .ops import held_order_count
+
+    return held_order_count()
+
+
+def artifact_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """PreToolUse: who may publish or delete a claude.ai artifact, failing closed (§3.3, §3.4)"""
+    tool_input = payload.get("tool_input") or {}
+    session = payload.get("session_id") or "?"
+    try:
+        spawned, store, wo = _artifact_order(payload, env)
+    except Exception as exc:  # noqa: BLE001 — a store error must not let the call through
+        return _deny(f"Artifact refused: the order for session {session} could not be read "
+                     f"({exc}).")
+    if not spawned:
+        if store is not None:
+            store.close()
+        return None  # the user's own session
+    if store is None or wo is None:
+        if store is not None:
+            store.close()
+        return _deny(f"Artifact refused: session {session} is OS-spawned but its work order "
+                     "cannot be read.")
+    try:
+        action = tool_input.get("action") or "publish"
+        if action not in ARTIFACT_ACTIONS:
+            return _deny(f"Artifact action {action!r} is not allowed in a work order "
+                         f"(allowed: {', '.join(sorted(ARTIFACT_ACTIONS))}).")
+        if action == "delete":
+            url = artifact_url(tool_input.get("url") or "")
+            if not any(a["url"] == url and a["decision"] == "delete_requested"
+                       for a in store.artifacts_of(wo["id"])):
+                return _deny("Artifact delete refused: the user has not asked to delete "
+                             f"{url or 'this artifact'} (`jarvis artifact delete`).")
+            return None
+        if action != "publish":
+            return None
+        who = _artifact_requestor(store, wo)
+        if who != "user":
+            return _deny(f"Only an order the user asked for may own an artifact "
+                         f"(requestor={who}). Write the report to a file instead.")
+        extra = sorted(set(tool_input) - ARTIFACT_PUBLISH_KEYS)
+        if extra:
+            return _deny(f"Artifact publish refused: {', '.join(extra)} would widen a private "
+                         "artifact. Publish with only "
+                         f"{', '.join(sorted(ARTIFACT_PUBLISH_KEYS))}.")
+        if not store.undecided_artifacts(wo["id"]):
+            cap = artifact_session_cap()
+            held = _held_order_count()
+            if held >= cap:
+                return _deny(f"Artifact publish refused: {held} orders already hold a session "
+                             f"for an undecided artifact (cap {cap}). See `jarvis artifact "
+                             "list`; write the report to a file instead.")
+        return None
+    except Exception as exc:  # noqa: BLE001 — fail closed: a crashed hook lets the call run
+        return _deny(f"Artifact refused: the check for session {session} failed ({exc}).")
+    finally:
+        store.close()
+
+
+def artifact_bash_decision(payload: dict[str, Any], env: dict[str, str]
+                           ) -> dict[str, Any] | None:
+    """PreToolUse: an OS-spawned session never decides an artifact (§3.3 item 5)"""
+    command = (payload.get("tool_input") or {}).get("command") or ""
+    if not _ARTIFACT_DECIDE.search(command):
+        return None
+    try:
+        spawned, store, _ = _artifact_order(payload, env)
+    except Exception:  # noqa: BLE001 — fail closed
+        return _deny(ARTIFACT_DECIDE_REASON)
+    if store is not None:
+        store.close()
+    return _deny(ARTIFACT_DECIDE_REASON) if spawned else None
+
+
+def capture_artifact(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
+    """PostToolUse: record a publish, or mark a delete carried out (§3.2)"""
+    if payload.get("tool_name") != ARTIFACT_TOOL:
+        return None
+    tool_input = payload.get("tool_input") or {}
+    action = tool_input.get("action") or "publish"
+    _, store, wo = _artifact_order(payload, env)
+    if store is None:
+        return None
+    try:
+        if wo is None:
+            return None
+        if action == "publish" and not tool_input.get("asset"):
+            url = artifact_url(payload.get("tool_response"))
+            if url is None:
+                return None
+            row = store.record_artifact(
+                wo["id"], url, title=tool_input.get("title"),
+                session_id=payload.get("session_id"),
+                # Claude Code sets `agent_id` only on a hook fired inside a subagent
+                via_subagent=bool(payload.get("agent_id")))
+            return {"artifact": row["id"], "wo_id": wo["id"]}
+        if action == "delete" and not tool_input.get("path"):
+            url = artifact_url(tool_input.get("url") or "")
+            for row in store.artifacts_of(wo["id"]):
+                if row["url"] == url:
+                    store.set_artifact_decision(row["id"], "deleted", "session")
+                    return {"artifact": row["id"], "wo_id": wo["id"]}
+        return None
+    finally:
+        store.close()
+
+
 def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     """PreToolUse auto-approvals that keep autonomous workers unattended (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
 
+    if tool == ARTIFACT_TOOL:
+        return artifact_decision(payload, env)
+
     if tool == "Bash":
+        # First, or the `jarvis …` auto-allow waves it through (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.3)
+        deciding = artifact_bash_decision(payload, env)
+        if deciding is not None:
+            return deciding
         # BEFORE the gate, and only because it never allows — see the docstring
         heredoc = heredoc_write_decision(payload, env)
         if heredoc is not None:
@@ -2855,8 +3035,18 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
     if event == "PostToolUse":
         # The memory mirror is a side effect and runs either way
         captured = capture_memory_write(payload, env)
+        # Same: a record, never a decision (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.2)
+        try:
+            published = capture_artifact(payload, env)
+        except Exception as exc:  # noqa: BLE001 — a lost record must not take the delivery below with it
+            from .paths import logs_dir
+
+            logs_dir().mkdir(parents=True, exist_ok=True)
+            with (logs_dir() / "hook-errors.log").open("a") as f:
+                f.write(f"capture_artifact: {exc!r}\n")
+            published = None
         return (_post_tool_compaction(env, cwd) or _post_tool_delivery(payload, env, cwd)
-                or captured)
+                or captured or published)
 
     if event == "PreCompact":
         return _pre_compact(payload, env, cwd)
