@@ -160,7 +160,8 @@ Questions, each answered YES/NO/UNKNOWN with verbatim evidence:
   auto-update if one happens, else UNKNOWN)?
 
 User steps (P1, P2, P5) go through `jarvis wo finish --needs-user` with a DRAFT PR, one
-park per batch of steps, each naming exactly what to click and when. The findings end
+park per batch of steps, each naming exactly what to click and when; expect up to three
+parks. P6 coming back UNKNOWN is acceptable. The findings end
 with a table mapping each answer to the §4/§5 branch it selects.
 
 ## 3. The artifact record and the manual-only invariant
@@ -233,8 +234,13 @@ Tests (new `tests/test_artifacts.py`): a PostToolUse payload with an Artifact pu
 result records one row; a republish updates it; an asset upload and a non-Artifact tool
 record nothing; a delete action marks `deleted`; a hook with no order is a no-op;
 PreToolUse denies a publish for `requestor='os'` and passes it for `'user'` and for no
-order; the cap denies the next new owner. Existing `tests/test_hooks*.py` and settings
-tests pass.
+order; the cap denies the next new owner (`register_projects` fixture for the
+cross-project count); `PRAGMA index_list(work_orders)` shows the `session_id` index;
+`artifact_published` and `artifact_decision` events are written; `jarvis artifact
+list|show` print the row. Extend `test_settings_matcher_names_agent` in
+`tests/test_background_refusal.py` with `"Artifact" in matcher.split("|")`. Hook tests
+live in `tests/test_background_refusal.py`, `tests/test_native_question.py` and
+`tests/test_investigation_orders.py`; they stay green.
 
 ## 4. The held session: keep it live, check it, revive it
 
@@ -264,8 +270,8 @@ then per held order whose turn is not running:
 
 Selected by the §2 findings, recorded as a constant with the finding cited:
 
-- P2 YES: revive = `claude respawn <short>` (no turn, $0). Add `claude_cli.respawn_bg`
-  beside `stop_bg` if absent; no hand-built argv elsewhere.
+- P2 YES: revive = `claude_cli.respawn_bg` (exists; no turn, $0; covered by
+  `tests/test_bg_transport.py::test_respawn_keeps_the_id_and_sends_nothing`).
 - P2 NO: revive = an `ARTIFACT_ARM_TURN` (below).
 
 An `ARTIFACT_ARM_TURN` is a `wo_turns` row of kind `artifact_arm`, sent by
@@ -323,6 +329,15 @@ next comment gets a fresh cap). Spend is booked to the order through the turn ro
 `Daemon.deliver_messages` waits and `resume_bg_turn` never stops a session mid-reply.
 
 ### 4.6 Done means
+
+The fake CLI (`src/jarvis/testing.py`) gains, first: `wake(session_id, text, cost)`
+(locked: status `busy`, append user and assistant transcript rows with usage, back to
+idle; today nothing makes an entry busy without an OS turn, and `set_session_state`
+writes `state` only, unlocked); `drop(session_id)` (pid gone); a forced respawn failure
+(e.g. env `FAKE_CLAUDE_RESPAWN=fail`). Reuse or copy the `bg_fleet`, `_bg_wo`,
+`_settled_bg_wo` fixtures of `tests/test_bg_transport.py`. Call
+`Daemon.hold_artifact_sessions` directly; "no roster read" = no `agents` call in
+`fake_claude.calls`; "no stop" = no `stop` call.
 
 Tests (`tests/test_bg_transport.py` style, fake CLI; new `tests/test_artifact_hold.py`):
 a settled turn of a held order leaves the session alive (no `stop` call); of a non-held
@@ -405,7 +420,11 @@ Tests (new `tests/test_artifact_gate.py`): `mark_done`, `complete_merged` and a
 then one daemon tick completes it; delete without `--yes` refuses; delete queues one
 message; a cancelled order with an undecided artifact keeps the blocker; the backstop
 invariant parks a `completed` order with an undecided artifact; an order with no
-artifact completes as today (existing lifecycle tests unchanged).
+artifact completes as today; `jarvis wo ack` refuses an owed order. "No session stopped"
+= no `stop` call to the fake. Must stay green: `tests/test_wo_done.py`,
+`tests/test_wo_pr_merge.py`, `tests/test_work_lands.py` (the `park_user_action`
+precedent), `tests/test_invariants.py`. The PR body lists every site that writes
+`completed` and how each is covered.
 
 ## 6. The dashboard: icon, link, modal
 
@@ -426,9 +445,12 @@ artifact completes as today (existing lifecycle tests unchanged).
   POST to new routes in `ui/app.py` calling `ops.decide_artifact(project, wo_id, art_id, choice, by="ui")` (§5.3); the
   delete button needs a second confirm click. Dismiss = decide later; the attention
   flag stays.
-- Done means: route tests (`tests/test_ui*.py` pattern) for both POSTs and the payload
-  flag; a template render test that the icon and the dialog appear for a parked order
-  and not otherwise. A screenshot in the PR.
+- Done means: route tests in `tests/test_ui.py` for both POSTs (each calls
+  `ops.decide_artifact(..., by="ui")`) and the payload flag; one icon assertion per list
+  page, plus one where a parent order shows it because a child row owns the artifact
+  (Yours page in `tests/test_yours.py`); the `<dialog>` renders only for a parked or
+  cancelled order with an undecided artifact. The delete button's second confirm is
+  JavaScript: proven by the screenshot in the PR, not by `TestClient`.
 
 ## Agent profile
 
