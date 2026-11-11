@@ -584,6 +584,10 @@ SESSION_KEPT_EVENT = "background_session_kept"
 SUBMITTED_ARTIFACT_EVENT = "submitted_artifact"
 #: The resolved path a `--from-file` submit refused for its name (#1538)
 REFUSED_ARTIFACT_EVENT = "refused_artifact"
+#: claude.ai artifacts an order owns (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.1)
+ARTIFACT_PUBLISHED_EVENT = "artifact_published"
+ARTIFACT_DECISION_EVENT = "artifact_decision"
+ARTIFACT_DECISIONS = ("keep", "delete_requested", "deleted")
 
 #: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
 MAX_PER_SWEEP_ROWS = 50
@@ -1124,6 +1128,24 @@ CREATE TABLE IF NOT EXISTS internal_follow_ups (
     created_at REAL NOT NULL,
     UNIQUE (digest, unit_id)
 );
+-- A claude.ai artifact an order published; a held session lives while one is undecided
+-- (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.1).
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    wo_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT,
+    session_id TEXT,
+    via_subagent INTEGER NOT NULL DEFAULT 0,
+    published_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    decision TEXT,
+    decided_at REAL,
+    decided_by TEXT,
+    UNIQUE (wo_id, url)
+);
+-- A bare-resumed session's hooks resolve their order by session id (§3.1, F6)
+CREATE INDEX IF NOT EXISTS idx_wo_session ON work_orders(session_id);
 CREATE INDEX IF NOT EXISTS idx_internal_follow_ups_unit ON internal_follow_ups(unit_id);
 CREATE INDEX IF NOT EXISTS idx_issue_links_unit ON issue_links(unit_id);
 CREATE INDEX IF NOT EXISTS idx_turns_wo ON wo_turns(wo_id, seq);
@@ -2048,6 +2070,79 @@ class ProjectStore:
             "SELECT * FROM work_orders WHERE session_id=?", (session_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    # --- artifacts (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.1) ---
+
+    def record_artifact(self, wo_id: str, url: str, *, title: str | None,
+                        session_id: str | None, via_subagent: bool) -> dict[str, Any]:
+        """One row per (order, URL); a republish only moves `updated_at`"""
+        ts = db.now()
+        self.conn.execute(
+            "INSERT INTO artifacts (id, wo_id, url, title, session_id, via_subagent, "
+            "published_at, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(wo_id, url) DO UPDATE SET updated_at=excluded.updated_at, "
+            "title=COALESCE(excluded.title, artifacts.title), "
+            "session_id=COALESCE(excluded.session_id, artifacts.session_id)",
+            (db.new_id("art"), wo_id, url, title, session_id, int(bool(via_subagent)), ts, ts))
+        row = dict(self.conn.execute(
+            "SELECT * FROM artifacts WHERE wo_id=? AND url=?", (wo_id, url)).fetchone())
+        self.add_event(wo_id, ARTIFACT_PUBLISHED_EVENT, {
+            "art_id": row["id"], "url": url,
+            "republish": row["published_at"] != row["updated_at"]})
+        return row
+
+    def artifact(self, art_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM artifacts WHERE id=?", (art_id,)).fetchone()
+        return dict(row) if row else None
+
+    def artifacts_of(self, wo_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM artifacts WHERE wo_id=? ORDER BY published_at, id", (wo_id,)
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def all_artifacts(self) -> list[dict[str, Any]]:
+        """`jarvis artifact list --all`"""
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM artifacts ORDER BY published_at, id").fetchall())
+
+    def undecided_artifacts(self, wo_id: str | None = None) -> list[dict[str, Any]]:
+        """A requested delete is not a decision carried out (§1.5)"""
+        sql = ("SELECT * FROM artifacts WHERE (decision IS NULL "
+               "OR decision='delete_requested')")
+        params: tuple[Any, ...] = ()
+        if wo_id is not None:
+            sql += " AND wo_id=?"
+            params = (wo_id,)
+        return db.rows_to_dicts(self.conn.execute(sql + " ORDER BY published_at, id",
+                                                  params).fetchall())
+
+    def set_artifact_decision(self, art_id: str, decision: str, by: str) -> dict[str, Any]:
+        if decision not in ARTIFACT_DECISIONS:
+            raise ValueError(f"artifact decision must be one of {ARTIFACT_DECISIONS}, "
+                             f"got {decision!r}")
+        row = self.artifact(art_id)
+        if row is None:
+            raise KeyError(art_id)
+        self.conn.execute(
+            "UPDATE artifacts SET decision=?, decided_at=?, decided_by=? WHERE id=?",
+            (decision, db.now(), by, art_id))
+        self.add_event(row["wo_id"], ARTIFACT_DECISION_EVENT,
+                       {"art_id": art_id, "url": row["url"], "decision": decision, "by": by})
+        return self.artifact(art_id) or row
+
+    def has_artifact(self, wo_id: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM artifacts WHERE wo_id=? LIMIT 1", (wo_id,)).fetchone() is not None
+
+    def held_orders(self) -> list[dict[str, Any]]:
+        """Background orders with an undecided artifact: the sessions §4 keeps alive (§1.5)"""
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE transport='background' AND id IN "
+            "(SELECT wo_id FROM artifacts WHERE decision IS NULL "
+            "OR decision='delete_requested') ORDER BY created_at"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
 
     def settled_worktrees(self, statuses: tuple[str, ...], settled_before: float,
                           limit: int = MAX_PER_SWEEP_ROWS) -> list[dict[str, Any]]:

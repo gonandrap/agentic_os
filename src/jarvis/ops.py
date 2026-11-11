@@ -890,6 +890,72 @@ def registered_project_paths(*, include_archived: bool = False) -> dict[str, Pat
         central.close()
 
 
+def artifact_session_cap() -> int:
+    """`os.artifacts.max_held_sessions`; the shipped default when no catalog loads"""
+    from .catalog import ArtifactsConfig
+
+    try:
+        return resolve_catalog().os.artifacts.max_held_sessions
+    except Exception:  # noqa: BLE001 — no catalog registered, or an unreadable one
+        return ArtifactsConfig.max_held_sessions
+
+
+def held_order_count() -> int:
+    """Orders fleet-wide holding a session for an undecided artifact (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.4)"""
+    total = 0
+    for path in registered_project_paths().values():
+        if not (path / ".jarvis").is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            total += len(store.held_orders())
+        finally:
+            store.close()
+    return total
+
+
+def list_artifacts(project_name: str | None = None, *, include_decided: bool = False
+                   ) -> list[dict[str, Any]]:
+    """`jarvis artifact list`: undecided unless asked (§3.5)"""
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered")
+        paths = {project_name: paths[project_name]}
+    out: list[dict[str, Any]] = []
+    for name, path in sorted(paths.items()):
+        if not (path / ".jarvis").is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            rows = store.all_artifacts() if include_decided else store.undecided_artifacts()
+            out.extend({"project": name, **row} for row in rows)
+        finally:
+            store.close()
+    return out
+
+
+def show_artifact(art_id: str) -> dict[str, Any]:
+    """`jarvis artifact show`: the row and its order (§3.5)"""
+    for name, path in sorted(registered_project_paths().items()):
+        if not (path / ".jarvis").is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            row = store.artifact(art_id)
+            if row is None:
+                continue
+            try:
+                wo = store.get_work_order(row["wo_id"])
+            except KeyError:
+                wo = {"id": row["wo_id"], "title": "(order deleted)", "status": None}
+            return {"project": name, **row,
+                    "order": {k: wo.get(k) for k in ("id", "title", "status")}}
+        finally:
+            store.close()
+    raise OpsError(f"artifact {art_id!r} not found")
+
+
 def require_registered_project(name: str) -> str:
     """Refuse a row under a project the OS does not know (issue #1333)"""
     central = CentralStore()
