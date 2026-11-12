@@ -360,8 +360,10 @@ def settle(store: ProjectStore, wo_id: str, tag: str, why: str | None = None) ->
         return "stays parked on its pull request"
     if store.pending_assumptions(wo_id):
         return "still has assumptions pending your review"
-    ops.close_out(store, wo, "release_completed", why=why,
-                  payload={"tag": tag, "why": why})
+    stopped = ops.close_out(store, wo, "release_completed", why=why,
+                            payload={"tag": tag, "why": why})
+    if stopped["status"] != "completed":
+        return "parked: an artifact awaits your keep or delete"
     ops.mark_backlog_done(wo)
     return f"completed (was {wo['status']})"
 

@@ -53,6 +53,7 @@ from .daemon import (
     OBJECTION_WITHDRAWN_REASON,
     RECONCILE_TICK_KEY,
     answers_question,
+    completes_decided_artifacts,
     daemon_running,
     delivers_message,
     polls_and_can_act_on_pull_request,
@@ -76,6 +77,8 @@ from .worker_brief import MODEL_ATTRIBUTION_NAMES
 from .stuck import IDLE_MANAGER_CAUSE  # noqa: F401
 from .project_store import (
     ALARM_REVIEWABLE_STATUSES,
+    ARTIFACT_DECIDED_EVENT,
+    ARTIFACT_DECISION_REQUIRED_EVENT,
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     ASSUMPTION_LAPSE_STATUSES,
@@ -2201,7 +2204,8 @@ def ack_decision_blocker(blockers: list[str]) -> str | None:
                  if "assumption" in b.lower()
                  or b in (invariants.IDLE_NO_FINISH_BLOCKER,
                           invariants.DELIVERED_UNSETTLED_BLOCKER)
-                 or b.startswith(invariants.RELEASE_NOTHING_SHIPPED_HEAD)), None)
+                 or b.startswith(invariants.RELEASE_NOTHING_SHIPPED_HEAD)
+                 or invariants.ARTIFACT_DECISION_HEAD in b), None)
 
 
 def ack_refusal(wo: dict[str, Any], blockers: list[str]) -> str | None:
@@ -2221,6 +2225,10 @@ def ack_refusal(wo: dict[str, Any], blockers: list[str]) -> str | None:
                 f"\"…\"` sends it back to work.")
     if blocker.startswith(invariants.RELEASE_NOTHING_SHIPPED_HEAD):
         return f"{wo['id']}: acknowledging would hide this — {blocker}"
+    if invariants.ARTIFACT_DECISION_HEAD in blocker:
+        return (f"{wo['id']}: acknowledging would hide an artifact only you may decide. "
+                f"`jarvis artifact list` names it; `jarvis artifact keep <id>` or "
+                f"`jarvis artifact delete <id> --yes` decides it.")
     return (f"{wo['id']} is waiting on a decision ({blocker}) — acknowledging would "
             f"bury it. Use `jarvis wo review {wo['id']}` to accept, or `--reject` to "
             f"send it back.")
@@ -4505,6 +4513,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
                 return park_pr_pending(store, wo, stranding)
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
+    if status == "completed" and artifact_owed(store, wo_id):
+        return park_artifact_decision(store, wo)
     if status == "completed" and (owed := declared_user_action(store, wo_id)):
         return park_user_action(store, wo, owed)
     # Spec §C of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md
@@ -6056,15 +6066,113 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
         stopped = close_out(store, wo, "marked_done", why="work order marked done")
     finally:
         store.close()
-    mark_backlog_done(wo)
+    if stopped["status"] == "completed":
+        mark_backlog_done(wo)
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
-            "status": "completed", "was": wo["status"],
+            "status": stopped["status"], "was": wo["status"],
             "session_stopped": stopped["stopped"]}
+
+
+ARTIFACT_DECIDER_REFUSAL = ("Only the user decides an artifact: run this from your own "
+                            "shell or the dashboard.")
+
+
+def artifact_owed(store: ProjectStore, wo_id: str) -> int:
+    """Undecided artifacts of one order (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.1)"""
+    return len(store.undecided_artifacts(wo_id))
+
+
+def park_artifact_decision(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """Hold a finished order until the user keeps or deletes its artifacts; stops nothing (§5.1)"""
+    from .invariants import artifact_decision_blocker
+    from .project_store import UNGOVERNED_ORIGINS
+
+    wo_id = wo["id"]
+    owed = artifact_owed(store, wo_id)
+    blocker = artifact_decision_blocker(owed)
+    store.set_status(wo_id, "needs_review", trigger="artifact_decision")
+    # After the status write: `artifact_park_open` reads a park at or after the last status event
+    store.add_event(wo_id, ARTIFACT_DECISION_REQUIRED_EVENT,
+                    {"was": wo["status"], "owed": owed})
+    store.flag_attention(wo_id, blocker)
+    fresh = store.get_work_order(wo_id) or wo
+    if not (launched_by_os(wo) or wo.get("origin") in UNGOVERNED_ORIGINS):
+        store.add_notification(
+            title=f"{wo_id} waits on you: {fresh.get('title') or 'untitled'}",
+            body=f"{fresh.get('result_summary') or 'No summary on record.'}\n\n{blocker}. "
+                 f"`jarvis artifact list` names each; `jarvis artifact keep <id>` or "
+                 f"`jarvis artifact delete <id> --yes` decides it.",
+            level="warning", wo_id=wo_id, source="completion", paired=True)
+    return "needs_review"
+
+
+def _os_session_deciding() -> bool:
+    """A worker, or a bare-resumed held session with no JARVIS_WO_ID (§5.3, F6)"""
+    if os.environ.get("JARVIS_WO_ID"):
+        return True
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session_id:
+        return False
+    for path in registered_project_paths().values():
+        if not (path / ".jarvis").is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            if store.find_by_session(session_id) is not None:
+                return True
+        finally:
+            store.close()
+    return False
+
+
+def decide_artifact(project: str, wo_id: str, art_id: str, choice: str, *, by: str,
+                    yes: bool = False, done: bool = False) -> dict[str, Any]:
+    """The user's keep or delete; never releases a session itself (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.3)"""
+    if _os_session_deciding():
+        raise OpsError(ARTIFACT_DECIDER_REFUSAL)
+    if choice not in ("keep", "delete"):
+        raise OpsError(f"choice must be keep or delete, got {choice!r}")
+    if by not in ("cli", "ui"):
+        raise OpsError(f"by must be cli or ui, got {by!r}")
+    path = registered_project_paths().get(project)
+    if path is None:
+        raise OpsError(f"project {project!r} not registered")
+    store = ProjectStore(path)
+    try:
+        row = store.artifact(art_id)
+        if row is None or row["wo_id"] != wo_id:
+            raise OpsError(f"artifact {art_id!r} not found on {wo_id}")
+        if row["decision"] == "deleted":
+            raise OpsError(f"{art_id} is already deleted: nothing left to decide")
+        if choice == "keep":
+            if row["decision"] != "keep":
+                store.set_artifact_decision(art_id, "keep", by)
+        elif by == "cli" and not yes:
+            raise OpsError(f"deleting {row['url']} cannot be undone: pass --yes to confirm")
+        elif done:
+            store.set_artifact_decision(art_id, "deleted", by)
+        elif row["decision"] != "delete_requested":
+            store.set_artifact_decision(art_id, "delete_requested", by)
+            # Probe P5 (wo-f770f7f0): a background delete hangs on its permission prompt, so the user deletes it
+            store.add_notification(
+                title=f"delete {art_id} on claude.ai yourself",
+                body=(f"Open {row['url']} and delete it there; a background session cannot. "
+                      f"Then run `jarvis artifact delete {art_id} --yes --done` to record it "
+                      f"and release {wo_id}."),
+                level="warning", wo_id=wo_id, source="artifact")
+        fresh = store.artifact(art_id) or row
+        return {"project": project, "wo_id": wo_id, "art_id": art_id, "url": row["url"],
+                "decision": fresh["decision"], "owed": artifact_owed(store, wo_id)}
+    finally:
+        store.close()
 
 
 def close_out(store: ProjectStore, wo: dict[str, Any], event: str, *, why: str,
               payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Settle a work order as `completed` and take its worker down with it, from OUTSIDE it"""
+    if artifact_owed(store, wo["id"]):
+        # Parked, nothing stopped: the held session keeps the comment watch (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.1)
+        return {"stopped": False, "status": park_artifact_decision(store, wo)}
     if os.environ.get("JARVIS_WO_ID") == wo["id"]:
         # THE CALLER IS INSIDE THE SESSION THIS WOULD KILL, and every write after it (io-d2a5dd69)
         raise OpsError(
@@ -6081,16 +6189,19 @@ def close_out(store: ProjectStore, wo: dict[str, Any], event: str, *, why: str,
         store.add_event(wo["id"], "session_stopped",
                         {**{k: v for k, v in stopped.items() if k != "stopped"},
                          "reason": why})
-    return stopped
+    return {**stopped, "status": "completed"}
 
 
 def settle_in_session(store: ProjectStore, wo: dict[str, Any], event: str, *,
-                      payload: dict[str, Any] | None = None) -> None:
-    """Settle a work order `completed` from INSIDE its own turn (io-d2a5dd69)"""
+                      payload: dict[str, Any] | None = None) -> str:
+    """Settle a work order `completed` from INSIDE its own turn (io-d2a5dd69); the status written"""
+    if artifact_owed(store, wo["id"]):
+        return park_artifact_decision(store, wo)
     store.set_status(wo["id"], "completed", trigger="submitted")
     store.clear_attention(wo["id"])
     store.add_event(wo["id"], event, {**(payload or {}), "was": wo["status"],
                                       "session_stopped": False})
+    return "completed"
 
 
 COMPLETED_TAIL_CHARS = 1200
@@ -6168,15 +6279,21 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
                                  **({"head_oid": head_oid} if head_oid else {}),
                                  **({"merge_commit": merge_commit}
                                     if merge_commit else {})})
-    mark_backlog_done(wo)
-    status = "completed"
-    if owed := declared_user_action(store, wo["id"]):
-        status = park_user_action(store, wo, owed)
-    else:
-        notify_completed(store, wo, "its pull request merged")
+    status = stopped["status"]
+    if status == "completed":
+        status = after_completion(store, wo, "its pull request merged")
     return {"wo_id": wo["id"], "status": status, "was": wo["status"],
             "pr_url": wo.get("pr_url"), "merged_at": merged_at,
             "session_stopped": stopped["stopped"]}
+
+
+def after_completion(store: ProjectStore, wo: dict[str, Any], how: str) -> str:
+    """Backlog item, then the owed user step or the completion notice; the status it leaves"""
+    mark_backlog_done(wo)
+    if owed := declared_user_action(store, wo["id"]):
+        return park_user_action(store, wo, owed)
+    notify_completed(store, wo, how)
+    return "completed"
 
 
 def settle_superseded(store: ProjectStore, wo: dict[str, Any], why: str,
@@ -6185,10 +6302,12 @@ def settle_superseded(store: ProjectStore, wo: dict[str, Any], why: str,
     store.update_work_order(wo["id"], pr_state="CLOSED")
     # The written decision INV-WORK-LANDED reads: this pull request will never merge
     store.add_event(wo["id"], "abandoned", {"reason": why, "source": "superseded"})
-    close_out(store, wo, "pr_superseded_settled", why="its work reached the base first",
-              payload={"pr_url": wo.get("pr_url"), "passed_round": passed_round})
-    mark_backlog_done(wo)
-    notify_completed(store, wo, "superseded, an equivalent change is on the base")
+    stopped = close_out(store, wo, "pr_superseded_settled",
+                        why="its work reached the base first",
+                        payload={"pr_url": wo.get("pr_url"), "passed_round": passed_round})
+    if stopped["status"] == "completed":
+        mark_backlog_done(wo)
+        notify_completed(store, wo, "superseded, an equivalent change is on the base")
 
 
 def record_pr_closed(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
@@ -10293,8 +10412,8 @@ def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
         route = kind_contract(wo).route
         if route == SETTLE_IN_SESSION:
             store.update_work_order(wo_id, result_summary=summary)
-            settle_in_session(store, wo, event, payload=payload)
-            return {"wo_id": wo_id, "status": "completed", "session_stopped": False}
+            status = settle_in_session(store, wo, event, payload=payload)
+            return {"wo_id": wo_id, "status": status, "session_stopped": False}
     finally:
         store.close()
     if route == SETTLE_BY_FINISH:
@@ -11534,8 +11653,8 @@ def submit_decision_forecast(do_id: str, doc: Any,
         if wo is not None and wo["status"] in OPEN_STATUSES:
             # A forecast is not a deliverable: no validation round, whatever the kind's route
             store.update_work_order(wo["id"], result_summary=reason)
-            settle_in_session(store, wo, DECISION_FORECAST_EVENT, payload=payload)
-            researcher = {"wo_id": wo["id"], "status": "completed", "session_stopped": False}
+            status = settle_in_session(store, wo, DECISION_FORECAST_EVENT, payload=payload)
+            researcher = {"wo_id": wo["id"], "status": status, "session_stopped": False}
         elif wo is not None:
             store.add_event(wo["id"], DECISION_FORECAST_EVENT, payload)
         flagged = store.raise_decision(
@@ -19651,6 +19770,10 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "Neo holds or is about to be asked a pending assumption of this order: "
               "a row `invariants.assumptions_owed_to_user` does not yet give the user",
               "daemon.reviews_assumptions", reviews_assumptions),
+        _Pass("Daemon.complete_decided_artifacts",
+              "the artifact gate parked this finished order and the user has decided "
+              "every artifact, so the pass completes it (artifact-session-hold §5.3)",
+              "daemon.completes_decided_artifacts", completes_decided_artifacts),
         REVIEWS_GATE,
     )),
     "waiting_pr_merge": ActorPasses((
