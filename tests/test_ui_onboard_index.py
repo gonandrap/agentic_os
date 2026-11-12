@@ -62,7 +62,7 @@ def test_copy_edit_apply_is_three_requests(client, tmp_path):
     assert "Copied from <b>proj_a</b>" in client.get("/onboard/newproj/review").text
     r = client.post("/onboard/newproj/apply", data={
         "rev": ops.onboard_view("newproj")["rev"], "reason": "like proj_a"})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 303 and "/onboard/newproj/applied/" in r.headers["location"], r.text
     # Control: a fresh draft keeps its must-haves open, and its edits stay on the section
     other = make_git_project(tmp_path / "work", "fresh")
     r = client.post("/onboard", data={"path": str(other)})
