@@ -20,6 +20,7 @@ from jarvis.testing import make_git_project
 from jarvis.ui import help_pty
 from jarvis.ui.help_pty import HelpSessions
 
+# clock-exempt: class 3 — deadline spin-waits on real PTY subprocesses and the idle sweep
 NAME = "newproj"
 
 

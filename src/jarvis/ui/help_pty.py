@@ -1,4 +1,4 @@
-"""PTY sessions behind the onboarding help panel (docs/superpowers/specs/2026-11-12-onboarding-help-terminal-panel.md §1, §0.2, §0.3)"""
+"""Help panel PTY sessions (docs/superpowers/specs/2026-11-12-onboarding-help-terminal-panel.md §1)"""
 
 from __future__ import annotations
 
