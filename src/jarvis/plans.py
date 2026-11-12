@@ -334,6 +334,12 @@ ESCALATE to the user, rather than deciding, when:
 - You cannot reconcile the plan with a standing learning below.
 - The ask itself is ambiguous enough that two reasonable decompositions differ, and
   picking one is really picking what the user meant.
+- Any choice listed under "rest only on this feature's OWN spec" is a user-facing
+  interaction choice that interprets or narrows the user's words (the ask said "a
+  session is open"; the choice decides HOW the user meets it). The planner's spec is
+  its own claim, not authority. Use cause `ambiguous-intent` and name each such choice
+  by its `#n` in `reason`. A listed choice that only implements what the words say
+  plainly does not escalate.
 
 Escalating is the safe answer and costs a little of the user's time. Releasing a bad plan
 costs N worker sessions and the review of N pull requests. When genuinely torn, escalate.
@@ -381,9 +387,24 @@ def build_plan_question(fo: dict[str, Any], plan: dict[str, Any]) -> str:
         f"the stored plan (jarvis fo show {fo['id']}):",
         *render_plan_skeleton(plan),
         "",
+        *bundled_lines(plan),
         "Release this plan?",
     ]
     return "\n".join(parts)
+
+
+#: Heads the planner's choices that rest only on its own spec (docs/superpowers/specs/2026-11-12-a-family-spec-is-not-authority.md §3.3)
+BUNDLED_HEADING = ("Choices the planner recorded that rest only on this feature's OWN spec "
+                   "— the planner wrote it, so it is not authority. Judge each against "
+                   "the user's words above; releasing the plan accepts every one:")
+
+
+def bundled_lines(plan: dict[str, Any]) -> list[str]:
+    """The bundled planner assumptions, one line each, or nothing"""
+    bundled = plan.get("bundled_assumptions") or []
+    if not bundled:
+        return []
+    return [BUNDLED_HEADING, *(f"  #{b.get('n')}: {b.get('content')}" for b in bundled), ""]
 
 
 def render_plan_skeleton(plan: dict[str, Any]) -> list[str]:
