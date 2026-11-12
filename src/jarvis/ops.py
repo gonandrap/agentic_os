@@ -10835,6 +10835,50 @@ def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
     return q
 
 
+def _bundled_assumptions(path: Path, fo: dict[str, Any]) -> list[dict[str, Any]]:
+    """The planner's rows this plan review carries (docs/superpowers/specs/2026-11-12-a-family-spec-is-not-authority.md §3.3)"""
+    from . import autoreview
+
+    planner_id = str(fo.get("plan_wo_id") or "")
+    if not planner_id:
+        return []
+    store = ProjectStore(path)
+    try:
+        wo = store.get_work_order(planner_id)
+        return [{"id": int(a["id"]), "n": a.get("n"), "content": str(a["content"])}
+                for a in store.all_assumptions(planner_id)
+                if a["status"] == "pending"
+                and autoreview.bundled_into_plan(store, wo, a)]
+    finally:
+        store.close()
+
+
+def _settle_bundled(store: ProjectStore, path: Path, name: str, fo: dict[str, Any],
+                    plan: dict[str, Any], decided_by: str, feedback: str) -> None:
+    """A released plan accepts the rows it carried, in its releaser's name (§3.3)"""
+    planner_id = str(fo.get("plan_wo_id") or "")
+    ids = {int(b["id"]) for b in plan.get("bundled_assumptions") or []}
+    if not (planner_id and ids):
+        return
+    wo = store.get_work_order(planner_id)
+    cfg = validation_config(name)
+    reason = f"released with the plan of {fo['id']} by {decided_by}: {feedback}"
+    land = wo["status"] == "needs_review"
+    for a in store.all_assumptions(planner_id):
+        if int(a["id"]) not in ids or a["status"] not in ("pending", ASSUMPTION_LAPSED):
+            continue
+        if decided_by == ASSUMPTION_DECIDER_OS:
+            accept_assumption(store, path, wo, a, reason=reason, model="",
+                              question_id=int(fo.get("plan_question_id") or 0),
+                              cfg=cfg, land=land)
+        else:
+            store.review_assumption(a["id"], "accepted", decided_by=decided_by,
+                                    reason=reason)
+    if land and decided_by != ASSUMPTION_DECIDER_OS \
+            and not store.pending_assumptions(planner_id):
+        _land_after_acceptance(store, path, planner_id, cfg)
+
+
 def submit_plan(fo_id: str, doc: Any, project_name: str | None = None,
                 source: Path | None = None) -> dict[str, Any]:
     """(Planners) hand back the decomposition"""
@@ -10878,6 +10922,7 @@ def submit_plan(fo_id: str, doc: Any, project_name: str | None = None,
 
     # §3: after the committed-copy check
     _record_spec_pull_request(path, fo_id, planner_wo, plan["design_doc"])
+    plan["bundled_assumptions"] = _bundled_assumptions(path, fo)
 
     # The planner is who Neo's question hangs off: it is a real work order
     planner_id = fo.get("plan_wo_id") or fo_id
@@ -11107,6 +11152,7 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
             # The feature's own agent type, built from the spec's `Agent profile` appendix
             specs.install_agent(path, fo_id, str(plan.get("summary") or fo["title"]),
                                 str(plan.get("design_doc_content") or ""))
+            _settle_bundled(store, path, name, fo, plan, decided_by, feedback)
         else:
             children = []
             store.set_feature_status(fo_id, "planning")

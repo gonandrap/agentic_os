@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -127,6 +128,49 @@ def _plan_section_for_title(plan: dict[str, Any], title: str) -> str:
              for c in (plan.get("children") or [])
              if isinstance(c, dict) and str(c.get("title") or "") == title]
     return found[0] if len(found) == 1 else ""
+
+
+def family_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The `feature` order this order belongs to, or None (docs/superpowers/specs/2026-11-12-a-family-spec-is-not-authority.md §3.1)"""
+    parent = str(wo.get("parent_id") or "")
+    if not parent:
+        return None
+    try:
+        fo = store.get_feature_order(parent)
+    except KeyError:
+        return None
+    return fo if fo.get("kind", "feature") == "feature" else None
+
+
+def predates(repo: Path, spec_path: str, ts: float) -> bool:
+    """Whether the default branch held `spec_path` before `ts`, False with no git answer"""
+    if not spec_path:
+        return False
+    # Not `evidence.base_ref`: only the round machine may import evidence (tests/test_evidence.py)
+    for ref in ("origin/HEAD", "origin/main", "main"):
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo), "log", "-1", "--format=%H",
+                 f"--before=@{int(ts)}", ref, "--", spec_path],
+                capture_output=True, text=True, check=False)
+        except OSError:
+            return False
+        if proc.returncode == 0:
+            return bool(proc.stdout.strip())
+    return False
+
+
+def family_written(store: ProjectStore, wo: dict[str, Any],
+                   paths: Any) -> tuple[str, set[str]]:
+    """`(fo_id, the paths that feature order wrote)`, or `("", set())` outside a family"""
+    fo = family_of(store, wo)
+    if fo is None:
+        return "", set()
+    repo = Path(store.project_path)
+    since = float(fo.get("created_at") or 0)
+    own = {p for p in {str(p).strip() for p in paths} - {""}
+           if not predates(repo, p, since)}
+    return str(fo["id"]), own
 
 
 def spec_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
