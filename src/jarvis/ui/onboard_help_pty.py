@@ -149,6 +149,8 @@ def register(app: FastAPI, render: Callable[..., HTMLResponse]) -> None:
                             msg = await ws.receive()
                             if msg["type"] == "websocket.disconnect":
                                 break
+                            if attached.get(name) is not q:
+                                continue  # replaced: keystrokes until the 4409 lands are not ours
                             if msg.get("bytes") is not None:
                                 s.write(msg["bytes"])
                             elif msg.get("text") is not None:

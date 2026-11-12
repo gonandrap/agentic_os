@@ -18,6 +18,7 @@ from starlette.websockets import WebSocketDisconnect  # noqa: E402
 from jarvis import claude_cli, interview, ops, paths, wiring  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.testing import make_git_project  # noqa: E402
+from jarvis.ui import help_pty  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 
 # clock-exempt: class 3 — deadline waits on real PTY subprocesses behind a websocket
@@ -238,6 +239,26 @@ def test_helper_exit_closes_the_socket_1000(section, fake_claude):
             _read_until(ws, b"interactive")
             ws.send_bytes(b"/exit\r")
             assert _close_code(ws) == 1000
+
+
+def test_lifespan_registry_closes_an_idle_helper(section, fake_claude, monkeypatch):
+    # HelpSessions starts its own idle sweep in __init__; shorten it for the test
+    class Quick(help_pty.HelpSessions):
+        def __init__(self):
+            super().__init__(idle_seconds=0.2)
+
+    monkeypatch.setattr(help_pty, "HelpSessions", Quick)
+    with _client() as c:
+        lone = _start(c, section).json()["token"]
+        lone_pid = _pid(c)
+        assert lone and _wait(lambda: _gone(lone_pid))
+        # Control: an attached session survives the same sweep
+        token = _start(c, section).json()["token"]
+        held_pid = _pid(c)
+        with _ws(c, token) as ws:
+            _read_until(ws, b"interactive")
+            time.sleep(0.6)
+            assert not _gone(held_pid)
 
 
 def test_startup_reaps_a_dead_dashboards_helper(section, fake_claude):
