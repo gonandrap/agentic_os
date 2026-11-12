@@ -1215,7 +1215,7 @@ class Daemon:
                 self.route_outbox(project, store)
                 # Turns are Jarvis's own processes, so reaping them costs a signal and a file read
                 self.settle_turns(project, store)
-                # After settlement and before delivery: a woken reply gets its row before a message could resume over it
+                # Before delivery: a woken reply gets its row before a message resumes over it
                 if reconcile:
                     self.hold_artifact_sessions(project, store)
                 # Before delivery, not after: a work order whose window has just reopened must re-send the turn it...

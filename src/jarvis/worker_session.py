@@ -1120,16 +1120,16 @@ def _reap_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
                                        cost_usd=cost,
                                        num_turns=(envelope or {}).get("api_calls"),
                                        usage=envelope)
+    # A held session stays up for its comment watch; the next resume stops it first (§4.1)
     if entry is not None and entry.alive and budget_cap is None and not held(store, wo):
         # Settled and idle; WAIT for the process, or a resume right after forks a copy (fact 8)
-        # A held session stays up for its comment watch; the next resume stops it first (§4.1)
         claude_cli.stop_bg(entry.id)
     return _settle_result(store, turn, result, project_name)
 
 
 # -- the held session (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §4)
 
-#: Revive = respawn, no turn: §2 probe P2 YES (docs/findings/2026-11-artifact-session-hold-probe.md, session c)
+#: Revive = respawn, no turn: probe P2 YES (docs/findings/2026-11-artifact-session-hold-probe.md)
 ARTIFACT_REVIVED_EVENT = "artifact_session_revived"
 ARTIFACT_REVIVE_FAILED_EVENT = "artifact_session_revive_failed"
 #: Seen alive again after failed revives: ends the streak
@@ -1234,8 +1234,7 @@ def hold_session(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
     if revive_failures(store, wo["id"]):
         store.add_event(wo["id"], ARTIFACT_SESSION_LIVE_EVENT, {"bg_id": entry.id})
     if not entry.idle:
-        # A Send to Claude woke it: record the turn so `poll` reaps and prices it (§4.5.1)
-        # Just past the last `Stop`, so that `Stop`'s message is not read as this reply's
+        # Woken by Send to Claude: a row just past the last Stop, so `poll` prices it (§4.5.1)
         started = _last_settled_at(store, wo["id"]) + 0.001
         row = store.create_turn(wo["id"], ARTIFACT_REPLY_TURN,
                                 prompt="(comment-woken turn)", started_at=started)

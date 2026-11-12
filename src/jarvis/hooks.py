@@ -2209,7 +2209,7 @@ COMMENT_FENCE_REASON = ("Comment-woken turn: only ArtifactComments may run. View
 
 def comment_fence_decision(payload: dict[str, Any], env: dict[str, str]
                            ) -> dict[str, Any] | None:
-    """PreToolUse: deny all but ArtifactComments while a held session runs a turn the OS did not start (§4.5.5)"""
+    """PreToolUse: only ArtifactComments in a turn the OS did not start (spec 2026-11-10 §4.5.5)"""
     from .project_store import ARTIFACT_TURN_KINDS
 
     tool = payload.get("tool_name")
