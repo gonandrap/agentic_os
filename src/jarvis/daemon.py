@@ -1215,6 +1215,9 @@ class Daemon:
                 self.route_outbox(project, store)
                 # Turns are Jarvis's own processes, so reaping them costs a signal and a file read
                 self.settle_turns(project, store)
+                # After settlement and before delivery: a woken reply gets its row before a message could resume over it
+                if reconcile:
+                    self.hold_artifact_sessions(project, store)
                 # Before delivery, not after: a work order whose window has just reopened must re-send the turn it...
                 if retry_paused:
                     self.retry_paused_turns(project, store, state)
@@ -5452,6 +5455,24 @@ class Daemon:
                 self.settle_work_order(project, store, wo)
             except Exception:  # noqa: BLE001 — same isolation as the sweep above
                 log.exception("[%s] settling %s failed", project.name, wo["id"])
+
+
+    def hold_artifact_sessions(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Keep every held order's session live, with no turn sent to keep it so (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §4.2)"""
+        held = store.held_orders()
+        if not held:
+            return  # an idle fleet spawns nothing
+        try:
+            roster = claude_cli.bg_roster()
+        except claude_cli.ClaudeCliError as e:
+            log.warning("[%s] could not read `claude agents` (%s); held sessions wait",
+                        project.name, e)
+            return
+        for wo in held:
+            try:
+                worker_session.hold_session(store, project, wo, roster)
+            except Exception:  # noqa: BLE001 — one order must not stall the rest
+                log.exception("[%s] holding %s failed", project.name, wo["id"])
 
     @staticmethod
     def _land_deferred(store: ProjectStore, wo: dict) -> None:

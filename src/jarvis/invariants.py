@@ -1077,6 +1077,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         # NOBODY OWNS IT, AND NOTHING IS OWED
         elif governed and actor is None and not blockers:
             blockers.append(NO_ACTOR_BLOCKER.format(status=wo["status"]))
+    # A held artifact session gone dark or a reply over its cap (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §4)
+    blockers.extend(artifact_hold_blockers(store, wo))
     # Below everything above: the flag asks for the more specific fact first
     blockers.extend(alarm_blockers(store, wo))
     # A DECLARED USER STEP OWNS THE LINE: whatever ranked above it rides on it (#1697)
@@ -4879,6 +4881,70 @@ def check_fix_registered_its_gap(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+# -- the held artifact session (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §4)
+
+INV_ARTIFACT_HELD = "INV-ARTIFACT-HELD"
+
+ARTIFACT_REVIVE_FAILED_BLOCKER = (
+    "its artifact session could not be revived after {n} tries, so comments on {urls} "
+    "reach nobody: `jarvis wo respawn {wo_id}`")
+ARTIFACT_REPLY_CAPPED_BLOCKER = (
+    "a comment reply on {urls} hit its ${cap:.2f} cap and was stopped; the next comment "
+    "gets a fresh cap")
+
+#: Two reconcile periods at the default 5 s tick (daemon.RECONCILE_EVERY_TICKS = 6)
+ARTIFACT_REVIVE_WINDOW = 2 * 6 * 5.0
+
+
+def artifact_hold_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
+    """What a held session owes the user: a revive that keeps failing, a reply over its cap (§4.2, §4.5.3)"""
+    if not worker_session.held(store, wo):
+        return []
+    urls = ", ".join(a["url"] for a in store.undecided_artifacts(wo["id"]))
+    lines: list[str] = []
+    failures = worker_session.revive_failures(store, wo["id"])
+    if failures >= worker_session.ARTIFACT_REVIVE_MAX_FAILURES:
+        lines.append(ARTIFACT_REVIVE_FAILED_BLOCKER.format(n=failures, urls=urls,
+                                                           wo_id=wo["id"]))
+    reply = store.latest_turn(wo["id"], kind=worker_session.ARTIFACT_REPLY_TURN)
+    if (reply is not None and reply["state"] == "failed"
+            and reply.get("terminal_reason") == claude_cli.BUDGET_TERMINAL_REASON):
+        from .ops import artifact_reply_budget
+
+        lines.append(ARTIFACT_REPLY_CAPPED_BLOCKER.format(urls=urls,
+                                                          cap=artifact_reply_budget()))
+    return lines
+
+
+def check_artifact_held(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ARTIFACT-HELD — a held order's session is live, or was revived lately (§4.4)"""
+    held = store.held_orders()
+    if not held:
+        return
+    try:
+        roster = claude_cli.bg_roster()
+    except claude_cli.ClaudeCliError:
+        return  # no roster is no verdict
+    now = time.time()
+    for wo in held:
+        entry = roster.get(str(wo.get("session_id") or ""))
+        if entry is not None and entry.alive:
+            continue
+        revived = store.last_event_of_kind(wo["id"], worker_session.ARTIFACT_REVIVED_EVENT)
+        if revived is not None and now - float(revived["ts"]) <= ARTIFACT_REVIVE_WINDOW:
+            continue
+        yield Violation(
+            invariant=INV_ARTIFACT_HELD,
+            wo_id=wo["id"],
+            detail=(f"holds a session for an undecided artifact, but session "
+                    f"{wo.get('bg_id') or wo.get('session_id')} has no process and was "
+                    f"not revived in the last {int(ARTIFACT_REVIVE_WINDOW)} s"),
+            repaired=False,
+            context={"bg_id": wo.get("bg_id"),
+                     "failures": worker_session.revive_failures(store, wo["id"])},
+        )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
                                    # reading, repairing nothing and touching no flag any other check derives
@@ -4911,6 +4977,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_pull_request_recorded,   # order-free: a pure timeline read that repairs
                                    # nothing and touches no flag
     check_closed_session_removed,  # ditto: a pure read of what the poll could not remove
+    check_artifact_held,           # ditto: the daemon's hold pass repairs, this only reads
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
     check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger

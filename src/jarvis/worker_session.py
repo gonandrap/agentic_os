@@ -14,7 +14,8 @@ from typing import Any
 from . import (background, budget, claude_cli, context, db, session_dispatch,
                systemd_units, usage)
 from .catalog import ProjectSpec
-from .project_store import (COMPACT_TURN, COST_FROM_TRANSCRIPT, SESSION_KEPT_EVENT,
+from .project_store import (ARTIFACT_ARM_TURN, ARTIFACT_REPLY_TURN, ARTIFACT_TURN_KINDS,
+                            COMPACT_TURN, COST_FROM_TRANSCRIPT, SESSION_KEPT_EVENT,
                             REFUSED_ARTIFACT_EVENT, SUBMITTED_ARTIFACT_EVENT,
                             TERMINAL_STATUSES, ProjectStore, pr_body_file,
                             submission_artifacts)
@@ -120,9 +121,26 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any],
 
 
 def busy(store: ProjectStore, wo_id: str) -> dict[str, Any] | None:
-    """The work order's in-flight turn, or None"""
-    turn = store.latest_turn(wo_id)
-    return turn if turn and turn["state"] == "running" else None
+    """The work order's in-flight turn, a held session's reply included, or None (§4.5.4)"""
+    turn = store.latest_turn(wo_id, include_artifact=True)
+    if turn and turn["state"] == "running":
+        return turn
+    try:
+        wo = store.get_work_order(wo_id)
+    except KeyError:
+        return None
+    if not (is_background(wo) and wo.get("session_id") and store.undecided_artifacts(wo_id)):
+        return None
+    # A reply the next hold check has not recorded yet: only the roster sees it
+    try:
+        entry = claude_cli.bg_roster().get(str(wo["session_id"]))
+    except claude_cli.ClaudeCliError:
+        return None
+    if entry is None or not entry.alive or entry.idle:
+        return None
+    return {"id": None, "wo_id": wo_id, "seq": None, "kind": ARTIFACT_REPLY_TURN,
+            "state": "running", "pid": None, "unit": None, "msg_id": None,
+            "started_at": time.time()}
 
 
 #: `DeliveryHold.kind`, so a caller could branch on the hold without matching its prose
@@ -843,6 +861,17 @@ def _settle_result(store: ProjectStore, turn: dict[str, Any],
     source = (COST_FROM_TRANSCRIPT
               if ((result.usage or {}).get("reported") or {}).get("source") == "transcript"
               else None)
+    if turn["kind"] in ARTIFACT_TURN_KINDS:
+        # Never the order's reply and never a pause: an event for the timeline (§4.5.2)
+        text = result.result or _last_assistant_message(store, wo_id, turn) or ""
+        store.add_event(wo_id, turn["kind"] if result.ok else f"{turn['kind']}_failed", {
+            "seq": turn["seq"], "text": text[:500], "cost_usd": result.cost_usd,
+            **({} if result.ok else {"error": (result.error or "")[:500]})})
+        return store.finish_turn(turn["id"], "done" if result.ok else "failed",
+                                 result=text, error=None if result.ok else result.error,
+                                 cost_usd=result.cost_usd, num_turns=result.num_turns,
+                                 usage_json=usage_json, cost_source=source,
+                                 terminal_reason=result.terminal_reason)
     if not result.ok:
         # A turn lost to the usage window or to a broken API is not a failure of the work
         overspent = claude_cli.stopped_for_budget(result)
@@ -949,13 +978,20 @@ def _poll_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
     """Reap a background turn once its session has SETTLED, or None while it works"""
     entry = roster.get(str(wo.get("session_id") or ""))
     age = time.time() - turn["started_at"]
+    own = turn["kind"] in ARTIFACT_TURN_KINDS
     if entry is not None and entry.alive and not entry.idle:
         # Busy covers the worker's own background tasks too (fact 10): never cut one short
-        cap = _bg_over_budget(store, wo, turn)
+        cap = (_reply_over_cap(store, wo, turn) if turn["kind"] == ARTIFACT_REPLY_TURN
+               else _bg_over_budget(store, wo, turn))
         if cap is not None:
             claude_cli.stop_bg(entry.id)
-            return _reap_bg(store, wo, turn, entry, project_name, budget_cap=cap)
-        if _parked_on_message(store, wo, turn) or _busy_but_done(store, wo, turn, entry):
+            done = _reap_bg(store, wo, turn, entry, project_name, budget_cap=cap)
+            if turn["kind"] == ARTIFACT_REPLY_TURN:
+                _raise_artifact_attention(store, wo)
+            return done
+        # A held session's own turn is never a stuck worker turn (§4.5.1)
+        if not own and (_parked_on_message(store, wo, turn)
+                        or _busy_but_done(store, wo, turn, entry)):
             # ...unless parked on a queued message (#1400) or done with no task (#1476); `_reap_bg` stops it
             return _reap_bg(store, wo, turn, entry, project_name)
         return None
@@ -1084,10 +1120,135 @@ def _reap_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
                                        cost_usd=cost,
                                        num_turns=(envelope or {}).get("api_calls"),
                                        usage=envelope)
-    if entry is not None and entry.alive and budget_cap is None:
+    if entry is not None and entry.alive and budget_cap is None and not held(store, wo):
         # Settled and idle; WAIT for the process, or a resume right after forks a copy (fact 8)
+        # A held session stays up for its comment watch; the next resume stops it first (§4.1)
         claude_cli.stop_bg(entry.id)
     return _settle_result(store, turn, result, project_name)
+
+
+# -- the held session (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §4)
+
+#: Revive = respawn, no turn: §2 probe P2 YES (docs/findings/2026-11-artifact-session-hold-probe.md, session c)
+ARTIFACT_REVIVED_EVENT = "artifact_session_revived"
+ARTIFACT_REVIVE_FAILED_EVENT = "artifact_session_revive_failed"
+#: Seen alive again after failed revives: ends the streak
+ARTIFACT_SESSION_LIVE_EVENT = "artifact_session_live"
+ARTIFACT_ARM_SENT_EVENT = "artifact_arm_sent"
+ARTIFACT_REVIVE_MAX_FAILURES = 3
+
+ARTIFACT_ARM_PROMPT = ("Housekeeping, not a task: arm comment watches. For each URL below "
+                       "call ArtifactComments with action watch, then reply ARMED. Do not "
+                       "read or answer comments, do not edit files.")
+
+
+def held(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is this order's session held for an undecided artifact (§1.5)?"""
+    return is_background(wo) and bool(store.undecided_artifacts(wo["id"]))
+
+
+def _reply_over_cap(store: ProjectStore, wo: dict[str, Any],
+                    turn: dict[str, Any]) -> float | None:
+    """The per-reply cap a comment-woken turn has spent through, or None (§4.5.3)"""
+    from .ops import artifact_reply_budget
+
+    now = time.time()
+    if now - _budget_checked.get(turn["id"], 0.0) < BG_BUDGET_EVERY:
+        return None
+    _budget_checked[turn["id"]] = now
+    cap = artifact_reply_budget()
+    try:
+        spent = usage.cost_between(str(wo.get("session_id") or ""), turn["started_at"], now)
+    except OSError:
+        return None
+    return cap if spent >= cap else None
+
+
+def revive_failures(store: ProjectStore, wo_id: str) -> int:
+    """Consecutive failed revives, newest first, up to the last success or live sighting"""
+    n = 0
+    for event in store.list_events(wo_id, limit=200, newest=True):
+        if event["kind"] == ARTIFACT_REVIVE_FAILED_EVENT:
+            n += 1
+        elif event["kind"] in (ARTIFACT_REVIVED_EVENT, ARTIFACT_SESSION_LIVE_EVENT):
+            break
+    return n
+
+
+def _raise_artifact_attention(store: ProjectStore, wo: dict[str, Any]) -> None:
+    """Flag the line `true_blockers` derives for the hold, and say it once (§4.2, §4.5.3)"""
+    from .invariants import artifact_hold_blockers
+
+    lines = artifact_hold_blockers(store, wo)
+    if not lines:
+        return
+    store.flag_attention(wo["id"], lines[0])
+    store.add_notification(title=f"{wo['id']}: its artifact session needs you",
+                           body=lines[0], level="warning", wo_id=wo["id"],
+                           source="reconciler", paired=True)
+
+
+def _arm_targets(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """Undecided artifacts whose publish armed no watch in the order's own session (§1.4 item 9)"""
+    sent: set[str] = set()
+    for event in store.list_events(wo["id"], limit=200, newest=True):
+        if event["kind"] == ARTIFACT_ARM_SENT_EVENT:
+            sent.update((db.from_json(event.get("payload"), {}) or {}).get("art_ids") or [])
+    sid = wo.get("session_id")
+    return [a for a in store.undecided_artifacts(wo["id"])
+            if a["id"] not in sent
+            and (a["via_subagent"] or (a["session_id"] and a["session_id"] != sid))]
+
+
+def _last_settled_at(store: ProjectStore, wo_id: str) -> float:
+    """When the session last went quiet: its last `Stop`, or its last turn's settlement"""
+    last = store.latest_turn(wo_id, include_artifact=True)
+    stops = [float(e["ts"]) for e in store.list_events(wo_id, limit=200, newest=True)
+             if e["kind"] == "hook:Stop"]
+    return max([*stops, float((last or {}).get("ended_at") or 0.0)])
+
+
+def hold_session(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
+                 roster: dict[str, claude_cli.BgEntry]) -> str | None:
+    """One held order's check: revive a dropped session, record a woken one, arm a watch (§4.2-§4.5.1)"""
+    turn = store.latest_turn(wo["id"], include_artifact=True)
+    if turn is not None and turn["state"] == "running":
+        return None  # `poll` owns it
+    sid = str(wo.get("session_id") or "")
+    if not sid:
+        return None
+    entry = roster.get(sid)
+    if entry is None or not entry.alive:
+        failures = revive_failures(store, wo["id"])
+        if failures >= ARTIFACT_REVIVE_MAX_FAILURES:
+            return None  # said once; the user's `jarvis wo respawn` ends the streak
+        short = entry.id if entry is not None else str(wo.get("bg_id") or sid[:8])
+        if claude_cli.respawn_bg(short):
+            store.add_event(wo["id"], ARTIFACT_REVIVED_EVENT, {"bg_id": short})
+            return "revived"
+        store.add_event(wo["id"], ARTIFACT_REVIVE_FAILED_EVENT,
+                        {"bg_id": short, "attempt": failures + 1})
+        if failures + 1 >= ARTIFACT_REVIVE_MAX_FAILURES:
+            _raise_artifact_attention(store, wo)
+        return "revive_failed"
+    if revive_failures(store, wo["id"]):
+        store.add_event(wo["id"], ARTIFACT_SESSION_LIVE_EVENT, {"bg_id": entry.id})
+    if not entry.idle:
+        # A Send to Claude woke it: record the turn so `poll` reaps and prices it (§4.5.1)
+        # Just past the last `Stop`, so that `Stop`'s message is not read as this reply's
+        started = _last_settled_at(store, wo["id"]) + 0.001
+        row = store.create_turn(wo["id"], ARTIFACT_REPLY_TURN,
+                                prompt="(comment-woken turn)", started_at=started)
+        store.add_event(wo["id"], "artifact_reply_started", {"seq": row["seq"]})
+        return "reply"
+    targets = _arm_targets(store, wo)
+    if not targets:
+        return None
+    cwd = worktree_path(project, wo) or project.path
+    _launch(store, project, wo, "\n".join([ARTIFACT_ARM_PROMPT, *(a["url"] for a in targets)]),
+            kind=ARTIFACT_ARM_TURN, resume=True, worktree=None, cwd=cwd)
+    store.add_event(wo["id"], ARTIFACT_ARM_SENT_EVENT, {"art_ids": [a["id"] for a in targets]})
+    return "armed"
 
 
 def _last_assistant_message(store: ProjectStore, wo_id: str,
@@ -1447,6 +1608,10 @@ def cancel(store: ProjectStore, wo_id: str) -> dict[str, Any]:
         return {"stopped": False, "reason": "no turn in flight"}
     wo = store.get_work_order(wo_id)
     unit = turn.get("unit")
+    if turn["id"] is None:
+        # A comment-woken reply with no row yet: stop it, there is nothing to settle
+        killed = bool(wo.get("bg_id")) and claude_cli.stop_bg(str(wo["bg_id"]))
+        return {"stopped": killed, "pid": None, "unit": None, "seq": None}
     if is_background(wo):
         # `claude stop` keeps the conversation; the next prompt resumes it
         killed = bool(wo.get("bg_id")) and claude_cli.stop_bg(str(wo["bg_id"]))
