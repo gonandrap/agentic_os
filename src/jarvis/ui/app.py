@@ -1150,7 +1150,7 @@ def wiring_groups(scope: str, *, refresh: bool = False) -> dict[str, object]:
 
 
 async def _start_help_sessions(app: FastAPI):
-    """The help terminal registry; a failure leaves the dashboard up (spec 2026-11-12-onboarding-help-terminal-panel.md §2)"""
+    """Help terminal registry; a failure leaves the dashboard up (help-terminal spec §2)"""
     import logging
 
     import anyio
