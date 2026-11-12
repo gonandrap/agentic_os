@@ -4216,10 +4216,15 @@ class Daemon:
                            cause=autoreview.escalation_cause(
                                over_cap=True, escalate=bool(verdict["escalate"])))
         pstore.flag_feature_attention(fo["id"], f"plan needs your review: {reason[:160]}")
+        # The user's words beside each choice (spec 2026-11-12 §3.3)
+        choices = plans.bundled_lines(plan)
+        if choices:
+            choices = [f"You asked: {(fo.get('description') or '')[:600]}", *choices]
         central.add_inbox(
             project=q["project"], level="warning",
             title=f"A plan needs your review: {fo['id']}",
             body=f"{fo['title']}\n{n_children} work orders proposed.\n{reason}\n\n"
+                 + "".join(f"{line}\n" for line in choices) +
                  f"Read it with: jarvis fo show {fo['id']}\n"
                  f"Then: jarvis fo approve {fo['id']} [--reject] --feedback \"...\"",
             wo_id=fo.get("plan_wo_id"),
@@ -6894,6 +6899,11 @@ class Daemon:
         for a in assumptions:
             # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.1
             if str(a.get("status") or "") != "pending":
+                continue
+            # Rides the plan review: one question per feature, not one per row (spec 2026-11-12 §3.3)
+            bundled = autoreview.bundled_into_plan(store, wo, a)
+            if bundled:
+                autoreview.note_bundled(store, wo, a, bundled)
                 continue
             owner = str(a.get("requestor") or "") == autoreview.OWNER_REQUESTOR
             # An owner's early objection is re-asked on the delivered pass, never HELD_OBJECTED (§4.4)
