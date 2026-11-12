@@ -22,6 +22,12 @@ def section_url(name: str, key: str, focus: str = "") -> str:
     return f"{url}?focus={quote(focus)}#k-{slug(focus)}" if focus else url
 
 
+# §0.3: verbs that answer a whole section move on; per-knob verbs stay on their row
+ADVANCE = ("answer", "defaults", "confirm")
+SAVED = {"defaults": "defaults accepted", "confirm": "kept the values shown",
+         "fleet_ack": "fleet warning acknowledged"}
+
+
 def first_section(view: dict[str, Any]) -> str:
     """First unanswered must-have, else first unanswered area, else review (§0.3)"""
     missing = view["progress"]["must_have_missing"]
@@ -53,7 +59,7 @@ def register(app: FastAPI, render: Callable[..., HTMLResponse]) -> None:
 
     def page(request: Request, name: str, key: str, focus: str = "", *,
              error: str = "", error_path: str = "", typed: str | None = None,
-             status_code: int = 200) -> HTMLResponse:
+             saved: bool = False, status_code: int = 200) -> HTMLResponse:
         try:
             view = ops.onboard_view(name)
         except ops.OpsError as e:
@@ -70,7 +76,7 @@ def register(app: FastAPI, render: Callable[..., HTMLResponse]) -> None:
         on_row = any(r["path"] == error_path for r in rows)
         return render(
             request, "onboard_section.html", active="onboard", status_code=status_code,
-            view=view, name=name, here=key, section=section, focus=focus,
+            view=view, name=name, here=key, section=section, focus=focus, saved=saved,
             asked=[r for r in rows if r["kind"] != "classified"],
             classified=[r for r in rows if r["kind"] == "classified"],
             prefilled=key != "identity" and section["status"] == "untouched"
@@ -91,9 +97,10 @@ def register(app: FastAPI, render: Callable[..., HTMLResponse]) -> None:
         return RedirectResponse(section_url(name, first_section(view)), status_code=303)
 
     @app.get("/onboard/{name}/{section}", response_class=HTMLResponse)
-    def onboard_section(request: Request, name: str, section: str, focus: str = ""):
-        """One section of the draft; `focus` marks one row (§3)"""
-        return page(request, name, section, focus)
+    def onboard_section(request: Request, name: str, section: str, focus: str = "",
+                        saved: str = ""):
+        """One section of the draft; `focus` marks one row, `saved` marks it saved (§3)"""
+        return page(request, name, section, focus, saved=bool(saved))
 
     @app.post("/onboard/{name}/edit", response_class=HTMLResponse)
     def onboard_edit(request: Request, name: str, verb: str = Form(""),
@@ -103,14 +110,27 @@ def register(app: FastAPI, render: Callable[..., HTMLResponse]) -> None:
         """`ops.onboard_edit` under another name; a refusal re-renders the section (§3)"""
         target = path or (f"project.{field}" if field else "") or lever
         try:
-            ops.onboard_edit(name, verb, rev=rev, section=section, path=path, value=value,
-                             mode=mode, field=field, lever=lever, wired=wired, fleet=fleet)
+            view = ops.onboard_edit(name, verb, rev=rev, section=section, path=path,
+                                    value=value, mode=mode, field=field, lever=lever,
+                                    wired=wired, fleet=fleet)
         except ops.OpsError as e:
             return page(request, name, section, target, error=str(e), error_path=target,
                         typed=value if verb in ("set", "identity") else None,
                         status_code=400)
         if not section:
             return RedirectResponse(f"/onboard/{quote(name)}", status_code=303)
-        url = section_url(name, section)
-        return RedirectResponse(f"{url}#k-{slug(target)}" if target else url,
-                                status_code=303)
+        title = next((s["title"] for s in view["sections"] if s["key"] == section), section)
+        what = SAVED.get(verb) or (mode.removeprefix("preset:") if verb == "answer"
+                                   else f"{target} changed")
+        note = quote(f"saved: {title} — {what}")
+        if view["project"]["like"]:  # a copied draft's edits return to review (§1)
+            return RedirectResponse(f"/onboard/{quote(name)}/review?note={note}",
+                                    status_code=303)
+        if verb in ADVANCE:
+            return RedirectResponse(
+                f"{section_url(name, first_section(view))}?note={note}", status_code=303)
+        if verb == "fleet_ack" or not target:
+            return RedirectResponse(f"{section_url(name, section)}?note={note}",
+                                    status_code=303)
+        return RedirectResponse(f"/onboard/{quote(name)}/{quote(section)}?focus="
+                                f"{quote(target)}&saved=1#k-{slug(target)}", status_code=303)
