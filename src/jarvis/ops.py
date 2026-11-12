@@ -906,6 +906,16 @@ def artifact_session_cap() -> int:
         return ArtifactsConfig.max_held_sessions
 
 
+def artifact_reply_budget() -> float:
+    """`os.artifacts.reply_budget_usd`; the shipped default when no catalog loads"""
+    from .catalog import ArtifactsConfig
+
+    try:
+        return resolve_catalog().os.artifacts.reply_budget_usd
+    except Exception:  # noqa: BLE001 — no catalog registered, or an unreadable one
+        return ArtifactsConfig.reply_budget_usd
+
+
 def held_order_count() -> int:
     """Orders fleet-wide holding a session for an undecided artifact (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.4)"""
     total = 0
@@ -4987,9 +4997,10 @@ not sent to the panel: a resubmission that answers nothing on the list costs a r
 round and moves the work order no further.
 
 Go back to round {n}'s feedback and address it. If you believe one of those points is
-already answered, or should not be, say which and why in `--evidence` and change the
-file it is about anyway — the review cannot read an argument you did not make in the
-diff. Then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
+already answered, or should not be, say why in `--evidence` and NAME the file it is
+about there: a submission whose evidence names a cited file goes to the panel, which
+judges the argument. Then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
+again."""
 
 #: WHAT A FIX ORDER REFUSED BY THE PRE-CHECK IS TOLD (§7.2 of... (docs/superpowers/specs/2026-09-27-self-evolution.md)
 PRECHECK_FEEDBACK = """REVIEW FEEDBACK (no round was spent)
@@ -5091,6 +5102,7 @@ def _worktree_file_test(project_path: Path,
 def unanswered_paths(store: ProjectStore, wo_id: str, packet: Any, *,
                      project_path: Path,
                      wo: Mapping[str, Any],
+                     argued: str = "",
                      ) -> tuple[dict[str, Any], tuple[str, ...]] | None:
     """`(the round that asked, the paths it asked about)` when this submission answers none of them"""
     from . import validation
@@ -5103,7 +5115,8 @@ def unanswered_paths(store: ProjectStore, wo_id: str, packet: Any, *,
         raised += validation.blockers(validation.findings(op))
     cited = validation.unanswered_submission(
         previous, raised, ProjectStore.validation_file_shas(previous),
-        dict(packet.file_shas), exists=_worktree_file_test(project_path, wo))
+        dict(packet.file_shas), exists=_worktree_file_test(project_path, wo),
+        argued=argued)
     return (previous, cited) if cited is not None else None
 
 
@@ -5171,7 +5184,8 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         return store.get_validation_round(int(round_row["id"]))
     unanswered = (None if forced_reason.strip()
                   else unanswered_paths(store, str(wo["id"]), packet,
-                                        project_path=project_path, wo=wo))
+                                        project_path=project_path, wo=wo,
+                                        argued=declared))
     if unanswered is not None:
         previous, cited = unanswered
         if consecutive_bounces(store, str(wo["id"]),

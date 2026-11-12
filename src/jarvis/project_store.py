@@ -369,10 +369,15 @@ NOT_RETRIED = ("pending", "completed", "cancelled", "budget_exhausted")
 SLOT_STATUSES = ("dispatching", "running")
 
 #: What a `wo_turns` row can be
-TURN_KINDS = ("dispatch", "message", "compact")
+TURN_KINDS = ("dispatch", "message", "compact", "artifact_reply", "artifact_arm")
 
 #: The one whose reply belongs to nobody
 COMPACT_TURN = "compact"
+
+#: A held session's own turns: never the order's reply, never settle it (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §4.5)
+ARTIFACT_REPLY_TURN = "artifact_reply"
+ARTIFACT_ARM_TURN = "artifact_arm"
+ARTIFACT_TURN_KINDS = (ARTIFACT_REPLY_TURN, ARTIFACT_ARM_TURN)
 
 #: Where a turn's `cost_usd` came from — see the `wo_turns.cost_source` comment
 COST_FROM_ENVELOPE = "envelope"
@@ -3835,8 +3840,9 @@ class ProjectStore:
 
     def create_turn(self, wo_id: str, kind: str, prompt: str,
                     msg_id: int | None = None, outfile: str = "",
-                    errfile: str = "", cache_ttl: str = "") -> dict[str, Any]:
-        """Open a turn row"""
+                    errfile: str = "", cache_ttl: str = "",
+                    started_at: float | None = None) -> dict[str, Any]:
+        """Open a turn row; `started_at` back-dates one the OS did not start (§4.5.1)"""
         assert kind in TURN_KINDS, kind
         seq = self.conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM wo_turns WHERE wo_id=?", (wo_id,)
@@ -3845,7 +3851,8 @@ class ProjectStore:
             """INSERT INTO wo_turns (wo_id, seq, kind, msg_id, prompt, started_at,
                                      outfile, errfile, cache_ttl)
                VALUES (?,?,?,?,?,?,?,?,?)""",
-            (wo_id, seq, kind, msg_id, prompt, db.now(), outfile, errfile, cache_ttl),
+            (wo_id, seq, kind, msg_id, prompt,
+             db.now() if started_at is None else started_at, outfile, errfile, cache_ttl),
         )
         return self.get_turn(int(cur.lastrowid))  # type: ignore[arg-type,return-value]
 
@@ -3915,10 +3922,17 @@ class ProjectStore:
             (COMPACT_TURN, since)).fetchall()
         return db.rows_to_dicts(rows)
 
-    def latest_turn(self, wo_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq DESC LIMIT 1", (wo_id,)
-        ).fetchone()
+    def latest_turn(self, wo_id: str, *, include_artifact: bool = False,
+                    kind: str | None = None) -> dict[str, Any] | None:
+        """The order's latest turn; a held session's own turns only when asked (§4.5.2)"""
+        sql, params = "SELECT * FROM wo_turns WHERE wo_id=?", [wo_id]
+        if kind is not None:
+            sql += " AND kind=?"
+            params.append(kind)
+        elif not include_artifact:
+            sql += f" AND kind NOT IN ({','.join('?' * len(ARTIFACT_TURN_KINDS))})"
+            params.extend(ARTIFACT_TURN_KINDS)
+        row = self.conn.execute(sql + " ORDER BY seq DESC LIMIT 1", params).fetchone()
         return dict(row) if row else None
 
     def turn_opened_by(self, turn: dict[str, Any] | None) -> str:
@@ -3946,10 +3960,13 @@ class ProjectStore:
 
     def closed_background_sessions(self) -> list[dict[str, Any]]:
         """Completed or cancelled orders whose background session has not been removed yet"""
+        # An undecided artifact holds the session; its decision is the release (spec 2026-11-10 §4.1)
         rows = self.conn.execute(
             "SELECT * FROM work_orders WHERE transport='background' AND bg_id IS NOT NULL "
             "AND status IN ('completed','cancelled') AND id NOT IN "
-            "(SELECT wo_id FROM wo_turns WHERE state='running')"
+            "(SELECT wo_id FROM wo_turns WHERE state='running') AND id NOT IN "
+            "(SELECT wo_id FROM artifacts WHERE decision IS NULL "
+            "OR decision='delete_requested')"
         ).fetchall()
         return db.rows_to_dicts(rows)
 

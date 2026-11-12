@@ -152,6 +152,7 @@ def _wedge_evidence(figures: dict[str, Any], dump: str) -> str:
 
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
+DEFAULT_POLL_INTERVAL = 5.0  # seconds per tick
 
 #: Reconcile stamp an outside reader judges liveness by; spec 2026-10-16 §2a
 RECONCILE_TICK_KEY = "reconcile_tick"
@@ -764,7 +765,7 @@ class CarryOutcome:
 
 
 class Daemon:
-    def __init__(self, catalog: Catalog, poll_interval: float = 5.0):
+    def __init__(self, catalog: Catalog, poll_interval: float = DEFAULT_POLL_INTERVAL):
         self.catalog = catalog
         # Daemon boot arms the transport backstop too, for the catalog it was HANDED (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
         claude_cli.set_max_os_prompt_chars(catalog.os.max_os_prompt_chars)
@@ -1223,6 +1224,9 @@ class Daemon:
                 self.route_outbox(project, store)
                 # Turns are Jarvis's own processes, so reaping them costs a signal and a file read
                 self.settle_turns(project, store)
+                # Before delivery: a woken reply gets its row before a message resumes over it
+                if reconcile:
+                    self.hold_artifact_sessions(project, store)
                 # Before delivery, not after: a work order whose window has just reopened must re-send the turn it...
                 if retry_paused:
                     self.retry_paused_turns(project, store, state)
@@ -5463,6 +5467,25 @@ class Daemon:
             except Exception:  # noqa: BLE001 — same isolation as the sweep above
                 log.exception("[%s] settling %s failed", project.name, wo["id"])
 
+
+    def hold_artifact_sessions(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Keep every held order's session live, with no turn sent to keep it so (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §4.2)"""
+        held = store.held_orders()
+        if not held:
+            return  # an idle fleet spawns nothing
+        try:
+            roster = claude_cli.bg_roster()
+        except claude_cli.ClaudeCliError as e:
+            log.warning("[%s] could not read `claude agents` (%s); held sessions wait",
+                        project.name, e)
+            return
+        for wo in held:
+            try:
+                worker_session.hold_session(store, project, wo, roster,
+                                            min_context=self.catalog.os.compact_min_context)
+            except Exception:  # noqa: BLE001 — one order must not stall the rest
+                log.exception("[%s] holding %s failed", project.name, wo["id"])
+
     @staticmethod
     def _land_deferred(store: ProjectStore, wo: dict) -> None:
         """The deferred landing, unless a user message postdates the finish (wo-f7ef5098)"""
@@ -9016,7 +9039,7 @@ conflicts, shipit refuses: report its reason and stop. Never fall back to releas
                 store.set_status(known["id"], "running")
 
 
-def run_daemon(catalog_path: str | Path, poll_interval: float = 5.0,
+def run_daemon(catalog_path: str | Path, poll_interval: float = DEFAULT_POLL_INTERVAL,
                log_to_file: bool = True) -> None:
     ensure_home()
     handlers: list[logging.Handler] = [logging.StreamHandler()]

@@ -216,6 +216,37 @@ def test_the_paths_are_returned_when_none_of_them_moved():
 # -- the round records what it judged
 
 
+@pytest.mark.parametrize("argued", [
+    "a/b.py is already fixed on main",
+    "b.py: lint passes, main has the fixes",
+])
+def test_a_cited_path_argued_in_the_evidence_lets_the_panel_judge(argued):
+    """Issue 1702: the review's own 'or correct the record, do not touch X' branch"""
+    found = [{"title": "a/b.py is wrong", "detail": ""}]
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found,
+        {"a/b.py": "1"}, {"a/b.py": "1", "a/z.py": "9"}, argued=argued) is None
+
+
+def test_one_argued_citation_of_two_is_enough_to_reach_the_panel():
+    """Per assumption #2: argued counts like touched, so SOME of the list suffices (spec §5)"""
+    found = [{"title": "a/b.py is wrong", "detail": ""},
+             {"title": "a/c.py is wrong", "detail": ""}]
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found,
+        {"a/b.py": "1", "a/c.py": "2"}, {"a/b.py": "1", "a/c.py": "2", "a/z.py": "9"},
+        argued="a/b.py: main already has it") is None
+
+
+@pytest.mark.parametrize("argued", ["", "ran pytest -q", "see a/bb.py and xb.py"])
+def test_evidence_that_names_no_cited_path_still_bounces(argued):
+    found = [{"title": "a/b.py is wrong", "detail": ""}]
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found,
+        {"a/b.py": "1"}, {"a/b.py": "1", "a/z.py": "9"},
+        argued=argued) == ("a/b.py",)
+
+
 def test_a_judged_round_records_a_digest_per_file(fleet):
     wo = fleet.dispatch()
     fleet.daemon.validator = Validator(passed())
@@ -338,6 +369,20 @@ def test_the_bounce_goes_back_to_the_worker_as_feedback(fleet):
     assert env["to_role"] == "implementor"
     assert "src/app.py" in payload["reason"]
     assert "no round was spent" in payload["reason"]
+
+
+def test_a_resubmission_arguing_the_cited_file_reaches_the_panel(fleet):
+    """Issue 1702: `--evidence` naming the cited file is an answer the panel judges"""
+    wo = fleet.dispatch()
+    v = rejected_once(fleet, wo["id"], "src/app.py")
+    v.outcomes = [passed()]
+
+    edit(fleet, wo["id"], "# unrelated\n", "notes/notes.py")
+    finish(fleet, wo["id"], evidence="src/app.py needs no change: main already has it")
+    fleet.drain()
+
+    assert not events(fleet, wo["id"], "validation_bounced")
+    assert len(v.calls) == 2
 
 
 def test_a_citation_absent_from_the_worktree_reaches_the_panel(fleet):

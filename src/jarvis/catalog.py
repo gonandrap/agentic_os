@@ -796,6 +796,8 @@ class ArtifactsConfig:
     """Fleet ceiling on sessions held alive for an undecided artifact (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.4)"""
 
     max_held_sessions: int = 10
+    #: Per comment-woken reply (§4.5.3)
+    reply_budget_usd: float = 1.00
 
 
 def _parse_artifacts(raw: Any) -> ArtifactsConfig:
@@ -805,7 +807,10 @@ def _parse_artifacts(raw: Any) -> ArtifactsConfig:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise _err(f"os.artifacts.max_held_sessions must be a whole number >= 0, "
                    f"got {value!r}")
-    return ArtifactsConfig(max_held_sessions=value)
+    reply = raw.get("reply_budget_usd", ArtifactsConfig.reply_budget_usd)
+    if isinstance(reply, bool) or not isinstance(reply, (int, float)) or reply <= 0:
+        raise _err(f"os.artifacts.reply_budget_usd must be a number > 0, got {reply!r}")
+    return ArtifactsConfig(max_held_sessions=value, reply_budget_usd=float(reply))
 
 
 @dataclass
