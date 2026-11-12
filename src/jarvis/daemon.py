@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import logging
 import os
 import re
@@ -15,8 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               notify, release, usage_meter, verdicts, worker_session)
+from . import (background, bugreport, bus, claude_cli, config_version, db, fleet, holds,
+               inspection, notify, release, service_manager, usage_meter, verdicts,
+               worker_session)
 from . import budget as budget_mod
 from . import steward
 from .catalog import DEFAULT_STAKES_CLASSIFIER, Catalog, ProjectSpec, load_catalog
@@ -64,6 +66,9 @@ log = logging.getLogger("jarvisd")
 #: The objection withdrawal rate's window, and the sample below which it is noise
 OBJECTION_ALARM_WINDOW_DAYS = 7
 OBJECTION_ALARM_MIN_SENT = 3
+
+#: `os_state` key: the open catalog-reload refusal's inbox id, resolved by the next good load
+RELOAD_REFUSAL_KEY = "catalog_reload_refusal_inbox"
 
 #: Why an objection was taken back
 
@@ -827,6 +832,8 @@ class Daemon:
         self.offboarded: frozenset[str] = frozenset()
         self.owner_move_warned = False
         self.evict_offboarded()
+        # A fresh daemon has loaded the catalog a previous run refused
+        self._resolve_reload_refusal("the daemon restarted on it")
 
     # -- lifecycle
 
@@ -1052,7 +1059,8 @@ class Daemon:
         if self._catalog_stamp is not None and mtime == self._catalog_stamp[0]:
             return False
         try:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
         except OSError as e:
             self._refuse_reload(f"cannot read the catalog at {path}: {e}")
             return False
@@ -1076,11 +1084,10 @@ class Daemon:
         gone = self._read_offboarded()
         offboarded = {n for n in before - after if n in gone or n not in registered}
         if after - gone != before - gone - offboarded:
-            self._refuse_reload(
-                f"{path} added or removed a project, and that is not a setting: a new "
-                f"project has never been through `bootstrap_project`, and a removed one "
-                f"leaves an open store behind. Run `jarvis start` to apply it. Setting "
-                f"changes in the same file are not applied either until you do.")
+            self._refuse_project_change(
+                path, raw, added=sorted((after - gone) - (before - gone - offboarded)),
+                removed=sorted((before - gone - offboarded) - (after - gone)),
+                registered=registered)
             return False
         owner = self._os_owner()
         self.catalog = fresh.without_projects(gone)
@@ -1088,6 +1095,7 @@ class Daemon:
         self._close_orphan_stores()
         self.catalog_reload_warned = False
         self._publish_projects()
+        self._resolve_reload_refusal("the running daemon reloaded the catalog")
         log.info("catalog reloaded from %s", path)
         return True
 
@@ -1122,15 +1130,66 @@ class Daemon:
                  build, len(moved), row["id"])
         return row
 
-    def _refuse_reload(self, detail: str) -> None:
+    def _refuse_project_change(self, path: Path, raw: bytes, *, added: list[str],
+                               removed: list[str], registered: set[str]) -> None:
+        """Outcome first, the project named, one action that works (io-74eab254)"""
+        if added and not removed:
+            verb = "is" if len(added) == 1 else "are"
+            outcome = f"{', '.join(added)} {verb} saved but not running yet"
+        elif removed and not added:
+            verb = "is" if len(removed) == 1 else "are"
+            outcome = f"{', '.join(removed)} left the catalog but {verb} still running"
+        else:
+            outcome = (f"catalog adds {', '.join(added)} and removes {', '.join(removed)}, "
+                       f"not live yet")
+        name = (added or removed)[0]
+        ui = notify.ui_base_url(self.catalog)
+        link = f"{ui}/project/{name}" if name in registered else ui
+        # `jarvis start` is a no-op while this daemon runs (kn-4fc0d66f)
+        body = (f"{outcome}. A running daemon picks up projects only when "
+                f"it starts, so this change, and any setting changed with it, waits for a "
+                f"restart.\n\n"
+                f"Restart it: `{service_manager.restart_hint(release.DAEMON_UNIT)}`\n"
+                f"Dashboard: {link}\n"
+                f"Config version: {self._config_version_of(raw)}\n"
+                f"Catalog: {path}")
+        self._refuse_reload(f"{path}: {outcome}", project=name, title=outcome, body=body)
+
+    def _config_version_of(self, raw: bytes) -> str:
+        """The ledger row this file is, or its hash when no row records it"""
+        try:
+            document = json.loads(raw)
+            head = self.central.head_config_version()
+        except Exception:  # noqa: BLE001 — a missing stamp must not hide the refusal
+            return "unknown"
+        if head is not None and (config_version.canonicalise(document)
+                                 == config_version.canonicalise(head["document"])):
+            return head["id"]
+        return f"{config_version.version_id(document)} (not in the config ledger: a hand edit)"
+
+    def _refuse_reload(self, detail: str, *, project: str = "os",
+                       title: str = "a catalog change was NOT applied",
+                       body: str | None = None) -> None:
         """Once per daemon run, not once per tick"""
         log.warning("catalog reload refused: %s", detail)
         if self.catalog_reload_warned:
             return
         self.catalog_reload_warned = True
-        self.central.add_inbox(
-            project="os", level="warning",
-            title="a catalog change was NOT applied", body=detail)
+        inbox_id = self.central.add_inbox(project=project, level="warning", title=title,
+                                          body=detail if body is None else body)
+        self.central.set_state(RELOAD_REFUSAL_KEY, str(inbox_id))
+
+    def _resolve_reload_refusal(self, how: str) -> None:
+        """Ack the open refusal once a catalog load succeeded, saying so (io-74eab254)"""
+        try:
+            pending = self.central.get_state(RELOAD_REFUSAL_KEY)
+            if not pending:
+                return
+            self.central.resolve_inbox(
+                int(pending), f"Applied: {how} at {time.strftime('%Y-%m-%d %H:%M')}.")
+            self.central.set_state(RELOAD_REFUSAL_KEY, "")
+        except Exception:  # noqa: BLE001 — the item stays open, never wrongly closed
+            log.exception("could not resolve the catalog-reload refusal")
 
     def run_forever(self) -> None:
         ensure_home()
