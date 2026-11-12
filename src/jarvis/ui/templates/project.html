@@ -53,7 +53,7 @@
     <div class="row" data-status="{{ o.status }}" data-type="{{ o.type }}">
       <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ o.status_label or m.word }}</span>
       <div class="grow">
-        {{ ui.row_id(o.id, ('/wo/' ~ project_name ~ '/' ~ o.id) if work else order_path(project_name, o.id)) }} {{ o.title }}
+        {{ ui.row_id(o.id, ('/wo/' ~ project_name ~ '/' ~ o.id) if work else order_path(project_name, o.id), o.id in artifact_ids) }} {{ o.title }}
         {% if o.hidden %}<span class="badge outside" title="hidden">🙈 hidden</span>{% endif %}
         {% if o.progress %}<span class="sub">{{ o.progress.label }}</span>{% endif %}
         {% if o.status == 'waiting_pr_merge' and o.pr_url %}

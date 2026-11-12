@@ -85,7 +85,7 @@
     <div class="row" data-status="{{ wo.status }}" data-type="{{ wo.type }}">
       <span class="st tone-{{ fm.tone }}"><span class="i">{{ fm.icon }}</span>{{ wo.status_label }}</span>
       <div class="grow">
-        {{ ui.row_id(wo.id, order_path(wo.project, wo.id)) }}
+        {{ ui.row_id(wo.id, order_path(wo.project, wo.id), wo.has_artifact) }}
         {{ wo.title }}
         <span class="sub">· {{ wo.project }}</span>
         {% if wo.type == 'feature' and wo.progress %}<div class="sub">{{ wo.progress.label }}</div>{% endif %}
@@ -99,7 +99,7 @@
     <div class="row" data-status="{{ wo.status }}">
       <span class="st tone-{{ m.tone }} {{ 'pulse' if wo.status == 'running' }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
       <div class="grow">
-        {{ ui.row_id(wo.id, '/wo/' ~ wo.project ~ '/' ~ wo.id) }}
+        {{ ui.row_id(wo.id, '/wo/' ~ wo.project ~ '/' ~ wo.id, wo.has_artifact) }}
         {{ wo.title }}
         <span class="sub">· {{ wo.project }}</span>
         {# Running and owing the user a decision are both true at once (#245) #}
@@ -352,5 +352,8 @@
   window.jarvisLiveSync = sync;  // browser tests drive a tick without waiting
 })();
 </script>
+
+{% import "_artifact_dialog.html" as artifact_ui %}
+{{ artifact_ui.artifact_dialogs(artifact_asks, "/") }}
 
 {% endblock %}

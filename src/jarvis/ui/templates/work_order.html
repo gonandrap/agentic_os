@@ -30,7 +30,7 @@
 <div class="wo-card">
 <div class="panel" style="padding: 14px 16px; margin-top: 18px;">
   <div style="display:flex; gap: 12px; align-items: baseline; flex-wrap: wrap;">
-    <strong style="font-size: 17px;">{{ wo.title }}</strong>
+    <strong style="font-size: 17px;">{{ wo.title }}</strong>{{ ui.artifact_icon() if artifacts }}
     <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
     <span>{{ ui.wo_tags(wo_tags(wo, project)) }}</span>
     <span class="grow"></span>
@@ -125,7 +125,25 @@ the latest release tag plus its one commit cherry-picked, not whatever else is o
       from you. The conversation is intact and the worker picks up from where it got
       to.</p>
   {% endif %}
-  {{ dispatched_ui.dispatched(siblings, project, 'its findings dispatched (' ~ siblings.io_id ~ ')') if siblings }}
+  {{ dispatched_ui.dispatched(siblings, project, 'its findings dispatched (' ~ siblings.io_id ~ ')', artifact_ids) if siblings }}
+  {# docs/superpowers/specs/2026-11-10-artifact-session-hold.md §6 #}
+  {% if artifacts %}
+  <div class="panel" id="artifacts" style="margin-top: 12px;">
+    <div class="row"><strong>Artifacts</strong></div>
+    {% for a in artifacts %}
+    <div class="row">
+      <span class="grow">{% if a.url.startswith('https://') %}<a href="{{ a.url }}" target="_blank" rel="noopener">{{ a.title or a.url }}</a>{% else %}<span class="mono">{{ a.url }}</span>{% endif %}</span>
+      {% if a.decision == 'delete_requested' %}
+      <span class="sub tone-warn" title="Delete it on claude.ai, then run: jarvis artifact delete {{ a.id }} --yes --done">delete requested · {{ fmt_age(a.decided_at) }}</span>
+      {% elif a.decision %}
+      <span class="sub" title="{{ fmt_ts(a.decided_at) }}">{{ a.decision }} by {{ a.decided_by }} · {{ fmt_age(a.decided_at) }}</span>
+      {% else %}
+      <span class="sub tone-warn">undecided</span>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
   {% if wo.description %}<p class="kv" style="white-space: pre-wrap;">{{ wo.description }}</p>{% endif %}
   {# The brief above is only the MARGIN around this order's section of its feature's
      spec — the scope boundary and what done means. The section itself is the work, and
@@ -729,5 +747,8 @@ the latest release tag plus its one commit cherry-picked, not whatever else is o
 {{ states_ui.view(states) }}
 </section>
 </div>
+
+{% import "_artifact_dialog.html" as artifact_ui %}
+{{ artifact_ui.artifact_dialogs(artifact_asks, '/wo/' ~ project ~ '/' ~ wo.id) }}
 
 {% endblock %}

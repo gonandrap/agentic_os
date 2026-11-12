@@ -162,3 +162,21 @@ def test_old_done_roots_hide_behind_show_older(store):
     page = client.get("/yours").text
     assert "ancient-ask" not in page and "show older" in page
     assert "ancient-ask" in client.get("/yours?older=1").text
+
+
+def test_a_parent_ask_carries_the_icon_when_a_child_owns_an_artifact(store):
+    """docs/superpowers/specs/2026-11-10-artifact-session-hold.md §6"""
+    fo = store.create_feature_order("ask-with-page", requestor="user")
+    kid = store.create_work_order("child-publishes", parent_id=fo["id"], status="running")
+    plain = store.create_work_order("ask-plain", requestor="user", status="running")
+    store.record_artifact(kid["id"], "https://claude.ai/artifact/x", title="r",
+                          session_id=None, via_subagent=False)
+
+    text = TestClient(create_app()).get("/yours").text
+
+    def row(order_id):
+        start = text.index(f'<tr id="{order_id}"')
+        return text[start:text.index("</tr>", start)]
+
+    assert "data-artifact-icon" in row(fo["id"])
+    assert "data-artifact-icon" not in row(plain["id"])

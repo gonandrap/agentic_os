@@ -4258,3 +4258,224 @@ def test_project_page_counts_proposed_and_quarantined_beside_open(client, projec
     assert "0 open · 1 proposed · 1 quarantined" in page
     central.add_backlog("proj_a", "an open idea")
     assert "1 open · 1 proposed · 1 quarantined" in client.get("/project/proj_a").text
+
+
+# -- artifacts (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §6)
+
+ART_URL = "https://claude.ai/artifact/abc-123"
+ART_ICON = "data-artifact-icon"
+ART_DIALOG = '<dialog id="artifact-dialog-'
+
+
+@pytest.fixture()
+def user_shell(monkeypatch):
+    # The suite may itself run inside a worker session; decide_artifact refuses those
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+
+
+def _publish(project, wo_id, url=ART_URL):
+    store = ProjectStore(project)
+    try:
+        return store.record_artifact(wo_id, url, title="report", session_id=None,
+                                     via_subagent=False)["id"]
+    finally:
+        store.close()
+
+
+def _work(project, title, **kw):
+    store = ProjectStore(project)
+    try:
+        return store.create_work_order(title, **kw)
+    finally:
+        store.close()
+
+
+def _icon_by(page, order_id):
+    """Whether the artifact icon sits on the line that names `order_id`"""
+    at = page.index(order_id)
+    return ART_ICON in page[at:at + 600]
+
+
+def test_os_status_flags_rows_that_own_an_artifact(client, project):
+    owner = _work(project, "publishes a page", status="running")
+    plain = _work(project, "publishes nothing", status="running")
+    fo = ops.create_feature_order("proj_a", "big ask", description="a page")
+    kid = _work(project, "child", parent_id=fo["id"], status="running")
+    _publish(project, owner["id"])
+    _publish(project, kid["id"])
+
+    proj = next(p for p in ops.os_status()["projects"] if p["name"] == "proj_a")
+    rows = {r["id"]: r for r in proj["open_work_orders"] + proj["feature_orders"]}
+    assert rows[owner["id"]]["has_artifact"] is True
+    assert rows[plain["id"]]["has_artifact"] is False
+    # A parent shows it when one of its work-order rows owns one
+    assert rows[fo["id"]]["has_artifact"] is True
+
+
+def test_the_dashboard_and_project_list_mark_an_artifact_owner(client, project):
+    owner = _work(project, "publishes a page", status="running")
+    plain = _work(project, "publishes nothing", status="running")
+    _publish(project, owner["id"])
+
+    for page in (client.get("/").text, client.get("/project/proj_a").text):
+        assert _icon_by(page, f'>{owner["id"]}</a>')
+        assert not _icon_by(page, f'>{plain["id"]}</a>')
+
+
+def test_the_feature_page_marks_an_owning_child(client, project):
+    fo = ops.create_feature_order("proj_a", "big ask", description="a page")
+    owner = _work(project, "child one", parent_id=fo["id"], status="running")
+    _publish(project, owner["id"])
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+    assert _icon_by(page, f'>{owner["id"]}</a>')
+
+
+def test_the_work_order_page_marks_the_order_and_lists_its_artifacts(client, project):
+    owner = _work(project, "publishes a page", status="running")
+    _publish(project, owner["id"])
+
+    page = client.get(f"/wo/proj_a/{owner['id']}").text
+    assert ART_ICON in page
+    assert 'id="artifacts"' in page
+    assert f'href="{ART_URL}" target="_blank"' in page
+    assert "undecided" in page
+
+
+def test_the_improvement_page_marks_its_owning_analyst(improvement, project):
+    client, io, analyst = improvement
+    _publish(project, analyst["id"])
+
+    page = client.get(f"/io/proj_a/{io['id']}").text
+    assert _icon_by(page, f"/wo/proj_a/{analyst['id']}")
+
+
+def test_the_decision_page_marks_its_owning_researcher(decision, project):
+    client, do = decision
+    _publish(project, do["plan_wo_id"])
+
+    page = client.get(f"/do/proj_a/{do['id']}").text
+    assert _icon_by(page, f'>{do["plan_wo_id"]}</a>')
+
+
+def test_the_investigation_page_marks_its_owning_investigator(investigation, project):
+    client, inv, investigator, _ = investigation
+    _publish(project, investigator["id"])
+
+    page = client.get(f"/inv/proj_a/{inv['id']}").text
+    assert _icon_by(page, f'>{investigator["id"]}</a>')
+
+
+@pytest.mark.parametrize("status, parked, asks", [
+    ("needs_review", True, True),
+    ("cancelled", False, True),
+    ("failed", False, True),
+    ("needs_review", False, False),   # needs_review for another reason: not parked
+    ("running", False, False),
+])
+def test_the_artifact_dialog_shows_only_for_a_parked_cancelled_or_failed_order(
+        client, project, status, parked, asks):
+    wo = _work(project, "publishes a page", status="running")
+    art_id = _publish(project, wo["id"])
+    store = ProjectStore(project)
+    try:
+        if parked:
+            ops.park_artifact_decision(store, store.get_work_order(wo["id"]))
+        elif status != "running":
+            store.set_status(wo["id"], status)
+    finally:
+        store.close()
+
+    for page in (client.get("/").text, client.get(f"/wo/proj_a/{wo['id']}").text):
+        assert (ART_DIALOG + art_id in page) is asks
+    if asks:
+        page = client.get("/").text
+        assert "couldn't start here" in page
+        assert f'action="/wo/proj_a/{wo["id"]}/artifact/{art_id}/keep"' in page
+        assert f'action="/wo/proj_a/{wo["id"]}/artifact/{art_id}/delete"' in page
+
+
+def test_a_non_https_artifact_url_is_never_a_link(client, project):
+    wo = _work(project, "publishes a page", status="running")
+    _publish(project, wo["id"], url="javascript:alert(1)")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "cancelled")
+    finally:
+        store.close()
+
+    for page in (client.get("/").text, client.get(f"/wo/proj_a/{wo['id']}").text):
+        assert ART_DIALOG in page or 'id="artifacts"' in page
+        assert 'href="javascript:' not in page
+
+
+def test_a_decided_artifact_asks_nothing(client, project, user_shell):
+    wo = _work(project, "publishes a page", status="running")
+    art_id = _publish(project, wo["id"])
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "cancelled")
+    finally:
+        store.close()
+    ops.decide_artifact("proj_a", wo["id"], art_id, "keep", by="ui")
+
+    assert ART_DIALOG not in client.get("/").text
+
+
+@pytest.fixture()
+def decide_spy(monkeypatch):
+    calls = []
+    real = ops.decide_artifact
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "decide_artifact", spy)
+    return calls
+
+
+def test_keep_posts_to_decide_artifact_as_the_ui(client, project, user_shell, decide_spy):
+    wo = _work(project, "publishes a page", status="running")
+    art_id = _publish(project, wo["id"])
+
+    res = client.post(f"/wo/proj_a/{wo['id']}/artifact/{art_id}/keep", data={"next": "/"})
+
+    assert res.status_code == 303 and res.headers["location"] == "/"
+    assert decide_spy == [(("proj_a", wo["id"], art_id, "keep"), {"by": "ui"})]
+    store = ProjectStore(project)
+    try:
+        assert store.artifact(art_id)["decision"] == "keep"
+    finally:
+        store.close()
+
+
+def test_delete_posts_to_decide_artifact_only_once_confirmed(client, project, user_shell,
+                                                            decide_spy):
+    wo = _work(project, "publishes a page", status="running")
+    art_id = _publish(project, wo["id"])
+    action = f"/wo/proj_a/{wo['id']}/artifact/{art_id}/delete"
+
+    unconfirmed = client.post(action, data={"next": "/"})
+    assert "error=" in unconfirmed.headers["location"]
+    assert decide_spy == []
+
+    res = client.post(action, data={"next": "/", "confirm": "1"})
+    assert res.status_code == 303 and "error=" not in res.headers["location"]
+    assert decide_spy == [(("proj_a", wo["id"], art_id, "delete"), {"by": "ui"})]
+    store = ProjectStore(project)
+    try:
+        assert store.artifact(art_id)["decision"] == "delete_requested"
+    finally:
+        store.close()
+
+
+def test_a_refused_decision_lands_as_an_error_flash(client, project, monkeypatch):
+    wo = _work(project, "publishes a page", status="running")
+    art_id = _publish(project, wo["id"])
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-someone")
+
+    res = client.post(f"/wo/proj_a/{wo['id']}/artifact/{art_id}/keep", data={"next": "/"})
+
+    assert "error=" in res.headers["location"]

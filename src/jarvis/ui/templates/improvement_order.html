@@ -34,7 +34,7 @@
   <a href="#brief">the brief</a>
   {% if io.analyst %}
   {% set analyst_href = order_path(project, io.analyst.id) %}
-  <a href="{{ analyst_href }}">the analyst · {{ io.analyst.status }}</a>
+  <a href="{{ analyst_href }}">the analyst · {{ io.analyst.status }}</a>{{ ui.artifact_icon() if io.analyst.id in artifact_ids }}
   <a href="{{ analyst_href }}#pending">what it asks of you</a>
   <a href="{{ analyst_href }}#tab-conversation">its questions</a>
   <a href="{{ analyst_href }}/debug">its debug</a>
@@ -47,7 +47,7 @@
 <div class="panel" style="margin-top: 12px;"><div class="row tone-warn">◭ {{ io.attention_reason }}</div></div>
 {% endif %}
 
-{{ dispatched_ui.dispatched(io.dispatched, project) }}
+{{ dispatched_ui.dispatched(io.dispatched, project, artifact_ids=artifact_ids) }}
 
 {% if io.report.summary %}
 <h2 id="findings">Findings — {{ io.report.summary }}</h2>
@@ -112,7 +112,7 @@
       <div class="sub">✓ accepted{% if f.feedback %} — {{ f.feedback }}{% endif %}</div>
       {% for o in io.filed_orders.get(f.key) or [] %}
       <div class="sub">filed:
-        {{ ui.row_id(o.id, order_path(o.project or project, o.id)) }}
+        {{ ui.row_id(o.id, order_path(o.project or project, o.id), o.id in artifact_ids) }}
         {{ o.title }} ({{ o.status }})</div>
       {% endfor %}
       {% elif status == 'rejected' %}

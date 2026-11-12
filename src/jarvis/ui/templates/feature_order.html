@@ -65,7 +65,7 @@
     <div class="row" data-status="{{ c.status }}">
       <span class="st tone-{{ cm.tone }}"><span class="i">{{ cm.icon }}</span>{{ cm.word }}</span>
       <div class="grow">
-        {{ ui.row_id(c.id, '/wo/' ~ project ~ '/' ~ c.id) }} {{ c.title }}
+        {{ ui.row_id(c.id, '/wo/' ~ project ~ '/' ~ c.id, c.id in artifact_ids) }} {{ c.title }}
         {% if c.superseded %}
           {# Superseded, not hidden: the row IS the feature's history, and dropping it
              would make a child the user answered for look like one that never ran. #}

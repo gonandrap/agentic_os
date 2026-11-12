@@ -1,0 +1,71 @@
+{# docs/superpowers/specs/2026-11-10-artifact-session-hold.md §6: one artifact at a time; `ops.artifact_asks`. #}
+{% macro artifact_dialogs(asks, back) %}
+{% for a in asks %}
+<dialog id="artifact-dialog-{{ a.art_id }}" data-artifact-ask="{{ a.art_id }}"
+  style="width: min(640px, 95vw); background: var(--surface); color: var(--ink); border: 1px solid var(--line);">
+  <div class="row"><strong class="grow">Keep or delete this claude.ai artifact?</strong>
+    {% if asks | length > 1 %}<span class="sub">{{ loop.index }} of {{ asks | length }}</span>{% endif %}</div>
+  <div class="row"><div class="grow">
+    <a class="rowid" href="/wo/{{ a.project }}/{{ a.wo_id }}">{{ a.wo_id }}</a>
+    <span class="sub">{{ a.wo_title }} · {{ a.wo_status }}</span>
+    <div>{% if a.url.startswith('https://') %}<a href="{{ a.url }}" target="_blank" rel="noopener">{{ a.title or a.url }}</a>{% else %}<span class="mono">{{ a.url }}</span>{% endif %}</div>
+    <p class="sub">Its session stays open so comments sent to Claude reach it. The order
+      cannot complete until you decide.</p>
+    <p><strong>Keep</strong>: the artifact stays on claude.ai and the session is released. A
+      comment sent to Claude after that will show claude.ai's "couldn't start here".</p>
+    <p><strong>Delete</strong>: permanent. A background session cannot delete it, so the OS
+      sends you the link to delete it on claude.ai; then
+      <span class="mono">jarvis artifact delete {{ a.art_id }} --yes --done</span> records it.</p>
+  </div></div>
+  <div class="row">
+    <button type="button" data-artifact-later>Decide later</button>
+    <span class="grow"></span>
+    <form class="inline" method="post" action="/wo/{{ a.project }}/{{ a.wo_id }}/artifact/{{ a.art_id }}/keep">
+      <input type="hidden" name="next" value="{{ back }}">
+      <button class="accept">Keep</button>
+    </form>
+    <form class="inline" method="post" action="/wo/{{ a.project }}/{{ a.wo_id }}/artifact/{{ a.art_id }}/delete"
+      data-artifact-delete>
+      <input type="hidden" name="next" value="{{ back }}">
+      <input type="hidden" name="confirm" value="">
+      <button type="button" class="danger">Delete</button>
+    </form>
+  </div>
+</dialog>
+{% endfor %}
+{% if asks %}
+<script>
+(function () {
+  // Dismissed = decide later: the attention flag stays; this tab stops re-asking on refresh
+  var KEY = "jarvis.artifact.later";
+  function later() {
+    try { return JSON.parse(sessionStorage.getItem(KEY) || "[]"); } catch (e) { return []; }
+  }
+  var dialogs = Array.prototype.slice.call(document.querySelectorAll("dialog[data-artifact-ask]"));
+  function openNext() {
+    var skip = later();
+    var next = dialogs.filter(function (d) { return skip.indexOf(d.dataset.artifactAsk) < 0; })[0];
+    if (next) { next.showModal(); }
+  }
+  dialogs.forEach(function (d) {
+    d.querySelector("[data-artifact-later]").addEventListener("click", function () {
+      var skip = later();
+      skip.push(d.dataset.artifactAsk);
+      try { sessionStorage.setItem(KEY, JSON.stringify(skip)); } catch (e) { /* private mode */ }
+      d.close();
+      openNext();
+    });
+    var form = d.querySelector("form[data-artifact-delete]");
+    var button = form.querySelector("button");
+    button.addEventListener("click", function () {
+      // Second click confirms; the server refuses a delete without it
+      if (form.confirm.value === "1") { form.submit(); return; }
+      form.confirm.value = "1";
+      button.textContent = "Click again: delete permanently";
+    });
+  });
+  openNext();
+})();
+</script>
+{% endif %}
+{% endmacro %}
