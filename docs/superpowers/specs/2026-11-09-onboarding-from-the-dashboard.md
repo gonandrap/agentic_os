@@ -217,11 +217,18 @@ The **view model** — what `onboard_view` returns, and what §3, §4, §5 read:
   wrapper; copying them would point the new project at someone else's.
 - Copies `model` into `draft.project.model`; leaves `description` empty.
 - Never copies an `os.*` value: those are already the fleet's.
-- Answers each area that is NOT `must_have` with `match_posture` over the candidate's
-  resolved map (as the re-run does), and appends the provenance entry
-  `{"area": "like", "mode": "<source>"}`. **Must-have areas stay unanswered**, with the
-  copied values in place: copying a project is a starting point, not twelve decisions, so
-  the user still confirms each must-have area (§2's `confirm` verb keeps the copied values).
+- Answers **every** area, must-haves included, with `match_posture` over the candidate's
+  resolved map (as the re-run does), each answer stamped `"from": "like:<source>"`, and
+  appends the provenance entry `{"area": "like", "mode": "<source>"}`. So
+  `must_have_missing` is empty after a copy. (Revised by io-74eab254: leaving must-haves
+  open turned a copy into a walk through every section; the user wants three steps —
+  pick the source, override a few settings, apply.) The single apply, with
+  `ops._require_reason` still guarding safety keys, is the deliberate decision.
+- Copy flow in the dashboard: `POST /onboard` with `like` redirects to `identity` when a
+  `project.*` field is empty (a copy never fills `description`), else to `review`. Review
+  says "copied from <source>" and every diff value links to its section; any successful
+  edit on a copied draft redirects back to `review`. Identity is never copied, so it is
+  the one step before review.
 - Ends in `_commit`, so a copied value that does not validate for the new project is
   refused with the parser's text rather than saved.
 
@@ -238,7 +245,9 @@ passes them through. The `onboard` subcommand set stays exactly `start`, `questi
    `projects.<new>.validation.enabled` and NO `production.path`, `path`, `bugs.repo`,
    `worker.launcher`, and no `os.` key — the control being that the source document DID
    set each of them in the same test. The provenance entry `{"area":"like","mode":<source>}`
-   is present, and no must-have area is in `answers`.
+   is present, and every area, must-haves included, is answered `from: like:<source>`.
+   `tests/test_ui_onboard_index.py`: copy, identity edit, apply in three POSTs; control: a
+   fresh draft keeps `must_have_missing` non-empty and its edits stay on the section.
 2. A source default it never wrote is absent from the new draft's `values` — control: that
    path IS in `config_version.resolve(parse_catalog(source_doc))`.
 2b. An unknown `source` raises, naming the projects that exist; `onboard_session(like=…)`

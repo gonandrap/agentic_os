@@ -32,6 +32,12 @@ def first_section(view: dict[str, Any]) -> str:
                 "review")
 
 
+def identity_gaps(view: dict[str, Any]) -> list[str]:
+    """The `project.*` fields still empty: what a copy never fills (§1)"""
+    section = next(s for s in view["sections"] if s["key"] == "identity")
+    return [k["path"] for k in section["knobs"] if k["kind"] == "identity" and not k["value"]]
+
+
 def _rows(section: dict[str, Any], error_path: str, typed: str | None) -> list[dict[str, Any]]:
     from .app import config_input_text, config_widget
 
@@ -103,12 +109,15 @@ def register(app: FastAPI, render: Callable[..., HTMLResponse]) -> None:
         """`ops.onboard_edit` under another name; a refusal re-renders the section (§3)"""
         target = path or (f"project.{field}" if field else "") or lever
         try:
-            ops.onboard_edit(name, verb, rev=rev, section=section, path=path, value=value,
-                             mode=mode, field=field, lever=lever, wired=wired, fleet=fleet)
+            view = ops.onboard_edit(name, verb, rev=rev, section=section, path=path,
+                                    value=value, mode=mode, field=field, lever=lever,
+                                    wired=wired, fleet=fleet)
         except ops.OpsError as e:
             return page(request, name, section, target, error=str(e), error_path=target,
                         typed=value if verb in ("set", "identity") else None,
                         status_code=400)
+        if view["project"]["like"]:  # a copied draft is overridden from review (§1)
+            return RedirectResponse(f"/onboard/{quote(name)}/review", status_code=303)
         if not section:
             return RedirectResponse(f"/onboard/{quote(name)}", status_code=303)
         url = section_url(name, section)
