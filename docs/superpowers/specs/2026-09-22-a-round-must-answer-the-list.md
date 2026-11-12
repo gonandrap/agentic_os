@@ -71,6 +71,10 @@ returns the cited paths when NONE of them moved, else None.
   answer "is that a file" and stays pure: no `Path`, no `os`, no stat. `ops.unanswered_paths`
   supplies the work order's worktree (`exists=lambda p: (worktree / p).is_file()`, None
   when no worktree resolves, and a path escaping the tree is never kept). Neo question 1382.
+- **A CITED PATH THE SUBMISSION'S `--evidence` NAMES IS ANSWERED BY ARGUMENT** (keyword
+  `argued`, by full path or file name; issue 1702). Review feedback can offer "fix X, or
+  correct the record and leave X alone"; the second branch changes no cited file, so the
+  argument, not a cosmetic edit, is what the panel judges. `BOUNCE_FEEDBACK` says so.
 - **SOME of the list is enough to reach the panel.** Partial progress is the panel's to
   judge. Only a round that addressed none short-circuits.
 - **Every uncertainty returns None.** No previous round, a previous round that was not a

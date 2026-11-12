@@ -527,8 +527,9 @@ def unanswered_submission(previous: Mapping[str, Any] | None,
                           now: Mapping[str, str],
                           *,
                           exists: Callable[[str], bool] | None = None,
+                          argued: str = "",
                           ) -> tuple[str, ...] | None:
-    """Did this submission touch NOTHING the previous round asked about?"""
+    """Did this submission touch NOTHING the previous round asked about, and argue none of it?"""
     if previous is None or str(previous.get("outcome") or "") != "rejected":
         return None
     cited = cited_paths(blockers_raised)
@@ -540,12 +541,24 @@ def unanswered_submission(previous: Mapping[str, Any] | None,
                   or _touched(p, was) or _touched(p, is_now))
     if not cited:
         return None
+    # A point argued in --evidence is the panel's to judge (issue 1702, spec §5)
+    if any(_named(path, argued) for path in cited):
+        return None
     from .evidence import changed_since
 
     moved = changed_since(before, now)
     if any(_touched(path, moved) for path in cited):
         return None
     return cited
+
+
+def _named(cited: str, text: str) -> bool:
+    """Does `text` name `cited`, by its path or its file name?"""
+    if not text:
+        return False
+    name = cited.rsplit("/", 1)[-1]
+    return cited in text or re.search(
+        rf"(?<![\w.-]){re.escape(name)}(?![\w-])", text) is not None
 
 
 def _touched(cited: str, moved: frozenset[str]) -> bool:
