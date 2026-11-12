@@ -1,37 +1,35 @@
 {% extends "base.html" %}
-{# Applied: §5 of docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md #}
+{# Applied: §5 of docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md; durable GET page, wo-6d9fbd23 #}
 {% block title %}Applied · onboard {{ name }} — Jarvis{% endblock %}
 {% block style %}
   .ob-pane .lede { color: var(--ink-2); max-width: 80ch; }
 {% endblock %}
 {% block content %}
 <div class="ob">
-{% include "_onboard_rail.html" %}
+{% if view %}{% include "_onboard_rail.html" %}{% else %}<div></div>{% endif %}
 <div class="ob-pane">
   <div class="page-head">
     <h1>Applied</h1>
     <span class="meta">onboard {{ name }}</span>
   </div>
+  {% set v = applied.version %}
   <p class="lede" id="ob-version">Config version
-    <a class="mono" href="{{ config_url }}">{{ result.version.id }}</a>
-    · {{ result.changes|length }} changes{% if not result.changed %} (the catalog already said all this){% endif %}.</p>
+    <a class="mono" href="{{ config_url }}">{{ v.id }}</a>
+    · {{ applied.changes }} changes · {{ fmt_age(v.ts) }}</p>
+  {% if v.reason %}<p class="lede" id="ob-reason">Reason: {{ v.reason }}</p>{% endif %}
 
-  {% if result.restart_needed %}
-  <div class="brake" role="status" id="ob-restart"><div class="grow">
-    <b>You must restart the OS yourself</b> — the dashboard never does: {{ result.restart_why }}.
-    <div>Run <code>jarvis start --catalog {{ result.catalog }}</code></div>
-  </div></div>
+  {% set live = applied.live %}
+  {% if live.state == "live" %}
+  <p class="lede" role="status" id="ob-live" data-state="live">{{ live.text }}.
+    {% if applied.cold %}{{ applied.cold[:3]|join(', ') }} only take effect on a restart:
+    run <code>{{ live.command }}</code>{% endif %}</p>
   {% else %}
-  <p class="lede">No restart needed: every change takes effect while the OS runs.</p>
+  <div class="brake" role="status" id="ob-live" data-state="{{ live.state }}"><div class="grow">
+    <b>{{ live.text }}</b>{% if live.command %} — the dashboard never restarts the OS:
+    <div>Run <code>{{ live.command }}</code></div>{% endif %}
+  </div></div>
   {% endif %}
-
-  {% if result.bootstrap %}
-  <h3>Bootstrap</h3>
-  <ul id="ob-actions">{% for a in result.bootstrap.actions %}<li>{{ a }}</li>{% else %}<li>nothing to do</li>{% endfor %}</ul>
-  {% if result.bootstrap.warnings %}
-  <div class="error-flash" id="ob-warnings"><ul>{% for w in result.bootstrap.warnings %}<li>{{ w }}</li>{% endfor %}</ul></div>
-  {% endif %}
-  {% endif %}
+  <p class="lede">Bootstrap warnings, if any, are in the <a href="/inbox">inbox</a>.</p>
 </div>
 </div>
 {% endblock %}
