@@ -1223,6 +1223,13 @@ class CentralStore:
             cur = self.conn.execute("UPDATE inbox SET status='acked' WHERE id=?", (inbox_id,))
         return cur.rowcount
 
+    def resolve_inbox(self, inbox_id: int, note: str) -> int:
+        """Ack an item the OS saw resolve, appending why; an item already acked is left alone"""
+        cur = self.conn.execute(
+            "UPDATE inbox SET status='acked', body = body || ? WHERE id=? AND status != 'acked'",
+            (f"\n\n{note}", inbox_id))
+        return cur.rowcount
+
     def ack_project_inbox(self, project: str) -> int:
         """Ack every unacked item one project raised"""
         return self.conn.execute(
