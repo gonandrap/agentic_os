@@ -15913,9 +15913,15 @@ def _onboard_help_prompt(view: dict[str, Any], sec: dict[str, Any], focus: str,
     return "\n".join(lines)
 
 
-def onboard_help(name: str, section: str, focus: str = "", *,
-                 catalog_path: str | None = None) -> dict[str, Any]:
-    """Open a read-only help session on one section of a draft (docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md §4)"""
+# Read verbs only: `Bash(jarvis onboard:*)` would let `onboard apply` (a write) run unprompted
+ONBOARD_HELP_ALLOWED_TOOLS = ("Bash(jarvis onboard explain:*)", "Bash(jarvis onboard questions:*)",
+                              "Bash(jarvis config show:*)", "Bash(jarvis config get:*)", "Read")
+ONBOARD_HELP_DISALLOWED_TOOLS = ("Edit", "Write", "NotebookEdit")
+
+
+def onboard_help_launch(name: str, section: str, focus: str = "", *,
+                        catalog_path: str | None = None) -> dict[str, Any]:
+    """How to start the interactive help terminal (docs/superpowers/specs/2026-11-12-onboarding-help-terminal-panel.md §1)"""
     import urllib.parse
 
     from . import bootstrap, claude_cli, notify, paths
@@ -15937,14 +15943,33 @@ def onboard_help(name: str, section: str, focus: str = "", *,
     add_dirs = [root, Path(view["project"]["path"])]
     # Never `[WO …`: `jarvis doctor` reports those as orphans
     session_name = f"[onboard] {name} · {section}"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("JARVIS_WO_ID", "JARVIS_TURN_TRANSPORT")}  # else hooks treat it as a worker
+    env.update(TERM="xterm-256color", COLORTERM="truecolor")
+    argv = [claude_cli.claude_bin(), "--name", session_name, "--agent", ONBOARD_HELPER,
+            *(a for d in add_dirs for a in ("--add-dir", str(d))),
+            "--disallowedTools", *ONBOARD_HELP_DISALLOWED_TOOLS,
+            "--allowedTools", *ONBOARD_HELP_ALLOWED_TOOLS, "--", prompt]
+    # cwd is not the project: its workspace trust is written only by the bootstrap
+    return {"argv": argv, "cwd": paths.jarvis_home(), "env": env, "prompt": prompt,
+            "session_name": session_name, "section": section, "focus": focus,
+            "add_dirs": add_dirs}
+
+
+def onboard_help(name: str, section: str, focus: str = "", *,
+                 catalog_path: str | None = None) -> dict[str, Any]:
+    """Open a read-only help session on one section of a draft (docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md §4)"""
+    from . import claude_cli
+
+    launch = onboard_help_launch(name, section, focus, catalog_path=catalog_path)
+    session_name, prompt, add_dirs = launch["session_name"], launch["prompt"], launch["add_dirs"]
     out = {"session_name": session_name, "job_id": None, "attach": "claude agents",
            "prompt": prompt, "error": "",
            "argv": [claude_cli.claude_bin(), "--bg", "--name", session_name,
                     "--agent", ONBOARD_HELPER,
                     *(a for d in add_dirs for a in ("--add-dir", str(d))), "--", prompt]}
     try:
-        # cwd is not the project: its workspace trust is written only by the bootstrap
-        job_id = claude_cli.spawn_background(prompt, cwd=paths.jarvis_home(),
+        job_id = claude_cli.spawn_background(prompt, cwd=launch["cwd"],
                                              name=session_name, agent=ONBOARD_HELPER,
                                              add_dirs=add_dirs)
     except claude_cli.ClaudeCliError as e:

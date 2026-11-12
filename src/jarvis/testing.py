@@ -237,6 +237,9 @@ def _write_call_record(finished=None):
         json.dump({"argv": argv, "cwd": os.getcwd(), "system_prompt_seen": seen,
                    "prompt": resolved_prompt(),
                    "started_at": _started, "finished_at": finished,
+                   "env": {k: os.environ[k] for k in
+                           ("JARVIS_WO_ID", "JARVIS_TURN_TRANSPORT", "TERM", "COLORTERM")
+                           if k in os.environ},
                    "cache_env": {k: os.environ[k] for k in
                                  ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H",
                                   "CLAUDE_CODE_PROMPT_CACHE_TTL",
@@ -1252,6 +1255,52 @@ elif "-p" in argv and "--resume" not in argv:
         verdict["dispatch"] = {"title": "test-forced ledger cleanup",
                                "description": "entries A and B contradict; B won"}
     emit_headless(json.dumps(verdict))
+elif "--print" not in argv and (not argv or argv[0].startswith("-")):
+    # Interactive TTY session (docs/superpowers/specs/2026-11-12-onboarding-help-terminal-panel.md §1)
+    import re, signal
+
+    def out(text):
+        os.write(1, (text + "\r\n").encode())
+
+    def on_winch(*_):
+        import fcntl, struct, termios
+        rows, cols = struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))[:2]
+        out(f"size: {rows} {cols}")
+
+    signal.signal(signal.SIGWINCH, on_winch)
+    if os.isatty(0):
+        import tty
+        tty.setraw(0, tty.TCSANOW)  # as the real CLI; TCSANOW keeps input typed before this
+    out(f"fake-claude interactive @{opt('--agent', '')}")
+    buf, line, paste, first = b"", b"", False, None
+    while True:
+        try:
+            chunk = os.read(0, 65536)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            sys.exit(0)
+        parts = re.split(rb"(\x1b\[200~|\x1b\[201~|\r\n?|\n)", buf + chunk)
+        buf = parts.pop()  # may end in half a marker
+        for tok in parts:
+            if tok == b"\x1b[200~":
+                paste, first = True, b""
+            elif tok == b"\x1b[201~" or (paste and tok in (b"\r", b"\n", b"\r\n")):
+                if first is not None:
+                    out("pasted: " + first.decode(errors="replace"))
+                    first = None
+                paste = paste and tok != b"\x1b[201~"
+            elif tok in (b"\r", b"\n", b"\r\n"):
+                text = line.decode(errors="replace")
+                out("echo: " + text)
+                if text == "/exit":
+                    sys.exit(0)
+                line = b""
+            elif paste:
+                if first is not None:
+                    first += tok
+            else:
+                line += tok
 else:
     sys.stderr.write(f"fake claude: unhandled argv {argv}\n"); sys.exit(2)
 '''
