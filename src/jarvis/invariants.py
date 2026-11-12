@@ -139,6 +139,11 @@ PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pul
 #: The other one: CI is red on the pull request and the worker could not get it green (#224)
 PR_CHECKS_BLOCKER = ("the pull request's checks are failing and the worker could not fix "
                      "them — do not merge it as it stands")
+#: Worker answered the run, or the PR is a draft: no "could not fix", no "do not merge" (#1697)
+PR_CHECKS_ANSWERED_BLOCKER = ("the pull request's checks are failing and the worker answered "
+                              "without fixing them — its last reply says why")
+PR_CHECKS_DRAFT_BLOCKER = ("the draft pull request's checks are still failing after the "
+                           "worker's attempts")
 
 #: The third: the worker answered a refusal with commits and never declared them
 PR_UNDECLARED_BLOCKER = ("the worker pushed commits answering your refusal and would not "
@@ -149,6 +154,12 @@ PR_UNDECLARED_BLOCKER = ("the worker pushed commits answering your refusal and w
 PR_REPAIR_BLOCKERS = ((PR_CONFLICT_REPAIR, PR_CONFLICT_BLOCKER),
                       (PR_CHECKS_REPAIR, PR_CHECKS_BLOCKER),
                       (PR_UNDECLARED_REPAIR, PR_UNDECLARED_BLOCKER))
+#: Every line each give-up can raise
+PR_REPAIR_LINES: dict[str, tuple[str, ...]] = {
+    PR_CONFLICT_REPAIR: (PR_CONFLICT_BLOCKER,),
+    PR_CHECKS_REPAIR: (PR_CHECKS_BLOCKER, PR_CHECKS_ANSWERED_BLOCKER, PR_CHECKS_DRAFT_BLOCKER),
+    PR_UNDECLARED_REPAIR: (PR_UNDECLARED_BLOCKER,),
+}
 
 #: The event `ops.rejudge_moved_head` writes when it will NOT re-judge a moved head: the round it... (docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md)
 REJUDGE_DECLINED_EVENT = "validation_rejudge_declined"
@@ -554,6 +565,28 @@ def user_action_owed_blocker(command: str) -> str:
             f"— `jarvis wo ack` once you have run it, or `jarvis wo done` to close it")
 
 
+#: Opening words of a declared user step's line; while open it OWNS the attention line (#1697)
+USER_STEP_PREFIXES = (user_action_blocker("").split("`")[0],
+                      user_action_owed_blocker("").split("`")[0])
+#: How a later blocker rides on the user step's line, never in place of it (#1697)
+USER_STEP_ALSO = "; also: "
+
+
+def user_step_line(line: str) -> str:
+    """The declared user step `line` opens with, else ``""`` (#1697)"""
+    return line.split(USER_STEP_ALSO)[0] if line.startswith(USER_STEP_PREFIXES) else ""
+
+
+def pr_checks_blocker(store: ProjectStore, wo_id: str) -> str:
+    """Which red-build line holds: answered, draft, or the real give-up (#1697)"""
+    if (store.pr_repair_attempts(wo_id, PR_CHECKS_REPAIR) < PR_REPAIR_MAX_ATTEMPTS
+            and store.pr_repair_held(wo_id, PR_CHECKS_REPAIR)):
+        return PR_CHECKS_ANSWERED_BLOCKER
+    asks = store.pr_repair_nudges(wo_id, PR_CHECKS_REPAIR)
+    draft = bool(asks and (db.from_json(asks[-1]["payload"], {}) or {}).get("draft"))
+    return PR_CHECKS_DRAFT_BLOCKER if draft else PR_CHECKS_BLOCKER
+
+
 def escalated_user_action(store: ProjectStore, wo: dict[str, Any]) -> str:
     """The user-only command the latest escalated round named, else ``""`` (#1352)"""
     judged = store.last_judged_round(wo_id=wo["id"])
@@ -942,7 +975,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             n = store.pr_repair_attempts(wo["id"], repair)
             # ...or held it: the worker answered and the red run never changed (#1438)
             if n >= PR_REPAIR_MAX_ATTEMPTS or (n and store.pr_repair_held(wo["id"], repair)):
-                blockers.append(blocker)
+                blockers.append(pr_checks_blocker(store, wo["id"])
+                                if repair == PR_CHECKS_REPAIR else blocker)
     # CANCELLED CI THE OS'S ONE RE-RUN DID NOT CLEAR — the column keeps the green path free of reads (#1123)
     ci_stuck = ci_checks_stuck(store, wo)
     if ci_stuck:
@@ -1045,6 +1079,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(NO_ACTOR_BLOCKER.format(status=wo["status"]))
     # Below everything above: the flag asks for the more specific fact first
     blockers.extend(alarm_blockers(store, wo))
+    # A DECLARED USER STEP OWNS THE LINE: whatever ranked above it rides on it (#1697)
+    step = next((i for i, b in enumerate(blockers) if user_step_line(b)), 0)
+    if step:
+        blockers.insert(0, blockers.pop(step) + USER_STEP_ALSO + "; ".join(blockers[:step]))
     # What the user has already looked at and dismissed stops being a blocker — but only exactly that
     return [b for b in blockers if b not in acknowledged(wo)]
 
@@ -1846,8 +1884,12 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
         if not blockers:
             continue
         reason = wo.get("attention_reason") or ""
-        # Only assumptions are enforced strictly (#705)
-        if _mentions_assumptions(blockers[0]) == _mentions_assumptions(reason):
+        # Strict on assumptions, a lost user step and a stale give-up line (#705, #1697)
+        step = user_step_line(blockers[0])
+        stale_give_up = (reason not in blockers and any(
+            reason in lines for lines in PR_REPAIR_LINES.values()))
+        if (_mentions_assumptions(blockers[0]) == _mentions_assumptions(reason)
+                and not (step and step not in reason) and not stale_give_up):
             continue
         if reason in alarm_blockers(store, wo):
             continue  # it names a real ask, and the rewrite is what hid al-86afc8b4 (io-d5e62d4d)

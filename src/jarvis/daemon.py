@@ -6193,7 +6193,7 @@ class Daemon:
                         self.heal_pull_request(
                             project, store, wo, ops.PR_CHECKS,
                             f"has failing checks ({', '.join(pr.failing)})",
-                            failing=", ".join(pr.failing),
+                            failing=", ".join(pr.failing), draft=pr.draft,
                             # BEHIND rides along with a nudge that was going out anyway and never causes one: spec §5
                             behind=(ops.PR_BEHIND_NOTE.format(
                                 base=pr.base_ref or "its base") if pr.behind else ""),

@@ -792,6 +792,23 @@ def _parse_autonomy(raw: Any) -> AutonomyConfig:
 
 
 @dataclass
+class ArtifactsConfig:
+    """Fleet ceiling on sessions held alive for an undecided artifact (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.4)"""
+
+    max_held_sessions: int = 10
+
+
+def _parse_artifacts(raw: Any) -> ArtifactsConfig:
+    if not isinstance(raw, dict):
+        raise _err('"os.artifacts" must be an object')
+    value = raw.get("max_held_sessions", ArtifactsConfig.max_held_sessions)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _err(f"os.artifacts.max_held_sessions must be a whole number >= 0, "
+                   f"got {value!r}")
+    return ArtifactsConfig(max_held_sessions=value)
+
+
+@dataclass
 class MessagingConfig:
     """When a message queued for a worker stops being in flight and becomes a defect"""
 
@@ -1235,6 +1252,7 @@ class OsConfig:
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
     autonomy: AutonomyConfig = field(default_factory=AutonomyConfig)
     morpheus: MorpheusConfig = field(default_factory=MorpheusConfig)
+    artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
 
 
 @dataclass
@@ -2325,6 +2343,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         worktree=_parse_worktree(os_raw.get("worktree", {})),
         autonomy=_parse_autonomy(os_raw.get("autonomy", {})),
         morpheus=_parse_morpheus(os_raw.get("morpheus", {})),
+        artifacts=_parse_artifacts(os_raw.get("artifacts", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")

@@ -890,6 +890,72 @@ def registered_project_paths(*, include_archived: bool = False) -> dict[str, Pat
         central.close()
 
 
+def artifact_session_cap() -> int:
+    """`os.artifacts.max_held_sessions`; the shipped default when no catalog loads"""
+    from .catalog import ArtifactsConfig
+
+    try:
+        return resolve_catalog().os.artifacts.max_held_sessions
+    except Exception:  # noqa: BLE001 — no catalog registered, or an unreadable one
+        return ArtifactsConfig.max_held_sessions
+
+
+def held_order_count() -> int:
+    """Orders fleet-wide holding a session for an undecided artifact (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.4)"""
+    total = 0
+    for path in registered_project_paths().values():
+        if not (path / ".jarvis").is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            total += len(store.held_orders())
+        finally:
+            store.close()
+    return total
+
+
+def list_artifacts(project_name: str | None = None, *, include_decided: bool = False
+                   ) -> list[dict[str, Any]]:
+    """`jarvis artifact list`: undecided unless asked (§3.5)"""
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered")
+        paths = {project_name: paths[project_name]}
+    out: list[dict[str, Any]] = []
+    for name, path in sorted(paths.items()):
+        if not (path / ".jarvis").is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            rows = store.all_artifacts() if include_decided else store.undecided_artifacts()
+            out.extend({"project": name, **row} for row in rows)
+        finally:
+            store.close()
+    return out
+
+
+def show_artifact(art_id: str) -> dict[str, Any]:
+    """`jarvis artifact show`: the row and its order (§3.5)"""
+    for name, path in sorted(registered_project_paths().items()):
+        if not (path / ".jarvis").is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            row = store.artifact(art_id)
+            if row is None:
+                continue
+            try:
+                wo = store.get_work_order(row["wo_id"])
+            except KeyError:
+                wo = {"id": row["wo_id"], "title": "(order deleted)", "status": None}
+            return {"project": name, **row,
+                    "order": {k: wo.get(k) for k in ("id", "title", "status")}}
+        finally:
+            store.close()
+    raise OpsError(f"artifact {art_id!r} not found")
+
+
 def require_registered_project(name: str) -> str:
     """Refuse a row under a project the OS does not know (issue #1333)"""
     central = CentralStore()
@@ -6256,6 +6322,27 @@ def same_red_run(nudge: dict[str, Any], fields: dict[str, Any]) -> bool:
             and set(fields["red_runs"]) <= set(last.get("red_runs") or ()))
 
 
+def flag_derived(store: ProjectStore, wo_id: str, fallback: str) -> None:
+    """Flag the DERIVED line, never a give-up written over a declared user step (#1697)"""
+    blockers = invariants.true_blockers(store, store.get_work_order(wo_id))
+    store.flag_attention(wo_id, blockers[0] if blockers else fallback)
+
+
+def settle_repair_line(store: ProjectStore, wo: dict[str, Any], repair: PrRepair) -> None:
+    """Take this repair's give-up off the attention line once it no longer holds"""
+    reason = wo["attention_reason"] or ""
+    lines = invariants.PR_REPAIR_LINES[repair.name]
+    if reason in lines:
+        store.clear_attention(wo["id"])
+    elif any(line in reason for line in lines):
+        # It rode on a user step's line: re-derive, keeping the step (#1697)
+        blockers = invariants.true_blockers(store, store.get_work_order(wo["id"]))
+        if blockers:
+            store.flag_attention(wo["id"], blockers[0])
+        else:
+            store.clear_attention(wo["id"])
+
+
 def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
                     **fields: Any) -> dict[str, Any]:
     """GitHub says this pull request is broken: ask the worker to fix it, or give up"""
@@ -6264,7 +6351,7 @@ def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
         if not store.pr_repair_gave_up(wo["id"], repair.name):
             store.add_event(wo["id"], repair.event("unresolved"),
                             {"pr_url": wo.get("pr_url"), "attempts": attempts})
-            store.flag_attention(wo["id"], repair.blocker)
+            flag_derived(store, wo["id"], repair.blocker)
         return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
                 "gave_up": True}
     # THE WORKER ALREADY ANSWERED THIS VERY RUN without a push: its answer is the user's (#1438)
@@ -6274,7 +6361,7 @@ def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
                             {"pr_url": wo.get("pr_url"), "attempts": attempts,
                              "head_sha": fields["head_sha"],
                              "red_runs": fields["red_runs"]})
-            store.flag_attention(wo["id"], repair.blocker)
+            flag_derived(store, wo["id"], repair.blocker)
         return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
                 "gave_up": False, "held": True}
     attempt = attempts + 1
@@ -6320,8 +6407,7 @@ def rearm_pr_repair(store: ProjectStore, wo: dict[str, Any],
         return 0
     store.add_event(wo["id"], repair.event("rearmed"), {
         "pr_url": wo.get("pr_url"), "attempts": len(nudges)})
-    if wo["attention_reason"] == repair.blocker:
-        store.clear_attention(wo["id"])
+    settle_repair_line(store, wo, repair)
     return len(nudges)
 
 
@@ -6331,8 +6417,7 @@ def clear_pr_repair(store: ProjectStore, wo: dict[str, Any],
     if not store.pr_repair_attempts(wo["id"], repair.name):
         return False
     store.add_event(wo["id"], repair.event("cleared"), {"pr_url": wo.get("pr_url")})
-    if wo["attention_reason"] == repair.blocker:
-        store.clear_attention(wo["id"])
+    settle_repair_line(store, wo, repair)
     resettle_after_repair(store, wo["id"])
     return True
 
