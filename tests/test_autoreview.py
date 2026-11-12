@@ -2299,7 +2299,7 @@ CHILD = {"id": "wo-1", "status": "needs_review", "title": "t", "description": "d
 
 @pytest.fixture(autouse=True)
 def specs_predate_their_feature(monkeypatch):
-    """These packets carry a spec the user's project already held; the other case is tests/test_family_spec_authority.py"""
+    """These packets model a pre-existing spec; test_family_spec_authority covers the rest"""
     monkeypatch.setattr(specs, "predates", lambda *_a: True)
 
 
