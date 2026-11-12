@@ -80,9 +80,9 @@ def test_like_copies_settings_never_identity_nor_os(tmp_path, repo):
     assert not any(p.startswith("os.") for p in values)
     assert draft.project.model == "opus" and draft.project.description == ""
     assert {"area": "like", "mode": "src"} in draft.answers
-    answered = {a["area"] for a in draft.answers}
-    assert not answered & onboard_knobs.MUST_HAVE
-    assert answered - {"like"}  # control: non-must-have areas ARE answered
+    copied = {a["area"] for a in draft.answers if a.get("from") == "like:src"}
+    assert copied == {a.key for a in onboard_prose.AREAS}
+    assert onboard_knobs.MUST_HAVE <= copied  # must-haves too: review is the override step
 
 
 def test_like_never_copies_a_default_the_source_never_wrote(tmp_path, repo):
