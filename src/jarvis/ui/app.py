@@ -74,10 +74,11 @@ from . import markdown
 TEMPLATES = Path(__file__).parent / "templates"
 # Third-party browser code, shipped in the package so no page loads a CDN (vendor/README.md)
 VENDOR = Path(__file__).parent / "vendor"
-VENDORED = frozenset(p.name for p in VENDOR.glob("*.js"))
+VENDOR_TYPES = {".js": "text/javascript", ".css": "text/css"}
+VENDORED = frozenset(p.name for p in VENDOR.iterdir() if p.suffix in VENDOR_TYPES)
 # `?v=<content hash>` on every vendored URL: `/vendor/` is cached for an hour
-VENDOR_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
-                  for p in VENDOR.glob("*.js")}
+VENDOR_VERSION = {name: hashlib.sha256((VENDOR / name).read_bytes()).hexdigest()[:12]
+                  for name in VENDORED}
 # The dashboard's OWN browser code (the shared chart helper), served the same way
 STATIC = Path(__file__).parent / "static"
 STATIC_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
@@ -1258,7 +1259,7 @@ def create_app() -> FastAPI:
         # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason the partial already...
         tool_table=fleetcost.tool_table,
         # `/static/<file>?v=<hash>`: the dashboard's own scripts, cache-busted like /vendor/
-        static_v=STATIC_VERSION,
+        static_v=STATIC_VERSION, vendor_v=VENDOR_VERSION,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must not be able to disagree...
         assumption_decider=ops.assumption_decider,
         # And the OS's RULING on one, same reason one authority along: the page and `jarvis wo show` must not... (#712)
@@ -2169,7 +2170,7 @@ def create_app() -> FastAPI:
         """The page's vendored libraries — listed, never a path walk (see vendor/README.md)"""
         if name not in VENDORED:
             return JSONResponse({"error": f"no vendored file {name}"}, status_code=404)
-        return FileResponse(VENDOR / name, media_type="text/javascript")
+        return FileResponse(VENDOR / name, media_type=VENDOR_TYPES[Path(name).suffix])
 
     @app.get("/static/{name}")
     def static(name: str):
