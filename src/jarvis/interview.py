@@ -209,7 +209,6 @@ _IDENTITY_TAILS = frozenset({"path", "description", "production.path", "bugs.rep
 def like_draft(path: str | Path, name: str, source: str, *, document: dict[str, Any],
                areas: Iterable[Area]) -> Draft:
     """A new draft copying what `source`'s catalog entry sets, never its identity"""
-    from .onboard_knobs import MUST_HAVE
     from .ops import _written_paths
 
     entries = {p["name"]: p for p in document.get("projects", [])
@@ -233,11 +232,11 @@ def like_draft(path: str | Path, name: str, source: str, *, document: dict[str, 
     if problems:
         raise InterviewError("\n".join(problems))
     candidate = _resolved(onboard_draft.candidate_document(draft, document))
-    # Must-haves stay unanswered: the user still confirms each one
+    # Every area, must-haves too, answered by the copy: review is the override step (spec §1)
     for area in areas:
-        if area.key not in MUST_HAVE:
-            draft.answers.append({"area": area.key,
-                                  "mode": _mode(match_posture(area, candidate, name))})
+        draft.answers.append({"area": area.key,
+                              "mode": _mode(match_posture(area, candidate, name)),
+                              "from": f"like:{source}"})
     draft.answers.append({"area": "like", "mode": source})
     return _commit(draft, before, document)
 

@@ -9,6 +9,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .. import ops
+from .onboard_pages import identity_gaps
 
 
 def register(app: FastAPI, render: Callable[..., HTMLResponse]) -> None:
@@ -41,5 +42,9 @@ def register(app: FastAPI, render: Callable[..., HTMLResponse]) -> None:
                                     like=like or None, fresh=bool(fresh))
         except ops.OpsError as e:
             return index(request, form=form, error=str(e), status_code=400)
-        return RedirectResponse(f"/onboard/{quote(view['project']['name'])}",
-                                status_code=303)
+        name = quote(view["project"]["name"])
+        if view["project"]["like"]:  # a copy answers every area: identity, then review (§1)
+            gaps = identity_gaps(view)
+            return RedirectResponse(f"/onboard/{name}/{'identity' if gaps else 'review'}",
+                                    status_code=303)
+        return RedirectResponse(f"/onboard/{name}", status_code=303)
