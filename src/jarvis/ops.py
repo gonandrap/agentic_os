@@ -6322,6 +6322,27 @@ def same_red_run(nudge: dict[str, Any], fields: dict[str, Any]) -> bool:
             and set(fields["red_runs"]) <= set(last.get("red_runs") or ()))
 
 
+def flag_derived(store: ProjectStore, wo_id: str, fallback: str) -> None:
+    """Flag the DERIVED line, never a give-up written over a declared user step (#1697)"""
+    blockers = invariants.true_blockers(store, store.get_work_order(wo_id))
+    store.flag_attention(wo_id, blockers[0] if blockers else fallback)
+
+
+def settle_repair_line(store: ProjectStore, wo: dict[str, Any], repair: PrRepair) -> None:
+    """Take this repair's give-up off the attention line once it no longer holds"""
+    reason = wo["attention_reason"] or ""
+    lines = invariants.PR_REPAIR_LINES[repair.name]
+    if reason in lines:
+        store.clear_attention(wo["id"])
+    elif any(line in reason for line in lines):
+        # It rode on a user step's line: re-derive, keeping the step (#1697)
+        blockers = invariants.true_blockers(store, store.get_work_order(wo["id"]))
+        if blockers:
+            store.flag_attention(wo["id"], blockers[0])
+        else:
+            store.clear_attention(wo["id"])
+
+
 def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
                     **fields: Any) -> dict[str, Any]:
     """GitHub says this pull request is broken: ask the worker to fix it, or give up"""
@@ -6330,7 +6351,7 @@ def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
         if not store.pr_repair_gave_up(wo["id"], repair.name):
             store.add_event(wo["id"], repair.event("unresolved"),
                             {"pr_url": wo.get("pr_url"), "attempts": attempts})
-            store.flag_attention(wo["id"], repair.blocker)
+            flag_derived(store, wo["id"], repair.blocker)
         return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
                 "gave_up": True}
     # THE WORKER ALREADY ANSWERED THIS VERY RUN without a push: its answer is the user's (#1438)
@@ -6340,7 +6361,7 @@ def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
                             {"pr_url": wo.get("pr_url"), "attempts": attempts,
                              "head_sha": fields["head_sha"],
                              "red_runs": fields["red_runs"]})
-            store.flag_attention(wo["id"], repair.blocker)
+            flag_derived(store, wo["id"], repair.blocker)
         return {"wo_id": wo["id"], "nudged": False, "attempts": attempts,
                 "gave_up": False, "held": True}
     attempt = attempts + 1
@@ -6386,8 +6407,7 @@ def rearm_pr_repair(store: ProjectStore, wo: dict[str, Any],
         return 0
     store.add_event(wo["id"], repair.event("rearmed"), {
         "pr_url": wo.get("pr_url"), "attempts": len(nudges)})
-    if wo["attention_reason"] == repair.blocker:
-        store.clear_attention(wo["id"])
+    settle_repair_line(store, wo, repair)
     return len(nudges)
 
 
@@ -6397,8 +6417,7 @@ def clear_pr_repair(store: ProjectStore, wo: dict[str, Any],
     if not store.pr_repair_attempts(wo["id"], repair.name):
         return False
     store.add_event(wo["id"], repair.event("cleared"), {"pr_url": wo.get("pr_url")})
-    if wo["attention_reason"] == repair.blocker:
-        store.clear_attention(wo["id"])
+    settle_repair_line(store, wo, repair)
     resettle_after_repair(store, wo["id"])
     return True
 
