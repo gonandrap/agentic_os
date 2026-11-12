@@ -1144,7 +1144,7 @@ ARTIFACT_ARM_PROMPT = ("Housekeeping, not a task: arm comment watches. For each 
 
 def held(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Is this order's session held for an undecided artifact (§1.5)?"""
-    return is_background(wo) and bool(store.undecided_artifacts(wo["id"]))
+    return is_background(wo) and any(w["id"] == wo["id"] for w in store.held_orders())
 
 
 def _reply_over_cap(store: ProjectStore, wo: dict[str, Any],
@@ -1209,7 +1209,8 @@ def _last_settled_at(store: ProjectStore, wo_id: str) -> float:
 
 
 def hold_session(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
-                 roster: dict[str, claude_cli.BgEntry]) -> str | None:
+                 roster: dict[str, claude_cli.BgEntry], *,
+                 min_context: int | None = None) -> str | None:
     """One held order's check: revive a dropped session, record a woken one, arm a watch (§4.2-§4.5.1)"""
     turn = store.latest_turn(wo["id"], include_artifact=True)
     if turn is not None and turn["state"] == "running":
@@ -1243,6 +1244,8 @@ def hold_session(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
     targets = _arm_targets(store, wo)
     if not targets:
         return None
+    if compact_before_relaunch(store, project, wo, min_context) is not None:
+        return "compacting"  # the arm goes on a later check, once that settles
     cwd = worktree_path(project, wo) or project.path
     _launch(store, project, wo, "\n".join([ARTIFACT_ARM_PROMPT, *(a["url"] for a in targets)]),
             kind=ARTIFACT_ARM_TURN, resume=True, worktree=None, cwd=cwd)

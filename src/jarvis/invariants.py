@@ -4892,8 +4892,11 @@ ARTIFACT_REPLY_CAPPED_BLOCKER = (
     "a comment reply on {urls} hit its ${cap:.2f} cap and was stopped; the next comment "
     "gets a fresh cap")
 
-#: Two reconcile periods at the default 5 s tick (daemon.RECONCILE_EVERY_TICKS = 6)
-ARTIFACT_REVIVE_WINDOW = 2 * 6 * 5.0
+def artifact_revive_window() -> float:
+    """Two reconcile periods: a revive the hold check owes is at most one check late (§4.4)"""
+    from .daemon import DEFAULT_POLL_INTERVAL, RECONCILE_EVERY_TICKS
+
+    return 2 * RECONCILE_EVERY_TICKS * DEFAULT_POLL_INTERVAL
 
 
 def artifact_hold_blockers(store: ProjectStore, wo: dict[str, Any]) -> list[str]:
@@ -4925,20 +4928,20 @@ def check_artifact_held(store: ProjectStore) -> Iterator[Violation]:
         roster = claude_cli.bg_roster()
     except claude_cli.ClaudeCliError:
         return  # no roster is no verdict
-    now = time.time()
+    now, window = time.time(), artifact_revive_window()
     for wo in held:
         entry = roster.get(str(wo.get("session_id") or ""))
         if entry is not None and entry.alive:
             continue
         revived = store.last_event_of_kind(wo["id"], worker_session.ARTIFACT_REVIVED_EVENT)
-        if revived is not None and now - float(revived["ts"]) <= ARTIFACT_REVIVE_WINDOW:
+        if revived is not None and now - float(revived["ts"]) <= window:
             continue
         yield Violation(
             invariant=INV_ARTIFACT_HELD,
             wo_id=wo["id"],
             detail=(f"holds a session for an undecided artifact, but session "
                     f"{wo.get('bg_id') or wo.get('session_id')} has no process and was "
-                    f"not revived in the last {int(ARTIFACT_REVIVE_WINDOW)} s"),
+                    f"not revived in the last {int(window)} s"),
             repaired=False,
             context={"bg_id": wo.get("bg_id"),
                      "failures": worker_session.revive_failures(store, wo["id"])},

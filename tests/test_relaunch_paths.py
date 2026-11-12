@@ -22,7 +22,6 @@ EXEMPT: dict[str, str] = {
     "worker_session._compact_or_withdraw": "the withdrawal wrapper around the action",
     "worker_session.compact_before_relaunch": "the decision itself",
     "worker_session.compact_while_warm": "the pre-expiry decision; nothing is relaunched (issue #1179)",
-    "worker_session.hold_session": "one arm turn per artifact, sent right after the publishing turn settles, cache warm (spec 2026-11-10 §1.4 item 9)",
 }
 
 

@@ -2217,8 +2217,10 @@ def comment_fence_decision(payload: dict[str, Any], env: dict[str, str]
         return None  # before any store open
     try:
         _, store, wo = _artifact_order(payload, env)
-    except Exception:  # noqa: BLE001 — no order resolved, so nothing is held to fence
-        return None
+    except Exception:  # noqa: BLE001 — an OS-spawned session that cannot be checked is fenced
+        spawned = bool(env.get("JARVIS_WO_ID")) or "/.claude/worktrees/wo-" in str(
+            payload.get("cwd") or "")
+        return _deny(COMMENT_FENCE_REASON) if spawned else None
     if store is None:
         return None
     try:

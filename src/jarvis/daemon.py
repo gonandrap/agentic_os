@@ -151,6 +151,7 @@ def _wedge_evidence(figures: dict[str, Any], dump: str) -> str:
 
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
+DEFAULT_POLL_INTERVAL = 5.0  # seconds per tick
 
 #: Reconcile stamp an outside reader judges liveness by; spec 2026-10-16 §2a
 RECONCILE_TICK_KEY = "reconcile_tick"
@@ -756,7 +757,7 @@ class CarryOutcome:
 
 
 class Daemon:
-    def __init__(self, catalog: Catalog, poll_interval: float = 5.0):
+    def __init__(self, catalog: Catalog, poll_interval: float = DEFAULT_POLL_INTERVAL):
         self.catalog = catalog
         # Daemon boot arms the transport backstop too, for the catalog it was HANDED (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
         claude_cli.set_max_os_prompt_chars(catalog.os.max_os_prompt_chars)
@@ -5470,7 +5471,8 @@ class Daemon:
             return
         for wo in held:
             try:
-                worker_session.hold_session(store, project, wo, roster)
+                worker_session.hold_session(store, project, wo, roster,
+                                            min_context=self.catalog.os.compact_min_context)
             except Exception:  # noqa: BLE001 — one order must not stall the rest
                 log.exception("[%s] holding %s failed", project.name, wo["id"])
 
@@ -9013,7 +9015,7 @@ conflicts, shipit refuses: report its reason and stop. Never fall back to releas
                 store.set_status(known["id"], "running")
 
 
-def run_daemon(catalog_path: str | Path, poll_interval: float = 5.0,
+def run_daemon(catalog_path: str | Path, poll_interval: float = DEFAULT_POLL_INTERVAL,
                log_to_file: bool = True) -> None:
     ensure_home()
     handlers: list[logging.Handler] = [logging.StreamHandler()]

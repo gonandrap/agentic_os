@@ -296,7 +296,8 @@ def test_an_os_started_turn_of_a_held_order_is_not_fenced(bg_fleet, fake_claude,
 @pytest.mark.parametrize("tool,matched", [
     ("Read", True), ("Grep", True), ("WebFetch", True), ("SendMessage", True),
     ("mcp__x__y", True), ("mcp__plugin_serena_serena__find_symbol", True),
-    ("mcp__serena__replace_symbol_body", True),
+    ("mcp__serena__replace_symbol_body", True), ("LS", True), ("BashOutput", True),
+    ("TaskOutput", True), ("Monitor", True), ("SendUserFile", True),
     ("mcp__plugin_serena_serena__activate_project", False)])
 def test_the_hook_matcher_reaches_every_fenced_tool(tool, matched):
     """Claude Code searches a regex matcher, as test_investigation_orders._cli_matches does"""
@@ -307,6 +308,30 @@ def test_the_hook_matcher_reaches_every_fenced_tool(tool, matched):
         (Path(hooks.__file__).parent / "assets" / "settings.base.json").read_text())
     matcher = settings["hooks"]["PreToolUse"][0]["matcher"]
     assert bool(re.search(matcher, tool)) is matched
+
+
+def test_the_fence_fails_closed_for_a_worker_whose_order_cannot_be_read(project, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(hooks, "_artifact_order", boom)
+    payload = {"tool_name": "Read", "tool_input": {}, "cwd": str(project)}
+    assert _denied_by_fence(hooks.comment_fence_decision(payload, {"JARVIS_WO_ID": "wo-x"}))
+    assert hooks.comment_fence_decision(payload, {}) is None  # not ours: a user session
+
+
+def test_an_arm_turn_waits_for_a_due_compaction(bg_fleet, fake_claude, settle_turns,
+                                                monkeypatch):
+    store = bg_fleet["store"]
+    wo, _ = _settled(bg_fleet, settle_turns, fake_claude, via_subagent=True)
+    asked = []
+    monkeypatch.setattr(worker_session, "compact_before_relaunch",
+                        lambda *a, **k: asked.append(a) or {"id": 1})
+
+    _hold(bg_fleet)
+    assert asked
+    assert not [t for t in store.list_turns(wo["id"])
+                if t["kind"] == worker_session.ARTIFACT_ARM_TURN]
 
 
 def test_an_unheld_order_is_not_fenced(bg_fleet, fake_claude, settle_turns):
