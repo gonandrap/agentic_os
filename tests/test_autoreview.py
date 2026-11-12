@@ -7,7 +7,7 @@ import re
 
 import pytest
 
-from jarvis import autoreview, neo, ops, plans, stakes
+from jarvis import autoreview, neo, ops, plans, specs, stakes
 from jarvis.catalog import ValidationConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
@@ -2297,8 +2297,16 @@ CHILD = {"id": "wo-1", "status": "needs_review", "title": "t", "description": "d
          "parent_id": "fo-1", "kind": "child", "spec_section": "2. The remedy"}
 
 
+@pytest.fixture(autouse=True)
+def specs_predate_their_feature(monkeypatch):
+    """These packets carry a spec the user's project already held; the other case is tests/test_family_spec_authority.py"""
+    monkeypatch.setattr(specs, "predates", lambda *_a: True)
+
+
 class SpecStore(FakeStore):
     """`specs.spec_of`'s one read — the parent feature's stored plan"""
+
+    project_path = "/nonexistent"
 
     def __init__(self, *messages: dict, doc: str = SPEC_DOC,
                  path: str = "docs/superpowers/specs/2026-10-13-bus.md"):

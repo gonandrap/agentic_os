@@ -129,6 +129,42 @@ def _plan_section_for_title(plan: dict[str, Any], title: str) -> str:
     return found[0] if len(found) == 1 else ""
 
 
+def family_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The `feature` order this order belongs to, or None (docs/superpowers/specs/2026-11-12-a-family-spec-is-not-authority.md §3.1)"""
+    parent = str(wo.get("parent_id") or "")
+    if not parent:
+        return None
+    try:
+        fo = store.get_feature_order(parent)
+    except KeyError:
+        return None
+    return fo if fo.get("kind", "feature") == "feature" else None
+
+
+def predates(repo: Path, spec_path: str, ts: float) -> bool:
+    """Did the default branch hold `spec_path` before `ts`? No git answer is False"""
+    from .evidence import _git, base_ref
+
+    ref = base_ref(repo)
+    if not (ref and spec_path):
+        return False
+    return bool(_git(repo, "log", "-1", "--format=%H", f"--before=@{int(ts)}", ref,
+                     "--", spec_path).strip())
+
+
+def family_written(store: ProjectStore, wo: dict[str, Any],
+                   paths: Any) -> tuple[str, set[str]]:
+    """`(fo_id, paths written inside that feature order)`; `("", set())` outside a family (§3.1)"""
+    fo = family_of(store, wo)
+    if fo is None:
+        return "", set()
+    repo = Path(store.project_path)
+    since = float(fo.get("created_at") or 0)
+    own = {p for p in {str(p).strip() for p in paths} - {""}
+           if not predates(repo, p, since)}
+    return str(fo["id"]), own
+
+
 def spec_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
     """This work order's spec, section included, or None (docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md)"""
     if not wo.get("parent_id") or wo.get("kind") in ("planner", "manager"):
