@@ -565,6 +565,17 @@ def user_action_owed_blocker(command: str) -> str:
             f"— `jarvis wo ack` once you have run it, or `jarvis wo done` to close it")
 
 
+#: docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.2
+ARTIFACT_DECISION_BLOCKER = "artifact awaiting your decision: keep or delete ({n})"
+ARTIFACT_DECISION_HEAD = ARTIFACT_DECISION_BLOCKER.split("(")[0]
+#: Where an undecided artifact asks the user: parked, cancelled, or failed (§5.2)
+ARTIFACT_ASK_STATUSES = ("needs_review", "cancelled", "failed")
+
+
+def artifact_decision_blocker(n: int) -> str:
+    return ARTIFACT_DECISION_BLOCKER.format(n=n)
+
+
 #: Opening words of a declared user step's line; while open it OWNS the attention line (#1697)
 USER_STEP_PREFIXES = (user_action_blocker("").split("`")[0],
                       user_action_owed_blocker("").split("`")[0])
@@ -1014,6 +1025,13 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # THE GIVE-UP, SURVIVING INTO THE STATUS THAT DROPPED IT (issue 902)
     if wo["status"] == "waiting_pr_merge" and parked_on_a_give_up(store, wo):
         blockers.append(PARKED_GIVE_UP_BLOCKER)
+    # AN ARTIFACT ONLY THE USER MAY KEEP OR DELETE (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.2)
+    artifact_parked = False
+    if wo["status"] in ARTIFACT_ASK_STATUSES:
+        if undecided := len(store.undecided_artifacts(wo["id"])):
+            blockers.append(artifact_decision_blocker(undecided))
+        artifact_parked = (wo["status"] == "needs_review"
+                           and store.artifact_park_open(wo["id"]))
     if governed and wo["status"] == "needs_review":
         # In the body, the pattern `auto_review_at` above already uses: `ops` imports this module
         from .ops import refusal_answered, user_message_unanswered
@@ -1028,7 +1046,9 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(user_action_owed_blocker(
                 str(owed_action.get("command") or "")))
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for something different (#224)
-        if release_parked_unshipped(store, wo):
+        if artifact_parked:
+            pass  # a completion the gate held (artifact-session-hold §5.3)
+        elif release_parked_unshipped(store, wo):
             # Rebuilt from the sentence its settler flagged, so both surfaces agree (#1591)
             blockers.append(RELEASE_NOTHING_SHIPPED_BLOCKER.format(wo_id=wo["id"]))
         elif wo.get("pr_state") == "CLOSED":
@@ -2974,6 +2994,11 @@ def check_consumed_documents_settle(store: ProjectStore) -> Iterator[Violation]:
             continue
 
         def settle(wo_id: str = wo_id, fo_id: str = fo_id) -> None:
+            from .ops import artifact_owed, park_artifact_decision
+
+            if artifact_owed(store, wo_id):  # docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.1
+                park_artifact_decision(store, store.get_work_order(wo_id))
+                return
             store.set_status(wo_id, "completed", trigger=INV_DOCUMENT_CONSUMED)
             store.clear_attention(wo_id)
             store.add_event(wo_id, "document_consumed_settled", {"parent": fo_id})
@@ -2983,6 +3008,31 @@ def check_consumed_documents_settle(store: ProjectStore) -> Iterator[Violation]:
         yield Violation(invariant=INV_DOCUMENT_CONSUMED, wo_id=wo_id, detail=detail,
                         repaired=True, repair="status set to `completed`",
                         context=context)
+
+
+INV_ARTIFACT_UNDECIDED_COMPLETED = "INV-ARTIFACT-UNDECIDED-COMPLETED"
+
+
+def check_undecided_artifact_not_completed(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ARTIFACT-UNDECIDED-COMPLETED — a `completed` order still owns an undecided artifact (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.1)"""
+    from .ops import park_artifact_decision
+
+    readonly = getattr(store, "readonly", False)
+    for wo_id in dict.fromkeys(a["wo_id"] for a in store.undecided_artifacts()):
+        try:
+            wo = store.get_work_order(wo_id)
+        except KeyError:
+            continue
+        if wo["status"] != "completed":
+            continue
+        detail = (f"work order {wo_id} is `completed` but owns an artifact the user has not "
+                  f"kept or deleted: a completion path skipped the gate")
+        if not readonly and not store.repair_while(
+                wo_id, "completed", lambda wo=wo: park_artifact_decision(store, wo)):
+            continue  # it moved under the sweep: the writer that moved it owns the status
+        yield Violation(invariant=INV_ARTIFACT_UNDECIDED_COMPLETED, wo_id=wo_id,
+                        detail=detail, repaired=True,
+                        repair="parked in needs_review for the user's decision")
 
 
 INV_INVESTIGATION_DISPATCH = "INV-INVESTIGATION-DISPATCH"
@@ -4962,6 +5012,7 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # the status they derive a reason from
     check_a_working_worker_is_not_waiting,  # BEFORE the reason checks: it moves the status
                                    # they derive from, and INV-ATTENTION-MISSING would re-flag what it clears
+    check_undecided_artifact_not_completed,  # ...and for the same reason: it parks a row
     check_attention_reason_is_true,
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks

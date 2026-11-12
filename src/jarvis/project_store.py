@@ -593,6 +593,9 @@ REFUSED_ARTIFACT_EVENT = "refused_artifact"
 ARTIFACT_PUBLISHED_EVENT = "artifact_published"
 ARTIFACT_DECISION_EVENT = "artifact_decision"
 ARTIFACT_DECISIONS = ("keep", "delete_requested", "deleted")
+#: The completion gate's park and its release (§5.1, §5.3)
+ARTIFACT_DECISION_REQUIRED_EVENT = "artifact_decision_required"
+ARTIFACT_DECIDED_EVENT = "artifact_decided"
 
 #: How many rows one reclaim sweep reads; `disk.MAX_PER_SWEEP` bounds the removals
 MAX_PER_SWEEP_ROWS = 50
@@ -2135,6 +2138,14 @@ class ProjectStore:
         self.add_event(row["wo_id"], ARTIFACT_DECISION_EVENT,
                        {"art_id": art_id, "url": row["url"], "decision": decision, "by": by})
         return self.artifact(art_id) or row
+
+    def artifact_park_open(self, wo_id: str) -> bool:
+        """Parked for an artifact decision and not moved since (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.3)"""
+        parks = self.events_of_kind(wo_id, ARTIFACT_DECISION_REQUIRED_EVENT)
+        if not parks:
+            return False
+        moved = self.events_of_kind(wo_id, "status")
+        return not moved or float(parks[-1]["ts"]) >= float(moved[-1]["ts"])
 
     def has_artifact(self, wo_id: str) -> bool:
         return self.conn.execute(
