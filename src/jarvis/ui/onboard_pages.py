@@ -38,6 +38,12 @@ def first_section(view: dict[str, Any]) -> str:
                 "review")
 
 
+def identity_gaps(view: dict[str, Any]) -> list[str]:
+    """The `project.*` fields still empty: what a copy never fills (§1)"""
+    section = next(s for s in view["sections"] if s["key"] == "identity")
+    return [k["path"] for k in section["knobs"] if k["kind"] == "identity" and not k["value"]]
+
+
 def _rows(section: dict[str, Any], error_path: str, typed: str | None) -> list[dict[str, Any]]:
     from .app import config_input_text, config_widget
 

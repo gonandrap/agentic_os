@@ -10835,6 +10835,50 @@ def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
     return q
 
 
+def _bundled_assumptions(path: Path, fo: dict[str, Any]) -> list[dict[str, Any]]:
+    """The planner's rows this plan review carries (docs/superpowers/specs/2026-11-12-a-family-spec-is-not-authority.md §3.3)"""
+    from . import autoreview
+
+    planner_id = str(fo.get("plan_wo_id") or "")
+    if not planner_id:
+        return []
+    store = ProjectStore(path)
+    try:
+        wo = store.get_work_order(planner_id)
+        return [{"id": int(a["id"]), "n": a.get("n"), "content": str(a["content"])}
+                for a in store.all_assumptions(planner_id)
+                if a["status"] == "pending"
+                and autoreview.bundled_into_plan(store, wo, a)]
+    finally:
+        store.close()
+
+
+def _settle_bundled(store: ProjectStore, path: Path, name: str, fo: dict[str, Any],
+                    plan: dict[str, Any], decided_by: str, feedback: str) -> None:
+    """A released plan accepts the rows it carried, in its releaser's name (§3.3)"""
+    planner_id = str(fo.get("plan_wo_id") or "")
+    ids = {int(b["id"]) for b in plan.get("bundled_assumptions") or []}
+    if not (planner_id and ids):
+        return
+    wo = store.get_work_order(planner_id)
+    cfg = validation_config(name)
+    reason = f"released with the plan of {fo['id']} by {decided_by}: {feedback}"
+    land = wo["status"] == "needs_review"
+    for a in store.all_assumptions(planner_id):
+        if int(a["id"]) not in ids or a["status"] not in ("pending", ASSUMPTION_LAPSED):
+            continue
+        if decided_by == ASSUMPTION_DECIDER_OS:
+            accept_assumption(store, path, wo, a, reason=reason, model="",
+                              question_id=int(fo.get("plan_question_id") or 0),
+                              cfg=cfg, land=land)
+        else:
+            store.review_assumption(a["id"], "accepted", decided_by=decided_by,
+                                    reason=reason)
+    if land and decided_by != ASSUMPTION_DECIDER_OS \
+            and not store.pending_assumptions(planner_id):
+        _land_after_acceptance(store, path, planner_id, cfg)
+
+
 def submit_plan(fo_id: str, doc: Any, project_name: str | None = None,
                 source: Path | None = None) -> dict[str, Any]:
     """(Planners) hand back the decomposition"""
@@ -10878,6 +10922,7 @@ def submit_plan(fo_id: str, doc: Any, project_name: str | None = None,
 
     # §3: after the committed-copy check
     _record_spec_pull_request(path, fo_id, planner_wo, plan["design_doc"])
+    plan["bundled_assumptions"] = _bundled_assumptions(path, fo)
 
     # The planner is who Neo's question hangs off: it is a real work order
     planner_id = fo.get("plan_wo_id") or fo_id
@@ -11107,6 +11152,7 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
             # The feature's own agent type, built from the spec's `Agent profile` appendix
             specs.install_agent(path, fo_id, str(plan.get("summary") or fo["title"]),
                                 str(plan.get("design_doc_content") or ""))
+            _settle_bundled(store, path, name, fo, plan, decided_by, feedback)
         else:
             children = []
             store.set_feature_status(fo_id, "planning")
@@ -15201,6 +15247,12 @@ def onboard_apply(draft_path: str, *, catalog_path: str | None = None,
         central.upsert_project(name=spec.name, path=str(spec.path),
                                description=spec.description, model=spec.model,
                                catalog_json=json.dumps(spec.raw))
+        if report.warnings:  # the applied page is rebuilt from the version, which drops them (wo-6d9fbd23)
+            central.add_inbox(
+                project=spec.name, level="warning",
+                title=f"onboarding {spec.name}: bootstrap left {len(report.warnings)} warning(s)",
+                body=f"config version {row['id']}\n\n" + "\n".join(
+                    f"- {w}" for w in report.warnings))
     finally:
         central.close()
     return {"version": row,
@@ -15913,9 +15965,15 @@ def _onboard_help_prompt(view: dict[str, Any], sec: dict[str, Any], focus: str,
     return "\n".join(lines)
 
 
-def onboard_help(name: str, section: str, focus: str = "", *,
-                 catalog_path: str | None = None) -> dict[str, Any]:
-    """Open a read-only help session on one section of a draft (docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md §4)"""
+# Read verbs only: `Bash(jarvis onboard:*)` would let `onboard apply` (a write) run unprompted
+ONBOARD_HELP_ALLOWED_TOOLS = ("Bash(jarvis onboard explain:*)", "Bash(jarvis onboard questions:*)",
+                              "Bash(jarvis config show:*)", "Bash(jarvis config get:*)", "Read")
+ONBOARD_HELP_DISALLOWED_TOOLS = ("Edit", "Write", "NotebookEdit")
+
+
+def onboard_help_launch(name: str, section: str, focus: str = "", *,
+                        catalog_path: str | None = None) -> dict[str, Any]:
+    """How to start the interactive help terminal (docs/superpowers/specs/2026-11-12-onboarding-help-terminal-panel.md §1)"""
     import urllib.parse
 
     from . import bootstrap, claude_cli, notify, paths
@@ -15937,14 +15995,33 @@ def onboard_help(name: str, section: str, focus: str = "", *,
     add_dirs = [root, Path(view["project"]["path"])]
     # Never `[WO …`: `jarvis doctor` reports those as orphans
     session_name = f"[onboard] {name} · {section}"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("JARVIS_WO_ID", "JARVIS_TURN_TRANSPORT")}  # else hooks treat it as a worker
+    env.update(TERM="xterm-256color", COLORTERM="truecolor")
+    argv = [claude_cli.claude_bin(), "--name", session_name, "--agent", ONBOARD_HELPER,
+            *(a for d in add_dirs for a in ("--add-dir", str(d))),
+            "--disallowedTools", *ONBOARD_HELP_DISALLOWED_TOOLS,
+            "--allowedTools", *ONBOARD_HELP_ALLOWED_TOOLS, "--", prompt]
+    # cwd is not the project: its workspace trust is written only by the bootstrap
+    return {"argv": argv, "cwd": paths.jarvis_home(), "env": env, "prompt": prompt,
+            "session_name": session_name, "section": section, "focus": focus,
+            "add_dirs": add_dirs}
+
+
+def onboard_help(name: str, section: str, focus: str = "", *,
+                 catalog_path: str | None = None) -> dict[str, Any]:
+    """Open a read-only help session on one section of a draft (docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md §4)"""
+    from . import claude_cli
+
+    launch = onboard_help_launch(name, section, focus, catalog_path=catalog_path)
+    session_name, prompt, add_dirs = launch["session_name"], launch["prompt"], launch["add_dirs"]
     out = {"session_name": session_name, "job_id": None, "attach": "claude agents",
            "prompt": prompt, "error": "",
            "argv": [claude_cli.claude_bin(), "--bg", "--name", session_name,
                     "--agent", ONBOARD_HELPER,
                     *(a for d in add_dirs for a in ("--add-dir", str(d))), "--", prompt]}
     try:
-        # cwd is not the project: its workspace trust is written only by the bootstrap
-        job_id = claude_cli.spawn_background(prompt, cwd=paths.jarvis_home(),
+        job_id = claude_cli.spawn_background(prompt, cwd=launch["cwd"],
                                              name=session_name, agent=ONBOARD_HELPER,
                                              add_dirs=add_dirs)
     except claude_cli.ClaudeCliError as e:
@@ -16118,6 +16195,57 @@ def set_wiring(lever: str, wired: bool, project: str | None = None, *,
         path = f"os.{path}"
     return set_config(path, value, project, reason=reason,
                       catalog_path=catalog_path, actor=actor)
+
+
+def onboard_live(name: str, catalog: str = "") -> dict[str, str]:
+    """Has the running daemon loaded `name`, and the one action that works if not (wo-6d9fbd23)"""
+    from .daemon import DAEMON_PROJECTS_KEY
+    from . import service_manager
+
+    central = CentralStore()
+    try:
+        published = db.from_json(central.get_state(DAEMON_PROJECTS_KEY), None)
+        catalog = catalog or central.get_state("catalog_path") or "<catalog>"
+    finally:
+        central.close()
+    start = f"jarvis start --catalog {catalog}"
+    if not daemon_running():
+        return {"state": "down", "text": "the OS is not running", "command": start}
+    if not isinstance(published, dict):
+        return {"state": "unknown", "command": "",
+                "text": f"cannot tell whether {name} is live: the running daemon "
+                        f"predates the release that publishes its project list"}
+    # `jarvis start` leaves a running daemon as it is (kn-ef104d83)
+    command = (service_manager.restart_hint(release.DAEMON_UNIT) if published.get("managed")
+               else f"jarvis stop && {start}")
+    if name in (published.get("projects") or []):
+        return {"state": "live", "command": command,
+                "text": f"{name} is live: the running daemon has it loaded"}
+    return {"state": "not_loaded", "command": command,
+            "text": f"{name} is saved but NOT live: the running daemon started without it"}
+
+
+def onboard_applied(name: str, version_id: str) -> dict[str, Any]:
+    """The applied page's facts, from the stored version alone (wo-6d9fbd23)"""
+    row = _find_version(version_id)
+    central = CentralStore()
+    try:
+        started = float(central.get_state("daemon_started_at") or 0)
+    finally:
+        central.close()
+    # A restart-class key is pending only if the daemon booted before this version
+    cold = sorted(c["path"] for c in row["changes"]
+                  if apply_class(c["path"]) == "restart") if started < row["ts"] else []
+    return {"version": row, "changes": len(row["changes"]), "cold": cold,
+            "live": onboard_live(name, row.get("source_path") or "")}
+
+
+def onboard_last_applied(name: str) -> str | None:
+    """The newest onboarding apply that touched `name`, or None"""
+    own = f"projects.{name}."
+    return next((r["id"] for r in config_history(name, limit=50)
+                 if r["actor"] == "onboard"
+                 and any(c["path"].startswith(own) for c in r["changes"])), None)
 
 
 def config_history(project: str | None = None,

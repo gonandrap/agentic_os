@@ -91,7 +91,9 @@ All GET query params are `str` (learning `kn-34d78a6e`).
 | `GET /onboard/{name}/review` | §5 | the review section |
 | `GET /onboard/{name}/{section}?focus=<path>` | §3 | one section; unknown section → 404 page |
 | `POST /onboard/{name}/edit` | §3 | form `verb, section, rev, path, value, mode, field, lever, wired, fleet` → `ops.onboard_edit` → 303 (see "Where an edit lands" below); on refusal re-render the section, status 400, the error shown and the typed value kept |
-| `POST /onboard/{name}/apply` | §5 | form `rev`, `reason` → `ops.onboard_apply` |
+| `POST /onboard/{name}/apply` | §5 | form `rev`, `reason` → `ops.onboard_apply` → 303 to `/onboard/{name}/applied/{version}` |
+| `GET /onboard/{name}/apply` | §5 | 303 to the latest applied page, else `review` |
+| `GET /onboard/{name}/applied/{version}` | §5 | the applied page, built from the stored version; unknown version → 404 page |
 | `POST /onboard/{name}/help` | §4 | form `section`, `focus` (knob path or empty) → `ops.onboard_help` → its own result page |
 
 `<slug>` is the knob path with every non-`[A-Za-z0-9_-]` character replaced by `-`.
@@ -225,11 +227,18 @@ The **view model** — what `onboard_view` returns, and what §3, §4, §5 read:
   wrapper; copying them would point the new project at someone else's.
 - Copies `model` into `draft.project.model`; leaves `description` empty.
 - Never copies an `os.*` value: those are already the fleet's.
-- Answers each area that is NOT `must_have` with `match_posture` over the candidate's
-  resolved map (as the re-run does), and appends the provenance entry
-  `{"area": "like", "mode": "<source>"}`. **Must-have areas stay unanswered**, with the
-  copied values in place: copying a project is a starting point, not twelve decisions, so
-  the user still confirms each must-have area (§2's `confirm` verb keeps the copied values).
+- Answers **every** area, must-haves included, with `match_posture` over the candidate's
+  resolved map (as the re-run does), each answer stamped `"from": "like:<source>"`, and
+  appends the provenance entry `{"area": "like", "mode": "<source>"}`. So
+  `must_have_missing` is empty after a copy. (Revised by io-74eab254: leaving must-haves
+  open turned a copy into a walk through every section; the user wants three steps —
+  pick the source, override a few settings, apply.) The single apply, with
+  `ops._require_reason` still guarding safety keys, is the deliberate decision.
+- Copy flow in the dashboard: `POST /onboard` with `like` redirects to `identity` when a
+  `project.*` field is empty (a copy never fills `description`), else to `review`. Review
+  says "copied from <source>" and every diff value links to its section; any successful
+  edit on a copied draft redirects back to `review`. Identity is never copied, so it is
+  the one step before review.
 - Ends in `_commit`, so a copied value that does not validate for the new project is
   refused with the parser's text rather than saved.
 
@@ -246,7 +255,9 @@ passes them through. The `onboard` subcommand set stays exactly `start`, `questi
    `projects.<new>.validation.enabled` and NO `production.path`, `path`, `bugs.repo`,
    `worker.launcher`, and no `os.` key — the control being that the source document DID
    set each of them in the same test. The provenance entry `{"area":"like","mode":<source>}`
-   is present, and no must-have area is in `answers`.
+   is present, and every area, must-haves included, is answered `from: like:<source>`.
+   `tests/test_ui_onboard_index.py`: copy, identity edit, apply in three POSTs; control: a
+   fresh draft keeps `must_have_missing` non-empty and its edits stay on the section.
 2. A source default it never wrote is absent from the new draft's `values` — control: that
    path IS in `config_version.resolve(parse_catalog(source_doc))`.
 2b. An unknown `source` raises, naming the projects that exist; `onboard_session(like=…)`
@@ -479,10 +490,15 @@ The review section shows, from `view["review"]` and a dry run
 - `problems`, if any, verbatim.
 
 `POST /onboard/{name}/apply` saves the reason if given, checks `rev` and the must-have
-rule, then calls `ops.onboard_apply(draft_path)`. `onboard_applied.html` shows the config
-version id (linked to `/config`), the change count, bootstrap actions and warnings, and —
-when `restart_needed` — the reason and the exact command `jarvis start --catalog <file>`
-to run, stated as something the user must do. The dashboard never restarts.
+rule, then calls `ops.onboard_apply(draft_path)` and 303s to
+`GET /onboard/{name}/applied/{version}` (wo-6d9fbd23). That page is rebuilt from the
+stored version alone: its id (linked to `/config`), change count and reason, plus one live
+line from `ops.onboard_live`: whether the running daemon has the project loaded (the
+daemon publishes `daemon_projects` at boot and on each reload) and, if not, the one
+command that works — `jarvis start --catalog <file>` when the OS is down, the service
+manager's restart when it runs the daemon, else `jarvis stop && jarvis start …`
+(`jarvis start` alone leaves a running daemon as it is). Bootstrap warnings go to the
+project's inbox, since the version does not hold them. The dashboard never restarts.
 
 **Tests** (`tests/test_ui_onboard_review.py`):
 1. `GET /onboard/x/review` renders the review (not §3's 404) — proves the registration order.

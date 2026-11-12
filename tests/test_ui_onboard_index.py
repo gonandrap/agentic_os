@@ -39,7 +39,7 @@ def client(jarvis_home, fake_claude, catalog_file):
 def test_like_opens_a_copied_draft_and_a_broken_draft_is_listed(client, tmp_path):
     repo = make_git_project(tmp_path / "work", "newproj")
     r = client.post("/onboard", data={"path": str(repo), "like": "proj_a"})
-    assert r.status_code == 303 and r.headers["location"] == "/onboard/newproj"
+    assert r.status_code == 303 and r.headers["location"] == "/onboard/newproj/identity"
     saved = json.loads(interview.draft_file("newproj").read_text())
     assert saved["values"]["projects.newproj.validation.enabled"] is True
 
@@ -48,6 +48,31 @@ def test_like_opens_a_copied_draft_and_a_broken_draft_is_listed(client, tmp_path
     assert 'href="/onboard/newproj"' in page  # control: the good draft links through
     broken = re.search(r'<tr id="draft-broken">.*?</tr>', page, re.S).group(0)
     assert "does not load:" in broken and 'href="/onboard/broken"' not in broken
+
+
+def test_copy_edit_apply_is_three_requests(client, tmp_path):
+    repo = make_git_project(tmp_path / "work", "newproj")
+    r = client.post("/onboard", data={"path": str(repo), "like": "proj_a"})
+    assert r.status_code == 303 and r.headers["location"] == "/onboard/newproj/identity"
+    assert ops.onboard_view("newproj")["progress"]["must_have_missing"] == []
+    r = client.post("/onboard/newproj/edit", data={
+        "rev": ops.onboard_view("newproj")["rev"], "section": "identity",
+        "verb": "identity", "field": "description", "value": "a copy of proj_a"})
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/onboard/newproj/review?note=saved")
+    assert "Copied from <b>proj_a</b>" in client.get("/onboard/newproj/review").text
+    r = client.post("/onboard/newproj/apply", data={
+        "rev": ops.onboard_view("newproj")["rev"], "reason": "like proj_a"})
+    assert r.status_code == 303 and "/onboard/newproj/applied/" in r.headers["location"], r.text
+    # Control: a fresh draft keeps its must-haves open, and its edits stay on the section
+    other = make_git_project(tmp_path / "work", "fresh")
+    r = client.post("/onboard", data={"path": str(other)})
+    assert r.status_code == 303 and r.headers["location"] == "/onboard/fresh"
+    assert ops.onboard_view("fresh")["progress"]["must_have_missing"]
+    r = client.post("/onboard/fresh/edit", data={
+        "rev": ops.onboard_view("fresh")["rev"], "section": "identity",
+        "verb": "identity", "field": "description", "value": "fresh"})
+    assert r.headers["location"].startswith("/onboard/fresh/identity")
 
 
 def test_a_non_git_path_re_renders_with_the_refusal_and_the_path_kept(client, tmp_path):

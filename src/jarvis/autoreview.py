@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from itertools import zip_longest
 from typing import Any
 
-from . import concision, sections, specs
+from . import concision, db, sections, specs
 from .neo import (DELEGATED_MARKER, MAX_REFINES, REFINE_INSTRUCTION, REFINE_PREFIX,
                   refine_note)
 from .catalog import (
@@ -1140,17 +1140,81 @@ NO_SPEC = "  (no spec section — this work order was not planned against one)"
 SPEC_INTRO = "What the work was supposed to be."
 
 
-def _spec_block(spec: dict[str, str] | None, chars: int, cites: str = "") -> str:
+#: A spec the same feature order wrote (docs/superpowers/specs/2026-11-12-a-family-spec-is-not-authority.md §3.2)
+FAMILY_HEADING = ("# A SPEC SECTION WRITTEN INSIDE {fo} — the worker's own claim, NOT "
+                  "authority")
+FAMILY_RULE = (
+    "# THE USER'S OWN WORDS — the ask of {fo}\n{ask}\n\n"
+    "{paths} {verb} written inside {fo}, so {pronoun} settle nothing here: the worker "
+    "wrote {pronoun}. Accept only on the user's words above, or on a spec or learning "
+    "that predates {fo}. A user-facing interaction choice that interprets or narrows "
+    "those words is the user's: escalate it with `cause: ambiguous-intent`.")
+
+
+def family_context(store: Any, wo: dict[str, Any], assumption: dict[str, Any],
+                   spec: dict[str, str] | None) -> dict[str, Any] | None:
+    """Which specs in this packet the order's own feature order wrote, or None (§3.1)"""
+    paths = [*(assumption.get("spec_path") or "").splitlines(),
+             str((spec or {}).get("repo_path") or "")]
+    fo_id, own = specs.family_written(store, wo, paths)
+    if not own:
+        return None
+    fo = specs.family_of(store, wo) or {}
+    return {"fo": fo_id, "own": own, "ask": str(fo.get("description") or "")}
+
+
+#: A planner assumption riding its feature's plan review instead of its own (§3.3)
+BUNDLED_EVENT = "autoreview_bundled"
+PLAN_OPEN_STATUSES = ("planning", "plan_review")
+
+
+def bundled_into_plan(store: Any, wo: dict[str, Any], assumption: dict[str, Any]) -> str:
+    """The feature order whose plan review carries this assumption, or '' (§3.3)"""
+    if wo.get("kind") != "planner":
+        return ""
+    fo = specs.family_of(store, wo)
+    if not fo or fo.get("status") not in PLAN_OPEN_STATUSES:
+        return ""
+    _, own = specs.family_written(store, wo,
+                                  (assumption.get("spec_path") or "").splitlines())
+    return str(fo["id"]) if own else ""
+
+
+def note_bundled(store: Any, wo: dict[str, Any], assumption: dict[str, Any],
+                 fo_id: str) -> None:
+    """Record the bundling once per assumption: the daemon re-checks every tick"""
+    seen = {db.from_json(e["payload"], {}).get("assumption_id")
+            for e in store.events_of_kind(wo["id"], BUNDLED_EVENT)}
+    if assumption["id"] not in seen:
+        store.add_event(wo["id"], BUNDLED_EVENT, {
+            "assumption_id": assumption["id"], "n": assumption.get("n"),
+            "feature_order": fo_id})
+
+
+def _family_rule(family: dict[str, Any] | None) -> list[str]:
+    if not family:
+        return []
+    own = sorted(family["own"])
+    return [FAMILY_RULE.format(
+        fo=family["fo"], ask=(family["ask"] or "(none given)")[:2000],
+        paths=", ".join(own), verb="was" if len(own) == 1 else "were",
+        pronoun="it" if len(own) == 1 else "they")]
+
+
+def _spec_block(spec: dict[str, str] | None, chars: int, cites: str = "",
+                family: dict[str, Any] | None = None) -> str:
     """The section `specs.spec_of` resolved, bounded — or that there is none, in words (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md §2)"""
     if not spec:
         return f"{SPEC_HEADING}\n{NO_SPEC}"
+    heading = (FAMILY_HEADING.format(fo=family["fo"])
+               if family and spec.get("repo_path") in family["own"] else SPEC_HEADING)
     ref = (f"{spec.get('repo_path') or '(no path recorded)'} § "
            f"{spec.get('section') or '(no section named)'}")
     text = (spec.get("section_text") or "").strip()
     if not text:
-        return (f"{SPEC_HEADING} — {ref}\n  (no spec section in the packet: the named "
+        return (f"{heading} — {ref}\n  (no spec section in the packet: the named "
                 f"section did not resolve in that document)")
-    return f"{SPEC_HEADING} — {ref}\n{SPEC_INTRO}\n{_focused(text, cites, chars, ref)}"
+    return f"{heading} — {ref}\n{SPEC_INTRO}\n{_focused(text, cites, chars, ref)}"
 
 
 def _focused(text: str, cites: str, chars: int, ref: str) -> str:
@@ -1189,26 +1253,32 @@ def _cited_ref(assumption: dict[str, Any]) -> str:
     return ref
 
 
-def _cited_block(assumption: dict[str, Any], chars: int) -> str:
+def _cited_block(assumption: dict[str, Any], chars: int,
+                 family: dict[str, Any] | None = None) -> str:
     """The sections the assumption cites, as `ops.assume` labelled them"""
     text = (assumption.get("spec_text") or "").strip()
     ref = _cited_ref(assumption)
     cites = str(assumption.get("content") or "")
-    return f"{CITED_HEADING} — {ref}\n{CITED_INTRO}\n{_focused(text, cites, chars, ref)}"
+    own = family and family["own"] & set((assumption.get("spec_path") or "").splitlines())
+    heading, intro = ((FAMILY_HEADING.format(fo=family["fo"]),
+                       "The assumption above argues from this section.")
+                      if own and family else (CITED_HEADING, CITED_INTRO))
+    return f"{heading} — {ref}\n{intro}\n{_focused(text, cites, chars, ref)}"
 
 
 def _spec_blocks(assumption: dict[str, Any], spec: dict[str, str] | None,
-                 chars: int) -> list[str]:
+                 chars: int, family: dict[str, Any] | None = None) -> list[str]:
     """The work order's spec block, then the sections the assumption cites if it cites any"""
     cited = (assumption.get("spec_text") or "").strip()
     built_to = ((spec or {}).get("section_text") or "").strip()
     cites = str(assumption.get("content") or "")
     if not cited:
-        return [_spec_block(spec, chars, cites)]
+        return [_spec_block(spec, chars, cites, family)]
     if not built_to:
-        return [_spec_block(spec, chars, cites), _cited_block(assumption, chars)]
+        return [_spec_block(spec, chars, cites, family),
+                _cited_block(assumption, chars, family)]
     a, b = _share(len(built_to), len(cited), chars)
-    return [_spec_block(spec, a, cites), _cited_block(assumption, b)]
+    return [_spec_block(spec, a, cites, family), _cited_block(assumption, b, family)]
 
 
 def _share(a: int, b: int, chars: int) -> tuple[int, int]:
@@ -1271,7 +1341,7 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
                      record: str = "", spec: dict[str, str] | None = None,
                      spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
                      delegated: bool = False, requestor_label: str = "",
-                     owner: bool = False) -> str:
+                     owner: bool = False, family: dict[str, Any] | None = None) -> str:
     """What the reviewer reads (#832)"""
     n = assumption.get("n")
     # Pointers, not text: a sibling this one cites is in the decision record (wo-ea3c6f0c)
@@ -1311,7 +1381,9 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         f"{(wo.get('description') or '')[:2000]}",
         *_requestor_block(requestor_label),
         *_owner_block(owner, early=early),
-        *_spec_blocks(assumption, spec, spec_chars),
+        *_spec_blocks(assumption, spec, spec_chars, family),
+        # An owner has no user's words to hold it to: relabel only (spec 2026-11-12 §3.2)
+        *([] if owner else _family_rule(family)),
         delivered,
         f"# Other assumptions on this order — do not rule on these: {others}",
         _record_block(record),
@@ -1328,7 +1400,8 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
                       siblings: list[dict[str, Any]],
                       record: str = "", spec: dict[str, str] | None = None,
                       spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
-                      requestor_label: str = "", owner: bool = False) -> str:
+                      requestor_label: str = "", owner: bool = False,
+                      family: dict[str, Any] | None = None) -> str:
     """What the reviewer reads at DELIVERY (#102)"""
     n = assumption.get("n")
     others = "\n".join(sibling_line(s) for s in siblings
@@ -1350,7 +1423,8 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"{(wo.get('description') or '')[:CONFIRM_DESCRIPTION_CHARS]}",
         *_requestor_block(requestor_label),
         *_owner_block(owner),
-        *_spec_blocks(assumption, spec, spec_chars),
+        *_spec_blocks(assumption, spec, spec_chars, family),
+        *([] if owner else _family_rule(family)),
         f"# What the worker says it delivered\n"
         f"{(wo.get('result_summary') or _no_summary(wo))[:CONFIRM_SUMMARY_CHARS]}",
         f"# The work order's other assumptions, for context only — do not rule on these\n"
@@ -1390,16 +1464,19 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                          *, cfg: Any = None) -> dict[str, Any]:
     """Put ONE already-judged assumption back to Neo at delivery"""
     who = _requestor(store, wo)
+    # GitHub issue #1035
+    spec = specs.spec_of(store, wo)
     question = neo.ask(project, wo["id"],
                        _confirm_question(project, wo, assumption, siblings,
                                          decision_record(
                                              store, neo, wo["id"], siblings, assumption,
                                              chars=_record_chars(cfg)),
-                                         # GitHub issue #1035
-                                         spec=specs.spec_of(store, wo),
+                                         spec=spec,
                                          spec_chars=_spec_chars(cfg),
                                          requestor_label=_requestor_label(who),
-                                         owner=who.kind == OWNER_REQUESTOR),
+                                         owner=who.kind == OWNER_REQUESTOR,
+                                         family=family_context(store, wo, assumption,
+                                                               spec)),
                        # No `context`: the packet carries the description already (wo-ea3c6f0c)
                        kind=QUESTION_KIND)
     store.link_assumption_confirmation(assumption["id"], question["id"])
@@ -1500,16 +1577,18 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
         store.set_assumption_requestor(assumption["id"], who.kind)
         return_to_worker(store, wo["id"], assumption, note, question["id"])
         return question
+    # GitHub issue #1035: resolved here, so no caller changes
+    spec = specs.spec_of(store, wo)
     text = _ruling_question(
         project, wo, assumption, siblings, early=early,
         record=decision_record(store, neo, wo["id"], siblings, assumption,
                                chars=_record_chars(cfg)),
-        # GitHub issue #1035: resolved here, so no caller changes
-        spec=specs.spec_of(store, wo),
+        spec=spec,
         spec_chars=_spec_chars(cfg),
         requestor_label=_requestor_label(who),
         # Advice is the user's to act on, never the owner's (fo-eaf1a59a spec §4.1)
-        owner=who.kind == OWNER_REQUESTOR and not advisory)
+        owner=who.kind == OWNER_REQUESTOR and not advisory,
+        family=family_context(store, wo, assumption, spec))
     if advisory:
         text = f"{ADVISORY_INTRO}\n\n{text}"
     # No `context`: the packet carries the description already (wo-ea3c6f0c)

@@ -114,6 +114,25 @@ def test_a_catalog_with_no_source_path_is_a_no_op(jarvis_home, tmp_path):
 # -- the reload itself
 
 
+def test_the_daemon_publishes_the_projects_it_loaded(daemon, catalog_file):
+    """What the onboarding applied page reads to say whether a project is live (wo-6d9fbd23)"""
+    from jarvis.daemon import DAEMON_PROJECTS_KEY
+
+    def published():
+        central = CentralStore()
+        try:
+            return json.loads(central.get_state(DAEMON_PROJECTS_KEY) or "null")
+        finally:
+            central.close()
+
+    daemon._write_pidfile()
+    assert published()["projects"] == ["proj_a"]
+    daemon.central.set_state(DAEMON_PROJECTS_KEY, "")
+    edit(catalog_file, defaults={"model": "opus"})
+    assert daemon.reload_catalog() is True
+    assert published()["projects"] == ["proj_a"]
+
+
 def test_a_settings_change_reaches_the_daemon_on_the_next_tick(daemon, catalog_file):
     edit(catalog_file, defaults={"model": "opus"}, validation={"enabled": True})
 
@@ -175,26 +194,113 @@ def test_a_repaired_catalog_reloads_and_re_arms_the_warning(daemon, catalog_file
     assert daemon.catalog_reload_warned is False
 
 
-def test_an_added_project_is_refused_and_the_item_says_jarvis_start(
-        daemon, catalog_file, tmp_path):
-    """Settings only"""
+@pytest.fixture()
+def systemd(monkeypatch):
+    from jarvis import service_manager
+    monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.SYSTEMD)
+
+
+def add_proj_b(catalog_file: Path, tmp_path: Path) -> dict:
     document = json.loads(catalog_file.read_text())
     document["projects"].append({"name": "proj_b", "path": str(tmp_path / "proj_a"),
                                  "description": "new"})
     document["os"]["defaults"]["model"] = "opus"
     _rewrite(catalog_file, document)
+    return document
+
+
+def inbox_row(inbox_id: int) -> dict:
+    central = CentralStore()
+    try:
+        return dict(central.conn.execute("SELECT * FROM inbox WHERE id=?",
+                                          (inbox_id,)).fetchone())
+    finally:
+        central.close()
+
+
+def refusals(project: str = "proj_b") -> list[dict]:
+    central = CentralStore()
+    try:
+        return [i for i in central.unacked_inbox() if i["project"] == project]
+    finally:
+        central.close()
+
+
+def test_an_added_project_is_refused_under_its_name_with_a_restart_that_works(
+        daemon, catalog_file, tmp_path, systemd):
+    """Outcome first, under the project, never `jarvis start` (io-74eab254)"""
+    register("proj_b", project=tmp_path / "proj_a")
+    add_proj_b(catalog_file, tmp_path)
 
     daemon.tick()
 
     assert [p.name for p in daemon.catalog.projects] == ["proj_a"]
     # The settings in the same file are refused with it: a half-applied catalog is a configuration nobody...
     assert daemon.catalog.os.default_model == "sonnet"
-    items = inbox()
+    assert inbox() == [], "filed under the project, not 'os'"
+    items = refusals()
     assert len(items) == 1
-    assert "jarvis start" in items[0]["body"]
+    assert items[0]["title"] == "proj_b is saved but not running yet"
+    body = items[0]["body"]
+    assert body.startswith("proj_b is saved but not running yet.")
+    assert "`systemctl --user restart jarvis.service`" in body
+    assert "jarvis start" not in body
+    assert "http://127.0.0.1:8787/project/proj_b" in body
 
 
-def test_a_removed_project_is_refused_too(jarvis_home, tmp_path):
+def test_the_refusal_names_the_config_version_that_caused_it(
+        daemon, catalog_file, tmp_path):
+    document = add_proj_b(catalog_file, tmp_path)
+    central = CentralStore()
+    try:
+        head = central.add_config_version(document, {}, actor="user", reason="onboard proj_b")
+    finally:
+        central.close()
+
+    daemon.tick()
+
+    assert f"Config version: {head['id']}\n" in refusals()[0]["body"]
+
+
+def test_a_hand_edit_refusal_says_no_ledger_row_records_it(daemon, catalog_file, tmp_path):
+    document = add_proj_b(catalog_file, tmp_path)
+
+    daemon.tick()
+
+    assert (f"Config version: {cv.version_id(document)} (not in the config ledger"
+            in refusals()[0]["body"])
+
+
+def test_a_later_good_reload_acks_the_refusal_as_applied(daemon, catalog_file, tmp_path):
+    """Never silent while it stands, never left open once it clears"""
+    original = json.loads(catalog_file.read_text())
+    add_proj_b(catalog_file, tmp_path)
+    daemon.tick()
+    (item,) = refusals()
+
+    _rewrite(catalog_file, original)
+    daemon.tick()
+
+    row = inbox_row(item["id"])
+    assert row["status"] == "acked"
+    assert "Applied: the running daemon reloaded the catalog" in row["body"]
+    assert refusals() == []
+
+
+def test_a_restarted_daemon_acks_the_refusal_its_predecessor_raised(
+        daemon, catalog_file, tmp_path):
+    add_proj_b(catalog_file, tmp_path)
+    daemon.tick()
+    (item,) = refusals()
+
+    Daemon(load_catalog(catalog_file))
+
+    row = inbox_row(item["id"])
+    assert row["status"] == "acked"
+    assert "Applied: the daemon restarted on it" in row["body"]
+
+
+def test_a_removed_project_is_refused_too(jarvis_home, tmp_path, systemd):
     path = tmp_path / "catalog.json"
     project = tmp_path / "proj_a"
     project.mkdir()
@@ -209,7 +315,9 @@ def test_a_removed_project_is_refused_too(jarvis_home, tmp_path):
     daemon.tick()
 
     assert [p.name for p in daemon.catalog.projects] == ["proj_a", "proj_b"]
-    assert "jarvis start" in inbox()[0]["body"]
+    (item,) = refusals()
+    assert item["title"] == "proj_b left the catalog but is still running"
+    assert "`systemctl --user restart jarvis.service`" in item["body"]
 
 
 def register(*names: str, project: Path, archived: tuple[str, ...] = ()) -> None:
