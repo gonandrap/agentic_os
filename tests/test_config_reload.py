@@ -209,7 +209,7 @@ def refusals(project: str = "proj_b") -> list[dict]:
 
 def test_an_added_project_is_refused_under_its_name_with_a_restart_that_works(
         daemon, catalog_file, tmp_path, systemd):
-    """Outcome first, filed under the project, and never `jarvis start`: a no-op on a live daemon (io-74eab254)"""
+    """Outcome first, under the project, never `jarvis start` (io-74eab254)"""
     register("proj_b", project=tmp_path / "proj_a")
     add_proj_b(catalog_file, tmp_path)
 
