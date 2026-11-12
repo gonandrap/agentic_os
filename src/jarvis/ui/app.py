@@ -1382,7 +1382,8 @@ def create_app() -> FastAPI:
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
                       shown=shown, total=len(every), rest_counts=rest_counts,
                       filters=filters, options=options,
-                      revealed=revealed, model_ids=ops.suggested_model_ids())
+                      revealed=revealed, model_ids=ops.suggested_model_ids(),
+                      artifact_asks=ops.artifact_asks())
 
     @app.get("/search", response_class=HTMLResponse)
     def search_page(request: Request):
@@ -1466,6 +1467,7 @@ def create_app() -> FastAPI:
             pauses = {k: v for k, v in pauses.items() if v}
             # Inside the store's lifetime like every other read on this page
             issue_board = ops.issue_board(store)
+            artifact_ids = ops.artifact_owners(store)
         finally:
             store.close()
         central = CentralStore()
@@ -1501,7 +1503,7 @@ def create_app() -> FastAPI:
                       backlog=backlog, backlog_counts=_backlog_counts(every_backlog),
                       show_hidden=show_hidden, blocked=blocked,
                       pauses=pauses, hidden_count=hidden_count,
-                      issue_board=issue_board)
+                      issue_board=issue_board, artifact_ids=artifact_ids)
 
     @app.get("/fo/{name}/{fo_id}", response_class=HTMLResponse)
     def feature_order(request: Request, name: str, fo_id: str, error: str = ""):
@@ -1544,7 +1546,8 @@ def create_app() -> FastAPI:
                                                    include_archived=True),
                       # Already on `detail` for `jarvis fo show`
                       issues=detail["issues"],
-                      validation=validation, error=error)
+                      validation=validation, error=error,
+                      artifact_ids=ops.artifact_owner_ids(detail["project"]))
 
     @app.get("/spec/{name}/{fo_id}", response_class=HTMLResponse)
     def spec_page(request: Request, name: str, fo_id: str):
@@ -1592,7 +1595,9 @@ def create_app() -> FastAPI:
                     (f.get("status") or "pending") == "pending"
                     and not (f.get("neo_question_id") and not f.get("neo_verdict"))))
         return render(request, "improvement_order.html", io=detail,
-                      project=detail["project"], error=error)
+                      project=detail["project"], error=error,
+                      # Fleet-wide: a finding may file orders in another project
+                      artifact_ids=ops.artifact_owner_ids())
 
     @app.get("/inv/{name}/{inv_id}", response_class=HTMLResponse)
     def investigation_order(request: Request, name: str, inv_id: str, error: str = ""):
@@ -1603,7 +1608,8 @@ def create_app() -> FastAPI:
             return render(request, "error.html", message=str(e))
         ops.mark_request_seen(detail["project"], inv_id)
         return render(request, "investigation_order.html", inv=detail,
-                      project=detail["project"], error=error)
+                      project=detail["project"], error=error,
+                      artifact_ids=ops.artifact_owner_ids(detail["project"]))
 
     @app.get("/do/{name}/{do_id}", response_class=HTMLResponse)
     def decision_order(request: Request, name: str, do_id: str, error: str = "",
@@ -1615,7 +1621,8 @@ def create_app() -> FastAPI:
             return render(request, "error.html", message=str(e))
         ops.mark_request_seen(detail["project"], do_id)
         return render(request, "decision_order.html", do=detail,
-                      project=detail["project"], error=error, note=note)
+                      project=detail["project"], error=error, note=note,
+                      artifact_ids=ops.artifact_owner_ids(detail["project"]))
 
     def _back_to_decision(name: str, do_id: str, **query: str) -> RedirectResponse:
         q = urlencode({k: v for k, v in query.items() if v}, quote_via=quote)
@@ -1760,6 +1767,7 @@ def create_app() -> FastAPI:
             spec_link = specs.spec_link(store, wo)
             # How long it has been where it is
             states = ops.state_durations(store, wo_id=wo_id).as_dict()
+            artifacts = store.artifacts_of(wo_id)
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
@@ -1770,6 +1778,7 @@ def create_app() -> FastAPI:
                          if t["kind"] == "escalation"
                          and t["status"] in ("escalated", "failed")), None)
         bill = wo_bill(wo_id, pname)
+        siblings = ops.analyst_dispatched(wo)
         # The ceiling, what has gone against it
         cap = ops.work_order_budget(wo_id, pname, include_archived=True)
         # What this order wrote to, or retired from, the knowledge base
@@ -1786,7 +1795,7 @@ def create_app() -> FastAPI:
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, deferrals=deferrals, spec=spec, spec_link=spec_link,
                       # An analyst's sibling fix orders (issue 1323)
-                      siblings=ops.analyst_dispatched(wo),
+                      siblings=siblings,
                       auto_merge=auto_merge,
                       merge_state=merge_state,
                       issues=issue_index,
@@ -1800,7 +1809,9 @@ def create_app() -> FastAPI:
                       conversation=conversation, questions=questions, open_ask=open_ask,
                       assumptions=assumptions, unreviewed=unreviewed, review=review,
                       approvals=approvals, bill=bill, states=states,
-                      turn_lines=turn_lines_by_message(bill))
+                      turn_lines=turn_lines_by_message(bill),
+                      artifacts=artifacts, artifact_asks=ops.artifact_asks(pname, wo_id),
+                      artifact_ids=ops.artifact_owner_ids() if siblings else set())
 
     @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)
     def work_order_debug(request: Request, name: str, wo_id: str, filed: str = ""):
@@ -2368,7 +2379,9 @@ def create_app() -> FastAPI:
                                   older=older == "1")
         shown = sum(len(rows) for rows in report["groups"].values())
         return render(request, "yours.html", active="yours", report=report, older=older == "1",
-                      filters=filters, options=options, shown=shown)
+                      filters=filters, options=options, shown=shown,
+                      # Fleet-wide: a tree crosses projects
+                      artifact_ids=ops.artifact_owner_ids())
 
     @app.get("/morpheus")
     @app.get("/morpheus/{item_id}")
@@ -2788,6 +2801,26 @@ def create_app() -> FastAPI:
             # The one case that refuses: pending assumptions want a decision, not a dismissal
             return RedirectResponse(f"{landing}?error={e}", status_code=303)
         return RedirectResponse(landing, status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/artifact/{art_id}/{choice}")
+    def decide_artifact(name: str, wo_id: str, art_id: str, choice: str,
+                        next: str = Form(""), confirm: str = Form("")):
+        """The user's keep or delete (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §6)"""
+        home = f"/wo/{name}/{wo_id}#artifacts"
+        if choice not in ("keep", "delete"):
+            return RedirectResponse(_same_site_back(next, home, f"unknown choice {choice!r}"),
+                                    status_code=303)
+        # The dialog's second click sets it, as `--yes` does on the CLI
+        if choice == "delete" and confirm != "1":
+            return RedirectResponse(_same_site_back(
+                next, home, quote("deleting cannot be undone: press Delete twice to confirm")),
+                status_code=303)
+        try:
+            ops.decide_artifact(name, wo_id, art_id, choice, by="ui")
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, home, quote(str(e))),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, home), status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/hide")
     def hide_wo(name: str, wo_id: str):

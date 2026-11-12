@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
@@ -697,6 +697,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "decide": decide_command(fo.get("kind"), fo_id),
                     })
                 drift = settings_drift(path / ".claude" / "settings.json")
+                owners = artifact_owners(store)
                 projects.append({
                     "name": p["name"], "path": p["path"],
                     "description": p["description"],
@@ -710,7 +711,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          "status_label": feature_status_label(fo.get("kind"),
                                                               fo["status"]),
                          "progress": feature_progress(store, fo),
-                         "requestor_view": requestor_view(store, fo)}
+                         "requestor_view": requestor_view(store, fo),
+                         "has_artifact": fo["id"] in owners}
                         for fo in features
                     ],
                     "open_work_orders": [
@@ -727,6 +729,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # And the whole answer in one string
                          "status_label": invariants.status_label(store, wo, fleet_state),
                          "requestor_view": view,
+                         "has_artifact": wo["id"] in owners,
                          "tags": wo_tags({**wo, "requestor_view": view}, p["name"])}
                         for wo in open_wos
                         for view in (requestor_view(store, wo),)
@@ -957,6 +960,66 @@ def show_artifact(art_id: str) -> dict[str, Any]:
         finally:
             store.close()
     raise OpsError(f"artifact {art_id!r} not found")
+
+
+def artifact_owners(store: ProjectStore) -> set[str]:
+    """Orders owning an artifact, plus each owner's parent: the dashboard icon (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §6)"""
+    owners = {row["wo_id"] for row in store.all_artifacts()}
+    for wo_id in list(owners):
+        try:
+            parent = store.get_work_order(wo_id).get("parent_id")
+        except KeyError:
+            continue
+        if parent:
+            owners.add(parent)
+    return owners
+
+
+def _artifact_stores(project: str | None) -> Iterator[tuple[str, ProjectStore]]:
+    paths = registered_project_paths(include_archived=True)
+    if project is not None:
+        paths = {project: paths[project]} if project in paths else {}
+    for name, path in sorted(paths.items()):
+        if not (path / ".jarvis").is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            yield name, store
+        finally:
+            store.close()
+
+
+def artifact_owner_ids(project: str | None = None) -> set[str]:
+    """`artifact_owners` over one project or the fleet; ids are unique fleet-wide (§6)"""
+    out: set[str] = set()
+    for _, store in _artifact_stores(project):
+        out |= artifact_owners(store)
+    return out
+
+
+def artifact_asks(project: str | None = None, wo_id: str | None = None
+                  ) -> list[dict[str, Any]]:
+    """The keep/delete dialog's queue: undecided artifacts of parked, cancelled or failed orders (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §6)"""
+    from .invariants import ARTIFACT_ASK_STATUSES
+
+    asks: list[dict[str, Any]] = []
+    for name, store in _artifact_stores(project):
+        for row in store.undecided_artifacts(wo_id):
+            # A requested delete already has the user's answer; the order page says what is left
+            if row["decision"] == "delete_requested":
+                continue
+            try:
+                wo = store.get_work_order(row["wo_id"])
+            except KeyError:
+                continue
+            if wo["status"] not in ARTIFACT_ASK_STATUSES:
+                continue
+            if wo["status"] == "needs_review" and not store.artifact_park_open(wo["id"]):
+                continue
+            asks.append({"project": name, "wo_id": wo["id"], "wo_title": wo["title"],
+                         "wo_status": wo["status"], "art_id": row["id"],
+                         "url": row["url"], "title": row["title"]})
+    return asks
 
 
 def require_registered_project(name: str) -> str:

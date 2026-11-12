@@ -44,7 +44,7 @@
 
 {% if inv.investigator %}
 <p class="sub">investigator:
-  {{ ui.row_id(inv.investigator.id, '/wo/' ~ project ~ '/' ~ inv.investigator.id) }}
+  {{ ui.row_id(inv.investigator.id, '/wo/' ~ project ~ '/' ~ inv.investigator.id, inv.investigator.id in artifact_ids) }}
   ({{ inv.investigator.status }})
   {% if inv.investigator.result_summary %}— {{ inv.investigator.result_summary }}{% endif %}
 </p>
@@ -89,7 +89,7 @@
       filed as a bug:
       <a href="{{ inv.filed.issue_url }}">{{ inv.filed.issue_url }}</a>
       {% if inv.filed.wo_id %}
-      · {{ ui.row_id(inv.filed.wo_id, '/wo/' ~ project ~ '/' ~ inv.filed.wo_id) }}
+      · {{ ui.row_id(inv.filed.wo_id, '/wo/' ~ project ~ '/' ~ inv.filed.wo_id, inv.filed.wo_id in artifact_ids) }}
       {% endif %}
       {% if inv.filed.dispatch %}<div class="sub">{{ inv.filed.dispatch }}</div>{% endif %}
     </div>
@@ -145,7 +145,7 @@
   {% endif %}
   {% if c.fix %}
   <div class="row"><div class="grow">fix
-    {{ ui.row_id(c.fix.wo_id, '/wo/' ~ project ~ '/' ~ c.fix.wo_id) }} ({{ c.fix.status }})
+    {{ ui.row_id(c.fix.wo_id, '/wo/' ~ project ~ '/' ~ c.fix.wo_id, c.fix.wo_id in artifact_ids) }} ({{ c.fix.status }})
     {% if c.fix.pr_url %}· <a href="{{ c.fix.pr_url }}">{{ c.fix.pr_url }}</a>{% endif %}
     {% if c.fix.carrier != c.fix.wo_id %}· carried by <span class="mono">{{ c.fix.carrier }}</span>{% endif %}
   </div></div>

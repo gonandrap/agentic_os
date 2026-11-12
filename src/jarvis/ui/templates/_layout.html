@@ -52,7 +52,10 @@
 </form>
 {% endmacro %}
 
-{% macro row_id(id, href) %}<a class="rowid" href="{{ href }}">{{ id }}</a>{% endmacro %}
+{% macro row_id(id, href, art=False) %}<a class="rowid" href="{{ href }}">{{ id }}</a>{{ artifact_icon() if art }}{% endmacro %}
+
+{# The order owns a claude.ai artifact: docs/superpowers/specs/2026-11-10-artifact-session-hold.md §6. Inline: the dashboard loads no CDN. #}
+{% macro artifact_icon() %}<svg data-artifact-icon role="img" aria-label="owns a claude.ai artifact" width="13" height="13" viewBox="0 0 16 16" style="vertical-align: -2px; margin-left: 4px; color: var(--cyan);"><title>owns a claude.ai artifact: keep or delete it when the order ends</title><path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" d="M3.5 1.5h6l3 3v10h-9z M9.5 1.5v3h3"/><path fill="currentColor" d="M8 7.2l.7 1.6 1.6.7-1.6.7L8 11.8l-.7-1.6-1.6-.7 1.6-.7z"/></svg>{% endmacro %}
 
 {# `ops.wo_tags`: the project first, then bug/expedite, then you|os #}
 {% macro wo_tags(tags) %}{% for t in tags %}<span class="badge {{ 'framework' if loop.first else 'outside' if t in ('bug', 'expedite') }}">{{ t }}</span> {% endfor %}{% endmacro %}

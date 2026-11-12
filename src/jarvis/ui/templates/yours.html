@@ -11,7 +11,7 @@
 {{ ui.filter_bar("/yours", filters, options, shown, report.total) }}
 
 {% macro tree_node(n) %}
-<li id="node-{{ n.id }}">{{ ui.row_id(n.id, order_path(n.project, n.id)) }}
+<li id="node-{{ n.id }}">{{ ui.row_id(n.id, order_path(n.project, n.id), n.id in artifact_ids) }}
   <span class="mono">{{ n.project }}</span>
   <span class="mono {{ 'tone-warn' if n.needs_attention }}">{{ n.status }}</span>
   <span class="sub">{{ n.title }}</span>
@@ -28,7 +28,7 @@
       <tr><th>ask</th><th>project</th><th>kind</th><th>title</th><th>state</th><th>cost</th></tr>
       {% for r in rows %}
       <tr id="{{ r.id }}">
-        <td>{{ ui.row_id(r.id, order_path(r.project, r.id)) }}</td>
+        <td>{{ ui.row_id(r.id, order_path(r.project, r.id), r.id in artifact_ids) }}</td>
         <td class="mono">{{ r.project }}</td>
         <td class="mono">{{ r.kind }}</td>
         <td class="prose">{{ r.title }}
