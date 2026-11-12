@@ -12,7 +12,9 @@ from jarvis.daemon import Daemon
 from jarvis.invariants import (
     DELIVERED_UNSETTLED_BLOCKER,
     IDLE_NO_FINISH_BLOCKER,
+    PR_CHECKS_ANSWERED_BLOCKER,
     PR_CHECKS_BLOCKER,
+    PR_CHECKS_DRAFT_BLOCKER,
     PR_CLOSED_BLOCKER,
     PR_CONFLICT_BLOCKER,
     PR_REPAIR_MAX_ATTEMPTS,
@@ -1343,7 +1345,8 @@ def test_an_unchanged_red_run_is_not_nudged_twice(started, project, fake_gh, par
     assert not store.queued_messages(parked["id"])
     assert len(store.events_of_kind(parked["id"], "pr_checks_held")) == 1
     row = store.get_work_order(parked["id"])
-    assert row["attention_reason"] == PR_CHECKS_BLOCKER
+    # It answered: neither "could not fix" nor "do not merge" (#1697)
+    assert row["attention_reason"] == PR_CHECKS_ANSWERED_BLOCKER
     assert [v.invariant for v in check_project(store)] == []
 
     # A re-run is a new run: ask again
@@ -1351,3 +1354,75 @@ def test_an_unchanged_red_run_is_not_nudged_twice(started, project, fake_gh, par
     fake_gh.set_pr(PR, "OPEN", base_ref="main", checks=rerun, head_oid=COUNTED_HEAD)
     poll(started, store)
     assert store.pr_repair_attempts(parked["id"], "checks") == 2
+
+
+# -- a declared user step owns the attention line (issue #1697)
+
+STEP = "comment on the artifact at 22:21 PST"
+
+
+def owes_a_step(store, wo_id: str) -> str:
+    """The park `wo finish --needs-user` leaves, and the line it derives"""
+    from jarvis.invariants import user_action_owed_blocker
+    from jarvis.project_store import USER_ACTION_EVENT
+
+    store.add_event(wo_id, USER_ACTION_EVENT, {"command": STEP})
+    return user_action_owed_blocker(STEP)
+
+
+def give_up(started, store, wo_id: str) -> None:
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS):
+        poll(started, store)
+        assert delivered(store, wo_id)
+    poll(started, store)
+
+
+def test_a_red_build_rides_on_the_users_step_and_never_replaces_it(
+        started, project, fake_gh, reviewing):
+    """wo-f770f7f0: the give-up overwrote 'Batch 2 of 2' with a merge the user could not make"""
+    red(fake_gh)
+    store = ProjectStore(project)
+    step = owes_a_step(store, reviewing["id"])
+
+    give_up(started, store, reviewing["id"])
+
+    row = store.get_work_order(reviewing["id"])
+    assert row["attention_reason"] == f"{step}; also: {PR_CHECKS_BLOCKER}"
+    assert true_blockers(store, row)[0] == row["attention_reason"]
+    assert [v.invariant for v in check_project(store)] == []
+
+
+def test_a_draft_is_never_told_do_not_merge(started, project, fake_gh, reviewing):
+    red(fake_gh)
+    fake_gh.set_pr(PR, "OPEN", checks=RED, draft=True)
+    store = ProjectStore(project)
+
+    give_up(started, store, reviewing["id"])
+
+    assert store.get_work_order(reviewing["id"])["attention_reason"] == \
+        PR_CHECKS_DRAFT_BLOCKER
+
+
+def test_a_give_up_written_over_a_users_step_is_put_back(started, project, fake_gh,
+                                                        reviewing):
+    """The rows flagged before this shipped heal on the next sweep"""
+    red(fake_gh)
+    store = ProjectStore(project)
+    step = owes_a_step(store, reviewing["id"])
+    give_up(started, store, reviewing["id"])
+    store.flag_attention(reviewing["id"], PR_CHECKS_BLOCKER)   # as the old poller wrote it
+
+    assert [v.invariant for v in check_project(store)] == ["INV-ATTENTION-REASON"]
+    assert store.get_work_order(reviewing["id"])["attention_reason"].startswith(step)
+
+
+def test_green_again_leaves_only_the_users_step(started, project, fake_gh, reviewing):
+    red(fake_gh)
+    store = ProjectStore(project)
+    step = owes_a_step(store, reviewing["id"])
+    give_up(started, store, reviewing["id"])
+
+    red(fake_gh, GREEN)
+    poll(started, store)
+
+    assert store.get_work_order(reviewing["id"])["attention_reason"] == step
