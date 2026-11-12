@@ -147,18 +147,25 @@ def test_a_lapsed_ci_hold_is_judged_and_its_held_seconds_still_discounted(
     fleet.daemon.validator = Validator(passed())
     pr = finish(fleet, wo["id"])["pr_url"]
     fake_gh.set_pr_artifact(pr, checks=PENDING, files=FILES, diff="+x = 1")
-    fleet.drain()
 
     store = ProjectStore(fleet.project)
     try:
+        # A loaded CI shard can tick before the round is picked up: wait for the hold itself (kn-31ce9c2b)
+        holds = []
+        for _ in range(5):
+            fleet.drain()
+            holds = [e for e in store.events_of_kind(wo["id"], "validation_failed")
+                     if db.from_json(e["payload"], {}).get("cause") == VALIDATION_CI_CAUSE]
+            if holds:
+                break
+        assert holds, "the round never recorded a CI hold, so there is nothing to discount"
         assert store.get_work_order(wo["id"])["status"] == "validating"
-        now = db.now()
         # Twenty minutes in `validating`
         at = park_order(store, wo["id"], "validating", hours=20 / 60.0)
-        for row in store.events_of_kind(wo["id"], "validation_failed"):
+        # Read after the back-dating, so `since` can never land past the lapse
+        now = db.now()
+        for row in holds:
             payload = db.from_json(row["payload"], {})
-            if payload.get("cause") != VALIDATION_CI_CAUSE:
-                continue
             payload["reopens_at"] = now - 60
             store.conn.execute("UPDATE wo_events SET ts=?, payload=? WHERE id=?",
                                (at, json.dumps(payload), row["id"]))
