@@ -16157,7 +16157,14 @@ def onboard_live(name: str, catalog: str = "") -> dict[str, str]:
 def onboard_applied(name: str, version_id: str) -> dict[str, Any]:
     """The applied page's facts, from the stored version alone (wo-6d9fbd23)"""
     row = _find_version(version_id)
-    cold = sorted(c["path"] for c in row["changes"] if apply_class(c["path"]) == "restart")
+    central = CentralStore()
+    try:
+        started = float(central.get_state("daemon_started_at") or 0)
+    finally:
+        central.close()
+    # A restart-class key is pending only if the daemon booted before this version
+    cold = sorted(c["path"] for c in row["changes"]
+                  if apply_class(c["path"]) == "restart") if started < row["ts"] else []
     return {"version": row, "changes": len(row["changes"]), "cold": cold,
             "live": onboard_live(name, row.get("source_path") or "")}
 
