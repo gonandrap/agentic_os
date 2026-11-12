@@ -91,7 +91,9 @@ All GET query params are `str` (learning `kn-34d78a6e`).
 | `GET /onboard/{name}/review` | §5 | the review section |
 | `GET /onboard/{name}/{section}?focus=<path>` | §3 | one section; unknown section → 404 page |
 | `POST /onboard/{name}/edit` | §3 | form `verb, section, rev, path, value, mode, field, lever, wired, fleet` → `ops.onboard_edit` → 303 back to `/onboard/{name}/{section}#k-<slug>`; on refusal re-render the section, status 400, the error shown and the typed value kept |
-| `POST /onboard/{name}/apply` | §5 | form `rev`, `reason` → `ops.onboard_apply` |
+| `POST /onboard/{name}/apply` | §5 | form `rev`, `reason` → `ops.onboard_apply` → 303 to `/onboard/{name}/applied/{version}` |
+| `GET /onboard/{name}/apply` | §5 | 303 to the latest applied page, else `review` |
+| `GET /onboard/{name}/applied/{version}` | §5 | the applied page, built from the stored version; unknown version → 404 page |
 | `POST /onboard/{name}/help` | §4 | form `section`, `focus` (knob path or empty) → `ops.onboard_help` → its own result page |
 
 `<slug>` is the knob path with every non-`[A-Za-z0-9_-]` character replaced by `-`.
@@ -478,10 +480,15 @@ The review section shows, from `view["review"]` and a dry run
 - `problems`, if any, verbatim.
 
 `POST /onboard/{name}/apply` saves the reason if given, checks `rev` and the must-have
-rule, then calls `ops.onboard_apply(draft_path)`. `onboard_applied.html` shows the config
-version id (linked to `/config`), the change count, bootstrap actions and warnings, and —
-when `restart_needed` — the reason and the exact command `jarvis start --catalog <file>`
-to run, stated as something the user must do. The dashboard never restarts.
+rule, then calls `ops.onboard_apply(draft_path)` and 303s to
+`GET /onboard/{name}/applied/{version}` (wo-6d9fbd23). That page is rebuilt from the
+stored version alone: its id (linked to `/config`), change count and reason, plus one live
+line from `ops.onboard_live`: whether the running daemon has the project loaded (the
+daemon publishes `daemon_projects` at boot and on each reload) and, if not, the one
+command that works — `jarvis start --catalog <file>` when the OS is down, the service
+manager's restart when it runs the daemon, else `jarvis stop && jarvis start …`
+(`jarvis start` alone leaves a running daemon as it is). Bootstrap warnings go to the
+project's inbox, since the version does not hold them. The dashboard never restarts.
 
 **Tests** (`tests/test_ui_onboard_review.py`):
 1. `GET /onboard/x/review` renders the review (not §3's 404) — proves the registration order.

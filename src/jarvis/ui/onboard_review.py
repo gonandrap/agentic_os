@@ -6,7 +6,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .. import ops
 
@@ -82,10 +82,31 @@ def register(app: FastAPI, render: Callable[..., HTMLResponse]) -> None:
             result = ops.onboard_apply(view["draft_path"])
         except ops.OpsError as e:
             return review(request, name, error=str(e), reason=reason, status_code=400)
+        return RedirectResponse(applied_url(name, result["version"]["id"]), status_code=303)
+
+    @app.get("/onboard/{name}/apply")
+    def onboard_apply_get(name: str):
+        """A reload of the POST's URL: the latest applied page, else review (wo-6d9fbd23)"""
+        vid = ops.onboard_last_applied(name)
+        return RedirectResponse(applied_url(name, vid) if vid
+                                else f"/onboard/{quote(name)}/review", status_code=303)
+
+    @app.get("/onboard/{name}/applied/{version_id}", response_class=HTMLResponse)
+    def onboard_applied(request: Request, name: str, version_id: str):
+        """Built from the stored version, plus whether the daemon has the project (wo-6d9fbd23)"""
         try:
-            view = ops.onboard_view(name)  # the rail as it is now
+            applied = ops.onboard_applied(name, version_id)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="onboard", message=str(e),
+                          status_code=404)
+        try:
+            view = ops.onboard_view(name)
         except ops.OpsError:
-            pass
+            view = None  # a deleted draft must not hide the record
         return render(request, "onboard_applied.html", active="onboard", view=view,
-                      name=name, here="review", result=result,
+                      name=name, here="review", applied=applied,
                       config_url=f"/config?scope={quote('projects.' + name)}#cfg-history")
+
+
+def applied_url(name: str, version_id: str) -> str:
+    return f"/onboard/{quote(name)}/applied/{quote(version_id)}"

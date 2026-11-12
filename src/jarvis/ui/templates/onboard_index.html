@@ -21,7 +21,8 @@
       <td>{% if d.error %}<strong>{{ d.name }}</strong>
         <div class="error-flash" role="alert">does not load: {{ d.error }}</div>
         {% else %}<a href="/onboard/{{ d.name|urlencode }}"><strong>{{ d.name }}</strong></a>
-        — <a href="/onboard/{{ d.name|urlencode }}">continue</a>{% if d.adopted %} (revising a live project){% endif %}{% endif %}</td>
+        — <a href="/onboard/{{ d.name|urlencode }}">continue</a>
+        · <a href="/onboard/{{ d.name|urlencode }}/apply">last apply</a>{% if d.adopted %} (revising a live project){% endif %}{% endif %}</td>
       <td class="mono">{{ d.answered if d.answered is not none else '—' }}/{{ d.total }}</td>
       <td class="mono">{% if d.error %}—{% elif d.like %}<a href="/project/{{ d.like }}">{{ d.like }}</a>{% else %}shipped defaults{% endif %}</td>
       <td class="when mono">{{ fmt_age(d.mtime) }}</td>

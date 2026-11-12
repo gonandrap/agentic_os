@@ -114,6 +114,25 @@ def test_a_catalog_with_no_source_path_is_a_no_op(jarvis_home, tmp_path):
 # -- the reload itself
 
 
+def test_the_daemon_publishes_the_projects_it_loaded(daemon, catalog_file):
+    """What the onboarding applied page reads to say whether a project is live (wo-6d9fbd23)"""
+    from jarvis.daemon import DAEMON_PROJECTS_KEY
+
+    def published():
+        central = CentralStore()
+        try:
+            return json.loads(central.get_state(DAEMON_PROJECTS_KEY) or "null")
+        finally:
+            central.close()
+
+    daemon._write_pidfile()
+    assert published()["projects"] == ["proj_a"]
+    daemon.central.set_state(DAEMON_PROJECTS_KEY, "")
+    edit(catalog_file, defaults={"model": "opus"})
+    assert daemon.reload_catalog() is True
+    assert published()["projects"] == ["proj_a"]
+
+
 def test_a_settings_change_reaches_the_daemon_on_the_next_tick(daemon, catalog_file):
     edit(catalog_file, defaults={"model": "opus"}, validation={"enabled": True})
 
