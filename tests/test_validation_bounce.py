@@ -228,6 +228,16 @@ def test_a_cited_path_argued_in_the_evidence_lets_the_panel_judge(argued):
         {"a/b.py": "1"}, {"a/b.py": "1", "a/z.py": "9"}, argued=argued) is None
 
 
+def test_one_argued_citation_of_two_is_enough_to_reach_the_panel():
+    """Per assumption #2: argued counts like touched, so SOME of the list suffices (spec §5)"""
+    found = [{"title": "a/b.py is wrong", "detail": ""},
+             {"title": "a/c.py is wrong", "detail": ""}]
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found,
+        {"a/b.py": "1", "a/c.py": "2"}, {"a/b.py": "1", "a/c.py": "2", "a/z.py": "9"},
+        argued="a/b.py: main already has it") is None
+
+
 @pytest.mark.parametrize("argued", ["", "ran pytest -q", "see a/bb.py and xb.py"])
 def test_evidence_that_names_no_cited_path_still_bounces(argued):
     found = [{"title": "a/b.py is wrong", "detail": ""}]
