@@ -32,6 +32,7 @@ from .timeline import QUESTION_ESCALATED
 from .uilog import (UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS,
                     register_stack_signal)
 from .project_store import (
+    ARTIFACT_DECIDED_EVENT,
     COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
@@ -421,6 +422,13 @@ def reviews_gate(store: ProjectStore, wo: dict[str, Any],
     """True when a privileged-action request the user does not hold is open — §3"""
     from . import invariants
     return invariants.waiting_on_neo_gate(store, wo)
+
+
+def completes_decided_artifacts(store: ProjectStore, wo: dict[str, Any],
+                                now: float | None = None) -> bool:
+    """Parked on an artifact the user has now decided, so `Daemon.complete_decided_artifacts` closes it (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.3)"""
+    return (wo["status"] == "needs_review" and store.artifact_park_open(wo["id"])
+            and not store.undecided_artifacts(wo["id"]))
 
 
 def reviews_assumptions(store: ProjectStore, wo: dict[str, Any],
@@ -1262,6 +1270,8 @@ class Daemon:
                     self.settle_shipped_releases(project, store)
                     # Immediately after it, never before: issue #945 spec §2.1
                     self.refile_dropped_fixes(project, store)
+                # Before `settle_features`: a decided artifact completes the child it settles on
+                self.complete_decided_artifacts(project, store)
                 # After the pull-request poll, so the merge that completes a feature's last child settles the feature...
                 self.settle_features(project, store)
                 if reconcile:
@@ -5659,6 +5669,20 @@ class Daemon:
             return
         ops_mod.settle_in_session(store, wo, "verdict_settled_by_reconciler",
                                   payload={"why": why})
+
+    def complete_decided_artifacts(self, project: ProjectSpec,
+                                   store: ProjectStore) -> None:
+        """Complete each order the artifact gate parked once the user decided (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §5.3)"""
+        from . import ops as ops_mod
+
+        for wo in store.list_work_orders(statuses=("needs_review",), include_hidden=True):
+            if (not completes_decided_artifacts(store, wo)
+                    or invariants_mod.true_blockers(store, wo)):
+                continue
+            ops_mod.close_out(store, wo, ARTIFACT_DECIDED_EVENT,
+                              why="the user decided its artifacts")
+            ops_mod.after_completion(store, wo, "its artifacts were decided")
+            log.info("[%s] %s: artifacts decided, completed", project.name, wo["id"])
 
     def settle_landed_investigators(self, project: ProjectSpec,
                                     store: ProjectStore) -> None:

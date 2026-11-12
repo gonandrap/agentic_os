@@ -1977,13 +1977,21 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--level", default="info", choices=["info", "warning", "critical"])
     n.add_argument("--wo-id")
 
-    arp = sub.add_parser("artifact", help="claude.ai artifacts orders published (read-only)")
+    arp = sub.add_parser("artifact", help="claude.ai artifacts orders published, and your "
+                                          "keep or delete")
     ar = arp.add_subparsers(dest="art_cmd", required=True)
     a = ar.add_parser("list", help="undecided artifacts, counts first")
     a.add_argument("project", nargs="?")
     a.add_argument("--all", action="store_true", help="decided ones too")
     a = ar.add_parser("show", help="one artifact: row, order, link")
     a.add_argument("art_id")
+    a = ar.add_parser("keep", help="keep it; its order completes and its session is released")
+    a.add_argument("art_id")
+    a = ar.add_parser("delete", help="ask to delete it; you delete it on claude.ai, then --done")
+    a.add_argument("art_id")
+    a.add_argument("--yes", action="store_true", help="confirm: deletion cannot be undone")
+    a.add_argument("--done", action="store_true",
+                   help="you deleted it on claude.ai: record it")
 
     ibp = sub.add_parser("inbox", help="central notification inbox")
     ib = ibp.add_subparsers(dest="ib_cmd", required=False)
@@ -6348,6 +6356,24 @@ def cmd_inbox(args: argparse.Namespace) -> int:
 def cmd_artifact(args: argparse.Namespace) -> int:
     """`jarvis artifact list|show` (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.5)"""
     from . import ops
+    if args.art_cmd in ("keep", "delete"):
+        row = ops.show_artifact(args.art_id)
+        out = ops.decide_artifact(row["project"], row["wo_id"], args.art_id, args.art_cmd,
+                                  by="cli", yes=getattr(args, "yes", False),
+                                  done=getattr(args, "done", False))
+        if args.json:
+            _print(out, True)
+            return 0
+        print(f"{out['art_id']}  {out['decision']}  {out['url']}")
+        if out["decision"] == "delete_requested":
+            print(f"  next: delete it on claude.ai, then `jarvis artifact delete "
+                  f"{out['art_id']} --yes --done`; {out['wo_id']} stays held until then")
+        elif out["owed"]:
+            print(f"  next: {out['owed']} more artifact(s) of {out['wo_id']} to decide")
+        else:
+            print(f"  next: {out['wo_id']}'s session is released on the next poll and the "
+                  f"order completes")
+        return 0
     if args.art_cmd == "show":
         row = ops.show_artifact(args.art_id)
         if args.json:
