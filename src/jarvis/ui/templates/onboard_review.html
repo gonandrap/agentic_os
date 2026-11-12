@@ -36,6 +36,10 @@
   {% else %}<p class="lede">Nothing: every must-have area has an answer.</p>{% endif %}
 
   <h3>What will change</h3>
+  {% if view.project.like %}
+  <p class="lede" id="ob-copied">Copied from <b>{{ view.project.like }}</b>: every value below is
+    its setting. Click one to change it; you come back here. Identity is never copied.</p>
+  {% endif %}
   <div class="panel table-wrap">
     <table class="ob-diff" id="ob-diff">
       {% for g in groups %}
@@ -45,7 +49,7 @@
       <tr>
         <td><a class="mono" href="{{ r.href }}">{{ r.path }}</a>
           {% if r.line %}<div class="line">{{ r.line }}</div>{% endif %}</td>
-        <td class="val">{{ r.old|tojson if r.kind != 'added' else '—' }} → {{ r.new|tojson if r.kind != 'removed' else '—' }}</td>
+        <td class="val"><a href="{{ r.href }}">{{ r.old|tojson if r.kind != 'added' else '—' }} → {{ r.new|tojson if r.kind != 'removed' else '—' }}</a></td>
         <td><span class="badge" title="when a change takes effect">{{ r.apply }}</span></td>
         <td>{% if r.safety %}<span class="badge outside" title="changes what a worker may do: applying needs a reason">safety</span>{% endif %}</td>
       </tr>
