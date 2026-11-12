@@ -132,7 +132,7 @@ the latest release tag plus its one commit cherry-picked, not whatever else is o
     <div class="row"><strong>Artifacts</strong></div>
     {% for a in artifacts %}
     <div class="row">
-      <span class="grow"><a href="{{ a.url }}" target="_blank" rel="noopener">{{ a.title or a.url }}</a></span>
+      <span class="grow">{% if a.url.startswith('https://') %}<a href="{{ a.url }}" target="_blank" rel="noopener">{{ a.title or a.url }}</a>{% else %}<span class="mono">{{ a.url }}</span>{% endif %}</span>
       {% if a.decision == 'delete_requested' %}
       <span class="sub tone-warn" title="Delete it on claude.ai, then run: jarvis artifact delete {{ a.id }} --yes --done">delete requested · {{ fmt_age(a.decided_at) }}</span>
       {% elif a.decision %}

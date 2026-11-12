@@ -4396,6 +4396,20 @@ def test_the_artifact_dialog_shows_only_for_a_parked_cancelled_or_failed_order(
         assert f'action="/wo/proj_a/{wo["id"]}/artifact/{art_id}/delete"' in page
 
 
+def test_a_non_https_artifact_url_is_never_a_link(client, project):
+    wo = _work(project, "publishes a page", status="running")
+    _publish(project, wo["id"], url="javascript:alert(1)")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "cancelled")
+    finally:
+        store.close()
+
+    for page in (client.get("/").text, client.get(f"/wo/proj_a/{wo['id']}").text):
+        assert ART_DIALOG in page or 'id="artifacts"' in page
+        assert 'href="javascript:' not in page
+
+
 def test_a_decided_artifact_asks_nothing(client, project, user_shell):
     wo = _work(project, "publishes a page", status="running")
     art_id = _publish(project, wo["id"])

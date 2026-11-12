@@ -8,7 +8,7 @@
   <div class="row"><div class="grow">
     <a class="rowid" href="/wo/{{ a.project }}/{{ a.wo_id }}">{{ a.wo_id }}</a>
     <span class="sub">{{ a.wo_title }} · {{ a.wo_status }}</span>
-    <div><a href="{{ a.url }}" target="_blank" rel="noopener">{{ a.title or a.url }}</a></div>
+    <div>{% if a.url.startswith('https://') %}<a href="{{ a.url }}" target="_blank" rel="noopener">{{ a.title or a.url }}</a>{% else %}<span class="mono">{{ a.url }}</span>{% endif %}</div>
     <p class="sub">Its session stays open so comments sent to Claude reach it. The order
       cannot complete until you decide.</p>
     <p><strong>Keep</strong>: the artifact stays on claude.ai and the session is released. A
