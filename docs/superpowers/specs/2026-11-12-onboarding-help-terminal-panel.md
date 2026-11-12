@@ -126,9 +126,13 @@ or `502 {"error"}` when the PTY could not start. `POST /onboard/{name}/help/pty/
    it is killed with `os.killpg`: SIGTERM, then SIGKILL after 2 s, then `waitpid`.
    (b) `close_all()` runs in the lifespan teardown. (c) Each child gets a record
    `<owner_dir>/<dashboard pid>-<child pid>.json`, where `owner_dir` defaults to
-   `paths.jarvis_home() / "ui" / "help-pty"`. `reap_stale()` at startup kills only the
-   children whose dashboard pid is dead. Two dashboards can run at once, so never reap
-   another live dashboard's helpers.
+   `paths.jarvis_home() / "ui" / "help-pty"`. The record holds the child's `argv`.
+   `reap_stale()` at startup kills only the children whose dashboard pid is dead. Two
+   dashboards can run at once, so never reap another live dashboard's helpers. Pids get
+   reused, so before killing, `reap_stale()` confirms the pid still leads its own process
+   group (`os.getpgid(pid) == pid`) and that its live command line (`/proc/<pid>/cmdline`,
+   or `ps -o command= -p <pid>` off Linux) equals the recorded `argv`. Otherwise it only
+   deletes the record.
 3. **Read-only by flags.** The interactive argv carries `--disallowedTools Edit Write
    NotebookEdit` and allows the persona's read verbs without a prompt (§1). The user can
    still approve some other Bash command in the terminal. That is the user acting, not the
@@ -242,8 +246,10 @@ against a deadline and never blocks unbounded.
    and `live_pids()` is empty. Control: before the close, the pid was alive.
 5. Idle: with `idle_seconds=0.2` and no attachment, the process dies within 2 s.
    Control: an attached session with the same setting survives the same wait.
-6. `reap_stale`: a record naming a dead dashboard pid plus a live `sleep 60` child gets
-   that child killed. A record naming the current pid is left alone.
+6. `reap_stale`: a record naming a dead dashboard pid plus a live `sleep 60` child (started
+   with `start_new_session=True`, its argv recorded) gets that child killed. A record naming
+   the current pid is left alone. Pid reuse: a record whose recorded `argv` differs from the
+   live process's command line leaves that process alive and deletes the record.
 7. Env: the child's recorded env lacks `JARVIS_WO_ID` and `JARVIS_TURN_TRANSPORT` while the
    parent has both set.
 8. Parent killed outright (Linux only, `skipif` elsewhere): a subprocess runs a
