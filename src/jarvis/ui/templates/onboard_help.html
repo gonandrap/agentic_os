@@ -3,6 +3,9 @@
 {% block head %}<style>.help-pre { white-space: pre-wrap; overflow-wrap: anywhere; }</style>{% endblock %}
 {% block content %}
 {% set back = "/onboard/" ~ project|urlencode ~ "/" ~ section|urlencode ~ ("?focus=" ~ focus|urlencode if focus else "") %}
+{% if pty_error %}
+<div class="error-flash" role="alert" id="help-pty-error">The terminal panel could not start: {{ pty_error }}</div>
+{% endif %}
 {% if res.error %}
 <h2>Help could not start</h2>
 <div class="error-flash" id="help-error">The help session for {{ section }} did not start: {{ res.error }}</div>

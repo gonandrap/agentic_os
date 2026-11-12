@@ -1,0 +1,33 @@
+{# The help terminal side panel: §3 of docs/superpowers/specs/2026-11-12-onboarding-help-terminal-panel.md.
+   Needs only `name` (the draft); help_panel.js takes over every form posting to …/help. #}
+<link rel="stylesheet" href="/vendor/xterm.css?v={{ vendor_v['xterm.css'] }}">
+<style>
+  :root { --help-w: 40vw; }
+  body.help-open .app { margin-right: var(--help-w); }
+  .help-panel { position: fixed; top: 0; right: 0; bottom: 0; width: var(--help-w); z-index: 30;
+                display: flex; flex-direction: column; background: var(--surface);
+                border-left: 1px solid var(--line); }
+  .help-panel[hidden] { display: none; }
+  .help-grip { position: absolute; left: -4px; top: 0; bottom: 0; width: 8px; cursor: col-resize; }
+  .help-head { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
+               border-bottom: 1px solid var(--line); font-size: 13px; }
+  .help-head .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .help-status { color: var(--ink-2); font-size: 12.5px; }
+  .help-term { flex: 1; min-height: 0; padding: 4px; background: #000; }
+  @media (max-width: 900px) { body.help-open .app { margin-right: 0; }
+    .help-panel { width: 100vw; top: auto; height: 60vh; border-left: 0; border-top: 1px solid var(--line); }
+    .help-grip { display: none; } }
+</style>
+<aside class="help-panel" id="help-panel" data-draft="{{ name }}" aria-label="help terminal" hidden>
+  <div class="help-grip" id="help-grip" role="separator" aria-orientation="vertical" title="drag to resize"></div>
+  <div class="help-head">
+    <span class="grow mono" id="help-name"></span>
+    <span class="help-status" id="help-status" role="status"></span>
+    <button type="button" id="help-again" hidden>start again</button>
+    <button type="button" id="help-close">Close</button>
+  </div>
+  <div class="help-term" id="help-term"></div>
+</aside>
+<script src="/vendor/xterm.js?v={{ vendor_v['xterm.js'] }}"></script>
+<script src="/vendor/xterm-addon-fit.js?v={{ vendor_v['xterm-addon-fit.js'] }}"></script>
+<script src="/static/help_panel.js?v={{ static_v['help_panel.js'] }}"></script>
