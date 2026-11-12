@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -118,7 +119,7 @@ def test_the_matcher_names_both_serena_tool_names(project, jarvis_home):
     matchers = [e.get("matcher", "") for e in settings["hooks"]["PreToolUse"]]
 
     for prefix in dispatch.SERENA_TOOL_PREFIXES:
-        assert any(f"{prefix}search_for_pattern" in m for m in matchers)
+        assert any(re.search(m, f"{prefix}search_for_pattern") for m in matchers if m)
 
 
 def test_the_refusal_is_reached_through_the_preflight_mcp_branch():

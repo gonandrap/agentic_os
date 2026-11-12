@@ -477,6 +477,8 @@ elif argv[:1] == ["respawn"]:
     entry = _bg_find(argv[1])
     if entry is None:
         sys.stderr.write(f"no such session {argv[1]}\n"); sys.exit(1)
+    if os.environ.get("FAKE_CLAUDE_RESPAWN") == "fail":
+        sys.stderr.write("respawn failed (test-forced)\n"); sys.exit(1)
     # A respawned session has nothing to do: it comes back idle, under the same id
     _set(entry["sessionId"], pid=900000 + len(load_sessions()), status="idle")
     print(f"respawned {argv[1]}")
@@ -2541,6 +2543,68 @@ def fake_claude(tmp_path, monkeypatch):
                 jdir.mkdir(parents=True, exist_ok=True)
                 (jdir / "state.json").write_text(json.dumps(payload))
             (fdir / "sessions.json").write_text(json.dumps(sessions))
+
+        def _locked_set(self, session_id: str, **fields) -> None:
+            """Under the fake's own lock: a `--bg` child may write the roster at the same time"""
+            import fcntl
+
+            with open(fdir / "sessions.json.lock", "a") as lk:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+                sessions = self.sessions
+                for s in sessions:
+                    if s["sessionId"] == session_id:
+                        for k, v in fields.items():
+                            if v is None:
+                                s.pop(k, None)
+                            else:
+                                s[k] = v
+                (fdir / "sessions.json").write_text(json.dumps(sessions))
+
+        def wake(self, session_id: str, text: str = "Answered the comment.",
+                 cost: float = 0.05, stay_busy: bool = False) -> None:
+            """A Send to Claude: the session runs a turn the OS did not start (spec 2026-11-10 §4.6)"""
+            from . import usage as usage_mod
+
+            self._locked_set(session_id, status="busy", state="working")
+            out_price = usage_mod.price_for("claude-fake-1")[1]
+            root = Path(os.environ.get("JARVIS_TRANSCRIPT_ROOT") or fdir / "transcripts")
+            path = root / "-fake" / f"{session_id}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            now = time.time()
+            stamp = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+                     + f".{int(now % 1 * 1000):03d}Z")
+            rows = [
+                {"type": "user", "origin": {"kind": "task-notification"},
+                 "message": {"role": "user", "content": "<task-type>artifact-auto-react"
+                             "</task-type>"}},
+                {"type": "assistant", "message": {
+                    "id": f"msg-wake-{time.time_ns()}", "model": "claude-fake-1",
+                    "role": "assistant", "content": [{"type": "text", "text": text}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 0, "output_tokens":
+                              round(cost * 1_000_000 / out_price)}}},
+            ]
+            with path.open("a") as f:
+                for row in rows:
+                    f.write(json.dumps({"timestamp": stamp, "sessionId": session_id,
+                                        **row}) + "\n")
+            if not stay_busy:
+                self.settle_wake(session_id)
+
+        def settle_wake(self, session_id: str) -> None:
+            """The woken turn ends: back to idle"""
+            self._locked_set(session_id, status="idle", state="done")
+
+        def drop(self, session_id: str) -> None:
+            """The session's process is gone: the roster keeps the entry with no pid"""
+            self._locked_set(session_id, pid=None, status=None)
+
+        def respawn_fails(self, on: bool = True) -> None:
+            """`claude respawn` exits 1"""
+            if on:
+                monkeypatch.setenv("FAKE_CLAUDE_RESPAWN", "fail")
+            else:
+                monkeypatch.delenv("FAKE_CLAUDE_RESPAWN", raising=False)
 
     return Handle()
 

@@ -82,7 +82,8 @@ def in_flight(store: ProjectStore, wo_id: str) -> float:
     """What the turn running RIGHT NOW has spent so far — an estimate, for display only"""
     from . import usage
 
-    turn = store.latest_turn(wo_id)
+    # A comment-woken reply spends the order's money too (spec 2026-11-10 §4.5.3)
+    turn = store.latest_turn(wo_id, include_artifact=True)
     if turn is None or turn["state"] != "running":
         return 0.0
     try:
