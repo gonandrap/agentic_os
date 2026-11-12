@@ -15201,6 +15201,12 @@ def onboard_apply(draft_path: str, *, catalog_path: str | None = None,
         central.upsert_project(name=spec.name, path=str(spec.path),
                                description=spec.description, model=spec.model,
                                catalog_json=json.dumps(spec.raw))
+        if report.warnings:  # the applied page is rebuilt from the version, which drops them (wo-6d9fbd23)
+            central.add_inbox(
+                project=spec.name, level="warning",
+                title=f"onboarding {spec.name}: bootstrap left {len(report.warnings)} warning(s)",
+                body=f"config version {row['id']}\n\n" + "\n".join(
+                    f"- {w}" for w in report.warnings))
     finally:
         central.close()
     return {"version": row,
@@ -16118,6 +16124,50 @@ def set_wiring(lever: str, wired: bool, project: str | None = None, *,
         path = f"os.{path}"
     return set_config(path, value, project, reason=reason,
                       catalog_path=catalog_path, actor=actor)
+
+
+def onboard_live(name: str, catalog: str = "") -> dict[str, str]:
+    """Has the running daemon loaded `name`, and the one action that works if not (wo-6d9fbd23)"""
+    from .daemon import DAEMON_PROJECTS_KEY
+    from . import service_manager
+
+    central = CentralStore()
+    try:
+        published = db.from_json(central.get_state(DAEMON_PROJECTS_KEY), None)
+        catalog = catalog or central.get_state("catalog_path") or "<catalog>"
+    finally:
+        central.close()
+    start = f"jarvis start --catalog {catalog}"
+    if not daemon_running():
+        return {"state": "down", "text": "the OS is not running", "command": start}
+    if not isinstance(published, dict):
+        return {"state": "unknown", "command": "",
+                "text": f"cannot tell whether {name} is live: the running daemon "
+                        f"predates the release that publishes its project list"}
+    # `jarvis start` leaves a running daemon as it is (kn-ef104d83)
+    command = (service_manager.restart_hint(release.DAEMON_UNIT) if published.get("managed")
+               else f"jarvis stop && {start}")
+    if name in (published.get("projects") or []):
+        return {"state": "live", "command": command,
+                "text": f"{name} is live: the running daemon has it loaded"}
+    return {"state": "not_loaded", "command": command,
+            "text": f"{name} is saved but NOT live: the running daemon started without it"}
+
+
+def onboard_applied(name: str, version_id: str) -> dict[str, Any]:
+    """The applied page's facts, from the stored version alone (wo-6d9fbd23)"""
+    row = _find_version(version_id)
+    cold = sorted(c["path"] for c in row["changes"] if apply_class(c["path"]) == "restart")
+    return {"version": row, "changes": len(row["changes"]), "cold": cold,
+            "live": onboard_live(name, row.get("source_path") or "")}
+
+
+def onboard_last_applied(name: str) -> str | None:
+    """The newest onboarding apply that touched `name`, or None"""
+    own = f"projects.{name}."
+    return next((r["id"] for r in config_history(name, limit=50)
+                 if r["actor"] == "onboard"
+                 and any(c["path"].startswith(own) for c in r["changes"])), None)
 
 
 def config_history(project: str | None = None,

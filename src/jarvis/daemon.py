@@ -157,6 +157,9 @@ DEFAULT_POLL_INTERVAL = 5.0  # seconds per tick
 #: Reconcile stamp an outside reader judges liveness by; spec 2026-10-16 §2a
 RECONCILE_TICK_KEY = "reconcile_tick"
 
+#: The project names this daemon has loaded, and whether a service manager runs it (wo-6d9fbd23)
+DAEMON_PROJECTS_KEY = "daemon_projects"
+
 #: Holds the low-disk warning, so it is raised once and re-armed only on recovery (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §2)
 DISK_LOW_KEY = "disk_low_warned"
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
@@ -1084,6 +1087,7 @@ class Daemon:
         self._warn_owner_moved(owner)
         self._close_orphan_stores()
         self.catalog_reload_warned = False
+        self._publish_projects()
         log.info("catalog reloaded from %s", path)
         return True
 
@@ -1169,6 +1173,14 @@ class Daemon:
         self.central.set_state("daemon_started_at", str(time.time()))
         if self.catalog.source_path:
             self.central.set_state("catalog_path", str(self.catalog.source_path))
+        self._publish_projects()
+
+    def _publish_projects(self) -> None:
+        # A terminal on macOS sets XPC_SERVICE_NAME to "0"; launchd sets it to the job label
+        managed = bool(os.environ.get("INVOCATION_ID")
+                       or os.environ.get("XPC_SERVICE_NAME", "0") != "0")
+        self.central.set_state(DAEMON_PROJECTS_KEY, db.to_json(
+            {"projects": sorted(p.name for p in self.catalog.projects), "managed": managed}))
 
     def _remove_pidfile(self) -> None:
         daemon_pidfile().unlink(missing_ok=True)

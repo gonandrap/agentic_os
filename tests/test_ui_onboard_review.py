@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 
 import pytest
@@ -14,6 +15,7 @@ from jarvis import interview, ops, wiring  # noqa: E402
 from jarvis.testing import make_git_project  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 from jarvis.ui.onboard_pages import section_url  # noqa: E402
+from jarvis.ui.onboard_review import applied_url  # noqa: E402
 
 NAME = "newproj"
 
@@ -112,20 +114,58 @@ def test_apply_refuses_open_must_haves_stale_rev_and_a_missing_reason(client):
     assert head() == before
 
     r = apply(client, reason="new project, defaults")
-    assert r.status_code == 200, r.text
     after = head()
     assert after["id"] != (before or {}).get("id") and after["actor"] == "onboard"
-    assert after["id"] in r.text
+    assert r.status_code == 303 and r.headers["location"] == applied_url(NAME, after["id"])
 
 
-def test_a_new_project_is_told_to_run_jarvis_start(client):
+def ready(client):
     for key in ops.onboard_view(NAME)["progress"]["must_have_missing"]:
         defaults(client, key)
-    view = ops.onboard_edit(NAME, "reason", rev=ops.onboard_view(NAME)["rev"],
-                            value="a new project")
-    dry = ops.onboard_apply(view["draft_path"], dry_run=True)
-    assert dry["restart_needed"]
-    assert dry["restart_why"] in html.unescape(client.get(f"/onboard/{NAME}/review").text)
-    page = html.unescape(apply(client, reason="a new project").text)
-    assert f"jarvis start --catalog {dry['catalog']}" in page
-    assert dry["restart_why"] in page
+
+
+def test_apply_redirects_to_a_durable_page_built_from_the_version(client):
+    """POST/redirect/GET: the result survives a reload (wo-6d9fbd23)"""
+    assert client.get(f"/onboard/{NAME}/apply").headers["location"] == f"/onboard/{NAME}/review"
+    ready(client)
+    r = apply(client, reason="a new project")
+    assert r.status_code == 303
+    vid = head()["id"]
+    page = client.get(r.headers["location"])
+    assert page.status_code == 200
+    text = html.unescape(page.text)
+    assert vid in text and "a new project" in text
+    assert f"{len(head()['changes'])} changes" in text
+    # No daemon runs in the suite: the one working action is to start it
+    assert 'data-state="down"' in text and "jarvis start --catalog" in text
+    # A reload of the POST's own URL lands on the same page, not the section 404
+    again = client.get(f"/onboard/{NAME}/apply")
+    assert again.status_code == 303 and again.headers["location"] == applied_url(NAME, vid)
+    # Controls: an unknown version and an unknown section are still 404s
+    assert client.get(f"/onboard/{NAME}/applied/nosuch").status_code == 404
+    assert client.get(f"/onboard/{NAME}/nosuch").status_code == 404
+    assert f'/onboard/{NAME}/apply"' in client.get("/onboard").text
+
+
+@pytest.mark.parametrize("published, managed, state, command", [
+    (None, False, "unknown", ""),
+    ([NAME], False, "live", "jarvis stop && jarvis start --catalog C"),
+    (["other"], False, "not_loaded", "jarvis stop && jarvis start --catalog C"),
+    (["other"], True, "not_loaded", "systemctl --user restart jarvis.service"),
+])
+def test_live_status_reads_what_the_running_daemon_published(
+        jarvis_home, monkeypatch, published, managed, state, command):
+    from jarvis import service_manager
+    from jarvis.central_store import CentralStore
+    from jarvis.daemon import DAEMON_PROJECTS_KEY
+
+    monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.SYSTEMD)
+    monkeypatch.setattr(ops, "daemon_running", lambda: 4242)
+    central = CentralStore()
+    try:
+        central.set_state(DAEMON_PROJECTS_KEY, "" if published is None else json.dumps(
+            {"projects": published, "managed": managed}))
+    finally:
+        central.close()
+    live = ops.onboard_live(NAME, "C")
+    assert (live["state"], live["command"]) == (state, command)
