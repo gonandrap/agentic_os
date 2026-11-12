@@ -588,9 +588,9 @@ def test_the_investigators_matcher_routes_every_mcp_call_to_the_hook(project, ja
     worker = _pretooluse_matcher(project, "worker")
     for tool in MCP_WRITES + MCP_READS:
         assert _cli_matches(investigator, tool), tool
-    # The negative control: an ordinary worker still pays the hook on NO MCP write
-    for tool in MCP_WRITES:
-        assert not _cli_matches(worker, tool), tool
+    # A worker pays it too since the comment fence (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §4.5.5)
+    for tool in MCP_WRITES + MCP_READS:
+        assert _cli_matches(worker, tool), tool
 
 
 def test_a_bare_mcp_prefix_alternative_would_have_matched_nothing():

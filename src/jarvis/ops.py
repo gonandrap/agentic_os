@@ -903,6 +903,16 @@ def artifact_session_cap() -> int:
         return ArtifactsConfig.max_held_sessions
 
 
+def artifact_reply_budget() -> float:
+    """`os.artifacts.reply_budget_usd`; the shipped default when no catalog loads"""
+    from .catalog import ArtifactsConfig
+
+    try:
+        return resolve_catalog().os.artifacts.reply_budget_usd
+    except Exception:  # noqa: BLE001 — no catalog registered, or an unreadable one
+        return ArtifactsConfig.reply_budget_usd
+
+
 def held_order_count() -> int:
     """Orders fleet-wide holding a session for an undecided artifact (docs/superpowers/specs/2026-11-10-artifact-session-hold.md §3.4)"""
     total = 0
