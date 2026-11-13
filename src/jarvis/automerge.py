@@ -796,7 +796,7 @@ def record_verdict(store: Any, approval: dict[str, Any], verdict: str, reason: s
         # THE COMMIT THIS VERDICT IS ABOUT, written rather than left inside `command`
         "head_sha": sha_of_command(approval["command"])})
     if verdict == "approved":
-        log.info("auto-merge approved for %s by %s — the next poll performs it",
+        log.info("auto-merge approved for %s by %s — the daemon performs it",
                  wo_id, decided_by)
         return
 

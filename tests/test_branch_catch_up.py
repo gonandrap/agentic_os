@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
 
 import pytest
 
@@ -390,6 +391,91 @@ def test_behind_then_updated_then_green_then_carried_then_merged_with_no_round(
         == [PR]
     assert store.get_work_order(wo["id"])["status"] == "completed"
     assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+
+
+# -- the fast lane (io-2f01e390): between polls, without one
+
+
+def fast(daemon, store):
+    daemon.auto_merge_hot(daemon.catalog.project("proj_a"), store)
+
+
+def neo_approves(daemon, store, approval):
+    """What the Neo thread's drain does with an approving verdict"""
+    assert approval["neo_question_id"]
+    q = {"id": approval["neo_question_id"], "project": "proj_a",
+         "wo_id": approval["wo_id"]}
+    daemon._deliver_gate_verdict(daemon.central, store, q,
+                                 {"escalate": False, "approve": True, "reason": "ok"})
+
+
+def test_the_catch_up_ci_and_the_approval_act_on_the_next_tick_with_no_poll(
+        started, project, fake_gh, local_proof):
+    """One poll catches up; every later step is the fast lane's"""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh)
+    poll(started, store)                      # the one poll: behind -> updated
+    assert fake_gh.updates == [PR]
+    assert ("proj_a", wo["id"]) in started.merge_hot
+
+    fake_gh.set_pr(PR, "OPEN", checks=RUNNING, merge_state="CLEAN", head_oid=UPDATED,
+                   base_oid=BASE_OID)
+    local_proof["contains"] = {BASE_OID}
+    fast(started, store)                      # CI running: held, and kept hot
+    assert store.list_approvals(wo["id"]) == []
+    assert ("proj_a", wo["id"]) in started.merge_hot
+
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=UPDATED,
+                   base_oid=BASE_OID)
+    fast(started, store)                      # green: proposed, and off the lane
+    [approval] = store.list_approvals(wo["id"])
+    assert approval["kind"] == "auto_merge" and UPDATED in approval["command"]
+    assert ("proj_a", wo["id"]) not in started.merge_hot
+
+    neo_approves(started, store, approval)    # the hand-off, never the merge
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+    assert ("proj_a", wo["id"]) in started.merge_hot
+
+    fast(started, store)
+    merges = [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+    assert len(merges) == 1 and merges[0]["argv"][-2:] == ["--match-head-commit", UPDATED]
+    assert store.get_work_order(wo["id"])["status"] == "completed"
+    fast(started, store)                      # merged: dropped, nothing more
+    assert ("proj_a", wo["id"]) not in started.merge_hot
+    assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]) == 1
+
+
+def test_the_fast_lane_lets_go_on_a_lasting_hold_and_at_its_deadline(
+        started, project, fake_gh, local_proof):
+    """A red PR is the poll's to heal; a lane past its deadline reads nothing"""
+    opt_in(started)
+    store, wo = parked(project)
+    key = ("proj_a", wo["id"])
+    fake_gh.set_pr(PR, "OPEN", checks=[check("unit", "FAILURE")], merge_state="CLEAN",
+                   head_oid=JUDGED, base_oid=BASE_OID)
+    started.mark_merge_hot(*key)
+    fast(started, store)
+    assert key not in started.merge_hot
+
+    started.mark_merge_hot(*key)
+    started.merge_hot[key] = 0.0              # past its deadline
+    reads = len(fake_gh.calls)
+    fast(started, store)
+    assert key not in started.merge_hot and len(fake_gh.calls) == reads
+
+
+def test_a_renewal_never_starts_the_lane():
+    """Only CI running, a catch-up push or an approval starts it"""
+    daemon = Daemon.__new__(Daemon)
+    daemon.merge_hot, daemon.merge_hot_renewed = {}, set()
+    daemon.merge_hot_lock = threading.Lock()
+    daemon.mark_merge_hot("p", "wo-1", renew_only=True)
+    assert daemon.merge_hot == {}
+    daemon.mark_merge_hot("p", "wo-1")
+    first = daemon.merge_hot[("p", "wo-1")]
+    daemon.mark_merge_hot("p", "wo-1", renew_only=True)
+    assert daemon.merge_hot[("p", "wo-1")] == first
 
 
 def test_a_merge_that_moved_the_base_makes_the_next_one_catch_up_before_it_merges(

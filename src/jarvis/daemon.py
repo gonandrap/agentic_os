@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import signal
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -170,6 +171,8 @@ DISK_LOW_KEY = "disk_low_warned"
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Seconds from one PR poll's start to the next; wall clock, not ticks (io-2f01e390)
 PR_POLL_EVERY_SECONDS = 120
+#: How long an order stays on the auto-merge fast lane after the event that put it there (io-2f01e390)
+MERGE_HOT_SECONDS = 600
 #: One Morpheus pass every N ticks (~1 minute at the default 5s poll)
 MORPHEUS_EVERY_TICKS = 12
 
@@ -815,6 +818,11 @@ class Daemon:
                                                 thread_name_prefix="validate")
         # Work orders whose round is in flight
         self.validating: set[str] = set()
+        #: Auto-merge fast lane: (project, wo_id) -> deadline; the Neo thread writes it too (io-2f01e390)
+        self.merge_hot: dict[tuple[str, str], float] = {}
+        #: Keys re-marked since the fast lane last took them up: the ones it keeps
+        self.merge_hot_renewed: set[tuple[str, str]] = set()
+        self.merge_hot_lock = threading.Lock()
         # The validator seam (see `_validator`)
         self.validator: Validator | None = None
         # Orders a reclaim sweep decided to keep: the next sweep spends no git call on them
@@ -1378,6 +1386,9 @@ class Daemon:
                     self.settle_shipped_releases(project, store)
                     # Immediately after it, never before: issue #945 spec §2.1
                     self.refile_dropped_fixes(project, store)
+                else:
+                    # Between polls only: a poll tick has just re-decided every order
+                    self.auto_merge_hot(project, store)
                 # Before `settle_features`: a decided artifact completes the child it settles on
                 self.complete_decided_artifacts(project, store)
                 # After the pull-request poll, so the merge that completes a feature's last child settles the feature...
@@ -4397,6 +4408,9 @@ class Daemon:
                                        exempt_pattern=verdict.get("exempt_pattern", ""))
         # WHAT WAS RECORDED, not what the reviewer said: the two differ on exactly one input
         ruling = decided["status"]
+        if ruling == "approved" and approval["kind"] == gates.AUTO_MERGE:
+            # Hand-off only: the merge itself runs on the tick thread (io-2f01e390)
+            self.mark_merge_hot(q["project"], q["wo_id"])
         # A shipped release is something the user wants to know happened
         if ruling != "dismissed":
             # A rejected CONTEST stays visible — the one place this feature spends the user's attention on purpose
@@ -6493,6 +6507,57 @@ class Daemon:
             return True
         return db.now() - float(latest["ts"] or 0.0) >= landing.FRESH_FOR_SECONDS
 
+    def mark_merge_hot(self, project: str, wo_id: str, *, renew_only: bool = False) -> None:
+        """Put an order on the auto-merge fast lane; thread-safe, the Neo thread calls it (io-2f01e390)"""
+        key = (project, wo_id)
+        with self.merge_hot_lock:
+            if renew_only and key not in self.merge_hot:
+                return
+            # The FIRST mark's deadline stands: a renewal never extends the lane
+            self.merge_hot.setdefault(key, time.time() + MERGE_HOT_SECONDS)
+            self.merge_hot_renewed.add(key)
+
+    def auto_merge_hot(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Re-decide this project's fast-lane orders from one PR read each (io-2f01e390)"""
+        from . import github
+
+        with self.merge_hot_lock:
+            keys = [k for k in self.merge_hot if k[0] == project.name]
+        if not keys:
+            return
+        base_red = self._base_red(project)
+        for key in keys:
+            with self.merge_hot_lock:
+                deadline = self.merge_hot.get(key)
+                self.merge_hot_renewed.discard(key)
+            wo = store.get_work_order(key[1])
+            if (deadline is None or time.time() > deadline or wo is None
+                    or wo["status"] != "waiting_pr_merge" or not wo.get("pr_url")):
+                self._drop_merge_hot(key)
+                continue
+            try:
+                pr = github.pr_view(wo["pr_url"], cwd=project.path)
+            except Exception as e:  # noqa: BLE001 — kept: the deadline bounds the retries
+                log.debug("[%s] fast lane could not read %s: %s", project.name,
+                          wo["pr_url"], e)
+                continue
+            # Merged, closed, conflicting, red: the poll's to settle and heal
+            if pr.state != "OPEN" or pr.conflicting or pr.failing:
+                self._drop_merge_hot(key)
+                continue
+            try:
+                self.auto_merge(project, store, wo, pr, base_red=base_red)
+            except Exception:  # noqa: BLE001 — never let one order stall the tick
+                log.exception("[%s] fast-lane auto-merge of %s failed", project.name, key[1])
+            with self.merge_hot_lock:
+                if key not in self.merge_hot_renewed:
+                    self.merge_hot.pop(key, None)
+
+    def _drop_merge_hot(self, key: tuple[str, str]) -> None:
+        with self.merge_hot_lock:
+            self.merge_hot.pop(key, None)
+            self.merge_hot_renewed.discard(key)
+
     def auto_merge(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                    pr: Any, *, record_only: bool = False,
                    base_red: Any = None) -> None:
@@ -6616,6 +6681,11 @@ class Daemon:
                     return
             if not decision.armed:
                 self._note_automerge_held(store, wo_id, decision)
+                if not record_only and decision.code in automerge.TURN_KEEPING_HOLDS:
+                    # CI running starts the fast lane; another transient hold only keeps it (io-2f01e390)
+                    self.mark_merge_hot(
+                        project.name, wo_id,
+                        renew_only=decision.code != automerge.HELD_CHECKS_RUNNING)
                 if not record_only and decision.code == automerge.HELD_DRAFT:
                     automerge.mark_ready(store, wo, decision.head_sha, cwd=project.path)
                 # TWO CODES, ONE PROPERTY (spec 2026-10-16 §1): a passed round whose commit binding is unusable and a...
@@ -7752,6 +7822,8 @@ class Daemon:
             log.info("[%s] %s was behind %s (%s) — caught it up, %s is now %s",
                      project.name, pr_url, base, base_oid[:10], head_before[:10],
                      fresh.head_oid[:10])
+        # Its CI is decided on the tick it goes green, not the next poll (io-2f01e390)
+        self.mark_merge_hot(project.name, wo_id)
         return ops.CatchUp(fresh, ops.CATCH_UP_DONE, "", base_tip=base_oid)
 
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
