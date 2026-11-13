@@ -85,6 +85,9 @@ def test_an_escalated_plan_leaves_its_bundled_rows_with_the_user(auto_review, st
     why = ops.waiting_on(store, wo)
     assert why["what"] == "plan_escalated"
     assert f"`jarvis fo approve {fo_id}` settles it" in why["detail"]
+    # `wo why` leads with the plan decision
+    assert ops.diagnose(wo["id"])["commands"][0]["command"].startswith(
+        f"jarvis fo approve {fo_id} ")
 
 
 @pytest.mark.parametrize("closer, field", [("neo_refined", "neo_question_id"),
