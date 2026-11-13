@@ -12,7 +12,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from jarvis import interview, ops, wiring  # noqa: E402
+from jarvis import interview, onboard_prose, ops, wiring  # noqa: E402
 from jarvis.testing import make_git_project  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 from jarvis.ui.onboard_pages import slug  # noqa: E402
@@ -91,14 +91,45 @@ def test_set_then_reload_shows_draft_and_a_bad_value_is_kept(client):
     good = "enforce" if knob["value"] != "enforce" else "shadow"
 
     r = edit(client, sec, verb="set", path=path, value=good)
-    assert r.status_code == 303 and r.headers["location"].endswith(f"#k-{slug(path)}")
-    page = client.get(f"/onboard/{NAME}/{sec}").text
+    to = r.headers["location"]
+    assert r.status_code == 303 and to.startswith(f"/onboard/{NAME}/{sec}?")
+    assert to.endswith(f"#k-{slug(path)}")
+    page = client.get(to).text
     assert f'value="{good}"' in row(page, path) and ">draft<" in row(page, path)
+    assert ">saved<" in row(page, path) and page.count(">saved<") == 1
 
     r = edit(client, sec, verb="set", path=path, value="nonsense-typed")
     assert r.status_code == 400
     assert "must be one of" in html.unescape(r.text)
     assert 'value="nonsense-typed"' in row(r.text, path)
+
+
+def test_a_section_pick_advances_to_the_next_open_section_with_a_flash(client):
+    a, b = view()["progress"]["must_have_missing"][:2]
+    title = next(s["title"] for s in view()["sections"] if s["key"] == a)
+    r = edit(client, a, verb="confirm")
+    assert r.status_code == 303
+    to = r.headers["location"]
+    assert to.startswith(f"/onboard/{NAME}/{b}?note=")
+    page = client.get(to).text
+    assert f"saved: {title} — kept the values shown" in html.unescape(page)
+    # Control: a refused edit stays on A, 400, nothing saved
+    r = edit(client, a, verb="answer", mode="preset:nosuch")
+    assert r.status_code == 400 and "saved:" not in html.unescape(r.text)
+
+
+def test_a_copied_draft_returns_to_review(client, project):
+    interview.new_draft(project, "proj_a")  # a catalog project to copy
+    document = json.loads(ops._catalog_file(None).read_text())
+    tmp = make_git_project(project.parent / "copy", "copied")
+    interview.like_draft(tmp, "copied", "proj_a", document=document,
+                         areas=onboard_prose.AREAS)
+    v = view("copied")
+    sec = next(s["key"] for s in v["sections"] if s["key"] not in ("identity", "review"))
+    r = client.post("/onboard/copied/edit",
+                    data={"rev": v["rev"], "section": sec, "verb": "defaults"})
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/onboard/copied/review?note=saved")
 
 
 def test_the_filter_index_reaches_other_sections(client):
