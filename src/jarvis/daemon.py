@@ -168,7 +168,7 @@ DAEMON_PROJECTS_KEY = "daemon_projects"
 #: Holds the low-disk warning, so it is raised once and re-armed only on recovery (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §2)
 DISK_LOW_KEY = "disk_low_warned"
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
-#: Ask GitHub about parked pull requests this many wall-clock seconds after the last poll STARTED; ticks stretch under slow work (io-2f01e390)
+#: Seconds from one PR poll's start to the next; wall clock, not ticks (io-2f01e390)
 PR_POLL_EVERY_SECONDS = 120
 #: One Morpheus pass every N ticks (~1 minute at the default 5s poll)
 MORPHEUS_EVERY_TICKS = 12
@@ -782,7 +782,7 @@ class Daemon:
         self.stores: dict[str, ProjectStore] = {}
         self.stop_requested = False
         self.tick_count = 0
-        #: The cadence clock; an attribute so a test can fake it without freezing the process's own time.monotonic
+        #: Cadence clock; an attribute so a test fakes it without patching time.monotonic
         self.monotonic = time.monotonic
         #: `self.monotonic()` when the last PR poll STARTED; None until the first one (io-2f01e390)
         self.pr_polled_at: float | None = None

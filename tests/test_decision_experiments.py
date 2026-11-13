@@ -236,6 +236,7 @@ def test_done_mid_experiment_closes_and_ticks_never_settle(started, store, catal
     d = _daemon(catalog_file)
     for _ in range(6):
         d.tick_count = 0
+        d.pr_polled_at = None
         d.tick()
         d.stuck_tick(None)
         d.health_tick(None)

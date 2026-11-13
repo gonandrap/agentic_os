@@ -26,6 +26,7 @@ def _catalog(tmp_path, project, max_in_flight: int = 15, name: str = "cat.json")
 
 def _tick(daemon):
     daemon.tick_count = 0  # the retry pass runs on this tick
+    daemon.pr_polled_at = None
     daemon.tick()
 
 

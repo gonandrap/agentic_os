@@ -160,6 +160,7 @@ def test_a_long_running_turn_is_reported_not_killed(fleet, fake_claude, settle_t
     store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
                        (aged["started_at"], turn["id"]))
     fleet["daemon"].tick_count = 0
+    fleet["daemon"].pr_polled_at = None
     fleet["daemon"].tick()
 
     fresh = store.get_work_order(wo["id"])

@@ -58,6 +58,7 @@ def two_projects(tmp_path, claude_json, project):
 def _tick(daemon):
     """One tick with the retry pass ON (the daemon runs it every RETRY_EVERY_TICKS)"""
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
 

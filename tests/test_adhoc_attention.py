@@ -48,6 +48,7 @@ def test_injected_session_going_idle_is_not_held_to_the_contract(
     store = ProjectStore(project)
     fake_claude.set_session_state("adhoc-1", "done")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     fresh = store.get_work_order(_injected_wo(store)["id"])
@@ -69,6 +70,7 @@ def test_injected_session_removed_from_agents_view_is_not_a_failure(
     _drop_session(fake_claude, "adhoc-1")
     _age_out(store, wo_id)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     fresh = store.get_work_order(wo_id)
@@ -92,6 +94,7 @@ def test_a_dispatched_worker_whose_turn_dies_is_still_a_failure(
 
     assert settle_turns(store)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     fresh = store.get_work_order(wo["id"])
@@ -111,6 +114,7 @@ def test_a_dispatched_worker_idle_without_finish_is_still_flagged(
 
     assert settle_turns(store)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     fresh = store.get_work_order(wo["id"])
@@ -255,6 +259,8 @@ def test_legacy_adopted_rows_are_not_tracked_from_the_roster(started, fake_claud
     _add_session(fake_claude, project, "working", sid="legacy-1", name="my manual hack")
 
     daemon.tick_count = 0
+
+    daemon.pr_polled_at = None
     daemon.tick()
 
     assert store.get_work_order(legacy["id"])["status"] == "completed"

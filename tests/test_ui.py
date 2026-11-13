@@ -869,6 +869,7 @@ def test_your_own_sessions_are_offered_for_injection(client, daemon, fake_claude
     """The dashboard affordance for GitHub issue 47: the project page offers to take a session the user..."""
     _add_session(fake_claude, project)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     assert "manual poking" not in client.get("/project/proj_a").text

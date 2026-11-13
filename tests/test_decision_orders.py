@@ -368,6 +368,7 @@ def test_nothing_but_the_user_ever_completes_a_decision_order(started, store, ca
     for _ in range(12):
         # Tick 1 runs every `% N == 1` cadence: PR poll, reconcile, landing sweep, schedule
         d.tick_count = 0
+        d.pr_polled_at = None
         d.tick()
         d.stuck_tick(None)
         d.health_tick(None)

@@ -228,6 +228,7 @@ def test_harvest_raises_turn_still_settles(fleet, settle_turns, monkeypatch):
     fleet["daemon"].tick()
     assert settle_turns(store)
     fleet["daemon"].tick_count = 0
+    fleet["daemon"].pr_polled_at = None
     fleet["daemon"].tick()
 
     assert store.latest_turn(wo["id"])["state"] == "failed"
