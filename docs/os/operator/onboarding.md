@@ -53,11 +53,12 @@ the fleet setting alone unless you choose otherwise.
 
 One configuration version, visible in `jarvis config history` with actor `onboard` and
 your reason; then the bootstrap, from the spec read back out of the committed catalog;
-then the project's row, so `jarvis status` sees it. A NEW project does not exist for the
-running daemon until the OS restarts — `Daemon.reload_catalog` refuses to reload when the
-set of project names changes, and freezes every other setting change in the file until
-then. `apply` prints the exact `jarvis restart --reason "…"` to run; `jarvis start` leaves
-a running OS as it is.
+then the project's row, so `jarvis status` sees it. The running daemon hot-adds a NEW
+project on its next tick (`Daemon.reload_catalog` loads an added project that has a row),
+so no restart is needed for it. Only restart-class keys of an existing project need one:
+`apply` then prints the exact `jarvis restart --reason "…"` to run; `jarvis start` leaves
+a running OS as it is. `jarvis doctor` flags a catalog project the daemon has not loaded
+(`INV-CATALOG-PROJECT-LOADED`).
 
 ## Onboarding from the dashboard
 

@@ -352,7 +352,8 @@ def run_doctor(project: str | None = None, repair: bool = False,
                catalog_path: str | None = None,
                include_os: bool = True) -> dict[str, Any]:
     """Run the OS's post-condition checks over one project or the whole fleet (#232)"""
-    from .invariants import check_catalog, check_os, check_project, check_release_marker
+    from .invariants import (check_catalog, check_catalog_loaded, check_os, check_project,
+                             check_release_marker)
 
     # Catalog-level checks run whenever a catalog is resolvable at all: a gate that can never open is a...
     config_violations: dict[str, list[Any]] = {}
@@ -361,7 +362,7 @@ def run_doctor(project: str | None = None, repair: bool = False,
     except (OpsError, CatalogError):
         cat = None
     if cat is not None:
-        for v in check_catalog(cat, project):
+        for v in [*check_catalog(cat, project), *check_catalog_loaded(cat, project)]:
             config_violations.setdefault(v.context.get("project", ""), []).append(v)
 
     if catalog_path:
@@ -15265,17 +15266,11 @@ def onboard_apply(draft_path: str, *, catalog_path: str | None = None,
                     f"these settings are what they are — and apply it again")
 
     classes = {c["path"]: apply_class(c["path"]) for c in changes}
-    restart_why = ""
-    if entry is None:
-        restart_why = (
-            f"{draft.project.name} is a NEW project, and `Daemon.reload_catalog` refuses "
-            f"to reload at all when the set of project names changes — so the project "
-            f"does not exist for the daemon, and every other setting change in this "
-            f"file stays frozen, until the OS restarts (`jarvis restart`; "
-            f"`jarvis start` leaves a running OS as it is)")
-    elif "restart" in classes.values():
-        cold = sorted(p for p, cls in classes.items() if cls == "restart")
-        restart_why = f"{', '.join(cold[:3])} only take effect on a restart"
+    # A new project's own keys were never cold: the daemon hot-adds and bootstraps it (io-74eab254)
+    fresh = f"projects.{draft.project.name}." if entry is None else None
+    cold = sorted(p for p, cls in classes.items()
+                  if cls == "restart" and not (fresh and p.startswith(fresh)))
+    restart_why = f"{', '.join(cold[:3])} only take effect on a restart" if cold else ""
     payload = {"changed": config_version.version_id(candidate) != was,
                "changes": changes, "apply": classes,
                "restart_needed": bool(restart_why), "restart_why": restart_why,
@@ -16280,11 +16275,14 @@ def onboard_applied(name: str, version_id: str) -> dict[str, Any]:
         started = float(central.get_state("daemon_started_at") or 0)
     finally:
         central.close()
+    live = onboard_live(name, row.get("source_path") or "")
+    # A hot-added project's own keys were never cold (io-74eab254)
+    own = f"projects.{name}." if live["state"] == "live" else None
     # A restart-class key is pending only if the daemon booted before this version
     cold = sorted(c["path"] for c in row["changes"]
-                  if apply_class(c["path"]) == "restart") if started < row["ts"] else []
-    return {"version": row, "changes": len(row["changes"]), "cold": cold,
-            "live": onboard_live(name, row.get("source_path") or "")}
+                  if apply_class(c["path"]) == "restart"
+                  and not (own and c["path"].startswith(own))) if started < row["ts"] else []
+    return {"version": row, "changes": len(row["changes"]), "cold": cold, "live": live}
 
 
 def onboard_last_applied(name: str) -> str | None:

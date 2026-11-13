@@ -3581,6 +3581,40 @@ def _launcher_violation(spec: Any, program: str) -> Violation:
     )
 
 
+INV_CATALOG_PROJECT_LOADED = "INV-CATALOG-PROJECT-LOADED"
+
+
+def check_catalog_loaded(catalog: Any, project: str | None = None) -> list[Violation]:
+    """INV-CATALOG-PROJECT-LOADED — the running daemon loaded every active catalog project (io-74eab254)"""
+    from . import release, service_manager
+    from .central_store import CentralStore
+    from .daemon import DAEMON_PROJECTS_KEY, archived_projects, daemon_running
+
+    if not daemon_running():
+        return []
+    central = CentralStore()
+    try:
+        published = db.from_json(central.get_state(DAEMON_PROJECTS_KEY), None)
+        archived = archived_projects(central)
+    finally:
+        central.close()
+    if not isinstance(published, dict):  # a daemon that predates the published list
+        return []
+    loaded = set(published.get("projects") or [])
+    restart = (service_manager.restart_hint(release.DAEMON_UNIT) if published.get("managed")
+               else "jarvis stop && jarvis start")
+    return [Violation(
+        invariant=INV_CATALOG_PROJECT_LOADED,
+        detail=(f"project {spec.name!r} is in the catalog but the running daemon has not "
+                f"loaded it, so none of its orders dispatch. A registered project is "
+                f"hot-added on the next tick; if this persists, the inbox says why the "
+                f"reload was refused. Restart: `{restart}`"),
+        context={"project": spec.name})
+        for spec in catalog.projects
+        if spec.name not in loaded and spec.name not in archived
+        and not (project and spec.name != project)]
+
+
 def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
     """Config-level post-conditions over the catalog itself"""
     found: list[Violation] = []

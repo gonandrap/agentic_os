@@ -226,10 +226,49 @@ def refusals(project: str = "proj_b") -> list[dict]:
         central.close()
 
 
-def test_an_added_project_is_refused_under_its_name_with_a_restart_that_works(
+def test_a_registered_added_project_is_hot_added_on_the_next_tick(
+        daemon, catalog_file, tmp_path, monkeypatch):
+    """What onboard_apply leaves (catalog entry + `projects` row) needs no restart (io-74eab254)"""
+    from jarvis import bootstrap
+    from jarvis.daemon import DAEMON_PROJECTS_KEY
+
+    booted: list[str] = []
+    real = bootstrap.bootstrap_project
+    monkeypatch.setattr(bootstrap, "bootstrap_project",
+                        lambda spec: booted.append(spec.name) or real(spec))
+    register("proj_b", project=tmp_path / "proj_a")
+    add_proj_b(catalog_file, tmp_path)
+
+    daemon.tick()
+
+    assert [p.name for p in daemon.catalog.projects] == ["proj_a", "proj_b"]
+    assert daemon.catalog.os.default_model == "opus"
+    assert booted == ["proj_b"]
+    assert refusals() == []
+    central = CentralStore()
+    try:
+        assert "proj_b" in json.loads(central.get_state(DAEMON_PROJECTS_KEY))["projects"]
+    finally:
+        central.close()
+
+
+def test_an_add_whose_row_lands_after_the_file_is_picked_up_without_another_edit(
+        daemon, catalog_file, tmp_path):
+    """onboard_apply commits the catalog before it registers the project"""
+    add_proj_b(catalog_file, tmp_path)
+    daemon.tick()
+    assert [p.name for p in daemon.catalog.projects] == ["proj_a"]
+
+    register("proj_b", project=tmp_path / "proj_a")
+    daemon.tick()
+
+    assert [p.name for p in daemon.catalog.projects] == ["proj_a", "proj_b"]
+    assert refusals() == []
+
+
+def test_an_unregistered_added_project_is_refused_under_its_name_with_a_restart_that_works(
         daemon, catalog_file, tmp_path, systemd):
     """Outcome first, under the project, never `jarvis start` (io-74eab254)"""
-    register("proj_b", project=tmp_path / "proj_a")
     add_proj_b(catalog_file, tmp_path)
 
     daemon.tick()
@@ -245,7 +284,7 @@ def test_an_added_project_is_refused_under_its_name_with_a_restart_that_works(
     assert body.startswith("proj_b is saved but not running yet.")
     assert "`systemctl --user restart jarvis.service`" in body
     assert "jarvis start" not in body
-    assert "http://127.0.0.1:8787/project/proj_b" in body
+    assert "http://127.0.0.1:8787" in body
 
 
 def test_the_refusal_names_the_config_version_that_caused_it(
@@ -661,3 +700,24 @@ def test_turning_validation_on_reaches_a_running_fleet_without_a_restart(started
     assert rounds[0]["config_version"] == head["id"]
     written = [v for v in history if v["actor"] == "user"]
     assert len(written) == 1 and written[0]["reason"] == "trying it"
+
+
+# -- doctor: a catalog project the running daemon has not loaded (io-74eab254)
+
+
+def test_doctor_names_a_catalog_project_the_daemon_has_not_loaded(
+        daemon, catalog_file, tmp_path, monkeypatch):
+    from jarvis import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "daemon_running", lambda: 4242)
+    daemon._write_pidfile()
+    document = add_proj_b(catalog_file, tmp_path)
+    catalog = parse_catalog(document)
+
+    found = invariants.check_catalog_loaded(catalog)
+    assert [v.context["project"] for v in found] == ["proj_b"]
+    assert found[0].invariant == invariants.INV_CATALOG_PROJECT_LOADED
+
+    register("proj_b", project=tmp_path / "proj_a")
+    daemon.tick()
+    assert invariants.check_catalog_loaded(catalog) == []
