@@ -205,7 +205,8 @@ def test_the_cli_prints_the_restart_command(catalog, repo, tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert rc == 0
-    assert f"jarvis start --catalog {catalog}" in out
+    assert 'next: jarvis restart --reason "onboarded shared_schedule"' in out
+    assert "jarvis start --catalog" not in out  # start never restarts a live OS (io-74eab254)
 
 
 def test_re_applying_an_unchanged_draft_writes_no_second_row(catalog, repo, tmp_path):

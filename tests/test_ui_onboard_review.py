@@ -149,9 +149,9 @@ def test_apply_redirects_to_a_durable_page_built_from_the_version(client):
 
 @pytest.mark.parametrize("published, managed, state, command", [
     (None, False, "unknown", ""),
-    ([NAME], False, "live", "jarvis stop && jarvis start --catalog C"),
-    (["other"], False, "not_loaded", "jarvis stop && jarvis start --catalog C"),
-    (["other"], True, "not_loaded", "systemctl --user restart jarvis.service"),
+    ([NAME], False, "live", f'jarvis restart --reason "onboarded {NAME}"'),
+    (["other"], False, "not_loaded", f'jarvis restart --reason "onboarded {NAME}"'),
+    (["other"], True, "not_loaded", f'jarvis restart --reason "onboarded {NAME}"'),
 ])
 def test_live_status_reads_what_the_running_daemon_published(
         jarvis_home, monkeypatch, published, managed, state, command):
@@ -169,3 +169,108 @@ def test_live_status_reads_what_the_running_daemon_published(
         central.close()
     live = ops.onboard_live(NAME, "C")
     assert (live["state"], live["command"]) == (state, command)
+
+
+# -- `jarvis restart` and its button (io-74eab254)
+
+def publish(projects, managed):
+    from jarvis.central_store import CentralStore
+    from jarvis.daemon import DAEMON_PROJECTS_KEY
+
+    central = CentralStore()
+    try:
+        central.set_state(DAEMON_PROJECTS_KEY, json.dumps(
+            {"projects": projects, "managed": managed}))
+    finally:
+        central.close()
+
+
+@pytest.fixture()
+def systemctl(monkeypatch):
+    """The fake systemctl: every argv the systemd runner would have executed"""
+    from jarvis import release, service_manager
+
+    monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.SYSTEMD)
+    argvs: list[list[str]] = []
+    monkeypatch.setattr(release.SystemdRunner, "_run",
+                        lambda self, argv: argvs.append(argv) or "")
+    return argvs
+
+
+def test_the_restart_button_issues_a_detached_restart_under_systemd(
+        client, monkeypatch, systemctl):
+    ready(client)
+    page_url = apply(client, reason="a new project").headers["location"]
+    monkeypatch.setattr(ops, "daemon_running", lambda: 4242)
+    publish(["other"], managed=True)
+
+    text = html.unescape(client.get(page_url).text)
+    assert 'data-state="not_loaded"' in text and "Restart now" in text
+    assert "never restarts" not in text
+
+    r = client.post("/os/restart", data={"reason": f"onboarded {NAME}", "next": page_url})
+    assert r.status_code == 303 and r.headers["location"] == page_url
+    [argv] = systemctl
+    assert argv[:3] == ["systemd-run", "--user", "--collect"]
+    assert argv[-1] == "sleep 3; systemctl --user restart jarvis.service"
+
+
+def test_no_restart_button_once_the_project_is_live(client, monkeypatch, systemctl):
+    ready(client)
+    page_url = apply(client, reason="a new project").headers["location"]
+    monkeypatch.setattr(ops, "daemon_running", lambda: 4242)
+    publish([NAME], managed=True)
+    from jarvis.central_store import CentralStore
+    central = CentralStore()
+    try:  # the daemon booted after this version: nothing restart-class is pending
+        central.set_state("daemon_started_at", str(head()["ts"] + 1))
+    finally:
+        central.close()
+    assert "Restart now" not in client.get(page_url).text
+
+
+def test_restart_refuses_without_a_reason_or_a_running_os(jarvis_home, systemctl):
+    with pytest.raises(ops.OpsError, match="say why"):
+        ops.restart_os("  ")
+    with pytest.raises(ops.OpsError, match="not running"):
+        ops.restart_os("apply settings")
+    assert systemctl == []
+
+
+def test_an_unmanaged_restart_stops_then_starts_from_the_registered_catalog(
+        jarvis_home, monkeypatch, systemctl):
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.set_state("catalog_path", "/c.json")
+    finally:
+        central.close()
+    publish(["p"], managed=False)
+    monkeypatch.setattr(ops, "daemon_running", lambda: 4242)
+    calls: list[str] = []
+    monkeypatch.setattr(ops, "stop_os", lambda: calls.append("stop") or {"status": "stopped"})
+    monkeypatch.setattr(ops, "start_os", lambda c: calls.append(f"start {c}") or {"daemon": {}})
+    assert ops.restart_os("apply settings")["status"] == "restarted"
+    assert calls == ["stop", "start /c.json"] and systemctl == []
+
+
+def test_config_shows_restart_now_only_while_a_restart_is_pending(client, monkeypatch):
+    monkeypatch.setattr(ops, "restart_pending", lambda: [])
+    assert 'id="cfg-restart"' not in client.get("/config").text
+    monkeypatch.setattr(ops, "restart_pending", lambda: ["os.max_concurrent_turns"])
+    page = client.get("/config").text
+    assert 'id="cfg-restart"' in page and 'action="/os/restart"' in page
+
+
+def test_a_worker_calling_restart_hits_the_service_restart_gate():
+    from jarvis import gate_rules
+
+    match = gate_rules.RuleSet.from_seeds().decide(
+        'jarvis restart --reason "x"', gate_rules.KIND_NAMES).match
+    assert match is not None and match.kind == "service_restart"
+
+
+def test_no_os_text_claims_start_restarts():
+    assert "jarvis start" not in ops.APPLY_NOTES["restart"]
+    assert "jarvis start` writes" not in ops.SETTINGS_OVERRIDES_NOTE

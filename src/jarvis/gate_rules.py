@@ -831,6 +831,7 @@ SEED_MATCHES: tuple[tuple[str, str], ...] = (
     ("release", r"\b(twine|uv)\s+publish\b"),
     ("release", r"\bgit\s+push\b[^\n]*--(tags|follow-tags)\b"),
     ("service_restart", r"\bsystemctl\b[^\n]*\b(restart|stop|start|disable|enable)\b"),
+    ("service_restart", r"\bjarvis\s+restart\b"),
     ("push_protected", r"\bgit\s+push\b[^\n]*\b(origin\s+)?(main|master)\b"),
     ("push_protected", r"\bgit\s+push\b[^\n]*\bHEAD:(refs/heads/)?(main|master)\b"),
     ("config_write", r"\bjarvis\s+config\s+(set|unset|restore|adopt)\b"),
@@ -870,6 +871,7 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("pr_merge", 'docker exec -it c "gh pr merge 31"'),
     ("service_restart", "sudo systemctl restart jarvis-daemon"),
     ("service_restart", "systemctl --user stop jarvisd"),
+    ("service_restart", 'jarvis restart --reason "apply settings"'),
     ("push_protected", "git push origin main"),
     ("push_protected", "git push -f origin HEAD:refs/heads/master"),
     # The recursion this cuts: the console can turn gates off
@@ -910,7 +912,8 @@ def seed_rows() -> list[dict[str, Any]]:
 # 2: the `config_write` kind, its recogniser and its canaries (the config console). 3: the... (#194)
 
 # 6: `jarvis onboard apply` joins `config_write`. 7: SHIPIT_PATTERN replaces bare `shipit` (#252)
-SEED_VERSION = "7"
+# 8: `jarvis restart` joins `service_restart` (io-74eab254)
+SEED_VERSION = "8"
 
 # Builtin recognisers a later seed replaced: (kind, pattern, why), retired on reseed
 RETIRED_SEED_MATCHES: tuple[tuple[str, str, str], ...] = (

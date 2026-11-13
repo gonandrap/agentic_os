@@ -2348,6 +2348,7 @@ def create_app() -> FastAPI:
             except ops.OpsError as e:
                 diff_error = str(e)
         return render(request, "config.html", active="config", show=show,
+                      restart_pending=ops.restart_pending(),
                       wiring=wiring_groups(scope, refresh=bool(refresh)),
                       scopes=scopes, scope=scope, node=node, q=q,
                       scope_title=next(s["title"] for s in scopes if s["key"] == scope),
@@ -3145,6 +3146,16 @@ def create_app() -> FastAPI:
                 next, "/", quote("the fleet is already paused — nothing changed")),
                 status_code=303)
         ops.pause_fleet(reason=reason.strip())
+        return RedirectResponse(_same_site_back(next, "/"), status_code=303)
+
+    @app.post("/os/restart")
+    def restart_os(reason: str = Form(""), next: str = Form("")):
+        """`jarvis restart --reason`, from the dashboard (io-74eab254)"""
+        try:
+            ops.restart_os(reason)
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/", quote(str(e))),
+                                    status_code=303)
         return RedirectResponse(_same_site_back(next, "/"), status_code=303)
 
     @app.post("/fleet/resume")
