@@ -1744,7 +1744,7 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
         return {"what": "failed", "stalled": False,
                 "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
                           f"relaunches it in the same session; nothing is running to nudge"}
-    # Above the Neo arm: an escalated plan question leaves its bundled rows with nobody but you (issue 1716)
+    # Above the Neo arm: an escalated plan leaves its bundled rows with you (issue 1716)
     from . import autoreview
     bundle =(autoreview.plan_bundle(store, wo) if wo["status"] == "needs_review"
               else None)
