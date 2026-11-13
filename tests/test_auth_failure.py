@@ -190,6 +190,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 def _tick(daemon):
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
 

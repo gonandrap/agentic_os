@@ -413,6 +413,7 @@ def test_a_real_tick_clears_before_it_dispatches(started, monkeypatch):
     monkeypatch.setattr(Daemon, "dispatch_pending",
                         lambda self, p, s, state: order.append("dispatch"))
     started.tick_count = 0      # the next tick is a reconcile one
+    started.pr_polled_at = None
 
     started.tick()
 

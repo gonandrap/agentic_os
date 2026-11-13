@@ -50,6 +50,7 @@ def repaired(started, project, fake_gh, fake_claude, settle_turns):
 
     conflicting(fake_gh)
     started.tick_count = 0                      # a tick that polls: queues the nudge
+    started.pr_polled_at = None
     started.tick()
     assert store.queued_messages(wo["id"])
     started.tick_count = 1                      # a tick that delivers but does not poll
@@ -73,6 +74,8 @@ def test_the_repaired_order_goes_back_in_the_merge_queue(started, project, fake_
     fake_gh.set_pr(PR, "OPEN")                  # the worker resolved it
 
     started.tick_count = 0
+
+    started.pr_polled_at = None
     poll(started, store)
 
     row = store.get_work_order(repaired["id"])
@@ -253,6 +256,7 @@ def test_a_nudge_batched_behind_a_users_message_reads_as_the_users(
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "OPEN")
     started.tick_count = 0                      # a tick that polls: clears the episode
+    started.pr_polled_at = None
     poll(started, store)
 
     ops.send_message(repaired["id"], "squash it before you merge")
@@ -321,6 +325,7 @@ def test_a_later_user_turn_keeps_the_review(started, project, fake_gh, repaired,
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "OPEN")
     started.tick_count = 0                      # a tick that polls: clears the episode
+    started.pr_polled_at = None
     poll(started, store)
     assert store.get_work_order(repaired["id"])["status"] == "waiting_pr_merge"
 
@@ -336,6 +341,8 @@ def test_a_later_user_turn_keeps_the_review(started, project, fake_gh, repaired,
             if v.invariant == "INV-REPAIR-RESETTLED"] == []
 
     started.tick_count = 0                      # a tick that polls: still no re-settle
+
+    started.pr_polled_at = None
     poll(started, store)
 
     assert store.get_work_order(repaired["id"])["status"] == "needs_review"
@@ -380,6 +387,8 @@ def test_a_repair_does_not_resettle_over_a_give_up_hidden_by_a_later_round(
     fake_gh.set_pr(PR, "OPEN")                  # the worker resolved the conflict
 
     started.tick_count = 0
+
+    started.pr_polled_at = None
     poll(started, store)
 
     assert store.get_work_order(repaired["id"])["status"] == "needs_review"

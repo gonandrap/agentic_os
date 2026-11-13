@@ -172,6 +172,7 @@ class Fleet:
     # -- the daemon
     def tick(self) -> None:
         self.daemon.tick_count = 0
+        self.daemon.pr_polled_at = None
         self.daemon.tick()
 
     def drain(self, ticks: int = 2, timeout: float = 15.0) -> None:

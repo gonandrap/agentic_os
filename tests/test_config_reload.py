@@ -638,6 +638,7 @@ def _run_one(daemon: Daemon, project: Path, title: str) -> dict:
 
     wo = ops.create_work_order("proj_a", title)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
     store = ProjectStore(project)
     try:
@@ -677,6 +678,7 @@ def test_turning_validation_on_reaches_a_running_fleet_without_a_restart(started
 
     ops.set_config("validation.enabled", True, project="proj_a", reason="trying it")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
     # The reload is the thing under test, so assert the daemon's OWN copy moved
     assert daemon.catalog.project("proj_a").validation.enabled is True

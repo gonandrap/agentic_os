@@ -100,6 +100,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 def _tick(daemon):
     """One tick with every cadence-gated pass firing — `tick` increments first"""
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
 

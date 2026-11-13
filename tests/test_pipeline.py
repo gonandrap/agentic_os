@@ -48,9 +48,11 @@ def turn_calls(fake_claude, resumed: bool | None = None,
 def run_turn(daemon, store, settle_turns):
     """A full cycle: tick (which launches whatever is due)"""
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
     assert settle_turns(store), "a worker turn never finished"
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
 
@@ -285,6 +287,7 @@ def test_message_delivery_when_idle(started, fake_claude, project, settle_turns)
 
     ops.send_message(wo["id"], "please also update the docs", source="ui")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()  # turn one is still in flight → nothing deliverable yet
     # Asserted on rows the daemon writes SYNCHRONOUSLY
     assert worker_session.busy(store, wo["id"]), "turn one should still be in flight"
@@ -294,6 +297,7 @@ def test_message_delivery_when_idle(started, fake_claude, project, settle_turns)
     gate.unlink()  # let turn one finish; later turns run without holding
     assert settle_turns(store)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     # delivered as the next turn of the SAME conversation
@@ -324,6 +328,7 @@ def test_queued_messages_for_one_work_order_deliver_as_a_single_turn(
     for text in ("first thought", "second thought", "third thought"):
         ops.send_message(wo["id"], text, source="ui")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     resumes = turn_calls(fake_claude, resumed=True, expect=1)
@@ -353,6 +358,7 @@ def test_two_work_orders_messages_stay_separate_turns(started, fake_claude, proj
     ops.send_message(first["id"], "for the first", source="ui")
     ops.send_message(second["id"], "for the second", source="ui")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     resumes = turn_calls(fake_claude, resumed=True, expect=2)
@@ -379,6 +385,7 @@ def test_session_id_never_moves_across_turns(started, fake_claude, project,
     for text in ("first follow-up", "second follow-up"):
         ops.send_message(wo["id"], text, source="ui")
         daemon.tick_count = 0
+        daemon.pr_polled_at = None
         daemon.tick()
         assert settle_turns(store)
 
@@ -404,6 +411,7 @@ def test_worker_final_message_is_recorded_alongside_the_summary(
 
     assert settle_turns(store)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     fresh = store.get_work_order(wo["id"])
@@ -416,6 +424,7 @@ def test_worker_final_message_is_recorded_alongside_the_summary(
     # Capture is idempotent: further passes must not duplicate the reply
     for _ in range(2):
         daemon.tick_count = 0
+        daemon.pr_polled_at = None
         daemon.tick()
     again = [m["content"] for m in store.list_messages(wo["id"])
              if m["direction"] == "agent_to_user"]
@@ -432,6 +441,7 @@ def test_crashed_turn_fails_the_work_order(started, fake_claude, project, settle
 
     assert settle_turns(store)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     assert store.latest_turn(wo["id"])["state"] == "failed"
@@ -452,6 +462,7 @@ def test_turn_reporting_is_error_fails_the_work_order(started, fake_claude, proj
     store = ProjectStore(project)
     assert settle_turns(store)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     turn = store.latest_turn(wo["id"])
@@ -471,6 +482,7 @@ def test_a_turn_in_flight_blocks_a_second_one(started, fake_claude, project,
     ops.send_message(wo["id"], "hurry up", source="ui")
     for _ in range(3):
         daemon.tick_count = 0
+        daemon.pr_polled_at = None
         daemon.tick()
     assert turn_calls(fake_claude, resumed=True) == []
     assert store.list_messages(wo["id"])[0]["status"] == "queued"
@@ -478,6 +490,7 @@ def test_a_turn_in_flight_blocks_a_second_one(started, fake_claude, project,
     gate.unlink()  # turn one completes
     assert settle_turns(store)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
     assert len(turn_calls(fake_claude, resumed=True, expect=1)) == 1
 
@@ -514,6 +527,7 @@ def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project,
 
     ops.send_message(wo["id"], "follow-up", source="ui")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     call = turn_calls(fake_claude, resumed=True, expect=1)[-1]
@@ -543,6 +557,7 @@ def test_injected_turn_gets_the_projects_permission_mode(started, fake_claude, p
     fake_claude.set_session_state("adhoc-pm-1", "done")
     ops.send_message(wo["id"], "carry on", source="ui")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     resumes = turn_calls(fake_claude, resumed=True, expect=1)
@@ -609,6 +624,7 @@ def test_reconciler_settles_done_worker(started, fake_claude, project, settle_tu
     ops.finish(wo["id"], "all good")   # worker finished properly, then its turn ended
     assert settle_turns(store)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
     assert store.get_work_order(wo["id"])["status"] == "completed"
 
@@ -622,6 +638,7 @@ def test_reconciler_flags_unfinished_idle_worker(started, fake_claude, project,
 
     assert settle_turns(store)  # turn ended but the worker never called finish
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
     fresh = store.get_work_order(wo["id"])
     assert fresh["status"] == "needs_review"
@@ -651,8 +668,11 @@ def test_reconciler_does_not_adopt_sessions(started, fake_claude, project):
     _add_session(fake_claude, project, "working")
 
     daemon.tick_count = 0
+
+    daemon.pr_polled_at = None
     daemon.tick()
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     store = ProjectStore(project)
@@ -667,6 +687,8 @@ def test_reconciler_does_not_read_the_roster_with_nothing_injected(started, fake
     before = [c for c in fake_claude.calls if c["argv"][:1] == ["agents"]]
 
     daemon.tick_count = 0
+
+    daemon.pr_polled_at = None
     daemon.tick()
 
     after = [c for c in fake_claude.calls if c["argv"][:1] == ["agents"]]
@@ -686,6 +708,7 @@ def test_injected_session_is_tracked(started, fake_claude, project):
 
     # tracked from here: the session ends, the record follows it — and stays singular
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
     assert len(store.list_work_orders()) == 1
 
@@ -695,6 +718,7 @@ def test_injecting_writes_nothing_into_the_session(started, fake_claude, project
     daemon = started
     _inject(fake_claude, project, "working")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     assert not turn_calls(fake_claude, expect=0), "injection started a turn"
@@ -718,6 +742,7 @@ def test_injected_working_session_does_not_ask_for_input(started, fake_claude, p
     daemon = started
     res = _inject(fake_claude, project, "working")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     store = ProjectStore(project)
@@ -731,6 +756,7 @@ def test_injected_blocked_session_asks_for_input(started, fake_claude, project):
     daemon = started
     res = _inject(fake_claude, project, "blocked")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     store = ProjectStore(project)
@@ -782,6 +808,7 @@ def test_re_injecting_resumes_tracking_a_session_that_woke_up(started, fake_clau
 
     fake_claude.set_session_state("adhoc-session-1", "done")
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
     assert store.get_work_order(res["wo_id"])["status"] == "completed"
 
@@ -812,6 +839,7 @@ def test_reconciler_clears_attention_when_worker_resumes(started, fake_claude, p
     assert settle_turns(store)
     ops.send_message(wo["id"], "yes, go ahead", source="ui")  # user answered
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     resumed = store.get_work_order(wo["id"])
@@ -1175,6 +1203,7 @@ def test_with_validation_disabled_finish_settles_exactly_as_before(
     assert result["status"] == "completed"
     assert settle_turns(store)
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
     fresh = store.get_work_order(wo["id"])

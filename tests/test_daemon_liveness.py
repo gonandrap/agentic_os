@@ -182,6 +182,24 @@ def test_a_reconcile_tick_stamps_the_interval_it_was_launched_with(
     assert float(stamp["ts"]) > 0.0
 
 
+def test_status_shows_the_tick_duration_and_the_pr_poll_age(
+        project, catalog_file, jarvis_home, fake_claude, monkeypatch):
+    """io-2f01e390: a slow tick is visible in `jarvis status --json`, not only in the drift"""
+    _register(catalog_file)
+    _alive(monkeypatch)
+    daemon = Daemon(load_catalog(catalog_file), poll_interval=POLL_INTERVAL)
+    clock = iter([100.0, 107.5])         # tick start, then the stamp at its end
+    daemon.monotonic = lambda: next(clock)
+    monkeypatch.setattr(db, "now", lambda: 1000.0)
+
+    daemon.tick()
+
+    monkeypatch.setattr(db, "now", lambda: 1090.0)
+    shown = ops.os_status()["daemon"]
+    assert shown["tick_seconds"] == 7.5
+    assert shown["pr_poll_age_seconds"] == 90
+
+
 def test_a_non_reconcile_tick_does_not_advance_the_stamp(project, catalog_file,
                                                          jarvis_home, fake_claude):
     daemon = Daemon(load_catalog(catalog_file), poll_interval=POLL_INTERVAL)

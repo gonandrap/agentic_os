@@ -434,6 +434,7 @@ def test_the_tick_runs_the_step_after_the_issue_sweep(project, daemon, monkeypat
         monkeypatch.setattr(daemon, name,
                             lambda *a, _n=name, **k: order.append(_n))
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
 
     daemon.tick()
 
@@ -737,6 +738,7 @@ def test_the_tick_runs_the_sweep_after_the_settlement_step(project, daemon, monk
         monkeypatch.setattr(daemon, name,
                             lambda *a, _n=name, **k: order.append(_n))
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
 
     daemon.tick()
 

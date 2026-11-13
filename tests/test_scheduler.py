@@ -713,6 +713,7 @@ def test_the_tick_actually_calls_it(clock, started, store, catalog_file, monkeyp
     monkeypatch.setattr(Daemon, "schedule_tick",
                         lambda self, project, st: seen.append(project.name))
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
     assert seen == ["proj_a"]
 
@@ -728,6 +729,7 @@ def test_the_cadence_reaches_the_pass_once_per_window(clock, started, catalog_fi
     monkeypatch.setattr(Daemon, "schedule_tick",
                         lambda self, project, st: seen.append(self.tick_count))
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     for _ in range(SCHEDULE_EVERY_TICKS * 3):
         daemon.tick()
     assert len(seen) == 3, f"reached the pass on ticks {seen}"

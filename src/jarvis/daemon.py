@@ -169,8 +169,8 @@ DAEMON_PROJECTS_KEY = "daemon_projects"
 #: Holds the low-disk warning, so it is raised once and re-armed only on recovery (docs/superpowers/specs/2026-10-22-a-settled-checkout-is-reclaimed.md §2)
 DISK_LOW_KEY = "disk_low_warned"
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
-#: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s interval
-PR_POLL_EVERY_TICKS = 24
+#: Seconds from one PR poll's start to the next; wall clock, not ticks (io-2f01e390)
+PR_POLL_EVERY_SECONDS = 120
 #: How long an order stays on the auto-merge fast lane after the event that put it there (io-2f01e390)
 MERGE_HOT_SECONDS = 600
 #: One Morpheus pass every N ticks (~1 minute at the default 5s poll)
@@ -785,6 +785,12 @@ class Daemon:
         self.stores: dict[str, ProjectStore] = {}
         self.stop_requested = False
         self.tick_count = 0
+        #: Cadence clock; an attribute so a test fakes it without patching time.monotonic
+        self.monotonic = time.monotonic
+        #: `self.monotonic()` when the last PR poll STARTED; None until the first one (io-2f01e390)
+        self.pr_polled_at: float | None = None
+        #: Wall-clock twin of `pr_polled_at`, for the reconcile stamp `jarvis status` reads
+        self.pr_polled_ts: float | None = None
         #: Tick each project was last swept for stuck orders on
         self.stuck_swept: dict[str, int] = {}
         #: SORT KEY — `(created_at, id)` — of the last order each project's rules pass actually evaluated (docs/superpowers/specs/2026-09-27-self-evolution.md)
@@ -1278,6 +1284,7 @@ class Daemon:
     # -- main tick
 
     def tick(self) -> None:
+        tick_started = self.monotonic()
         # First, so everything below runs under one configuration — and the same one
         self.reload_catalog()
         self.evict_offboarded()
@@ -1285,7 +1292,10 @@ class Daemon:
         self.note_stuck_enablement()
         self.tick_count += 1
         reconcile = self.tick_count % RECONCILE_EVERY_TICKS == 1
-        poll_prs = self.tick_count % PR_POLL_EVERY_TICKS == 1
+        poll_prs = (self.pr_polled_at is None
+                    or tick_started - self.pr_polled_at >= PR_POLL_EVERY_SECONDS)
+        if poll_prs:
+            self.pr_polled_at, self.pr_polled_ts = tick_started, db.now()
         retry_paused = self.tick_count % RETRY_EVERY_TICKS == 1
         sweep_landings = self.tick_count % LANDING_SWEEP_EVERY_TICKS == 1
         run_schedule = self.tick_count % SCHEDULE_EVERY_TICKS == 1
@@ -1477,7 +1487,10 @@ class Daemon:
         if reconcile:
             self.central.set_state(RECONCILE_TICK_KEY, db.to_json(
                 {"ts": db.now(),
-                 "interval": RECONCILE_EVERY_TICKS * self.poll_interval}))
+                 "interval": RECONCILE_EVERY_TICKS * self.poll_interval,
+                 # How long this reconcile tick took, and when the PR poll last started (io-2f01e390)
+                 "tick_seconds": round(self.monotonic() - tick_started, 3),
+                 "pr_poll_ts": self.pr_polled_ts}))
 
     def seal_bills(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Freeze the bill of every order that has settled and has none yet"""

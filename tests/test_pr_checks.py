@@ -141,6 +141,8 @@ def test_the_repair_turn_gives_the_work_order_back_to_needs_review(
     red(fake_gh)
 
     started.tick_count = 0               # a tick that polls: queues the nudge
+
+    started.pr_polled_at = None
     started.tick()
     assert store.queued_messages(wo["id"])
 
@@ -173,6 +175,8 @@ def test_a_parked_work_order_still_goes_back_to_the_merge_queue(
     red(fake_gh)
 
     started.tick_count = 0
+
+    started.pr_polled_at = None
     started.tick()
     started.tick_count = 1
     started.tick()

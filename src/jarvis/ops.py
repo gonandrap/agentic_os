@@ -613,6 +613,17 @@ def _daemon_liveness(central: CentralStore, pid: int | None) -> dict[str, Any] |
     }
 
 
+def _daemon_cadence(central: CentralStore) -> dict[str, Any]:
+    """Last reconcile tick's duration and the PR poll's age, from the reconcile stamp (io-2f01e390)"""
+    stamp = db.from_json(central.get_state(RECONCILE_TICK_KEY), None)
+    if not isinstance(stamp, dict):
+        return {"tick_seconds": None, "pr_poll_age_seconds": None}
+    polled = stamp.get("pr_poll_ts")
+    return {"tick_seconds": stamp.get("tick_seconds"),
+            "pr_poll_age_seconds": (round(db.now() - float(polled))
+                                    if isinstance(polled, (int, float)) else None)}
+
+
 def _count_paused(summary: dict[str, Any], open_wos: list[dict[str, Any]],
                   pauses: dict[str, dict[str, Any] | None]) -> None:
     """A `running` order whose turn is paused is counted `paused`, not running (#247)"""
@@ -888,6 +899,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "running": pid is not None,
                 "pid": pid,
                 "catalog": central.get_state("catalog_path"),
+                **_daemon_cadence(central),
             },
             # The user's brake and the reopen ramp (issue #843)
             "fleet": fleet_summary(central),

@@ -243,6 +243,7 @@ def test_the_poll_runs_before_the_pull_request_poll_on_the_pr_cadence(
     monkeypatch.setattr(Daemon, "poll_pull_requests",
                         lambda self, p, s: order.append("prs"))
     started.tick_count = 0      # the next tick is the PR-poll one
+    started.pr_polled_at = None
 
     started.tick()
 

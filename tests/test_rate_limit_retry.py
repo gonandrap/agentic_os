@@ -494,6 +494,7 @@ def started(jarvis_home, fake_claude, catalog_file, project, monkeypatch):
 def _tick(daemon):
     """One tick with the retry pass ON (the daemon runs it every RETRY_EVERY_TICKS)"""
     daemon.tick_count = 0
+    daemon.pr_polled_at = None
     daemon.tick()
 
 
