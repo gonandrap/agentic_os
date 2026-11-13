@@ -11,6 +11,12 @@ review page (`/knowledge/review`) draws with these, served by `/vendor/<file>` i
 | `cose-base.js` | cose-base | 2.2.0 | MIT | https://cdn.jsdelivr.net/npm/cose-base@2.2.0/cose-base.js |
 | `cytoscape-fcose.js` | cytoscape-fcose | 2.2.0 | MIT | https://cdn.jsdelivr.net/npm/cytoscape-fcose@2.2.0/cytoscape-fcose.js |
 | `cytoscape-edgehandles.js` | cytoscape-edgehandles | 4.0.1 | MIT | https://cdn.jsdelivr.net/npm/cytoscape-edgehandles@4.0.1/cytoscape-edgehandles.js |
+| `xterm.js` | @xterm/xterm | 5.5.0 | MIT | https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js |
+| `xterm.css` | @xterm/xterm | 5.5.0 | MIT | https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css |
+| `xterm-addon-fit.js` | @xterm/addon-fit | 0.10.0 | MIT | https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js |
+
+The xterm files draw the onboarding help terminal (`templates/onboard_help_panel.html`,
+`static/help_panel.js`); the fit addon reads `window.FitAddon.FitAddon`.
 
 Load order matters: `layout-base` → `cose-base` → `cytoscape-fcose` (each UMD build
 reads the previous one off `window`). `cytoscape-edgehandles` expects lodash's
@@ -32,4 +38,7 @@ ec15ab5df9af3f20708f4faab994accf91cda71848cd5bb10a23432cc50b6745  layout-base.js
 7cae9509bd36235a63a85e71c8d9fa2cd0bc1d0c1ecc5b5a737976f39d040ddf  cose-base.js
 4b1cab218d74996aa59cd8473f9239cc6398b8c1774d84d7e59ad9a68959cb57  cytoscape-fcose.js
 0f3cc29c8d7a0306ff7895fc34483e7a18d2047e4ce152782dc94f2da83a16ee  cytoscape-edgehandles.js
+1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495  xterm.js
+ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6  xterm.css
+bdaefa370b1bfc42ee88d46fe6072400902a4d4b2d45cd93438dda9b23c97089  xterm-addon-fit.js
 ```

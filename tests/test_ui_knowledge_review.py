@@ -189,6 +189,17 @@ def test_vendored_libraries_are_served_and_nothing_else_is(client):
     assert client.get("/vendor/..%2Fapp.py").status_code == 404
 
 
+def test_vendored_css_is_served_as_css_and_js_stays_js(client):
+    """§3 of docs/superpowers/specs/2026-11-12-onboarding-help-terminal-panel.md"""
+    css = client.get("/vendor/xterm.css")
+    assert css.status_code == 200 and css.headers["content-type"].startswith("text/css")
+    assert ".xterm" in css.text
+    # Control: the script next to it is still javascript
+    js = client.get("/vendor/xterm.js")
+    assert js.status_code == 200 and js.headers["content-type"].startswith("text/javascript")
+    assert client.get("/vendor/LICENSES.txt").status_code == 404
+
+
 def test_the_page_loads_no_script_from_another_host(client):
     page = client.get("/knowledge/review").text
     assert "<script src=\"http" not in page and "cdn" not in page.lower()

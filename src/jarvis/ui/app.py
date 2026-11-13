@@ -74,10 +74,11 @@ from . import markdown
 TEMPLATES = Path(__file__).parent / "templates"
 # Third-party browser code, shipped in the package so no page loads a CDN (vendor/README.md)
 VENDOR = Path(__file__).parent / "vendor"
-VENDORED = frozenset(p.name for p in VENDOR.glob("*.js"))
+VENDOR_TYPES = {".js": "text/javascript", ".css": "text/css"}
+VENDORED = frozenset(p.name for p in VENDOR.iterdir() if p.suffix in VENDOR_TYPES)
 # `?v=<content hash>` on every vendored URL: `/vendor/` is cached for an hour
-VENDOR_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
-                  for p in VENDOR.glob("*.js")}
+VENDOR_VERSION = {name: hashlib.sha256((VENDOR / name).read_bytes()).hexdigest()[:12]
+                  for name in VENDORED}
 # The dashboard's OWN browser code (the shared chart helper), served the same way
 STATIC = Path(__file__).parent / "static"
 STATIC_VERSION = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:12]
@@ -1149,6 +1150,31 @@ def wiring_groups(scope: str, *, refresh: bool = False) -> dict[str, object]:
             "unwired": data["unwired"], "project": data["project"]}
 
 
+async def _start_help_sessions(app: FastAPI):
+    """Help terminal registry; a failure leaves the dashboard up (help-terminal spec §2)"""
+    import logging
+
+    import anyio
+
+    from .help_pty import HelpSessions
+
+    log = logging.getLogger(__name__)
+    app.state.help_sessions = None
+    try:
+        sessions = HelpSessions()
+    except Exception:  # noqa: BLE001 — a startup step must not stop the dashboard
+        log.exception("help terminal registry failed to start")
+        return None
+    app.state.help_sessions = sessions
+    try:
+        killed = await anyio.to_thread.run_sync(sessions.reap_stale)
+        if killed:
+            log.warning("reaped stale help terminals: %s", killed)
+    except Exception:  # noqa: BLE001
+        log.exception("reaping stale help terminals failed")
+    return sessions
+
+
 def create_app() -> FastAPI:
     probe = PoolProbe()
     cost_cache = CostCache()
@@ -1170,9 +1196,16 @@ def create_app() -> FastAPI:
             # Warm from disk, never from a round (docs/superpowers/specs/2026-11-01-the-dashboard-never-waits-for-the-cost-page.md)
             cost_cache.load_snapshot()
             tg.start_soon(cost_cache.run)
+            help_sessions = await _start_help_sessions(_app)
             try:
                 yield
             finally:
+                if help_sessions is not None:
+                    try:  # before the loop goes: a helper outliving the dashboard is an orphan
+                        await help_sessions.close_all()
+                    except Exception:  # noqa: BLE001 — teardown must reach the rest
+                        import logging
+                        logging.getLogger(__name__).exception("closing help terminals failed")
                 watchdog.stop()
                 # Before the loop goes: a strand holds a SQLite read nobody will close
                 cost_cache.quiesce()
@@ -1226,7 +1259,7 @@ def create_app() -> FastAPI:
         # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason the partial already...
         tool_table=fleetcost.tool_table,
         # `/static/<file>?v=<hash>`: the dashboard's own scripts, cache-busted like /vendor/
-        static_v=STATIC_VERSION,
+        static_v=STATIC_VERSION, vendor_v=VENDOR_VERSION,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must not be able to disagree...
         assumption_decider=ops.assumption_decider,
         # And the OS's RULING on one, same reason one authority along: the page and `jarvis wo show` must not... (#712)
@@ -1300,8 +1333,9 @@ def create_app() -> FastAPI:
             return HTMLResponse(f"<h1>Something went wrong</h1><p>{message}</p>",
                                 status_code=500)
 
-    from . import onboard_help
+    from . import onboard_help, onboard_help_pty
     onboard_help.register(app, render)
+    onboard_help_pty.register(app, render)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
@@ -2136,7 +2170,7 @@ def create_app() -> FastAPI:
         """The page's vendored libraries — listed, never a path walk (see vendor/README.md)"""
         if name not in VENDORED:
             return JSONResponse({"error": f"no vendored file {name}"}, status_code=404)
-        return FileResponse(VENDOR / name, media_type="text/javascript")
+        return FileResponse(VENDOR / name, media_type=VENDOR_TYPES[Path(name).suffix])
 
     @app.get("/static/{name}")
     def static(name: str):
