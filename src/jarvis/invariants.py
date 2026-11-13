@@ -3585,7 +3585,7 @@ INV_CATALOG_PROJECT_LOADED = "INV-CATALOG-PROJECT-LOADED"
 
 
 def check_catalog_loaded(catalog: Any, project: str | None = None) -> list[Violation]:
-    """INV-CATALOG-PROJECT-LOADED — every active catalog project is loaded by the running daemon (io-74eab254)"""
+    """INV-CATALOG-PROJECT-LOADED — the running daemon loaded every active catalog project (io-74eab254)"""
     from . import release, service_manager
     from .central_store import CentralStore
     from .daemon import DAEMON_PROJECTS_KEY, archived_projects, daemon_running
