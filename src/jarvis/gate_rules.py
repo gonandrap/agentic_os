@@ -911,8 +911,7 @@ def seed_rows() -> list[dict[str, Any]]:
 
 # 2: the `config_write` kind, its recogniser and its canaries (the config console). 3: the... (#194)
 
-# 6: `jarvis onboard apply` joins `config_write`. 7: SHIPIT_PATTERN replaces bare `shipit` (#252)
-# 8: `jarvis restart` joins `service_restart` (io-74eab254)
+# 6: onboard apply joins config_write; 7: SHIPIT_PATTERN (#252); 8: `jarvis restart` gated
 SEED_VERSION = "8"
 
 # Builtin recognisers a later seed replaced: (kind, pattern, why), retired on reseed

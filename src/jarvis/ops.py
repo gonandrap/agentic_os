@@ -299,7 +299,7 @@ def stop_os() -> dict[str, Any]:
 
 
 def restart_os(reason: str) -> dict[str, Any]:
-    """`jarvis restart`: put restart-class settings in force; `start_os` never restarts a live daemon (io-74eab254)"""
+    """`jarvis restart`: put restart-class settings in force (io-74eab254)"""
     from .daemon import DAEMON_PROJECTS_KEY
 
     if not reason.strip():
