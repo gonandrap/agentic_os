@@ -187,10 +187,10 @@ def test_the_dry_run_tells_the_truth(catalog, repo, tmp_path):
     assert dry["restart_needed"] == real["restart_needed"]
 
 
-def test_restart_needed_for_a_new_project_and_not_for_a_hot_change(catalog, repo,
-                                                                  tmp_path):
+def test_a_new_project_alone_needs_no_restart(catalog, repo, tmp_path):
+    """The daemon hot-adds it (io-74eab254)"""
     first = ops.onboard_apply(str(draft_file(tmp_path, repo)))
-    assert first["restart_needed"] and "shared_schedule" in first["restart_why"]
+    assert first["restart_needed"] is False, first["restart_why"]
 
     hot = draft_file(tmp_path, repo, name="hot.json", reason="too noisy after all",
                      values={"projects.shared_schedule.validation.enabled": False})
@@ -200,12 +200,13 @@ def test_restart_needed_for_a_new_project_and_not_for_a_hot_change(catalog, repo
     assert res["apply"] == {"projects.shared_schedule.validation.enabled": "hot"}
 
 
-def test_the_cli_prints_the_restart_command(catalog, repo, tmp_path, capsys):
+def test_the_cli_asks_no_restart_for_a_new_project(catalog, repo, tmp_path, capsys):
+    """The daemon hot-adds it (io-74eab254)"""
     rc = cli.main(["onboard", "apply", "--from", str(draft_file(tmp_path, repo))])
 
     out = capsys.readouterr().out
     assert rc == 0
-    assert f"jarvis start --catalog {catalog}" in out
+    assert "jarvis start" not in out
 
 
 def test_re_applying_an_unchanged_draft_writes_no_second_row(catalog, repo, tmp_path):

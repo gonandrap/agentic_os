@@ -57,7 +57,9 @@ Verified in the worktree; do not re-derive it.
 ### 0.1 Non-goals
 
 No change to the draft schema, to `onboard_apply`'s semantics, to `/config`, to the daemon,
-to `hooks.py`, to `WO_KINDS` or `dispatch.py`. No hot-add of a project. No tabs on any
+to `hooks.py`, to `WO_KINDS` or `dispatch.py`. ~~No hot-add of a project.~~ Superseded by
+io-74eab254 (wo-33d21f62): `Daemon.reload_catalog` hot-adds an added project that has a
+`projects` row, and `onboard_apply` asks no restart for a new project's own keys. No tabs on any
 onboarding page (Playwright's `inner_text` cannot see a hidden panel — `kn-6aa0e6d8`). The
 help session never writes anything (§4). Renaming a project inside a draft is not
 supported: the name is the draft's key, so a different name is a different draft.

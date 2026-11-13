@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import (background, bugreport, bus, claude_cli, config_version, db, fleet, holds,
+from . import (background, bootstrap, bugreport, bus, claude_cli, config_version, db, fleet, holds,
                inspection, notify, release, service_manager, usage_meter, verdicts,
                worker_session)
 from . import budget as budget_mod
@@ -1074,7 +1074,7 @@ class Daemon:
                 f"{e}\n\nThe fleet is still running the configuration it started with. "
                 f"Fix {path} and it will be picked up on the next tick.")
             return False
-        # Removing an archived or purged (row-less) project is applicable; any other set change is not (§6.1)
+        # Applicable: removing an archived or purged (row-less) project (§6.1), adding a registered one
         before = {p.name for p in self.catalog.projects}
         try:
             registered = {p["name"] for p in self.central.list_projects()}
@@ -1083,11 +1083,17 @@ class Daemon:
         after = {p.name for p in fresh.projects}
         gone = self._read_offboarded()
         offboarded = {n for n in before - after if n in gone or n not in registered}
-        if after - gone != before - gone - offboarded:
-            self._refuse_project_change(
-                path, raw, added=sorted((after - gone) - (before - gone - offboarded)),
-                removed=sorted((before - gone - offboarded) - (after - gone)),
-                registered=registered)
+        added = (after - gone) - (before - gone - offboarded)
+        removed = (before - gone - offboarded) - (after - gone)
+        # An unregistered add or a live removal waits for a restart (io-74eab254)
+        if removed or added - registered:
+            if added - registered:
+                # onboard_apply commits the file before the row: re-read until the row lands
+                self._catalog_stamp = None
+            self._refuse_project_change(path, raw, added=sorted(added),
+                                        removed=sorted(removed), registered=registered)
+            return False
+        if not self._bootstrap_added(fresh, added):
             return False
         owner = self._os_owner()
         self.catalog = fresh.without_projects(gone)
@@ -1130,6 +1136,23 @@ class Daemon:
                  build, len(moved), row["id"])
         return row
 
+    def _bootstrap_added(self, fresh: Catalog, added: set[str]) -> bool:
+        """Bootstrap each hot-added project (idempotent), as `start_os` does at boot"""
+        for spec in fresh.projects:
+            if spec.name not in added:
+                continue
+            try:
+                report = bootstrap.bootstrap_project(spec)
+            except Exception as e:  # noqa: BLE001 — keep the last good catalog, say why
+                self._refuse_reload(f"bootstrapping {spec.name} failed: {e}",
+                                    project=spec.name,
+                                    title=f"{spec.name} is saved but not running yet")
+                return False
+            for warning in report.warnings:
+                log.warning("hot-add %s: %s", spec.name, warning)
+            log.info("hot-added project %s", spec.name)
+        return True
+
     def _refuse_project_change(self, path: Path, raw: bytes, *, added: list[str],
                                removed: list[str], registered: set[str]) -> None:
         """Outcome first, the project named, one action that works (io-74eab254)"""
@@ -1146,9 +1169,9 @@ class Daemon:
         ui = notify.ui_base_url(self.catalog)
         link = f"{ui}/project/{name}" if name in registered else ui
         # `jarvis start` is a no-op while this daemon runs (kn-4fc0d66f)
-        body = (f"{outcome}. A running daemon picks up projects only when "
-                f"it starts, so this change, and any setting changed with it, waits for a "
-                f"restart.\n\n"
+        body = (f"{outcome}. A running daemon adds a project only once it is registered "
+                f"and drops one only once it is offboarded, so this change, and any "
+                f"setting changed with it, waits for a restart.\n\n"
                 f"Restart it: `{service_manager.restart_hint(release.DAEMON_UNIT)}`\n"
                 f"Dashboard: {link}\n"
                 f"Config version: {self._config_version_of(raw)}\n"
