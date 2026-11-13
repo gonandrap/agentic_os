@@ -1650,6 +1650,13 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
     deferred = len(pending) if (pending and working
                                 and invariants.neo_reviews_later(store, wo)) else 0
     if pending and not deferred:
+        # Bundled rows of an escalated plan are settled by the plan decision (issue 1716)
+        bundled = invariants.escalated_bundle_ids(store, wo)
+        if bundled and all(int(a["id"]) in bundled for a in pending):
+            from . import autoreview
+            line = autoreview.plan_bundle_line(autoreview.plan_bundle(store, wo), len(pending))
+            return {"what": "plan_escalated", "stalled": False,
+                    "detail": f"{len(pending)} assumption(s) {line}"}
         return {"what": "assumptions", "stalled": False,
                 "detail": f"{len(pending)} assumption(s) await your review — "
                           f"`jarvis wo review {wo_id}`{round_note}"}
@@ -1744,16 +1751,6 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
         return {"what": "failed", "stalled": False,
                 "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
                           f"relaunches it in the same session; nothing is running to nudge"}
-    # Above the Neo arm: an escalated plan leaves its bundled rows with you (issue 1716)
-    from . import autoreview
-    bundle =(autoreview.plan_bundle(store, wo) if wo["status"] == "needs_review"
-              else None)
-    if bundle and bundle["with_user"]:
-        n = len(bundle["ids"] & {int(a["id"]) for a in store.pending_assumptions(wo_id)})
-        if n:
-            return {"what": "plan_escalated", "stalled": False,
-                    "detail": f"{n} assumption(s) "
-                              f"{autoreview.plan_bundle_line(bundle, n)}"}
     if wo["status"] == "needs_review" and reviews_assumptions(store, wo):
         return {"what": "assumptions_with_neo", "stalled": False,
                 "detail": "Neo is reviewing its assumptions — each is settled by itself "
@@ -2818,11 +2815,19 @@ def flag_assumptions_pending(store: ProjectStore, wo_id: str) -> None:
         return
     n = len(fresh)
     store.add_event(wo_id, ASSUMPTIONS_PINGED_EVENT, {"assumption_ids": fresh})
+    # Bundled rows of an escalated plan are settled by `fo approve`, not `wo review` (issue 1716)
+    bundled = invariants.escalated_bundle_ids(store, row)
+    decide = []
+    if any(int(a["id"]) not in bundled for a in owed):
+        decide.append(f"Decide: jarvis wo review {wo_id} [--reject] --feedback \"…\"")
+    if bundled & {int(a["id"]) for a in owed}:
+        fo_id = row.get("parent_id") or ""
+        decide.append(f"Decide the plan they ride: jarvis fo approve {fo_id} "
+                      f"[--reject] --feedback \"…\"")
     store.add_notification(
         title=f"{wo_id} is waiting on your review of {n} assumption{'s' if n != 1 else ''}",
         body=f"{row.get('title') or ''}\n"
-             f"Read them: jarvis wo show {wo_id}\n"
-             f"Decide: jarvis wo review {wo_id} [--reject] --feedback \"…\"",
+             f"Read them: jarvis wo show {wo_id}\n" + "\n".join(decide),
         level="warning", wo_id=wo_id, source="assumptions", paired=True)
 
 

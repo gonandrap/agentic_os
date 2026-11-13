@@ -71,6 +71,14 @@ def test_an_escalated_plan_leaves_its_bundled_rows_with_the_user(auto_review, st
 
     assert autoreview.plan_bundle(store, wo)["with_user"]
     assert not reviews_assumptions(store, wo)
+    # Still owed to the user, so the flag and ping fire, naming the plan decision
+    from jarvis import invariants
+    assert [a["id"] for a in invariants.assumptions_owed_to_user(store, wo)] == [
+        a["id"] for a in store.pending_assumptions(wo["id"])]
+    ops.flag_assumptions_pending(store, wo["id"])
+    note = store.unrouted_notifications()[-1]
+    assert f"jarvis fo approve {fo_id}" in note["body"]
+    assert "jarvis wo review" not in note["body"]
     line = ops.assumption_routing_line(ops.assumptions_with_rulings(store, wo["id"])[0])
     assert line == (f"Bundled into plan review Q{qid}, escalated to you "
                     f"(scope-too-large); `jarvis fo approve {fo_id}` settles it")

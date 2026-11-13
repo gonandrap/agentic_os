@@ -443,17 +443,12 @@ def completes_decided_artifacts(store: ProjectStore, wo: dict[str, Any],
 def reviews_assumptions(store: ProjectStore, wo: dict[str, Any],
                         now: float | None = None) -> bool:
     """True when a pending row is not yet the user's, so `Daemon.auto_review` holds it (io-ed253c2b)"""
-    from . import autoreview, invariants
+    from . import invariants
     # `Daemon.auto_review` lists rows with the hidden-excluding default
     if wo.get("hidden"):
         return False
-    owed = {int(a["id"]) for a in invariants.assumptions_owed_to_user(store, wo)}
-    # Rows riding a plan question Neo escalated: nobody but the user rules on them now (issue 1716)
-    bundle = autoreview.plan_bundle(store, wo)
-    if bundle and bundle["with_user"]:
-        owed |= bundle["ids"]
-    return any(int(a["id"]) not in owed
-               for a in invariants.reviewable_assumptions(store, wo))
+    return (len(invariants.reviewable_assumptions(store, wo))
+            > len(invariants.assumptions_owed_to_user(store, wo)))
 
 
 #: Walk the transcript tree for one-hour cache writes every N ticks
