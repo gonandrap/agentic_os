@@ -63,8 +63,8 @@
   <h3>What happens next</h3>
   {% if dry %}
     {% if dry.restart_needed %}
-    <p class="lede" id="ob-next">After applying you must run <code>jarvis start --catalog {{ dry.catalog }}</code>
-      yourself — the dashboard never restarts: {{ dry.restart_why }}.</p>
+    <p class="lede" id="ob-next">After applying, the OS needs a restart: {{ dry.restart_why }}.
+      The applied page has a <b>Restart now</b> button (<code>jarvis restart --reason "…"</code>).</p>
     {% else %}
     <p class="lede" id="ob-next">No restart: every change takes effect while the OS runs.</p>
     {% endif %}

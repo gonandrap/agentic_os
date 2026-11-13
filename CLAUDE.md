@@ -45,6 +45,7 @@ Before using a command you have not used this session, read its
 ```bash
 jarvis status [--json] [--attention]       # whole-OS pulse; --attention = the short list
 jarvis start --catalog <path> / jarvis stop  # boot / shut down (catalogs/ is untracked)
+jarvis restart --reason "…"                # restart-class settings; start never restarts a live OS
 jarvis pause [--allow <wo-id,...>] [--reason "…"]   # THE BRAKE when spend runs away; never kill processes
 jarvis resume <wo-id...> | --all           # let named orders through a pause, or lift it
 jarvis wo create <project> "title" -d "details" [--model m] [--budget usd]

@@ -19,15 +19,23 @@
   {% if v.reason %}<p class="lede" id="ob-reason">Reason: {{ v.reason }}</p>{% endif %}
 
   {% set live = applied.live %}
+  {% macro restart_now(why, back) %}
+  <form class="inline" method="post" action="/os/restart" id="ob-restart">
+    <input type="hidden" name="reason" value="{{ why }}">
+    <input type="hidden" name="next" value="{{ back }}">
+    <button class="accept" title="jarvis restart">Restart now</button>
+  </form>
+  {% endmacro %}
   {% if live.state == "live" %}
   <p class="lede" role="status" id="ob-live" data-state="live">{{ live.text }}.
-    {% if applied.cold %}{{ applied.cold[:3]|join(', ') }} only take effect on a restart:
-    run <code>{{ live.command }}</code>{% endif %}</p>
+    {% if applied.cold %}{{ applied.cold[:3]|join(', ') }} only take effect on a restart
+    (<code>{{ live.command }}</code>){% endif %}</p>
+  {% if applied.cold %}{{ restart_now("onboard " ~ name ~ ": " ~ applied.cold[:3]|join(', '), request.url.path) }}{% endif %}
   {% else %}
   <div class="brake" role="status" id="ob-live" data-state="{{ live.state }}"><div class="grow">
-    <b>{{ live.text }}</b>{% if live.command %} — the dashboard never restarts the OS:
+    <b>{{ live.text }}</b>{% if live.command %}
     <div>Run <code>{{ live.command }}</code></div>{% endif %}
-  </div></div>
+  </div>{% if live.state == "not_loaded" %}{{ restart_now("onboarded " ~ name, request.url.path) }}{% endif %}</div>
   {% endif %}
   <p class="lede">Bootstrap warnings, if any, are in the <a href="/inbox">inbox</a>.</p>
 </div>
