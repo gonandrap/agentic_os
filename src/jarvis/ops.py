@@ -298,6 +298,54 @@ def stop_os() -> dict[str, Any]:
     return {"status": "still-stopping", "pid": pid}
 
 
+def restart_os(reason: str) -> dict[str, Any]:
+    """`jarvis restart`: put restart-class settings in force (io-74eab254)"""
+    from .daemon import DAEMON_PROJECTS_KEY
+
+    if not reason.strip():
+        raise OpsError('say why: `jarvis restart --reason "…"`')
+    central = CentralStore()
+    try:
+        published = db.from_json(central.get_state(DAEMON_PROJECTS_KEY), None)
+        catalog = central.get_state("catalog_path") or ""
+        if not daemon_running():
+            raise OpsError(f"the OS is not running — "
+                           f"`jarvis start --catalog {catalog or '<file>'}`")
+        central.set_state("os_restart", db.to_json({"ts": time.time(), "reason": reason.strip()}))
+    finally:
+        central.close()
+    if isinstance(published, dict) and published.get("managed"):
+        # Detached: the caller may live in the daemon's own cgroup (kn-58429229)
+        release.service_runner().restart_unit_detached(release.DAEMON_UNIT,
+                                                       f"os-{int(time.time())}")
+        log.info("restart_os: queued detached restart of %s (%s)", release.DAEMON_UNIT, reason)
+        return {"status": "restarting", "managed": True, "reason": reason.strip()}
+    if not catalog:
+        raise OpsError("no catalog is registered — `jarvis stop`, then "
+                       "`jarvis start --catalog <file>`")
+    stopped = stop_os()
+    if stopped["status"] == "still-stopping":
+        raise OpsError(f"jarvisd (pid {stopped['pid']}) has not exited yet — "
+                       f"run `jarvis restart` again once it has")
+    started = start_os(catalog)
+    return {"status": "restarted", "managed": False, "reason": reason.strip(),
+            "daemon": started["daemon"]}
+
+
+def restart_pending() -> list[str]:
+    """Restart-class paths changed since the running daemon booted; [] when it is down"""
+    if not daemon_running():
+        return []
+    central = CentralStore()
+    try:
+        started = float(central.get_state("daemon_started_at") or 0)
+        rows = central.config_versions(limit=50)
+    finally:
+        central.close()
+    return sorted({c["path"] for row in rows if row["ts"] > started
+                   for c in row["changes"] if apply_class(c["path"]) == "restart"})
+
+
 # -- status
 
 def run_doctor(project: str | None = None, repair: bool = False,
@@ -14824,13 +14872,13 @@ APPLY_NOTES = {
     "hot": "in force on the daemon's next tick",
     "next-dispatch": "applies to work orders dispatched from now on — a worker already "
                      "running keeps what it was dispatched with",
-    "restart": "NOT in force until `jarvis start` restarts the OS",
+    "restart": "NOT in force until the OS restarts: `jarvis restart --reason \"…\"`",
 }
 
 # `settings_overrides` is `restart` for a reason the class name does not carry: nothing re-runs...
 SETTINGS_OVERRIDES_NOTE = (
-    "nothing re-runs bootstrap_project, so the project's .claude settings on disk are "
-    "unchanged until `jarvis start` writes them"
+    "nothing re-runs bootstrap_project while the OS runs, so the project's .claude settings "
+    "on disk are unchanged until `jarvis restart --reason \"…\"` writes them"
 )
 
 
@@ -16196,7 +16244,6 @@ def set_wiring(lever: str, wired: bool, project: str | None = None, *,
 def onboard_live(name: str, catalog: str = "") -> dict[str, str]:
     """Has the running daemon loaded `name`, and the one action that works if not (wo-6d9fbd23)"""
     from .daemon import DAEMON_PROJECTS_KEY
-    from . import service_manager
 
     central = CentralStore()
     try:
@@ -16212,8 +16259,7 @@ def onboard_live(name: str, catalog: str = "") -> dict[str, str]:
                 "text": f"cannot tell whether {name} is live: the running daemon "
                         f"predates the release that publishes its project list"}
     # `jarvis start` leaves a running daemon as it is (kn-ef104d83)
-    command = (service_manager.restart_hint(release.DAEMON_UNIT) if published.get("managed")
-               else f"jarvis stop && {start}")
+    command = f'jarvis restart --reason "onboarded {name}"'
     if name in (published.get("projects") or []):
         return {"state": "live", "command": command,
                 "text": f"{name} is live: the running daemon has it loaded"}

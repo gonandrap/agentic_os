@@ -325,7 +325,7 @@ def test_settings_overrides_says_why_it_is_inert_rather_than_accepting_it_silent
     res = ops.set_config("settings_overrides", {"env": {"X": "1"}}, project="proj_a")
 
     assert res["apply"] == "restart"
-    assert "bootstrap_project" in res["note"] and "jarvis start" in res["note"]
+    assert "bootstrap_project" in res["note"] and "jarvis restart" in res["note"]
 
 
 # --- unset

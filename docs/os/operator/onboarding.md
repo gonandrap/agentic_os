@@ -53,10 +53,12 @@ the fleet setting alone unless you choose otherwise.
 
 One configuration version, visible in `jarvis config history` with actor `onboard` and
 your reason; then the bootstrap, from the spec read back out of the committed catalog;
-then the project's row, so `jarvis status` sees it. A NEW project does not exist for the
-running daemon until `jarvis start` — `Daemon.reload_catalog` refuses to reload when the
-set of project names changes, and freezes every other setting change in the file until
-then. `apply` prints the exact `jarvis start --catalog <file>` to run.
+then the project's row, so `jarvis status` sees it. The running daemon hot-adds a NEW
+project on its next tick (`Daemon.reload_catalog` loads an added project that has a row),
+so no restart is needed for it. Only restart-class keys of an existing project need one:
+`apply` then prints the exact `jarvis restart --reason "…"` to run; `jarvis start` leaves
+a running OS as it is. `jarvis doctor` flags a catalog project the daemon has not loaded
+(`INV-CATALOG-PROJECT-LOADED`).
 
 ## Onboarding from the dashboard
 
@@ -81,8 +83,9 @@ Spec: `docs/superpowers/specs/2026-11-09-onboarding-from-the-dashboard.md`.
 - **Review** is the last section: what still needs deciding, the real diff with each row
   linked to its setting, the reason the safety keys require, and **apply** — the same one
   write as `jarvis onboard apply`.
-- A **new** project needs `jarvis start --catalog <file>` after apply; the applied page
-  prints it. The dashboard never restarts anything.
+- A **new** project, or a restart-class setting, needs the OS restarted after apply: the
+  applied page (and `/config`) shows **Restart now**, the same as
+  `jarvis restart --reason "…"`. `jarvis start` leaves a running OS as it is.
 
 The terminal and the dashboard share one draft: start in one, continue in the other.
 

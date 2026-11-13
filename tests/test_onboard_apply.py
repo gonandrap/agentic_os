@@ -206,6 +206,7 @@ def test_the_cli_asks_no_restart_for_a_new_project(catalog, repo, tmp_path, caps
 
     out = capsys.readouterr().out
     assert rc == 0
+    assert "jarvis restart" not in out
     assert "jarvis start" not in out
 
 

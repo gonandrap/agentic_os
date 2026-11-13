@@ -117,6 +117,17 @@
     {% if show.version.reason %} · {{ show.version.reason }}{% endif %}</div>
   {% endif %}
 </div>
+{% if restart_pending %}
+<div class="brake" role="status" id="cfg-restart"><div class="grow">
+  <b>Not in force yet:</b> {{ restart_pending[:3]|join(', ') }}{% if restart_pending|length > 3 %} and {{ restart_pending|length - 3 }} more{% endif %}
+  only take effect on a restart (<code>jarvis restart --reason "…"</code>).</div>
+  <form class="inline" method="post" action="/os/restart">
+    <input type="hidden" name="reason" value="config: {{ restart_pending[:3]|join(', ') }}">
+    <input type="hidden" name="next" value="/config">
+    <button class="accept">Restart now</button>
+  </form>
+</div>
+{% endif %}
 
 <form class="cfg-bar" method="get" action="/config">
   <label class="sub" for="cfg-scope">showing</label>

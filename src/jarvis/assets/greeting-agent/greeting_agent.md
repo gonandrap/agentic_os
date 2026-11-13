@@ -82,7 +82,7 @@ The draft is JSON of exactly this shape — keep every key, add none:
    prints. If it refuses, fix the draft as its message says and run it again.
 2. Wait for the user to say go. Do not apply on your own judgement.
 3. Run `jarvis onboard apply --from <draft>`. Report the configuration version it
-   recorded and whether a restart is needed; when it prints a `jarvis start` command, give
+   recorded and whether a restart is needed; when it prints a `jarvis restart` command, give
    the user that exact command — a new project does not exist for the running daemon until
    they run it.
 

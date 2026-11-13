@@ -491,6 +491,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--poll-interval", type=float, default=5.0)
 
     sub.add_parser("stop", help="stop the daemon")
+    sp = sub.add_parser(
+        "restart", help="restart a running OS so restart-class settings take effect",
+        description="`jarvis start` leaves a running daemon as it is; this restarts it. "
+                    "Under systemd/launchd the restart is detached, so it survives the caller. "
+                    "Gated as service_restart for a worker.")
+    sp.add_argument("--reason", required=True, help="why the OS is being restarted")
 
     sp = sub.add_parser(
         "pause", help="stop the fleet starting turns (only allow-listed orders run)",
@@ -2077,6 +2083,12 @@ def cmd_start(args: argparse.Namespace) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     from . import ops
     _print(ops.stop_os(), args.json)
+    return 0
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    from . import ops
+    _print(ops.restart_os(args.reason), args.json)
     return 0
 
 
@@ -5524,7 +5536,7 @@ def cmd_onboard(args: argparse.Namespace) -> int:
     for warning in data["bootstrap"]["warnings"]:
         print(f"  ⚠ {warning}")
     if data["restart_needed"]:
-        print(f"\nnext: jarvis start --catalog {data['catalog']}")
+        print(f'\nnext: jarvis restart --reason "onboarded {data["project"]}"')
         print(f"  {data['restart_why']}")
     return 0
 
@@ -6478,6 +6490,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_start(args)
         if args.cmd == "stop":
             return cmd_stop(args)
+        if args.cmd == "restart":
+            return cmd_restart(args)
         if args.cmd == "pause":
             return cmd_pause(args)
         if args.cmd == "resume":
