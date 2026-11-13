@@ -1744,6 +1744,16 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
         return {"what": "failed", "stalled": False,
                 "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
                           f"relaunches it in the same session; nothing is running to nudge"}
+    # Above the Neo arm: an escalated plan question leaves its bundled rows with nobody but you (issue 1716)
+    from . import autoreview
+    bundle =(autoreview.plan_bundle(store, wo) if wo["status"] == "needs_review"
+              else None)
+    if bundle and bundle["with_user"]:
+        n = len(bundle["ids"] & {int(a["id"]) for a in store.pending_assumptions(wo_id)})
+        if n:
+            return {"what": "plan_escalated", "stalled": False,
+                    "detail": f"{n} assumption(s) "
+                              f"{autoreview.plan_bundle_line(bundle, n)}"}
     if wo["status"] == "needs_review" and reviews_assumptions(store, wo):
         return {"what": "assumptions_with_neo", "stalled": False,
                 "detail": "Neo is reviewing its assumptions — each is settled by itself "
@@ -1857,7 +1867,7 @@ def _project_permission_mode(project_name: str) -> str | None:
 #: The `waiting_on` answers that mean THE USER IS NEEDED (#197)
 USER_IS_NEEDED_WAITS = frozenset({
     "assumptions", "gate_escalated", "neo_escalated", "plan_assumptions",
-    "message_stuck", "signin", "needs_review",
+    "message_stuck", "signin", "needs_review", "plan_escalated",
 })
 
 #: As much timeline as any conversation the fleet has run
@@ -2364,6 +2374,16 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     out: list[dict[str, str]] = []
     refusals: list[str] = []
 
+    # The plan decision is the only move that settles bundled rows (issue 1716)
+    if blocker["what"] == "plan_escalated":
+        from . import autoreview
+        bundle = autoreview.plan_bundle(store, wo)
+        if bundle:
+            out.append({"command": f"jarvis fo approve {bundle['fo']} [--reject] "
+                                   f"--feedback \"…\"",
+                        "why": f"decide plan review Q{bundle['question_id']}; the "
+                               f"assumptions it carries are settled with it"})
+
     # FIRST — §7 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md
     retry_no = retry_refusal(store, wo)
     if retry_no is None:
@@ -2503,7 +2523,7 @@ FIX_WORKER_MOVE: frozenset[str] = frozenset({"gate_held"})
 #: CLOSED SET: the slugs whose own `detail` names a command THE USER MAY RUN
 FIX_USERS_MOVE: frozenset[str] = frozenset({
     "signin", "assumptions", "plan_assumptions", "gate_escalated", "neo_escalated",
-    "message_stuck",
+    "message_stuck", "plan_escalated",
 })
 FIX_NOTHING = "nothing here for a remedy to clear — {detail}"
 FIX_LIVE_EDGES = ("every dependency edge it waits on is still LIVE, so the `unblock` "
@@ -4120,7 +4140,7 @@ def _unreachable_asks():
 
 def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     """`all_assumptions`, each row carrying what the OS DID with it under `os_ruling` (#712)"""
-    from . import db
+    from . import autoreview, db
 
     newest: dict[int, dict[str, Any]] = {}
     # WHY AN OBJECTION WAS TAKEN BACK
@@ -4173,12 +4193,16 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
     over = (_overtaken(store, wo_id)
             if any(str(a.get("status") or "") == "pending" for a in rows) else None)
     # WHY a pending row with no ruling is with the user — the catalog is read only if one is
-    off = (autoreview_off_because(store.project_path)
-           if any(str(a.get("status") or "") == "pending" and not a.get("os_ruling")
-                  for a in rows) else "")
+    unruled = any(str(a.get("status") or "") == "pending" and not a.get("os_ruling")
+                  for a in rows)
+    off = autoreview_off_because(store.project_path) if unruled else ""
+    # Where a bundled row waits: Neo's plan review or, once escalated, you (issue 1716)
+    bundle = autoreview.plan_bundle(store, store.get_work_order(wo_id)) if unruled else None
     replies = store.agent_replies(wo_id) if rows else []
     return [{**a, "overtaken": over if str(a.get("status") or "") == "pending" else None,
              "autoreview_off": off,
+             "plan_bundle": (bundle if bundle and int(a.get("id") or 0) in bundle["ids"]
+                             else None),
              "source_ref": assumption_source_ref(a, replies)}
             for a in rows]
 
@@ -4340,6 +4364,11 @@ def assumption_routing_line(a: dict[str, Any]) -> str:
     # A row with a ruling already says who looked, through `assumption_ruling_line`
     if str(a.get("status") or "") != "pending" or a.get("os_ruling"):
         return ""
+    bundle = a.get("plan_bundle")
+    if bundle:
+        from . import autoreview
+        line = autoreview.plan_bundle_line(bundle)
+        return line[:1].upper() + line[1:]
     # ABSENT, not empty: a row `assumptions_with_rulings` never enriched carries no answer
     off = a.get("autoreview_off")
     if off is None:
