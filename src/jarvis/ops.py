@@ -1601,6 +1601,13 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
     deferred = len(pending) if (pending and working
                                 and invariants.neo_reviews_later(store, wo)) else 0
     if pending and not deferred:
+        # Bundled rows of an escalated plan are settled by the plan decision (issue 1716)
+        bundled = invariants.escalated_bundle_ids(store, wo)
+        if bundled and all(int(a["id"]) in bundled for a in pending):
+            from . import autoreview
+            line = autoreview.plan_bundle_line(autoreview.plan_bundle(store, wo), len(pending))
+            return {"what": "plan_escalated", "stalled": False,
+                    "detail": f"{len(pending)} assumption(s) {line}"}
         return {"what": "assumptions", "stalled": False,
                 "detail": f"{len(pending)} assumption(s) await your review — "
                           f"`jarvis wo review {wo_id}`{round_note}"}
@@ -1808,7 +1815,7 @@ def _project_permission_mode(project_name: str) -> str | None:
 #: The `waiting_on` answers that mean THE USER IS NEEDED (#197)
 USER_IS_NEEDED_WAITS = frozenset({
     "assumptions", "gate_escalated", "neo_escalated", "plan_assumptions",
-    "message_stuck", "signin", "needs_review",
+    "message_stuck", "signin", "needs_review", "plan_escalated",
 })
 
 #: As much timeline as any conversation the fleet has run
@@ -2315,6 +2322,16 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     out: list[dict[str, str]] = []
     refusals: list[str] = []
 
+    # The plan decision is the only move that settles bundled rows (issue 1716)
+    if blocker["what"] == "plan_escalated":
+        from . import autoreview
+        bundle = autoreview.plan_bundle(store, wo)
+        if bundle:
+            out.append({"command": f"jarvis fo approve {bundle['fo']} [--reject] "
+                                   f"--feedback \"…\"",
+                        "why": f"decide plan review Q{bundle['question_id']}; the "
+                               f"assumptions it carries are settled with it"})
+
     # FIRST — §7 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md
     retry_no = retry_refusal(store, wo)
     if retry_no is None:
@@ -2454,7 +2471,7 @@ FIX_WORKER_MOVE: frozenset[str] = frozenset({"gate_held"})
 #: CLOSED SET: the slugs whose own `detail` names a command THE USER MAY RUN
 FIX_USERS_MOVE: frozenset[str] = frozenset({
     "signin", "assumptions", "plan_assumptions", "gate_escalated", "neo_escalated",
-    "message_stuck",
+    "message_stuck", "plan_escalated",
 })
 FIX_NOTHING = "nothing here for a remedy to clear — {detail}"
 FIX_LIVE_EDGES = ("every dependency edge it waits on is still LIVE, so the `unblock` "
@@ -2749,11 +2766,19 @@ def flag_assumptions_pending(store: ProjectStore, wo_id: str) -> None:
         return
     n = len(fresh)
     store.add_event(wo_id, ASSUMPTIONS_PINGED_EVENT, {"assumption_ids": fresh})
+    # Bundled rows of an escalated plan are settled by `fo approve`, not `wo review` (issue 1716)
+    bundled = invariants.escalated_bundle_ids(store, row)
+    decide = []
+    if any(int(a["id"]) not in bundled for a in owed):
+        decide.append(f"Decide: jarvis wo review {wo_id} [--reject] --feedback \"…\"")
+    if bundled & {int(a["id"]) for a in owed}:
+        fo_id = row.get("parent_id") or ""
+        decide.append(f"Decide the plan they ride: jarvis fo approve {fo_id} "
+                      f"[--reject] --feedback \"…\"")
     store.add_notification(
         title=f"{wo_id} is waiting on your review of {n} assumption{'s' if n != 1 else ''}",
         body=f"{row.get('title') or ''}\n"
-             f"Read them: jarvis wo show {wo_id}\n"
-             f"Decide: jarvis wo review {wo_id} [--reject] --feedback \"…\"",
+             f"Read them: jarvis wo show {wo_id}\n" + "\n".join(decide),
         level="warning", wo_id=wo_id, source="assumptions", paired=True)
 
 
@@ -4071,7 +4096,7 @@ def _unreachable_asks():
 
 def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     """`all_assumptions`, each row carrying what the OS DID with it under `os_ruling` (#712)"""
-    from . import db
+    from . import autoreview, db
 
     newest: dict[int, dict[str, Any]] = {}
     # WHY AN OBJECTION WAS TAKEN BACK
@@ -4124,12 +4149,16 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
     over = (_overtaken(store, wo_id)
             if any(str(a.get("status") or "") == "pending" for a in rows) else None)
     # WHY a pending row with no ruling is with the user — the catalog is read only if one is
-    off = (autoreview_off_because(store.project_path)
-           if any(str(a.get("status") or "") == "pending" and not a.get("os_ruling")
-                  for a in rows) else "")
+    unruled = any(str(a.get("status") or "") == "pending" and not a.get("os_ruling")
+                  for a in rows)
+    off = autoreview_off_because(store.project_path) if unruled else ""
+    # Where a bundled row waits: Neo's plan review or, once escalated, you (issue 1716)
+    bundle = autoreview.plan_bundle(store, store.get_work_order(wo_id)) if unruled else None
     replies = store.agent_replies(wo_id) if rows else []
     return [{**a, "overtaken": over if str(a.get("status") or "") == "pending" else None,
              "autoreview_off": off,
+             "plan_bundle": (bundle if bundle and int(a.get("id") or 0) in bundle["ids"]
+                             else None),
              "source_ref": assumption_source_ref(a, replies)}
             for a in rows]
 
@@ -4291,6 +4320,11 @@ def assumption_routing_line(a: dict[str, Any]) -> str:
     # A row with a ruling already says who looked, through `assumption_ruling_line`
     if str(a.get("status") or "") != "pending" or a.get("os_ruling"):
         return ""
+    bundle = a.get("plan_bundle")
+    if bundle:
+        from . import autoreview
+        line = autoreview.plan_bundle_line(bundle)
+        return line[:1].upper() + line[1:]
     # ABSENT, not empty: a row `assumptions_with_rulings` never enriched carries no answer
     off = a.get("autoreview_off")
     if off is None:

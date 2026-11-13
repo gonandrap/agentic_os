@@ -891,7 +891,26 @@ def assumptions_owed_to_user(store: ProjectStore,
                              wo: dict[str, Any]) -> list[dict[str, Any]]:
     """The rows that are the user's now: the ONE answer flag, ping and blockers ask (io-ed253c2b)"""
     pending = reviewable_assumptions(store, wo)
-    if not pending or neo_reviews_later(store, wo):
+    if not pending:
+        return []
+    owed = _owed_before_plan(store, wo, pending)
+    # Rows riding a plan question Neo escalated: nobody but the user rules on them now (issue 1716)
+    bundled = escalated_bundle_ids(store, wo)
+    have = {int(a["id"]) for a in owed}
+    return owed + [a for a in pending if int(a["id"]) in bundled - have]
+
+
+def escalated_bundle_ids(store: ProjectStore, wo: dict[str, Any]) -> set[int]:
+    """Ids of this planner's rows bundled into a plan review Neo escalated to the user (issue 1716)"""
+    from .autoreview import plan_bundle
+
+    bundle = plan_bundle(store, wo)
+    return set(bundle["ids"]) if bundle and bundle["with_user"] else set()
+
+
+def _owed_before_plan(store: ProjectStore, wo: dict[str, Any],
+                      pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if neo_reviews_later(store, wo):
         return []
     from .ops import assumptions_held_final, auto_review_at
 
