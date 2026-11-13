@@ -28,7 +28,7 @@ attention flag — `invariants.true_blockers` has no branch for it, on purpose: 
 merge queue the user works through in the dashboard, not a decision blocking the fleet.
 Pending assumptions outrank it (`needs_review` wins).
 
-`Daemon.poll_pull_requests` is what ends it, on its own `PR_POLL_EVERY_TICKS` (24, ~2min)
+`Daemon.poll_pull_requests` is what ends it, on its own wall-clock `PR_POLL_EVERY_SECONDS` (120s since the last poll started)
 cadence — the only step in the OS that leaves the machine. It runs
 `github.pr_view` (`gh pr view <url> --json state,mergedAt`) for each parked work order
 and writes the answer to `work_orders.pr_state`:

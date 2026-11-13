@@ -9,7 +9,7 @@ import pytest
 from jarvis import cli, db, gates, github, hooks, ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
-from jarvis.daemon import PR_POLL_EVERY_TICKS, Daemon
+from jarvis.daemon import PR_POLL_EVERY_SECONDS, Daemon
 from jarvis.invariants import (
     PR_CLOSED_BLOCKER,
     PR_CONFLICT_BLOCKER,
@@ -92,8 +92,11 @@ def test_the_reconciler_leaves_it_parked(started, project, fake_claude, settle_t
     ops.finish(wo["id"], "opened a PR", pr_url=PR)
 
     started.tick_count = 0
+
+    started.pr_polled_at = None
     started.tick()
     started.tick_count = 0
+    started.pr_polled_at = None
     started.tick()
 
     assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
@@ -443,16 +446,20 @@ def test_one_unreadable_pr_does_not_hide_the_others(started, project, fake_gh, p
     assert store.get_work_order(parked["id"])["status"] == "waiting_pr_merge"
 
 
-def test_the_poll_runs_on_its_own_cadence(started, project, fake_gh, parked):
-    """Every tick would be four times the API calls for no perceptible gain"""
+def test_the_poll_runs_on_wall_clock_seconds_not_ticks(started, project, fake_gh, parked):
+    """A slow tick must not stretch the poll period (io-2f01e390)"""
     fake_gh.set_pr(PR, "OPEN")
+    now = [1000.0]
+    started.monotonic = lambda: now[0]
+    started.pr_polled_at = None
 
-    started.tick_count = 0
-    started.tick()                       # tick 1: polls
+    started.tick()                       # first tick: polls
     assert len(fake_gh.calls) == 1
-    for _ in range(PR_POLL_EVERY_TICKS - 1):
+    for _ in range(50):                  # many ticks inside the window: no poll
+        now[0] += 1
         started.tick()
-    assert len(fake_gh.calls) == 1       # ... and not again until the cadence comes up
+    assert len(fake_gh.calls) == 1
+    now[0] = 1000.0 + PR_POLL_EVERY_SECONDS   # one tick, 120s after the last poll started
     started.tick()
     assert len(fake_gh.calls) == 2
 
@@ -557,6 +564,8 @@ def test_the_worker_is_woken_and_parks_itself_back(started, project, fake_gh,
     conflicting(fake_gh)
 
     started.tick_count = 0               # a tick that polls: queues the nudge
+
+    started.pr_polled_at = None
     started.tick()
     assert store.queued_messages(wo["id"])
 
