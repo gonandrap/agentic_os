@@ -58,7 +58,8 @@ def test_copy_edit_apply_is_three_requests(client, tmp_path):
     r = client.post("/onboard/newproj/edit", data={
         "rev": ops.onboard_view("newproj")["rev"], "section": "identity",
         "verb": "identity", "field": "description", "value": "a copy of proj_a"})
-    assert r.status_code == 303 and r.headers["location"] == "/onboard/newproj/review"
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/onboard/newproj/review?note=saved")
     assert "Copied from <b>proj_a</b>" in client.get("/onboard/newproj/review").text
     r = client.post("/onboard/newproj/apply", data={
         "rev": ops.onboard_view("newproj")["rev"], "reason": "like proj_a"})
