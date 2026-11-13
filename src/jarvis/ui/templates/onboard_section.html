@@ -74,6 +74,7 @@
       {% endif %}
     </td>
     <td><div class="badges">
+      {% if saved and focus and k.path == focus %}<span class="badge" role="status">saved</span>{% endif %}
       <span class="badge" title="where this value comes from">{{ k.source }}</span>
       {% if k.safety %}<span class="badge outside" title="changes what a worker may do: applying needs a reason">safety</span>{% endif %}
       {% if k.apply %}<span class="badge" title="when a change takes effect">{{ k.apply }}</span>{% endif %}

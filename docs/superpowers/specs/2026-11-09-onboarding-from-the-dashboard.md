@@ -90,13 +90,23 @@ All GET query params are `str` (learning `kn-34d78a6e`).
 | `GET /onboard/{name}` | §3 | 303 to the first section needing the user (first unanswered must-have, else first unanswered, else `review`) |
 | `GET /onboard/{name}/review` | §5 | the review section |
 | `GET /onboard/{name}/{section}?focus=<path>` | §3 | one section; unknown section → 404 page |
-| `POST /onboard/{name}/edit` | §3 | form `verb, section, rev, path, value, mode, field, lever, wired, fleet` → `ops.onboard_edit` → 303 back to `/onboard/{name}/{section}#k-<slug>`; on refusal re-render the section, status 400, the error shown and the typed value kept |
+| `POST /onboard/{name}/edit` | §3 | form `verb, section, rev, path, value, mode, field, lever, wired, fleet` → `ops.onboard_edit` → 303 (see "Where an edit lands" below); on refusal re-render the section, status 400, the error shown and the typed value kept |
 | `POST /onboard/{name}/apply` | §5 | form `rev`, `reason` → `ops.onboard_apply` → 303 to `/onboard/{name}/applied/{version}` |
 | `GET /onboard/{name}/apply` | §5 | 303 to the latest applied page, else `review` |
 | `GET /onboard/{name}/applied/{version}` | §5 | the applied page, built from the stored version; unknown version → 404 page |
 | `POST /onboard/{name}/help` | §4 | form `section`, `focus` (knob path or empty) → `ops.onboard_help` → its own result page |
 
 `<slug>` is the knob path with every non-`[A-Za-z0-9_-]` character replaced by `-`.
+
+**Where an edit lands** (amended by io-74eab254, wo-917e2120). A section-level verb
+(`answer` = a posture, `defaults`, `confirm` = keep these) answers the area, so it 303s
+to the first section still needing the user (the `GET /onboard/{name}` rule, else
+`review`) with `?note=saved: <section title> — <what>`, shown by `base.html`'s note
+flash. `fleet_ack` is the exception: the ack unlocks editing THIS section, so it stays
+on it with the same flash. A per-knob verb (`set`, `unset`, `identity`, `wire`) stays on
+its row: `/onboard/{name}/{section}?focus=<path>&saved=1#k-<slug>`, the row marked
+`saved`. Any edit to a copied draft (`project.like` set) returns to `review` with the
+flash (§1 copy flow). A refusal is unchanged: 400, same section, typed value kept.
 
 **Route modules.** Each UI child puts its routes in its own module under
 `src/jarvis/ui/` exposing `register(app, …)` and adds ONE call to it inside
