@@ -1180,6 +1180,46 @@ def bundled_into_plan(store: Any, wo: dict[str, Any], assumption: dict[str, Any]
     return str(fo["id"]) if own else ""
 
 
+def plan_bundle(store: Any, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """Which plan question carries this planner's bundled rows, and whose it is now (issue 1716)"""
+    if wo.get("kind") != "planner":
+        return None
+    fo = specs.family_of(store, wo)
+    if not fo or fo.get("status") not in PLAN_OPEN_STATUSES:
+        return None
+    plan = db.from_json(fo.get("plan"), {}) or {}
+    ids = {int(b.get("id") or 0) for b in plan.get("bundled_assumptions") or []} - {0}
+    qid = int(fo.get("plan_question_id") or 0)
+    if not (ids and qid):
+        return None
+    from .neo_store import USER_HELD_Q_STATUSES, NeoStore
+
+    try:
+        neo = NeoStore()
+        try:
+            q = neo.get(qid)
+        finally:
+            neo.close()
+    except Exception:  # noqa: BLE001 — a reader's lookup never takes its caller down
+        return None
+    if not q:
+        return None
+    return {"fo": str(fo["id"]), "question_id": qid, "ids": ids,
+            "with_user": str(q.get("status") or "") in USER_HELD_Q_STATUSES,
+            "cause": str(q.get("escalation_cause") or "")}
+
+
+def plan_bundle_line(bundle: dict[str, Any], n: int = 1) -> str:
+    """Where bundled rows wait, in words, with the command that settles them (issue 1716)"""
+    them = "it" if n == 1 else "them"
+    if bundle["with_user"]:
+        cause = f" ({bundle['cause']})" if bundle["cause"] else ""
+        return (f"bundled into plan review Q{bundle['question_id']}, escalated to you"
+                f"{cause}; `jarvis fo approve {bundle['fo']}` settles {them}")
+    return (f"bundled into plan review Q{bundle['question_id']} of {bundle['fo']}; "
+            f"Neo rules on {them} with the plan")
+
+
 def note_bundled(store: Any, wo: dict[str, Any], assumption: dict[str, Any],
                  fo_id: str) -> None:
     """Record the bundling once per assumption: the daemon re-checks every tick"""

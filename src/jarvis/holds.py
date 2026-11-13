@@ -57,6 +57,9 @@ _CLOSE: dict[str, tuple[frozenset[str], str | None, bool]] = {
     "turn_retries_exhausted": (TRANSPORT, None, False),
     "neo_answered": (frozenset({NEO_QUESTION}), "neo_question_id", False),
     "escalation_answered": (frozenset({NEO_QUESTION}), "neo_question_id", False),
+    # Both end the wait as surely as an answer: a refined question is handed back (issue 1716)
+    "neo_refined": (frozenset({NEO_QUESTION}), "neo_question_id", False),
+    "question_lapsed": (frozenset({NEO_QUESTION}), "question_id", False),
     "gate_decided": (frozenset({GATE}), "approval_id", False),
     "gate_dismissed": (frozenset({GATE}), "approval_id", False),
     "gate_abandoned": (frozenset({GATE}), "approval_id", False),
