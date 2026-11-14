@@ -4,27 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import re
 import subprocess
 from pathlib import Path
+
+from . import gitrefs
+from .gitrefs import REF_RE
 
 log = logging.getLogger("jarvis.branchproof")
 
 #: Same ceiling as `ci.CI_TIMEOUT`
 GIT_TIMEOUT = 30
 
-#: A ref BECOMES AN ARGUMENT, and one of the two callers passes `baseRefName` as GitHub answered it...
-REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-
 #: A commit, at any length `git` accepts
 SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
-
-def _env() -> dict[str, str]:
-    """`git` with nothing of the user's configuration and NOTHING INTERACTIVE"""
-    return {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "true",
-            "GIT_CONFIG_NOSYSTEM": "1", "GCM_INTERACTIVE": "never"}
+#: The in-module name, unchanged: every existing call site reads `_env`
+_env = gitrefs.env
 
 
 def attempt(repo: Path, *args: str, stdin: str | None = None) -> tuple[str | None, str]:
@@ -69,14 +65,9 @@ def _git_bytes(repo: Path, *args: str) -> bytes | None:
 
 def fetch(repo: Path, *refs: str) -> bool:
     """Bring `refs` down from `origin`, once per carry attempt"""
-    wanted = [r.split("/", 1)[1] if r.startswith("origin/") else r for r in refs]
-    if not wanted or not all(REF_RE.match(r or "") for r in wanted):
-        log.warning("refusing to fetch %r into %s — not a ref this may ask for",
-                    list(refs), repo)
-        return False
-    if _git(repo, "fetch", "--quiet", "origin", *wanted) is None:
-        log.warning("git fetch origin %s in %s failed — no local proof can be computed "
-                    "about this branch", " ".join(wanted), repo)
+    if not gitrefs.fetch_ref(repo, *refs):
+        log.warning("no local proof can be computed about %s in %s",
+                    " ".join(refs) or "∅", repo)
         return False
     return True
 
